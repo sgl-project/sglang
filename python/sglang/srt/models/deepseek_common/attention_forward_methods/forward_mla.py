@@ -31,7 +31,7 @@ from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
-    view_transposed_fp8_scale_nocopy_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -1161,8 +1161,10 @@ class DeepseekMLAForwardMixin:
                         transpose_scale=_emit_bpre,
                     )
                     if _emit_bpre:
-                        attn_bmm_output = view_transposed_fp8_scale_nocopy_tuple(
-                            attn_bmm_output
+                        attn_bmm_output = (
+                            view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                                attn_bmm_output
+                            )
                         )
                     elif _use_aiter_bpreshuffle_gfx95:
                         attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
@@ -1186,7 +1188,7 @@ class DeepseekMLAForwardMixin:
                     transpose_scale=_emit_bpre,
                 )
                 if _emit_bpre:
-                    attn_bmm_output = view_transposed_fp8_scale_nocopy_tuple(
+                    attn_bmm_output = view_aiter_fused_rms_transposed_fp8_scale_tuple(
                         attn_bmm_output
                     )
                 elif _use_aiter_bpreshuffle_gfx95:

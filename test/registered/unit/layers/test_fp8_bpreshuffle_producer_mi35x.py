@@ -8,7 +8,7 @@ These tests invoke the two producers the optimization actually routes through --
 o_proj) -- and prove, on real gfx95 kernels, that the two producer paths are
 equivalent:
 
-    transpose_scale=True  + view_transposed_fp8_scale_nocopy   (the optimized path)
+    transpose_scale=True  + view_aiter_fused_rms_transposed_fp8_scale   (the optimized path)
     transpose_scale=False + materialize_bpreshuffle_fp8_scale   (the row-major path)
 
 For M(tokens) >= 2 they must agree bit-for-bit on the quantized output and on the
@@ -27,7 +27,7 @@ import torch
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
-    view_transposed_fp8_scale_nocopy,
+    view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.utils.common import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -110,7 +110,7 @@ class TestBpreshuffleProducerScaleNoCopy(CustomTestCase):
                 # Optimized path: same input, transpose_scale=True + no-copy view.
                 torch.manual_seed(m)
                 q_t, s_t, _ = run_producer(m, transpose_scale=True)
-                nocopy = view_transposed_fp8_scale_nocopy(s_t)
+                nocopy = view_aiter_fused_rms_transposed_fp8_scale(s_t)
 
                 # Quantized output is layout-independent: transpose_scale only
                 # changes the *scale* storage, never the quantized bytes.

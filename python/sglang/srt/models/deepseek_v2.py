@@ -123,7 +123,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
-    view_transposed_fp8_scale_nocopy,
+    view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
@@ -429,7 +429,7 @@ class DeepseekV2MLP(nn.Module):
                     transpose_scale=_emit_bpre,
                 )
                 if _emit_bpre:
-                    x_scale = view_transposed_fp8_scale_nocopy(x_scale)
+                    x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
                 elif _use_aiter_bpreshuffle_gfx95:
                     x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
                 x = (x_fp8, x_scale)

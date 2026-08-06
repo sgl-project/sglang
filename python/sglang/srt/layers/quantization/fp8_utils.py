@@ -112,7 +112,7 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.t().contiguous().t() if scale.dim() == 2 else scale
 
 
-def view_transposed_fp8_scale_nocopy(scale: torch.Tensor) -> torch.Tensor:
+def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
     """Zero-copy view of a ``transpose_scale=True`` fp8 group scale.
 
     Producer-neutral counterpart of ``materialize_bpreshuffle_fp8_scale``. When an
@@ -145,18 +145,18 @@ def materialize_bpreshuffle_fp8_scale_tuple(
     )
 
 
-def view_transposed_fp8_scale_nocopy_tuple(
+def view_aiter_fused_rms_transposed_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
     """Zero-copy scale reinterpret for FP8 ``(q_input, x_scale, ...)`` tuples."""
-    return (value[0], view_transposed_fp8_scale_nocopy(value[1]), *value[2:])
+    return (value[0], view_aiter_fused_rms_transposed_fp8_scale(value[1]), *value[2:])
 
 
 def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> bool:
     """Whether a producer should emit its fp8 scale already transposed.
 
     Producer sites choose between two equivalent gfx95 bpreshuffle scale layouts:
-    ``transpose_scale=True`` + zero-copy ``view_transposed_fp8_scale_nocopy`` (this
+    ``transpose_scale=True`` + zero-copy ``view_aiter_fused_rms_transposed_fp8_scale`` (this
     predicate True), or row-major ``transpose_scale=False`` +
     ``materialize_bpreshuffle_fp8_scale`` (this predicate False). The transposed
     zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:

@@ -85,7 +85,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_utils import (
-    view_transposed_fp8_scale_nocopy,
+    view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -249,7 +249,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
     if _use_aiter_bpreshuffle_gfx95:
         x_quant = (
             x_quant[0],
-            view_transposed_fp8_scale_nocopy(x_quant[1]),
+            view_aiter_fused_rms_transposed_fp8_scale(x_quant[1]),
         )
     return x_quant, x_bf16
 

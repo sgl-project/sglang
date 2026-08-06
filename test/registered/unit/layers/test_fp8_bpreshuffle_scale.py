@@ -7,8 +7,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
-    view_transposed_fp8_scale_nocopy,
-    view_transposed_fp8_scale_nocopy_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -60,9 +60,9 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
         logical_scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         aiter_scale = logical_scale.t().contiguous().view(logical_scale.shape)
 
-        repaired = view_transposed_fp8_scale_nocopy(aiter_scale)
+        repaired = view_aiter_fused_rms_transposed_fp8_scale(aiter_scale)
         materialized = materialize_bpreshuffle_fp8_scale(repaired)
-        renormalized = view_transposed_fp8_scale_nocopy(repaired)
+        renormalized = view_aiter_fused_rms_transposed_fp8_scale(repaired)
 
         self.assertTrue(torch.equal(repaired, logical_scale))
         self.assertTrue(torch.equal(materialized, logical_scale))
@@ -129,7 +129,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
                 values = torch.arange(m * g, dtype=torch.float32).reshape(m, g)
                 emitted = _simulate_transpose_scale_emit(values)
 
-                nocopy = view_transposed_fp8_scale_nocopy(emitted)
+                nocopy = view_aiter_fused_rms_transposed_fp8_scale(emitted)
                 # Row-major producer path (transpose_scale=False + materialize).
                 materialized = materialize_bpreshuffle_fp8_scale(values)
 
@@ -142,7 +142,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
         values = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         emitted = _simulate_transpose_scale_emit(values)
 
-        nocopy = view_transposed_fp8_scale_nocopy(emitted)
+        nocopy = view_aiter_fused_rms_transposed_fp8_scale(emitted)
 
         # The whole point of the optimization: reinterpret, do not copy.
         self.assertEqual(nocopy.data_ptr(), emitted.data_ptr())
@@ -156,7 +156,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
             torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),  # 3-D
         ):
             with self.subTest(dim=scale.dim()):
-                self.assertIs(view_transposed_fp8_scale_nocopy(scale), scale)
+                self.assertIs(view_aiter_fused_rms_transposed_fp8_scale(scale), scale)
 
     def test_tuple_helper_reinterprets_only_the_scale_slot(self):
         q_input = torch.ones((3, 8), dtype=torch.float8_e4m3fn)
@@ -164,7 +164,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
         emitted = _simulate_transpose_scale_emit(values)
         bf16_side = torch.ones((3, 8), dtype=torch.bfloat16)
 
-        q_out, scale_out, bf16_out = view_transposed_fp8_scale_nocopy_tuple(
+        q_out, scale_out, bf16_out = view_aiter_fused_rms_transposed_fp8_scale_tuple(
             (q_input, emitted, bf16_side)
         )
 
