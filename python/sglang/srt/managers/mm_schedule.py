@@ -221,13 +221,13 @@ def _embedding_token_count(embedding: torch.Tensor) -> int:
 
 
 def _mm_item_batch_signature(item: MultimodalDataItem) -> tuple:
-    """Describe tensor geometry that must agree inside one encoder call."""
+    """Describe tensor geometry that must agree after leading-axis concat."""
 
     def tensor_signature(value):
         if isinstance(value, torch.Tensor):
-            return ("torch", tuple(value.shape), value.dtype)
+            return ("torch", value.ndim, tuple(value.shape[1:]), value.dtype)
         if isinstance(value, np.ndarray):
-            return ("numpy", tuple(value.shape), value.dtype.str)
+            return ("numpy", value.ndim, tuple(value.shape[1:]), value.dtype.str)
         return None
 
     fields = [("feature", item.feature)]

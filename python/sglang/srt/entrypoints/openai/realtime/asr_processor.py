@@ -88,8 +88,8 @@ class RealtimeASRState(msgspec.Struct):
     encoder_window_disabled: bool = False
     # True after cumulative transcript state has handed off to suffix decoding.
     encoder_window_active: bool = False
-    # A length-limited decode must keep audio from this absolute offset until a
-    # full-budget commit replay succeeds.
+    # A length-limited decode retains audio from this absolute offset until a
+    # full-budget recovery decode succeeds.
     final_replay_start_offset_bytes: Optional[int] = None
 
     @property
@@ -377,10 +377,20 @@ class RealtimeASRProcessor:
             sampling_params,
             self.adapter.prompt_template + step.decoder_prefix,
         )
+        if step.is_last and generation.finish_reason == "length":
+            raise RuntimeError("final realtime ASR decode reached max_new_tokens")
         delta = state.transcript.reconcile_cumulative_transcript(
             generation.text, is_last=step.is_last
         )
-        return _TranscriptionOutcome(audio_processed=True, cumulative_delta=delta)
+        return _TranscriptionOutcome(
+            audio_processed=True,
+            cumulative_delta=delta,
+            replay_start_offset_bytes=(
+                step.start_offset_bytes
+                if generation.finish_reason == "length"
+                else None
+            ),
+        )
 
     async def _execute_encoder_window_step(
         self,
@@ -397,10 +407,10 @@ class RealtimeASRProcessor:
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
 
-        # Intermediate requests use the heuristic suffix budget above. The
-        # final commit keeps the adapter budget so pending text is not limited
-        # by that estimate.
-        if not step.is_last:
+        # Normal intermediate requests use the heuristic suffix budget above.
+        # A replay after truncation keeps the adapter budget so it can recover
+        # the suffix before rolling context advances again.
+        if not step.is_last and not state.final_replay_required:
             max_suffix_tokens = estimate_decoder_suffix_token_budget(
                 step.end_offset_bytes - state.audio.last_processed_offset_bytes,
                 self.pcm_bytes_per_second,
@@ -503,6 +513,20 @@ class RealtimeASRProcessor:
         after its decode enters transcript state."""
         audio = state.audio
         audio.last_attempted_offset_bytes = step.end_offset_bytes
+        replay_was_pending = state.final_replay_start_offset_bytes is not None
+        replay_completed = (
+            replay_was_pending
+            and outcome.replay_start_offset_bytes is None
+            and outcome.audio_processed
+            and (
+                not step.uses_encoder_windows
+                or step.is_last
+                or (
+                    outcome.decoder_update is not None
+                    and outcome.decoder_update.pending_suffix is not None
+                )
+            )
+        )
         if (
             outcome.decoder_update is not None
             and outcome.decoder_update.pending_suffix is not None
@@ -516,7 +540,7 @@ class RealtimeASRProcessor:
             if state.final_replay_start_offset_bytes is not None:
                 replay_start = min(replay_start, state.final_replay_start_offset_bytes)
             state.final_replay_start_offset_bytes = replay_start
-        elif step.is_last:
+        elif replay_completed:
             state.final_replay_start_offset_bytes = None
         if not outcome.audio_processed:
             return
@@ -526,7 +550,13 @@ class RealtimeASRProcessor:
         if step.is_last:
             return
         if step.uses_encoder_windows:
-            audio.discard_before(step.start_offset_bytes)
+            discard_offset_bytes = step.start_offset_bytes
+            if replay_completed:
+                discard_offset_bytes = max(
+                    discard_offset_bytes,
+                    self._encoder_window_start_offset(state),
+                )
+            audio.discard_before(discard_offset_bytes)
 
     def _requires_cumulative_retry(
         self,

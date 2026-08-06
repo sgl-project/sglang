@@ -163,22 +163,28 @@ def _encoder_window_processor(transcripts, *, min_audio_sec=0.0):
     return tokenizer_manager, processor, processor.create_state()
 
 
-def _encoder_window_connection(transcripts, finish_reasons):
+def _realtime_connection(transcripts, finish_reasons, *, encoder_windows=True):
     tokenizer_manager = _MockTokenizerManager(
         transcripts,
-        supports_encoder_windows=True,
+        supports_encoder_windows=encoder_windows,
         finish_reasons=finish_reasons,
     )
     connection = RealtimeConnection(
         Mock(send_text=AsyncMock(), close=AsyncMock()),
         tokenizer_manager,
-        _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
-        _server_args(120),
+        _adapter(
+            encoder_window_config=(_ENCODER_WINDOW_POLICY if encoder_windows else None)
+        ),
+        _server_args(
+            120,
+            long_audio_strategy=("encoder_window" if encoder_windows else "cumulative"),
+        ),
     )
     connection.config.configured = True
     connection.config.sampling_params = {"max_new_tokens": 256}
     connection._send = AsyncMock()
-    connection.asr_state.transcript.emitted_text = "one two three"
+    if encoder_windows:
+        connection.asr_state.transcript.emitted_text = "one two three"
     connection.asr_state.audio.append_pcm(b"\x01\x00\x02\x00")
     return tokenizer_manager, connection
 
@@ -347,8 +353,8 @@ class TestStreamingASR(CustomTestCase):
         self.assertFalse(state.encoder_window_active)
         self.assertEqual(len(tokenizer_manager.requests), 2)
 
-    def test_commit_replays_windowed_audio_with_full_decode_budget(self):
-        tokenizer_manager, connection = _encoder_window_connection(
+    def test_length_limited_decode_replays_with_full_budget(self):
+        tokenizer_manager, connection = _realtime_connection(
             ["three four", "three four five"],
             ["length", "stop"],
         )
@@ -362,18 +368,16 @@ class TestStreamingASR(CustomTestCase):
             tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
         )
 
-        tokenizer_manager, connection = _encoder_window_connection(
-            "three four", ["stop"]
-        )
+        tokenizer_manager, connection = _realtime_connection("three four", ["stop"])
 
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
 
         self.assertEqual(len(tokenizer_manager.requests), 1)
 
-        tokenizer_manager, connection = _encoder_window_connection(
-            ["one two three", "", "three four five"],
-            ["length", "stop", "stop"],
+        tokenizer_manager, connection = _realtime_connection(
+            ["one two three", "", "three four five", "four five six"],
+            ["length", "stop", "stop", "stop"],
         )
         connection.asr_state.audio.append_pcm(bytes(96))
 
@@ -383,17 +387,69 @@ class TestStreamingASR(CustomTestCase):
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         self.assertTrue(connection.asr_state.final_replay_required)
         self.assertEqual(connection.asr_state.audio.base_offset_bytes, 0)
+        self.assertEqual(
+            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
+        )
+
+        connection.asr_state.audio.append_pcm(bytes(4))
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        self.assertFalse(connection.asr_state.final_replay_required)
+        self.assertEqual(connection.asr_state.audio.base_offset_bytes, 32)
+        self.assertEqual(
+            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
+        )
+
+        connection.asr_state.audio.append_pcm(bytes(4))
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        self.assertEqual(tokenizer_manager.requests[-1].audio_data.size, 40)
+        self.assertEqual(
+            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 36
+        )
 
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-        self.assertEqual(len(tokenizer_manager.requests), 3)
-        self.assertEqual(tokenizer_manager.requests[-1].audio_data.size, 52)
+        self.assertEqual(len(tokenizer_manager.requests), 4)
 
-        tokenizer_manager, connection = _encoder_window_connection(
+        tokenizer_manager, connection = _realtime_connection(
             ["three four", "three four five"],
             ["length", "length"],
         )
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        self.assertEqual(len(tokenizer_manager.requests), 2)
+        sent_event_types = [
+            call.args[0].type for call in connection._send.call_args_list
+        ]
+        self.assertIn(
+            "conversation.item.input_audio_transcription.failed", sent_event_types
+        )
+        self.assertNotIn(
+            "conversation.item.input_audio_transcription.completed", sent_event_types
+        )
+
+        tokenizer_manager, connection = _realtime_connection(
+            ["hello world", "hello world tail"],
+            ["length", "stop"],
+            encoder_windows=False,
+        )
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        self.assertTrue(connection.asr_state.final_replay_required)
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        self.assertEqual(len(tokenizer_manager.requests), 2)
+        sent_event_types = [
+            call.args[0].type for call in connection._send.call_args_list
+        ]
+        self.assertIn(
+            "conversation.item.input_audio_transcription.completed", sent_event_types
+        )
+
+        tokenizer_manager, connection = _realtime_connection(
+            ["hello world", "hello world tail"],
+            ["length", "length"],
+            encoder_windows=False,
+        )
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        self.assertEqual(len(tokenizer_manager.requests), 2)
         sent_event_types = [
             call.args[0].type for call in connection._send.call_args_list
         ]

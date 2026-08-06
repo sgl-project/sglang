@@ -180,7 +180,7 @@ def test_tensor_cache_entries_own_storage():
         assert emb.untyped_storage().nbytes() == own_bytes
 
 
-def test_cross_request_misses_group_incompatible_feature_shapes():
+def test_cross_request_misses_group_incompatible_trailing_shapes():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     calls = []
 
@@ -215,6 +215,43 @@ def test_cross_request_misses_group_incompatible_feature_shapes():
 
     assert len(embeddings) == 2
     assert calls == [[(1, 128, 800)], [(1, 128, 801)]]
+
+
+def test_cross_request_misses_batch_ragged_leading_shapes():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    calls = []
+
+    def encoder(items):
+        calls.append([tuple(item.feature.shape) for item in items])
+        torch.cat([item.feature for item in items], dim=0)
+        return torch.cat(
+            [torch.zeros(_num_tokens(item), HIDDEN) for item in items], dim=0
+        )
+
+    requests = []
+    for index, patch_count in enumerate((5, 7)):
+        offset = (0, 3 + index)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=3000 + index,
+            feature=torch.zeros(patch_count, 128),
+            offsets=[offset],
+            model_specific_data={"image_grid_thw": torch.ones(1, 3)},
+        )
+        requests.append(
+            mm_schedule.PerImageRequestInfo(
+                req_idx=index,
+                items=[item],
+                items_offset=[offset],
+                extend_prefix_len=0,
+                extend_seq_len=offset[1] + 1,
+            )
+        )
+
+    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+
+    assert len(embeddings) == 2
+    assert calls == [[(5, 128), (7, 128)]]
 
 
 if __name__ == "__main__":
