@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
@@ -430,8 +431,12 @@ struct TopKKernel {
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
+    // The fused small-batch DSMEM path is tuned and validated on SM100. On
+    // Hopper it can leave output slots unwritten; keep the correct
+    // persistent-cluster + main-kernel path there.
+    static const bool kUseFusedSmallBatch = host::runtime::get_sm_version(device.device_id) >= 100;
     if (use_cluster) {
-      if (batch_size <= kNumPersistentClusters) {
+      if (kUseFusedSmallBatch && batch_size <= kNumPersistentClusters) {
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
             .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
             .launch(topk_small_batch_kernel<kUsePDL>, params);

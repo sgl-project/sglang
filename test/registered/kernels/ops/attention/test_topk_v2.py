@@ -185,6 +185,34 @@ def test_topk_v2(batch: int, seq: int, k: int, page_mode: str) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+@torch.inference_mode()
+def test_topk_v2_small_batch_cluster_floor_transition() -> None:
+    """Exercise mixed rows around the 32K small-batch cluster floor.
+
+    On Hopper, the fused DSMEM path returned incomplete top-k output for the
+    rows just above the floor while the register and streaming rows were
+    correct. The Hopper fallback must preserve all rows in the same launch.
+    """
+    torch.manual_seed(32769)
+    device = "cuda"
+    k = 512
+    lengths = [32767, 32768, 32769, 33000, 2000, 12000, 16385, 1000]
+    batch, seq = len(lengths), max(lengths)
+    scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(
+        batch,
+        num_pages,
+        "identity",
+        device,
+    )
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize(
     "batch,shape",
