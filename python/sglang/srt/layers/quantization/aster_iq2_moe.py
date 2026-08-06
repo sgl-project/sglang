@@ -67,12 +67,13 @@ def aster_iq2_moe_fused_decode(
     situ_beta: float | None,
     situ_linear_beta: float | None,
 ) -> torch.Tensor | None:
-    """Bit-exact batch-one K3 SiTU path, or ``None`` when not covered."""
+    """Bit-exact K3 SiTU path for decode/verify widths up to eight."""
+    tokens = x.shape[0] if x.ndim == 2 else 0
     if (
         x.ndim != 2
-        or x.shape[0] != 1
-        or topk_ids.shape != (1, 16)
-        or topk_weights.shape != (1, 16)
+        or not 1 <= tokens <= 8
+        or topk_ids.shape != (tokens, 16)
+        or topk_weights.shape != (tokens, 16)
         or topk_ids.dtype != torch.int32
         or topk_weights.dtype != torch.float32
         or not topk_ids.is_contiguous()
@@ -89,9 +90,11 @@ def aster_iq2_moe_fused_decode(
     global _FUSED_REACHED
     if not _FUSED_REACHED:
         logger.warning(
-            "ASTER_IQ2_MOE_FUSED_DECODE_REACHED w13_qtype=%d w2_qtype=%d",
+            "ASTER_IQ2_MOE_FUSED_DECODE_REACHED w13_qtype=%d w2_qtype=%d "
+            "tokens=%d",
             w13_qtype,
             w2_qtype,
+            tokens,
         )
         _FUSED_REACHED = True
 
@@ -102,7 +105,7 @@ def aster_iq2_moe_fused_decode(
         16,
         w13_qtype,
         1_536,
-        1,
+        tokens,
         4,
         1,
         4.0,
@@ -116,7 +119,7 @@ def aster_iq2_moe_fused_decode(
         16,
         w2_qtype,
         3_584,
-        1,
+        tokens,
         1,
         1,
         True,
