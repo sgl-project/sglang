@@ -187,11 +187,8 @@ class ModelStorageManifest:
                 (f"{kind}:{name}", TensorStorageMetadata.from_tensor(tensor))
                 for name, tensor in tensors
             )
-        # Sort by name only. The explicit key is required, not stylistic: a bare
-        # sorted() would fall back to comparing TensorStorageMetadata whenever two
-        # entries share a name, and that dataclass is intentionally not ordered.
-        # Sorting also makes unchanged_parameter_names() report a deterministic
-        # name for tensors aliased under several names (e.g. tied embeddings).
+        # Key explicitly by name because TensorStorageMetadata is not orderable,
+        # and stable name ordering keeps diagnostics deterministic for aliases.
         return cls(tensors=tuple(sorted(entries, key=lambda entry: entry[0])))
 
     def changed_names(self, model: nn.Module) -> Tuple[str, ...]:
@@ -328,18 +325,11 @@ class StartupWeightLoadManager:
         options: StartupWeightLoadOptions,
     ) -> Optional[str]:
         architectures = tuple(model_config.hf_config.architectures or ())
-        # NOTE(2026-08): every rule below is a hard gate for the first overlap
-        # rollout, and TP<=2 plus FP16/BF16 are the two the support matrix is
-        # most likely to be widened past. Broadening any of them requires
-        # storage-stability, capture-sentinel, and startup correctness coverage
-        # for the new case; the staged plan is described in the PR that
-        # introduced this module and lands in its PR 2 / PR 3 follow-ups.
-        #
-        # The rules stay here, on the manager, rather than being split into a
-        # ServerArgs pre-check: they are evaluated against the resolved loader,
-        # load format, model config, and model class, so a ServerArgs-only copy
-        # would cover a strict subset and would be a second place to keep in
-        # sync. ServerArgs only owns the mode value itself.
+        # NOTE(2026-08): The initial rollout supports only the configurations
+        # admitted below. Expand this matrix only with storage-stability,
+        # capture-sentinel, and startup-correctness coverage for the new case.
+        # Keep these checks here because they depend on resolved loader and model
+        # state; ServerArgs owns only the mode selection.
         basic_rules = (
             (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
