@@ -2093,19 +2093,17 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-            # Beam request (sampling_params.beam_width > 1): the leader rides
-            # the standard per-row top-2k logprob channel internally.
-            beam_width = BeamCoordinator.request_beam_width(recv_req)
-            is_beam = beam_width > 1
+            # Beam request (sampling_params.beam_width > 1): selection reads
+            # the raw logits at the relay point, so the leader needs no
+            # logprob channel.
+            is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=True if is_beam else recv_req.return_logprob,
-                top_logprobs_num=(
-                    2 * beam_width if is_beam else recv_req.top_logprobs_num
-                ),
+                return_logprob=recv_req.return_logprob,
+                top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
@@ -2775,15 +2773,6 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
-        # Spawn pending beam members as decode-ready rows (their leader merged
-        # just above, so the whole group enters decode in the same tick).
-        member_batch = self.beam_coordinator.build_pending_member_batch()
-        if member_batch is not None:
-            if running_batch.is_empty():
-                running_batch = member_batch
-            else:
-                running_batch.merge_batch(member_batch)
-
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
         # for load reporting (num_running_reqs via /v1/loads).
@@ -2851,15 +2840,16 @@ class Scheduler(
         pp_budget = get_server_args().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
 
-        # New-path beam groups: reserve the member rows that admitted-but-not-
-        # yet-spawned groups will claim (beam_width - 1 each, leader included
-        # in its own row), so admission never over-commits the req slot pool.
+        # Beam groups: reserve the member rows that admitted-but-not-yet-
+        # spawned groups will claim (beam_width - 1 each, leader included in
+        # its own row), so admission never over-commits the req slot pool.
         active_batch = running_batch or self.running_batch
         pending_member_rows = sum(
             r.beam_group.beam_width - 1
             for r in active_batch.reqs
             if r.beam_group is not None
-            and len(r.beam_group.member_reqs) < r.beam_group.beam_width
+            and r.beam_group.member_rows is None
+            and not r.beam_group.retired
             and not r.finished()
         )
         available = max(available - pending_member_rows, 0)
@@ -3147,6 +3137,9 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Beam member rows (appended by prepare_for_decode) are not
+            # supported inside a mixed extend batch.
+            and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
@@ -3250,6 +3243,9 @@ class Scheduler(
                     ),
                     req,
                 )
+            # Aborted beam leaders: their member rows were freed inside
+            # retract_decode; retire the groups from the live set.
+            self.beam_coordinator.retire_aborted_beam_groups(reqs_to_abort)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -3430,7 +3426,9 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
+                            self._relay_forward_payload(
+                                batch, future_indices, batch_result
+                            )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -3463,7 +3461,7 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
@@ -3499,7 +3497,9 @@ class Scheduler(
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
-                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3568,7 +3568,10 @@ class Scheduler(
             model_runner._pending_elastic_scale_update = None
 
     def _relay_forward_payload(
-        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        future_indices: torch.Tensor,
+        batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs.
         ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
@@ -3580,7 +3583,17 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
+        if batch.beam_tail is not None:
+            # Sampled tokens only cover the reqs-aligned rows (the worker
+            # sliced the beam member rows off before sampling); the member
+            # rows are relayed by the coordinator's selection below.
+            future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
+        # Beam rows: overwrite the relayed sampled tokens with joint-selected
+        # ones (and reparent KV) before the next forward resolves its inputs.
+        self.beam_coordinator.maybe_select_and_relay(
+            batch, batch_result, chunked_req=self.chunked_req
+        )
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
@@ -3595,7 +3608,9 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
-            self._relay_forward_payload(batch_result.future_indices, batch_result)
+            self._relay_forward_payload(
+                cur_batch, batch_result.future_indices, batch_result
+            )
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,

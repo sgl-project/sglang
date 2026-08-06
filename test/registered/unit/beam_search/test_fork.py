@@ -1,4 +1,4 @@
-"""Unit tests for the fork primitive (S3): spawn, reparent, drift guard."""
+"""Unit tests for the fork primitives: prompt alias, member-row free, reparent."""
 
 import unittest
 from types import SimpleNamespace
@@ -6,12 +6,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.beam_search.fork import (
-    FORK_STATE_PLAN,
-    collect_req_state_fields,
-    init_member_kv_state,
+    alias_members_prompt_kv,
+    free_member_rows,
     neutral_member_sampling_params,
     reparent_kv,
-    spawn_member,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -75,92 +73,104 @@ class TestReparentKV(CustomTestCase):
             self.assertTrue(torch.equal(buf, orig))
 
 
-class TestInitMemberKvState(CustomTestCase):
-    def test_alias_mapping_and_bookkeeping(self):
-        req_to_token = torch.arange(24, dtype=torch.int64).reshape(2, 12)
+class TestAliasMembersPromptKV(CustomTestCase):
+    def test_alias_mapping(self):
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
         leader_prompt = req_to_token[0, :5].clone()
-        member_tail_before = req_to_token[1, 5:].clone()
-        # The member's row is assigned by the standard pool alloc beforehand.
-        member = SimpleNamespace(req_pool_idx=1)
+        tails_before = req_to_token[1:, 5:].clone()
 
-        init_member_kv_state(member, req_to_token, leader_row=0, prompt_len=5)
+        alias_members_prompt_kv(
+            req_to_token,
+            dst_rows=torch.tensor([1, 2]),
+            leader_row=0,
+            prompt_len=5,
+        )
 
-        # Prompt indices aliased from the leader; the tail stays member-owned.
+        # Prompt indices aliased from the leader; the tails stay member-owned.
         self.assertTrue(torch.equal(req_to_token[1, :5], leader_prompt))
-        self.assertTrue(torch.equal(req_to_token[1, 5:], member_tail_before))
-        # Born-correct linear accounting; prompt is not the member's to free.
-        self.assertEqual(member.req_pool_idx, 1)
-        self.assertEqual(member.kv.kv_allocated_len, 5)
-        self.assertEqual(member.kv_committed_len, 5)
-        self.assertEqual(member.cache_protected_len, 5)
-        self.assertTrue(member.skip_radix_cache_insert)
+        self.assertTrue(torch.equal(req_to_token[2, :5], leader_prompt))
+        self.assertTrue(torch.equal(req_to_token[1:, 5:], tails_before))
 
 
-class TestForkStatePlan(CustomTestCase):
-    def test_every_req_field_is_classified(self):
-        fields = set(collect_req_state_fields())
-        plan = set(FORK_STATE_PLAN)
+class _FakeReqToTokenPool:
+    def __init__(self, req_to_token):
+        self.req_to_token = req_to_token
+        self.freed = []
 
-        unclassified = fields - plan
-        self.assertFalse(
-            unclassified,
-            f"New Req fields must be classified in FORK_STATE_PLAN: {unclassified}",
+    def free_raw(self, indices):
+        self.freed.extend(indices)
+
+
+class _FakeAllocator:
+    def __init__(self):
+        self.freed = []
+
+    def free(self, slots):
+        self.freed.extend(slots.tolist())
+
+
+class TestFreeMemberRows(CustomTestCase):
+    def _make_group(self, req_to_token, allocated_len):
+        leader = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=allocated_len))
+        return SimpleNamespace(
+            leader=leader,
+            prompt_len=5,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=torch.tensor([0, 1, 2], dtype=torch.int64),
         )
-        stale = plan - fields
-        self.assertFalse(
-            stale, f"FORK_STATE_PLAN entries no longer exist on Req: {stale}"
-        )
+
+    def test_frees_suffix_slots_and_rows(self):
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = self._make_group(req_to_token, allocated_len=8)
+
+        free_member_rows(group, pool, allocator)
+
+        # Each member row owns its decode suffix [5, 8); the aliased prompt
+        # is the leader's to free.
+        expected = req_to_token[1:3, 5:8].flatten().tolist()
+        self.assertEqual(sorted(allocator.freed), sorted(expected))
+        self.assertEqual(sorted(pool.freed), [1, 2])
+        self.assertIsNone(group.member_rows)
+        self.assertIsNone(group.member_rows_cpu)
+        self.assertIsNone(group.all_rows)
+
+        # Idempotent: a second free is a no-op.
+        free_member_rows(group, pool, allocator)
+        self.assertEqual(sorted(pool.freed), [1, 2])
+
+    def test_empty_suffix_frees_rows_only(self):
+        # Dead leader right after spawn: allocated == prompt, no KV to free.
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = self._make_group(req_to_token, allocated_len=5)
+
+        free_member_rows(group, pool, allocator)
+
+        self.assertEqual(allocator.freed, [])
+        self.assertEqual(sorted(pool.freed), [1, 2])
 
 
-class TestSpawnMember(CustomTestCase):
-    def _make_leader(self):
-        from sglang.srt.managers.schedule_batch import Req
+class TestNeutralParams(CustomTestCase):
+    def test_neutral_params(self):
         from sglang.srt.sampling.sampling_params import SamplingParams
 
-        leader = Req(
-            rid="leader",
-            origin_input_text="",
-            origin_input_ids=[1, 2, 3],
-            sampling_params=SamplingParams(
-                max_new_tokens=8,
-                temperature=0.0,
-                frequency_penalty=0.5,
-                stop_token_ids={7},
-            ),
+        leader_params = SamplingParams(
+            max_new_tokens=8,
+            temperature=0.0,
+            frequency_penalty=0.5,
+            stop_token_ids={7},
         )
-        leader.vocab_size = 1000
-        return leader
-
-    def test_neutral_params(self):
-        leader = self._make_leader()
-        params = neutral_member_sampling_params(leader.sampling_params)
+        params = neutral_member_sampling_params(leader_params)
         self.assertEqual(params.temperature, 1.0)
         self.assertEqual(params.top_p, 1.0)
         self.assertEqual(params.frequency_penalty, 0.0)
         self.assertTrue(params.ignore_eos)
         self.assertIsNone(params.stop_token_ids)
         self.assertGreater(params.max_new_tokens, 8)
-
-    def test_spawn_member(self):
-        leader = self._make_leader()
-        # Spawning only ever happens off a leader with an attached group;
-        # is_beam_leader derives from the group's leader identity.
-        leader.beam_group = SimpleNamespace(leader=leader)
-        leader.logprob.top_logprobs_num = 4  # leader's internal top-2k channel
-        member = spawn_member(leader, first_token=42, member_index=1)
-
-        self.assertEqual(member.rid, "leader#beam1")
-        self.assertIs(member.origin_input_ids, leader.origin_input_ids)
-        self.assertEqual(list(member.output_ids), [42])
-        self.assertEqual(member.vocab_size, 1000)
-        self.assertEqual(member.sampling_params.temperature, 1.0)
-        self.assertTrue(member.sampling_params.ignore_eos)
-        self.assertFalse(member.stream)
-        self.assertFalse(member.is_beam_leader)
-        self.assertTrue(leader.is_beam_leader)
-        # Members ride the internal top-2k logprob channel.
-        self.assertTrue(member.return_logprob)
-        self.assertEqual(member.logprob.top_logprobs_num, 4)
 
 
 if __name__ == "__main__":

@@ -341,7 +341,10 @@ class _GenerationStreamAccumulator:
         return req.is_beam_leader and req.finished()
 
     def accept(self, *, req: Req) -> None:
-        if req.beam_group is not None and not self._beam_admits(req=req):
+        # getattr: unit-test fakes may not carry the beam_group field.
+        if getattr(req, "beam_group", None) is not None and not self._beam_admits(
+            req=req
+        ):
             return
         if req.finished():
             assert not req.finished_output
@@ -405,7 +408,9 @@ class _GenerationStreamAccumulator:
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
-            pack_beam_search_output(req) if req.beam_group is not None else None
+            pack_beam_search_output(req)
+            if getattr(req, "beam_group", None) is not None
+            else None
         )
         if beam_output is not None:
             self.completion_tokens[-1] = sum(

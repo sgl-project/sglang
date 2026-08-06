@@ -260,6 +260,16 @@ class SchedulerInvariantChecker:
                         req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
+                # Beam member rows carry no Req: each owns its decode suffix
+                # [prompt_len, allocated) in lockstep with the leader (the
+                # aliased prompt belongs to the leader's accounting; beam
+                # requires page_size == 1 and rejects hybrid SWA).
+                group = req.beam_group
+                if group is not None and group.member_rows is not None:
+                    full_uncached += group.num_member_rows * (
+                        req.kv.kv_allocated_len - group.prompt_len
+                    )
+
         return full_uncached, swa_uncached
 
     def self_check_during_busy(self):

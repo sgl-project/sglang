@@ -1,39 +1,43 @@
-"""Scheduler wiring for beam search (plain-req group architecture).
+"""Scheduler wiring for beam search (columnar member-row architecture).
 
-A beam_width=k request runs as k plain member rows: the leader (the user's
-Req, member 0) plus k-1 internal members spawned decode-ready after the
-leader's prefill. Members run the standard decode path end to end; this
-processor only hooks three points:
+A beam_width=k request runs as one leader Req plus k-1 bare member rows:
+physical req_to_token rows tracked columnarly on the group, with no Req
+object behind them. The leader is a standard scheduler request; the member
+rows are appended to the decode batch's row tensors just before allocation
+(ScheduleBatch._append_beam_tail) and sliced off the logits before sampling
+(tp_worker), so the reqs-aligned world never sees them. This coordinator
+hooks three points:
 
 1. admission -- validate_and_init: validation, neutral row params, the
-   internal top-2k logprob channel, the group overlay
-2. selection -- on_leader_prefill / process_decode: joint_select over per-row
-   top-2k, overwrite next tokens via the FutureMap relay, reparent KV
+   group overlay
+2. selection -- at the forward's relay point: per-group top-2k straight from
+   the raw decode logits (leader row + member tail rows), joint_select on
+   device, overwrite next tokens via the FutureMap relay, reparent KV
    (copy-on-fork) where the frontier moved
-3. lifecycle -- member spawn (prebuilt decode batch) and group finish
-   (finalize + beam_results on the leader; members exit silently)
+3. lifecycle -- member-row spawn at the leader's prefill relay (row alloc +
+   prompt alias + first-token stash, no host sync) and group finish
+   (finalize + beam_results on the leader; member rows freed in one shot)
 
-Member KV bookkeeping is born correct on the standard per-req fields:
-committed == allocated == prompt_len, cache_protected_len == prompt_len
-(the aliased prompt is not the member's to free).
+Member KV bookkeeping is implied by the leader's: all rows decode in
+lockstep, so each member row owns exactly the decode-suffix slots
+[prompt_len, leader_allocated).
 """
 
 from __future__ import annotations
 
 import logging
-from array import array
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
-    init_member_kv_state,
+    alias_members_prompt_kv,
+    free_member_rows,
     neutral_member_sampling_params,
     reparent_kv,
-    spawn_member,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -44,7 +48,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -56,6 +59,25 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+
+def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
+    """Per-row top-`num_candidates` logprobs from raw decode logits.
+
+    Normalizes with a per-row logsumexp instead of materializing a full
+    [rows, vocab] log_softmax; topk order on the raw logits is identical
+    (monotone shift). Returns fp32 [rows, 2k] values and int64 token ids.
+    """
+    vals, toks = [], []
+    for piece in pieces:
+        if piece.shape[0] == 0:
+            continue
+        x = piece.float()
+        lse = torch.logsumexp(x, dim=-1, keepdim=True)
+        v, t = torch.topk(x, num_candidates, dim=-1)
+        vals.append(v - lse)
+        toks.append(t)
+    return torch.cat(vals), torch.cat(toks)
 
 
 @dataclass(kw_only=True)
@@ -71,8 +93,9 @@ class BeamCoordinator:
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
-    _pending_spawn_groups: List[BeamGroup] = field(default_factory=list)
     _kv_buffers: Optional[List[torch.Tensor]] = None
+    # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
+    _num_live_groups: int = 0
 
     # ==================== admission ====================
 
@@ -85,17 +108,12 @@ class BeamCoordinator:
         """Validate a beam request and attach its group; returns an error or None.
 
         On success the leader's row params are neutralized (the user's
-        semantics move onto the group) and the top-2k channel is armed.
+        semantics move onto the group).
         """
         user_params = req.sampling_params
         beam_width = user_params.beam_width
 
-        # Server-level compatibility (sync transition + long-term exclusions).
-        if self.enable_overlap:
-            return (
-                "Beam search currently requires the server to run with "
-                "--disable-overlap-schedule."
-            )
+        # Server-level compatibility (long-term exclusions).
         if not self.spec_algorithm.is_none():
             return "Beam search is not supported with speculative decoding."
         if self.server_args.disaggregation_mode != "null":
@@ -110,10 +128,16 @@ class BeamCoordinator:
             return "Beam search is not supported with pipeline parallelism."
         if self.server_args.enable_hierarchical_cache:
             return "Beam search is not supported with hierarchical cache."
+        if self.model_config.is_encoder_decoder:
+            return "Beam search is not supported with encoder-decoder models."
+        if self.tree_cache.supports_swa() or self.tree_cache.supports_mamba():
+            return "Beam search is not supported with SWA/mamba hybrid caches."
 
         # Request-level compatibility.
         if req.session_id is not None or recv_req.session_params is not None:
             return "Beam search is not supported for session requests."
+        if req.lora_id is not None:
+            return "Beam search is not supported with LoRA."
         if recv_req.return_logprob:
             return "Beam search does not support return_logprob."
         if recv_req.return_hidden_states:
@@ -167,12 +191,11 @@ class BeamCoordinator:
             stop_token_ids=self._collect_stop_token_ids(req, user_params),
             max_new_tokens=max_new_tokens,
             num_return=user_params.n if user_params.n > 1 else beam_width,
-            # Frontier state lives on device: selection consumes the sampler's
-            # top-2k tensors in place; only k-sized results ever reach the host.
+            # Frontier state lives on device: selection consumes device top-2k
+            # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,
         )
         group.leader = req
-        group.member_reqs = [req]
         group.prompt_len = prompt_len
 
         # Neutralize the leader's row params (raw log_softmax scoring, no
@@ -186,6 +209,7 @@ class BeamCoordinator:
         # radix tree (this also skips the prefill-time unfinished insert: in v1
         # the leader row keeps sole ownership of any non-tree prompt KV).
         req.skip_radix_cache_insert = True
+        self._num_live_groups += 1
         return None
 
     @staticmethod
@@ -201,190 +225,202 @@ class BeamCoordinator:
             stop_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or ())
         return sorted(stop_ids)
 
+    # ==================== relay hook ====================
+    # Split for overlap: selection is the launch-path half (all tensor-side,
+    # no D2H) -- it must run before the next forward resolves its inputs, so
+    # the relayed tokens and reparented KV are the selected ones.
+    # commit_decode / commit_prefill are the deferred half (DAG build +
+    # finish/abort); under overlap they lag one forward and discard overshoot
+    # steps, mirroring the standard overlap finish-lag. Sync callers run both
+    # back-to-back within one tick.
+
+    def maybe_select_and_relay(
+        self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
+    ) -> None:
+        """Per-forward relay hook (launch path; runs where the sampled tokens
+        are stashed): overwrite beam rows' relayed tokens with joint-selected
+        ones before the next forward resolves its inputs. O(1) when no beam
+        group is live."""
+        if self._num_live_groups == 0:
+            return
+        if not batch.spec_algorithm.is_none():
+            return
+        logits_output = batch_result.logits_output
+        if logits_output is None or logits_output.next_token_logits is None:
+            return
+        if batch.forward_mode.is_decode():
+            self.select_and_relay_decode(batch, logits_output)
+        elif batch.forward_mode.is_extend():
+            leader_pos = {
+                row: pos for pos, row in enumerate(logits_output.beam_leader_rows or ())
+            }
+            for i, req in enumerate(batch.reqs):
+                group = req.beam_group
+                if (
+                    group is None
+                    or group.state != BeamGroupState.DECODING
+                    or group.num_generated > 0
+                    or req is chunked_req  # mid-chunk leader: no selection yet
+                    or req.is_retracted
+                    or req.finished()
+                ):
+                    continue
+                assert i in leader_pos, (
+                    "beam leader prefill logits were not captured pre-sample "
+                    "(worker beam_leader_logits wiring)"
+                )
+                self.select_leader_prefill(
+                    req, leader_pos[i], logits_output, tick=batch.forward_iter
+                )
+
     # ==================== prefill hook ====================
 
-    def on_leader_prefill(
-        self, req: Req, i: int, logits_output: LogitsProcessorOutput
+    def select_leader_prefill(
+        self,
+        req: Req,
+        pos: int,
+        logits_output: LogitsProcessorOutput,
+        tick: int = 0,
     ) -> None:
-        """First joint selection, replacing the normal sampled-token append:
-        the leader adopts survivor 0, the remaining first tokens are staged
-        for the member-spawn tick."""
+        """Launch half of the leader's prefill tick: first joint selection off
+        the pre-sample capture of the leader's prefill logits (row `pos` of
+        beam_leader_logits), member-row spawn (row alloc + prompt alias), and
+        the relay overwrite (the sampled token is void). All tensor-side;
+        finish/abort actions stay in commit_prefill."""
         group: BeamGroup = req.beam_group
+        top_logprobs, top_tokens = _rows_topk_logprobs(
+            [logits_output.beam_leader_logits[pos : pos + 1]], group.num_candidates
+        )
+        final = group.next_step_is_final()
+        next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
+        if final:
+            # Prefill-terminated (e.g. effective max_new_tokens == 1): no
+            # spawn. The relay slot still gets a token so an overlap overshoot
+            # step has a valid input; commit_prefill applies the finish.
+            self._stash_next_tokens([req.req_pool_idx], next_tokens[:1])
+            return
+        self._spawn_member_rows(group, req)
+        req.output_ids.append(0)  # length placeholder; DAG owns history
+        self._stash_next_tokens(group.all_rows, next_tokens)
+
+    def commit_prefill(self, req: Req, up_to_tick: Optional[int] = None) -> None:
+        """Deferred half of the leader's prefill tick: fold the staged
+        selection into the DAG (the designated D2H point) and apply
+        finish/abort actions. Only steps staged up to the processed batch's
+        forward tick are consumed (later ticks' selection kernels are not
+        yet covered by this result's copy_done sync)."""
+        group: BeamGroup = req.beam_group
+        if group.retired:
+            return
         if req.to_finish is not None:
             # The leader was aborted mid-prefill; the group never starts.
             self._abort_group(group)
             return
-        device = group.stop_token_ids.device
-        top_logprobs = self._rows_to_tensor(
-            [logits_output.next_token_top_logprobs_val[i]], torch.float32, device
-        )
-        top_tokens = self._rows_to_tensor(
-            [logits_output.next_token_top_logprobs_idx[i]], torch.int64, device
-        )
-
-        sel_tokens = self._advance(group, top_logprobs, top_tokens)
-        if sel_tokens is None:
+        if group.commit_pending(up_to_tick):
             self._finish_group(group)
-            return
 
-        req.output_ids.append(sel_tokens[0])
-        group.pending_first_tokens = sel_tokens
-        self._pending_spawn_groups.append(group)
-        # Overwrite the leader's relayed next token (the sampled one is void).
-        self._stash_next_tokens([req.req_pool_idx], sel_tokens[:1])
-
-    # ==================== member spawn ====================
-
-    def build_pending_member_batch(self) -> Optional[ScheduleBatch]:
-        """Build one decode-ready batch of all pending members (rows allocated
-        here, prompt mapping aliased from the leader, first tokens via the
-        relay); the caller merges it into the running batch."""
-        if not self._pending_spawn_groups:
-            return None
-        groups = self._pending_spawn_groups
-        self._pending_spawn_groups = []
-
-        members: List[Req] = []
-        spawn_plan = []  # (member, leader_row, prompt_len, first_token)
-        for group in groups:
-            leader = group.leader
-            if leader.finished() or leader.is_retracted:
-                # The leader died between selection and spawn (abort/timeout);
-                # the group never activates.
-                group.state = BeamGroupState.FINISHED
-                group.pending_first_tokens = None
-                continue
-            first_tokens = group.pending_first_tokens
-            group.pending_first_tokens = None
-            for j, token in enumerate(first_tokens[1:], start=1):
-                member = spawn_member(leader, token, j)
-                members.append(member)
-                spawn_plan.append(
-                    (member, leader.req_pool_idx, group.prompt_len, token)
-                )
-                group.member_reqs.append(member)
-
-        if not members:
-            return None
-
-        rows = self.req_to_token_pool.alloc(members)
+    def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
+        """Allocate the k-1 member rows and alias the leader's prompt KV
+        mapping onto them, all batched; the rows enter the next decode batch
+        via ScheduleBatch._append_beam_tail. No Req objects, no host sync."""
+        rows = self.req_to_token_pool.alloc_raw(group.beam_width - 1)
         assert rows is not None, (
-            f"Beam member spawn needs {len(members)} req-to-token slots but only "
-            f"{self.req_to_token_pool.available_size()} are free; the admission "
-            f"gate (get_num_allocatable_reqs) must reserve them."
+            f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
+            f"but only {self.req_to_token_pool.available_size()} are free; the "
+            f"admission gate (get_num_allocatable_reqs) must reserve them."
         )
-        req_to_token = self.req_to_token_pool.req_to_token
-        for member, leader_row, prompt_len, _ in spawn_plan:
-            init_member_kv_state(member, req_to_token, leader_row, prompt_len)
-
-        batch = ScheduleBatch.init_new(
-            reqs=members,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-            model_config=self.model_config,
-            enable_overlap=self.enable_overlap,
-            spec_algorithm=self.spec_algorithm,
+        device = self.req_to_token_pool.device
+        member_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+        alias_members_prompt_kv(
+            self.req_to_token_pool.req_to_token,
+            member_rows,
+            leader.req_pool_idx,
+            group.prompt_len,
         )
-        device = batch.device
-        batch.req_pool_indices = torch.tensor(rows, dtype=torch.int64, device=device)
-        batch.req_pool_indices_cpu = torch.tensor(rows, dtype=torch.int64)
-        seq_lens = [plan[2] for plan in spawn_plan]  # KV present = prompt only
-        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
-        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        batch.seq_lens_sum = sum(seq_lens)
-        # First decode input rides the relay, like every other decode row.
-        self._stash_next_tokens(rows, [plan[3] for plan in spawn_plan])
-        batch.input_ids = None
-        batch.multimodal_inputs = [None] * len(members)
-        batch.top_logprobs_nums = [m.logprob.top_logprobs_num for m in members]
-        batch.token_ids_logprobs = [None] * len(members)
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            batch, self.model_config.vocab_size
+        group.member_rows = member_rows
+        group.member_rows_cpu = torch.tensor(rows, dtype=torch.int64)
+        leader_row = torch.tensor(
+            [leader.req_pool_idx], dtype=torch.int64, device=device
         )
-        return batch
+        group.all_rows = torch.cat([leader_row, member_rows])
 
     # ==================== decode hook ====================
 
-    def process_decode(
+    def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
     ) -> None:
-        """Joint-select every group in this decode batch (runs once per decode
-        result, before the per-req loop): rewrites member histories and next
-        tokens, reparents KV, finishes groups."""
-        row_of: Dict[int, int] = {}
-        for i, req in enumerate(batch.reqs):
-            if req.beam_group is not None and not req.is_retracted:
-                row_of[id(req)] = i
-        if not row_of:
-            return
+        """Launch half: joint-select every group in this decode batch on
+        device, reparent KV, and overwrite the relayed next tokens. Makes no
+        finish decisions and performs no D2H.
 
-        seen = set()
+        Group rows come from the batch's beam tail layout: the leader's raw
+        logits are the worker's pre-sample capture (one beam_leader_logits
+        row per tail entry; the sampler overwrites its own view in place),
+        the member rows the tail slice split off before sampling."""
+        tail = batch.beam_tail
+        if tail is None:
+            return
+        for gi, (group, leader_idx, start, end) in enumerate(tail.entries):
+            if group.retired or group.state != BeamGroupState.DECODING:
+                continue
+            top_logprobs, top_tokens = _rows_topk_logprobs(
+                [
+                    logits_output.beam_leader_logits[gi : gi + 1],
+                    logits_output.beam_tail_logits[start:end],
+                ],
+                group.num_candidates,
+            )
+            next_tokens, parent_idx = self._select_group(
+                group, top_logprobs, top_tokens, batch.forward_iter
+            )
+            self._apply_survivors(group, next_tokens, parent_idx)
+
+    def commit_decode(self, batch: ScheduleBatch) -> set:
+        """Deferred half: fold staged selections into the DAG (the designated
+        D2H point) and apply finish/abort, group-atomically.
+
+        Returns the ids of groups finished/aborted by THIS call: under overlap
+        a finished leader row reappears for one overshoot tick, and the
+        caller's per-req loop must run the shared finish machinery (KV
+        release, stream) exactly once -- on the committing tick.
+
+        Commits are gated to steps staged at forward tick <= this batch's:
+        this result's copy_done sync covers exactly those selection kernels;
+        a later tick's staged step is not readable yet."""
+        newly_finished = set()
         for req in batch.reqs:
             group = req.beam_group
-            if group is None or id(group) in seen:
+            if group is None or group.retired:
                 continue
-            seen.add(id(group))
-            if group.state != BeamGroupState.DECODING:
+            if req.to_finish is not None:
+                self._abort_group(group)
+                newly_finished.add(id(group))
                 continue
-            self._process_group_decode(group, row_of, logits_output)
+            if group.commit_pending(batch.forward_iter):
+                self._finish_group(group)
+                newly_finished.add(id(group))
+        return newly_finished
 
-    def _process_group_decode(
-        self,
-        group: BeamGroup,
-        row_of: Dict[int, int],
-        logits_output: LogitsProcessorOutput,
-    ) -> None:
-        members = group.member_reqs
-        assert len(members) == group.beam_width and all(
-            id(m) in row_of for m in members
-        ), f"beam group of {group.leader.rid} lost rows mid-decode (group atomicity bug)"
-
-        if any(m.to_finish is not None for m in members):
-            # The leader was aborted mid-decode (members never carry their own
-            # to_finish); the whole group exits atomically.
-            self._abort_group(group)
-            return
-
-        idxs = [row_of[id(m)] for m in members]
-        device = group.stop_token_ids.device
-        top_logprobs = self._rows_to_tensor(
-            [logits_output.next_token_top_logprobs_val[i] for i in idxs],
-            torch.float32,
-            device,
-        )
-        top_tokens = self._rows_to_tensor(
-            [logits_output.next_token_top_logprobs_idx[i] for i in idxs],
-            torch.int64,
-            device,
-        )
-
-        sel_tokens_and_parents = self._advance(
-            group, top_logprobs, top_tokens, return_parents=True
-        )
-        if sel_tokens_and_parents is None:
-            self._finish_group(group)
-            return
-        tokens, parents = sel_tokens_and_parents
-        self._apply_survivors(group, parents, tokens)
-
-    def _advance(
+    def _select_group(
         self,
         group: BeamGroup,
         top_logprobs: torch.Tensor,
         top_tokens: torch.Tensor,
-        return_parents: bool = False,
+        tick: int,
     ):
-        """Run one selection step; returns survivors or None if the group ended."""
+        """One on-device selection step; returns (next_tokens, parent_idx)
+        GPU tensors of shape [k]. parent_idx is None on a length-terminated
+        final step (its selections all finish; no row moves onto them, and an
+        overlap overshoot step is discarded at commit). The staged result is
+        stamped with the forward tick so commit only consumes it once that
+        forward's copy_done sync covers its kernels."""
         k = group.beam_width
         if group.next_step_is_final():
-            group.advance_final(
-                select_final_topk(
-                    group.frontier_cum_logprobs, top_logprobs, top_tokens, k
-                )
+            fsel = select_final_topk(
+                group.frontier_cum_logprobs, top_logprobs, top_tokens, k
             )
-            return None
+            group.advance_final_frontier(fsel, tick)
+            return fsel.tokens, None
         sel = joint_select(
             group.frontier_cum_logprobs,
             top_logprobs,
@@ -392,101 +428,104 @@ class BeamCoordinator:
             group.stop_token_ids,
             k,
         )
-        if group.advance(sel):
-            return None
-        tokens = sel.next_tokens[:k].tolist()
-        if return_parents:
-            return tokens, sel.parent_idx[:k].tolist()
-        return tokens
+        group.advance_frontier(sel, tick)
+        return sel.next_tokens[:k], sel.parent_idx[:k]
 
     def _apply_survivors(
-        self, group: BeamGroup, parents: List[int], tokens: List[int]
+        self,
+        group: BeamGroup,
+        next_tokens: torch.Tensor,
+        parent_idx: Optional[torch.Tensor],
     ) -> None:
-        """Move rows onto the surviving paths: reparent KV, rewrite histories,
-        and relay the selected next tokens."""
-        members = group.member_reqs
-        moved = [(j, p) for j, p in enumerate(parents) if p != j]
-        if moved:
-            device = self.req_to_token_pool.device
-            dst_rows = torch.tensor(
-                [members[j].req_pool_idx for j, _ in moved],
-                dtype=torch.int64,
-                device=device,
-            )
-            src_rows = torch.tensor(
-                [members[p].req_pool_idx for _, p in moved],
-                dtype=torch.int64,
-                device=device,
-            )
+        """Move rows onto surviving paths on-device: reparent KV by parent
+        index and relay the selected next tokens, no D2H round-trip.
+
+        History authority is the backpointer DAG (built at commit); the
+        leader's output_ids carries length only (member rows have no host
+        state at all), so advance it by one placeholder.
+        """
+        k = group.beam_width
+        device = self.req_to_token_pool.device
+        rows = group.all_rows
+        if parent_idx is not None:
+            # Rows whose surviving path came from a different beam must copy
+            # that beam's decode-suffix KV; parent == self is a no-op (dropped
+            # by mask). Final steps skip this: their KV is never read again.
+            moved = parent_idx != torch.arange(k, device=device)
             reparent_kv(
                 self.req_to_token_pool.req_to_token,
                 self._kv_data_buffers(),
-                dst_rows=dst_rows,
-                src_rows=src_rows,
+                dst_rows=rows[moved],
+                src_rows=rows[parent_idx[moved]],
                 prefix_len=group.prompt_len,
-                # All rows are synchronized; the leader's committed length is
-                # the group's (it covers the KV computed through this step).
-                seq_len=members[0].kv_committed_len,
+                # All rows are synchronized; the leader's committed length
+                # covers the KV computed through this step.
+                seq_len=group.leader.kv_committed_len,
             )
-
-        # Snapshot parents' histories first: a parent row may itself be
-        # rewritten by an earlier survivor in the same step.
-        old_outputs = {p: list(members[p].output_ids) for _, p in moved}
-        for j, (parent, token) in enumerate(zip(parents, tokens)):
-            member = members[j]
-            if parent != j:
-                member.output_ids = array("q", old_outputs[parent])
-            member.output_ids.append(token)
-
-        self._stash_next_tokens([m.req_pool_idx for m in members], tokens)
+            group.leader.output_ids.append(0)  # length placeholder
+        self._stash_next_tokens(rows, next_tokens)
 
     # ==================== group finish ====================
 
     def _finish_group(self, group: BeamGroup) -> None:
-        """Mark every row finished (group-atomic): the leader carries the best
-        sequence's finish reason; members exit with an innocuous one."""
+        """Finish the leader (it carries the best sequence's finish reason)
+        and free the member rows in one shot."""
         group.final_results = group.finalize()
         top = group.final_results[0]
-        leader = group.member_reqs[0]
+        leader = group.leader
         if top.matched_token is not None:
             leader.finished_reason = FINISH_MATCHED_TOKEN(matched=top.matched_token)
         else:
-            leader.finished_reason = FINISH_LENGTH(length=group.num_generated)
-        for member in group.member_reqs[1:]:
-            member.finished_reason = FINISH_LENGTH(length=len(member.output_ids))
+            leader.finished_reason = FINISH_LENGTH(length=group.num_committed)
+        self._free_member_rows(group)
+        self._retire_group(group)
 
     def _abort_group(self, group: BeamGroup) -> None:
         """Terminate a group whose leader was aborted: no beam results."""
         group.state = BeamGroupState.FINISHED
         group.final_results = []
-        leader = group.member_reqs[0] if group.member_reqs else group.leader
+        leader = group.leader
         leader.finished_reason = leader.to_finish or FINISH_ABORT("Beam group aborted.")
         leader.to_finish = None
-        for member in group.member_reqs[1:]:
-            member.finished_reason = FINISH_LENGTH(length=len(member.output_ids))
-            member.to_finish = None
+        self._free_member_rows(group)
+        self._retire_group(group)
+
+    def retire_aborted_beam_groups(self, reqs_to_abort: List[Req]) -> None:
+        """Bookkeeping for groups whose leader was aborted outside the commit
+        path (retract_decode OOM abort): the member rows were already freed
+        there while the leader's kv info was alive; here the group only
+        leaves the live set."""
+        for req in reqs_to_abort:
+            group = req.beam_group
+            if group is None or group.retired:
+                continue
+            group.state = BeamGroupState.FINISHED
+            group.final_results = []
+            self._retire_group(group)
+
+    def _free_member_rows(self, group: BeamGroup) -> None:
+        free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
+
+    def _retire_group(self, group: BeamGroup) -> None:
+        """Take a group out of the live set exactly once (finish or abort);
+        keeps the O(1) live-group gate accurate and drops any overshoot
+        selections staged after the terminal commit."""
+        if not group.retired:
+            group.retired = True
+            group._pending_steps.clear()
+            self._num_live_groups -= 1
 
     # ==================== helpers ====================
 
-    @staticmethod
-    def _rows_to_tensor(entries, dtype, device) -> torch.Tensor:
-        """Stack per-row top-2k entries into [rows, 2k] on the target device.
-
-        Entries are device tensors on the standard decode path (kept on device
-        by _normalize_decode_outputs) and python lists on the prefill path.
-        """
-        if torch.is_tensor(entries[0]):
-            return torch.stack(entries).to(dtype)
-        return torch.tensor(entries, dtype=dtype, device=device)
-
-    def _stash_next_tokens(self, rows: List[int], tokens: List[int]) -> None:
+    def _stash_next_tokens(self, rows, tokens) -> None:
+        """Relay next tokens into the FutureMap. Accepts GPU tensors (decode
+        path, no D2H) or host lists (prefill-final seeding)."""
         device = self.req_to_token_pool.device
-        self.future_map.stash(
-            torch.tensor(rows, dtype=torch.int64, device=device),
-            RelayPayload(
-                bonus_tokens=torch.tensor(tokens, dtype=torch.int64, device=device)
-            ),
-        )
+        if not torch.is_tensor(rows):
+            rows = torch.tensor(rows, dtype=torch.int64, device=device)
+        if not torch.is_tensor(tokens):
+            tokens = torch.tensor(tokens, dtype=torch.int64, device=device)
+        self.future_map.stash(rows, RelayPayload(bonus_tokens=tokens))
 
     def _kv_data_buffers(self) -> List[torch.Tensor]:
         if self._kv_buffers is None:

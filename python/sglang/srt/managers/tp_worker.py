@@ -543,6 +543,42 @@ class TpModelWorker(BaseTpWorker):
                 indexer_topk_output=out.indexer_topk_output,
             )
 
+            if (
+                batch is not None
+                and logits_output is not None
+                and logits_output.next_token_logits is not None
+            ):
+                if batch.beam_tail is not None:
+                    # Beam member rows: split their logits off before sampling
+                    # so the sampler (and every reqs-aligned consumer
+                    # downstream) sees only the reqs-aligned rows; the
+                    # scheduler-side selection consumes the tail at the relay
+                    # point. The tail slice lies outside the sampler's view,
+                    # so its raw logits survive the sampler's in-place
+                    # temperature/softmax writes; the leader rows do not --
+                    # clone them here, pre-sample.
+                    n = batch.beam_tail.num_base_rows
+                    logits = logits_output.next_token_logits
+                    logits_output.beam_tail_logits = logits[n:]
+                    logits_output.next_token_logits = logits[:n]
+                    leader_rows = [e[1] for e in batch.beam_tail.entries]
+                    logits_output.beam_leader_logits = logits[leader_rows].clone()
+                    if logits_output.hidden_states is not None:
+                        logits_output.hidden_states = logits_output.hidden_states[:n]
+                    forward_batch.positions = forward_batch.positions[:n]
+                elif forward_batch.forward_mode.is_extend():
+                    # Beam leaders' first selection reads their prefill
+                    # logits at the relay point (after sampling); capture
+                    # them before the sampler's in-place writes.
+                    leader_rows = [
+                        i for i, r in enumerate(batch.reqs) if r.beam_group is not None
+                    ]
+                    if leader_rows:
+                        logits_output.beam_leader_logits = (
+                            logits_output.next_token_logits[leader_rows].clone()
+                        )
+                        logits_output.beam_leader_rows = leader_rows
+
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result

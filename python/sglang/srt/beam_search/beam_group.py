@@ -1,12 +1,16 @@
 """Per-request beam search state: frontier, completed pool, lifecycle.
 
-BeamGroup owns no batch rows and no KV -- members are plain requests; it
-only holds search state and consumes joint_select results.
+BeamGroup holds search state and consumes joint_select results. Members are
+not requests: the group tracks them columnarly as req_to_token rows
+(member_rows) that decode in lockstep with the leader row.
 
-Sync discipline: advance()/advance_final() are the designated sync points
-(they read the small fixed-shape result tensors to CPU); the frontier tensor
-stays on device. Under overlap this consumption moves off the launch path
-and replays from an event stream.
+Sync discipline (overlap-ready split): advance_frontier/advance_final_frontier
+are the launch-path half -- they evolve the frontier tensor and stage the
+selection result, no D2H. commit_pending is the deferred half -- it reads the
+small fixed-shape result tensors to CPU, builds the DAG, and detects finish.
+Under overlap the commit lags one forward (finish-lag); steps staged behind a
+finish (overshoot) are discarded there. Sync callers use the advance()/
+advance_final() wrappers, which run both halves back-to-back.
 """
 
 from __future__ import annotations
@@ -74,30 +78,91 @@ class BeamGroup:
 
         self.frontier_cum_logprobs = torch.zeros(1, dtype=torch.float32, device=device)
         self.leaves: List[Optional[BeamNode]] = [None]  # parents of the next tokens
+        # Two step counters, one per half: num_generated counts frontier steps
+        # taken (launch path; schedules the next selection), num_committed
+        # counts steps folded into the DAG (deferred path; the group's true
+        # length). Equal in sync mode; generated may lead by one under overlap.
         self.num_generated = 0
+        self.num_committed = 0
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
+        # Selection results staged by the launch half as (forward tick, sel),
+        # consumed in tick order by commit.
+        self._pending_steps: List[tuple] = []
+        # Set once by the coordinator when the group leaves the live set
+        # (finish / abort / dead-leader); guards double bookkeeping.
+        self.retired = False
 
-        # Scheduler wiring (set by BeamCoordinator, not by the search
-        # core): the leader request, the member requests in frontier-row order
-        # (member_reqs[0] is the leader), and the first tokens staged between
-        # the prefill selection and the member-spawn tick.
+        # Scheduler wiring (set by BeamCoordinator, not by the search core):
+        # the leader request plus the columnar member state. Members are not
+        # Reqs -- each is one physical req_to_token row that decodes in
+        # lockstep with the leader; all per-member bookkeeping (seq len, KV
+        # committed/allocated) is implied by the leader's.
         self.leader = None
-        self.member_reqs: List = []
-        self.pending_first_tokens: Optional[List[int]] = None
+        # Device [k-1] member row indices, and the same rows on host (for
+        # row-slot free). None until the post-prefill spawn / after free.
+        self.member_rows: Optional[torch.Tensor] = None
+        self.member_rows_cpu: Optional[torch.Tensor] = None
+        # Device [k]: leader row first, then member_rows (frontier-row order).
+        self.all_rows: Optional[torch.Tensor] = None
 
-    # ==================== step consumption (sync points) ====================
+    @property
+    def num_member_rows(self) -> int:
+        return 0 if self.member_rows is None else self.member_rows.shape[0]
+
+    # ==================== step consumption ====================
 
     def next_step_is_final(self) -> bool:
         """The upcoming selection hits max_new_tokens (decided host-side)."""
         return self.num_generated + 1 >= self.max_new_tokens
 
-    def advance(self, sel: SelectResult) -> bool:
-        """Consume one joint_select result; returns True if the group finished."""
+    def advance_frontier(self, sel: SelectResult, tick: int = 0) -> None:
+        """Launch half of one selection step: evolve the frontier tensor and
+        stage the result for commit, stamped with its forward tick. No D2H."""
         assert self.state == BeamGroupState.DECODING
+        self.frontier_cum_logprobs = sel.new_cum_logprobs
+        self.num_generated += 1
+        self._pending_steps.append((tick, sel))
+
+    def advance_final_frontier(self, sel: FinalSelect, tick: int = 0) -> None:
+        """Launch half of a length-terminated step: stage only (the final step
+        needs no next frontier). No D2H."""
+        assert self.state == BeamGroupState.DECODING
+        self.num_generated += 1
+        self._pending_steps.append((tick, sel))
+
+    def commit_pending(self, up_to_tick: Optional[int] = None) -> bool:
+        """Deferred half: consume staged selection results (the D2H sync
+        point) into the DAG and detect finish. Returns True when this commit
+        finishes the group; steps staged behind a finish (overlap overshoot)
+        are discarded.
+
+        Only steps staged at forward tick <= up_to_tick are consumed (None =
+        all): the caller's copy_done sync covers exactly the selection
+        kernels enqueued up to that forward, so a later-staged step's device
+        tensors may not be readable yet."""
+        if self.state == BeamGroupState.FINISHED:
+            self._pending_steps.clear()
+            return False
+        while self._pending_steps:
+            tick, sel = self._pending_steps[0]
+            if up_to_tick is not None and tick > up_to_tick:
+                break
+            self._pending_steps.pop(0)
+            finished = (
+                self._commit_final(sel)
+                if isinstance(sel, FinalSelect)
+                else self._commit_step(sel)
+            )
+            if finished:
+                self._pending_steps.clear()
+                return True
+        return False
+
+    def _commit_step(self, sel: SelectResult) -> bool:
         num_survivors = int(sel.num_survivors)
         num_finished = int(sel.num_finished)
-        new_len = self.num_generated + 1
+        new_len = self.num_committed + 1
 
         fin_tokens = sel.fin_tokens[:num_finished].tolist()
         fin_parents = sel.fin_parent_idx[:num_finished].tolist()
@@ -114,8 +179,7 @@ class BeamGroup:
             BeamNode(token, self.leaves[parent])
             for token, parent in zip(surv_tokens, surv_parents)
         ]
-        self.frontier_cum_logprobs = sel.new_cum_logprobs
-        self.num_generated = new_len
+        self.num_committed = new_len
 
         if num_survivors < self.beam_width:
             # Not enough live beams to continue: fold the partial frontier into
@@ -130,20 +194,36 @@ class BeamGroup:
             return True
         return False
 
-    def advance_final(self, sel: FinalSelect) -> bool:
-        """Consume a length-terminated select_final_topk result; always finishes."""
-        assert self.state == BeamGroupState.DECODING
-        new_len = self.num_generated + 1
+    def _commit_final(self, sel: FinalSelect) -> bool:
+        new_len = self.num_committed + 1
         tokens = sel.tokens.tolist()
         parents = sel.parent_idx.tolist()
         cums = sel.cum_logprobs.tolist()
+        # A parent outside the committed frontier means the commit consumed a
+        # step whose device tensors were not yet synchronized (tick gating
+        # bug) -- fail loudly rather than build a corrupt DAG.
+        assert not parents or max(parents) < len(
+            self.leaves
+        ), "beam commit consumed an unsynced or misordered step"
         for token, parent, cum in zip(tokens, parents, cums):
             leaf = BeamNode(token, self.leaves[parent])
             self.completed.append(CompletedBeam(leaf, cum, new_len, matched_token=None))
         self.leaves = []
-        self.num_generated = new_len
+        self.num_committed = new_len
         self.state = BeamGroupState.FINISHED
         return True
+
+    # Sync wrappers: both halves back-to-back (UT / prefill-path interface).
+
+    def advance(self, sel: SelectResult) -> bool:
+        """Consume one joint_select result; returns True if the group finished."""
+        self.advance_frontier(sel)
+        return self.commit_pending()
+
+    def advance_final(self, sel: FinalSelect) -> bool:
+        """Consume a length-terminated select_final_topk result; always finishes."""
+        self.advance_final_frontier(sel)
+        return self.commit_pending()
 
     # ==================== finalize ====================
 

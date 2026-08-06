@@ -192,6 +192,17 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
+    # Beam search only, consumed by the scheduler-side joint selection at the
+    # relay point. The sampler overwrites next_token_logits in place
+    # (temperature/softmax), so the selection inputs are preserved by the
+    # worker pre-sample: beam_tail_logits is the member rows' slice (outside
+    # the sampler's view), beam_leader_logits a pre-sample clone of the
+    # leader rows (decode: one per beam_tail entry; extend: one per
+    # beam_leader_rows entry).
+    beam_tail_logits: Optional[torch.Tensor] = None
+    beam_leader_logits: Optional[torch.Tensor] = None
+    beam_leader_rows: Optional[List[int]] = None
+
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 

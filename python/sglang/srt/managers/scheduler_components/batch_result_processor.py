@@ -232,10 +232,13 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     if req.beam_group is not None:
-                        # Beam leader: joint selection over the top-2k channel
-                        # replaces the sampled-token append; the group owns all
-                        # finish semantics (the leader never self-finishes).
-                        self.beam_coordinator.on_leader_prefill(req, i, logits_output)
+                        # Beam leader: the joint selection already ran at the
+                        # forward's relay point (replacing the sampled-token
+                        # append); commit applies the deferred finish/abort.
+                        # The group owns all finish semantics.
+                        self.beam_coordinator.commit_prefill(
+                            req, up_to_tick=batch.forward_iter
+                        )
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
@@ -698,29 +701,38 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Beam groups joint-select before the per-req loop: it rewrites member
-        # histories / next tokens and sets group-atomic finish states that the
-        # loop below then observes. (Beam + spec is rejected at admission.)
+        # Beam groups: the selection already ran at the forward's relay point
+        # (launch path); here the deferred commit folds it into the DAG and
+        # sets group-atomic finish states that the loop below then observes.
+        # (Beam + spec is rejected at admission.)
+        newly_finished_beam_groups = set()
         if batch.spec_algorithm.is_none() and logits_output is not None:
-            self.beam_coordinator.process_decode(batch, logits_output)
+            newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
 
         for i, req in enumerate(batch.reqs):
             req: Req
+
+            if req.beam_group is not None:
+                # Beam row: the commit pre-pass owns tokens and finish state;
+                # only the shared finish machinery (KV release, completion
+                # time) runs here. Under overlap a finished row reappears for
+                # one overshoot tick; only the tick whose commit finished the
+                # group handles it (exactly once).
+                if req.finished() and (
+                    id(req.beam_group) not in newly_finished_beam_groups
+                ):
+                    continue
+                req.time_stats.set_last_decode_finish_time()
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
+                continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
-
-            if req.beam_group is not None:
-                # Beam row: the pre-pass owns tokens and finish state; only the
-                # shared finish machinery (KV release, completion time) runs here.
-                req.time_stats.set_last_decode_finish_time()
-                self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
-                )
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -808,21 +820,11 @@ class SchedulerBatchResultProcessor:
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
             if logits_output.next_token_top_logprobs_val:
-                # Beam-member rows keep their top-2k on device: they feed the
-                # GPU joint_select and a wholesale tolist would move
-                # O(beam_width * 2k) elements to the host every step.
-                keep_on_device = [req.beam_group is not None for req in batch.reqs]
                 logits_output.next_token_top_logprobs_val = [
-                    v if keep else v.tolist()
-                    for v, keep in zip(
-                        logits_output.next_token_top_logprobs_val, keep_on_device
-                    )
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
                 ]
                 logits_output.next_token_top_logprobs_idx = [
-                    x if keep else x.tolist()
-                    for x, keep in zip(
-                        logits_output.next_token_top_logprobs_idx, keep_on_device
-                    )
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:
