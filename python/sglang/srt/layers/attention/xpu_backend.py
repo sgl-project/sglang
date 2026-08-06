@@ -637,8 +637,13 @@ class XPUAttentionBackend(AttentionBackend):
                     - forward_batch.extend_seq_lens.to(torch.int32)
                 )
                 appendkv_kwargs = dict(
-                    k=k.contiguous(),
-                    v=v.contiguous(),
+                    # flash_attn_with_kvcache applies maybe_contiguous() to
+                    # k_new/v_new, copying only when the last dim isn't unit-stride
+                    # (the kernel's actual contract). A .contiguous() here would
+                    # force full C-contiguity and add a redundant copy on the hot
+                    # prefill path, so pass k/v through unchanged.
+                    k=k,
+                    v=v,
                     cache_seqlens=cache_seqlens_prefix,
                     cu_seqlens_k_new=cu_seqlens_q,
                     max_seqlen_k=metadata.max_seq_len_q,
