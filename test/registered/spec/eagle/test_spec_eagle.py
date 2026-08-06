@@ -1,5 +1,7 @@
-"""EAGLE3 spec-decoding core: overlap (spec v2) x no-overlap (spec v1) matrix,
-same standard config (topk=1, page_size=1), only ``disable_overlap`` differs.
+"""EAGLE3 spec-decoding core: overlap x no-overlap matrix at the standard
+config (topk=1, page_size=1); only ``disable_overlap`` differs. Both run the
+same EAGLEWorkerV2 -- the scheduler just drives it synchronously when overlap
+is off.
 flashinfer is pinned (the 5090 default) so a default-selection change can't
 silently alter what this exercises.
 """
@@ -35,13 +37,13 @@ class _Core(Eagle3Base):
 
 
 class TestEagle3Overlap(_Core, *_KITS):
-    """Spec v2 (overlap scheduler on)."""
+    """Overlap scheduler on."""
 
     disable_overlap = False
 
 
 class TestEagle3NoOverlap(_Core, *_KITS):
-    """Spec v1 (overlap scheduler off)."""
+    """Overlap scheduler off (synchronous)."""
 
     disable_overlap = True
 
