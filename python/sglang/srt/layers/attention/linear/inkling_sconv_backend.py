@@ -115,7 +115,6 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         """Sized from the CONFIGURED capture shapes, once, never reallocated:
         growing a buffer after a graph captured it moves the address that graph
         reads, and prefill captures before the decode runner reports its bounds."""
-        server_args = get_server_args()
         cuda_graph_config = get_exec().graph.cuda_graph_config
         decode_bs: list[int] = []
         prefill_tokens: list[int] = []
