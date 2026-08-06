@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -66,6 +66,7 @@ def build_kv_host_pool(
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
+    pool_label: str = "kv",
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -88,6 +89,7 @@ def build_kv_host_pool(
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
+        pool_label=pool_label,
         **kwargs,
     )
 
@@ -219,6 +221,7 @@ def build_hybrid_swa_stack(
         server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
+        pool_label="full",
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
@@ -226,6 +229,7 @@ def build_hybrid_swa_stack(
         server_args=server_args,
         use_mla=use_mla,
         host_size=swa_host_size,
+        pool_label="swa",
     )
 
     # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
@@ -665,6 +669,7 @@ def build_hybrid_mamba_swa_stack(
         server_args=server_args,
         use_mla=False,
         host_size=kv_host_size,
+        pool_label="full",
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
@@ -672,6 +677,7 @@ def build_hybrid_mamba_swa_stack(
         server_args=server_args,
         use_mla=False,
         host_size=swa_host_size,
+        pool_label="swa",
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
@@ -1038,7 +1044,7 @@ class _SwaStrategy(StackStrategy):
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
             },
             transfer_layer_num=len(full_layer_mapping | swa_layer_mapping),
-            pools_desc="KV + SWA",
+            pools_desc="Full + SWA",
         )
 
 
