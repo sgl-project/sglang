@@ -936,7 +936,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         """
         cls.tc_name = cls._get_tc_name()
         current_date = datetime.now().strftime("%Y%m%d")
-        test_type = getattr(cls, "test_type", "accuracy")
+        test_type = getattr(cls, "test_type", "perf")
         base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
         os.makedirs(base_output, exist_ok=True)
         cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
