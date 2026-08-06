@@ -19,6 +19,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -144,16 +145,24 @@ class MlxModelRunnerStub(ModelRunner):
         (``MlxAuxiliaryStateComponent``) raises ``NotImplementedError`` for
         the mode.
         """
-        if self.server_args.disable_radix_cache:
+        if get_memory().disable_radix_cache:
             return 1
         return MLX_AUX_STATE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+
+    def _explicit_aux_state_size_per_worker(self) -> int | None:
+        """Return the explicit auxiliary-state cap for this attention-DP owner."""
+        aux_state_size = get_schedule().max_mamba_cache_size
+        if aux_state_size is None:
+            return None
+        return aux_state_size // self.ps.attn_dp_size
 
     def _resolve_max_running_requests(self) -> int:
         """Concurrency cap handed to the scheduler.
 
         Honors ``--max-running-requests``, mirroring the base runner's clamp
         (``model_runner_kv_cache_mixin._resolve_max_num_reqs``): the requested
-        value is split per dp worker and capped by the KV pool capacity. When
+        value is split across attention-DP KV-cache owners and capped by the KV
+        pool capacity. Pure-DP replicas retain the full per-replica limit. When
         the flag is unset, fall back to a capacity-based default.
 
         On hybrid / linear-attention models the concurrency is additionally
@@ -165,15 +174,15 @@ class MlxModelRunnerStub(ModelRunner):
         Requires ``self.max_total_num_tokens`` to already be set.
         """
         capacity_cap = self.max_total_num_tokens // 2
-        requested = self.server_args.max_running_requests
+        requested = get_schedule().max_running_requests
         if requested is None:
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // self.dp_size
+            requested_per_worker = requested // self.ps.attn_dp_size
             resolved = min(requested_per_worker, capacity_cap)
 
-        aux_state_size = self.server_args.max_mamba_cache_size
+        aux_state_size = self._explicit_aux_state_size_per_worker()
         if (
             mambaish_config(self.model_config) is not None
             and aux_state_size is not None
@@ -181,19 +190,23 @@ class MlxModelRunnerStub(ModelRunner):
             ratio = self._aux_state_slots_per_request()
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
+                global_aux_state_size = get_schedule().max_mamba_cache_size
+                min_global_aux_state_size = ratio * self.ps.attn_dp_size
                 raise RuntimeError(
                     f"MLX auxiliary-state cache is too small to serve any "
-                    f"requests: max_mamba_cache_size={aux_state_size} backs "
-                    f"only {aux_state_size // ratio} concurrent requests "
-                    f"({ratio} slots per request). Increase "
-                    f"--max-mamba-cache-size to at least {ratio}, or leave it "
-                    f"unset to size the pool from the concurrency cap."
+                    f"requests: max_mamba_cache_size={global_aux_state_size} "
+                    f"backs only {aux_state_size // ratio} concurrent requests "
+                    f"per attention-DP worker (per-worker auxiliary-state "
+                    f"cap={aux_state_size}, {ratio} slots per request). "
+                    f"Increase --max-mamba-cache-size to at least "
+                    f"{min_global_aux_state_size}, or leave it unset to size "
+                    f"the pool from the concurrency cap."
                 )
 
         if requested_per_worker is not None and resolved < requested_per_worker:
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache or "
+                "(per attention-DP worker) due to the available KV cache or "
                 "auxiliary-state capacity.",
                 requested_per_worker,
                 resolved,
@@ -209,7 +222,7 @@ class MlxModelRunnerStub(ModelRunner):
         from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
+            enable=get_exec().features.enable_memory_saver
         )
 
         # Load model (sets metadata only)
@@ -241,7 +254,7 @@ class MlxModelRunnerStub(ModelRunner):
 
         # Create minimal pools
         if mambaish_config(self.model_config) is not None:
-            auxiliary_state_size = self.server_args.max_mamba_cache_size
+            auxiliary_state_size = self._explicit_aux_state_size_per_worker()
             if auxiliary_state_size is None:
                 auxiliary_state_size = (
                     self.max_running_requests * self._aux_state_slots_per_request()
@@ -255,7 +268,7 @@ class MlxModelRunnerStub(ModelRunner):
                 # With the radix cache disabled no tree component exists to
                 # release auxiliary slots, so the pool owns their release
                 # (see MlxAuxiliaryStateReqToTokenPool docstring).
-                owns_auxiliary_state_release=self.server_args.disable_radix_cache,
+                owns_auxiliary_state_release=get_memory().disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(
@@ -281,7 +294,6 @@ class MlxModelRunnerStub(ModelRunner):
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None
-        self.graph_mem_usage = 0
         self.attn_backend = None
 
         self.init_ngram_embedding_manager()

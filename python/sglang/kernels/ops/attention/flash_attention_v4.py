@@ -23,6 +23,10 @@ else:
     _flash_attn_import_error = None
 
 
+def is_flash_attention_v4_available() -> bool:
+    return _flash_attn_varlen_func is not None
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
