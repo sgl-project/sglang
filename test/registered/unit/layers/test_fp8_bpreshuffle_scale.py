@@ -27,11 +27,6 @@ def _simulate_transpose_scale_emit(values: torch.Tensor) -> torch.Tensor:
     return colmajor_bytes.view(m, g)  # [M, G] over the same (unchanged) storage
 
 
-def _as_strided_nocopy(x_scale: torch.Tensor) -> torch.Tensor:
-    """The exact fresh-quant no-copy reinterpret from ``aiter_w8a8_block_fp8_linear``."""
-    return torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
-
-
 class TestBpreshuffleScaleMaterialization(CustomTestCase):
     def test_materializes_transposed_physical_storage(self):
         scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -123,18 +118,20 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
 class TestBpreshuffleScaleFreshQuantNoCopy(CustomTestCase):
     """The dense w8a8 fresh-quant path asks the quant kernel for the scale in
     bpreshuffle byte-order (``transpose_scale=True``) and reinterprets its strides
-    with ``torch.as_strided`` instead of relaying it out with
-    ``materialize_bpreshuffle_fp8_scale`` (a ``.t().contiguous().t()`` copy). These
-    pin the PR's core claim: the reinterpret is bit-identical to the copy path for
-    M>=2, and allocates nothing."""
+    via ``view_aiter_fused_rms_transposed_fp8_scale`` (the shared #31727 helper)
+    instead of relaying it out with ``materialize_bpreshuffle_fp8_scale`` (a
+    ``.t().contiguous().t()`` copy). These pin the PR's core claim: the reinterpret
+    is bit-identical to the copy path for M>=2, and allocates nothing. The real
+    quant/GEMM equivalence is validated on gfx95 in
+    ``test_fp8_bpreshuffle_dense_linear_mi35x.py``."""
 
-    def test_as_strided_matches_materialize(self):
+    def test_nocopy_matches_materialize(self):
         for m, g in ((3, 4), (2, 2), (8, 5), (16, 128)):
             with self.subTest(m=m, g=g):
                 values = torch.arange(m * g, dtype=torch.float32).reshape(m, g)
                 emitted = _simulate_transpose_scale_emit(values)
 
-                nocopy = _as_strided_nocopy(emitted)
+                nocopy = view_aiter_fused_rms_transposed_fp8_scale(emitted)
                 materialized = materialize_bpreshuffle_fp8_scale(values)
 
                 self.assertTrue(torch.equal(nocopy, materialized))
@@ -143,17 +140,33 @@ class TestBpreshuffleScaleFreshQuantNoCopy(CustomTestCase):
                 self.assertEqual(nocopy.stride(), materialized.stride())
                 self.assertTrue(nocopy.t().is_contiguous())
 
-    def test_as_strided_shares_storage_no_allocation(self):
+    def test_nocopy_shares_storage_no_allocation(self):
         values = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         emitted = _simulate_transpose_scale_emit(values)
 
-        nocopy = _as_strided_nocopy(emitted)
+        nocopy = view_aiter_fused_rms_transposed_fp8_scale(emitted)
 
         # The reinterpret is a view over the producer's buffer -- no new storage.
         self.assertEqual(nocopy.data_ptr(), emitted.data_ptr())
         # ...unlike the materialize path it replaces.
         materialized = materialize_bpreshuffle_fp8_scale(values)
         self.assertNotEqual(materialized.data_ptr(), values.data_ptr())
+
+    def test_m1_uses_materialize_path_values_and_layout(self):
+        """Production gates the no-copy emit on ``input_2d.shape[0] >= 2``
+        (`_emit_bpreshuffle`), so a single row (M == 1) keeps the materialize
+        path. Pin that fallback's values and resulting bpreshuffle layout: the
+        `(1, M)` == `(1, 1)` column-major stride with scale values intact. The
+        actual M==1 gating through aiter_w8a8_block_fp8_linear is exercised on
+        gfx95 in test_fp8_bpreshuffle_dense_linear_mi35x.py."""
+        scale = torch.arange(4, dtype=torch.float32).reshape(1, 4)  # [M=1, G=4]
+
+        materialized = materialize_bpreshuffle_fp8_scale(scale)
+
+        self.assertTrue(torch.equal(materialized, scale))
+        self.assertEqual(materialized.shape, (1, 4))
+        self.assertEqual(materialized.stride(), (1, 1))
+        self.assertTrue(materialized.t().is_contiguous())
 
 
 if __name__ == "__main__":
