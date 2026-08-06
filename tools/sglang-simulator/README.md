@@ -48,12 +48,17 @@ Upgrade this pin only after rerunning the AIC predictor and compatibility tests.
 
 ## Quick start
 
-The two supported integration modes are exercised by executable tests:
+The maintained tests define the supported first-version scope:
 
 - [`test/test_simulation_sglang_runner.py`](test/test_simulation_sglang_runner.py):
   direct Python use of `SGLangBenchmarkRunner` in the current process;
 - [`test/test_simulation_sglang_serving.py`](test/test_simulation_sglang_serving.py):
-  server plus benchmark-client use through the HTTP serving path.
+  server plus benchmark-client use through the HTTP serving path with AIC, ML,
+  and replay predictors and ShareGPT or timestamped traffic;
+- [`test/test_simulation_offline_blocking.py`](test/test_simulation_offline_blocking.py):
+  equivalent logical results in `OFFLINE` and `BLOCKING` modes;
+- [`test/test_simulation_cache_hit_ratio.py`](test/test_simulation_cache_hit_ratio.py):
+  reusable-prefix accounting and cache-tier hit metrics across repeated runs.
 
 From `tools/sglang-simulator`:
 
@@ -63,8 +68,9 @@ python3 -m pytest -q test/test_simulation_sglang_serving.py
 ```
 
 Read these tests as the minimal maintained examples for constructing a dataset,
-running a benchmark, starting a simulator server, sending ShareGPT or timestamped
-traffic, and collecting metrics.
+running a benchmark, starting a simulator server, sending programmatic, ShareGPT,
+or timestamped traffic, comparing execution modes, and collecting request,
+latency, throughput, and prefix-cache metrics.
 
 ## Serving mode
 
@@ -166,6 +172,16 @@ A simulator configuration has three sections:
 - `predictor` selects forward-latency prediction.
 - `scheduler` describes target parallelism and backend metadata. It does not
   launch physical tensor-parallel workers.
+
+### Prefix-cache accuracy
+
+Prefix-cache hit accuracy is highly sensitive to `max_total_tokens`. It controls
+the simulated device KV-cache capacity and participates in hierarchical host-cache
+sizing, so a mismatch changes eviction timing and device, host, and storage hit
+attribution. For deployment-faithful results, copy `max_total_num_tokens=N` from
+the real SGLang server startup log and launch the simulator with
+`--max-total-tokens N`. Avoid relying on a separately estimated capacity when
+comparing the simulator with production traces.
 
 Supported predictors:
 
