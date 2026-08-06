@@ -25,6 +25,7 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 # Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
 # so that torch.compile can trace through the mHC module. Without registration,
@@ -50,7 +51,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -99,6 +100,56 @@ def mhc_pre(
     n_splits: int,
     n_splits_pre: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if is_npu():
+        # Native NPU fallback.  The fused Ascend-C kernels currently only
+        # accept D in {4096, 7168}, while TeleChat4 uses D=3584.
+        num_tokens, hc_mult, hidden_size = residual.shape
+        residual_fp32 = residual.float()
+        residual_flat = residual_fp32.reshape(num_tokens, hc_mult * hidden_size)
+
+        inv_rms = torch.rsqrt(
+            residual_flat.square().mean(dim=-1, keepdim=True) + rms_eps
+        )
+        mixes = F.linear(residual_flat, fn.float()) * inv_rms
+        pre_logits, post_logits, comb_logits = torch.split(
+            mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
+        )
+
+        pre_mix = (
+            torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:hc_mult])
+            + hc_pre_eps
+        )
+        post_mix = torch.sigmoid(
+            post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+        ) * hc_post_mult_value
+        comb_mix = (
+            comb_logits * hc_scale[2] + hc_base[2 * hc_mult :]
+        ).reshape(num_tokens, hc_mult, hc_mult)
+
+        # Match hc_split_sinkhorn_kernel exactly: stable row softmax with eps,
+        # one column normalization, then alternating row/column normalization.
+        comb_mix = torch.exp(comb_mix - comb_mix.amax(dim=-1, keepdim=True))
+        comb_mix = (
+            comb_mix / comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps
+        )
+        comb_mix = comb_mix / (
+            comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps
+        )
+        for _ in range(sinkhorn_repeat - 1):
+            comb_mix = comb_mix / (
+                comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps
+            )
+            comb_mix = comb_mix / (
+                comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps
+            )
+
+        layer_input = (pre_mix.unsqueeze(-1) * residual_fp32).sum(dim=1)
+        return (
+            post_mix.unsqueeze(-1),
+            comb_mix,
+            layer_input.to(residual.dtype),
+        )
+
     return _mhc_pre_orig(
         residual=residual,
         fn=fn,
@@ -125,6 +176,15 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if is_npu():
+        # comb_res_mix is transposed by mHCModule.forward to match the
+        # TileLang kernel's [input_stream, output_stream] convention.
+        output = post_layer_mix.squeeze(-1).unsqueeze(-1) * x.float().unsqueeze(1)
+        output = output + (
+            comb_res_mix.unsqueeze(-1) * residual.float().unsqueeze(2)
+        ).sum(dim=1)
+        return output.to(x.dtype)
+
     return _mhc_post_orig(x, residual, post_layer_mix, comb_res_mix)
 
 
@@ -322,7 +382,7 @@ class TeleChat4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
 
-        if hasattr(config, "rope_parameters"):
+        if getattr(config, "rope_parameters", None) is not None:
             rope_theta = config.rope_parameters["rope_theta"]
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None
@@ -980,8 +1040,12 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if is_npu():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
