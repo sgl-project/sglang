@@ -527,6 +527,7 @@ class MiniMaxH3Attention(nn.Module):
         self.inner_dim = self.total_num_heads * self.head_dim
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
+        self.prefix = prefix
         self._supported_attention_backends = arch._supported_attention_backends
         self._attention_impl = None
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
@@ -576,6 +577,7 @@ class MiniMaxH3Attention(nn.Module):
             causal=False,
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
+            prefix=self.prefix,
         )
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
