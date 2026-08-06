@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, InitLoadBackParams
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -177,8 +177,11 @@ class DecodeHiCacheTransferMixin:
         ):
             self.tree_cache.release_aborted_request(decode_req.req.rid)
         if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
+            self.tree_cache.dec_lock_ref(
+                decode_req.hicache_restored_node, decode_req.hicache_restored_lock
+            )
             decode_req.hicache_restored_node = None
+            decode_req.hicache_restored_lock = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
@@ -231,7 +234,12 @@ class DecodeHiCacheTransferMixin:
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
         dr.hicache_restored_node = restored_node
-        self.tree_cache.inc_lock_ref(restored_node)
+        # Keep the acquire's token: on a hybrid-SWA tree this lock can skip
+        # component tombstones, and replaying an empty token at release would
+        # drop a lock another request took after that tombstone was restored.
+        dr.hicache_restored_lock = self.tree_cache.inc_lock_ref(
+            restored_node
+        ).to_dec_params()
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.
@@ -296,7 +304,15 @@ class DecodeHiCacheTransferMixin:
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
 
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+        # This releases the admission-time acquire from `_match_prefix_and_lock`,
+        # so it must replay that acquire's token, not an empty one.
+        self.tree_cache.dec_lock_ref(
+            prefix_match.last_device_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock,
+                skip_lock_node_ids=decode_req.req.skip_lock_node_ids,
+            ),
+        )
 
         self.tree_cache.req_to_token_pool.write(
             (
@@ -309,3 +325,9 @@ class DecodeHiCacheTransferMixin:
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
         decode_req.req.last_node = decode_req.hicache_restored_node
+        # The request now owns the restore lock; its release (cache_unfinished_req
+        # / cache_finished_req) must replay THAT acquire's token.
+        restored_lock = decode_req.hicache_restored_lock or DecLockRefParams()
+        decode_req.req.swa_uuid_for_lock = restored_lock.swa_uuid_for_lock
+        decode_req.req.skip_lock_node_ids = restored_lock.skip_lock_node_ids
+        decode_req.hicache_restored_lock = None

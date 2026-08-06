@@ -165,6 +165,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.is_swa_enabled = ComponentType.SWA in params.tree_components
         # Whether Mamba is enabled.
         self.is_mamba_enabled = ComponentType.MAMBA in params.tree_components
+        # Hybrid-SWA (FULL + SWA, nothing else) is the one shape where
+        # match_prefix's all-component gating can under-report a prefix whose
+        # FULL KV is fully device-resident -- see cache_unfinished_req. Any
+        # other component set must keep its own gating, so the FULL-only
+        # re-derivation stays off there.
+        self.is_full_swa_only_tree = set(self.tree_components) == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+        }
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
@@ -798,10 +807,29 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
+        # Match prefix.
+        #
+        # match_prefix() gates the returned device indices on ALL components. On
+        # a hybrid-SWA tree the SWA validator stops at the first out-of-window
+        # tombstone, so device_indices collapses -- to length 0 for a prefix that
+        # is entirely out of window -- even though the FULL-attention KV for that
+        # whole prefix is device-resident and, after the insert above, owned by
+        # the tree. Taking that answer would under-report cache_protected_len and
+        # let the request free slots the tree still references (and trips the
+        # new_prefix_len assert below once another request shares the prefix).
+        # Re-derive the prefix from the FULL component alone and re-point the
+        # request onto it, protecting its deepest node from eviction. SWA reuse
+        # stays correctly window-gated everywhere else.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
+        if self.is_full_swa_only_tree:
+            full_indices, full_last_node = self.tree_core.match_full_device_prefix(
+                radix_key
+            )
+            if len(full_indices) > len(new_indices):
+                new_indices = full_indices
+                new_last_node = full_last_node
         new_prefix_len = result.prefix_len
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1

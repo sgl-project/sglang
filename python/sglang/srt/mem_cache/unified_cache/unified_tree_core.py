@@ -798,6 +798,53 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[torch.Tensor, NodeId]:
+        """Match ``key`` against the FULL component only, ignoring every other
+        component's validator.
+
+        ``match_prefix`` gates its device indices on ALL components: on a
+        hybrid-SWA tree the SWA validator stops at the first out-of-window
+        tombstone, so the returned indices collapse even when the FULL-attention
+        KV for the whole prefix is still device-resident. Callers that own the
+        FULL KV independently (decode-side radix under SWA-tail preallocation)
+        use this ungated walk instead. Read-only: no LRU refresh, no hit counts,
+        no actions.
+        """
+        # An empty key has no child key to compute -- `child_key` indexes into
+        # the token array and would raise on a bigram (EAGLE) key. Same guard
+        # `match_prefix` takes before its own walk.
+        if len(key) == 0:
+            return self._empty_match_result.device_indices, self.root_node.id
+
+        values: list[torch.Tensor] = []
+        last_node = self.root_node
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            value = child.component_data[BASE_COMPONENT_TYPE].value
+            if value is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                # Divergence is inside this node, so its children extend past
+                # the matched span -- take the span and stop, mirroring
+                # _match_prefix_helper's partial-match handling.
+                values.append(value[:prefix_len])
+                last_node = child
+                break
+            values.append(value)
+            last_node = child
+            node = child
+            key = key[prefix_len:]
+            if len(key) == 0:
+                break
+            child_key = key.child_key(self.page_size)
+
+        if not values:
+            return self._empty_match_result.device_indices, self.root_node.id
+        return torch.cat(values), last_node.id
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:

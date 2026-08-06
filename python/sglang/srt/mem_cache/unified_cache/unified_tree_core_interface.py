@@ -329,6 +329,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[torch.Tensor, NodeId]:
+        """Match ``key`` against the FULL component only, ungated by other components."""
+        ...
+
+    @abstractmethod
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the (single-flight) insert, running to its first barrier or completion."""
         ...
