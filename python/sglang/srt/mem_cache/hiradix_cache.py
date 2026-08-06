@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import atexit
 import heapq
+import itertools
 import json
 import logging
 import os
 import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -72,6 +75,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_FNV64_OFFSET = 0xCBF29CE484222325
+_FNV64_PRIME = 0x100000001B3
+_INT63_MASK = 0x7FFFFFFFFFFFFFFF
+# Backup acks synced per drain round when mirror release is on.  For MLA
+# models only tp_rank 0 writes L3 (cache_controller.backup_skip) and every
+# other rank acks with completed_tokens=0, so durable state must come from
+# the writer's completed count, broadcast through the drain collective.
+_MIRROR_ACK_SYNC_SLOTS = 8
+# Sentinel a non-writer contributes so the MIN reduce recovers the smallest
+# completed count among actual writers.
+_MIRROR_ACK_NO_WRITER = 1 << 40
+
+
+def _fnv1a64(data: bytes, h: int = _FNV64_OFFSET) -> int:
+    for b in data:
+        h ^= b
+        h = (h * _FNV64_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+@dataclass
+class MirrorReleasePlan:
+    """A release plan prepared one drain round ahead of execution.
+
+    Mutation only happens after every rank reports the identical
+    (count, tokens, digest) triple AND revalidates the plan — see
+    drain_storage_control_queues().
+    """
+
+    nodes: List[TreeNode] = field(default_factory=list)
+    tokens: int = 0
+    digest: int = 0
+
 
 class HiRadixCache(RadixCache):
 
@@ -125,6 +161,44 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
+
+        # --- L2-as-channel: redundant host mirror release ---------------------
+        # Under write_through every inserted node keeps a host copy that
+        # evict_host() can never reclaim while the node stays device-resident,
+        # so the host pool fills with mirrors of device data and blocks the
+        # only staging path into L3.  When enabled, mirrors whose pages are all
+        # durably backed to L3 become reclaimable through a TP-consistent
+        # prepare/commit protocol in drain_storage_control_queues().
+        self.mirror_release_enabled = self.enable_storage and os.getenv(
+            "SGLANG_HICACHE_MIRROR_RELEASE", "0"
+        ).lower() in ("1", "true")
+        self.mirror_release_free_frac = float(
+            os.getenv("SGLANG_HICACHE_MIRROR_RELEASE_FREE_FRAC", "0.2")
+        )
+        # After this many drain rounds a durable node may be re-staged so a
+        # copy evicted by the L3 backend itself can be refreshed (0 = never).
+        self.mirror_refresh_rounds = int(
+            os.getenv("SGLANG_HICACHE_MIRROR_REFRESH_ROUNDS", "100000")
+        )
+        self.storage_backed_capacity = int(
+            os.getenv("SGLANG_HICACHE_DURABLE_CAPACITY", "262144")
+        )
+        # page hash -> logical clock at (re-)mark; bounded LRU, overflow is a
+        # conservative false negative (mirror stays, node may re-stage).
+        self.storage_backed_hashes: OrderedDict[str, int] = OrderedDict()
+        self.storage_backed_generation = 0
+        self.hicache_logical_clock = 0
+        # device-resident nodes whose host copy is redundant (device + L3 both
+        # hold the data); membership is state-derived only — transient guards
+        # (lock_ref / host_ref_counter) are checked at plan time, so busy nodes
+        # stay members instead of being lost.
+        self.redundant_host_nodes: set = set()
+        self._mirror_release_plan: Optional[MirrorReleasePlan] = None
+        self._mirror_release_disabled_reason: Optional[str] = None
+        self._mirror_release_mismatch_streak = 0
+        self._mirror_released_tokens_total = 0
+        self._mirror_release_plans_executed = 0
+        self._mirror_release_plans_dropped = 0
 
         (
             extra_config,
@@ -326,6 +400,11 @@ class HiRadixCache(RadixCache):
         extra_metric_labels: Optional[Dict[str, str]],
     ) -> None:
         self.enable_storage = enable_storage
+        # Recompute on runtime attach/detach; a fail-close (see
+        # _mirror_release_fail_close) is tracked separately and stays sticky.
+        self.mirror_release_enabled = enable_storage and os.getenv(
+            "SGLANG_HICACHE_MIRROR_RELEASE", "0"
+        ).lower() in ("1", "true")
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_config = prefetch_timeout_config
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
@@ -511,6 +590,10 @@ class HiRadixCache(RadixCache):
 
         self.enable_storage = False
         self.enable_storage_metrics = False
+        # No storage backend, no durable pages: stop treating any mirror as
+        # reclaimable and forget the durable markings of the old backend.
+        self.mirror_release_enabled = False
+        self._reset_mirror_release_state()
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
@@ -584,6 +667,7 @@ class HiRadixCache(RadixCache):
             n_backup=None,
             n_release=None,
             log_metrics=False,
+            acked_completed=None,
         )
 
     def _drain_storage_control_queues_impl(
@@ -593,6 +677,7 @@ class HiRadixCache(RadixCache):
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
+        acked_completed: Optional[List[int]] = None,
     ):
         cc = self.cache_controller
 
@@ -658,11 +743,47 @@ class HiRadixCache(RadixCache):
                 cc.prefetch_buffer.put(operation)
 
         def _drain_backup():
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+            for ack_index, operation in enumerate(
+                _drain_queue(cc.ack_backup_queue, n_backup)
+            ):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     entry.release_host()
+                if self.mirror_release_enabled:
+                    # An ack is not success: _page_backup() stops advancing
+                    # completed_tokens on the first failed batch but the
+                    # operation is acked regardless, so only the completed
+                    # page prefix is durable.  For MLA models only tp_rank 0
+                    # writes L3 (backup_skip) and everyone else acks with 0,
+                    # so the authoritative count is the collective-reduced
+                    # per-op value, not the local one.  operation.hash_value
+                    # is the list captured at write_storage() time, so
+                    # marking by hash also covers nodes split mid-backup.
+                    if acked_completed is not None and ack_index < len(
+                        acked_completed
+                    ):
+                        completed = acked_completed[ack_index]
+                    else:
+                        completed = operation.completed_tokens
+                    completed_pages = completed // self.page_size
+                    for page_hash in (operation.hash_value or [])[:completed_pages]:
+                        self._mark_hash_durable(page_hash)
+                    if entry is not None:
+                        self._update_redundant_host_status(entry)
+                        # A node split during the backup leaves the prefix
+                        # half as an ancestor the ack's entry pointer misses;
+                        # walking up while ancestors are fully durable
+                        # registers those halves (and any other now-covered
+                        # ancestors) as release candidates.
+                        parent = entry.parent
+                        while (
+                            parent is not None
+                            and parent is not self.root_node
+                            and self._node_fully_durable(parent)
+                        ):
+                            self._update_redundant_host_status(parent)
+                            parent = parent.parent
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -780,6 +901,7 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self._reset_mirror_release_state()
         super().reset()
 
     def release_host_resources(self) -> None:
@@ -821,6 +943,8 @@ class HiRadixCache(RadixCache):
                 # Check if the storage backend has a clear method (for nixl backends)
                 if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
+                    # everything previously marked durable is gone from L3
+                    self._reset_mirror_release_state()
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
@@ -840,9 +964,16 @@ class HiRadixCache(RadixCache):
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
-        # up yet;
+        # up yet.  A parent whose host mirror was released but whose pages are
+        # all durable in L3 still satisfies the invariant: the prefix hash
+        # chain it anchors exists in storage even without a host copy.
         if not write_back and (
-            node.parent != self.root_node and not node.parent.backuped
+            node.parent != self.root_node
+            and not node.parent.backuped
+            and not (
+                self.mirror_release_enabled
+                and self._node_fully_durable(node.parent)
+            )
         ):
             return 0
 
@@ -862,6 +993,7 @@ class HiRadixCache(RadixCache):
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self._track_write_through_node(node, len(node.key))
+            self._update_redundant_host_status(node)
             if not write_back:
                 self.inc_lock_ref(node)
         else:
@@ -982,8 +1114,22 @@ class HiRadixCache(RadixCache):
 
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
+                if self._skip_restage_durable(node):
+                    return
                 # write to host if the node is not backuped
                 self.write_backup(node)
+
+    def _skip_restage_durable(self, node: TreeNode) -> bool:
+        """Anti-churn: a released mirror flips backuped to False, and without
+        this guard every later hit would re-stage and re-write the node to L3
+        in an endless release/rewrite loop.  Age-gated so a copy the L3
+        backend evicted on its own can still be refreshed eventually."""
+        if not (self.mirror_release_enabled and self._node_fully_durable(node)):
+            return False
+        return (
+            self.mirror_refresh_rounds <= 0
+            or self._node_durable_age(node) < self.mirror_refresh_rounds
+        )
 
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
@@ -1181,6 +1327,228 @@ class HiRadixCache(RadixCache):
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
 
+    # --- L2-as-channel: durable tracking + mirror release -------------------
+
+    def _mark_hash_durable(self, page_hash: str):
+        d = self.storage_backed_hashes
+        if page_hash in d:
+            d.move_to_end(page_hash)
+        d[page_hash] = self.hicache_logical_clock
+        if len(d) > self.storage_backed_capacity:
+            d.popitem(last=False)
+
+    def _node_fully_durable(self, node: TreeNode) -> bool:
+        hashes = node.hash_value
+        if not hashes:
+            return False
+        d = self.storage_backed_hashes
+        return all(h in d for h in hashes)
+
+    def _node_durable_age(self, node: TreeNode) -> int:
+        """Rounds since the oldest page of this node was last marked durable."""
+        d = self.storage_backed_hashes
+        return self.hicache_logical_clock - min(d[h] for h in node.hash_value)
+
+    def _revoke_node_durable(self, node: TreeNode):
+        """Forget durable markings when a node leaves the tree entirely.
+
+        A durable mark is a record of one past backup ack, not a retention
+        lease — the L3 backend may self-evict the pages at any time.  While
+        the node is tree-resident that staleness is bounded (device or host
+        still holds the data, and the refresh age re-stages eventually), but
+        once the node is deleted a stale mark would keep claiming the pages
+        exist and anti-churn would block the re-inserted prefix from ever
+        re-staging.  Revoking on deletion costs at most one redundant L3
+        rewrite after a full local eviction.
+        """
+        if not self.mirror_release_enabled:
+            return
+        for page_hash in node.hash_value or []:
+            self.storage_backed_hashes.pop(page_hash, None)
+        self.redundant_host_nodes.discard(node)
+
+    def _update_redundant_host_status(self, node: TreeNode):
+        if not self.mirror_release_enabled:
+            return
+        if (
+            node is not self.root_node
+            and node.value is not None
+            and node.host_value is not None
+            and self._node_fully_durable(node)
+        ):
+            self.redundant_host_nodes.add(node)
+        else:
+            self.redundant_host_nodes.discard(node)
+
+    def _mirror_release_active(self) -> bool:
+        return (
+            self.mirror_release_enabled
+            and self._mirror_release_disabled_reason is None
+        )
+
+    def _mirror_release_local_deficit(self) -> int:
+        host_pool = self.cache_controller.mem_pool_host
+        target = int(host_pool.size * self.mirror_release_free_frac)
+        return max(0, target - int(host_pool.available_size()))
+
+    def _mirror_node_releasable(self, node: TreeNode) -> bool:
+        # lock_ref == 0 rules out all three in-flight windows: device->host DMA
+        # (write_backup holds a lock until the ack), host->device load-back
+        # (load_back locks the chain until loading_check), and request use;
+        # host_ref_counter == 0 rules out an in-flight L3 backup or prefetch.
+        return (
+            node is not self.root_node
+            and node.value is not None
+            and node.host_value is not None
+            and node.lock_ref == 0
+            and node.host_ref_counter == 0
+            and self._node_fully_durable(node)
+        )
+
+    def _prepare_mirror_release_plan(
+        self, budget_tokens: int
+    ) -> Optional[MirrorReleasePlan]:
+        if budget_tokens <= 0 or not self.redundant_host_nodes:
+            return None
+        candidates = []
+        for node in list(self.redundant_host_nodes):
+            if self._mirror_node_releasable(node):
+                candidates.append(node)
+            elif (
+                node.value is None
+                or node.host_value is None
+                or not self._node_fully_durable(node)
+            ):
+                # Permanently ineligible in this state; the state-transition
+                # hooks re-register it if it becomes redundant again.  Nodes
+                # that are merely busy (lock/ref held) stay members.
+                self.redundant_host_nodes.discard(node)
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda n: (self.eviction_strategy.get_priority(n), n.id)
+        )
+        plan = MirrorReleasePlan()
+        digest = _FNV64_OFFSET
+        for node in candidates:
+            plan.nodes.append(node)
+            plan.tokens += len(node.host_value)
+            for page_hash in node.hash_value:
+                digest = _fnv1a64(page_hash.encode(), digest)
+            digest = _fnv1a64(len(node.host_value).to_bytes(8, "little"), digest)
+            if plan.tokens >= budget_tokens:
+                break
+        plan.digest = digest & _INT63_MASK
+        return plan
+
+    def _release_mirror_of(self, node: TreeNode):
+        host_indices = node.host_value
+        node.host_value = None
+        # Only the CPU medium is removed; the GPU copy stays device-resident
+        # and downstream indexers keep scoring it as device-local.
+        self._record_remove_event(node, medium=StorageMedium.CPU)
+        released = self.cache_controller.evict_host(host_indices)
+        self._mirror_released_tokens_total += released
+        self.redundant_host_nodes.discard(node)
+        self._update_host_leaf_status(node.parent)
+        return released
+
+    def _execute_mirror_release_plan(self, plan: MirrorReleasePlan):
+        for node in plan.nodes:
+            self._release_mirror_of(node)
+        self._mirror_release_plans_executed += 1
+
+    def _mirror_release_fail_close(self, reason: str):
+        self._mirror_release_disabled_reason = reason
+        self._mirror_release_plan = None
+        logger.error(
+            "HiCache mirror release permanently disabled (fail-close): %s. "
+            "Reverting to pre-feature behavior; host mirrors are no longer "
+            "reclaimed on this process.",
+            reason,
+        )
+
+    def _advance_mirror_release(
+        self,
+        global_deficit: int,
+        pc_min: int,
+        pc_max: int,
+        pt_min: int,
+        pt_max: int,
+        pd_min: int,
+        pd_max: int,
+    ):
+        """Commit-or-drop last round's plan, then prepare the next one.
+
+        All branch decisions below derive from all-reduced values, so every
+        rank takes the same path; the only rank-local input is the plan
+        revalidation, which is itself MIN-synced before any mutation.
+        """
+        plan = self._mirror_release_plan
+        self._mirror_release_plan = None
+        consensus = pc_min == pc_max and pt_min == pt_max and pd_min == pd_max
+        if pc_max > 0 or pt_max > 0 or pd_max > 0:
+            if consensus and pc_min > 0:
+                # Every rank prepared the identical plan; make sure it is
+                # still executable everywhere before mutating anything.
+                local_valid = plan is not None and all(
+                    self._mirror_node_releasable(n) for n in plan.nodes
+                )
+                valid = torch.tensor(
+                    [1 if local_valid else 0], dtype=torch.int64
+                )
+                self._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
+                if int(valid.item()) == 1:
+                    self._execute_mirror_release_plan(plan)
+                else:
+                    # Benign state change (e.g. a planned node got locked).
+                    # Under lockstep ranks this invalidation is identical
+                    # everywhere, so dropping the whole plan stays consistent.
+                    self._mirror_release_plans_dropped += 1
+                self._mirror_release_mismatch_streak = 0
+            elif not consensus:
+                self._mirror_release_plans_dropped += 1
+                self._mirror_release_mismatch_streak += 1
+                logger.warning(
+                    "mirror-release plan mismatch: my_plan=%s candidates=%d "
+                    "durable_hashes=%d deficit=%d clock=%d "
+                    "(count %d/%d tokens %d/%d digest %x/%x)",
+                    f"{len(plan.nodes)}n/{plan.tokens}t/{plan.digest:x}"
+                    if plan
+                    else "none",
+                    len(self.redundant_host_nodes),
+                    len(self.storage_backed_hashes),
+                    global_deficit,
+                    self.hicache_logical_clock,
+                    pc_min,
+                    pc_max,
+                    pt_min,
+                    pt_max,
+                    pd_min,
+                    pd_max,
+                )
+                if self._mirror_release_mismatch_streak >= 4:
+                    self._mirror_release_fail_close(
+                        f"release-plan consensus mismatch x{self._mirror_release_mismatch_streak} "
+                        f"(count {pc_min}/{pc_max}, tokens {pt_min}/{pt_max}, "
+                        f"digest {pd_min:x}/{pd_max:x}) — durable state has "
+                        "diverged across ranks"
+                    )
+                    return
+        else:
+            self._mirror_release_mismatch_streak = 0
+        if self._mirror_release_active():
+            self._mirror_release_plan = self._prepare_mirror_release_plan(
+                global_deficit
+            )
+
+    def _reset_mirror_release_state(self):
+        self.storage_backed_generation += 1
+        self.storage_backed_hashes.clear()
+        self.redundant_host_nodes.clear()
+        self._mirror_release_plan = None
+        self._mirror_release_mismatch_streak = 0
+
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
@@ -1216,8 +1584,30 @@ class HiRadixCache(RadixCache):
             _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
+            # A node demoted earlier in this same pass can be popped again via
+            # a stale heap entry; with mirror release on, released-parent
+            # pruning also mutates the tree mid-pass.  An already-evicted node
+            # has no device memory left to reclaim.
+            if x.evicted:
+                continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
+            elif x.children:
+                # A released-mirror parent whose children were demoted
+                # to host-only: it has no host copy to demote to, and
+                # _evict_regular would delete a node that still anchors
+                # children.  Eviction MUST make progress here — both
+                # skipping (device pin -> prefill OOM) and re-staging
+                # (whole heap turns into no-op pops under pressure)
+                # starved the allocator in load tests.  Prune the
+                # host-only subtree (its data lives in L3 or is
+                # recomputable) so the parent becomes a true leaf and
+                # frees its device tokens right now; fall back to
+                # re-staging only while the subtree is busy.
+                freed = self._evict_released_parent(x)
+                if freed == 0:
+                    self.write_backup(x)
+                num_evicted += freed
             else:
                 num_evicted += self._evict_regular(x)
             self._promote_parent(x, heap)
@@ -1266,6 +1656,8 @@ class HiRadixCache(RadixCache):
         node.value = None
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
+        # demoted to host-only: its host copy is the real copy now, not a mirror
+        self._update_redundant_host_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
         return num_evicted
@@ -1276,6 +1668,39 @@ class HiRadixCache(RadixCache):
         self.cache_controller.evict_device(device_indices)
         return num_evicted
 
+    def _evict_released_parent(self, node: TreeNode) -> int:
+        """Evict a released-mirror parent by pruning its host-only subtree.
+
+        Every descendant must be device-evicted, host-backed and unpinned;
+        their host copies are freed and the nodes unlinked (the durable data
+        stays in L3, anything not yet durable is recomputable), after which
+        the parent is a true leaf and goes through _evict_regular.  Returns
+        the device tokens freed, or 0 if the subtree is busy.
+        """
+        descendants = []
+        stack = list(node.children.values())
+        while stack:
+            d = stack.pop()
+            if (
+                d.value is not None
+                or d.host_value is None
+                or d.lock_ref > 0
+                or d.host_ref_counter > 0
+            ):
+                return 0
+            descendants.append(d)
+            stack.extend(d.children.values())
+
+        for d in descendants:
+            self._record_remove_event(d, medium=StorageMedium.CPU)
+            self.cache_controller.evict_host(d.host_value)
+            d.host_value = None
+            self.evictable_host_leaves.discard(d)
+            self._revoke_node_durable(d)
+        node.children = {}
+        self._update_host_leaf_status(node)
+        return self._evict_regular(node)
+
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
@@ -1284,6 +1709,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
+        self._revoke_node_durable(node)
         return num_evicted
 
     def _drop_subtree_no_host(self, root: TreeNode) -> int:
@@ -1360,6 +1786,7 @@ class HiRadixCache(RadixCache):
             assert v == x, f"parent does not have child key, {key}"
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
+            self._revoke_node_durable(x)
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
@@ -1434,6 +1861,10 @@ class HiRadixCache(RadixCache):
             # Block promoted from host to GPU -- emit store(GPU) so downstream
             # indexers see it as device-local again.
             self._record_store_event(node, medium=StorageMedium.GPU)
+            # device + host again: if all pages are durable the host copy is a
+            # mirror once more (the lock taken below defers actual release
+            # until the load completes).
+            self._update_redundant_host_status(node)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
@@ -1516,7 +1947,12 @@ class HiRadixCache(RadixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
-        if self.pp_size != 1:
+        if self.pp_size != 1 or self.mirror_release_enabled:
+            # Mirror release rides the storage-drain collective (deficit,
+            # release-plan consensus triple, synced backup acks), which the
+            # fused ready-counts path below does not carry.  The flag is
+            # env-driven and identical on every rank, so all ranks take the
+            # same branch.
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
@@ -1548,28 +1984,93 @@ class HiRadixCache(RadixCache):
         """
         Combine prefetch revoke, backup ack, and host mem release checks
         to minimize TP synchronization and Python overhead.
+
+        The same collective also carries the mirror-release protocol fields:
+        the pool deficit (negated, so the MIN recovers the cross-rank MAX) and
+        last round's release-plan consensus triple (count/tokens/digest, each
+        paired with its negation so MIN yields both min and max).  A plan only
+        executes after every rank reports the identical triple — mutation
+        never precedes consensus.
         """
         cc = self.cache_controller
+
+        self.hicache_logical_clock += 1
+        mirror_active = self._mirror_release_active()
+        plan = self._mirror_release_plan if mirror_active else None
+        plan_count = len(plan.nodes) if plan else 0
+        plan_tokens = plan.tokens if plan else 0
+        plan_digest = plan.digest if plan else 0
+        local_deficit = self._mirror_release_local_deficit() if mirror_active else 0
+
+        ack_slots = [_MIRROR_ACK_NO_WRITER] * _MIRROR_ACK_SYNC_SLOTS
+        if self.mirror_release_enabled:
+            # Peek (not pop) the acks this round may consume.  The queue is
+            # FIFO with a single consumer, so the first min(qsize) entries
+            # are the same logical operations in the same order on every
+            # rank; only the writer ranks contribute their completed counts.
+            # The backup thread puts concurrently, so both the length and
+            # the head snapshot must be taken under the queue's own mutex —
+            # bare iteration over Queue.queue can raise "deque mutated
+            # during iteration" and kill the scheduler loop.
+            with cc.ack_backup_queue.mutex:
+                queue = cc.ack_backup_queue.queue
+                n_backup_local = len(queue)
+                ack_peek = list(itertools.islice(queue, _MIRROR_ACK_SYNC_SLOTS))
+            if not getattr(cc, "backup_skip", False):
+                for i, operation in enumerate(ack_peek):
+                    ack_slots[i] = operation.completed_tokens
+        else:
+            n_backup_local = cc.ack_backup_queue.qsize()
 
         qsizes = torch.tensor(
             [
                 cc.prefetch_revoke_queue.qsize(),
                 cc.prefetch_hit_queue.qsize(),
-                cc.ack_backup_queue.qsize(),
+                n_backup_local,
                 cc.host_mem_release_queue.qsize(),
+                -local_deficit,
+                plan_count,
+                -plan_count,
+                plan_tokens,
+                -plan_tokens,
+                plan_digest,
+                -plan_digest,
+                *ack_slots,
             ],
-            dtype=torch.int,
+            # int64: the plan digest and the NO_WRITER ack sentinel exceed
+            # int32 range; queue counts are unaffected by the wider dtype.
+            dtype=torch.int64,
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
+        vals = qsizes.tolist()
+        n_revoke, n_storage_hit, n_backup, n_release = (int(v) for v in vals[:4])
+        acked_completed = None
+        if self.mirror_release_enabled:
+            # Consume at most as many acks as we synced completed counts for.
+            n_backup = min(n_backup, _MIRROR_ACK_SYNC_SLOTS)
+            acked_completed = [
+                0 if v >= _MIRROR_ACK_NO_WRITER else max(0, int(v))
+                for v in vals[11 : 11 + _MIRROR_ACK_SYNC_SLOTS]
+            ]
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
+            acked_completed=acked_completed,
         )
+        if mirror_active:
+            self._advance_mirror_release(
+                global_deficit=-int(vals[4]),
+                pc_min=int(vals[5]),
+                pc_max=-int(vals[6]),
+                pt_min=int(vals[7]),
+                pt_max=-int(vals[8]),
+                pd_min=int(vals[9]),
+                pd_max=-int(vals[10]),
+            )
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
@@ -1903,6 +2404,11 @@ class HiRadixCache(RadixCache):
 
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
+        # both halves must re-qualify for mirror release from their own hash
+        # slices; registering only the ack'd original would leak the prefix
+        # half's mirror forever under shared-prefix workloads.
+        self._update_redundant_host_status(new_node)
+        self._update_redundant_host_status(child)
 
         return new_node
 
