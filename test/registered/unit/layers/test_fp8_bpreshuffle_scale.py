@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
@@ -100,6 +101,73 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
         self.assertIs(bf16_out, bf16_side)
         self.assertTrue(torch.equal(scale_out, scale))
         self.assertEqual(scale_out.stride(), (1, scale.shape[0]))
+
+    def test_aiter_bpreshuffle_defers_activation_quantization(self):
+        input_tensor = torch.ones((2, 3), dtype=torch.bfloat16)
+        weight = torch.ones((4, 3), dtype=torch.float32)
+        weight_scale = torch.ones((1, 1), dtype=torch.float32)
+        expected = torch.arange(8, dtype=torch.float32).to(torch.bfloat16).view(2, 4)
+        captured = {}
+
+        def fake_bpreshuffle_gemm(
+            passed_input,
+            passed_weight,
+            passed_input_scale,
+            passed_weight_scale,
+            dtype,
+        ):
+            captured.update(
+                input=passed_input,
+                weight=passed_weight,
+                input_scale=passed_input_scale,
+                weight_scale=passed_weight_scale,
+                dtype=dtype,
+            )
+            return expected
+
+        with (
+            patch.object(fp8_utils, "_use_aiter_bpreshuffle_gfx95", True),
+            patch.object(
+                fp8_utils,
+                "_aiter_bpreshuffle_supports_unquantized_input",
+                True,
+            ),
+            patch.object(
+                fp8_utils,
+                "use_aiter_triton_gemm_w8a8_tuned_gfx950",
+                return_value=False,
+            ),
+            patch.object(
+                fp8_utils,
+                "gemm_a8w8_blockscale_bpreshuffle",
+                side_effect=fake_bpreshuffle_gemm,
+                create=True,
+            ),
+            patch.object(
+                fp8_utils,
+                "aiter_per1x128_quant",
+                side_effect=AssertionError("SGLang must defer activation quantization"),
+                create=True,
+            ),
+        ):
+            result = fp8_utils.aiter_w8a8_block_fp8_linear(
+                input_tensor,
+                weight,
+                [128, 128],
+                weight_scale,
+            )
+
+        self.assertTrue(
+            torch.equal(
+                captured["input"],
+                input_tensor.view(-1, input_tensor.shape[-1]),
+            )
+        )
+        self.assertIs(captured["weight"], weight)
+        self.assertIsNone(captured["input_scale"])
+        self.assertIs(captured["weight_scale"], weight_scale)
+        self.assertEqual(captured["dtype"], input_tensor.dtype)
+        self.assertTrue(torch.equal(result, expected))
 
 
 if __name__ == "__main__":

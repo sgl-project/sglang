@@ -68,6 +68,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+_aiter_bpreshuffle_supports_unquantized_input = False
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
 # fallback ck_gemm_a8w8_blockscale returns NaN above a per-shape M for some shapes
 # (measured NaN onset: (2560,4096)@M>=4096, (4096,1024)@M>=8192 at TP8; at TP4 the
@@ -168,6 +169,13 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    _aiter_bpreshuffle_supports_unquantized_input = bool(
+        getattr(
+            aiter,
+            "GEMM_A8W8_BPRESHUFFLE_SUPPORTS_UNQUANTIZED_INPUT",
+            False,
+        )
+    )
 
 
 if _is_cuda:
@@ -1043,41 +1051,59 @@ def aiter_w8a8_block_fp8_linear(
         )
     else:
         use_triton = True
-
-    # if input_scale not None, input is quanted
-    if input_scale is not None:
-        q_input = input_2d
-        x_scale = input_scale
-        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
-            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
-        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
-        # Triton needs a row-major view, so adjust strides only. No copy.
-        elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
-    else:
-        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
-        q_input, x_scale = aiter_per1x128_quant(
-            input_2d,
-            quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
-        )
-        if materialize_bpreshuffle_scale:
-            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
-
-    if use_triton:
-        gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
-    elif _use_aiter_bpreshuffle_gfx95:
-        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
-    else:
-        gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
-
-    output = gemm_a8w8_blockscale_op(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+    
+    use_backend_native_quant = (
+        input_scale is None
+        and _use_aiter_bpreshuffle_gfx95
+        and not use_triton
+        and _aiter_bpreshuffle_supports_unquantized_input
     )
+
+    # Let AITER perform backend-native quantization
+    # (e.g. MXFP8 1x32 for FlyDSL) when supported.
+    if use_backend_native_quant:
+        output = gemm_a8w8_blockscale_bpreshuffle(
+            input_2d,
+            weight,
+            None,
+            weight_scale,
+            dtype=input.dtype,
+        )
+    else:
+        # if input_scale not None, input is quanted
+        if input_scale is not None:
+            q_input = input_2d
+            x_scale = input_scale
+            if _use_aiter_bpreshuffle_gfx95 and not use_triton:
+                x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+            # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
+            # Triton needs a row-major view, so adjust strides only. No copy.
+            elif use_triton and _use_aiter_bpreshuffle_gfx95:
+                x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+        else:
+            materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+            q_input, x_scale = aiter_per1x128_quant(
+                input_2d,
+                quant_dtype=aiter.dtypes.fp8,
+                transpose_scale=False,
+            )
+            if materialize_bpreshuffle_scale:
+                x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+            
+        if use_triton:
+            gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+        elif _use_aiter_bpreshuffle_gfx95:
+            gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
+        else:
+            gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
+
+        output = gemm_a8w8_blockscale_op(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )    
 
     if bias is not None:
         output += bias
