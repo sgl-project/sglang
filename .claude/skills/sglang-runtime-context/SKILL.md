@@ -60,17 +60,16 @@ resolved configuration lives in the namespace bags.**
   multi-tokenizer workers it is serialized for, the schedulers it forks. Returning a
   variant here is a bug: the launcher rebinds its local and everyone else keeps the
   unresolved object.
-- **A config another runner / worker / process is built from**: `server_args.derive(
-  source, **fields)` returns a variant (an encode worker's `base_gpu_id`/`tp_size`).
-  The receiver — and any bags projected from it — are untouched; resolution does
-  **not** re-run, so do not reach for it to "re-resolve" a config.
-- **Per-runner values inside one process are constructor arguments, not a variant.**
-  The draft worker's `context_length`, load format and attention backend travel as
-  arguments to `TpModelWorker` / `ModelRunner` and live on the runner
-  (`ModelRunner.draft_attention_backend`, `kv_cache_dtype_str`, …), because target
-  and draft coexist and the process-wide bags can only describe one of them.
+- **A value another runner / worker owns is a constructor argument, not a config
+  copy.** The draft worker's `context_length`, load format and attention backend
+  travel as arguments to `TpModelWorker` / `ModelRunner` and live on the runner
+  (`ModelRunner.draft_attention_backend`, `kv_cache_dtype_str`, …); the encoder
+  DP worker's device is `MMEncoder(gpu_id=...)`. There is no `ServerArgs.derive`
+  any more — a config object is never copied-and-edited; test doubles that need a
+  modified copy use `sglang.test.test_utils.server_args_variant`.
 
-**Why a bag override cannot stand in for the last two.** The bags are projected at
+**Why a bag override cannot stand in for late resolution or per-runner
+construction.** The bags are projected at
 publish *from the instance's fields*, so anything the runtime must read has to be on
 the instance before publish — an override afterwards puts instance and bags back out
 of agreement, and whole-object readers (`ModelConfig.from_server_args`,
@@ -98,10 +97,11 @@ bag to override at all.
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
   `entrypoints/`, and the tokenizer-process multimodal processors read
   `self.server_args`: several `Engine`s can share one process, and the process-global
-  bags are last-publish-wins across engines. `base_gpu_id` also differs per worker
-  (the encode-server DP workers each specialize their own copy), so no process-global
-  value can stand in for it — `BaseMultimodalProcessor._fast_image_processor_device`
-  is the shape to copy.
+  bags are last-publish-wins across engines. `base_gpu_id` also differs per engine,
+  so no process-global value can stand in for it —
+  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy. (The
+  encode-server DP workers used to specialize a config copy for the same reason;
+  their device now travels as `MMEncoder(gpu_id=...)`.)
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
@@ -240,16 +240,16 @@ ONE thread — do not design for TBO threads that don't exist.
 1. **Strict mutation guard** (always on): bare `server_args.x = ...` after resolution
    raises unconditionally in `ServerArgs.__setattr__` — this *is* the guarantee that
    no writer can desync the bags, so there is no writer ratchet any more. Change
-   resolved config with `get_context().override`, build a per-runner config with
-   `server_args.derive`. Projected bags are sealed the same way (leaf assignment
-   raises).
+   resolved config with `get_context().override`; hand a per-runner value to its
+   runner as a constructor argument. Projected bags are sealed the same way (leaf
+   assignment raises).
 2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
    package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
    raise the baseline.
-3. **Derive contract** (`test_server_args_derive.py`): deriving leaves the receiver
-   intact, a published config still refuses assignment, and deriving does not publish.
-   Rerouting a writer to the bags means flipping **all its readers in the same commit**
-   (no transitional dual-write).
+3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
+   `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
+   calls either form. Rerouting a writer to the bags means flipping **all its readers
+   in the same commit** (no transitional dual-write).
 4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
    call sites must not grow — new code uses `runtime_context.get_server_args()` (and
    business decisions should read the bags).

@@ -1027,9 +1027,19 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
+        from sglang.srt.arg_groups.overrides import _apply_fields
+
         server_args = ServerArgs(model_path="dummy")
-        if self._fields:
-            server_args = server_args.derive("test-override", **self._fields)
+        # Underscore names seed private property caches (the strict guard
+        # exempts them); everything else must be a real config field.
+        unknown = {name for name in self._fields if not name.startswith("_")} - set(
+            type(server_args).__dataclass_fields__
+        )
+        if unknown:
+            raise ValueError(
+                f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
+            )
+        _apply_fields(server_args, self._fields)
         # The dummy boundary skips materialization, which would leave the
         # strict mutation guard unarmed on the published object — mark it
         # materialized so bare post-publish writes raise like they do on a
