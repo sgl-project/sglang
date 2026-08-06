@@ -1015,7 +1015,6 @@ class MQALayer(MqaAttentionBase):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
         kv_handle = None
-        sub_index = getattr(forward_batch, "tbo_subbatch_index", 0)
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1146,10 +1145,7 @@ class MQALayer(MqaAttentionBase):
                         # kv is not read again until this function returns, so the
                         # indexer + compressor below can run while it gathers.
                         kv_handle = cp_all_gather_rerange_launch(
-                            kv,
-                            self.cp_size,
-                            comm_stream,
-                            ("kv", self.layer_id, sub_index),
+                            kv, self.cp_size, comm_stream, ("kv", self.layer_id)
                         )
                         kv = None
                     else:
@@ -1199,14 +1195,6 @@ class MQALayer(MqaAttentionBase):
 
         if kv_handle is not None:
             kv = cp_all_gather_rerange_finish(kv_handle)
-
-        # A prelaunched gather whose consumer was skipped still has to be waited:
-        # dropping the handle would let the allocator recycle buffers the comm
-        # stream is still reading.
-        pending = getattr(forward_batch, "_cp_pending_gathers", None)
-        if pending:
-            for key in [k for k in pending if k[1] == self.layer_id]:
-                cp_all_gather_rerange_finish(pending.pop(key))
 
         return q, kv
 

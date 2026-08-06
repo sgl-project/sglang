@@ -445,10 +445,7 @@ class Compressor(MultiPlatformOp):
         # ubatches cannot collect each other's gather.
         pending = forward_batch.__dict__.setdefault("_cp_pending_gathers", {})
         pending[self._pending_key()] = cp_all_gather_rerange_launch(
-            kv_score,
-            get_parallel().attn_cp_size,
-            comm_stream,
-            (*self._pending_key(), getattr(forward_batch, "tbo_subbatch_index", 0)),
+            kv_score, get_parallel().attn_cp_size, comm_stream, self._pending_key()
         )
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
