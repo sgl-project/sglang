@@ -2505,6 +2505,12 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:
             raise ValueError("kv_gather_degree must be >= 1")
+        if self.kv_gather_degree > 1 and self.sp_degree != self.kv_gather_degree:
+            raise ValueError(
+                f"kv_gather_degree ({self.kv_gather_degree}) must equal "
+                f"sp_degree ({self.sp_degree}); check how many GPUs remain for "
+                "sequence parallelism after dp/tp/cfg"
+            )
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(
