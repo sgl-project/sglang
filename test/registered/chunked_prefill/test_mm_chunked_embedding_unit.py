@@ -180,9 +180,7 @@ def test_tensor_cache_entries_own_storage():
         extend_prefix_len=0,
         extend_seq_len=TOTAL_LEN,
     )
-    mm_schedule._batch_encode_per_image_misses_with_policy(
-        _encoder_tensor, [request], _CPU
-    )
+    mm_schedule._resolve_item_policy_embeddings(_encoder_tensor, [request], _CPU)
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
         own_bytes = emb.numel() * emb.element_size()
@@ -217,7 +215,7 @@ def test_noncacheable_item_is_reencoded():
         extend_seq_len=3,
     )
     for _ in range(2):
-        mm_schedule._batch_encode_per_image_misses_with_policy(encoder, [request], _CPU)
+        mm_schedule._resolve_item_policy_embeddings(encoder, [request], _CPU)
 
     assert encoded_item_counts == [2, 1]
     assert mm_schedule.embedding_cache.has(items[0].hash)
@@ -249,12 +247,86 @@ def test_encoder_batch_key_separates_incompatible_items():
         extend_prefix_len=0,
         extend_seq_len=2,
     )
-    embeddings = mm_schedule._batch_encode_per_image_misses_with_policy(
-        encoder, [request], _CPU
-    )
+    embeddings = mm_schedule._resolve_item_policy_embeddings(encoder, [request], _CPU)
 
     assert encoder_calls == [[(3,)], [(4,)]]
     assert set(embeddings) == {item.hash for item in items}
+
+
+def test_legacy_and_item_policy_results_are_isolated():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    shared_hash = 4000
+    legacy_item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=shared_hash,
+        feature=torch.zeros(1),
+        offsets=[(0, 0)],
+    )
+    policy_item = MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=shared_hash,
+        feature=torch.zeros(1),
+        offsets=[(0, 0)],
+        use_embedding_cache=False,
+        encoder_batch_key=("audio",),
+    )
+
+    def encoder(items):
+        value = 2.0 if items[0].encoder_batch_key is not None else 1.0
+        return torch.full((sum(_num_tokens(item) for item in items), HIDDEN), value)
+
+    embeddings, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [legacy_item, policy_item],
+        [0, 1, 2],
+        [0, 0],
+        [1, 1],
+        [[(0, 0)], [(0, 0)]],
+        torch.zeros(2, dtype=torch.long),
+    )
+
+    torch.testing.assert_close(embeddings[0], torch.ones(HIDDEN))
+    torch.testing.assert_close(embeddings[1], torch.full((HIDDEN,), 2.0))
+
+
+def test_same_hash_requires_matching_item_policy_metadata():
+    conflicts = [
+        (("other",), (1, 1), True),
+        (("audio",), (1, 2), True),
+        (("audio",), (1, 1), False),
+    ]
+
+    for batch_key, second_offset, cacheable in conflicts:
+        mm_schedule.init_mm_embedding_cache(1 << 30)
+        items = [
+            MultimodalDataItem(
+                modality=Modality.AUDIO,
+                hash=5000,
+                feature=torch.zeros(1),
+                offsets=[(0, 0)],
+                encoder_batch_key=("audio",),
+            ),
+            MultimodalDataItem(
+                modality=Modality.AUDIO,
+                hash=5000,
+                feature=torch.zeros(1),
+                offsets=[second_offset],
+                use_embedding_cache=cacheable,
+                encoder_batch_key=batch_key,
+            ),
+        ]
+        request = mm_schedule.PerImageRequestInfo(
+            req_idx=0,
+            items=items,
+            items_offset=[item.offsets[0] for item in items],
+            extend_prefix_len=0,
+            extend_seq_len=second_offset[1] + 1,
+        )
+
+        with pytest.raises(RuntimeError, match="matching encoder_batch_key"):
+            mm_schedule._resolve_item_policy_embeddings(
+                _encoder_tensor, [request], _CPU
+            )
 
 
 if __name__ == "__main__":

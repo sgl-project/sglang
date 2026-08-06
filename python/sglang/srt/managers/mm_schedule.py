@@ -431,11 +431,11 @@ def _get_chunked_embedding_by_item(
     return torch.cat(chunk_slices, dim=0)
 
 
-def _requires_custom_embedding_schedule(item: MultimodalDataItem) -> bool:
+def _uses_item_embedding_policy(item: MultimodalDataItem) -> bool:
     return not item.use_embedding_cache or item.encoder_batch_key is not None
 
 
-def _encode_policy_misses(
+def _encode_item_policy_misses(
     data_embedding_func: DataEmbeddingFunc,
     misses: Dict[int, Tuple[MultimodalDataItem, int]],
     device: torch.device,
@@ -445,9 +445,7 @@ def _encode_policy_misses(
     for item_hash, miss in misses.items():
         batch_key = miss[0].encoder_batch_key
         if batch_key is None:
-            raise RuntimeError(
-                "custom-scheduled multimodal item requires encoder_batch_key"
-            )
+            raise RuntimeError("item embedding policy requires encoder_batch_key")
         miss_groups.setdefault(batch_key, {})[item_hash] = miss
 
     encoded = {}
@@ -484,16 +482,17 @@ def _encode_policy_misses(
     return encoded
 
 
-def _batch_encode_per_image_misses_with_policy(
+def _resolve_item_policy_embeddings(
     data_embedding_func: DataEmbeddingFunc,
-    per_image_requests: List[PerImageRequestInfo],
+    policy_requests: List[PerImageRequestInfo],
     device: torch.device,
 ) -> Dict[int, torch.Tensor]:
-    """Encode only requests that explicitly opt into item scheduling policy."""
+    """Resolve cache hits and encode misses for item-policy requests."""
     unique_misses: Dict[int, Tuple[MultimodalDataItem, int]] = {}
     hash_to_embedding: Dict[int, torch.Tensor] = {}
+    item_metadata: Dict[int, Tuple[tuple, int, bool]] = {}
 
-    for req_info in per_image_requests:
+    for req_info in policy_requests:
         chunk_start = req_info.extend_prefix_len
         chunk_end = chunk_start + req_info.extend_seq_len
         overlapping = []
@@ -507,11 +506,21 @@ def _batch_encode_per_image_misses_with_policy(
 
         for _idx, item, start, end in overlapping:
             if item.hash is None:
-                raise RuntimeError("custom-scheduled multimodal item has no hash")
+                raise RuntimeError("item embedding policy requires an item hash")
             if item.encoder_batch_key is None:
+                raise RuntimeError("item embedding policy requires encoder_batch_key")
+            token_count = end - start + 1
+            metadata = (
+                item.encoder_batch_key,
+                token_count,
+                item.use_embedding_cache,
+            )
+            if item.hash in item_metadata and item_metadata[item.hash] != metadata:
                 raise RuntimeError(
-                    "custom-scheduled multimodal item requires encoder_batch_key"
+                    "items with the same hash must have matching encoder_batch_key, "
+                    "token count, and cacheability"
                 )
+            item_metadata[item.hash] = metadata
             if item.hash in hash_to_embedding or item.hash in unique_misses:
                 _acknowledge_deferred_cuda_ipc_cache_hits([item])
                 continue
@@ -524,20 +533,20 @@ def _batch_encode_per_image_misses_with_policy(
                 hash_to_embedding[item.hash] = cached.embedding
                 _acknowledge_deferred_cuda_ipc_cache_hits([item])
             else:
-                unique_misses[item.hash] = (item, end - start + 1)
+                unique_misses[item.hash] = (item, token_count)
 
     hash_to_embedding.update(
-        _encode_policy_misses(data_embedding_func, unique_misses, device)
+        _encode_item_policy_misses(data_embedding_func, unique_misses, device)
     )
     return hash_to_embedding
 
 
-def _get_chunked_embedding_by_item_with_policy(
+def _get_chunked_embedding_with_item_policy(
     data_embedding_func: DataEmbeddingFunc,
     req_info: PerImageRequestInfo,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
-    hash_to_embedding = _batch_encode_per_image_misses_with_policy(
+    hash_to_embedding = _resolve_item_policy_embeddings(
         data_embedding_func, [req_info], device
     )
     return _assemble_per_image_chunk(
@@ -585,18 +594,17 @@ def _get_chunked_prefill_embedding(
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """
-    Chunked prefill embedding: encode items across all requests and extract
-    per-request chunks. Images from all requests are batched into a single
-    ViT call for efficiency.
+    """Build chunked-prefill embeddings across scheduler requests.
+
+    Legacy requests keep their existing miss encoder. Only items that explicitly
+    declare cache/batch policy enter the policy path.
     """
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
-    # Phase 0: classify requests into legacy, opt-in policy, or full/EVS paths.
-    per_image_requests = []  # all CUDA requests, kept in input order
-    legacy_requests = []  # unchanged batched ViT encoding
+    # Phase 0: classify requests into per-image vs full/EVS path
+    per_image_requests = []  # batched ViT encoding
     policy_requests = []  # producer-declared item scheduling
     full_path_requests = []  # per-request encoding (EVS etc.)
     all_chunks: List[Tuple[int, torch.Tensor]] = []
@@ -625,33 +633,32 @@ def _get_chunked_prefill_embedding(
             extend_seq_len=extend_seq_len,
         )
 
-        policy_flags = [
-            _requires_custom_embedding_schedule(item)
-            for item in embedding_items_per_req
+        item_policy_flags = [
+            _uses_item_embedding_policy(item) for item in embedding_items_per_req
         ]
-        requires_custom_schedule = any(policy_flags)
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
-        if requires_custom_schedule:
-            if not is_per_image:
+        uses_item_embedding_policy = any(item_policy_flags)
+        has_single_offset_items = all(
+            len(item.offsets) == 1 for item in embedding_items_per_req
+        )
+        if uses_item_embedding_policy:
+            if not has_single_offset_items:
                 raise RuntimeError(
-                    "custom embedding scheduling requires single-offset MM items"
+                    "item embedding policy requires single-offset MM items"
                 )
-            if not all(policy_flags):
+            if not all(item_policy_flags):
                 raise RuntimeError(
-                    "mixing legacy and custom-scheduled MM items in one request "
+                    "mixing legacy and item-policy MM items in one request "
                     "is unsupported"
                 )
             if any(item.encoder_batch_key is None for item in embedding_items_per_req):
-                raise RuntimeError(
-                    "custom-scheduled multimodal item requires encoder_batch_key"
-                )
+                raise RuntimeError("item embedding policy requires encoder_batch_key")
 
-        if is_per_image:
+        if has_single_offset_items:
             if _is_hip or _is_npu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
                 # the previous per-request path on HIP while CUDA uses batching.
-                if requires_custom_schedule:
-                    chunk = _get_chunked_embedding_by_item_with_policy(
+                if uses_item_embedding_policy:
+                    chunk = _get_chunked_embedding_with_item_policy(
                         data_embedding_func, req_info, device
                     )
                 else:
@@ -666,37 +673,42 @@ def _get_chunked_prefill_embedding(
                 if chunk is not None:
                     all_chunks.append((i, chunk))
             else:
-                per_image_requests.append(req_info)
-                if requires_custom_schedule:
+                if uses_item_embedding_policy:
                     policy_requests.append(req_info)
                 else:
-                    legacy_requests.append(req_info)
+                    per_image_requests.append(req_info)
         else:
             full_path_requests.append(req_info)
 
-    # Phase 1: batch encode all per-image cache misses in ONE ViT call
-    hash_to_embedding: Dict[int, torch.Tensor] = {}
-    if legacy_requests:
-        hash_to_embedding.update(
-            _batch_encode_per_image_misses(data_embedding_func, legacy_requests, device)
+    # Phase 1: encode and assemble each path independently. Keeping their hash
+    # maps separate prevents an opt-in item from replacing a legacy result.
+    if per_image_requests:
+        legacy_embeddings = _batch_encode_per_image_misses(
+            data_embedding_func, per_image_requests, device
         )
-    if policy_requests:
-        hash_to_embedding.update(
-            _batch_encode_per_image_misses_with_policy(
-                data_embedding_func, policy_requests, device
+        for req_info in per_image_requests:
+            chunk = _assemble_per_image_chunk(
+                req_info.overlapping,
+                legacy_embeddings,
+                req_info.extend_prefix_len,
+                req_info.extend_seq_len,
             )
-        )
+            if chunk is not None:
+                all_chunks.append((req_info.req_idx, chunk))
 
-    # Phase 2: assemble per-request chunks in original request order
-    for req_info in per_image_requests:
-        chunk = _assemble_per_image_chunk(
-            req_info.overlapping,
-            hash_to_embedding,
-            req_info.extend_prefix_len,
-            req_info.extend_seq_len,
+    if policy_requests:
+        policy_embeddings = _resolve_item_policy_embeddings(
+            data_embedding_func, policy_requests, device
         )
-        if chunk is not None:
-            all_chunks.append((req_info.req_idx, chunk))
+        for req_info in policy_requests:
+            chunk = _assemble_per_image_chunk(
+                req_info.overlapping,
+                policy_embeddings,
+                req_info.extend_prefix_len,
+                req_info.extend_seq_len,
+            )
+            if chunk is not None:
+                all_chunks.append((req_info.req_idx, chunk))
 
     for req_info in full_path_requests:
         chunk_embedding, input_ids = _get_chunked_embedding_full(
