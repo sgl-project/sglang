@@ -332,12 +332,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+
+        if extend_seq_lens is None and forward_batch.forward_mode.is_target_verify():
+            spec_info = forward_batch.spec_info
+            if spec_info is None:
+                raise ValueError(
+                    "MiniMax sparse TARGET_VERIFY requires spec_info when "
+                    "extend_seq_lens is absent."
+                )
+            verify_len = spec_info.draft_token_num
+            extend_seq_lens = torch.full(
+                (forward_batch.batch_size,),
+                verify_len,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            extend_seq_lens_cpu = [verify_len] * forward_batch.batch_size
+
+        if extend_seq_lens is None:
+            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
+
         cu_seqlens = torch.cat(
             [
-                torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
-                ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                torch.zeros(1, dtype=torch.int32, device=extend_seq_lens.device),
+                extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
         seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -348,8 +368,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         # DP attention pads q beyond the real token count for collective alignment;
         # trim to actual tokens so the sparse kernel sees consistent shapes.
-        if forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+        if extend_seq_lens_cpu is not None:
+            actual_num_tokens = int(sum(extend_seq_lens_cpu))
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
@@ -387,13 +407,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             score_type=self.score_type,
             disable_index_value=disable_value,
             use_msa=self.use_msa,
-            seqlens_cpu=forward_batch.extend_seq_lens_cpu,
             q_scale=layer.q_scale_float,
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
             idx_q_scale=layer.idx_q_scale_float,
             idx_k_scale=layer.idx_k_scale_float,
             idx_v_scale=layer.idx_v_scale_float,
+            seqlens_cpu=extend_seq_lens_cpu,
         )
 
         if actual_num_tokens < original_num_tokens:
