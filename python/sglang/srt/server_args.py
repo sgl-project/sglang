@@ -2676,12 +2676,12 @@ class ServerArgs:
             help="How L3 storage object keys encode what an object holds. "
             "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
             "so only bit-identical topologies can share cache. "
-            "'canonical-grid': keys carry topology-free canonical cell "
+            "'unified': keys carry topology-free canonical cell "
             "coordinates (namespace digest + layer/head group indices), so "
             "any topology whose shards tile the same grid shares cache. "
             "v1 supports the file and mooncake backends with plain KV pools "
             "only.",
-            choices=["rank-suffix", "canonical-grid"],
+            choices=["rank-suffix", "unified"],
         ),
         NS("memory"),
     ] = "rank-suffix"
@@ -7152,7 +7152,7 @@ class ServerArgs:
         2) Storage <-> layout compatibility (may rewrite layout).
         """
         # Step 0: L3 key-scheme validation. Runs before the early return so
-        # canonical-grid flags are never silently inert.
+        # unified flags are never silently inert.
         self._resolve_hicache_key_scheme()
 
         # Skip all normalization when neither hicache nor decode-offload path is active.
@@ -7179,33 +7179,33 @@ class ServerArgs:
             or self.disaggregation_decode_enable_offload_kvcache
         ):
             raise ValueError(
-                "--hicache-storage-key-scheme canonical-grid has no effect "
+                "--hicache-storage-key-scheme unified has no effect "
                 "without --enable-hierarchical-cache (or decode KV offload); "
                 "refusing a silently inert flag."
             )
         if self.hicache_storage_backend is None:
             raise ValueError(
-                "--hicache-storage-key-scheme canonical-grid requires an L3 "
+                "--hicache-storage-key-scheme unified requires an L3 "
                 "backend (--hicache-storage-backend)."
             )
         if self.hicache_storage_backend not in ("file", "mooncake"):
             raise NotImplementedError(
-                "canonical-grid v1 supports --hicache-storage-backend file "
+                "the unified key scheme v1 supports --hicache-storage-backend file "
                 f"or mooncake; got {self.hicache_storage_backend!r}. Other "
-                "backends need cell-granular key support first."
+                "backends need chunk-granular key support first."
             )
         if self.speculative_algorithm is not None:
             raise NotImplementedError(
-                "canonical-grid does not cover speculative-decoding draft "
+                "the unified key scheme does not cover speculative-decoding draft "
                 "pools yet; use --hicache-storage-key-scheme rank-suffix."
             )
         # Topologies whose at-rest KV is not a dense per-rank rectangle of
-        # whole pages cannot be named by canonical cells yet. Checked here
+        # whole pages cannot be named by unified chunks yet. Checked here
         # (not only at attach) because the decode-offload attach path has no
         # CP/DCP group wired into its controller.
         if self.dcp_size > 1:
             raise NotImplementedError(
-                "canonical-grid with --dcp-size > 1 is not supported: each "
+                "the unified key scheme with --dcp-size > 1 is not supported: each "
                 "DCP rank holds an interleaved token shard (needs the "
                 "token-granule extension)."
             )
@@ -7213,15 +7213,15 @@ class ServerArgs:
         # mutating the raw field), so read it through the resolved view.
         if self._resolved().attn_cp_size > 1:
             raise NotImplementedError(
-                "canonical-grid with --attn-cp-size > 1 is not supported: "
+                "the unified key scheme with --attn-cp-size > 1 is not supported: "
                 "CP ranks hold sub-page slices or replicated pages (needs "
-                "token-granule cells / writer election)."
+                "token-granule chunks / writer election)."
             )
         # Best-effort early check of the partition knobs when the extra
         # config is inline JSON (the '@file' form is re-validated at attach).
-        # Any knob selects the cell adapter: objects use the layout-neutral
-        # canonical byte order, so there is no host-layout requirement, but
-        # the per-cell key fan-out needs a multi-key backend.
+        # Any knob selects the KV layout adapter: objects use the unified
+        # byte order, so there is no host-layout requirement, but the
+        # per-chunk key fan-out needs a multi-key backend.
         extra = self.hicache_storage_backend_extra_config
         if extra and not extra.startswith("@"):
             try:
@@ -7236,8 +7236,8 @@ class ServerArgs:
             if tp_lcm_size:
                 raise ValueError(
                     "tp_lcm_size is the legacy rank-suffix split-heads knob; "
-                    "canonical-grid uses head_group in the extra config "
-                    "(heads per cell)."
+                    "the unified key scheme uses head_group in the extra "
+                    "config (heads per chunk)."
                 )
             # head_group is ignored on rank-replicated (MLA-family) pools, so
             # a shared fleet extra-config must not be rejected for them here.
@@ -7246,7 +7246,7 @@ class ServerArgs:
             )
             if adapter and self.hicache_storage_backend != "mooncake":
                 raise NotImplementedError(
-                    "canonical-grid partition knobs (head_group / "
+                    "unified-scheme partition knobs (head_group / "
                     "layer_partition) need a multi-key-per-page backend; "
                     "only mooncake supports them."
                 )
