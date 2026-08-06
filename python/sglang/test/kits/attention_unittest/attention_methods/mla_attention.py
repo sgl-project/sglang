@@ -200,6 +200,9 @@ class TinyMLAModelConfig:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tp_size: int) -> int:
         return 1
 
@@ -230,6 +233,11 @@ class MockMLAModelRunner(ModelRunner):
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
         self.kv_cache_dtype_str = "fp8_e4m3" if fp8_kv_cache else "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
