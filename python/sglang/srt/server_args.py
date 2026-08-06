@@ -83,6 +83,7 @@ from sglang.srt.utils.common import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
+    is_sm80_supported,
     is_sm90_supported,
     is_sm100_or_sm110_supported,
     is_sm100_supported,
@@ -100,6 +101,24 @@ from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def _disable_topk_v2_without_thread_block_clusters() -> None:
+    """Turn off the fused top-k v2 kernel on CUDA devices below SM90.
+
+    ``topk_transform_512_v2`` uses ``cg::this_cluster()``, i.e. thread-block
+    clusters, which only exist from Hopper on. On SM8x the JIT compile fails
+    with "namespace cooperative_groups has no member this_cluster" while the
+    v1 path compiles and runs, so pick v1 the same way this file already does
+    for ROCm and SM120.
+    """
+    if is_sm80_supported():
+        logger.info(
+            "Disabling SGLANG_OPT_USE_TOPK_V2: the fused top-k v2 kernel needs "
+            "thread-block clusters (SM90+)."
+        )
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -5250,6 +5269,10 @@ class ServerArgs:
             )
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
+            if is_deepseek_dsa(hf_config):
+                # Same kernel, same reason as the HIP arm below: no
+                # thread-block clusters before SM90.
+                _disable_topk_v2_without_thread_block_clusters()
             if is_hip():
                 if is_deepseek_dsa(hf_config):
                     # The fused top-k v2 kernel (topk_transform_512_v2) is a
@@ -5308,6 +5331,8 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+            elif is_sm80_supported():
+                _disable_topk_v2_without_thread_block_clusters()
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
