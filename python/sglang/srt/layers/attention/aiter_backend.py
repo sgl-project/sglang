@@ -386,8 +386,8 @@ class AiterAttnBackend(AttentionBackend):
             self.dcp_world_size = get_attention_dcp_world_size()
             # Under DCP the decode path runs aiter's gluon MLA kernel
             # (_mla_decode_fwd_gluon_dcp), which tiles the query heads and so
-            # serves any local head count. The {4,8,16k} constraint below only
-            # applies to the non-DCP cprr/ASM kernels, so skip it under DCP
+            # serves any local head count. The {4,8,16k} constraint below
+            # applies to the non-DCP path only, so skip it under DCP
             # (e.g. Kimi-K3 has 12 local heads at tp8).
             _valid_heads = self.num_head in (4, 8) or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
@@ -928,8 +928,8 @@ class AiterAttnBackend(AttentionBackend):
         """DCP decode via aiter's gluon MLA kernel over this rank's round-robin
         KV shard.
 
-        Unlike the cprr kernel, gluon tiles the query heads, so it serves any
-        gathered head count (e.g. Kimi-K3's 96) instead of only {16,32,64,128}.
+        gluon tiles the query heads, so it serves any gathered head count
+        (e.g. Kimi-K3's 96 at tp8 dcp8).
         Round-robin global-position causal masking is unnecessary for pure decode
         (q_len == 1): every shard entry is a past token, so this rank attends its
         whole shard, and partials are merged across ranks by the caller
@@ -1121,17 +1121,13 @@ class AiterAttnBackend(AttentionBackend):
         kv_lora_rank = layer.v_head_dim
         qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
 
-        # The decode and verify paths swap in a static upper bound under capture;
-        # this one cannot. There is no per-graph bound to fall back on, and the
-        # repack below allocates per batch, so the whole path is uncapturable --
-        # prefill cuda graphs are disabled for K3 DCP. Assert that invariant so a
-        # future change that enables them fails here with a readable message
-        # instead of an opaque error from the .item() inside capture.
-        assert not self.forward_metadata.run_graph, (
-            "gluon DCP prefill cannot run under cuda-graph capture: it does a "
-            "GPU->CPU sync for max_kv and repacks KV into pages per batch. "
-            "Keep prefill cuda graphs disabled on this path."
-        )
+        # NOTE: the .item() below is a GPU->CPU sync, which would be illegal
+        # under cuda-graph capture -- but this path is uncapturable anyway
+        # (pack_dcp_kv_into_pages allocates per batch) and prefill cuda graphs
+        # are disabled for K3 DCP. Do NOT try to assert that via
+        # ForwardMetadata.run_graph: it defaults to True and is only set to
+        # False explicitly on the eager decode/verify paths, so on the prefill
+        # metadata it is always True and says nothing about capture state.
         seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
         max_kv = int(seqused_k.max().item())
         # gluon takes its KV tile straight from the paged block size, so feeding
@@ -2296,10 +2292,9 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = 1
 
                 # DCP decode runs the gluon kernel (builds its own block-table
-                # metadata in forward_decode), so skip the cprr persist metadata.
-                # Mirrors the eager guard in init_forward_metadata: the cprr
-                # make_mla_meta_data -> get_mla_metadata_v1_0_device rejects K3's
-                # gathered head count (num_local_heads * dcp), which is unused here.
+                # metadata in forward_decode), so the cprr persist metadata is
+                # unused on this path and is skipped. Mirrors the eager guard in
+                # init_forward_metadata.
                 if _use_mla_ps_kernel and dcp_cp_world_size == 1:
                     num_kv_splits = self.max_split_per_batch
 
@@ -3312,8 +3307,8 @@ class AiterAttnBackend(AttentionBackend):
             if self.forward_metadata.dcp_cp_world_size > 1:
                 # DCP decode: run aiter's gluon MLA decode over this rank's
                 # round-robin KV shard and return (out, lse2). The gluon kernel
-                # tiles query heads (no cprr power-of-2 gathered-head limit) and
-                # its base-2 lse feeds cp_lse_ag_out_rs_mla for the cross-rank merge.
+                # tiles query heads, so any gathered head count works, and its
+                # base-2 lse feeds cp_lse_ag_out_rs_mla for the cross-rank merge.
                 return self._mla_decode_fwd_gluon_dcp(q, k_buffer, layer, k_descale)
 
             work_metadata = self.forward_metadata.work_metadata

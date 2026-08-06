@@ -3859,8 +3859,8 @@ class ServerArgs:
 
         The decode path runs aiter's gluon MLA kernel over each rank's
         round-robin KV shard (see AiterAttnBackend._mla_decode_fwd_gluon_dcp).
-        gluon tiles the query heads, so unlike the cprr kernels there is no
-        power-of-2 gathered-head-count constraint (Kimi-K3's 96 heads work).
+        gluon tiles the query heads, so it serves any gathered head count
+        (Kimi-K3's 96 at tp8 dcp8 works).
         """
         from sglang.srt.configs.model_config import AttentionArch
 

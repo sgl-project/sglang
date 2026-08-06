@@ -186,9 +186,8 @@ class TritonAttnBackend(AttentionBackend):
         # the DCP attention paths over a replicated pool is not just wasteful, it is
         # wrong: _forward_extend_dcp merges the per-rank partials as if they covered
         # disjoint keys, which inflates the prefix LSE by log(W) and over-weights the
-        # committed prefix against the in-hand window by a factor of W. Measured on
-        # gsm8k(200) at dcp8 that costs accept len 4.8 -> 2.5. A replicated pool is
-        # exactly the non-DCP case, so drive these paths with dcp_size = 1.
+        # committed prefix against the in-hand window by a factor of W. A replicated
+        # pool is exactly the non-DCP case, so drive these paths with dcp_size = 1.
         spec_alg = model_runner.spec_algorithm
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         if self.is_dspark_draft:
@@ -1247,12 +1246,11 @@ class TritonAttnBackend(AttentionBackend):
             if self.use_mla:
                 # The MLA pool's set_kv_buffer owner-filters by `loc % dcp_size`
                 # but never divides, and the hybrid pool drops `dcp_kv_mask` on
-                # its MLA branch -- so the pre-divided loc below would be
-                # filtered a SECOND time, leaving each rank holding ~1/dcp_size
-                # of the wrong tokens (damage grows with dcp_size). The
-                # set_mla_kv_buffer kernel is DCP-aware end to end (owner filter
-                # AND `loc // dcp_size`), so hand it the RAW virtual loc and the
-                # latent split into nope/rope.
+                # its MLA branch, so the pre-divided loc below would have the
+                # owner filter applied twice. The set_mla_kv_buffer kernel is
+                # DCP-aware end to end (owner filter AND `loc // dcp_size`), so
+                # hand it the RAW virtual loc and the latent split into
+                # nope/rope.
                 kv_lora_rank = v.shape[-1]
                 self.token_to_kv_pool.set_mla_kv_buffer(
                     layer,

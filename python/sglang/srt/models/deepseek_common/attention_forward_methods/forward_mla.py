@@ -1020,11 +1020,9 @@ class DeepseekMLAForwardMixin:
             )
             and get_parallel().dcp_enabled
         ):
-            # aiter DCP decode over the round-robin KV shard. This runs aiter's
-            # GLUON MLA kernel, NOT the cprr kernels: gluon tiles the query heads,
-            # so it has no power-of-2 gathered-head-count constraint (K3's 96
-            # heads work), and _apply_cuda_graph_metadata deliberately skips the
-            # cprr make_mla_meta_data under DCP. Q is already gathered across the
+            # aiter DCP decode over the round-robin KV shard, via aiter's GLUON
+            # MLA kernel: it tiles the query heads, so it serves any gathered
+            # head count (K3's 96 at tp8 dcp8). Q is already gathered across the
             # dcp group in forward_absorb_prepare; write this rank's KV shard then
             # run the per-rank partial attention returning (out, lse) so the
             # cross-rank merge below can combine partials.
