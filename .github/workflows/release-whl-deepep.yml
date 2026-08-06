@@ -20,7 +20,7 @@ on:
         description: "DeepEP ref containing the shared sgl_deep_ep overlay"
         type: string
         required: false
-        default: "sgl-deepep-x86"
+        default: "sgl-deepep-packaging"
 
 concurrency:
   group: release-sgl-deep-ep
@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sgl-project/DeepEP
-          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-x86' }}
+          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-packaging' }}
           path: DeepEP-packaging
           sparse-checkout: sgl_deep_ep
 
@@ -133,7 +133,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sgl-project/DeepEP
-          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-x86' }}
+          ref: ${{ inputs['packaging-ref'] || 'sgl-deepep-packaging' }}
           path: DeepEP-packaging
           sparse-checkout: sgl_deep_ep
 

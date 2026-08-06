@@ -1021,13 +1021,6 @@
                   "docs/developer_guide/bench_serving"
                 ]
               },
-              {
-                "group": "Release",
-                "pages": [
-                  "docs/developer_guide/release_process",
-                  "docs/developer_guide/release_sgl_deep_ep"
-                ]
-              },
               "docs/developer_guide/evaluating_new_models",
               "docs/developer_guide/msprobe_debugging_guide"
             ]
