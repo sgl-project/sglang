@@ -240,7 +240,7 @@ async fn new_replica_view_matches_warm_replica_over_gzipped_http() {
         .expect("fetch succeeds")
         .expect("peer serves a snapshot");
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
-    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).expect("vets clean");
+    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64)).expect("vets clean");
     let new_tree = HashTree::new();
     vetted.graft_into(&new_tree).expect("restore succeeds");
     assert_same_view(&old_tree, &new_tree, "gzipped bootstrap");
@@ -305,7 +305,7 @@ async fn new_replica_view_matches_warm_replica_over_http() {
         .expect("fetch succeeds")
         .expect("peer serves a snapshot");
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
-    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).expect("vets clean");
+    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64)).expect("vets clean");
 
     let new_tree = HashTree::new();
     vetted.graft_into(&new_tree).expect("restore succeeds");
@@ -336,7 +336,7 @@ async fn cursors_survive_the_round_trip() {
         .unwrap()
         .unwrap();
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
-    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).unwrap();
+    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64)).unwrap();
 
     for (w, seq) in &cursors {
         assert_eq!(
@@ -377,13 +377,13 @@ async fn grafting_requires_going_through_vetting() {
 
     // A hostile-or-buggy peer's block size is refused here, before any tree
     // mutation is even reachable: there is no second path to try.
-    let mismatched = VettedSnapshot::from_wire(fetched.clone(), &live, Some(32), false);
+    let mismatched = VettedSnapshot::from_wire(fetched.clone(), &live, Some(32));
     assert!(
         mismatched.is_err(),
         "a block-size mismatch must be refused by the only available bridge",
     );
 
-    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).expect("vets clean");
+    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64)).expect("vets clean");
     let new_tree = HashTree::new();
     assert!(
         vetted.graft_into(&new_tree).unwrap() > 0,
@@ -409,7 +409,7 @@ async fn cold_sibling_is_rejected_as_a_source() {
         !fetched.producer_ready,
         "a replica with an empty tree must not advertise itself as a source",
     );
-    let err = VettedSnapshot::from_wire(fetched, &HashSet::new(), Some(64), false)
+    let err = VettedSnapshot::from_wire(fetched, &HashSet::new(), Some(64))
         .expect_err("an empty snapshot must be refused");
     assert_eq!(err, VetError::ProducerCold);
 }
@@ -458,7 +458,7 @@ async fn unknown_workers_are_dropped_but_known_view_is_preserved() {
         .unwrap();
 
     let live: HashSet<KvWorkerId> = known.iter().cloned().collect();
-    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64), false).unwrap();
+    let vetted = VettedSnapshot::from_wire(fetched, &live, Some(64)).unwrap();
     assert_eq!(vetted.dropped_workers(), 1, "the unknown worker is dropped");
     assert!(
         !vetted.has_worker(&rogue),
@@ -509,7 +509,7 @@ async fn mismatched_block_size_is_refused() {
         .unwrap()
         .unwrap();
     let live: HashSet<KvWorkerId> = workers.iter().cloned().collect();
-    let err = VettedSnapshot::from_wire(fetched, &live, Some(64), false)
+    let err = VettedSnapshot::from_wire(fetched, &live, Some(64))
         .expect_err("a block-size mismatch must be refused");
     assert_eq!(
         err,

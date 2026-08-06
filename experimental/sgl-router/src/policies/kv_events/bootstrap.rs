@@ -140,6 +140,11 @@ pub const CURSORS_ONLY_PARAM: &str = "cursors_only";
 /// sharing one walk.
 pub const PRODUCER_CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// Default upper bound on one peer-snapshot fetch; see the
+/// `bootstrap_fetch_timeout_cap_ms` field doc for the rationale, and
+/// `default_bootstrap_fetch_timeout_cap_ms`, which must agree with this.
+pub const DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP: Duration = Duration::from_secs(30);
+
 /// Per-rank bootstrap outcome.
 ///
 /// `Pending` is the only state in which the pump buffers rather than applies,
@@ -190,8 +195,9 @@ pub enum SnapshotOutcome {
     /// Peer answered but is itself still bootstrapping, so its tree is no
     /// better than ours.
     ColdPeer,
-    /// Peer answered with a snapshot we must not trust: unknown format, or a
-    /// block size / bigram flag that makes its hashes incomparable to ours.
+    /// Peer answered with a snapshot we must not trust: unknown format, an
+    /// invalid parent reference, or a block size that makes its hashes
+    /// incomparable to ours.
     Rejected,
 }
 
@@ -283,8 +289,10 @@ pub struct PeerSnapshot {
     /// Producer's established block size. Block hashes are only comparable at
     /// the same page size, so a mismatch is fatal to the snapshot.
     pub block_size: u32,
-    /// Producer's bigram flag (EAGLE-family workers hash token bigrams).
-    /// Same reasoning as `block_size`.
+    /// Producer's primary hashing mode (EAGLE-family workers hash token
+    /// bigrams), derived from its live worker set at export time. Kept for
+    /// older consumers that still vet on it; current consumers do not — see
+    /// [`VettedSnapshot::from_wire`].
     pub is_bigram: bool,
     /// Whether the producer is a tree worth copying: its own bootstrap has
     /// settled AND it actually holds nodes.
@@ -351,10 +359,6 @@ pub enum VetError {
         peer: u32,
         local: u32,
     },
-    BigramMismatch {
-        peer: bool,
-        local: bool,
-    },
     ProducerCold,
     /// The snapshot was well formed, but nothing in it survives vetting for this
     /// replica — every carrier was a worker we do not know.
@@ -382,10 +386,6 @@ impl std::fmt::Display for VetError {
             Self::BlockSizeMismatch { peer, local } => write!(
                 f,
                 "peer block_size {peer} disagrees with local {local}; block hashes are incomparable",
-            ),
-            Self::BigramMismatch { peer, local } => write!(
-                f,
-                "peer is_bigram {peer} disagrees with local {local}; block hashes are incomparable",
             ),
             Self::NothingUsable {
                 wire_nodes,
@@ -461,6 +461,27 @@ impl VettedSnapshot {
     /// Wire workers this replica does not know; see the field docs.
     pub fn dropped_workers(&self) -> usize {
         self.dropped_workers
+    }
+
+    /// The workers that survived vetting, for the consumer's graft-time
+    /// observability (mode breakdown of what it is about to copy).
+    pub(crate) fn workers(&self) -> &[KvWorkerId] {
+        &self.worker_table
+    }
+
+    /// `(carried, structure)`: nodes with at least one surviving carrier vs
+    /// carrier-less interior kept on a live path. Carried nodes are answered
+    /// by live workers whose votes selection hashes for — modulo the
+    /// vote-flip window the pump's post-restart re-introspection exists to
+    /// close, after which old-family nodes (carried or structure) linger
+    /// until evicted. Structure nodes hold no carriers, so they cannot
+    /// answer a query; a query can still bottom out on one and become a
+    /// hit-shaped miss (`matched_blocks > 0` with no owner), which is why
+    /// they are kept only on paths to a carried descendant — and why their
+    /// count is worth surfacing rather than burying inside `node_count`.
+    pub(crate) fn carrier_counts(&self) -> (usize, usize) {
+        let structure = self.nodes.iter().filter(|n| n.workers.is_empty()).count();
+        (self.nodes.len() - structure, structure)
     }
 
     /// Whether `id` survived vetting as a carrier source.
@@ -622,11 +643,21 @@ impl VettedSnapshot {
     /// `local_block_size` is `None` before any worker has established one, in
     /// which case the peer's value is accepted — there is nothing yet to
     /// contradict it, and `add_worker` will reject any worker that disagrees.
+    ///
+    /// The producer's `is_bigram` stamp is deliberately NOT vetted. Hashing
+    /// mode is a property of the publishing worker, and the live-set filter
+    /// below already drops every node whose carriers this replica does not
+    /// know — so the surviving nodes all come from workers this replica
+    /// discovered itself, whose modes it can hash for directly (unimodally,
+    /// or dual-hash in a bimodal fleet). Vetting the producer's process-wide
+    /// mode on top of that would reject snapshots whose usable payload is
+    /// perfectly comparable — e.g. during a rolling update that changes the
+    /// fleet's speculative-decoding config, when the producer exported while
+    /// the old generation was still draining.
     pub fn from_wire(
         snap: PeerSnapshot,
         live: &HashSet<KvWorkerId>,
         local_block_size: Option<u32>,
-        local_is_bigram: bool,
     ) -> Result<Self, VetError> {
         if snap.format != SNAPSHOT_FORMAT {
             return Err(VetError::UnknownFormat {
@@ -645,13 +676,6 @@ impl VettedSnapshot {
                 return Err(VetError::BlockSizeMismatch {
                     peer: snap.block_size,
                     local,
-                });
-            }
-            // Only meaningful once a local worker exists to define it.
-            if local_is_bigram != snap.is_bigram {
-                return Err(VetError::BigramMismatch {
-                    peer: snap.is_bigram,
-                    local: local_is_bigram,
                 });
             }
         }
@@ -764,6 +788,10 @@ pub struct BootstrapTracker {
     /// the bootstrap budget.
     deadline: Mutex<Option<Instant>>,
     timeout: Duration,
+    /// Upper bound on one peer-snapshot fetch within `timeout`. Carried here
+    /// so the sweep can size its HTTP client from the same configured object
+    /// as the deadline that bounds it.
+    fetch_cap: Duration,
     /// Whether peer bootstrap is configured at all (a `--kv-peer-selector` is
     /// set), as opposed to configured-and-already-finished.
     ///
@@ -822,7 +850,12 @@ pub struct BootstrapTracker {
 
 impl BootstrapTracker {
     pub fn new(timeout: Duration) -> Self {
+        Self::new_with_fetch_cap(timeout, DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP)
+    }
+
+    pub fn new_with_fetch_cap(timeout: Duration, fetch_cap: Duration) -> Self {
         Self {
+            fetch_cap,
             states: Mutex::new(HashMap::new()),
             // Armed at construction, NOT lazily at first registration.
             //
@@ -912,6 +945,12 @@ impl BootstrapTracker {
 
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Upper bound on one peer-snapshot fetch within [`Self::timeout`]; see
+    /// [`super::index::snapshot_fetch_timeout`], which combines the two.
+    pub fn fetch_cap(&self) -> Duration {
+        self.fetch_cap
     }
 
     /// Ranks added after the tracker has latched are recorded (so metrics stay
@@ -1437,7 +1476,7 @@ mod tests {
     fn vet_rejects_unknown_format() {
         let mut snap = snapshot(vec![], vec![]);
         snap.format = SNAPSHOT_FORMAT + 1;
-        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64), false).unwrap_err();
+        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64)).unwrap_err();
         assert_eq!(
             err,
             VetError::UnknownFormat {
@@ -1452,7 +1491,7 @@ mod tests {
     fn vet_rejects_cold_producer() {
         let mut snap = snapshot(vec![], vec![]);
         snap.producer_ready = false;
-        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64), false).unwrap_err();
+        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64)).unwrap_err();
         assert_eq!(err, VetError::ProducerCold);
         assert_eq!(err.outcome(), SnapshotOutcome::ColdPeer);
     }
@@ -1469,7 +1508,7 @@ mod tests {
             vec![wire_worker("http://a", 0)],
             vec![node(None, 1, vec![0]), node(Some(99), 2, vec![0])],
         );
-        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64), false)
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64))
             .expect_err("an out-of-range parent must be refused, not panic");
         assert_eq!(
             err,
@@ -1488,7 +1527,7 @@ mod tests {
             vec![wire_worker("http://a", 0)],
             vec![node(Some(1), 1, vec![0]), node(None, 2, vec![0])],
         );
-        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64), false)
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64))
             .expect_err("a forward parent must be refused");
         assert_eq!(
             err,
@@ -1510,7 +1549,7 @@ mod tests {
         );
         // The only carrier is a worker this replica has never discovered, so
         // every node becomes carrier-less and is pruned.
-        let err = VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64), false)
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64))
             .expect_err("a snapshot that prunes to nothing must be refused");
         assert_eq!(
             err,
@@ -1556,8 +1595,7 @@ mod tests {
         );
         snap.cursors = vec![(0, 7)];
         let vetted =
-            VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64), false)
-                .unwrap();
+            VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64)).unwrap();
 
         assert!(vetted.covers_any(&[KvWorkerId::new("http://known".into(), 0)]));
         assert!(
@@ -1592,8 +1630,7 @@ mod tests {
     fn vet_rejects_snapshot_with_no_nodes_even_when_producer_claims_ready() {
         let mut snap = snapshot(vec![wire_worker("http://a", 0)], vec![]);
         snap.producer_ready = true;
-        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64), false)
-            .unwrap_err();
+        let err = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap_err();
         assert_eq!(err, VetError::ProducerCold);
         assert_eq!(err.outcome(), SnapshotOutcome::ColdPeer);
     }
@@ -1601,7 +1638,7 @@ mod tests {
     #[test]
     fn vet_rejects_block_size_mismatch() {
         let snap = snapshot(vec![], vec![node(None, 1, vec![])]);
-        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(32), false).unwrap_err();
+        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(32)).unwrap_err();
         assert_eq!(
             err,
             VetError::BlockSizeMismatch {
@@ -1611,17 +1648,22 @@ mod tests {
         );
     }
 
+    /// The producer's `is_bigram` stamp is advisory, not vetted: nodes survive
+    /// only when carried by workers this replica knows, and those workers'
+    /// modes are what query hashing uses — a rolling update that migrates the
+    /// fleet between hashing modes must not make sibling snapshots
+    /// permanently rejectable.
     #[test]
-    fn vet_rejects_bigram_mismatch() {
-        let snap = snapshot(vec![], vec![node(None, 1, vec![])]);
-        let err = VettedSnapshot::from_wire(snap, &live(&[]), Some(64), true).unwrap_err();
-        assert_eq!(
-            err,
-            VetError::BigramMismatch {
-                peer: false,
-                local: true
-            }
+    fn vet_ignores_the_producer_bigram_stamp() {
+        let mut snap = snapshot(
+            vec![wire_worker("http://a", 0)],
+            vec![node(None, 1, vec![0])],
         );
+        for stamp in [false, true] {
+            snap.is_bigram = stamp;
+            VettedSnapshot::from_wire(snap.clone(), &live(&[("http://a", 0)]), Some(64))
+                .unwrap_or_else(|e| panic!("is_bigram={stamp} must not affect vetting: {e}"));
+        }
     }
 
     /// Before any worker establishes a block size there is nothing to
@@ -1632,8 +1674,7 @@ mod tests {
             vec![wire_worker("http://a", 0)],
             vec![node(None, 1, vec![0])],
         );
-        let vetted =
-            VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), None, false).unwrap();
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), None).unwrap();
         assert_eq!(vetted.worker_table.len(), 1);
     }
 
@@ -1653,7 +1694,6 @@ mod tests {
             snap,
             &live(&[("http://known", 0), ("http://known", 1)]),
             Some(64),
-            false,
         )
         .unwrap();
 
@@ -1690,14 +1730,35 @@ mod tests {
                 node(Some(1), 3, vec![0]), // the surviving carrier, at depth 3
             ],
         );
-        let vetted =
-            VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64), false).unwrap();
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
         assert_eq!(vetted.nodes.len(), 3, "path to a carrier must survive");
         assert_eq!(vetted.nodes[2].workers, vec![0]);
         // Parent links must still be backward references after any remap.
         for (i, rec) in vetted.nodes.iter().enumerate() {
             assert!(rec.parent.is_none_or(|p| (p as usize) < i));
         }
+    }
+
+    /// The graft-observability split: carried nodes are matchable, structure
+    /// nodes are match paths only. And both accessors describe the SURVIVING
+    /// population: a carrier nobody knows is already gone from the count.
+    #[test]
+    fn carrier_counts_split_carrying_nodes_from_kept_structure() {
+        let snap = snapshot(
+            vec![wire_worker("http://a", 0), wire_worker("http://drained", 0)],
+            vec![
+                node(None, 1, vec![]),        // interior on a live path: kept structure
+                node(Some(0), 2, vec![0, 1]), // carried (by both)
+                node(Some(1), 3, vec![1]),    // carried only by the drained worker
+            ],
+        );
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
+        // The drained carrier leaves the worker table; its exclusive node is
+        // pruned as a carrier-less leaf, and the shared node keeps the live
+        // worker as its only carrier.
+        assert_eq!(vetted.workers().len(), 1);
+        assert_eq!(vetted.dropped_workers(), 1);
+        assert_eq!(vetted.carrier_counts(), (1, 1));
     }
 
     /// Pruning must remap parent indices, not just drop entries.
@@ -1737,8 +1798,7 @@ mod tests {
         );
         snap.cursors = vec![(0, 42), (1, 99)];
         let vetted =
-            VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64), false)
-                .unwrap();
+            VettedSnapshot::from_wire(snap, &live(&[("http://known", 0)]), Some(64)).unwrap();
         assert_eq!(
             vetted.cursors,
             vec![(KvWorkerId::new("http://known".into(), 0), 42)],
@@ -1753,8 +1813,7 @@ mod tests {
             vec![wire_worker("http://a", 0)],
             vec![node(None, 1, vec![0, 7])],
         );
-        let vetted =
-            VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64), false).unwrap();
+        let vetted = VettedSnapshot::from_wire(snap, &live(&[("http://a", 0)]), Some(64)).unwrap();
         assert_eq!(vetted.nodes[0].workers, vec![0]);
     }
 
@@ -1771,6 +1830,19 @@ mod tests {
 
         t.set(&b, BootstrapState::Failed);
         assert!(t.settled(), "Failed is terminal — cold is a valid outcome");
+    }
+
+    #[test]
+    fn fetch_cap_round_trips_through_the_tracker() {
+        let t =
+            BootstrapTracker::new_with_fetch_cap(Duration::from_secs(120), Duration::from_secs(90));
+        assert_eq!(t.timeout(), Duration::from_secs(120));
+        assert_eq!(t.fetch_cap(), Duration::from_secs(90));
+        assert_eq!(
+            BootstrapTracker::new(Duration::from_secs(120)).fetch_cap(),
+            DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP,
+            "a tracker built without a cap takes the default",
+        );
     }
 
     #[test]

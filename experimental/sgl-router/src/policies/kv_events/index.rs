@@ -105,21 +105,25 @@ const SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE: u32 = 4;
 /// Preferred, not absolute — see [`snapshot_fetch_timeout`], which lets the
 /// deadline override it. An unconditional floor would hand a single fetch the
 /// entire budget at the default deadline, reintroducing the starvation above.
+///
+/// The CLI's `--kv-bootstrap-fetch-timeout-cap-ms` minimum mirrors this
+/// value; keep them in agreement if it moves.
 const SNAPSHOT_FETCH_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
-
-/// Cap for the per-fetch timeout, so a deliberately generous deadline (see
-/// `MAX_KV_BOOTSTRAP_TIMEOUT_MS`) still cannot let one hung peer park for
-/// minutes.
-const SNAPSHOT_FETCH_TIMEOUT_CAP: Duration = Duration::from_secs(30);
 
 /// Per-request timeout for a peer snapshot fetch, a strict fraction of the
 /// configured bootstrap budget so several peers can be tried within it.
+///
+/// `cap` (from `--kv-bootstrap-fetch-timeout-cap-ms`, default
+/// [`super::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`]) bounds the
+/// derivation, so a deliberately generous deadline (see
+/// `MAX_KV_BOOTSTRAP_TIMEOUT_MS`) still cannot let one hung peer park for
+/// minutes; raise it when the snapshot body outgrows the default budget.
 ///
 /// Derived from the CONFIGURED budget, not from the time a given sweep has left:
 /// a later sweep running on a shrunken remainder still carries this value, so it
 /// bounds the search less tightly than the first sweep. Recomputing per sweep
 /// would need the client rebuilt per sweep, which costs a connection pool.
-fn snapshot_fetch_timeout(deadline: Duration) -> Duration {
+pub(crate) fn snapshot_fetch_timeout(deadline: Duration, cap: Duration) -> Duration {
     // A pre-settled (bootstrap-disabled) tracker reports a zero deadline. The
     // client is still built, and a zero reqwest timeout means "expire
     // immediately" rather than "no timeout", so fall back to the floor.
@@ -128,9 +132,11 @@ fn snapshot_fetch_timeout(deadline: Duration) -> Duration {
     }
     // The floor yields to the deadline rather than overriding it. The default
     // budget equals the floor, so an unconditional floor would make every
-    // default-configured router spend its whole deadline on one peer.
-    let floor = SNAPSHOT_FETCH_TIMEOUT_FLOOR.min(deadline / 2);
-    (deadline / SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE).clamp(floor, SNAPSHOT_FETCH_TIMEOUT_CAP)
+    // default-configured router spend its whole deadline on one peer. It also
+    // yields to the cap, so a below-floor cap degrades to itself instead of
+    // panicking `clamp`.
+    let floor = SNAPSHOT_FETCH_TIMEOUT_FLOOR.min(deadline / 2).min(cap);
+    (deadline / SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE).clamp(floor, cap)
 }
 
 /// How long a grafted rank may wait for its own live stream to prove the splice
@@ -735,7 +741,10 @@ impl KvEventIndex {
         // `snapshot_fetch_timeout`. The sweep bounds the whole search, but only a
         // shorter per-request bound lets it reach a second candidate.
         let snapshot_http = reqwest::Client::builder()
-            .timeout(snapshot_fetch_timeout(bootstrap.timeout()))
+            .timeout(snapshot_fetch_timeout(
+                bootstrap.timeout(),
+                bootstrap.fetch_cap(),
+            ))
             .build()
             .unwrap_or_else(|_| http.clone());
         let tree = Arc::new(HashTree::new());
@@ -756,6 +765,8 @@ impl KvEventIndex {
                 cursors: cursors.clone(),
                 live_workers: live_workers.clone(),
                 bootstrap: bootstrap.clone(),
+                oracle: Arc::clone(&block_size_oracle),
+                http: http.clone(),
                 peers: Arc::clone(&peers),
                 snapshot_http: snapshot_http.clone(),
                 bootstrap_tx: bootstrap_tx.clone(),
@@ -1161,10 +1172,10 @@ impl KvEventIndex {
             );
             return;
         }
-        // Establish the bigram flag alongside block_size. EAGLE-family workers
-        // hash KV blocks over token bigrams, so the policy must use the bigram
-        // hasher for its query hashes to match the worker's stored hashes.
-        self.block_size_oracle.set_bigram(cfg.is_bigram);
+        // The worker's hashing mode is reported to the oracle below, at the
+        // registration-commit point. EAGLE-family workers hash KV blocks over
+        // token bigrams, so the policy must use the bigram hasher for its
+        // query hashes to match the worker's stored hashes.
         info!(
             worker_url = %worker_url,
             dp_size = cfg.dp_size,
@@ -1211,6 +1222,12 @@ impl KvEventIndex {
         } else {
             Vec::new()
         };
+        // Registration commits here: the worker's hashing mode joins the
+        // oracle's live registry together with its worker entry, so every
+        // early return above leaves the mode registry untouched (the block
+        // size latch may already have been published by `try_set`).
+        self.block_size_oracle
+            .report_worker(worker_url, cfg.is_bigram);
         self.workers.lock().insert(
             worker_url.to_string(),
             WorkerEntry {
@@ -1321,6 +1338,11 @@ impl KvEventIndex {
         let Some(entry) = self.workers.lock().remove(worker_url) else {
             return;
         };
+        // The oracle vote drops WITH the entry, not at the end of teardown:
+        // this function awaits below, and placing the forget after those
+        // awaits would let a same-URL worker re-added in the window have its
+        // fresh vote deleted when this task resumes.
+        self.block_size_oracle.forget_worker(worker_url);
         let ids: Vec<KvWorkerId> = entry
             .dp_ranks
             .iter()
@@ -1589,12 +1611,12 @@ async fn sweep_peers(
         oracle,
         freshness_floor,
     } = ctx;
-    // Do not vet a snapshot against a partially published local hash config:
-    // accepting unigram state during the block-size/bigram registration
-    // window would permanently graft incomparable hashes into an EAGLE tree.
-    let (local_block_size, local_is_bigram) = oracle.hash_config()?;
+    // The vet needs only the local block size: block hashes at different
+    // page sizes can never share a tree. Hashing mode is deliberately not
+    // vetted — see `VettedSnapshot::from_wire`.
+    let local_block_size = oracle.get()?;
     for peer in peers.candidates() {
-        // A format / block-size / bigram mismatch is a stable property of that
+        // A format / block-size mismatch is a stable property of that
         // peer for the life of the process, so re-downloading its whole tree on
         // every 250ms pass cannot change the answer — it just loads a replica
         // that is itself booting.
@@ -1642,7 +1664,7 @@ async fn sweep_peers(
         // Snapshot the live set at vet time so a peer cannot introduce a worker
         // this replica has not discovered.
         let live = live_workers.lock().clone();
-        match VettedSnapshot::from_wire(snap, &live, Some(local_block_size), local_is_bigram) {
+        match VettedSnapshot::from_wire(snap, &live, Some(local_block_size)) {
             Ok(vetted) => {
                 // Vetting only proves the snapshot is well formed and hash-
                 // comparable. It can still know nothing about the ranks we are
@@ -1658,11 +1680,29 @@ async fn sweep_peers(
                     cooldown.insert(peer.clone(), PEER_COOLDOWN_PASSES);
                     continue;
                 }
+                // How much of the copy can steer a selection: carried nodes
+                // hash under a mode their carriers voted at fetch time;
+                // structure nodes are match paths only. An `unvoted` carrier
+                // means the vote left the registry between vet and accept
+                // (a removal interleaved). See `VettedSnapshot`'s
+                // `carrier_counts`.
+                let (carried, structure) = vetted.carrier_counts();
+                let (bigram, unigram, unvoted) =
+                    vetted.workers().iter().fold((0, 0, 0), |(b, u, x), w| {
+                        match oracle.vote_of(&w.url) {
+                            Some(true) => (b + 1, u, x),
+                            Some(false) => (b, u + 1, x),
+                            None => (b, u, x + 1),
+                        }
+                    });
                 info!(
                     peer = %peer,
                     nodes = vetted.node_count(),
+                    carried_nodes = carried,
+                    structure_nodes = structure,
                     workers = vetted.worker_count(),
                     dropped_workers = vetted.dropped_workers(),
+                    carrier_votes = %format!("{bigram} bigram / {unigram} unigram / {unvoted} unvoted"),
                     "kv-bootstrap: snapshot accepted; handing to pump",
                 );
                 bootstrap.record_peer_outcome(SnapshotOutcome::Accepted, &peer, None);
@@ -1699,6 +1739,14 @@ struct PumpDeps {
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     bootstrap: Arc<BootstrapTracker>,
+    /// Fleet-mode registry the pump refreshes after a publisher reset (see
+    /// `spawn_mode_recheck`), and the `/server_info` client for that fetch —
+    /// distinct from `snapshot_http`, which pulls peer snapshot bodies.
+    /// Oracle writes deliberately bypass `ctrl_tx`: the oracle has its own
+    /// concurrency semantics; the single-writer rule covers tree/cursor/load
+    /// state only.
+    oracle: Arc<BlockSizeOracle>,
+    http: reqwest::Client,
     /// Peer set and client for the splice probe; see `spawn_splice_probe`. The
     /// pump does not fetch snapshots for bootstrap itself — only this one
     /// question, about state it already grafted.
@@ -1710,6 +1758,100 @@ struct PumpDeps {
     /// Loopback into this pump's own control channel, so a probe answer arrives
     /// on the single writer like every other tree mutation.
     ctrl_tx: mpsc::Sender<PumpControl>,
+}
+
+/// Re-introspect one worker's hashing mode after its publisher restarted.
+///
+/// Runs detached: an HTTP round-trip must never stall the single writer. No
+/// coalescing beyond the natural one-task-per-`PublisherReset` granularity —
+/// a worker restart resets all its ranks, and a handful of concurrent
+/// `/server_info` GETs is cheaper than bookkeeping to merge them.
+///
+/// The write is fenced the same way `PumpControl::ApplySnapshot` is: the
+/// rank epoch is captured at spawn and rechecked before reporting, alongside
+/// a live-set membership test. Without that gate a fetch that outlives
+/// `remove_worker` (up to the full retry budget) would resurrect a vote for
+/// a dead worker — with no future `forget_worker` to erase it — and a fetch
+/// from an older incarnation could overwrite a re-added worker's fresh vote.
+/// Trackers with no registered epochs (peer bootstrap disabled) fence on the
+/// live set alone.
+fn spawn_mode_recheck(
+    http: &reqwest::Client,
+    oracle: &Arc<BlockSizeOracle>,
+    live_workers: &Arc<Mutex<HashSet<KvWorkerId>>>,
+    bootstrap: &Arc<BootstrapTracker>,
+    worker: &KvWorkerId,
+) {
+    let http = http.clone();
+    let oracle = Arc::clone(oracle);
+    let live_workers = Arc::clone(live_workers);
+    let bootstrap = Arc::clone(bootstrap);
+    let id = worker.clone();
+    let url = worker.url.clone();
+    let epoch = bootstrap.epoch_of(&id);
+    tokio::spawn(async move {
+        let cfg = match fetch_event_config(&url, &http).await {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => {
+                // The worker answered: it no longer publishes KV events.
+                // Keep the vote — removal is the manager's call.
+                info!(
+                    worker_url = %url,
+                    "kv-events: worker stopped publishing KV events across its restart; \
+                     keeping the vote until removal",
+                );
+                return;
+            }
+            Err(e) => {
+                // Unreachable or a definitive HTTP failure: a fetch that
+                // cannot answer must not re-shape the fleet.
+                warn!(
+                    worker_url = %url,
+                    error = %e,
+                    "kv-events: post-restart mode re-introspection failed; keeping the vote",
+                );
+                return;
+            }
+        };
+        // Fence the write (see the fn doc): only land a vote that the
+        // worker's CURRENT incarnation can still claim.
+        if bootstrap.epoch_of(&id) != epoch {
+            debug!(
+                worker_url = %url,
+                "kv-events: mode re-introspection skipped; the rank changed incarnation mid-fetch",
+            );
+            return;
+        }
+        if !live_workers.lock().iter().any(|r| r.url == url) {
+            debug!(
+                worker_url = %url,
+                "kv-events: mode re-introspection skipped; the worker was removed mid-fetch",
+            );
+            return;
+        }
+        if let Some(established) = oracle.get() {
+            if established != cfg.block_size {
+                warn!(
+                    worker_url = %url,
+                    established_block_size = established,
+                    worker_block_size = cfg.block_size,
+                    "kv-events: restarted worker's page_size disagrees with the fleet; its \
+                     entries will never match queries — re-register it at the fleet page size",
+                );
+            }
+        }
+        let previous = oracle.vote_of(&url);
+        if previous != Some(cfg.is_bigram) {
+            warn!(
+                worker_url = %url,
+                previous = ?previous,
+                is_bigram = cfg.is_bigram,
+                "kv-events: worker hashing mode changed across a publisher restart; \
+                 updating its vote in the fleet view",
+            );
+        }
+        oracle.report_worker(&url, cfg.is_bigram);
+    });
 }
 
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
@@ -1732,6 +1874,8 @@ async fn pump_loop(
         cursors,
         live_workers,
         bootstrap,
+        oracle,
+        http,
         peers,
         snapshot_http,
         bootstrap_tx,
@@ -2002,6 +2146,15 @@ async fn pump_loop(
                         "kv-events pump: publisher reset; cursor cleared",
                     );
                 }
+                // A reset also means the engine process restarted — possibly
+                // with different speculative-decoding config. Discovery only
+                // notices restarts that change its entry (pod replacement, a
+                // readiness toggle, Removed→Added); a silent in-place restart
+                // (same pod UID/IP, or static worker-urls) emits nothing, so
+                // the pump re-introspects the vote itself. Note resets only
+                // follow a graceful publisher shutdown; a crash restart
+                // surfaces as a stream gap handled by the gap path instead.
+                spawn_mode_recheck(&http, &oracle, &live_workers, &bootstrap, &worker);
             }
             WorkerEvent::Batch { worker, seq, batch } => {
                 // A rank still awaiting its snapshot holds its batches: applying
@@ -2634,18 +2787,18 @@ mod tests {
     /// equal to the deadline lets the first unresponsive peer starve every other
     /// candidate and the replica boots cold with warm peers still unqueried.
     ///
-    /// The deadline set below spans the CONFIGURED DEFAULT upward. An earlier
-    /// version of this test started at 10s, which is above the floor and so could
-    /// not observe that the floor swallowed the division at the default — the one
+    /// The deadlines below span the CONFIGURED DEFAULT upward; the default is
+    /// the one case where the floor, not the divisor, shapes the answer — the
     /// value every unconfigured router actually runs with.
     #[test]
     fn snapshot_fetch_timeout_is_a_strict_fraction_of_every_nonzero_deadline() {
+        use crate::policies::kv_events::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP as CAP;
         let default_secs = crate::config::types::default_bootstrap_timeout_ms() / 1_000;
         assert_eq!(default_secs, 5, "test's premise: the default budget is 5s");
 
         for deadline_secs in [1, 2, default_secs, 6, 10, 20, 30, 60, 120, 600] {
             let deadline = Duration::from_secs(deadline_secs);
-            let per_fetch = snapshot_fetch_timeout(deadline);
+            let per_fetch = snapshot_fetch_timeout(deadline, CAP);
             assert!(
                 per_fetch < deadline,
                 "a single fetch may not consume the whole {deadline_secs}s deadline \
@@ -2660,14 +2813,48 @@ mod tests {
         // Above the floor the divisor governs, so the budget buys the full
         // attempt count rather than merely two.
         assert_eq!(
-            snapshot_fetch_timeout(Duration::from_secs(120)) * SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE,
+            snapshot_fetch_timeout(Duration::from_secs(120), CAP)
+                * SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE,
             Duration::from_secs(120),
         );
         // A pre-settled (bootstrap-disabled) tracker reports a zero deadline, where
         // a derived value would be zero — an immediate expiry, not "no timeout".
         assert_eq!(
-            snapshot_fetch_timeout(Duration::ZERO),
+            snapshot_fetch_timeout(Duration::ZERO, CAP),
             SNAPSHOT_FETCH_TIMEOUT_FLOOR,
+        );
+    }
+
+    /// The configurable cap binds a deadline that would otherwise derive
+    /// above it, yields to storage-heavy fleets that need more per fetch,
+    /// and never panics when misconfigured below the floor.
+    #[test]
+    fn snapshot_fetch_timeout_honours_the_configured_cap() {
+        // A 10-minute deadline would derive 150s per fetch; the default cap
+        // holds it at 30s, and a raised cap takes over exactly at its value.
+        use crate::policies::kv_events::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP as CAP;
+        assert_eq!(snapshot_fetch_timeout(Duration::from_secs(600), CAP), CAP);
+        assert_eq!(
+            snapshot_fetch_timeout(Duration::from_secs(600), Duration::from_secs(90)),
+            Duration::from_secs(90),
+            "the raised cap must not itself be exceeded",
+        );
+        assert_eq!(
+            snapshot_fetch_timeout(Duration::from_secs(600), Duration::from_secs(400)),
+            Duration::from_secs(150),
+            "above the derivation the cap stops binding",
+        );
+        // A cap below the floor degrades to the cap itself rather than
+        // panicking `clamp` — the CLI rejects this, but the math stays safe
+        // for any path that skips it.
+        assert_eq!(
+            snapshot_fetch_timeout(Duration::from_secs(120), Duration::from_secs(2)),
+            Duration::from_secs(2),
+        );
+        // And the default constant must not drift from the config default.
+        assert_eq!(
+            CAP,
+            Duration::from_millis(crate::config::types::default_bootstrap_fetch_timeout_cap_ms()),
         );
     }
 
@@ -2734,7 +2921,7 @@ mod tests {
     async fn cursors_only_body_carries_cursors_and_no_nodes() {
         let oracle = BlockSizeOracle::new();
         oracle.try_set(256).expect("first set establishes");
-        oracle.set_bigram(false);
+        oracle.report_worker("http://w1:30000", false);
         let index =
             KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
         let w = worker_id("http://w1:30000", 0);
@@ -2770,6 +2957,28 @@ mod tests {
         );
     }
 
+    /// The wire stamp for older consumers must be the majority-derived
+    /// primary: a bigram-majority fleet stamps `is_bigram: true`, so an old
+    /// router build that still vets the stamp agrees with this replica's
+    /// query hashing.
+    #[tokio::test]
+    async fn snapshot_stamps_the_majority_derived_hashing_mode() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(256).expect("first set establishes");
+        oracle.report_worker("http://w1:30000", true);
+        oracle.report_worker("http://w2:30000", true);
+        oracle.report_worker("http://w3:30000", false);
+        let index =
+            KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
+
+        let body = index.peer_cursors_body();
+        let snap: PeerSnapshot = serde_json::from_slice(&body).expect("valid JSON");
+        assert!(
+            snap.is_bigram,
+            "the stamp must track the majority-derived primary (2 bigram vs 1 unigram)",
+        );
+    }
+
     /// A replica with an empty tree must not claim to be worth believing, for the
     /// same reason `snapshot_entry` checks it: a replica whose own bootstrap timed
     /// out is settled while holding nothing.
@@ -2777,7 +2986,7 @@ mod tests {
     async fn cursors_only_body_reports_not_ready_with_an_empty_tree() {
         let oracle = BlockSizeOracle::new();
         oracle.try_set(256).expect("first set establishes");
-        oracle.set_bigram(false);
+        oracle.report_worker("http://w1:30000", false);
         let index =
             KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
 
@@ -2856,7 +3065,7 @@ mod tests {
     async fn the_cursors_only_table_keeps_witnesses_the_full_export_loses() {
         let oracle = BlockSizeOracle::new();
         oracle.try_set(256).expect("first set establishes");
-        oracle.set_bigram(false);
+        oracle.report_worker("http://w1:30000", false);
         let index =
             KvEventIndex::new_with_http_and_oracle(reqwest::Client::new(), Arc::clone(&oracle));
         let cleared = worker_id("http://w1:30000", 0);
@@ -2921,6 +3130,50 @@ mod tests {
                 .collect(),
             nodes: Vec::new(),
         }
+    }
+
+    /// Spin an axum `/server_info` and return `(base_url, hits, release)`:
+    /// `hits` ticks once per request, and `body["status"]` steers the reply —
+    /// `503` answers 503 with an empty body (a retriable failure), `"hold"`
+    /// parks the reply until `release.notify_waiters()`, anything else
+    /// answers 200 with the body (steering key removed).
+    async fn serve_server_info(
+        mut body: serde_json::Value,
+    ) -> (String, mpsc::Receiver<()>, Arc<tokio::sync::Notify>) {
+        let (hits_tx, hits_rx) = mpsc::channel(8);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_in_handler = Arc::clone(&release);
+        let status = body
+            .as_object_mut()
+            .expect("server_info body is a JSON object")
+            .remove("status")
+            .unwrap_or(serde_json::json!(200));
+        let hold = status == "hold";
+        let retriable = status == 503;
+        let app = axum::Router::new().route(
+            "/server_info",
+            axum::routing::get(move || {
+                let hits_tx = hits_tx.clone();
+                let release = Arc::clone(&release_in_handler);
+                let body = body.clone();
+                async move {
+                    let _ = hits_tx.send(()).await;
+                    if hold {
+                        release.notified().await;
+                    }
+                    let status = if retriable {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    (status, axum::Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hits_rx, release)
     }
 
     /// Serve one canned body on the real snapshot path, recording the query
@@ -3131,6 +3384,10 @@ mod tests {
         ctrl_tx: mpsc::Sender<PumpControl>,
         /// Obligations the pump handed back, e.g. a gap-driven retry.
         bootstrap_rx: mpsc::Receiver<ObligationBatch>,
+        /// The vote registry the pump re-introspects into on `PublisherReset`.
+        /// Read only by tests that drive that path.
+        #[allow(dead_code)]
+        oracle: Arc<BlockSizeOracle>,
     }
 
     /// Build a tree + cursors + live-set wired through `pump_loop` with
@@ -3156,6 +3413,7 @@ mod tests {
         let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
         // Real queue so a gap-driven re-queue is observable rather than dropped.
         let (bootstrap_tx, bootstrap_rx) = mpsc::channel(16);
+        let oracle = BlockSizeOracle::new();
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
                 tree: tree.clone(),
@@ -3163,6 +3421,8 @@ mod tests {
                 cursors: cursors.clone(),
                 live_workers: live_set.clone(),
                 bootstrap: bootstrap.clone(),
+                oracle: Arc::clone(&oracle),
+                http: reqwest::Client::new(),
                 // Empty peer set: a splice probe finds no witness and returns
                 // `Unknown`, so these tests exercise the pump's own gates without
                 // any network. Probe verdicts are driven directly instead.
@@ -3185,6 +3445,7 @@ mod tests {
             pump,
             ctrl_tx,
             bootstrap_rx,
+            oracle,
         }
     }
 
@@ -4318,6 +4579,115 @@ mod tests {
         assert_eq!(h.cursors.lock().get(&id).copied(), Some(1));
     }
 
+    /// A reset means the engine restarted, and its speculative-decoding
+    /// config may have changed with it — when discovery emits nothing for it
+    /// (silent in-place restart), the pump re-introspects the vote itself.
+    #[tokio::test]
+    async fn pump_publisher_reset_rechecks_the_workers_mode_vote() {
+        let (url, _hits, _release) = serve_server_info(serde_json::json!({
+            "status": 200,
+            "speculative_algorithm": "EAGLE3",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "127.0.0.1",
+                "endpoint_port_base": 19557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            },
+        }))
+        .await;
+        let id = worker_id(&url, 0);
+
+        let h = spawn_pump(std::slice::from_ref(&id));
+        // The pre-restart fleet view: this worker votes unigram.
+        h.oracle.report_worker(&url, false);
+        h.tx.send(WorkerEvent::PublisherReset { worker: id.clone() })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if h.oracle.vote_of(&url) == Some(true) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reset must trigger a re-introspection that flips the vote");
+    }
+
+    /// A recheck that gets no usable answer must leave the vote alone — and
+    /// the assertion is fenced by the fetch's full retry budget arriving at
+    /// the fake, so it cannot pass merely because the task is still running.
+    #[tokio::test]
+    async fn pump_recheck_keeps_the_vote_when_unanswered() {
+        let (url, mut hits, _release) = serve_server_info(serde_json::json!({"status": 503})).await;
+        let id = worker_id(&url, 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        h.oracle.report_worker(&url, true);
+        h.tx.send(WorkerEvent::PublisherReset { worker: id.clone() })
+            .await
+            .unwrap();
+        // A 5xx is retriable, so the fetch burns its whole 3-attempt budget
+        // (`FETCH_MAX_ATTEMPTS` in discovery) before the detached task can
+        // reach the vote path at all.
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(5), hits.recv())
+                .await
+                .expect("a retriable answer must exhaust the retry budget")
+                .expect("the fake outlives the test");
+        }
+        assert_eq!(
+            h.oracle.vote_of(&url),
+            Some(true),
+            "an unanswered recheck must not erase the vote",
+        );
+    }
+
+    /// The fence: a recheck whose fetch outlives the worker's removal must
+    /// not re-insert a vote the teardown already erased — no later
+    /// `forget_worker` will ever clean a resurrected one.
+    #[tokio::test]
+    async fn pump_recheck_does_not_resurrect_a_removed_workers_vote() {
+        let spec = serde_json::json!({
+            "status": "hold",
+            "speculative_algorithm": "EAGLE3",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "127.0.0.1",
+                "endpoint_port_base": 19557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            },
+        });
+        let (url, mut hits, release) = serve_server_info(spec).await;
+        let id = worker_id(&url, 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        h.oracle.report_worker(&url, false);
+        h.tx.send(WorkerEvent::PublisherReset { worker: id.clone() })
+            .await
+            .unwrap();
+        // The fetch is in flight against the held fake; the worker leaves
+        // discovery before the answer arrives.
+        tokio::time::timeout(Duration::from_secs(5), hits.recv())
+            .await
+            .expect("the fetch must have started")
+            .expect("the fake outlives the test");
+        h.live_set.lock().remove(&id);
+        release.notify_waiters();
+        // The recheck now completes: without the fence its bigram answer
+        // would flip the vote severed from any live worker.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            h.oracle.vote_of(&url),
+            Some(false),
+            "a recheck landing after removal must not resurrect the vote",
+        );
+    }
+
     /// S10: a reset while still Pending must bail the rank to cold.
     ///
     /// Post-reset seq 1 can never exceed the peer's watermark, so the gap check
@@ -4790,6 +5160,11 @@ mod tests {
             0,
             "mismatched worker must not be registered"
         );
+        assert_eq!(
+            index.block_size_oracle().hash_config(),
+            None,
+            "a rejected worker must not vote in the fleet hashing mode",
+        );
         index.shutdown().await;
     }
 
@@ -4824,20 +5199,97 @@ mod tests {
         // select() picks the bigram hasher for EAGLE workers.
         let index = KvEventIndex::new();
         assert!(!index.block_size_oracle().is_bigram());
-        // dp_size=0 short-circuits the subscriber spawn but still runs the seed.
         let cfg = EventConfig {
             host: "127.0.0.1".into(),
             port_base: 30300,
             topic: String::new(),
             load_port_base: None,
             block_size: 64,
-            dp_size: 0,
+            dp_size: 1,
             is_bigram: true,
         };
         index.add_worker("http://127.0.0.1:30300", Some(cfg)).await;
         assert!(
             index.block_size_oracle().is_bigram(),
             "add_worker must seed the bigram flag from EventConfig"
+        );
+        index.shutdown().await;
+    }
+
+    /// A worker that yields zero usable ranks exits before the registration
+    /// commit point. Its block size may stay (page size is fleet-wide either
+    /// way), but it must NOT vote in the hashing mode: a rank-less worker
+    /// publishes nothing, so its vote would skew selection toward a family
+    /// that never carries a node.
+    #[tokio::test]
+    async fn add_worker_with_no_usable_ranks_leaves_no_mode_vote() {
+        let index = KvEventIndex::new();
+        let cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 30400,
+            topic: String::new(),
+            load_port_base: None,
+            block_size: 64,
+            dp_size: 0,
+            is_bigram: true,
+        };
+        index.add_worker("http://127.0.0.1:30400", Some(cfg)).await;
+        assert_eq!(
+            index.block_size_oracle().hash_config(),
+            None,
+            "a zero-rank worker must not vote in the fleet hashing mode",
+        );
+        index.shutdown().await;
+    }
+
+    /// The rolling-update scenario through the real wiring: as the old
+    /// (EAGLE) generation drains out of discovery, the derived fleet mode
+    /// must converge with it — a vote left behind reruns the incident this
+    /// registry exists to prevent.
+    #[tokio::test]
+    async fn remove_worker_converges_the_fleet_hashing_mode() {
+        let index = KvEventIndex::new();
+        let cfg = |port_base: u16, is_bigram: bool| EventConfig {
+            host: "127.0.0.1".into(),
+            port_base,
+            topic: String::new(),
+            load_port_base: None,
+            block_size: 64,
+            dp_size: 1,
+            is_bigram,
+        };
+        let (eagle1, eagle2, dspark) = (
+            "http://127.0.0.1:30501",
+            "http://127.0.0.1:30502",
+            "http://127.0.0.1:30503",
+        );
+        index.add_worker(eagle1, Some(cfg(30501, true))).await;
+        index.add_worker(eagle2, Some(cfg(30502, true))).await;
+        index.add_worker(dspark, Some(cfg(30503, false))).await;
+        assert_eq!(
+            index.block_size_oracle().hash_config(),
+            Some((64, true)),
+            "bigram majority while the old generation dominates",
+        );
+        assert!(index.block_size_oracle().is_bimodal());
+
+        index.remove_worker(eagle1).await;
+        index.remove_worker(eagle2).await;
+        assert!(
+            !index.block_size_oracle().is_bimodal(),
+            "the drained generation must stop making the fleet bimodal",
+        );
+        assert_eq!(
+            index.block_size_oracle().hash_config(),
+            Some((64, false)),
+            "the fleet converges to unigram with the surviving worker",
+        );
+
+        index.remove_worker(dspark).await;
+        assert_eq!(
+            index.block_size_oracle().hash_config(),
+            None,
+            "an empty fleet is unknown, not unigram",
         );
         index.shutdown().await;
     }

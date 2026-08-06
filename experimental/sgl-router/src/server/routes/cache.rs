@@ -497,7 +497,7 @@ mod tests {
 
         let oracle = BlockSizeOracle::new();
         oracle.try_set(256).expect("first set establishes");
-        oracle.set_bigram(false);
+        oracle.report_worker("http://w1:30000", false);
         let index = crate::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
             Client::new(),
             Arc::clone(&oracle),
@@ -566,7 +566,7 @@ mod tests {
 
         let oracle = BlockSizeOracle::new();
         oracle.try_set(256).expect("first set establishes");
-        oracle.set_bigram(false);
+        oracle.report_worker("http://w1:30000", false);
         let index = crate::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
             Client::new(),
             Arc::clone(&oracle),
@@ -599,7 +599,7 @@ mod tests {
 
         let live = std::collections::HashSet::new();
         assert_eq!(
-            VettedSnapshot::from_wire(snap, &live, Some(256), false).unwrap_err(),
+            VettedSnapshot::from_wire(snap, &live, Some(256)).unwrap_err(),
             VetError::ProducerCold,
             "an empty node list must be refused as a graft source",
         );

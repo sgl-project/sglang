@@ -502,6 +502,15 @@ pub struct CacheAwareConfig {
     /// serves anyway with whatever it has — a cold fleet has no warm sibling to
     /// ask, so a gate without a deadline would never open.
     pub bootstrap_timeout_ms: u64,
+    /// Upper bound on a single peer-snapshot fetch. The per-fetch timeout is
+    /// derived as a quarter of `bootstrap_timeout_ms` (raised toward a
+    /// 5s floor for short budgets) so several peers can be tried within one
+    /// deadline; this caps that derivation, so a generous deadline cannot
+    /// let one hung peer park for minutes.
+    ///
+    /// Raise it when the fleet's tree is large enough that one transfer +
+    /// decode of the snapshot body no longer fits under the derived value.
+    pub bootstrap_fetch_timeout_cap_ms: u64,
     /// Candidates sampled for each min-load fallback pick: the pick is the
     /// least-loaded of this many uniformly random eligible workers, not the
     /// fleet-wide minimum. Default 2 (power-of-two choices), which damps the
@@ -518,6 +527,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             load_gate: LoadGate::default(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
+            bootstrap_fetch_timeout_cap_ms: default_bootstrap_fetch_timeout_cap_ms(),
             min_load_choices: default_min_load_choices(),
         }
     }
@@ -536,11 +546,19 @@ fn default_balance_rel() -> f32 {
 /// 5s: long enough for a peer fetch plus a multi-MB snapshot graft, short
 /// enough to sit inside a normal readinessProbe budget.
 ///
-/// `pub(crate)` so the per-fetch timeout derived from it can be tested AT this
-/// value — an earlier test covered only deadlines above the floor and so missed
-/// that the default was the one budget the derivation mishandled.
+/// `pub(crate)` so the per-fetch derivation can be tested AT this value —
+/// the default budget sits exactly at the fetch floor, the one case a test
+/// that only covers above-floor deadlines cannot see.
 pub(crate) fn default_bootstrap_timeout_ms() -> u64 {
     5_000
+}
+
+/// 30s: comfortably past one gzipped transfer + decode of a snapshot body,
+/// small enough that a generous `--kv-bootstrap-timeout-ms` cannot park the
+/// sweep on one hung peer (see the field doc). Must agree with
+/// `DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`; a test pins the two.
+pub(crate) fn default_bootstrap_fetch_timeout_cap_ms() -> u64 {
+    30_000
 }
 
 fn default_min_load_choices() -> usize {

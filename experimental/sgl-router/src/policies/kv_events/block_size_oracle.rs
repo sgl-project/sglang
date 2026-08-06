@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-shared per-(cache-aware-zmq) `block_size`, sourced from the
-//! workers themselves.
+//! Process-shared per-(cache-aware-zmq) hashing configuration, derived from
+//! the workers themselves.
 //!
 //! # Why an oracle instead of a config field?
 //!
@@ -23,42 +23,42 @@
 //! through `KvEventIndex::add_worker`; that refactor can land later
 //! without changing the oracle's public surface.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Tri-state for the bigram flag: distinguishes "not yet reported" from an
-/// established `false`, so [`BlockSizeOracle::set_bigram`] can be first-wins
-/// (matching `try_set`) rather than last-writer-wins.
-const BIGRAM_UNKNOWN: u8 = 0;
-const BIGRAM_UNIGRAM: u8 = 1;
-const BIGRAM_BIGRAM: u8 = 2;
+use parking_lot::Mutex;
 
-/// First-wins, idempotent block-size publisher.
+/// First-wins, idempotent block-size publisher, plus the fleet's KV-block
+/// hashing mode **derived from the live worker set**.
 ///
-/// Internally an `AtomicU32` where 0 means "not yet known". Use
-/// [`Self::try_set`] to publish a worker-reported value and
-/// [`Self::get`] to read at routing time.
+/// `block_size` is a first-wins latch ([`Self::try_set`]): workers must all
+/// agree on a page size, so a mismatch is operator error reported loudly at
+/// registration.
 ///
-/// Also carries a `bigram` flag — EAGLE-family workers hash KV blocks over
-/// token bigrams, so the policy must pick the bigram hasher. The **primary**
-/// mode (`bigram`) is established first-wins, mirroring `try_set`, and is what
-/// `hash_config` / `is_bigram` report — the peer-snapshot prewarm protocol
-/// vets replicas against it, so it must stay a single stable value.
+/// The hashing *mode* is different: EAGLE-family workers hash KV blocks over
+/// token bigrams while everyone else hashes unigrams, and which modes the
+/// fleet carries is a property of the **currently live workers**, not of
+/// history. Deriving it from a per-worker registry keeps it accurate during a
+/// rolling update that changes speculative-decoding config: every replica that
+/// sees the same live set derives the same mode, the mode converges as the old
+/// generation drains out of service discovery, and the peer-snapshot stamp
+/// (`hash_config`) tracks the live fleet instead of permanently carrying
+/// whichever worker happened to register first.
 ///
 /// A heterogeneous fleet (EAGLE-family + non-EAGLE workers behind one base
-/// model — e.g. an EAGLE3 fleet with a DSPARK canary) is no longer treated as
-/// pure misconfiguration: the second mode's arrival is recorded in
-/// `secondary_seen` so [`Self::is_bimodal`] reports it, and the selection path
-/// dual-hashes queries (hashing each request both ways and unioning the
-/// eligible owners) so neither family loses cache affinity. `block_size` must
-/// still agree across the fleet; only the hashing *mode* may differ.
+/// model) is supported: [`Self::is_bimodal`] reports both modes present and
+/// the selection path dual-hashes queries so neither family loses cache
+/// affinity. `block_size` must still agree across the fleet; only the hashing
+/// *mode* may differ.
 #[derive(Debug, Default)]
 pub struct BlockSizeOracle {
     value: AtomicU32,
-    bigram: AtomicU8,
-    /// Latched `true` once a worker registers with the opposite hashing mode
-    /// from the established primary — i.e. the fleet is bimodal.
-    secondary_seen: AtomicBool,
+    /// Live per-worker hashing modes, keyed by worker URL. The derived
+    /// primary mode is the majority, with ties broken toward unigram — any
+    /// deterministic rule would do; this one only matters so that two
+    /// replicas holding the same live set derive the same value.
+    modes: Mutex<HashMap<String, bool>>,
 }
 
 /// Returned by [`BlockSizeOracle::try_set`] when the candidate disagrees
@@ -67,6 +67,17 @@ pub struct BlockSizeOracle {
 pub struct BlockSizeMismatch {
     pub established: u32,
     pub candidate: u32,
+}
+
+/// The mode pair derived from a worker-mode map: `(primary, bimodal)`.
+/// `None` when no worker is registered; primary is the majority mode.
+fn derive(modes: &HashMap<String, bool>) -> Option<(bool, bool)> {
+    if modes.is_empty() {
+        return None;
+    }
+    let bigrams = modes.values().filter(|&&m| m).count();
+    let unigrams = modes.len() - bigrams;
+    Some((bigrams > unigrams, bigrams > 0 && unigrams > 0))
 }
 
 impl BlockSizeOracle {
@@ -87,83 +98,105 @@ impl BlockSizeOracle {
         }
     }
 
-    /// Publish whether a registering worker uses bigram (EAGLE-family) KV-block
-    /// hashing. Called from `KvEventIndex::add_worker` alongside `try_set`.
+    /// Publish a live worker's hashing mode. Called from
+    /// `KvEventIndex::add_worker` alongside `try_set`, and from the pump's
+    /// post-restart re-introspection (`spawn_mode_recheck`); re-reporting
+    /// overwrites the previous vote (a restarted worker may have changed
+    /// speculative-decoding config).
     ///
-    /// The **primary** mode is first-wins (the first worker establishes what
-    /// `hash_config` / `is_bigram` report, which the peer-snapshot protocol
-    /// depends on). A later worker of the *opposite* mode no longer just loses:
-    /// it latches [`Self::is_bimodal`] so the selection path dual-hashes queries
-    /// and both families keep cache affinity. `block_size` must still agree
-    /// (enforced separately by [`Self::try_set`]); only the mode may differ.
-    pub fn set_bigram(&self, is_bigram: bool) {
-        let candidate = if is_bigram {
-            BIGRAM_BIGRAM
-        } else {
-            BIGRAM_UNIGRAM
+    /// Transitions of the derived fleet shape are logged: entering or
+    /// leaving a bimodal fleet is exactly the rolling-update window an
+    /// operator needs to see, and the dual-hash selection path costs a
+    /// second hash per query for as long as it lasts.
+    pub(crate) fn report_worker(&self, worker_url: &str, is_bigram: bool) {
+        let (before, after) = {
+            let mut modes = self.modes.lock();
+            let before = derive(&modes);
+            modes.insert(worker_url.to_string(), is_bigram);
+            (before, derive(&modes))
         };
-        match self.bigram.compare_exchange(
-            BIGRAM_UNKNOWN,
-            candidate,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {}
-            Err(existing) if existing == candidate => {}
-            Err(existing) => {
-                // Opposite hashing mode from the established primary. In a mixed
-                // EAGLE-family + non-EAGLE fleet behind one base model both modes
-                // are legitimately present; record it so selection dual-hashes.
-                self.secondary_seen.store(true, Ordering::Release);
-                tracing::info!(
-                    primary_bigram = existing == BIGRAM_BIGRAM,
-                    worker_bigram = is_bigram,
-                    "kv-events: worker uses the opposite KV-block hashing mode from the \
-                     established primary; fleet is bimodal (EAGLE-family + non-EAGLE). \
-                     Cache-aware selection will dual-hash queries so both families keep \
-                     cache affinity — ensure all workers serve the same base model and \
-                     the same block_size.",
-                );
-            }
-        }
+        Self::log_transition(before, after, worker_url, true);
     }
 
-    /// Whether the fleet carries workers of **both** hashing modes (an
-    /// EAGLE-family bigram worker and a non-EAGLE unigram worker). Latched
-    /// `true` the first time a worker of the non-primary mode registers; never
-    /// clears. Read at routing time so `CacheAwareZmqPolicy::select` dual-hashes
-    /// only when it must, leaving the uniform-fleet fast path untouched.
+    /// Drop a deregistered worker's mode. Called from
+    /// `KvEventIndex::remove_worker`; without it a drained generation would
+    /// keep voting in the derived mode forever.
+    pub(crate) fn forget_worker(&self, worker_url: &str) {
+        let (before, after) = {
+            let mut modes = self.modes.lock();
+            let before = derive(&modes);
+            modes.remove(worker_url);
+            (before, derive(&modes))
+        };
+        Self::log_transition(before, after, worker_url, false);
+    }
+
+    /// The recorded hashing mode of one registered worker, or `None` when it
+    /// has not voted (or was forgotten on removal). `None` stays distinct
+    /// from a unigram vote so consumers — the bootstrap acceptance log's
+    /// unvoted tally, the re-introspection warn — can tell "never
+    /// introspected" from "seen as unigram".
+    pub(crate) fn vote_of(&self, worker_url: &str) -> Option<bool> {
+        self.modes.lock().get(worker_url).copied()
+    }
+
+    fn log_transition(
+        before: Option<(bool, bool)>,
+        after: Option<(bool, bool)>,
+        worker_url: &str,
+        added: bool,
+    ) {
+        if before == after {
+            return;
+        }
+        tracing::info!(
+            worker_url = worker_url,
+            worker_added = added,
+            before = ?before,
+            after = ?after,
+            "kv-events: fleet hashing-mode shape changed (primary, bimodal) — derived \
+             from the live worker set; bimodal selection dual-hashes every query",
+        );
+    }
+
+    /// Whether the fleet currently carries workers of **both** hashing modes
+    /// (an EAGLE-family bigram worker and a non-EAGLE unigram worker). Read
+    /// at routing time so `CacheAwareZmqPolicy::select` dual-hashes only
+    /// while the mixed fleet actually exists.
     pub fn is_bimodal(&self) -> bool {
-        self.secondary_seen.load(Ordering::Acquire)
+        derive(&self.modes.lock()).is_some_and(|(_, bimodal)| bimodal)
     }
 
-    /// Whether query hashing should use the bigram variant
-    /// ([`super::hash::compute_block_hashes_bigram`]).
+    /// The derived primary hashing mode: whether query hashing should use
+    /// the bigram variant ([`super::hash::compute_block_hashes_bigram`]).
     ///
-    /// This accessor collapses "not reported" into `false`; routing-time
-    /// callers must use [`Self::hash_config`] so unknown mode cannot be
-    /// mistaken for established unigram hashing.
+    /// This accessor collapses an empty fleet into `false`; routing-time
+    /// callers must use [`Self::fleet_config`] so "no worker registered"
+    /// cannot be mistaken for an established unigram fleet. Test-only so
+    /// that distinction stays structural rather than documented.
+    #[cfg(test)]
     pub fn is_bigram(&self) -> bool {
-        self.bigram.load(Ordering::Acquire) == BIGRAM_BIGRAM
+        derive(&self.modes.lock()).is_some_and(|(primary, _)| primary)
     }
 
-    /// Return a coherent block-hashing configuration once both worker
-    /// properties have been established.
-    ///
-    /// `add_worker` publishes `block_size` before `bigram`; the release/acquire
-    /// pair on `bigram` makes the preceding size write visible here. Returning
-    /// `None` while either half is unknown prevents a transient unigram lookup
-    /// against an EAGLE tree during first-worker registration.
+    /// Routing-time fleet view, derived under one modes-map lock:
+    /// `(block_size, primary, bimodal)`. Selection reads all three, so it
+    /// must take them atomically — separate [`Self::hash_config`] +
+    /// [`Self::is_bimodal`] calls can straddle a worker arriving or draining
+    /// and pair a stale primary with a fresh bimodal bit.
+    pub fn fleet_config(&self) -> Option<(u32, bool, bool)> {
+        let (primary, bimodal) = derive(&self.modes.lock())?;
+        let block_size = self.get()?;
+        Some((block_size, primary, bimodal))
+    }
+
+    /// `(block_size, primary)` half of [`Self::fleet_config`], for the
+    /// snapshot-stamping path, which has no use for the bimodal bit.
+    /// Returning `None` in the registration window prevents a transient
+    /// unigram lookup against an EAGLE tree.
     pub fn hash_config(&self) -> Option<(u32, bool)> {
-        let bigram = self.bigram.load(Ordering::Acquire);
-        if bigram == BIGRAM_UNKNOWN {
-            return None;
-        }
-        let block_size = self.value.load(Ordering::Relaxed);
-        if block_size == 0 {
-            return None;
-        }
-        Some((block_size, bigram == BIGRAM_BIGRAM))
+        self.fleet_config()
+            .map(|(size, primary, _)| (size, primary))
     }
 
     /// Publish a candidate block size. Returns the established value on
@@ -201,6 +234,7 @@ mod tests {
     fn fresh_oracle_returns_none() {
         let oracle = BlockSizeOracle::new();
         assert_eq!(oracle.get(), None);
+        assert_eq!(oracle.hash_config(), None);
     }
 
     #[test]
@@ -220,55 +254,85 @@ mod tests {
     }
 
     #[test]
-    fn bigram_flag_defaults_false_first_wins_and_is_idempotent() {
+    fn empty_fleet_reads_as_unknown_not_unigram() {
         let oracle = BlockSizeOracle::new();
+        assert!(!oracle.is_bigram());
+        assert!(!oracle.is_bimodal());
+        assert_eq!(oracle.hash_config(), None, "no workers, no hash config");
+    }
+
+    #[test]
+    fn primary_is_derived_from_the_live_set() {
+        let oracle = BlockSizeOracle::new();
+        oracle.report_worker("http://w1:30000", true);
+        oracle.report_worker("http://w2:30000", true);
+        assert!(oracle.is_bigram());
+        assert!(!oracle.is_bimodal(), "a single mode is not bimodal");
+        // A minority of opposite-mode workers makes the fleet bimodal but
+        // does not flip the majority-derived primary.
+        oracle.report_worker("http://w3:30000", false);
+        assert!(oracle.is_bimodal());
+        assert!(oracle.is_bigram(), "2 bigram vs 1 unigram: bigram majority");
+        // Majority flips with the live set.
+        oracle.report_worker("http://w4:30000", false);
+        oracle.report_worker("http://w5:30000", false);
+        assert!(oracle.is_bimodal());
         assert!(
             !oracle.is_bigram(),
-            "unknown (no worker reported yet) reads as non-bigram"
+            "3 unigram vs 2 bigram: unigram majority"
         );
-        oracle.set_bigram(true);
-        assert!(oracle.is_bigram(), "first worker establishes the mode");
-        assert!(!oracle.is_bimodal(), "a single mode is not bimodal");
-        oracle.set_bigram(true); // idempotent agreement
-        assert!(oracle.is_bigram());
-        assert!(!oracle.is_bimodal(), "agreement does not make it bimodal");
-        // Independent of block_size establishment.
-        assert_eq!(oracle.get(), None);
-        // First-wins for the PRIMARY: a conflicting later worker does not flip
-        // the reported mode, but it does latch the fleet as bimodal.
-        oracle.set_bigram(false);
-        assert!(
-            oracle.is_bigram(),
-            "a disagreeing worker must not flip the established primary mode"
-        );
-        assert!(
-            oracle.is_bimodal(),
-            "an opposite-mode worker latches the fleet as bimodal"
-        );
-    }
-
-    #[test]
-    fn bigram_flag_establishes_false_first_wins() {
-        let oracle = BlockSizeOracle::new();
-        oracle.set_bigram(false);
-        assert!(!oracle.is_bigram(), "established as unigram");
-        assert!(!oracle.is_bimodal());
-        oracle.set_bigram(true); // conflicting; first (unigram) wins, fleet bimodal
+        // Forgetting the minority heals the fleet back to unimodal.
+        oracle.forget_worker("http://w1:30000");
+        oracle.forget_worker("http://w2:30000");
         assert!(!oracle.is_bigram());
-        assert!(oracle.is_bimodal(), "opposite mode latches bimodal");
+        assert!(
+            !oracle.is_bimodal(),
+            "once only one mode remains live the fleet is unimodal again"
+        );
     }
 
     #[test]
-    fn is_bimodal_latches_and_never_clears() {
+    fn equal_split_breaks_toward_unigram() {
         let oracle = BlockSizeOracle::new();
-        assert!(!oracle.is_bimodal(), "fresh oracle is unimodal");
-        oracle.set_bigram(true); // primary = bigram
-        oracle.set_bigram(false); // opposite → bimodal
+        oracle.report_worker("http://w1:30000", true);
+        oracle.report_worker("http://w2:30000", false);
         assert!(oracle.is_bimodal());
-        // Subsequent agreeing workers of either established mode never clear it.
-        oracle.set_bigram(true);
-        oracle.set_bigram(false);
-        assert!(oracle.is_bimodal(), "bimodal is a latch, not a live count");
+        assert!(
+            !oracle.is_bigram(),
+            "the tie-break is deterministic so replicas holding the same live \
+             set derive the same primary"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_worker_overwrites_its_mode() {
+        let oracle = BlockSizeOracle::new();
+        oracle.report_worker("http://w1:30000", false);
+        // Same URL returning with a new speculative-decoding config.
+        oracle.report_worker("http://w1:30000", true);
+        assert!(oracle.is_bigram());
+        assert!(
+            !oracle.is_bimodal(),
+            "a re-added worker has exactly one vote"
+        );
+    }
+
+    #[test]
+    fn vote_of_distinguishes_unvoted_from_unigram() {
+        let oracle = BlockSizeOracle::new();
+        assert_eq!(oracle.vote_of("http://w1:30000"), None);
+        oracle.report_worker("http://w1:30000", false);
+        assert_eq!(oracle.vote_of("http://w1:30000"), Some(false));
+    }
+
+    #[test]
+    fn forget_is_idempotent_and_unknown_urls_are_ignored() {
+        let oracle = BlockSizeOracle::new();
+        oracle.forget_worker("http://never:30000");
+        oracle.report_worker("http://w1:30000", true);
+        oracle.forget_worker("http://w1:30000");
+        oracle.forget_worker("http://w1:30000");
+        assert_eq!(oracle.hash_config(), None, "the fleet is empty again");
     }
 
     #[test]
@@ -281,7 +345,7 @@ mod tests {
             None,
             "a block size alone must not transiently imply unigram hashing",
         );
-        oracle.set_bigram(true);
+        oracle.report_worker("http://w1:30000", true);
         assert_eq!(oracle.hash_config(), Some((64, true)));
     }
 

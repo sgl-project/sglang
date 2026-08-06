@@ -97,6 +97,18 @@ fn render_kv_bootstrap(index: &Arc<crate::policies::kv_events::KvEventIndex>) ->
     out.push_str("# TYPE sgl_router_kv_peers gauge\n");
     out.push_str(&format!("sgl_router_kv_peers {}\n", index.peers().len()));
 
+    // The bimodal window doubles selection cost (every query is hashed and
+    // walked twice) and typically spans a rolling update, so it needs a time
+    // series, not just the transition log line.
+    out.push_str(
+        "# HELP sgl_router_kv_fleet_bimodal 1 while the fleet carries both KV-block hashing modes (selection dual-hashes).\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_fleet_bimodal gauge\n");
+    out.push_str(&format!(
+        "sgl_router_kv_fleet_bimodal {}\n",
+        u8::from(index.block_size_oracle().is_bimodal())
+    ));
+
     let states = tracker.states();
     if !states.is_empty() {
         out.push_str(

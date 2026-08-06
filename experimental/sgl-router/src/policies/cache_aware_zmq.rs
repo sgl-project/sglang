@@ -437,8 +437,8 @@ impl CacheAwareZmqPolicy {
         tokens: &[u32],
         block_size: usize,
         primary_bigram: bool,
+        bimodal: bool,
     ) -> MatchOutcome {
-        let bimodal = self.block_size_oracle.is_bimodal();
         // Primary mode first; append the opposite only when the fleet is mixed.
         let modes: &[bool] = match (bimodal, primary_bigram) {
             (false, true) => &[true],
@@ -657,10 +657,11 @@ impl Policy for CacheAwareZmqPolicy {
         };
 
         // 3. Hash + match.
-        // Source both hashing properties from the worker. Reading them as one
-        // published configuration avoids a first-registration window where
-        // block_size is visible but an EAGLE bigram flag is not.
-        let Some((block_size, is_bigram)) = self.block_size_oracle.hash_config() else {
+        // Block size, primary mode, and bimodality come from one locked read,
+        // so a worker arriving or draining mid-selection cannot split them
+        // into an incoherent pair. `None` covers both the registration window
+        // and an empty fleet, never an assumed unigram default.
+        let Some((block_size, is_bigram, bimodal)) = self.block_size_oracle.fleet_config() else {
             self.record_decision(model_id, CacheAwareDecision::HashConfigUnknown);
             // Not necessarily the startup window: `KvEventIndex::add_worker`
             // returns before it reaches the oracle when a worker publishes no
@@ -684,7 +685,7 @@ impl Policy for CacheAwareZmqPolicy {
         // Uniform fleet: hash once with the established mode. Bimodal fleet
         // (EAGLE-family + non-EAGLE behind one base model): hash both ways and
         // union the eligible owners, so a prefix warm on either family is a hit.
-        let outcome = self.match_request(tokens, block_size as usize, is_bigram);
+        let outcome = self.match_request(tokens, block_size as usize, is_bigram, bimodal);
         if !outcome.had_blocks {
             self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
             return Self::pick_min_load(
@@ -892,7 +893,7 @@ mod tests {
         let o = BlockSizeOracle::new();
         o.try_set(block_size)
             .expect("fresh oracle accepts first set");
-        o.set_bigram(false);
+        o.report_worker("http://test-worker:30000", false);
         o
     }
 
@@ -1051,17 +1052,20 @@ mod tests {
         assert_eq!(chosen.url, "http://w0:30000");
     }
 
-    /// Helper: an oracle for a **bimodal** fleet — `primary_bigram` established
-    /// first, then the opposite mode registers, latching `is_bimodal()`.
-    /// Mirrors `add_worker` seeing an EAGLE-family worker and a non-EAGLE worker
-    /// behind the same base model.
+    /// Helper: an oracle for a **bimodal** fleet whose majority-derived
+    /// primary is `primary_bigram`. The primary is the live-set majority,
+    /// so the primary family gets two registrations.
+    /// Mirrors `add_worker` seeing an EAGLE-family worker and a non-EAGLE
+    /// worker behind the same base model.
     fn bimodal_oracle(block_size: u32, primary_bigram: bool) -> Arc<BlockSizeOracle> {
         let o = BlockSizeOracle::new();
         o.try_set(block_size)
             .expect("fresh oracle accepts first set");
-        o.set_bigram(primary_bigram); // primary mode
-        o.set_bigram(!primary_bigram); // opposite mode -> bimodal
-        assert!(o.is_bimodal(), "two opposite modes must latch bimodal");
+        o.report_worker("http://majority-a:30000", primary_bigram);
+        o.report_worker("http://majority-b:30000", primary_bigram);
+        o.report_worker("http://minority:30000", !primary_bigram);
+        assert!(o.is_bimodal(), "two opposite modes must read as bimodal");
+        assert_eq!(o.is_bigram(), primary_bigram);
         o
     }
 
@@ -1069,8 +1073,7 @@ mod tests {
     /// unigram (DSPARK) worker is still matched: the query is dual-hashed, so
     /// the unigram entry is found even though the established primary is bigram.
     /// Without dual-hashing a bigram-only query never touches the unigram tree
-    /// entry and the DSPARK worker is starved to min-load — the exact
-    /// mixed-fleet artifact this change fixes.
+    /// entry and the DSPARK worker is starved to min-load.
     #[test]
     fn bimodal_matches_unigram_owner_under_bigram_primary() {
         let tree = Arc::new(HashTree::new());
@@ -1133,10 +1136,10 @@ mod tests {
             &hashes,
         );
 
-        // Unimodal bigram oracle: only set_bigram(true), never the opposite.
+        // Unimodal bigram fleet: every live worker reports bigram.
         let oracle = BlockSizeOracle::new();
         oracle.try_set(4).unwrap();
-        oracle.set_bigram(true);
+        oracle.report_worker("http://eagle:30000", true);
         assert!(!oracle.is_bimodal());
 
         let policy = new_policy(
@@ -1569,7 +1572,7 @@ mod tests {
             );
             let oracle = BlockSizeOracle::new();
             oracle.try_set(block_size).unwrap();
-            oracle.set_bigram(true);
+            oracle.report_worker("http://w0:30000", true);
             let metrics = MetricsRegistry::new();
             let policy = new_policy(
                 CacheAwareConfig {
@@ -1608,7 +1611,7 @@ mod tests {
             );
             let oracle = BlockSizeOracle::new();
             oracle.try_set(block_size).unwrap();
-            oracle.set_bigram(false);
+            oracle.report_worker("http://w0:30000", false);
             let metrics = MetricsRegistry::new();
             let policy = new_policy(
                 CacheAwareConfig {

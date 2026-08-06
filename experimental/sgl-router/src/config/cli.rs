@@ -101,6 +101,14 @@ pub struct Cli {
     /// cache-aware tree from a warm sibling. Defaults to 5000.
     #[arg(long)]
     pub kv_bootstrap_timeout_ms: Option<u64>,
+    /// Upper bound on one peer-snapshot fetch during bootstrap, in
+    /// milliseconds. The per-fetch timeout is derived as a quarter of
+    /// `--kv-bootstrap-timeout-ms` (raised toward a 5s floor for short
+    /// budgets); this caps that derivation (default 30000). Raise it when
+    /// the fleet's tree is large enough that one transfer + decode no
+    /// longer fits under the derived value.
+    #[arg(long)]
+    pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
     /// Label selector matching this router's own pods, so a booting replica can
     /// find siblings to pull a tree snapshot from. Unset disables peer
     /// bootstrap and every replica starts cold.
@@ -332,13 +340,15 @@ impl Cli {
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some()
             || self.kv_bootstrap_timeout_ms.is_some()
+            || self.kv_bootstrap_fetch_timeout_cap_ms.is_some()
             || self.kv_peer_selector.is_some()
             || self.worker_queue_limit.is_some()
             || self.min_load_choices.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
-                 --balance-rel-threshold / --kv-bootstrap-timeout-ms / --kv-peer-selector / \
+                 --balance-rel-threshold / --kv-bootstrap-timeout-ms / \
+                 --kv-bootstrap-fetch-timeout-cap-ms / --kv-peer-selector / \
                  --worker-queue-limit / --min-load-choices) requires --policy cache_aware_zmq"
             ));
         }
@@ -374,6 +384,22 @@ impl Cli {
                     "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms \
                      ceiling; /readyz stays 503 for this long, so a larger value would \
                      outlast any reasonable readinessProbe"
+                ));
+            }
+        }
+
+        // Below the internal fetch floor (5s) the cap would cut every fetch
+        // short of a body transfer, and past the deadline ceiling it could
+        // never bind — both read as typos, so reject them at startup.
+        // The 5s below mirrors SNAPSHOT_FETCH_TIMEOUT_FLOOR in
+        // policies::kv_events::index; keep them in agreement if it moves.
+        if let Some(ms) = self.kv_bootstrap_fetch_timeout_cap_ms {
+            const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 5_000;
+            if !(MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS..=MAX_KV_BOOTSTRAP_TIMEOUT_MS).contains(&ms)
+            {
+                return Err(anyhow!(
+                    "--kv-bootstrap-fetch-timeout-cap-ms {ms} is out of range \
+                     ({MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS}..={MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms)"
                 ));
             }
         }
@@ -481,6 +507,9 @@ impl Cli {
                 bootstrap_timeout_ms: self
                     .kv_bootstrap_timeout_ms
                     .unwrap_or(d.bootstrap_timeout_ms),
+                bootstrap_fetch_timeout_cap_ms: self
+                    .kv_bootstrap_fetch_timeout_cap_ms
+                    .unwrap_or(d.bootstrap_fetch_timeout_cap_ms),
                 min_load_choices: self
                     .min_load_choices
                     .map(NonZeroUsize::get)
@@ -1221,6 +1250,38 @@ mod tests {
             err.to_string().contains("ceiling"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn kv_bootstrap_fetch_timeout_cap_validates_its_range_and_plumbs() {
+        let base_args = with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+        ]);
+        for bad in ["4999", "600001"] {
+            let mut args = base_args.clone();
+            args.push("--kv-bootstrap-fetch-timeout-cap-ms".to_string());
+            args.push(bad.to_string());
+            let err = into_config_owned(args).unwrap_err().to_string();
+            assert!(
+                err.contains("kv-bootstrap-fetch-timeout-cap-ms"),
+                "cap {bad} must be rejected; got: {err}",
+            );
+        }
+        for good in ["5000", "30000", "600000"] {
+            let mut args = base_args.clone();
+            args.push("--kv-bootstrap-fetch-timeout-cap-ms".to_string());
+            args.push(good.to_string());
+            let c = into_config_owned(args)
+                .unwrap_or_else(|e| panic!("cap {good} must be accepted; got: {e}"));
+            assert_eq!(
+                c.model.cache_aware.unwrap().bootstrap_fetch_timeout_cap_ms,
+                good.parse::<u64>().unwrap(),
+                "the flag must reach CacheAwareConfig",
+            );
+        }
     }
 
     #[test]
