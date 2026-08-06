@@ -1317,7 +1317,7 @@ class MQALayer(MqaAttentionBase):
 
         return o
 
-    # ---- TBO op decomposition (prefill two-batch-overlap) ----
+    # ---- TBO op decomposition ----
     def op_attn(self, state):
         """Run the attention forward as a single TBO op.
 
@@ -1873,7 +1873,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         return hidden_states
 
     # ------------------------------------------------------------------
-    # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
+    # TBO op decomposition (EP / mori path)
     #
     # These mirror the NON-fused branch of ``forward`` (cross-layer mHC
     # fusion is disabled under TBO, so every layer is self-contained), split
@@ -2184,24 +2184,30 @@ class DeepseekV4Model(nn.Module):
         )
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
-        """DSV4 prefill-only two-batch-overlap gate.
+        """Gate DSV4 TBO to the modes covered by its operation strategies.
 
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
-        DP-attention preparer allows it (mori `normal` mode permits prefill
-        TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
-        non-CP path, which is the only case the DSV4 op strategy implements.
+        DP-attention preparer allows it. DSV4 supports prefill for its existing
+        backends and decode for DeepEP; both remain restricted to single PP and
+        the non-CP path.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
+        global_mode = forward_batch.global_forward_mode
+        supports_prefill = (
+            global_mode is not None and global_mode.is_extend_without_speculative()
+        )
+        supports_deepep_decode = (
+            global_mode is not None
+            and global_mode.is_decode()
+            and get_moe_a2a_backend().is_deepep()
+        )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
-            and forward_batch.global_forward_mode is not None
-            # MTP target-verify also reports is_extend(); only real prefill
-            # should enter the prefill TBO strategy.
-            and forward_batch.global_forward_mode.is_extend_without_speculative()
+            and (supports_prefill or supports_deepep_decode)
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )
@@ -2352,8 +2358,8 @@ class DeepseekV4Model(nn.Module):
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         if self._can_run_tbo(forward_batch) and not capture_dspark:
-            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
-            # disabled here (each layer self-contained), so no trailing hc_post.
+            # Two-batch-overlap (EP / mori). Cross-layer mHC fusion is disabled
+            # here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
                 positions=positions,
                 hidden_states=hidden_states,

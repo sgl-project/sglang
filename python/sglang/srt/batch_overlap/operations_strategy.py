@@ -173,12 +173,46 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_v4_prefill(layer)
+    elif forward_mode == ForwardMode.DECODE:
+        return _compute_moe_deepseek_v4_decode(layer)
     else:
-        # Decode TBO for DSV4 is not implemented yet (ATOM data: decode TBO
-        # regresses; needs cuda-graph capture work). Prefill-only for now.
         raise NotImplementedError(
-            f"DeepseekV4 TBO only supports prefill (EXTEND), got {forward_mode=}"
+            f"DeepseekV4 TBO only supports EXTEND/DECODE, got {forward_mode=}"
         )
+
+
+def _compute_moe_deepseek_v4_decode(layer):
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep():
+        raise NotImplementedError("DeepseekV4 decode TBO requires DeepEP")
+
+    # Keep the six-stage delta-2 pipeline used by DeepSeek decode. DSV4 exposes
+    # attention as one reusable op, so its first stage contains only mHC prepare.
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=2,
+        operations=[
+            layer.op_mhc_prepare_attn,
+            operations.YieldOperation(),
+            layer.self_attn.op_attn,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_b,
+            operations.YieldOperation(),
+            layer.mlp.op_output,
+            layer.op_mhc_postprocess,
+        ],
+    )
 
 
 def _compute_moe_deepseek_v4_prefill(layer):
