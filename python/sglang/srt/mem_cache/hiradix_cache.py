@@ -134,6 +134,9 @@ class HiRadixCache(RadixCache):
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
+        if server_args.file_storage_path:
+            extra_config = dict(extra_config or {})
+            extra_config.setdefault("file_storage_path", server_args.file_storage_path)
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
