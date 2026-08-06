@@ -24,6 +24,7 @@ compaction only mutates those (no reference rewriting).
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -258,7 +259,20 @@ class UnifiedKVPool:
             self._raw = torch.empty(
                 total_bytes + view_tail_pad_bytes, dtype=torch.uint8, device=device
             )
-        self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
+        if os.environ.get("SGLANG_DEBUG_POISON_POOL"):
+            # Debug: fill the pool with bf16-NaN bit patterns (0x7FC1 LE) so
+            # every never-written byte reads as NaN. Converts the boot-lottery
+            # "does freed GPU heap contain NaN patterns" into a deterministic
+            # switch: if an attention kernel arithmetically masks (instead of
+            # selectively masking) the unwritten tail rows of a partial last
+            # page, the NaN leaks into its output on EVERY boot under poison.
+            self._raw.view(torch.int16).fill_(0x7FC1)
+            logger.warning(
+                "[unified-memory-pool] POISONED: pool filled with bf16-NaN "
+                "patterns (SGLANG_DEBUG_POISON_POOL)"
+            )
+        else:
+            self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
 
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
