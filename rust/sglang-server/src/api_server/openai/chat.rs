@@ -1,12 +1,10 @@
 //! OpenAI Chat Completions endpoint and chat-template preparation.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -23,9 +21,9 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
+use super::super::submit::submit_openai;
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
@@ -33,12 +31,12 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
-    submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChoiceStep, OpenAiChoice, choice_step_stream, collect_choices,
+    contains_media, invalid_request, native_stops, normalize_sampling, parse_logit_bias,
+    require_served_model, stream_include_usage, unix_seconds_u32,
 };
 use crate::ids::Rid;
-use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
-use crate::utils::response::error_response;
+use crate::message::{ChunkExtras, GenerateRequest, OneOrMany, SamplingParams};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -51,58 +49,25 @@ async fn chat_completions(
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
-                false,
-            );
+            return invalid_request(rejection.body_text());
         }
     };
-    if request.model != state.server_args.served_model_name {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                format!("The model `{}` does not exist", request.model),
-            ),
-            false,
-        );
+    if let Some(response) = require_served_model(&request.model, &state.server_args) {
+        return response;
     }
     if request.messages.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "messages cannot be empty"),
-            false,
-        );
+        return invalid_request("messages cannot be empty");
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "image, audio, video, and file message content is not supported",
-            ),
-            false,
-        );
+        return invalid_request("image, audio, video, and file message content is not supported");
     }
     if request.n == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "n must be at least 1"),
-            false,
-        );
+        return invalid_request("n must be at least 1");
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
     if max_tokens == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "max_completion_tokens must be positive",
-            ),
-            false,
-        );
+        return invalid_request("max_completion_tokens must be positive");
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
         serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
@@ -111,24 +76,14 @@ async fn chat_completions(
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
     {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "audio, prediction, web search, and multimodal inputs are not supported",
-            ),
-            false,
+        return invalid_request(
+            "audio, prediction, web search, and multimodal inputs are not supported",
         );
     }
     #[allow(deprecated)]
     if request.function_call.is_some() || request.functions.is_some() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "deprecated function_call/functions are not supported; use tools and tool_choice",
-            ),
-            false,
+        return invalid_request(
+            "deprecated function_call/functions are not supported; use tools and tool_choice",
         );
     }
 
@@ -142,14 +97,7 @@ async fn chat_completions(
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
     if tools_enabled && parser.is_none() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "tool calls require --tool-call-parser",
-            ),
-            false,
-        );
+        return invalid_request("tool calls require --tool-call-parser");
     }
     // Python gates the split on `request.separate_reasoning` (default true);
     // the Dynamo request type has no such field, so it is always on when the
@@ -183,11 +131,7 @@ async fn chat_completions(
     ) {
         Ok(sampling) => sampling,
         Err(message) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, message),
-                false,
-            );
+            return invalid_request(message);
         }
     };
 
@@ -201,10 +145,7 @@ async fn chat_completions(
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let model = request.model;
-    let include_usage = request
-        .stream_options
-        .is_some_and(|options| options.include_usage)
-        || state.server_args.stream_response_default_include_usage;
+    let include_usage = stream_include_usage(request.stream_options.as_ref(), &state.server_args);
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(n);
 
@@ -233,11 +174,17 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
-        let rx = match submit_generation(&state, native, stream, &mut guard).await {
+        let rx = match submit_openai(&state, native, stream, &mut guard).await {
             Ok(rx) => rx,
             Err(response) => return response,
         };
-        submitted.push((index, rid, rx));
+        submitted.push(OpenAiChoice {
+            index,
+            prompt_index: 0,
+            rid,
+            echo: String::new(),
+            rx,
+        });
     }
 
     if stream {
@@ -286,30 +233,16 @@ pub(super) async fn prepare_chat_request(
     mut request: CreateChatCompletionRequest,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "this model has no usable chat template",
-            ),
-            false,
-        ));
+        return Err(invalid_request("this model has no usable chat template"));
     };
     // Template stops first, then the request's own — Python
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request).map_err(|error| {
-        error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                format!("chat template render failed: {error}"),
-            ),
-            false,
-        )
-    })?;
+    let prompt = formatter
+        .render(&request)
+        .map_err(|error| invalid_request(format!("chat template render failed: {error}")))?;
     Ok((request, prompt))
 }
 
@@ -337,12 +270,7 @@ pub(super) fn chat_sampling(
         tools,
         parallel_tool_calls,
     )?;
-    sampling
-        .normalize(
-            server_args.skip_tokenizer_init,
-            server_args.model_config.vocab_size.unwrap_or(u64::MAX),
-        )
-        .map_err(|error| error.to_string())?;
+    normalize_sampling(&mut sampling, server_args)?;
     Ok(sampling)
 }
 
@@ -408,25 +336,8 @@ pub(super) fn chat_sampling_params(
     request: &CreateChatCompletionRequest,
     defaults: &SamplingDefaults,
 ) -> Result<SamplingParams, String> {
-    let mut stop = None;
-    let mut stop_token_ids = None;
-    match request.stop.as_ref() {
-        Some(Stop::String(value)) => stop = Some(OneOrMany::One(value.clone())),
-        Some(Stop::StringArray(values)) => stop = Some(OneOrMany::Many(values.clone())),
-        Some(Stop::TokenIdArray(values)) => {
-            stop_token_ids = Some(values.iter().map(|&id| id as i64).collect())
-        }
-        None => {}
-    }
-    let mut logit_bias = BTreeMap::new();
-    if let Some(values) = request.logit_bias.as_ref() {
-        for (token, bias) in values {
-            let bias = bias
-                .as_f64()
-                .ok_or_else(|| format!("logit_bias[{token:?}] must be a number"))?;
-            logit_bias.insert(token.clone(), bias);
-        }
-    }
+    let (stop, stop_token_ids) = native_stops(request.stop.as_ref());
+    let logit_bias = parse_logit_bias(request.logit_bias.as_ref())?;
     let json_schema = match request.response_format.as_ref() {
         Some(ResponseFormat::JsonSchema { json_schema }) => Some(json_schema.schema.to_string()),
         Some(ResponseFormat::JsonObject) => Some(r#"{"type":"object"}"#.into()),
@@ -453,7 +364,7 @@ pub(super) fn chat_sampling_params(
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
         n: 1,
-        logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
+        logit_bias,
         sampling_seed: request.seed,
         json_schema,
         ..Default::default()
@@ -462,7 +373,7 @@ pub(super) fn chat_sampling_params(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
+    submitted: Vec<OpenAiChoice>,
     mut guard: AbortGuard,
     response_id: String,
     model: String,
@@ -474,22 +385,14 @@ pub(super) async fn unary_chat(
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
-    let mut choices = Vec::with_capacity(submitted.len());
-    let mut prompt_tokens = 0;
-    let mut completion_tokens = 0u64;
-
-    for (index, rid, rx) in submitted {
-        let output = match collect_output(rx, &mut guard, &rid).await {
-            Ok(output) => output,
-            Err((status, message)) => {
-                return error_response(status, error_payload(status, message), false);
-            }
+    let (outputs, prompt_tokens, completion_tokens) =
+        match collect_choices(submitted, &mut guard).await {
+            Ok(collected) => collected,
+            Err(response) => return response,
         };
+    let mut choices = Vec::with_capacity(outputs.len());
 
-        if prompt_tokens == 0 {
-            prompt_tokens = output.prompt_tokens;
-        }
-        completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+    for (index, _echo, output) in outputs {
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
         // Split reasoning markers out of the content first (Python splits
@@ -546,8 +449,8 @@ pub(super) async fn unary_chat(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
-    mut guard: AbortGuard,
+    submitted: Vec<OpenAiChoice>,
+    guard: AbortGuard,
     response_id: String,
     model: String,
     created: u32,
@@ -564,10 +467,6 @@ pub(super) fn chat_event_stream(
     let count = submitted.len();
     let raw = async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
-        let mut streams = Vec::with_capacity(count);
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u64;
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
@@ -580,14 +479,12 @@ pub(super) fn chat_event_stream(
             };
         let reasoning_enabled = !reasoning_splitters.is_empty();
 
-        for (index, rid, rx) in submitted {
-            rids.push(rid);
-            streams.push(indexed_egress_stream(index, rx));
+        for choice in &submitted {
             yield Annotated {
                 data: Some(CreateChatCompletionStreamResponse {
                     id: response_id.clone(),
                     choices: vec![ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                        index: u32::try_from(choice.index).unwrap_or(u32::MAX),
                         delta: chat_delta(None, Some(Role::Assistant), None, None),
                         finish_reason: None,
                         logprobs: None,
@@ -606,56 +503,46 @@ pub(super) fn chat_event_stream(
             };
         }
 
-        let mut events = futures::stream::select_all(streams);
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
-                };
-                continue;
-            };
-            let output = match item {
-                EgressItem::Frame(output) => output,
-                EgressItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
-                EgressItem::Error(error) => {
-                    guard.disarm(&rids[index]);
+        let steps = choice_step_stream(submitted, guard);
+        futures::pin_mut!(steps);
+        while let Some(step) = steps.next().await {
+            let (index, output) = match step {
+                ChoiceStep::Error(payload) => {
                     yield Annotated {
                         data: None,
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
+                        error: Some(payload),
                     };
                     continue;
                 }
-                EgressItem::Control(_) | EgressItem::Data(_) => continue,
+                ChoiceStep::Usage { prompt_tokens, completion_tokens } => {
+                    if include_usage {
+                        yield Annotated {
+                            data: Some(CreateChatCompletionStreamResponse {
+                                id: response_id.clone(),
+                                choices: vec![],
+                                created,
+                                model: model.clone(),
+                                service_tier: service_tier.clone(),
+                                system_fingerprint: None,
+                                object: "chat.completion.chunk".into(),
+                                usage: Some(completion_usage(
+                                    prompt_tokens,
+                                    u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                                )),
+                            }),
+                            id: None,
+                            event: None,
+                            comment: None,
+                            error: None,
+                        };
+                    }
+                    continue;
+                }
+                ChoiceStep::Output { index, output, .. } => (index, output),
             };
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
-                };
-                continue;
-            }
-
-            if prompt_tokens == 0 {
-                prompt_tokens = output.prompt_tokens;
-            }
-            completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let finish_reason = chat_finish_reason(&output);
             // Split the step's text into (reasoning, normal) deltas when
             // `--reasoning-parser` is set. Mirrors Python's per-step emission:
@@ -749,28 +636,6 @@ pub(super) fn chat_event_stream(
                     error: None,
                 };
             }
-        }
-
-        if include_usage {
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id,
-                    choices: vec![],
-                    created,
-                    model,
-                    service_tier,
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: Some(completion_usage(
-                        prompt_tokens,
-                        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                    )),
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
         }
     };
 

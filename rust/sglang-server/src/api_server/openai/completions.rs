@@ -15,20 +15,20 @@ use axum::{
 };
 use dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
+    CreateCompletionResponse, Logprobs, Prompt,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
+use super::super::submit::submit_openai;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
-    submit_generation, unix_seconds_u32,
+    AppState, ChoiceStep, MAX_OPENAI_CHOICES, OpenAiChoice, choice_step_stream, collect_choices,
+    error_payload, invalid_request, native_stops, normalize_sampling, parse_logit_bias,
+    require_served_model, stream_include_usage, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{
-    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, SamplingParams,
-    TokenIds,
+    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, SamplingParams, TokenIds,
 };
 use crate::utils::response::error_response;
 
@@ -42,13 +42,6 @@ enum PromptSpec {
     TokenIds(TokenIds),
 }
 
-pub(super) struct SubmittedChoice {
-    pub(super) index: usize,
-    pub(super) prompt_index: usize,
-    pub(super) rid: Rid,
-    pub(super) echo: String,
-    pub(super) rx: mpsc::Receiver<EgressItem>,
-}
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
@@ -64,118 +57,54 @@ async fn completions(
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
-                false,
-            );
+            return invalid_request(rejection.body_text());
         }
     };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if model != state.server_args.served_model_name {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                format!("The model `{model}` does not exist"),
-            ),
-            false,
-        );
+    if let Some(response) = require_served_model(&model, &state.server_args) {
+        return response;
     }
 
     if request.prompt_embeds.is_some() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "prompt_embeds is not supported by the Rust frontend",
-            ),
-            false,
-        );
+        return invalid_request("prompt_embeds is not supported by the Rust frontend");
     }
     if request.suffix.is_some() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "suffix is not supported by this model",
-            ),
-            false,
-        );
+        return invalid_request("suffix is not supported by this model");
     }
     if request.best_of.is_some_and(|best_of| best_of != 1) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(
-                StatusCode::BAD_REQUEST,
-                "best_of values greater than 1 are not supported",
-            ),
-            false,
-        );
+        return invalid_request("best_of values greater than 1 are not supported");
     }
     if request.max_tokens == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "max_tokens must be positive"),
-            false,
-        );
+        return invalid_request("max_tokens must be positive");
     }
     if request.n == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, "n must be at least 1"),
-            false,
-        );
+        return invalid_request("n must be at least 1");
     }
     let prompts = match completion_prompt_specs(&request.prompt) {
         Ok(prompts) => prompts,
         Err(message) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, message),
-                false,
-            );
+            return invalid_request(message);
         }
     };
     let mut sampling = match completion_sampling_params(&request) {
         Ok(sampling) => sampling,
         Err(message) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(StatusCode::BAD_REQUEST, message),
-                false,
-            );
+            return invalid_request(message);
         }
     };
-    if let Err(error) = sampling.normalize(
-        state.server_args.skip_tokenizer_init,
-        state
-            .server_args
-            .model_config
-            .vocab_size
-            .unwrap_or(u64::MAX),
-    ) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, error.to_string()),
-            false,
-        );
+    if let Err(error) = normalize_sampling(&mut sampling, &state.server_args) {
+        return invalid_request(error);
     }
 
     let n = request.n.unwrap_or(1) as usize;
     let choice_count = match prompts.len().checked_mul(n) {
         Some(count) if count <= MAX_OPENAI_CHOICES => count,
         _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error_payload(
-                    StatusCode::BAD_REQUEST,
-                    format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}"),
-                ),
-                false,
-            );
+            return invalid_request(format!(
+                "prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}"
+            ));
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
@@ -217,11 +146,11 @@ async fn completions(
                 return_prompt_text: echo_from_sink,
                 ..Default::default()
             };
-            let rx = match submit_generation(&state, native, stream, &mut guard).await {
+            let rx = match submit_openai(&state, native, stream, &mut guard).await {
                 Ok(rx) => rx,
                 Err(response) => return response,
             };
-            submitted.push(SubmittedChoice {
+            submitted.push(OpenAiChoice {
                 index,
                 prompt_index,
                 rid,
@@ -256,11 +185,7 @@ async fn completions(
                 }
             },
             Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    error_payload(StatusCode::BAD_REQUEST, message),
-                    false,
-                );
+                return invalid_request(message);
             }
             Some(EgressItem::Error(error)) => {
                 let status = StatusCode::from_u16(error.http_status())
@@ -285,11 +210,8 @@ async fn completions(
     }
 
     if stream {
-        let include_usage = request
-            .stream_options
-            .map(|o| o.include_usage)
-            .unwrap_or(false)
-            || state.server_args.stream_response_default_include_usage;
+        let include_usage =
+            stream_include_usage(request.stream_options.as_ref(), &state.server_args);
         let continuous_usage = request
             .stream_options
             .map(|o| o.continuous_usage_stats)
@@ -358,28 +280,8 @@ fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
 }
 
 fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {
-    let mut stop = None;
-    let mut stop_token_ids = None;
-    match request.stop.as_ref() {
-        Some(Stop::String(value)) => stop = Some(OneOrMany::One(value.clone())),
-        Some(Stop::StringArray(values)) => stop = Some(OneOrMany::Many(values.clone())),
-        Some(Stop::TokenIdArray(values)) => {
-            stop_token_ids
-                .get_or_insert_with(Vec::new)
-                .extend(values.iter().map(|&id| id as i64));
-        }
-        None => {}
-    }
-
-    let mut logit_bias = BTreeMap::new();
-    if let Some(values) = request.logit_bias.as_ref() {
-        for (token, bias) in values {
-            let bias = bias
-                .as_f64()
-                .ok_or_else(|| format!("logit_bias[{token:?}] must be a number"))?;
-            logit_bias.insert(token.clone(), bias);
-        }
-    }
+    let (stop, stop_token_ids) = native_stops(request.stop.as_ref());
+    let logit_bias = parse_logit_bias(request.logit_bias.as_ref())?;
 
     Ok(SamplingParams {
         max_new_tokens: Some(request.max_tokens.unwrap_or(16) as i64),
@@ -392,14 +294,14 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
         // OpenAI `n` is implemented by fan-out: every native request has one
         // output, avoiding the native path's intentional `n > 1` rejection.
         n: 1,
-        logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
+        logit_bias,
         sampling_seed: request.seed,
         ..Default::default()
     })
 }
 
 pub(super) async fn unary_completion(
-    submitted: Vec<SubmittedChoice>,
+    submitted: Vec<OpenAiChoice>,
     mut guard: AbortGuard,
     response_id: String,
     model: String,
@@ -410,27 +312,19 @@ pub(super) async fn unary_completion(
     // Every request is already submitted, so draining in choice order does not
     // serialize generation. The non-streaming native path sends one terminal
     // result, and the accumulator also tolerates intermediate frames.
-    let mut choices = Vec::with_capacity(submitted.len());
-    let mut extensions = Vec::with_capacity(submitted.len());
-    let mut prompt_tokens = BTreeMap::<usize, u32>::new();
-    let mut completion_tokens = 0u64;
-
-    for choice in submitted {
-        let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
-            Ok(output) => output,
-            Err((status, message)) => {
-                return error_response(status, error_payload(status, message), false);
-            }
+    let (outputs, prompt_tokens, completion_tokens) =
+        match collect_choices(submitted, &mut guard).await {
+            Ok(collected) => collected,
+            Err(response) => return response,
         };
+    let mut choices = Vec::with_capacity(outputs.len());
+    let mut extensions = Vec::with_capacity(outputs.len());
 
-        prompt_tokens
-            .entry(choice.prompt_index)
-            .or_insert(output.prompt_tokens);
-        completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+    for (index, prompt_echo, output) in outputs {
         let (response_choice, extension) = completion_choice(
-            choice.index,
+            index,
             if echo {
-                choice.echo + &output.text
+                prompt_echo + &output.text
             } else {
                 output.text.clone()
             },
@@ -442,10 +336,6 @@ pub(super) async fn unary_completion(
         extensions.push(extension);
     }
 
-    let prompt_tokens = prompt_tokens
-        .values()
-        .copied()
-        .fold(0u32, u32::saturating_add);
     let usage = completion_usage(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
@@ -556,8 +446,8 @@ pub(super) fn completion_response_value(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn completion_event_stream(
-    submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
+    submitted: Vec<OpenAiChoice>,
+    guard: AbortGuard,
     response_id: String,
     model: String,
     created: u32,
@@ -568,108 +458,64 @@ pub(super) fn completion_event_stream(
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
-        let mut prompt_indexes = Vec::with_capacity(count);
-        let mut echoes = Vec::with_capacity(count);
-        let mut first_chunks = vec![true; count];
-        let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
+        let mut echoes = vec![String::new(); count];
+        for choice in &submitted {
+            echoes[choice.index] = choice.echo.clone();
+        }
+        // Per-choice running total, only for `continuous_usage_stats` chunks;
+        // the final usage chunk uses the driver's totals.
         let mut completion_tokens_by_choice = vec![0u64; count];
-        let mut streams = Vec::with_capacity(count);
 
-        for choice in submitted {
-            let index = choice.index;
-            rids.push(choice.rid);
-            prompt_indexes.push(choice.prompt_index);
-            echoes.push(choice.echo);
-            streams.push(indexed_egress_stream(index, choice.rx));
-        }
-        let mut events = futures::stream::select_all(streams);
-
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string();
-                continue;
-            };
-            let output = match item {
-                EgressItem::Frame(output) => output,
-                EgressItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
+        let steps = choice_step_stream(submitted, guard);
+        futures::pin_mut!(steps);
+        while let Some(step) = steps.next().await {
+            match step {
+                ChoiceStep::Error(payload) => yield payload,
+                ChoiceStep::Usage { prompt_tokens, completion_tokens } => {
+                    if include_usage {
+                        let final_chunk = CreateCompletionResponse {
+                            id: response_id.clone(),
+                            choices: vec![],
+                            created,
+                            model: model.clone(),
+                            system_fingerprint: None,
+                            object: "text_completion".into(),
+                            usage: Some(completion_usage(
+                                prompt_tokens,
+                                u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                            )),
+                        };
+                        yield completion_response_value(final_chunk, &[]).to_string();
+                    }
                 }
-                EgressItem::Error(error) => {
-                    guard.disarm(&rids[index]);
-                    yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
-                    continue;
+                ChoiceStep::Output { index, output, first } => {
+                    completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
+                        .saturating_add(output.completion_tokens);
+                    let text = if echo && first {
+                        echoes[index].clone() + &output.text
+                    } else {
+                        output.text.clone()
+                    };
+                    let chunk_usage = continuous_usage.then(|| {
+                        completion_usage(
+                            output.prompt_tokens,
+                            u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
+                        )
+                    });
+                    let (choice, extension) =
+                        completion_choice(index, text, &output, want_logprobs, echo && first);
+                    let chunk = CreateCompletionResponse {
+                        id: response_id.clone(),
+                        choices: vec![choice],
+                        created,
+                        model: model.clone(),
+                        system_fingerprint: None,
+                        object: "text_completion".into(),
+                        usage: chunk_usage,
+                    };
+                    yield completion_response_value(chunk, &[extension]).to_string();
                 }
-                EgressItem::Control(_) | EgressItem::Data(_) => continue,
-            };
-
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string();
-                continue;
             }
-
-            prompt_tokens_by_prompt
-                .entry(prompt_indexes[index])
-                .or_insert(output.prompt_tokens);
-            completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
-                .saturating_add(output.completion_tokens);
-            let first = std::mem::replace(&mut first_chunks[index], false);
-            let text = if echo && first {
-                echoes[index].clone() + &output.text
-            } else {
-                output.text.clone()
-            };
-            let chunk_usage = continuous_usage.then(|| {
-                completion_usage(
-                    output.prompt_tokens,
-                    u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
-                )
-            });
-            let (choice, extension) = completion_choice(
-                index,
-                text,
-                &output,
-                want_logprobs,
-                echo && first,
-            );
-            let chunk = CreateCompletionResponse {
-                id: response_id.clone(),
-                choices: vec![choice],
-                created,
-                model: model.clone(),
-                system_fingerprint: None,
-                object: "text_completion".into(),
-                usage: chunk_usage,
-            };
-            yield completion_response_value(chunk, &[extension]).to_string();
-        }
-
-        if include_usage {
-            let prompt_tokens = prompt_tokens_by_prompt
-                .values()
-                .copied()
-                .fold(0u32, u32::saturating_add);
-            let completion_tokens = completion_tokens_by_choice
-                .into_iter()
-                .fold(0u64, u64::saturating_add);
-            let final_chunk = CreateCompletionResponse {
-                id: response_id,
-                choices: vec![],
-                created,
-                model,
-                system_fingerprint: None,
-                object: "text_completion".into(),
-                usage: Some(completion_usage(
-                    prompt_tokens,
-                    u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                )),
-            };
-            yield completion_response_value(final_chunk, &[]).to_string();
         }
         yield "[DONE]".to_string();
     }

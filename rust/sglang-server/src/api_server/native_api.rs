@@ -27,7 +27,7 @@ use super::frame::{
     OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
-use super::submit::submit;
+use super::submit::submit_native;
 use crate::environ::env_bool;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
@@ -104,10 +104,10 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
         ..Default::default()
     };
     let (rid, _keepalive) =
-        match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
+        match submit_native(&state, RequestKind::Generate(Box::new(probe)), false).await {
             // Hold the receiver so the probe's sink stays open until it completes.
             Ok(v) => v,
-            Err(resp) => return resp,
+            Err(response) => return response,
         };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
@@ -191,11 +191,11 @@ async fn generate(
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
-    let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
-    {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let (rid_str, mut rx) =
+        match submit_native(state, RequestKind::Generate(Box::new(req)), stream).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     // `rid_str` is the response `meta_info.id`, reused for every frame.
@@ -280,12 +280,12 @@ async fn generate_batch(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
-        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
+        match submit_native(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((rid, rx)) => {
                 guard.arm(rid.clone());
                 receivers.push((rid, rx));
             }
-            Err(resp) => return resp,
+            Err(response) => return response,
         }
     }
 

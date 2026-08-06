@@ -15,7 +15,7 @@ use axum::{
 
 use super::AppState;
 use super::guard::AbortGuard;
-use super::submit::submit;
+use super::submit::submit_native;
 use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
 use crate::runtime::ServerArgs;
 
@@ -38,7 +38,8 @@ async fn await_control_result(
     state: &AppState,
     control: ControlRequest,
 ) -> Result<bytes::Bytes, Response> {
-    let (rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
+    let (rid, mut rx) =
+        submit_native(state, RequestKind::Control(Box::new(control)), false).await?;
     // Control requests register a detok entry like any other, and only
     // `handle_result` removes it — so a request that never produces one (a stalled
     // scheduler, a client that hangs up mid-await) leaves the entry behind. A

@@ -6,23 +6,22 @@ use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
 use super::AppState;
+use super::guard::AbortGuard;
 use crate::fsm::RequestState;
 use crate::ids::Rid;
-use crate::message::{EgressItem, EgressSink, Request, RequestKind};
+use crate::message::{EgressItem, EgressSink, GenerateRequest, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
 use crate::utils::response::{error_response, error_value};
 
+/// The single submission failure: the TM inbox is closed.
+struct ChannelClosed;
+
 /// Submit one request; returns the rid, its hashed routing key, and the egress
-/// receiver. Every request arrives with its final rid — a generate request from
-/// `into_requests` (or the `HEALTH_CHECK_<uuid>` the health probe sets), a
-/// control request from its constructor — so this only echoes it back.
-pub(super) async fn submit(
+/// receiver.
+async fn submit(
     state: &AppState,
     kind: RequestKind,
-    // `stream`: the client is reading an SSE stream, so it expects 200 plus an
-    // error frame rather than a 4xx — `utils::response::error_response`'s rule.
-    stream: bool,
-) -> Result<(Rid, mpsc::Receiver<EgressItem>), Response> {
+) -> Result<(Rid, mpsc::Receiver<EgressItem>), ChannelClosed> {
     let rid = match &kind {
         // Generate rids are already final: `GenerateBody::into_requests` normalized the
         // client's, or minted one. Control requests have no client-facing rid.
@@ -33,11 +32,7 @@ pub(super) async fn submit(
     };
     // Two in-flight requests can name the same client rid, but they cannot share a
     // `Rid`: `into_requests` built each through `Rid::from_client`, which appends a
-    // uniquifier. So nothing here needs to check for a collision — the detok table
-    // key is unique by construction, and `client_facing` restores what the client
-    // sent for `meta_info.id`.
-    // Async-aware send so a full TM inbox yields (backpressure) instead of parking
-    // a thread; Err only when the inbox is closed (shutdown).
+    // uniquifier.
     let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
     let request = Request {
         rid: rid.clone(),
@@ -49,13 +44,44 @@ pub(super) async fn submit(
         Ok(()) => Ok((rid, rx)),
         // `SendError` has a single meaning — the channel is disconnected.
         Err(_) => {
-            tracing::error!(%rid, "tm inbox closed; request rejected");
-            // Return 503 so the client can retry.
-            Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                error_value(503, "service unavailable"),
-                stream,
-            ))
+            tracing::error!(%rid, "tm ingress channel closed; request rejected");
+            Err(ChannelClosed)
         }
+    }
+}
+
+/// Native-frontend submission.
+pub(super) async fn submit_native(
+    state: &AppState,
+    kind: RequestKind,
+    stream: bool,
+) -> Result<(Rid, mpsc::Receiver<EgressItem>), Response> {
+    match submit(state, kind).await {
+        Ok(submitted) => Ok(submitted),
+        Err(ChannelClosed) => Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_value(503, "service unavailable"),
+            stream,
+        )),
+    }
+}
+
+/// OpenAI-frontend submission.
+pub(super) async fn submit_openai(
+    state: &AppState,
+    request: GenerateRequest,
+    stream: bool,
+    guard: &mut AbortGuard,
+) -> Result<mpsc::Receiver<EgressItem>, Response> {
+    match submit(state, RequestKind::Generate(Box::new(request))).await {
+        Ok((rid, rx)) => {
+            guard.arm(rid);
+            Ok(rx)
+        }
+        Err(ChannelClosed) => Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::openai::error_payload(StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
+            stream,
+        )),
     }
 }
