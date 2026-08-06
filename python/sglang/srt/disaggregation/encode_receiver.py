@@ -690,7 +690,7 @@ def _aggregate_embedding_part(current, recv_obj, model_type):
     return current
 
 
-class WaitingImageRequestStatus(IntEnum):
+class WaitingMMRequestStatus(IntEnum):
     FAIL = -1
     PENDING = 0
     SUCCESS = 1
@@ -732,8 +732,13 @@ def calculate_modality_num_parts(modalities, num_items_assigned):
     return total_num_parts, modality_num_parts
 
 
-# For zmq_to_scheduler
-class WaitingImageRequest:
+class WaitingMMRequestBase(ABC):
+    """One in-flight multimodal request on a scheduler rank, waiting for
+    encoder embeddings. Owns the shared machinery: the ZMQ receive loop,
+    failure handling (_fail_and_release), pool-slot lifetime, and the
+    TP-consistent status. Subclasses bind the transport.
+    """
+
     def __init__(
         self,
         rid: str,
@@ -762,7 +767,7 @@ class WaitingImageRequest:
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
         # ok=1 pending=0 fail=-1
-        self.status = WaitingImageRequestStatus.PENDING
+        self.status = WaitingMMRequestStatus.PENDING
         self.error_msg = None
         self.error_code = None
         self.start_time = time.time()
@@ -776,6 +781,180 @@ class WaitingImageRequest:
         self._mm_finalizer: Optional[weakref.finalize] = None
         self._pool_full_warned = False
 
+    @abstractmethod
+    def send_encode_request(self) -> None:
+        """Kick off the transport-specific encode / receive flow."""
+
+    def _try_recv_mm_data(self):
+        if self.status != WaitingMMRequestStatus.PENDING:
+            return
+        while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
+            try:
+                parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
+            except zmq.Again:
+                # No data available yet, wait a bit and retry
+                return
+            except zmq.ZMQError:
+                # Socket closed by another path (e.g. the RDMA receive thread
+                # after an encoder error); status is already terminal.
+                return
+            try:
+                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+                if getattr(recv_obj, "error_msg", None) is not None:
+                    logger.warning(
+                        f"Received error signal from encoder for {self.rid}: "
+                        f"{recv_obj.error_msg} {recv_obj.error_code = }"
+                    )
+                    self._fail_and_release(recv_obj.error_msg, recv_obj.error_code)
+                    return
+                if not self._is_valid_embedding_part(recv_obj):
+                    continue
+                # For zmq backend, _extract_embedding_from_buffer deserializes the numpy buffer.
+                # For RDMA backend, this is effectively a no-op because the buffer is ready for use.
+                self._extract_embedding_from_buffer(recv_obj, parts)
+                self.recv_embedding_data = _aggregate_embedding_part(
+                    self.recv_embedding_data, recv_obj, self.model_type
+                )
+            except Exception as e:
+                # A message the scheduler cannot decode (blocked unpickle,
+                # bad shape/dtype, ...) must fail this request, not crash the
+                # scheduler event loop; FAIL still reaches the TP-wide status
+                # all-reduce in _process_waiting_requests.
+                logger.exception(
+                    "Failed to decode embedding message for rid=%s", self.rid
+                )
+                self._fail_and_release(f"Failed to decode embedding message: {e}")
+                return
+
+        # For zmq backend, this stages CPU parts into the pool (False = pool full, retry next tick).
+        # For RDMA backend, this views the GPU buffer its receive thread already landed.
+        if not self._assemble_mm_inputs_from_embeddings():
+            return
+        self.recv_socket.close()
+
+    def _fail_and_release(self, error_msg, error_code=None) -> None:
+        """Terminal failure: record the error, free buffers, close the socket."""
+        self.error_msg = error_msg
+        self.error_code = error_code
+        self.status = WaitingMMRequestStatus.FAIL
+        self._cleanup_gpu_buffer()
+        self.recv_socket.close()
+
+    async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
+        """Validate gathered encoder responses; on the first error, FAIL the
+        request and release its resources. Returns True if all succeeded."""
+        msg = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
+        if msg is None:
+            return True
+        self._fail_and_release(msg)
+        return False
+
+    def _is_valid_embedding_part(self, recv_obj) -> bool:
+        """Check for and drop stale or out-of-sync payloads; normalize the part req_id to the original rid."""
+        original_req_id = extract_original_req_id(recv_obj.req_id)
+        if original_req_id != self.recv_req.rid:
+            logger.warning(
+                f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+            )
+            return False
+        recv_obj.req_id = original_req_id
+        return True
+
+    @abstractmethod
+    def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
+        """Materialize ``recv_obj.embedding`` from one received part message."""
+
+    @abstractmethod
+    def _prepare_embedding_buffer(self) -> bool:
+        """Make ``embeddings_buffer`` ready for assembly, or leave it None
+        for the CPU-concat path. False = not ready yet, stay PENDING."""
+
+    def _view_dtype(self):
+        """dtype of the bytes in ``embeddings_buffer``."""
+        return self.recv_embedding_data.dtype
+
+    def _assemble_mm_inputs_from_embeddings(self) -> bool:
+        """Assemble mm_inputs from the received embeddings and mark
+        SUCCESS/FAIL. Failures are caught so they still reach the TP-wide
+        status all-reduce.
+
+        Returns True when done so the caller closes the recv socket; False
+        when the buffer is not ready yet (stay PENDING, retry next tick) or
+        the request can never fit the pool (already FAILed, socket closed).
+        """
+        try:
+            if not self._prepare_embedding_buffer():
+                return False
+            if self.embeddings_buffer is not None:
+                # Zero-copy per-modality views into the GPU buffer; slot
+                # lifetime is bound to mm_inputs GC in _finish_assemble.
+                recv_embedding = _view_pool_buffer_by_modality(
+                    self.embeddings_buffer,
+                    self.recv_embedding_data,
+                    self._view_dtype(),
+                )
+            else:
+                recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+            self._finish_assemble(recv_embedding)
+            # Releases whatever is still attached: no-op once the slot was
+            # detached; RDMA's override also deregisters non-pool buffers.
+            self._cleanup_gpu_buffer()
+        except Exception as e:
+            self._fail_assemble(e)
+        return True
+
+    def _finish_assemble(self, recv_embedding) -> None:
+        """get_mm_data → bind pool slot → publish onto recv_req → SUCCESS."""
+        mm_inputs = self.mm_processor.get_mm_data(
+            self.recv_req.input_text,
+            recv_embedding,
+            **self.recv_embedding_data.get_mm_extra_meta(),
+        )
+        self._bind_pool_slot_to_mm_inputs(mm_inputs)
+        self.recv_req.mm_inputs = mm_inputs
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
+        self.status = WaitingMMRequestStatus.SUCCESS
+
+    def _fail_assemble(self, e: Exception) -> None:
+        logger.exception("Failed to assemble multimodal inputs for rid=%s", self.rid)
+        self._fail_and_release(f"Failed to assemble multimodal inputs: {e}")
+
+    def _bind_pool_slot_to_mm_inputs(self, mm_inputs) -> bool:
+        """Bind pool-slot release to mm_inputs GC. Returns True if bound."""
+        if (
+            mm_inputs is None
+            or self._pool_slot_id is None
+            or self.embedding_pool is None
+        ):
+            return False
+        # Keep the handle so abort can release the slot immediately.
+        self._mm_finalizer = self.embedding_pool.release_on_gc(
+            mm_inputs, self._pool_slot_id
+        )
+        _mark_keep_device_embedding(mm_inputs)
+        # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
+        self._pool_slot_id = None
+        self.embeddings_buffer = None
+        return True
+
+    def _cleanup_gpu_buffer(self):
+        if self._pool_slot_id is not None and self.embedding_pool is not None:
+            self.embedding_pool.release(self._pool_slot_id)
+            self._pool_slot_id = None
+        self.embeddings_buffer = None
+
+    def release_resources(self):
+        """Free pool/GPU resources on abort/fail/timeout. Idempotent."""
+        self._cleanup_gpu_buffer()
+        finalizer, self._mm_finalizer = self._mm_finalizer, None
+        if finalizer is not None:
+            finalizer()  # at-most-once; a later GC call becomes a no-op
+
+
+# For zmq_to_scheduler: embedding parts arrive as ZMQ payload frames and
+# are optionally staged into the GPU EmbeddingPool.
+class WaitingZmqRequest(WaitingMMRequestBase):
     def send_encode_request(self):
 
         async def _send_single_request(session, url, payload):
@@ -856,7 +1035,7 @@ class WaitingImageRequest:
                     # A rank without a registered receive URL can never be
                     # pushed to; fail via the normal completion path now
                     # instead of pending until the embedding wait times out.
-                    self.status = WaitingImageRequestStatus.FAIL
+                    self.status = WaitingMMRequestStatus.FAIL
                     self.error_msg = (
                         f"Failed to register receive URL with encoder: {failed[0]!r}"
                     )
@@ -872,79 +1051,7 @@ class WaitingImageRequest:
             )
         )
 
-    def _try_recv_mm_data(self):
-        if self.status != WaitingImageRequestStatus.PENDING:
-            return
-        while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
-            try:
-                parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
-            except zmq.Again:
-                # No data available yet, wait a bit and retry
-                return
-            except zmq.ZMQError:
-                # Socket closed by another path (e.g. the RDMA receive thread
-                # after an encoder error); status is already terminal.
-                return
-            try:
-                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-                if getattr(recv_obj, "error_msg", None) is not None:
-                    logger.warning(
-                        f"Received error signal from encoder for {self.rid}: "
-                        f"{recv_obj.error_msg} {recv_obj.error_code = }"
-                    )
-                    self._fail_and_release(recv_obj.error_msg, recv_obj.error_code)
-                    return
-                if not self._is_valid_embedding_part(recv_obj):
-                    continue
-                self._build_embedding_buffer(recv_obj, parts)
-                self.recv_embedding_data = _aggregate_embedding_part(
-                    self.recv_embedding_data, recv_obj, self.model_type
-                )
-            except Exception as e:
-                # A message the scheduler cannot decode (blocked unpickle,
-                # bad shape/dtype, ...) must fail this request, not crash the
-                # scheduler event loop; FAIL still reaches the TP-wide status
-                # all-reduce in _process_waiting_requests.
-                logger.exception(
-                    "Failed to decode embedding message for rid=%s", self.rid
-                )
-                self._fail_and_release(f"Failed to decode embedding message: {e}")
-                return
-
-        if not self._assemble_mm_inputs_from_embeddings():
-            return
-        self.recv_socket.close()
-
-    def _fail_and_release(self, error_msg, error_code=None) -> None:
-        """Terminal failure: record the error, free buffers, close the socket."""
-        self.error_msg = error_msg
-        self.error_code = error_code
-        self.status = WaitingImageRequestStatus.FAIL
-        self._cleanup_gpu_buffer()
-        self.recv_socket.close()
-
-    async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
-        """Validate gathered encoder responses; on the first error, FAIL the
-        request and release its resources. Returns True if all succeeded."""
-        msg = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
-        if msg is None:
-            return True
-        self._fail_and_release(msg)
-        return False
-
-    def _is_valid_embedding_part(self, recv_obj) -> bool:
-        """Check for and drop stale or out-of-sync payloads; normalize the part req_id to the original rid."""
-        original_req_id = extract_original_req_id(recv_obj.req_id)
-        if original_req_id != self.recv_req.rid:
-            logger.warning(
-                f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
-            )
-            return False
-        recv_obj.req_id = original_req_id
-        return True
-
-    def _build_embedding_buffer(self, recv_obj, parts) -> None:
+    def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
         """ZMQ transport carries the embedding bytes as frame 1. Clone so we
         don't depend on the ZMQ buffer after the next recv."""
         buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
@@ -954,64 +1061,12 @@ class WaitingImageRequest:
             .clone()
         )
 
-    def _assemble_mm_inputs_from_embeddings(self) -> bool:
-        """Assemble mm_inputs from the received embeddings and mark
-        SUCCESS/FAIL. Failures are caught so they still reach the TP-wide
-        status all-reduce.
-
-        Returns True when done so the caller closes the recv socket; False
-        when the pool is full (stay PENDING, retry next tick) or the request
-        can never fit (already FAILed with the socket closed).
-        """
-        try:
-            if self.embedding_pool is not None:
-                if not self._try_stage_into_pool():
-                    return False
-                recv_embedding = _view_pool_buffer_by_modality(
-                    self.embeddings_buffer,
-                    self.recv_embedding_data,
-                    self.recv_embedding_data.dtype,
-                )
-            else:
-                recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-            self._finish_assemble(recv_embedding)
-        except Exception as e:
-            self._fail_assemble(e)
-        return True
-
-    def _finish_assemble(self, recv_embedding) -> None:
-        """get_mm_data → bind pool slot → publish onto recv_req → SUCCESS."""
-        mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
-            recv_embedding,
-            **self.recv_embedding_data.get_mm_extra_meta(),
-        )
-        self._bind_pool_slot_to_mm_inputs(mm_inputs)
-        self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
-        self.status = WaitingImageRequestStatus.SUCCESS
-
-    def _fail_assemble(self, e: Exception) -> None:
-        logger.exception("Failed to assemble multimodal inputs for rid=%s", self.rid)
-        self._fail_and_release(f"Failed to assemble multimodal inputs: {e}")
-
-    def _bind_pool_slot_to_mm_inputs(self, mm_inputs) -> bool:
-        """Bind pool-slot release to mm_inputs GC. Returns True if bound."""
-        if (
-            mm_inputs is None
-            or self._pool_slot_id is None
-            or self.embedding_pool is None
-        ):
-            return False
-        # Keep the handle so abort can release the slot immediately.
-        self._mm_finalizer = self.embedding_pool.release_on_gc(
-            mm_inputs, self._pool_slot_id
-        )
-        _mark_keep_device_embedding(mm_inputs)
-        # Detach so _cleanup_gpu_buffer no-ops; finalize now owns release.
-        self._pool_slot_id = None
-        self.embeddings_buffer = None
-        return True
+    def _prepare_embedding_buffer(self) -> bool:
+        """Stage the CPU parts into the GPU pool when one is configured;
+        without a pool the CPU-concat path is used (buffer stays None)."""
+        if self.embedding_pool is None:
+            return True
+        return self._try_stage_into_pool()
 
     def _try_stage_into_pool(self) -> bool:
         """Copy the received parts into one pooled GPU slot, packed in part
@@ -1051,21 +1106,8 @@ class WaitingImageRequest:
             parts[i] = None
         return True
 
-    def _cleanup_gpu_buffer(self):
-        if self._pool_slot_id is not None and self.embedding_pool is not None:
-            self.embedding_pool.release(self._pool_slot_id)
-            self._pool_slot_id = None
-        self.embeddings_buffer = None
 
-    def release_resources(self):
-        """Free pool/GPU resources on abort/fail/timeout. Idempotent."""
-        self._cleanup_gpu_buffer()
-        finalizer, self._mm_finalizer = self._mm_finalizer, None
-        if finalizer is not None:
-            finalizer()  # at-most-once; a later GC call becomes a no-op
-
-
-class WaitingImageRequestGrpc(WaitingImageRequest):
+class WaitingZmqRequestGrpc(WaitingZmqRequest):
     def send_encode_request(self):
         async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
             tasks = []
@@ -1112,7 +1154,7 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
         )
 
 
-class WaitingImageRDMARequest(WaitingImageRequest):
+class WaitingRDMARequest(WaitingMMRequestBase):
     def __init__(
         self,
         rid,
@@ -1158,7 +1200,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             asyncio.run(self._pull_meta_and_receive_embedding())
         except Exception as e:
             logger.error(f"RDMA receive failed for rid={self.rid}: {e}")
-            self.status = WaitingImageRequestStatus.FAIL
+            self.status = WaitingMMRequestStatus.FAIL
             self.error_msg = str(e)
             self._cleanup_gpu_buffer()
             self.recv_socket.close()
@@ -1233,16 +1275,12 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                         self.embedding_pool.alloc, total_bytes
                     )
                     if alloc_result is None:
-                        # Either the request exceeds pool capacity outright, or
-                        # the wait timed out. Both are fatal for this request
-                        # — fall through to error handling.
-                        self.status = WaitingImageRequestStatus.FAIL
-                        self.error_msg = (
+                        # Oversize or alloc timeout — fatal for this request.
+                        self._fail_and_release(
                             f"EmbeddingPool could not allocate "
                             f"{total_bytes // (1024 * 1024)}MB (oversize or "
                             f"timeout). Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
                         )
-                        self.recv_socket.close()
                         return
                     pool_view, buffer_address, slot_id = alloc_result
                     with self._buffer_lock:
@@ -1311,29 +1349,21 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 return
             logger.info(f"RDMA transfers completed for rid={self.rid}")
 
-    def _build_embedding_buffer(self, recv_obj, parts) -> None:
+    def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
         # The embedding already landed in the pre-registered GPU buffer via
         # RDMA; the completion message carries no payload, so
         # recv_obj.embedding stays None.
         pass
 
-    def _assemble_mm_inputs_from_embeddings(self) -> bool:
-        """RDMA variant: zero-copy per-modality views into the pre-registered
-        GPU buffer (no per-part split + torch.cat copy); slot lifetime is
-        bound to mm_inputs GC via _bind_pool_slot_to_mm_inputs."""
-        try:
-            if self.embeddings_buffer is not None:
-                recv_embedding = _view_pool_buffer_by_modality(
-                    self.embeddings_buffer, self.recv_embedding_data, self.dtype
-                )
-            else:
-                recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-            self._finish_assemble(recv_embedding)
-            # Deregisters non-pool buffers; no-op for already-detached pool ones.
-            self._cleanup_gpu_buffer()
-        except Exception as e:
-            self._fail_assemble(e)
+    def _prepare_embedding_buffer(self) -> bool:
+        # The receive thread already landed the embedding via RDMA (or left
+        # the buffer None for the zero-byte case).
         return True
+
+    def _view_dtype(self):
+        # Parts carry no payload (aggregate dtype is None); use the model
+        # dtype the receiver was constructed with.
+        return self.dtype
 
     def _cleanup_gpu_buffer(self):
         """Latch _terminal and release the GPU buffer. While the receive
@@ -1665,7 +1695,7 @@ class MMReceiverBase(ABC):
         self.tp_group = tp_group
         self.nnodes = server_args.nnodes
         self.hostname = get_local_ip_auto()
-        self.waiting_list: List[WaitingImageRequest] = []
+        self.waiting_list: List[WaitingMMRequestBase] = []
         self.scheduler = scheduler
         self.gpu_id = scheduler.ps.gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
@@ -1805,8 +1835,8 @@ class MMReceiverBase(ABC):
             if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
                 continue
             if waiting_req.status in (
-                WaitingImageRequestStatus.PENDING,
-                WaitingImageRequestStatus.SUCCESS,
+                WaitingMMRequestStatus.PENDING,
+                WaitingMMRequestStatus.SUCCESS,
             ):
                 waiting_req._fail_and_release("Aborted by user", error_code=400)
                 waiting_req.release_resources()
@@ -2019,7 +2049,7 @@ class MMReceiverBase(ABC):
                 )
             obj.need_wait_for_mm_inputs = False
 
-    def _sync_fail_info_across_tp(self, waiting_req: WaitingImageRequest) -> None:
+    def _sync_fail_info_across_tp(self, waiting_req: WaitingMMRequestBase) -> None:
         """Share encoder error fields across TP ranks before abort.
 
         The encoder sends ZMQ error signals to each TP rank's receive socket,
@@ -2082,7 +2112,7 @@ class MMReceiverBase(ABC):
         for waiting_req in self.waiting_list:
             waiting_req._try_recv_mm_data()
             if current_time - waiting_req.start_time > self.wait_timeout:
-                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
+                waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
                 waiting_req.recv_socket.close()
             local_status.append(waiting_req.status)
@@ -2099,9 +2129,9 @@ class MMReceiverBase(ABC):
         abort_reqs = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
-            if status_value == WaitingImageRequestStatus.SUCCESS:
+            if status_value == WaitingMMRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
-            elif status_value == WaitingImageRequestStatus.FAIL:
+            elif status_value == WaitingMMRequestStatus.FAIL:
                 self._sync_fail_info_across_tp(waiting_req)
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
@@ -2116,7 +2146,7 @@ class MMReceiverBase(ABC):
                         waiting_req.error_code,
                     )
                 )
-            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+            elif status_value == WaitingMMRequestStatus.TIMEOUT:
                 logger.error(
                     f"Timed out waiting for image embeddings for request {waiting_req.rid}"
                 )
@@ -2128,7 +2158,7 @@ class MMReceiverBase(ABC):
                         HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
-            else:  # status_value == WaitingImageRequestStatus.PENDING
+            else:  # status_value == WaitingMMRequestStatus.PENDING
                 new_waiting.append(waiting_req)
 
         self.waiting_list = new_waiting
@@ -2327,14 +2357,14 @@ class MMReceiverHTTP(MMReceiverBase):
         if self.encoder_transfer_backend == "mooncake":
             return self._process_waiting_requests(
                 recv_reqs,
-                WaitingImageRDMARequest,
+                WaitingRDMARequest,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
             )
         return self._process_waiting_requests(
-            recv_reqs, WaitingImageRequest, embedding_pool=self.embedding_pool
+            recv_reqs, WaitingZmqRequest, embedding_pool=self.embedding_pool
         )
 
     async def encode(
@@ -2461,7 +2491,7 @@ class MMReceiverGrpc(MMReceiverBase):
 
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
-        return self._process_waiting_requests(recv_reqs, WaitingImageRequestGrpc)
+        return self._process_waiting_requests(recv_reqs, WaitingZmqRequestGrpc)
 
     async def encode(
         self,
