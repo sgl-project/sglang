@@ -43,7 +43,7 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -75,7 +75,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.num_fused_shared_experts = 0
         self._determine_num_fused_shared_experts()
@@ -120,7 +120,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 text_config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("language_model.lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -135,7 +135,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
         server_args = get_server_args()
-        if server_args.disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None

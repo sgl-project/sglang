@@ -285,7 +285,13 @@ def should_async_load(weight: torch.Tensor) -> bool:
     For host (CPU) tensors, using a threadpool can overlap H2D copies
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
+
+    RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
+    must be consumed synchronously before the streamer fills its next batch.
     """
+    if getattr(weight, "_sglang_runai_streamer_tensor", False):
+        return False
+
     device = getattr(weight, "device", None)
     if device is None:
         return False
