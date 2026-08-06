@@ -2214,11 +2214,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
-        if self._is_cutedsl_v2_standard:
-            layer._cutedsl_wrapper = None
-            layer._cutedsl_scales = None
-            layer._cutedsl_input_scale = None
-            layer._cutedsl_per_token_input_scale = None
 
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
@@ -2474,23 +2469,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
-        if self._is_cutedsl_v2_standard and self.quant_config.use_per_token_activation:
-            from flashinfer.quantization.nvfp4_quantization_utils import (
-                current_nvfp4_4over6_config,
-                make_nvfp4_global_scale,
-            )
-
-            cutedsl_per_token_input_scale = make_nvfp4_global_scale(
-                layer.w13_input_scale_quant,
-                per_token_activation=True,
-                nvfp4_4over6_config=current_nvfp4_4over6_config(),
-            )
-            if layer._cutedsl_per_token_input_scale is None:
-                layer._cutedsl_per_token_input_scale = cutedsl_per_token_input_scale
-            else:
-                layer._cutedsl_per_token_input_scale.copy_(
-                    cutedsl_per_token_input_scale
-                )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             gemm1_clamp_limit = (
@@ -2521,19 +2499,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
-        dispatcher_input_global_scale = (
-            layer.w13_input_scale_quant
-            if MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
-            else None
+        use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
+            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
         )
-        if self._is_cutedsl_v2_standard and self.quant_config.use_per_token_activation:
-            # FlashInfer A2A can pre-quantize with only a scalar scale. Keep the
-            # payload in BF16 so the CuteDSL runner can compute and forward the
-            # per-token row scale required by FlashInfer's per-token contract.
-            dispatcher_input_global_scale = None
 
         layer.dispatcher.set_quant_config(
-            {"input_global_scale": dispatcher_input_global_scale}
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant if use_dispatch_fp4 else None
+                )
+            }
         )
         block_size = 16
         # Validate weight scales
@@ -2700,7 +2675,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         sf_vec_size=sf_vec_size,
                     ),
                 )
-                if layer._cutedsl_wrapper is not None:
+                if getattr(layer, "_cutedsl_wrapper", None) is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
     @property
@@ -2871,11 +2846,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ),
                 w1_alpha=w1_alpha,
                 w2_alpha=w2_alpha,
-                a1_scale=(
-                    layer._cutedsl_per_token_input_scale
-                    if self.quant_config.use_per_token_activation
-                    else layer._cutedsl_input_scale
-                ),
+                a1_scale=layer._cutedsl_input_scale,
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
                 use_per_token_activation=self.quant_config.use_per_token_activation,

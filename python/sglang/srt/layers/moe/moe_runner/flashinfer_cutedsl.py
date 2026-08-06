@@ -238,12 +238,27 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
     )
 
 
+def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
+
+    return make_nvfp4_global_scale(
+        input_tensor,
+        per_token_activation=True,
+        nvfp4_4over6_config=current_nvfp4_4over6_config(),
+    )
+
+
 def refresh_cutedsl_standard_scales_for_weight_update(
     layer: torch.nn.Module,
 ) -> None:
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
         resolve_cutedsl_standard_scales(layer)
     )
+    if layer.quant_config.use_per_token_activation:
+        used_input_scale = _make_per_token_global_scale(used_input_scale)
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     current_scales = layer._cutedsl_scales
@@ -293,7 +308,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     during later CUDA graph capture, which runs outside inference_mode. The
     resolved scale tensors share this scope because reload updates them in place.
     """
-    if layer._cutedsl_wrapper is not None:
+    if getattr(layer, "_cutedsl_wrapper", None) is not None:
         return
 
     try:
@@ -350,6 +365,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
+        if layer.quant_config.use_per_token_activation:
+            used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
 
