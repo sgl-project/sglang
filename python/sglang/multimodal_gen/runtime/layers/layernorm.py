@@ -51,7 +51,7 @@ if _is_npu:
         import attentions  # noqa: F401
     except ImportError:
         from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-    
+
         logger = init_logger(__name__)  # pylint: disable=invalid-name
         logger.warning(
             "The 'attentions' library is not installed. Falling back to native layernorm. "
