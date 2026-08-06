@@ -59,7 +59,11 @@ class SpecEagleServerBase(CustomTestCase):
     # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
     mem_fraction_static = 0.85
-    max_running_requests = 8
+    # The eval kits drive 128 client threads; admitting only a handful serializes
+    # them for no coverage. 64 also matches the capture bound popen_launch_server
+    # sets -- capture_bs is clipped by req_to_token_pool.size (max_running + 1),
+    # so a smaller cap here would silently shrink the captured range too.
+    max_running_requests = 64
     chunked_prefill_size = 128
     # bf16 rather than fp16: fp16 activations can overflow (-> Inf -> NaN) on
     # degenerate draft branches in verify and trip the CI NaN asserts.

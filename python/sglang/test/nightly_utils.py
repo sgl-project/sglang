@@ -272,6 +272,8 @@ class NightlyBenchmarkRunner:
                     else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
                 ),
                 env=env,
+                # Benchmarks measure the prefill path the deployed default takes.
+                bounded_cuda_graph=False,
             )
 
             # Generate filenames

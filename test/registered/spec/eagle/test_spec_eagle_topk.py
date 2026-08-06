@@ -40,6 +40,9 @@ class TestEagle3Topk16(
     spec_tokens = 64
     disable_overlap = False
     enable_return_hidden_states = True
+    # Verify materializes bs * spec_tokens fp32 logit rows; with a 128k vocab
+    # that is 262MB here and 2.1GB (OOM on a 32GB card) at the fixture's 64.
+    max_running_requests = 8
     cuda_graph_max_bs_decode = 5
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75
