@@ -180,8 +180,7 @@ class TestNamespaceDigest(CustomTestCase):
             with self.assertRaises(msgspec.ValidationError):
                 load_namespace_descriptor(f.name)
 
-    def test_descriptor_rejects_uniform_layer_grid(self):
-        # layer_group != 0 is the not-yet-implemented uniform-grid fan-out.
+    def test_descriptor_rejects_negative_layer_group(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
                 {
@@ -191,14 +190,14 @@ class TestNamespaceDigest(CustomTestCase):
                     "page_size": 64,
                     "rank_replicated": True,
                     "total_kv_heads": 0,
-                    "layer_group": 40,
+                    "layer_group": -1,
                     "head_group": 0,
                     "object_layout": "page_first",
                 },
                 f,
             )
             f.flush()
-            with self.assertRaisesRegex(NotImplementedError, "layer_group"):
+            with self.assertRaisesRegex(ValueError, "layer_group"):
                 load_namespace_descriptor(f.name)
 
     def test_grid_validation(self):
@@ -548,9 +547,9 @@ class TestLayerPartition(CustomTestCase):
     written under a different pipeline split by name alone."""
 
     def _mla_partition_namespace(self):
-        return _mla_namespace(layer_boundaries=[0, 30, 61])
+        return _mla_namespace(layer_group=30)
 
-    def _suffixes(self, start_layer, end_layer, namespace=None):
+    def _suffixes(self, start_layer, end_layer, namespace=None, final=True):
         return build_canonical_cell_suffixes(
             namespace or self._mla_partition_namespace(),
             attn_tp_rank=0,
@@ -564,28 +563,34 @@ class TestLayerPartition(CustomTestCase):
             model_id="deepseek-ai/DeepSeek-V3",
             rank_replicated=True,
             object_layout="page_first_direct",
+            is_final_stage=final,
         )
 
     def test_pp_read_back_coverage(self):
-        # DeepSeek-V3, partition [0,30,61] (the default uneven PP2 split):
-        # PP2 stages own one cell each; a PP1 rank fans out to exactly their
-        # union — PP1 reads PP2-written cells and vice versa.
+        # DeepSeek-V3 (61 layers), layer unit 30, default uneven PP2 split
+        # [0,30)/[30,61): the trailing remainder forms a short final cell
+        # (L60-61). PP1 fans out to exactly the stages' union.
         digest = namespace_digest(self._mla_partition_namespace())
-        stage0 = self._suffixes(0, 30)
+        stage0 = self._suffixes(0, 30, final=False)
         stage1 = self._suffixes(30, 61)
         pp1 = self._suffixes(0, 61)
         self.assertEqual(stage0, [f"{digest}_L0-30"])
-        self.assertEqual(stage1, [f"{digest}_L30-61"])
+        self.assertEqual(stage1, [f"{digest}_L30-60", f"{digest}_L60-61"])
         self.assertEqual(pp1, stage0 + stage1)
 
     def test_misaligned_stage_rejected(self):
-        with self.assertRaisesRegex(ValueError, "boundaries"):
-            self._suffixes(0, 45)
+        # Start off the layer unit is never legal.
+        with self.assertRaisesRegex(ValueError, "start"):
+            self._suffixes(45, 61)
+        # An off-unit END is legal only on the final stage (short chunk).
+        with self.assertRaisesRegex(ValueError, "FINAL"):
+            self._suffixes(0, 45, final=False)
+        self.assertEqual(len(self._suffixes(0, 45)), 2)  # L0-30 + L30-45
 
-    def _gqa_partition_suffixes(self, *, tp_rank, tp_size, start_layer, end_layer):
-        namespace = _gqa_namespace(
-            layer_boundaries=[0, 30, 61], object_layout="page_first_direct"
-        )
+    def _gqa_partition_suffixes(
+        self, *, tp_rank, tp_size, start_layer, end_layer, final=True
+    ):
+        namespace = _gqa_namespace(layer_group=30, object_layout="page_first_direct")
         return build_canonical_cell_suffixes(
             namespace,
             attn_tp_rank=tp_rank,
@@ -599,14 +604,15 @@ class TestLayerPartition(CustomTestCase):
             model_id="meta-llama/Llama-3-70B",
             rank_replicated=False,
             object_layout="page_first_direct",
+            is_final_stage=final,
         )
 
     def test_mha_pp_read_back_coverage(self):
         # GQA layer fan-out: TP4 rank 2 (head_group == local, no head
         # fan-out) — PP1's cells are the union of the PP2 stages', with the
-        # H coordinate constant.
+        # H coordinate constant and the short final chunk included.
         stage0 = self._gqa_partition_suffixes(
-            tp_rank=2, tp_size=4, start_layer=0, end_layer=30
+            tp_rank=2, tp_size=4, start_layer=0, end_layer=30, final=False
         )
         stage1 = self._gqa_partition_suffixes(
             tp_rank=2, tp_size=4, start_layer=30, end_layer=61
@@ -614,6 +620,7 @@ class TestLayerPartition(CustomTestCase):
         pp1 = self._gqa_partition_suffixes(
             tp_rank=2, tp_size=4, start_layer=0, end_layer=61
         )
+        self.assertEqual(len(stage1), 2)  # L30-60 + short L60-61
         self.assertEqual(pp1, stage0 + stage1)
         self.assertTrue(all(sfx.endswith("_H2") for sfx in pp1))
 
@@ -649,76 +656,25 @@ class TestLayerPartition(CustomTestCase):
     def test_partition_enters_digest(self):
         self.assertNotEqual(
             namespace_digest(self._mla_partition_namespace()),
-            namespace_digest(_mla_namespace(layer_boundaries=[0, 61])),
+            namespace_digest(_mla_namespace(layer_group=61)),
         )
         self.assertNotEqual(
             namespace_digest(self._mla_partition_namespace()),
             namespace_digest(_mla_namespace()),
         )
 
-    def test_integer_layer_grid_spelling(self):
-        # layer_partition may be an integer (uniform layers per cell); the
-        # equivalent boundary list canonicalizes to the SAME digest, so both
-        # spellings of one grid share one keyspace.
-        from sglang.srt.mem_cache.hicache_key_scheme import canonical_layer_grid
-
-        common = dict(
-            model_id="x",
-            dtype="bfloat16",
-            page_size=64,
-            rank_replicated=True,
-            total_kv_heads=0,
-            head_group=0,
-            object_layout="page_first_direct",
-        )
-        ns_int = derive_namespace(layer_group=40, **common)
-        ns_list = derive_namespace(layer_boundaries=[0, 40, 80], **common)
-        self.assertEqual(namespace_digest(ns_int), namespace_digest(ns_list))
-        self.assertEqual(ns_list.layer_group, 40)
-        self.assertEqual(ns_list.layer_boundaries, [])
-
-        def suffixes(ns, start, end):
-            return build_canonical_cell_suffixes(
-                ns,
-                attn_tp_rank=0,
-                attn_tp_size=2,
-                attn_cp_size=1,
-                start_layer=start,
-                end_layer=end,
-                local_kv_heads=0,
+    def test_negative_layer_unit_rejected(self):
+        with self.assertRaises(ValueError):
+            derive_namespace(
+                model_id="m",
                 dtype="bfloat16",
                 page_size=64,
-                model_id="x",
                 rank_replicated=True,
-                object_layout="page_first_direct",
+                total_kv_heads=0,
+                head_group=0,
+                object_layout="page_first",
+                layer_group=-1,
             )
-
-        digest = namespace_digest(ns_int)
-        self.assertEqual(
-            suffixes(ns_int, 0, 80), [f"{digest}_L0-40", f"{digest}_L40-80"]
-        )
-        self.assertEqual(suffixes(ns_list, 0, 80), suffixes(ns_int, 0, 80))
-        # Misaligned stage (uneven model) fails with the list-form remedy.
-        with self.assertRaisesRegex(ValueError, "layer_partition"):
-            suffixes(ns_int, 30, 61)
-        # The two spellings are mutually exclusive; non-uniform lists stay.
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            canonical_layer_grid(40, [0, 30, 61])
-        self.assertEqual(canonical_layer_grid(0, [0, 30, 61]), (0, [0, 30, 61]))
-
-    def test_bad_boundaries_rejected(self):
-        for bad in ([0], [5, 30], [0, 30, 30]):
-            with self.assertRaises(ValueError):
-                derive_namespace(
-                    model_id="m",
-                    dtype="bfloat16",
-                    page_size=64,
-                    rank_replicated=True,
-                    total_kv_heads=0,
-                    head_group=0,
-                    object_layout="page_first",
-                    layer_boundaries=bad,
-                )
 
 
 class TestMlaLayerRangeBufferMeta(CustomTestCase):

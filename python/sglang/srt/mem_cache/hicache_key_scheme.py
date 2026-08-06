@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
 
 import msgspec
 
@@ -97,13 +96,11 @@ class KVCacheNamespace(
     # such namespaces have no head axis (total_kv_heads/head_group are 0).
     rank_replicated: bool
     total_kv_heads: int
-    # Head grid: kv heads per cell. Layer grid, one of two spellings:
-    # layer_group > 0 = uniform grid (Lg layers per cell; every stage must
-    # start AND end on multiples of Lg, which also forces Lg to divide the
-    # model's layer count via the last stage); layer_boundaries = explicit
-    # boundary list for uneven partitions. Mutually exclusive; a uniform
-    # boundary list is canonicalized to layer_group so both spellings of the
-    # same grid share one digest.
+    # Head grid: kv heads per cell. Layer grid: layer_group > 0 = layers per
+    # cell (the fleet's layer unit). Every stage must START on a multiple of
+    # layer_group; the model's trailing remainder simply forms a short final
+    # cell (allowed only on the last PP stage, where the stage end is the
+    # model total). 0 = per-stage ranges (same-partition sharing only).
     layer_group: int = 0
     head_group: int
     # Optional kernel/build ABI digest; deployments whose numerics must not
@@ -115,13 +112,6 @@ class KVCacheNamespace(
     # deployments could exchange byte-permuted KV under identical keys.
     # Identity field: mismatched layouts miss instead of corrupting.
     object_layout: str
-    # Canonical layer partition (the fleet agreement for PP read-back):
-    # strictly increasing boundaries starting at 0 and ending at the model's
-    # layer count, e.g. [0, 30, 61]. Every deployment's stage must start and
-    # end on boundaries; a stage spanning several ranges owns one cell per
-    # range (layer fan-out). Empty = per-stage ranges (same-partition
-    # deployments share; differing partitions miss).
-    layer_boundaries: list[int] = []
 
 
 def namespace_digest(namespace: KVCacheNamespace) -> str:
@@ -165,7 +155,6 @@ def derive_namespace(
     total_kv_heads: int,
     head_group: int,
     object_layout: str,
-    layer_boundaries: Optional[list[int]] = None,
     layer_group: int = 0,
 ) -> KVCacheNamespace:
     """Derive the namespace from deployment facts plus the fleet agreements.
@@ -173,14 +162,14 @@ def derive_namespace(
     ``head_group`` is the head-grid agreement (the ``head_group`` extra-config
     knob): deployments passing the same value land in one keyspace; without
     it, ``head_group`` = the rank's local head count and only same-TP
-    deployments share. ``layer_boundaries`` is the
-    layer-partition agreement (``layer_partition`` in the extra config) that
-    enables PP read-back across different pipeline splits; without it, layer
-    cells are per-stage ranges and only same-partition deployments share.
+    deployments share. ``layer_group`` is the layer-unit agreement
+    (``layer_partition`` in the extra config, layers per cell) that enables
+    PP read-back across different pipeline splits — the model's trailing
+    remainder forms a short final cell; without it, layer cells are
+    per-stage ranges and only same-partition deployments share.
     All other mismatches (model, logical dtype, page size) partition into
     disjoint keyspaces — safe, never a geometry collision.
     """
-    layer_group, boundaries = canonical_layer_grid(layer_group, layer_boundaries)
     namespace = KVCacheNamespace(
         model_id=model_id,
         dtype=dtype,
@@ -190,52 +179,14 @@ def derive_namespace(
         head_group=0 if rank_replicated else head_group,
         object_layout=object_layout,
         layer_group=layer_group,
-        layer_boundaries=boundaries,
     )
     _validate_grid(namespace)
     return namespace
 
 
-def canonical_layer_grid(
-    layer_group: int, layer_boundaries: Optional[list[int]]
-) -> tuple[int, list[int]]:
-    """Normalize the two layer-grid spellings to one canonical form.
-
-    A uniform boundary list ([0, 40, 80]) and the equivalent integer
-    (layer_group=40) must produce the same namespace digest, so uniform
-    lists collapse to the integer form here.
-    """
-    boundaries = list(layer_boundaries) if layer_boundaries else []
-    if layer_group and boundaries:
-        raise ValueError(
-            "layer_group and layer_boundaries are mutually exclusive "
-            "spellings of the layer grid; set one."
-        )
-    if len(boundaries) >= 2:
-        diffs = {b - a for a, b in zip(boundaries, boundaries[1:])}
-        if len(diffs) == 1:
-            return diffs.pop(), []
-    return layer_group, boundaries
-
-
 def _validate_grid(namespace: KVCacheNamespace) -> None:
     if namespace.layer_group < 0:
         raise ValueError(f"layer_group must be non-negative: {namespace}")
-    if namespace.layer_group and namespace.layer_boundaries:
-        raise ValueError(
-            f"layer_group and layer_boundaries are mutually exclusive: " f"{namespace}"
-        )
-    boundaries = namespace.layer_boundaries
-    if boundaries:
-        if len(boundaries) < 2 or boundaries[0] != 0:
-            raise ValueError(
-                f"layer_boundaries must start at 0 and contain at least one "
-                f"range: {boundaries}"
-            )
-        if any(a >= b for a, b in zip(boundaries, boundaries[1:])):
-            raise ValueError(
-                f"layer_boundaries must be strictly increasing: {boundaries}"
-            )
     if namespace.page_size <= 0:
         raise ValueError(f"page_size must be positive: {namespace}")
     if not namespace.model_id:
@@ -276,6 +227,7 @@ def build_canonical_cell_suffixes(
     model_id: str,
     rank_replicated: bool,
     object_layout: str,
+    is_final_stage: bool = True,
 ) -> list[str]:
     """Validate this rank against the namespace; return its owned cell suffixes.
 
@@ -311,33 +263,30 @@ def build_canonical_cell_suffixes(
         raise ValueError(f"invalid layer range [{start_layer}, {end_layer}).")
     # Layer coordinates are absolute ranges: any PP partition (uneven stages
     # included) yields valid, collision-free names; differing partitions miss
-    # instead of colliding. With a canonical layer partition, the stage must
-    # align to boundaries and owns one cell per contained range (layer
-    # fan-out — this is what lets a reader consume cells written under a
-    # different pipeline split).
+    # instead of colliding. With a layer unit declared, the stage must start
+    # on the grid and owns one cell per contained window; the model's
+    # trailing remainder forms a short final cell (legal only on the last
+    # pipeline stage, whose end IS the model total) — this is what lets a
+    # reader consume cells written under a different pipeline split.
     if namespace.layer_group:
         lg = namespace.layer_group
-        if start_layer % lg != 0 or end_layer % lg != 0:
+        if start_layer % lg != 0:
             raise ValueError(
                 f"this rank's layer range [{start_layer}, {end_layer}) does "
-                f"not align to the uniform layer_group={lg}; stages must "
-                f"start and end on multiples of it (uneven models need the "
-                f"layer_partition boundary-list form instead)."
+                f"not start on a multiple of layer_partition={lg}; stages "
+                f"whose boundaries do not align to the layer unit cannot "
+                f"share a partitioned namespace (drop layer_partition for "
+                f"per-stage ranges)."
             )
-        layer_coords = [f"L{a}-{a + lg}" for a in range(start_layer, end_layer, lg)]
-    elif namespace.layer_boundaries:
-        boundaries = namespace.layer_boundaries
-        if start_layer not in boundaries or end_layer not in boundaries:
+        if end_layer % lg != 0 and not is_final_stage:
             raise ValueError(
-                f"this rank's layer range [{start_layer}, {end_layer}) does "
-                f"not start and end on canonical layer boundaries "
-                f"{boundaries}; every deployment sharing this namespace must "
-                f"partition layers on these boundaries."
+                f"this rank's layer range [{start_layer}, {end_layer}) ends "
+                f"off the layer_partition={lg} grid; only the FINAL pipeline "
+                f"stage may end short (the model's trailing remainder forms "
+                f"the short last cell)."
             )
-        first = boundaries.index(start_layer)
-        last = boundaries.index(end_layer)
         layer_coords = [
-            f"L{boundaries[i]}-{boundaries[i + 1]}" for i in range(first, last)
+            f"L{a}-{min(a + lg, end_layer)}" for a in range(start_layer, end_layer, lg)
         ]
     else:
         layer_coords = [f"L{start_layer}-{end_layer}"]
