@@ -279,6 +279,19 @@ def kda_decode_mtp_kernel(
         # staged if (UNSUP_EARLY_EXIT).
         nvvm.exit()
 
+    # Promote the slot id to int64 BEFORE it multiplies any state-pool slot
+    # stride. The pool tensors arrive with compile-time-constant strides
+    # (compiled with static layouts); each per-slot stride fits int32 — e.g.
+    # the unified memory pool's envelope-strided KDA state views carry
+    # slot strides of ~14M (fp32 ssm) / ~28M (bf16 conv) elements — so the
+    # constant folds into 32-bit arithmetic and `slot * stride` silently
+    # wraps mod 2^32 once slot ids exceed ~153 (conv) / ~306 (ssm): reads
+    # land inside ANOTHER slot's bytes (silent state corruption; NaN under
+    # a poisoned pool) or off the allocation entirely. int64 keeps the
+    # product in the 64-bit domain. Static contiguous pools never reach the
+    # wrap point (slot stride ~197K elements); the unified pool does.
+    slot = cutlass.Int64(slot)
+
     # q/k/g each run on P1_JOB_WARPS warps split by token parity and the v-conv
     # takes the rest. Each token's conv is an independent window over globals,
     # so the split needs no cross-warp communication.
