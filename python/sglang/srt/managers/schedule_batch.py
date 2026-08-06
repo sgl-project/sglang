@@ -2566,6 +2566,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ) -> _MambaRadixCacheV2TrackEntry:
         server_args = get_server_args()
         mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        mamba_state_chunk_size = server_args.mamba_state_chunk_size
 
         def _force_track_h(i: int) -> int:
             assert i % mamba_cache_chunk_size == 0
@@ -2599,16 +2600,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 * mamba_cache_chunk_size
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
+            # The cache boundary can be coarser than the kernel's intermediate-state
+            # boundary (for example page_size=128 with 64-token FLA chunks).
+            # Force the exact cache boundary to be read from h in that case.
+            mamba_track_state_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
+                + (req.extend_range.length // mamba_state_chunk_size)
+                * mamba_state_chunk_size
             )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
+            if mamba_track_state_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)

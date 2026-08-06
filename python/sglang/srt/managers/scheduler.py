@@ -3173,6 +3173,11 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            mamba_prefill_align_size=(
+                self.server_args.mamba_cache_chunk_size
+                if self.server_args.uses_mamba_radix_cache
+                else None
+            ),
         )
 
         if self.chunked_req is not None:

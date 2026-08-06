@@ -316,7 +316,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        mamba_state_chunk_size = get_server_args().mamba_state_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -326,9 +326,9 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            num_h_states = extend_seq_lens // mamba_state_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // mamba_state_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -338,17 +338,16 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
-        is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
+        is_aligned = (lens_masked % mamba_state_chunk_size) == 0
 
         # Aligned: last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Unaligned: intermediate state from h.
-        # TODO: handle mamba_cache_chunk_size % page size != 0
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
+            lens_masked[not_aligned] // mamba_state_chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
