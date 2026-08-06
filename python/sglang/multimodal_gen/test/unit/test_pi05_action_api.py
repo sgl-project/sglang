@@ -33,6 +33,7 @@ def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
         sp_degree=1,
         ulysses_degree=1,
         ring_degree=1,
+        kv_gather_degree=1,
         pipeline_config=config or Pi05PipelineConfig(),
     )
 
