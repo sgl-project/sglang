@@ -1144,6 +1144,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_dp_serving_2_gpu.py",
     ],
 }
 
@@ -1178,6 +1179,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        # zimage server startup dominates; six short requests after warmup
+        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
     },
 }
 

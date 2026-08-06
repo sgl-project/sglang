@@ -222,7 +222,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # number of data parallelism groups
     dp_size: int = 1
     # number of gpu in a dp group
-    dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
@@ -356,6 +355,8 @@ class ServerArgs(DisaggServerArgsMixin):
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    # settled ingress ports, one per DP replica; None until ports are settled
+    scheduler_ports: list[int] | None = None
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
@@ -974,7 +975,10 @@ class ServerArgs(DisaggServerArgsMixin):
             requested_ports = []
             if needs_http:
                 requested_ports.append((self.port, "HTTP"))
-            requested_ports.append((self.scheduler_port, "Scheduler"))
+            for replica in range(self.dp_size or 1):
+                requested_ports.append(
+                    (self.scheduler_port + replica, f"Scheduler[{replica}]")
+                )
             if self.master_port is not None:
                 requested_ports.append((self.master_port, "Master"))
             seen_ports: dict[int, str] = {}
@@ -998,6 +1002,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 initial_scheduler_port, avoid=settled_ports
             )
             settled_ports.add(self.scheduler_port)
+            self.scheduler_ports = [self.scheduler_port]
+            for _ in range((self.dp_size or 1) - 1):
+                port = self.settle_port(
+                    self.scheduler_ports[-1] + 1, avoid=settled_ports
+                )
+                settled_ports.add(port)
+                self.scheduler_ports.append(port)
             if self.master_port is not None:
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
@@ -2047,10 +2058,22 @@ class ServerArgs(DisaggServerArgsMixin):
         Internal endpoint for scheduler.
         Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
+        return self.scheduler_endpoint_for(0)
+
+    def scheduler_endpoint_for(self, replica: int) -> str:
+        """Ingress endpoint of one DP replica's driver rank."""
         scheduler_host = self.host
         if scheduler_host is None or scheduler_host == "localhost":
             scheduler_host = "127.0.0.1"
-        return f"tcp://{scheduler_host}:{self.scheduler_port}"
+        if self.scheduler_ports is not None:
+            port = self.scheduler_ports[replica]
+        else:
+            port = self.scheduler_port + replica
+        return f"tcp://{scheduler_host}:{port}"
+
+    @property
+    def scheduler_endpoints(self) -> list[str]:
+        return [self.scheduler_endpoint_for(r) for r in range(self.dp_size or 1)]
 
     def settle_port(
         self,
@@ -2459,8 +2482,11 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.dp_size < 1:
             raise ValueError("--dp-size must be a natural number")
 
-        if self.dp_size > 1:
-            raise ValueError("DP is not yet supported")
+        if self.dp_size > 1 and self.disagg_role != RoleType.MONOLITHIC:
+            raise ValueError(
+                "--dp-size > 1 is only supported for monolithic serving; "
+                "disaggregated roles scale by adding role instances instead"
+            )
 
         num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:
