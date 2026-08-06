@@ -46,9 +46,19 @@ def install() -> None:
         import triton.knobs as knobs
     except ImportError:
         return
-    _prev_compile_listener = knobs.compilation.listener
-    knobs.runtime.kernel_load_start_hook.add(_on_kernel_load)
-    knobs.compilation.listener = _on_compilation
+    # Some Triton builds shipped in the ROCm CI images (e.g. Triton 3.4.0)
+    # expose ``triton.knobs`` but not ``knobs.runtime.kernel_load_start_hook``
+    # / ``knobs.compilation.listener``. Guarding only ``ImportError`` above is
+    # insufficient: touching the missing attribute raises ``AttributeError``
+    # and crashes every scheduler at startup. Skip diagnostics on such builds.
+    runtime = getattr(knobs, "runtime", None)
+    compilation = getattr(knobs, "compilation", None)
+    hook = getattr(runtime, "kernel_load_start_hook", None)
+    if hook is None or compilation is None or not hasattr(compilation, "listener"):
+        return
+    _prev_compile_listener = compilation.listener
+    hook.add(_on_kernel_load)
+    compilation.listener = _on_compilation
     _installed = True
 
 
