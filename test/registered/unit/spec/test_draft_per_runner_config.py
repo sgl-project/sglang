@@ -12,12 +12,17 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner import (
+    ModelRunner,
+    resolve_draft_attention_backend,
+)
+from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+    resolve_attention_backend_strs,
+)
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
 )
 from sglang.srt.runtime_context import get_context, get_model
-from sglang.srt.speculative.draft_worker_common import draft_server_args_overrides
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -102,27 +107,66 @@ class TestDraftPerRunnerConfig(CustomTestCase):
             build_load_config(load_format="dummy", **common).load_format, "dummy"
         )
 
-    # -- the variant left in the dflash / dspark path carries backends only ----
+    # -- the attention backend is per-runner, not a config variant -------------
 
-    def test_the_draft_variant_carries_the_backend_family_only(self):
-        self._seed(disable_chunked_prefix_cache=False)
-        fields = draft_server_args_overrides("triton")
+    def _runner(self, *, is_draft_worker, draft_attention_backend=None):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.server_args = get_context().server_args
+        runner.is_draft_worker = is_draft_worker
+        runner.draft_attention_backend = draft_attention_backend
+        return runner
 
-        self.assertEqual(fields["attention_backend"], "triton")
-        self.assertEqual(fields["speculative_draft_attention_backend"], "triton")
-        self.assertIsNone(fields["prefill_attention_backend"])
-        self.assertIsNone(fields["decode_attention_backend"])
-        self.assertNotIn("context_length", fields)
-        self.assertNotIn("load_format", fields)
-        self.assertNotIn("skip_tokenizer_init", fields)
+    def test_the_draft_backend_applies_to_the_draft_runner_only(self):
+        self._seed(attention_backend="fa3")
 
-    def test_the_variant_carries_the_targets_resolved_gate(self):
-        """Publishing the variant re-projects the bags, so the gate travels."""
-        self._seed(disable_chunked_prefix_cache=False)
-        get_context().override("test.gate", disable_chunked_prefix_cache=True)
-        self.assertTrue(
-            draft_server_args_overrides("triton")["disable_chunked_prefix_cache"]
+        draft = resolve_attention_backend_strs(
+            model_runner=self._runner(
+                is_draft_worker=True, draft_attention_backend="triton"
+            )
         )
+        self.assertEqual((draft.prefill, draft.decode), ("triton", "triton"))
+        self.assertTrue(draft.is_draft_override)
+
+        target = resolve_attention_backend_strs(
+            model_runner=self._runner(is_draft_worker=False)
+        )
+        self.assertEqual((target.prefill, target.decode), ("fa3", "fa3"))
+
+    def test_an_unresolved_draft_falls_back_to_the_config_field(self):
+        """The v2 workers pass no backend: --speculative-draft-attention-backend."""
+        server_args = self._seed(
+            attention_backend="fa3", speculative_draft_attention_backend="triton"
+        )
+
+        def effective(*, is_draft_worker, passed=None):
+            return resolve_draft_attention_backend(
+                draft_attention_backend=passed,
+                server_args=server_args,
+                is_draft_worker=is_draft_worker,
+            )
+
+        self.assertEqual(effective(is_draft_worker=True), "triton")
+        self.assertEqual(effective(is_draft_worker=True, passed="fa3"), "fa3")
+        self.assertIsNone(effective(is_draft_worker=False))
+
+        draft = resolve_attention_backend_strs(
+            model_runner=self._runner(
+                is_draft_worker=True,
+                draft_attention_backend=effective(is_draft_worker=True),
+            )
+        )
+        self.assertEqual((draft.prefill, draft.decode), ("triton", "triton"))
+
+    def test_the_target_keeps_its_split_pair(self):
+        self._seed(
+            attention_backend="fa3",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="fa3",
+        )
+        target = resolve_attention_backend_strs(
+            model_runner=self._runner(is_draft_worker=False)
+        )
+        self.assertEqual((target.prefill, target.decode), ("flashinfer", "fa3"))
 
     # -- the scheduler hands over the process's own config ---------------------
 
