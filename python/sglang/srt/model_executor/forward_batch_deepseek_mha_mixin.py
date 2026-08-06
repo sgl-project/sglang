@@ -84,6 +84,15 @@ class ForwardBatchDeepSeekMHAMixin:
                 chunk_kv_indices,
                 req_to_token.shape[1],
             )
+            # Unified pool: req_to_token stores VIRTUAL ids — translate at
+            # production so the pool door (get_mla_kv_buffer) receives
+            # kernel-facing ids, mirroring the write rail's ForwardBatch
+            # rebind. The translate returns int64 (the v2p dtype) — exactly
+            # what the door used to hand downstream. No-op on non-unified
+            # pools (callable is None; the int32 indices are already physical
+            # there).
+            if self._unified_kv_loc_translate is not None:
+                chunk_kv_indices = self._unified_kv_loc_translate(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     # Here we suppose the length of each chunk is equal
@@ -221,5 +230,14 @@ class ForwardBatchDeepSeekMHAMixin:
             kv_indices,
             req_to_token.shape[1],
         )
+        # Unified pool: req_to_token stores VIRTUAL ids — translate at
+        # production (once; the cache below holds the translated result and
+        # this method has a single consumer) so the pool door
+        # (get_mla_kv_buffer) receives kernel-facing ids, mirroring the write
+        # rail's ForwardBatch rebind. The translate returns int64 (the v2p
+        # dtype) — exactly what the door used to hand downstream. No-op on
+        # non-unified pools (callable None).
+        if self._unified_kv_loc_translate is not None:
+            kv_indices = self._unified_kv_loc_translate(kv_indices)
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices

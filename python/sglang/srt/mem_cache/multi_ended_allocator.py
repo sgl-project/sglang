@@ -2296,9 +2296,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """SWA-layer read path: virtual TOKEN ids -> swa-physical TOKEN ids (int32,
-        matching the non-shared API). Page math against the swa side's v2p table.
-        Supports ``out=`` (int32, same shape) for cuda-graph buffer stability.
+        """SWA-layer read path: virtual TOKEN ids -> swa-physical TOKEN ids.
+
+        Returns int32 — the shared READ-index kernel convention (window /
+        kv_indices buffers and their Triton kernels are int32, unified and
+        non-unified alike). NOTE this differs from the non-shared pool's
+        WRITE-rail API, which returns int64 (its full_to_swa_index_mapping is
+        int64); this one function serves both the write rail and the window
+        read rail here, so it uses the common-denominator dtype. Page math
+        against the swa side's v2p table. Supports ``out=`` (int32, same
+        shape) for cuda-graph buffer stability.
         """
         if out is not None:
             assert out.dtype == torch.int32, (

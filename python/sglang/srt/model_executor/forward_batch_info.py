@@ -408,6 +408,54 @@ class NgramEmbeddingInfo:
         )
 
 
+def apply_unified_kv_loc_rebind(fb, model_runner) -> None:
+    """Unified memory pool: translate the forward batch's WRITE loc to
+    PHYSICAL ids, exactly once, at ForwardBatch preparation.
+
+    The ONE RULE of the physical-loc contract: ScheduleBatch-side tensors stay
+    VIRTUAL always (radix/accept/inflight machinery reads them); each
+    ForwardBatch is translated exactly once at its construction. `init_new`
+    calls this for every standard construction; the rare hand-built live
+    forward (e.g. the DFLASH draft-block batch) calls it explicitly. Backends
+    with a wired translate handle assert `out_cache_loc_is_physical`, so a
+    construction site that forgets fails loudly instead of writing virtual ids
+    as if physical.
+
+    REBIND, never mutate: `translate_kv_loc` returns a FRESH tensor, so the
+    ScheduleBatch's aliased tensor is untouched (scheduler-thread readers —
+    on_forward_launched, accept bookkeeping — require virtual ids).
+
+    ORDER-CRITICAL for hybrid SWA: one virtual id maps to TWO physicals
+    (full + swa). The swa rail must be computed from the still-VIRTUAL loc
+    BEFORE the full-side rebind replaces it.
+
+    No-op (byte-identical) on non-unified pools: they have no
+    `translate_kv_loc`, and `out_cache_loc` is already physical there.
+    """
+    # Dense-first, EXACTLY the preference the attention backends use for
+    # their kernel-facing translate handle: the MLA composite exposes
+    # `translate_kv_loc_dense` (virtual -> dense view id; collapses onto the
+    # physical id at page-multiplier 1), every other composite only
+    # `translate_kv_loc` (virtual -> physical). Using the same preference
+    # here is what makes every downstream consumer — backend metadata,
+    # cuda-graph refill, pool doors — a pure passthrough.
+    allocator = model_runner.token_to_kv_pool_allocator
+    translate = getattr(allocator, "translate_kv_loc_dense", None) or getattr(
+        allocator, "translate_kv_loc", None
+    )
+    if translate is None or fb.out_cache_loc is None:
+        return
+    swa_map = getattr(
+        model_runner.token_to_kv_pool, "translate_loc_from_full_to_swa", None
+    )
+    if swa_map is not None:
+        # int32 — the shared read-index kernel convention (dtype preserved).
+        fb.swa_out_cache_loc = swa_map(fb.out_cache_loc)
+    fb.out_cache_loc = translate(fb.out_cache_loc)
+    fb.out_cache_loc_is_physical = True
+    fb._unified_kv_loc_translate = translate
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -423,7 +471,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool
+    # The indices of output tokens in the token_to_kv_pool. Under the unified
+    # memory pool this field is REBOUND at ForwardBatch preparation to a FRESH
+    # PHYSICAL tensor (see apply_unified_kv_loc_rebind): the ScheduleBatch's
+    # tensor stays VIRTUAL (radix/accept/inflight machinery reads it), while
+    # every forward-side consumer — attention backends, model-side pool
+    # writes — sees physical slot ids and never translates again.
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -438,6 +491,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
+
+    # === Unified memory pool: physical write-loc contract ===
+    # SWA-rail write locs (unified hybrid-SWA only): the SAME virtual ids as
+    # out_cache_loc, translated through the swa-side v2p BEFORE the full-side
+    # rebind (one virtual id -> TWO physicals). int32 — the shared read-index
+    # kernel convention (see translate_loc_from_full_to_swa). None elsewhere.
+    swa_out_cache_loc: Optional[torch.Tensor] = None
+    # True once out_cache_loc has been rebound to KERNEL-FACING ids
+    # (apply_unified_kv_loc_rebind): physical slot ids, or dense view ids for
+    # the MLA composite (where the dense id collapses onto the physical id at
+    # page-multiplier 1). Backends with a wired translate handle assert
+    # this — a hand-built ForwardBatch that skipped the rebind fails loudly
+    # instead of writing virtual ids as if physical.
+    out_cache_loc_is_physical: bool = False
+    # The allocator's translate_kv_loc, stashed for read-rail producers
+    # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices) so
+    # req_to_token-derived READ indices can be translated at production.
+    # None on non-unified pools.
+    _unified_kv_loc_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -842,6 +914,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret._maybe_init_non_generation_fields(batch)
 
         device = model_runner.device
+
+        # Unified memory pool: rebind out_cache_loc to PHYSICAL ids (fresh
+        # tensor — the ScheduleBatch tensor stays VIRTUAL). Runs BEFORE the
+        # idle early-return below so idle/DP-idle batches also carry the
+        # contract flag. No-op on non-unified pools.
+        apply_unified_kv_loc_rebind(ret, model_runner)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1461,6 +1539,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.swa_out_cache_loc is not None:
+            # Unified hybrid-SWA write rail: pad alongside out_cache_loc with
+            # the same value 0 (physical swa slot 0 is the reserved sink). A
+            # shorter swa tensor would be silently sliced by
+            # KVWriteLoc.__post_init__ and the store would read out of bounds.
+            self.swa_out_cache_loc = self._pad_tensor_to_size(
+                self.swa_out_cache_loc, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
@@ -1504,6 +1590,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
+            self.swa_output_cache_loc_backup = self.swa_out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
             # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
             # a disjoint subset of the fields below, so getattr-guard each one.
@@ -1601,6 +1688,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.spec_info.hidden_states = self.hidden_states_backup
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
+            if hasattr(self, "swa_output_cache_loc_backup"):
+                self.swa_out_cache_loc = self.swa_output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
@@ -1660,6 +1749,13 @@ def build_inner_fb_view(
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # Unified physical-loc contract passthrough (see
+        # apply_unified_kv_loc_rebind): inner backends must observe the same
+        # rebound state as the outer batch.
+        swa_out_cache_loc=getattr(forward_batch, "swa_out_cache_loc", None),
+        out_cache_loc_is_physical=getattr(
+            forward_batch, "out_cache_loc_is_physical", False
+        ),
         spec_info=forward_batch.spec_info,
     )
 
