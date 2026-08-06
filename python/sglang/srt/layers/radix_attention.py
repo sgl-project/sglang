@@ -69,6 +69,13 @@ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
         buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
 
 
+def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
+    """Zero outputs when an idle DP rank skips attention work."""
+    for buf in bufs:
+        if buf is not None:
+            buf.zero_()
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -319,6 +326,10 @@ def _unified_attention_with_output_impl(
     if key_value_num_tokens is None:
         key_value_num_tokens = real_query_num_tokens
 
+    if real_query_num_tokens == 0:
+        _zero_skipped_attn_outputs(output)
+        return
+
     query = query[:real_query_num_tokens]
     if key is not None:
         key = key[:key_value_num_tokens]
@@ -509,6 +520,10 @@ def unified_sparse_attention_with_output(
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        _zero_skipped_attn_outputs(attn_out, idx_out)
+        return
 
     query = query[:real_num_tokens]
     if key is not None:
