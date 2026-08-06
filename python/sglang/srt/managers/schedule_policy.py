@@ -704,6 +704,27 @@ class PrefillAdder:
             return 0
         return cap // self.page_size * self.page_size
 
+    def _swa_req_never_fits(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> bool:
+        """True when a request's SWA budget exceeds the *entire* SWA pool, so it
+        can never be admitted whole no matter how far the pool drains.
+
+        This is the head-of-line livelock the _swa_chunk_cap escape hatch exists
+        for; the hatch must fire only in this case. A request that merely
+        exceeds *current* rem_swa (transient pressure) would fit once running
+        decodes free their windows, so it must wait — admitting it into the
+        decode headroom collapses the SWA evictable cushion and forces running
+        requests to retract (observed as a severe retraction/re-prefill storm on
+        hybrid-SWA models at high concurrency)."""
+        capacity = self.token_to_kv_pool_allocator.size_swa
+        return (
+            self._swa_budget_for_req(
+                extend_input_len, max_new_tokens, swa_host_hit_length
+            )
+            >= capacity
+        )
+
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
         mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
@@ -1125,6 +1146,12 @@ class PrefillAdder:
                 swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
+                if not self._swa_req_never_fits(
+                    real_input_tokens,
+                    self._swa_new_tokens(req),
+                    req.swa_host_hit_length,
+                ):
+                    return AddReqResult.NO_TOKEN
                 swa_cap = self._swa_chunk_cap(
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
@@ -1155,6 +1182,12 @@ class PrefillAdder:
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
+                    if not self._swa_req_never_fits(
+                        real_input_tokens,
+                        self._swa_new_tokens(req),
+                        req.swa_host_hit_length,
+                    ):
+                        return AddReqResult.NO_TOKEN
                     swa_cap = self._swa_chunk_cap(
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )
