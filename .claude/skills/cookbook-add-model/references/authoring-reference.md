@@ -6,6 +6,7 @@ the canonical specs — read their headers first:
 
 - [`_deployment.jsx`](../../../../docs/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
 - [`_playground.jsx`](../../../../docs/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
+- [`_community.jsx`](../../../../docs/src/snippets/_community.jsx) — the community-contributions carousel at the page bottom (§2.5). Reads its own `<model>-community.jsx`, never `config.cells`.
 
 Engine extension (adding a new playground axis) lives in [engine-axis.md](engine-axis.md).
 
@@ -287,6 +288,88 @@ benchmark card grows a **"⚡ Reproduce"** button that opens a modal listing
 the runnable commands for the current cell — one `bench_serving` command for
 Speed (with concurrency chips that rewrite `--max-concurrency`) plus an
 Accuracy command with a chip per eval. No separate benchmark section needed.
+
+---
+
+## 2.5 Community Configs (optional, page bottom)
+
+A contributed config for hardware the SGLang team does not run in CI does **not**
+belong in `config.cells`. Adding one there costs a whole matrix axis: a new
+`supportedHardware` id multiplies every quant × strategy × nodes and leaves a row
+of greyed-out combinations, a new `quantizations` entry leaks that quant onto every
+other GPU, and the cell inherits the green **Verified** badge that means *the team
+reproduced this*. Land it in the community section instead — the matrix stays a
+team-reproduced artifact and the contribution is one file.
+
+Data lives in a sibling `configs/<org>/<model>-community.jsx` exporting
+`community: Contribution[]`. The unit is a **contribution (one PR)**, holding every
+config that PR added:
+
+```js
+export const community = [
+  {
+    source: { label: "PR #31006", url: "…", author: "<gh-login>", org: "…", authorUrl: "…" },
+    reportedAt: "2026-07-24",
+    configs: [
+      {
+        id: "h20-w4afp8-low-latency",          // #community-<id> anchor, unique per file
+        title: "H20 · W4AFP8 · low-latency",   // also the chip label
+        hardware: "NVIDIA H20 (96GB)",         // GPU MODEL ONLY — no "8×"
+        modelName: "PhalaCloud/GLM-5.2-W4AFP8",
+        sglangVersion: "0.5.14",
+        dockerImage: "lmsysorg/sglang:v0.5.14",   // optional, enables the Docker tab
+        env: [], flags: [ … ],                    // verbatim
+      },
+    ],
+  },
+];
+```
+
+**Do not hand-write this file.** Generate each block from the contribution PR:
+
+```bash
+node docs/scripts/gen_community_entry.mjs --pr 31006
+```
+
+The generator imports the PR's config + benchmarks files as *objects* at both the PR
+head and its base and structurally diffs them, so `flags` / `env` / `modelName` /
+`dockerImage` / `hardware` / `sglangVersion` come out byte-faithful to what the
+contributor ran — immune to diff formatting, unlike a regex over `gh pr diff`. It
+declines a PR that only fills benchmarks for existing cells (that belongs in the
+matrix). The **only** field a human writes is `source.org`, which GitHub does not know.
+
+Three things are deliberately absent, and `check_cookbook_configs.mjs` **rejects**
+them by name so an entry written against an older draft fails loudly:
+
+- **`benchmark`** — measurements stay in the PR. A community number is taken in the
+  contributor's own workload (#31006 used concurrency 10, not the house 1/16), so
+  rendering it beside the matrix cards invites a comparison that is not valid.
+- **`summary`** — the knob line under a title is computed from `flags` by
+  `describeFlags()`, and the GPU count from `--tp × --nnodes`. Prose drifts from the
+  command it describes; derived text cannot. (Note `--tp` absent means **tp=1**,
+  sglang's real default — not 8.)
+- **`status` / `caveats` / `editorNotes`** — no trust taxonomy and no editorial
+  layer. Caveats, review, and discussion live in the linked PR.
+
+MDX, as the **last** section on the page:
+
+```mdx
+## Community Configs
+
+[one sentence: contributed, not part of the verified matrix, see the PR]
+
+import { CommunityConfigs } from "/src/snippets/_community.jsx";
+import { community }        from "/src/snippets/configs/<org>/<model>-community.jsx";
+
+<CommunityConfigs community={community} config={config} />
+```
+
+The `config` prop is optional — it is read only for placeholder defaults, so
+`HOST_IP` / `PORT` match what the reader set in the Deploy panel's Env dialog.
+Contributions render as a horizontal carousel (one per slide, auto-advancing every
+5s, all cards sized to the tallest) so N contributions cost the height of one.
+Autoplay pauses on hover/focus and stops permanently on any interaction — the slides
+hold a command a reader may be mid-copy of.
 
 ---
 
