@@ -58,7 +58,7 @@ runtime_base = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "smg-grpc-servicer>=0.5.0",
+  "smg-grpc-servicer>=0.5.5",
   "soundfile==0.13.1",
   "tiktoken",
   "tqdm",
