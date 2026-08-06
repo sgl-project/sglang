@@ -32,7 +32,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.model_executor.input_buffers import share_input_buffer
+from sglang.srt.model_executor.input_buffers import (
+    INDEX_SEMANTIC_BUFFERS,
+    share_input_buffer,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -774,6 +777,22 @@ def build_decode_registry(
                     ),
                     bind=canary,
                 )
+
+    # ZERO covers replay; a mid-serving recapture is covered by
+    # ForwardInputBuffers.reset_index_buffers, which keys off
+    # INDEX_SEMANTIC_BUFFERS. Diverge and one of the two skips a buffer.
+    registered = set(reg.slot_names())
+    zero_slots = {
+        name
+        for name in registered
+        if reg.get_slot(name).padding_policy is PaddingPolicy.ZERO
+    }
+    expected_zero = INDEX_SEMANTIC_BUFFERS & registered
+    assert zero_slots == expected_zero, (
+        "ZERO-policy slots and INDEX_SEMANTIC_BUFFERS disagree: "
+        f"zero_but_unlisted={sorted(zero_slots - expected_zero)}, "
+        f"listed_but_not_zero={sorted(expected_zero - zero_slots)}"
+    )
 
     return reg
 

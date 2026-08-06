@@ -37,6 +37,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
+    MiniMaxH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -141,6 +142,7 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -180,7 +182,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.utils import KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
 
 logger = init_logger(__name__)
 
@@ -286,6 +287,22 @@ _MODEL_HF_PATH_TO_NAME: Dict[str, str] = {}
 
 # Detectors to identify model families from paths or class names
 _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
+
+# native pipelines do not have a diffusers model_index.json. Keep their path
+# aliases next to the resolver that consumes them so CLI detection and
+# pipeline selection cannot drift apart
+KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
+    "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "lerobot/pi05": "Pi05Pipeline",
+    "pi05": "Pi05Pipeline",
+    "pi0.5": "Pi05Pipeline",
+    "hunyuan3d": "Hunyuan3D2Pipeline",
+    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+    "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
+    "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
+    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+}
 
 
 def register_configs(
@@ -826,6 +843,18 @@ def _register_configs():
             lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
         ],
     )
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: "minimaxh3"
+            in model_id.lower().replace("-", "").replace("_", "")
+        ],
+    )
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -1035,7 +1064,7 @@ def _register_configs():
 
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
-    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
+    # Both Nano (16B) and Super (64B) share the same pipeline; arch dimensions
     # come from ``transformer/config.json`` via ``update_model_arch``.
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,
@@ -1149,17 +1178,28 @@ _register_configs()
 
 
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
+    return get_non_diffusers_pipeline_name(model_path) is not None
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
-    model_path_lower = model_path.lower()
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
-        if pattern in model_path_lower:
+        pattern = pattern.lower()
+        if "/" not in pattern and pattern in normalized_model_path:
+            return pipeline_name
+        if "/" in pattern and (
+            normalized_model_path == pattern
+            or model_short_name == get_model_short_name(pattern)
+            or f"models--{pattern.replace('/', '--')}" in normalized_model_path
+        ):
             return pipeline_name
     return None
+
+
+def is_registered_diffusion_model_path(model_path: str) -> bool:
+    """Return whether the diffusion registry recognizes a model path."""
+    return has_registered_diffusion_model_path(model_path) or (
+        get_non_diffusers_pipeline_name(model_path) is not None
+    )

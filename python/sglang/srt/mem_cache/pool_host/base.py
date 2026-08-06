@@ -79,6 +79,8 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
+    dcp_size = 1
+    dcp_rank = 0
 
     def __init__(
         self,
@@ -90,9 +92,22 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
     ):
         self.device_pool = device_pool
-        self.page_size = page_size
+        self.pool_label = pool_label
+        # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        assert page_size % dcp_size == 0, (
+            f"HiCache host pool page_size ({page_size}) must be a multiple of "
+            f"dcp_size ({dcp_size}); expected the widened page from the DCP "
+            "paged allocator."
+        )
+        self.page_size = page_size // dcp_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -115,9 +130,10 @@ class HostKVCache(abc.ABC):
 
         if self.size <= device_pool.size:
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                pool_label,
                 self.size,
                 device_pool.size,
             )
@@ -135,7 +151,10 @@ class HostKVCache(abc.ABC):
             )
         else:
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                pool_label,
+                self.size,
+                requested_bytes / 1e9,
             )
 
         self.kv_buffer = self.init_kv_buffer()
@@ -265,16 +284,16 @@ class HostKVCache(abc.ABC):
     def clear(self):
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
+            (self.logical_size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.free_slots = torch.arange(self.logical_size, dtype=torch.int64)
         # Keep freed chunks aside and consume them lazily from alloc() to avoid
         # concatenating a large free-list on every host-pool free.
         self.release_slots = []
         self.num_release_slots = 0
         # Per-slot flag used to detect double-free.
         # slot_used[k] is true if slot k is allocated.
-        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+        self.slot_used = torch.zeros(self.logical_size, dtype=torch.bool)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -291,10 +310,36 @@ class HostKVCache(abc.ABC):
         self.release_slots = []
         self.num_release_slots = 0
 
+    @property
+    def logical_size(self) -> int:
+        """Slots the radix/controller layer sees: dcp_size of them share a row."""
+        return self.size * self.dcp_size
+
+    @property
+    def logical_page_size(self) -> int:
+        """Page size in that same logical space (the widened DCP page)."""
+        return self.page_size * self.dcp_size
+
+    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Transfer kernels index per-rank rows; callers hold widened logical slots.
+
+        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
+        """
+        if self.dcp_size == 1:
+            return indices
+        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
+        assert owned.numel() * self.dcp_size == indices.numel(), (
+            "HiCache DCP translation expects runs of whole widened pages "
+            f"(every residue class equally represented); got {indices.numel()} "
+            f"logical slots -> {owned.numel()} owned rows with dcp_size="
+            f"{self.dcp_size}."
+        )
+        return owned
+
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
-            need_size % self.page_size == 0
+            need_size % self.logical_page_size == 0
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
