@@ -32,7 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -112,6 +112,7 @@ def maybe_register_hicache_draft(
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
+        pool_label="draft",
     )
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
