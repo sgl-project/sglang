@@ -224,6 +224,9 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+    # Prompt tokens charged to the in-flight admission budget
+    # (max_inflight_prefill_tokens); summed over unfinished requests.
+    admitted_prefill_tokens: int = 0
 
     # For streaming output
     last_output_offset: int = 0
@@ -408,6 +411,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # In a tokenizer-worker process this is the process's first publish;
         # the in-process path re-projects the object the launcher published.
         set_global_server_args_for_tokenizer(server_args)
+        self.max_inflight_prefill_tokens = server_args.max_inflight_prefill_tokens
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
         self.elastic_pending_ep_size = None
@@ -1201,6 +1205,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
+
+        # Token-aware admission: reject up front when the prompt tokens already
+        # in flight plus this request would exceed the budget, so a burst of
+        # long-context prompts sheds gracefully instead of over-committing
+        # prefill memory (count-based caps cannot see prompt length). This is
+        # synchronous, so the sum and the charge are atomic against other
+        # in-flight requests; the charge is released when the request finishes.
+        if self.max_inflight_prefill_tokens is not None:
+            inflight = sum(
+                st.admitted_prefill_tokens
+                for st in self.rid_to_state.values()
+                if not st.finished
+            )
+            if inflight + input_token_num > self.max_inflight_prefill_tokens:
+                raise ValueError(
+                    f"Rejecting request: {inflight} prompt tokens already in flight "
+                    f"plus this request's {input_token_num} exceed "
+                    f"max_inflight_prefill_tokens ({self.max_inflight_prefill_tokens})."
+                )
+            cur_state = self.rid_to_state.get(getattr(obj, "rid", None))
+            if cur_state is not None:
+                cur_state.admitted_prefill_tokens = input_token_num
 
         # Validate input length
         if input_token_num >= self.context_len:
