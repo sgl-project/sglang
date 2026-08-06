@@ -1337,8 +1337,8 @@ class ServerArgs:
         NS("serving"),
     ] = None
     file_storage_path: A[
-        str, "The path of the file storage in backend.", NS("serving")
-    ] = "sglang_storage"
+        Optional[str], "The path of the file storage in backend.", NS("serving")
+    ] = None
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
