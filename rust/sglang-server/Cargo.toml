@@ -47,12 +47,16 @@ dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
+# Outbound HTTP for the embedded PD load balancer.
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 itertools = "0.14"
 # POSIX shm for the MM feature fan-out (`mm::ShmSegment`).
 libc = "0.2"
 # Same major as the workspace pyo3: the zero-copy MM drain (`take_mm`) moves
 # Rust vectors into numpy arrays.
 numpy = "0.29.0"
+rand = "0.9"
 # Pinned EXACTLY: this crate's accepted grammar defines the
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.

@@ -20,6 +20,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::AppState;
@@ -141,20 +142,39 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// dispatches to the single or batch path; a malformed body is a 400 before
 /// anything reaches the scheduler.
 ///
-/// The body is extracted as a `Result` so a deserialization failure is answered
-/// with **400** (Python's status for a bad request) carrying serde's field-level
-/// message, instead of axum's default 422.
+/// The body is extracted as raw JSON so the embedded PD front door (see
+/// `pd_lb`) can inject bootstrap params before the typed parse; extraction is
+/// still a `Result` so a malformed body is answered with **400** (Python's
+/// status for a bad request), instead of axum's default 422.
 async fn generate(
     State(state): State<AppState>,
-    body: Result<Json<GenerateBody>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let body = match body {
-        Ok(Json(body)) => body,
+    let mut value = match body {
+        Ok(Json(value)) => value,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
         // handler runs).
         Err(rejection) => {
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    // For PD, an unrouted request gets bootstrap params injected here.
+    let forward = match &state.prefill_worker_pool {
+        Some(pool) if !super::pd_lb::has_bootstrap(&value) => pool.pick().map(|endpoint| {
+            super::pd_lb::inject_bootstrap_params(&mut value, &endpoint);
+            (pool.clone(), endpoint)
+        }),
+        _ => None,
+    };
+    let body = match GenerateBody::deserialize(&value) {
+        Ok(body) => body,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error_value(400, &e.to_string()),
+                false,
+            );
         }
     };
     let stream = body.stream;
@@ -168,11 +188,28 @@ async fn generate(
             return native_error(code, &e.to_string(), stream);
         }
     };
+
+    // Forward only after the body parsed and fanned out: a 400-able request
+    // never reaches the prefill server (mini_lb dispatches both legs together).
+    if let Some((pool, endpoint)) = forward {
+        let rids = payloads.iter().map(|p| p.rid.clone()).collect();
+        super::pd_lb::spawn_forward(
+            pool,
+            endpoint,
+            "/generate",
+            &value,
+            rids,
+            state.senders.clone(),
+        );
+    }
+
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
+    // TODO: Organize this when the api-server is deployed via standalone
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
         return native_error(StatusCode::BAD_REQUEST, &e, stream);
     }
+
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
