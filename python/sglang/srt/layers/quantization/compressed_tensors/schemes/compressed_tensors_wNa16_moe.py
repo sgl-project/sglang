@@ -531,7 +531,53 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         w2_scale = w2_scale.transpose(1, 2).contiguous()
         layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
 
+        # Convert zero points to the uint8 nibble-packed layout the Triton
+        # fused-MoE int4 kernel expects ([E, N//2, K_groups] uint8). Without this
+        # the kernel runs in symmetric mode and silently drops the per-group
+        # zero point, systematically biasing asymmetric (AWQ-with-zp) MoE output.
+        # Checkpoint zp is [E, K_groups, N//8] int32 (8 nibbles per int32, one
+        # per N position); view-as-uint8 then permute the 4 bytes within each
+        # int32 into the N dimension to get [E, N//2, K_groups] uint8.
+        if getattr(layer, "w13_weight_zero_point", None) is not None:
+            self._convert_triton_zero_points(layer, "w13")
+        if getattr(layer, "w2_weight_zero_point", None) is not None:
+            self._convert_triton_zero_points(layer, "w2")
+
         layer.is_triton_converted = True
+
+    @staticmethod
+    def _convert_triton_zero_points(layer: torch.nn.Module, prefix: str) -> None:
+        zp = getattr(layer, f"{prefix}_weight_zero_point").data
+        # Some checkpoints leave a fully-zero zp for experts that were pruned or
+        # not loaded; a zero zp would shift those experts' output by the full
+        # int4 range. Fill them with the symmetric midpoint zp=8 (0x88 per byte).
+        num_zero_experts = 0
+        for ei in range(zp.shape[0]):
+            if (zp[ei] == 0).all():
+                zp[ei].view(torch.uint8).fill_(0x88)
+                num_zero_experts += 1
+        if num_zero_experts > 0:
+            logger.warning(
+                "%s_weight_zero_point: %d/%d experts had an all-zero zp, "
+                "filled with the default zp=8. Shape=%s",
+                prefix,
+                num_zero_experts,
+                zp.shape[0],
+                tuple(zp.shape),
+            )
+        # [E, K_groups, N//8] int32 -> [E, N//8, K_groups] int32
+        zp = zp.transpose(1, 2).contiguous()
+        e_zp, n_pack, k_groups = zp.shape
+        # int32 -> 4 uint8 bytes (little-endian) -> flatten bytes into N dim.
+        zp_u8 = zp.view(torch.uint8).reshape(e_zp, n_pack, k_groups, 4)
+        zp_u8 = zp_u8.permute(0, 1, 3, 2).contiguous().reshape(
+            e_zp, n_pack * 4, k_groups
+        )
+        setattr(
+            layer,
+            f"{prefix}_weight_zero_point",
+            torch.nn.Parameter(zp_u8, requires_grad=False),
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -542,12 +588,19 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     def get_triton_quant_info(self, layer):
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
+        # Pass the converted zero points through so the Triton kernel performs
+        # asymmetric (per-group zero-point) dequant. None for symmetric ckpts.
+        w13_zp = getattr(layer, "w13_weight_zero_point", None)
+        w2_zp = getattr(layer, "w2_weight_zero_point", None)
+
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight_packed,
             w2_weight=layer.w2_weight_packed,
             use_int4_w4a16=True,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+            w13_zp=w13_zp,
+            w2_zp=w2_zp,
             block_shape=[0, self.group_size],
         )
 
