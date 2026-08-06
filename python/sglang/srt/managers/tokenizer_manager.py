@@ -606,6 +606,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Weight updates
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
+        self.model_update_operation_lock = asyncio.Lock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
@@ -2006,23 +2007,47 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
+        async def run_update():
+            async with self.model_update_operation_lock:
+                update_task = asyncio.create_task(
+                    self._wait_for_model_update_from_disk(obj)
+                )
+                cancelled_error = None
+                try:
+                    success, message, num_paused_requests = await asyncio.shield(
+                        update_task
+                    )
+                except asyncio.CancelledError as exc:
+                    # Scheduler responses have no operation id. Keep ownership of
+                    # the shared completion state until this response is drained.
+                    while not update_task.done():
+                        try:
+                            await asyncio.shield(update_task)
+                        except asyncio.CancelledError:
+                            continue
+                    success, message, num_paused_requests = update_task.result()
+                    cancelled_error = exc
+
+                if success and obj.weight_version is not None:
+                    self._update_weight_version_if_provided(obj.weight_version)
+                    message += f" Weight version updated to {obj.weight_version}."
+
+                if cancelled_error is not None:
+                    raise cancelled_error
+
+                return success, message, num_paused_requests
+
+        # Keep the pause state stable through a paused update so generation
+        # cannot resume while the update bypasses the inference writer lock.
         async with self.is_pause_cond:
-            is_paused = self.is_pause
+            if self.is_pause:
+                return await run_update()
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
-
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
-
-        return success, message, num_paused_requests
+        # Queue unpaused operations as writers before serializing access to the
+        # scheduler's untagged completion state. This preserves the RWLock's
+        # writer preference for every update already requested.
+        async with self.model_update_lock.writer_lock:
+            return await run_update()
 
     def record_config_updates(self, source: str, **fields) -> None:
         """Record a control-plane config change for this engine.
