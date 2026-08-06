@@ -111,6 +111,10 @@ On the serving side the model is a hybrid: 36 of 40 transformer layers use **GDN
 
 ## 3. Advanced Usage
 
+<Note>
+  The outputs below are verbatim captures from a live server (sampling per the checkpoint's `generation_config.json`, temperature 0.8). Re-running the same request yields a semantically equivalent but textually different trace — treat them as representative, not deterministic.
+</Note>
+
 ### 3.1 Reasoning
 
 InternS2-Mobius is a hybrid-reasoning model — thinking traces start with "Thinking Process:" before the final answer. Enable the **`qwen3` reasoning parser** (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to split thinking into `message.reasoning_content` and the answer into `message.content`.
@@ -137,23 +141,26 @@ print("Answer:", msg.content)
 ```text Output
 Reasoning: Thinking Process:
 
-1.  **Identify the goal:** Calculate 15% of 240.
-2.  **Understand the operation:** "Percent" means per hundred, so 15% is
-    equivalent to 15/100 or 0.15. "Of" usually means multiplication. So,
-    the calculation is 0.15 × 240.
-3.  **Perform the calculation:**
-    *   Method 1: Decimal multiplication. 0.15 × 240 → 15 × 240 = 3600;
-        adjust decimal places → 36.00. So, 36.
-    *   Method 2: Fractions. 15/100 × 240. Simplify 240/100 → 2.4; 15 × 2.4 = 36.
+1.  **Identify the core question:** The user is asking for 15% of 240.
+2.  **Determine the calculation method:** To find a percentage of a
+    number, multiply the number by the percentage expressed as a decimal
+    or fraction.
+    *   Percentage: 15%
+    *   Decimal: 0.15
+    *   Fraction: 15/100
+3.  **Perform the calculation:** $240 \times 0.15$
+    *   Method 1: $240 \times 0.10 = 24$ (10%) and
+        $240 \times 0.05 = 12$ (5%). Then add them: $24 + 12 = 36$.
+    *   Method 2: $240 \times 15 = 3600$. Divide by 100 -> 36.
+4.  **Verify the result:** The calculation is correct.
+5.  **Formulate the answer:** State the final number clearly.cw
 
 Answer:
-To find 15% of 240, you can break it down into easier steps:
 
-1.  Find 10% of 240, which is **24**.
-2.  Find 5% of 240 (half of 10%), which is **12**.
-3.  Add them together: 24 + 12 = 36.
+15% of 240 is **36**.
 
-So, 15% of 240 is **36**.
+Here is the math:
+$240 \times 0.15 = 36$
 ```
 
 </Accordion>
@@ -199,14 +206,15 @@ print("Tool calls:", msg.tool_calls)
 <Accordion title="Example Output">
 
 ```text Output
-Reasoning: The user is asking for the weather in Beijing. I have a
-get_weather function available that takes a location parameter (city
-name). The user specified "Beijing" as the location, so I have all the
-required parameters to make this function call.
+Reasoning: The user is asking for the weather in Beijing. I have access
+to a get_weather function that can get the current weather for a
+location. The function requires a "location" parameter which should be
+the city name. In this case, the user specified "Beijing", so I should
+use that as the location parameter.
 
 Tool calls: [
   {
-    "id": "call_a39f018ee5ae4a07abdbf9ad",
+    "id": "call_545b5956b4c3457286261490",
     "index": 0,
     "type": "function",
     "function": {"name": "get_weather", "arguments": "{\"location\": \"Beijing\"}"}
@@ -249,12 +257,18 @@ print("Answer:", msg.content)
 <Accordion title="Example Output">
 
 ```text Output
-Reasoning: The user wants a single-sentence description. The image shows a
-tiger sitting on a dirt path surrounded by green foliage. I should mention
-the subject and setting without extra detail.
+Reasoning: The user wants a one-sentence description of the image.
+Key elements: Tiger, lying down, grass, looking at camera.
+Drafting: A tiger is lying in the green grass looking directly at the
+camera.
+Refining for flow and detail: A majestic tiger with striking orange and
+black stripes rests calmly on a bed of lush green grass, staring
+intently directly at the viewer.
 
-Answer: A tiger sits on a dirt path in a lush green forest, looking toward
-the camera.
+Answer:
+
+A majestic tiger with striking orange and black stripes rests calmly on a
+bed of lush green grass, staring intently directly at the viewer.
 ```
 
 </Accordion>
