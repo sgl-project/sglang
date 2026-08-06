@@ -106,7 +106,7 @@ class _KwargIdentity(torch.nn.Module):
         return x
 
 
-def test_cache_dit_compat_flag_reaches_both_gated_residuals():
+def test_cache_dit_compat_flag_only_spares_the_block_input():
     block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
     torch.nn.Module.__init__(block)
     block.norm1 = torch.nn.Identity()
@@ -142,6 +142,7 @@ def test_cache_dit_compat_flag_reaches_both_gated_residuals():
             adaln_params=adaln_params,
         )
         assert gate_modes == [True, True]
+        # Without the flag both gated residuals may reuse their input buffer.
 
         gate_modes.clear()
         block._sglang_cache_dit_force_out_of_place_residual = True
@@ -154,7 +155,9 @@ def test_cache_dit_compat_flag_reaches_both_gated_residuals():
             max_seqlen=2,
             adaln_params=adaln_params,
         )
-        assert gate_modes == [False, False]
+        # Only the first gated residual touches the block input, so only it
+        # has to be out-of-place; the second keeps the fused kernel.
+        assert gate_modes == [False, True]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -52,7 +52,13 @@ def _set_minimax_h3_cache_dit_compat(
     caching is attached; otherwise both snapshots alias the mutated output.
     """
 
-    if transformer.__class__.__name__ != "MiniMaxH3DiTModel":
+    # Match through the MRO rather than comparing the concrete class name: a
+    # subclass would otherwise silently keep the in-place residual and the only
+    # symptom would be that caching stops hitting, which is exactly the failure
+    # this compat shim exists to prevent.
+    if not any(
+        base.__name__ == "MiniMaxH3DiTModel" for base in type(transformer).__mro__
+    ):
         return False
 
     if enabled:

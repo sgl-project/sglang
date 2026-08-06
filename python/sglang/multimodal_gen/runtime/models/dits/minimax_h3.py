@@ -917,7 +917,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         if adaln_params is None:
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
-        allow_inplace = not getattr(
+        # Cache-DiT keeps the block-stack input by reference to measure its
+        # Fn/Bn residuals. Only the first gated residual writes to that tensor,
+        # so only it has to give up the fused in-place kernel; the second one
+        # operates on a buffer this block just allocated and nothing outside
+        # holds a reference to it.
+        preserve_input = getattr(
             self, "_sglang_cache_dit_force_out_of_place_residual", False
         )
 
@@ -940,7 +945,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
-            allow_inplace=allow_inplace,
+            allow_inplace=not preserve_input,
         )
 
         residual = x
@@ -949,13 +954,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
         )
         h = self.mlp(h)
+        # `residual` is block-local here (see above), so this stays in-place
+        # even while Cache-DiT is attached.
         return _modulate_gate(
             residual,
             gate_mlp,
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
-            allow_inplace=allow_inplace,
         )
 
 
@@ -1072,7 +1078,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             if value % tp_size:
                 raise ValueError(
-                    f"MiniMax H3 {name}={value} must be divisible by TP size {tp_size}."
+                    f"MiniMax H3 {name}={value} must be divisible by "
+                    f"TP size {tp_size}."
                 )
 
     @staticmethod
