@@ -47,6 +47,40 @@ class _AudioWindowFeatures(msgspec.Struct, frozen=True):
     token_count: int
 
 
+def _extract_feature_batch(
+    windows: list[np.ndarray],
+    config: AudioEncoderWindowConfig,
+    *,
+    extract_features_fn: Callable[[list[np.ndarray]], Any],
+    output_length_fn: Callable[[Any], Any],
+    complete: bool,
+) -> list[_AudioWindowFeatures]:
+    if not windows:
+        return []
+
+    audio_inputs = extract_features_fn(windows)
+    processed_features = audio_inputs[config.feature_output_key]
+    processed_masks = audio_inputs[config.attention_mask_output_key]
+    token_counts = [
+        int(count) for count in output_length_fn(processed_masks.sum(dim=-1))
+    ]
+
+    if complete and token_counts != [config.window_tokens] * len(windows):
+        raise ValueError("audio window token geometry changed")
+    if any(count <= 0 for count in token_counts):
+        raise ValueError("audio window produced no encoder tokens")
+
+    feature_frames = config.window_frames if complete else processed_features.shape[-1]
+    return [
+        _AudioWindowFeatures(
+            feature=processed_features[row : row + 1, :, :feature_frames].clone(),
+            attention_mask=processed_masks[row : row + 1, :feature_frames].clone(),
+            token_count=token_counts[row],
+        )
+        for row in range(len(windows))
+    ]
+
+
 def resolve_audio_encoder_window_config(
     spec: AudioEncoderWindowSpec,
     *,
@@ -99,53 +133,38 @@ def _extract_audio_window_features(
         # as a standalone item would make artificial samples look valid in the
         # attention mask; the merged item remains uncached and is recomputed.
         complete_count -= 1
-        sample_counts = [config.window_samples] * complete_count
-        sample_counts.append(config.window_samples + tail_samples)
-    else:
-        sample_counts = [config.window_samples] * complete_count
-        if tail_samples:
-            sample_counts.append(tail_samples)
-    if not sample_counts:
-        raise ValueError("audio windowing requires non-empty audio")
 
-    windows = []
-    offset = 0
-    for sample_count in sample_counts:
-        window = samples[offset : offset + sample_count]
-        if sample_count < config.min_input_samples:
-            # Whisper-style feature extractors reject inputs shorter than n_fft.
-            window = np.pad(window, (0, config.min_input_samples - sample_count))
-        windows.append(window)
-        offset += sample_count
-
-    audio_inputs = extract_features_fn(windows)
-    processed_features = audio_inputs[config.feature_output_key]
-    processed_masks = audio_inputs[config.attention_mask_output_key]
-    token_counts = [
-        int(count) for count in output_length_fn(processed_masks.sum(dim=-1))
+    complete_windows = [
+        samples[index * config.window_samples : (index + 1) * config.window_samples]
+        for index in range(complete_count)
     ]
+    # Extract the mutable tail separately: Whisper pads waveforms before STFT,
+    # so batching it here could change a complete window's boundary mel frame.
+    window_features = _extract_feature_batch(
+        complete_windows,
+        config,
+        extract_features_fn=extract_features_fn,
+        output_length_fn=output_length_fn,
+        complete=True,
+    )
 
-    if token_counts[:complete_count] != [config.window_tokens] * complete_count:
-        raise ValueError("audio window token geometry changed")
-    if any(count <= 0 for count in token_counts):
-        raise ValueError("audio window produced no encoder tokens")
-
-    window_features = []
-    for row in range(len(windows)):
-        # A longer mutable tail may increase batch padding. Trim complete
-        # windows back to their declared geometry so their hash stays stable.
-        feature_frames = (
-            config.window_frames
-            if row < complete_count
-            else processed_features.shape[-1]
-        )
-        window_features.append(
-            _AudioWindowFeatures(
-                feature=processed_features[row : row + 1, :, :feature_frames].clone(),
-                attention_mask=processed_masks[row : row + 1, :feature_frames].clone(),
-                token_count=token_counts[row],
+    tail_start = complete_count * config.window_samples
+    if tail_start < samples.size:
+        tail = samples[tail_start:]
+        if tail.size < config.min_input_samples:
+            # Whisper-style feature extractors reject inputs shorter than n_fft.
+            tail = np.pad(tail, (0, config.min_input_samples - tail.size))
+        window_features.extend(
+            _extract_feature_batch(
+                [tail],
+                config,
+                extract_features_fn=extract_features_fn,
+                output_length_fn=output_length_fn,
+                complete=False,
             )
         )
+    if not window_features:
+        raise ValueError("audio windowing requires non-empty audio")
     return window_features, complete_count
 
 

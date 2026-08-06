@@ -241,18 +241,15 @@ class RealtimeASRProcessor:
 
         The first encoder-window update is computed without mutation so
         unsupported no-whitespace CJK can retry cumulatively."""
-        policy = self._encoder_window_policy
+        step = self._build_transcription_step(state, is_last)
         if (
-            policy is not None
-            and not is_last
-            and state.audio.received_bytes > policy.activation_threshold_bytes
-            and not state.encoder_window_disabled
+            step.uses_encoder_windows
             and not state.encoder_window_active
             and not cumulative_is_suffix_compatible(state.transcript)
         ):
             state.encoder_window_disabled = True
+            step = self._build_transcription_step(state, is_last)
 
-        step = self._build_transcription_step(state, is_last)
         outcome = await self._execute_step(state, step, sampling_params)
 
         if self._requires_cumulative_retry(state, step, outcome):
@@ -279,14 +276,21 @@ class RealtimeASRProcessor:
         transcript = state.transcript
         audio = state.audio
         policy = self._encoder_window_policy
+        end_offset_bytes = (
+            audio.received_bytes
+            if is_last
+            else min(
+                audio.received_bytes,
+                audio.last_attempted_offset_bytes + self.chunk_size_bytes,
+            )
+        )
         if (
             policy is not None
             and not state.encoder_window_disabled
             and (
                 state.encoder_window_active
                 or (
-                    not is_last
-                    and audio.received_bytes > policy.activation_threshold_bytes
+                    not is_last and end_offset_bytes > policy.activation_threshold_bytes
                 )
             )
         ):
@@ -308,8 +312,10 @@ class RealtimeASRProcessor:
             return _TranscriptionStep(
                 is_last=is_last,
                 uses_encoder_windows=True,
-                start_offset_bytes=self._encoder_window_start_offset(state),
-                end_offset_bytes=audio.received_bytes,
+                start_offset_bytes=self._encoder_window_start_offset(
+                    state, end_offset_bytes
+                ),
+                end_offset_bytes=end_offset_bytes,
                 decoder_prefix=decoder_prefix,
                 handoff_text=handoff_text,
             )
@@ -317,11 +323,13 @@ class RealtimeASRProcessor:
             is_last=is_last,
             uses_encoder_windows=False,
             start_offset_bytes=0,
-            end_offset_bytes=audio.received_bytes,
+            end_offset_bytes=end_offset_bytes,
             decoder_prefix=transcript.get_prefix_text(),
         )
 
-    def _encoder_window_start_offset(self, state: RealtimeASRState) -> int:
+    def _encoder_window_start_offset(
+        self, state: RealtimeASRState, end_offset_bytes: int
+    ) -> int:
         """Pick a window-aligned start so resent windows keep their cache
         identity; never advances past deferred audio."""
         policy = self._encoder_window_policy
@@ -333,7 +341,7 @@ class RealtimeASRProcessor:
         if not state.encoder_window_active:
             return 0
         window_bytes = policy.window_bytes
-        complete_end = audio.received_bytes // window_bytes * window_bytes
+        complete_end = end_offset_bytes // window_bytes * window_bytes
         # Deferred audio must remain inside the next rolling request even when
         # the nominal context horizon advances.
         start = min(

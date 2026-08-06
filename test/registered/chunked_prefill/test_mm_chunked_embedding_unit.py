@@ -171,8 +171,17 @@ def test_list_cache_entries_own_storage():
 def test_tensor_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
-    mm_schedule._get_chunked_embedding_by_item(
-        _encoder_tensor, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
+    for item in items:
+        item.encoder_batch_key = ("test",)
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=items,
+        items_offset=ITEM_OFFSETS,
+        extend_prefix_len=0,
+        extend_seq_len=TOTAL_LEN,
+    )
+    mm_schedule._batch_encode_per_image_misses_with_policy(
+        _encoder_tensor, [request], _CPU
     )
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
@@ -190,6 +199,7 @@ def test_noncacheable_item_is_reencoded():
             feature=torch.zeros(1),
             offsets=[offset],
             use_embedding_cache=index == 0,
+            encoder_batch_key=("test",),
         )
         for index, offset in enumerate(offsets)
     ]
@@ -199,15 +209,15 @@ def test_noncacheable_item_is_reencoded():
         encoded_item_counts.append(len(items))
         return _encoder_tensor(items)
 
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=items,
+        items_offset=offsets,
+        extend_prefix_len=0,
+        extend_seq_len=3,
+    )
     for _ in range(2):
-        mm_schedule._get_chunked_embedding_by_item(
-            encoder,
-            items,
-            offsets,
-            0,
-            3,
-            _CPU,
-        )
+        mm_schedule._batch_encode_per_image_misses_with_policy(encoder, [request], _CPU)
 
     assert encoded_item_counts == [2, 1]
     assert mm_schedule.embedding_cache.has(items[0].hash)
@@ -239,7 +249,9 @@ def test_encoder_batch_key_separates_incompatible_items():
         extend_prefix_len=0,
         extend_seq_len=2,
     )
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
+    embeddings = mm_schedule._batch_encode_per_image_misses_with_policy(
+        encoder, [request], _CPU
+    )
 
     assert encoder_calls == [[(3,)], [(4,)]]
     assert set(embeddings) == {item.hash for item in items}

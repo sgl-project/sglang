@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from transformers import WhisperFeatureExtractor
 
 from sglang.srt.multimodal.audio_encoder_windowing import (
     AudioEncoderWindowSpec,
@@ -21,7 +22,7 @@ from sglang.srt.multimodal.processors.qwen3_asr import Qwen3ASRMultimodalProcess
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FeatureExtractor:
@@ -145,9 +146,75 @@ class TestAudioEncoderWindowing(CustomTestCase):
         tail = build(30)[1]
         complete = build(32)[1]
 
-        self.assertTrue(torch.equal(tail.feature, complete.feature))
         self.assertEqual(tail.offsets, complete.offsets)
+        self.assertNotEqual(tail.feature.shape, complete.feature.shape)
         self.assertNotEqual(tail.hash, complete.hash)
+
+    def test_complete_window_hash_is_stable_with_real_whisper_frontend(self):
+        feature_extractor = WhisperFeatureExtractor(
+            feature_size=128,
+            sampling_rate=16000,
+            hop_length=160,
+            n_fft=400,
+            chunk_length=30,
+        )
+
+        def output_lengths(lengths):
+            lengths = torch.as_tensor(lengths)
+            remainder = lengths % 100
+            reduced = (remainder - 1) // 2 + 1
+            return ((reduced - 1) // 2 + 1 - 1) // 2 + 1 + lengths // 100 * 13
+
+        config = resolve_audio_encoder_window_config(
+            AudioEncoderWindowSpec(window_frames=800, alignment_frames=100),
+            feature_extractor=feature_extractor,
+            output_length_fn=output_lengths,
+            model_sample_rate=16000,
+        )
+        samples = (
+            np.random.default_rng(7)
+            .normal(
+                0,
+                0.1,
+                size=3 * config.window_samples + 200,
+            )
+            .astype(np.float32)
+        )
+
+        def build(audio):
+            return build_audio_encoder_window_items(
+                samples=audio,
+                input_ids=torch.tensor([10, 99, 11]),
+                placeholder_token_id=99,
+                config=config,
+                extract_features_fn=lambda windows: feature_extractor(
+                    windows,
+                    sampling_rate=feature_extractor.sampling_rate,
+                    return_attention_mask=True,
+                    return_tensors="pt",
+                    truncation=False,
+                    padding="longest",
+                    do_normalize=False,
+                ),
+                output_length_fn=output_lengths,
+            )[0]
+
+        exact_items = build(samples[: 3 * config.window_samples])
+        tiny_tail_items = build(samples)
+
+        self.assertEqual(
+            [item.use_embedding_cache for item in tiny_tail_items],
+            [True, True, False],
+        )
+        for exact, with_tail in zip(exact_items[:2], tiny_tail_items[:2]):
+            self.assertTrue(torch.equal(exact.feature, with_tail.feature))
+            self.assertTrue(
+                torch.equal(
+                    exact.model_specific_data["feature_attention_mask"],
+                    with_tail.model_specific_data["feature_attention_mask"],
+                )
+            )
+            self.assertEqual(exact.hash, with_tail.hash)
 
     def test_qwen_capability_uses_base_builder_and_audio_config(self):
         feature_extractor = _FeatureExtractor()

@@ -159,7 +159,11 @@ def _flatten_embedding_result(
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
-    """Whether the model batches item features before one device transfer."""
+    """Models that materialize and batch visual features inside their encoder.
+
+    instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
+    for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
+    """
     owner = getattr(data_embedding_func, "__self__", None)
     if owner is None:
         return False
@@ -196,8 +200,6 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     the equivalent single acknowledgement.  This preserves the fixed-pool
     lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
     """
-    if not any(item.has_cuda_ipc_proxy() for item in items):
-        return
     parallel = get_parallel()
     if parallel.attn_tp_rank != 0:
         return
@@ -223,8 +225,7 @@ def _get_chunked_embedding_full(
     """
     item_hashes = [item.hash for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-    use_cache = all(item.use_embedding_cache for item in embedding_items_per_req)
-    embedding_per_req = embedding_cache.get(item_hashes) if use_cache else None
+    embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
@@ -239,8 +240,7 @@ def _get_chunked_embedding_full(
             if isinstance(embedding, torch.Tensor)
             else embedding
         )
-        if use_cache:
-            embedding_cache.set(embedding_items_hash, embedding_per_req)
+        embedding_cache.set(embedding_items_hash, embedding_per_req)
     else:
         _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
 
@@ -279,51 +279,6 @@ class PerImageRequestInfo:
     )
 
 
-def _encode_mm_misses(
-    data_embedding_func: DataEmbeddingFunc,
-    misses: Dict[int, Tuple[MultimodalDataItem, int]],
-    device: torch.device,
-) -> Dict[int, torch.Tensor]:
-    """Encode cache misses in producer-declared compatible groups."""
-    miss_groups = {}
-    for item_hash, miss in misses.items():
-        miss_groups.setdefault(miss[0].encoder_batch_key, {})[item_hash] = miss
-
-    encoded = {}
-    for compatible_misses in miss_groups.values():
-        ordered_hashes = list(compatible_misses)
-        items = [compatible_misses[item_hash][0] for item_hash in ordered_hashes]
-        token_counts = [compatible_misses[item_hash][1] for item_hash in ordered_hashes]
-
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(items, device)
-        embeddings = data_embedding_func(items)
-
-        if isinstance(embeddings, list):
-            assert len(embeddings) == len(items), (
-                f"per-item embedding count {len(embeddings)} != "
-                f"cache-miss item count {len(items)}"
-            )
-            split_embeddings = [
-                embedding.reshape(-1, embedding.shape[-1]) for embedding in embeddings
-            ]
-            split_from_batch = False
-        else:
-            embeddings = embeddings.reshape(-1, embeddings.shape[-1])
-            split_embeddings = torch.split(embeddings, token_counts, dim=0)
-            split_from_batch = True
-
-        for item_hash, embedding in zip(ordered_hashes, split_embeddings):
-            item = compatible_misses[item_hash][0]
-            if item.use_embedding_cache:
-                # A split view would retain the complete encoder batch.
-                if split_from_batch:
-                    embedding = embedding.clone()
-                embedding_cache.set(item_hash, EmbeddingResult(embedding=embedding))
-            encoded[item_hash] = embedding
-    return encoded
-
-
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -353,27 +308,46 @@ def _batch_encode_per_image_misses(
         req_info.overlapping = overlapping
 
         for _idx, item, start, end in overlapping:
-            if item.hash is None:
-                raise RuntimeError("multimodal item is missing its cache identity")
             if item.hash in hash_to_embedding:
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
                 continue
-            cached = (
-                embedding_cache.get_single(item.hash)
-                if item.use_embedding_cache
-                else None
-            )
+            cached = embedding_cache.get_single(item.hash)
             if cached is not None:
                 hash_to_embedding[item.hash] = cached.embedding
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
             elif item.hash not in unique_misses:
-                unique_misses[item.hash] = (item, end - start + 1)
-            else:
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+                token_count = end - start + 1
+                unique_misses[item.hash] = (item, token_count)
 
-    hash_to_embedding.update(
-        _encode_mm_misses(data_embedding_func, unique_misses, device)
-    )
+    # Phase 1b: single ViT call for all unique cache misses
+    if unique_misses:
+        ordered_hashes = list(unique_misses.keys())
+        miss_items = [unique_misses[h][0] for h in ordered_hashes]
+        token_counts = [unique_misses[h][1] for h in ordered_hashes]
+
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(miss_items, device)
+        all_miss_embedding = data_embedding_func(miss_items)
+
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached). Mirrors
+            # _get_chunked_embedding_by_item.
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        for h, emb in zip(ordered_hashes, split_embeddings):
+            embedding_cache.set(h, EmbeddingResult(embedding=emb))
+            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
+            hash_to_embedding[h] = emb
 
     return hash_to_embedding
 
@@ -409,9 +383,7 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
-        cached = (
-            embedding_cache.get_single(item.hash) if item.use_embedding_cache else None
-        )
+        cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
             _acknowledge_deferred_cuda_ipc_cache_hits([item])
@@ -419,13 +391,33 @@ def _get_chunked_embedding_by_item(
             miss_items.append((idx, item, start, end))
 
     if miss_items:
-        encoded_misses = _encode_mm_misses(
-            data_embedding_func,
-            {item.hash: (item, end - start + 1) for _, item, start, end in miss_items},
-            device,
-        )
-        for idx, item, _, _ in miss_items:
-            cached_embeddings[idx] = encoded_misses[item.hash]
+        miss_item_list = [item for _, item, _, _ in miss_items]
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(miss_item_list, device)
+        all_miss_embedding = data_embedding_func(miss_item_list)
+
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached).
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            # Split output by per-item token count
+            token_counts = [end - start + 1 for _, _, start, end in miss_items]
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+
+        for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
+            cached_embeddings[idx] = emb
+            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
 
     chunk_slices = []
     for idx, _, start, end in overlapping:
@@ -437,6 +429,123 @@ def _get_chunked_embedding_by_item(
         chunk_slices.append(emb[local_start:local_end])
 
     return torch.cat(chunk_slices, dim=0)
+
+
+def _requires_custom_embedding_schedule(item: MultimodalDataItem) -> bool:
+    return not item.use_embedding_cache or item.encoder_batch_key is not None
+
+
+def _encode_policy_misses(
+    data_embedding_func: DataEmbeddingFunc,
+    misses: Dict[int, Tuple[MultimodalDataItem, int]],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """Encode opt-in items in producer-declared compatible groups."""
+    miss_groups = {}
+    for item_hash, miss in misses.items():
+        batch_key = miss[0].encoder_batch_key
+        if batch_key is None:
+            raise RuntimeError(
+                "custom-scheduled multimodal item requires encoder_batch_key"
+            )
+        miss_groups.setdefault(batch_key, {})[item_hash] = miss
+
+    encoded = {}
+    for compatible_misses in miss_groups.values():
+        ordered_hashes = list(compatible_misses)
+        items = [compatible_misses[item_hash][0] for item_hash in ordered_hashes]
+        token_counts = [compatible_misses[item_hash][1] for item_hash in ordered_hashes]
+
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(items, device)
+        embeddings = data_embedding_func(items)
+
+        if isinstance(embeddings, list):
+            assert len(embeddings) == len(items), (
+                f"per-item embedding count {len(embeddings)} != "
+                f"cache-miss item count {len(items)}"
+            )
+            split_embeddings = [
+                embedding.reshape(-1, embedding.shape[-1]) for embedding in embeddings
+            ]
+            clone_cached_splits = False
+        else:
+            embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+            split_embeddings = torch.split(embeddings, token_counts, dim=0)
+            clone_cached_splits = len(items) > 1
+
+        for item_hash, embedding in zip(ordered_hashes, split_embeddings):
+            item = compatible_misses[item_hash][0]
+            if item.use_embedding_cache:
+                if clone_cached_splits:
+                    embedding = embedding.clone()
+                embedding_cache.set(item_hash, EmbeddingResult(embedding=embedding))
+            encoded[item_hash] = embedding
+    return encoded
+
+
+def _batch_encode_per_image_misses_with_policy(
+    data_embedding_func: DataEmbeddingFunc,
+    per_image_requests: List[PerImageRequestInfo],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """Encode only requests that explicitly opt into item scheduling policy."""
+    unique_misses: Dict[int, Tuple[MultimodalDataItem, int]] = {}
+    hash_to_embedding: Dict[int, torch.Tensor] = {}
+
+    for req_info in per_image_requests:
+        chunk_start = req_info.extend_prefix_len
+        chunk_end = chunk_start + req_info.extend_seq_len
+        overlapping = []
+        if req_info.extend_seq_len > 0:
+            for idx, (item, (start, end)) in enumerate(
+                zip(req_info.items, req_info.items_offset)
+            ):
+                if end >= chunk_start and start < chunk_end:
+                    overlapping.append((idx, item, start, end))
+        req_info.overlapping = overlapping
+
+        for _idx, item, start, end in overlapping:
+            if item.hash is None:
+                raise RuntimeError("custom-scheduled multimodal item has no hash")
+            if item.encoder_batch_key is None:
+                raise RuntimeError(
+                    "custom-scheduled multimodal item requires encoder_batch_key"
+                )
+            if item.hash in hash_to_embedding or item.hash in unique_misses:
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+                continue
+            cached = (
+                embedding_cache.get_single(item.hash)
+                if item.use_embedding_cache
+                else None
+            )
+            if cached is not None:
+                hash_to_embedding[item.hash] = cached.embedding
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+            else:
+                unique_misses[item.hash] = (item, end - start + 1)
+
+    hash_to_embedding.update(
+        _encode_policy_misses(data_embedding_func, unique_misses, device)
+    )
+    return hash_to_embedding
+
+
+def _get_chunked_embedding_by_item_with_policy(
+    data_embedding_func: DataEmbeddingFunc,
+    req_info: PerImageRequestInfo,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    hash_to_embedding = _batch_encode_per_image_misses_with_policy(
+        data_embedding_func, [req_info], device
+    )
+    return _assemble_per_image_chunk(
+        req_info.overlapping,
+        hash_to_embedding,
+        req_info.extend_prefix_len,
+        req_info.extend_seq_len,
+    )
 
 
 def _assemble_per_image_chunk(
@@ -485,8 +594,10 @@ def _get_chunked_prefill_embedding(
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
-    # Phase 0: classify requests into per-image vs full/EVS path
-    per_image_requests = []  # batched ViT encoding
+    # Phase 0: classify requests into legacy, opt-in policy, or full/EVS paths.
+    per_image_requests = []  # all CUDA requests, kept in input order
+    legacy_requests = []  # unchanged batched ViT encoding
+    policy_requests = []  # producer-declared item scheduling
     full_path_requests = []  # per-request encoding (EVS etc.)
     all_chunks: List[Tuple[int, torch.Tensor]] = []
 
@@ -514,31 +625,66 @@ def _get_chunked_prefill_embedding(
             extend_seq_len=extend_seq_len,
         )
 
+        policy_flags = [
+            _requires_custom_embedding_schedule(item)
+            for item in embedding_items_per_req
+        ]
+        requires_custom_schedule = any(policy_flags)
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        if requires_custom_schedule:
+            if not is_per_image:
+                raise RuntimeError(
+                    "custom embedding scheduling requires single-offset MM items"
+                )
+            if not all(policy_flags):
+                raise RuntimeError(
+                    "mixing legacy and custom-scheduled MM items in one request "
+                    "is unsupported"
+                )
+            if any(item.encoder_batch_key is None for item in embedding_items_per_req):
+                raise RuntimeError(
+                    "custom-scheduled multimodal item requires encoder_batch_key"
+                )
+
         if is_per_image:
             if _is_hip or _is_npu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
                 # the previous per-request path on HIP while CUDA uses batching.
-                chunk = _get_chunked_embedding_by_item(
-                    data_embedding_func,
-                    embedding_items_per_req,
-                    items_offset,
-                    extend_prefix_len,
-                    extend_seq_len,
-                    device,
-                )
+                if requires_custom_schedule:
+                    chunk = _get_chunked_embedding_by_item_with_policy(
+                        data_embedding_func, req_info, device
+                    )
+                else:
+                    chunk = _get_chunked_embedding_by_item(
+                        data_embedding_func,
+                        embedding_items_per_req,
+                        items_offset,
+                        extend_prefix_len,
+                        extend_seq_len,
+                        device,
+                    )
                 if chunk is not None:
                     all_chunks.append((i, chunk))
             else:
                 per_image_requests.append(req_info)
+                if requires_custom_schedule:
+                    policy_requests.append(req_info)
+                else:
+                    legacy_requests.append(req_info)
         else:
             full_path_requests.append(req_info)
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
     hash_to_embedding: Dict[int, torch.Tensor] = {}
-    if per_image_requests:
-        hash_to_embedding = _batch_encode_per_image_misses(
-            data_embedding_func, per_image_requests, device
+    if legacy_requests:
+        hash_to_embedding.update(
+            _batch_encode_per_image_misses(data_embedding_func, legacy_requests, device)
+        )
+    if policy_requests:
+        hash_to_embedding.update(
+            _batch_encode_per_image_misses_with_policy(
+                data_embedding_func, policy_requests, device
+            )
         )
 
     # Phase 2: assemble per-request chunks in original request order

@@ -433,7 +433,9 @@ class RealtimeConnection:
                 self.model_sample_rate,
             )
         self.asr_state.audio.append_pcm(data)
-        if self.asr_processor.is_chunk_ready(self.asr_state):
+        # A client may batch several chunks in one append; preserve the normal
+        # inference cadence instead of turning that payload into one large call.
+        while self.asr_processor.is_chunk_ready(self.asr_state):
             ok = await self._run_inference(is_last=False)
             if not ok:
                 # WS already closed inside _run_inference.

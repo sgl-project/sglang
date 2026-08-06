@@ -1,5 +1,7 @@
 """Focused CPU tests for realtime ASR transcript and request behavior."""
 
+import base64
+
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
@@ -281,10 +283,53 @@ class TestStreamingASR(CustomTestCase):
         )
         state.transcript.emitted_text = "one two three"
         state.audio.append_pcm(bytes(122))
+        state.audio.last_attempted_offset_bytes = 120
+        state.audio.last_processed_offset_bytes = 120
         _run(processor.process(state, is_last=False, sampling_params={}))
         self.assertEqual(
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
             _ENCODER_WINDOW_GEOMETRY,
+        )
+
+    def test_large_append_is_drained_on_chunk_boundaries(self):
+        tokenizer_manager = _MockTokenizerManager(
+            ["one"] * 45,
+            supports_encoder_windows=True,
+        )
+        connection = RealtimeConnection(
+            Mock(send_text=AsyncMock(), close=AsyncMock()),
+            tokenizer_manager,
+            _adapter(
+                min_audio_sec=60.0,
+                encoder_window_config=_ENCODER_WINDOW_POLICY,
+            ),
+            _server_args(120),
+        )
+        connection.config.configured = True
+        connection.config.input_sample_rate = 1
+        connection.config.sampling_params = {"max_new_tokens": 256}
+        connection._send = AsyncMock()
+
+        pcm = bytes(90 * 2)
+        closed = _run(
+            connection._on_input_audio_buffer_append(
+                SimpleNamespace(audio=base64.b64encode(pcm).decode())
+            )
+        )
+
+        self.assertFalse(closed)
+        self.assertEqual(len(tokenizer_manager.requests), 45)
+        self.assertEqual(
+            [request.audio_data.size for request in tokenizer_manager.requests[:3]],
+            [2, 4, 6],
+        )
+        self.assertLessEqual(
+            max(request.audio_data.size for request in tokenizer_manager.requests),
+            64,
+        )
+        self.assertEqual(
+            connection.asr_state.audio.last_attempted_offset_bytes,
+            len(pcm),
         )
 
     def test_encoder_window_mode_compacts_on_encoder_boundaries(self):
@@ -294,13 +339,15 @@ class TestStreamingASR(CustomTestCase):
         state.transcript.emitted_text = "one two three"
 
         state.audio.append_pcm(bytes(122))
+        state.audio.last_attempted_offset_bytes = 120
+        state.audio.last_processed_offset_bytes = 120
         _run(processor.process(state, is_last=False, sampling_params={}))
-        state.audio.append_pcm(bytes(78))
+        state.audio.append_pcm(bytes(4))
         _run(processor.process(state, is_last=False, sampling_params={}))
 
         self.assertEqual(tokenizer_manager.requests[0].audio_data.size, 61)
-        self.assertEqual(tokenizer_manager.requests[1].audio_data.size, 52)
-        self.assertEqual(state.audio.base_offset_bytes, 96)
+        self.assertEqual(tokenizer_manager.requests[1].audio_data.size, 47)
+        self.assertEqual(state.audio.base_offset_bytes, 32)
         self.assertEqual(
             state.audio.base_offset_bytes + len(state.audio.data),
             state.audio.received_bytes,
