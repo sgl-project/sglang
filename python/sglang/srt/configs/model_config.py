@@ -315,8 +315,11 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
+        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
         self.model_is_mrope = (
-            rope_scaling is not None and "mrope_section" in rope_scaling
+            not self.is_lm_only
+            and rope_scaling is not None
+            and "mrope_section" in rope_scaling
         )
 
         self.hf_generation_config = get_generation_config(
@@ -433,10 +436,9 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
-        is_language_model_only = getattr(self.hf_config, "language_model_only", False)
         self.is_multimodal = (
             enable_multimodal
-            and not is_language_model_only
+            and not self.is_lm_only
             and (
                 is_multimodal_model(self.hf_config.architectures)
                 or has_multimodal_subconfig
@@ -448,7 +450,7 @@ class ModelConfig:
         # TODO: requires further polishing
         self.is_image_understandable_model = (
             enable_multimodal
-            and not is_language_model_only
+            and not self.is_lm_only
             and hasattr(self.hf_config, "vision_config")
         )
 
@@ -460,7 +462,7 @@ class ModelConfig:
         # TODO: Handle this more robustly by standardizing the config structure in the future
         self.is_audio_understandable_model = (
             enable_multimodal
-            and not is_language_model_only
+            and not self.is_lm_only
             and (
                 hasattr(self.hf_config, "audio_config")
                 or hasattr(
