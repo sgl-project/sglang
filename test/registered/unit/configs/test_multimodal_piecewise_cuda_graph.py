@@ -35,6 +35,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
+        runner.mla_pinned_under_bcg = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
