@@ -127,6 +127,61 @@ def zimage_rmsnorm_scale(
     return norm(x) * scale
 
 
+# One-time self-check state for the fused native qk-norm path: on the first
+# fused call we also run the eager reference and require torch.equal. If the
+# comparison ever fails (e.g. an aten kernel dispatch change on a new torch
+# build), the fused path is permanently disabled for the process.
+_ZIMAGE_QK_NORM_FUSION_STATE = {"verified": False, "enabled": True}
+
+
+def zimage_native_qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: ZImageRMSNorm,
+    norm_k: ZImageRMSNorm,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fused per-head ZImageRMSNorm for q/k, bit-exact vs the eager fallback.
+
+    Replaces `apply_qk_norm`'s eager chain (`q_norm(q.reshape(-1, head_dim))`)
+    with one Triton launch per tensor that reads the strided fused-qkv slices
+    directly. Returns contiguous (q, k) or None when unsupported.
+    """
+    if not _ZIMAGE_QK_NORM_FUSION_STATE["enabled"]:
+        return None
+
+    from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
+        can_use_qk_rmsnorm_native,
+        zimage_qk_rmsnorm_native,
+    )
+
+    q_weight = norm_q.weight.data
+    k_weight = norm_k.weight.data
+    if not (
+        can_use_qk_rmsnorm_native(q, q_weight, head_dim)
+        and can_use_qk_rmsnorm_native(k, k_weight, head_dim)
+    ):
+        return None
+    q_out = zimage_qk_rmsnorm_native(q, q_weight, norm_q.variance_epsilon)
+    k_out = zimage_qk_rmsnorm_native(k, k_weight, norm_k.variance_epsilon)
+    if q_out is None or k_out is None:
+        return None
+
+    if not _ZIMAGE_QK_NORM_FUSION_STATE["verified"]:
+        q_ref = norm_q(q.reshape(-1, head_dim)).view(q.shape)
+        k_ref = norm_k(k.reshape(-1, head_dim)).view(k.shape)
+        if torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref):
+            _ZIMAGE_QK_NORM_FUSION_STATE["verified"] = True
+        else:
+            _ZIMAGE_QK_NORM_FUSION_STATE["enabled"] = False
+            logger.warning(
+                "Fused Z-Image qk-norm self-check failed torch.equal against the "
+                "eager path; permanently falling back to the eager qk-norm."
+            )
+            return None
+    return q_out, k_out
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
         super().__init__()
@@ -324,6 +379,15 @@ class ZImageAttention(nn.Module):
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
     ):
+        # The fused native qk-norm kernel reads the strided fused-qkv slices
+        # directly and writes contiguous outputs, so q/k materialization is
+        # deferred to it on the main (rope-cache) path.
+        try_native_qk_norm = (
+            self.qk_norm
+            and rope_cos_sin_cache is not None
+            and self.enable_zimage_qk_fusion
+            and not torch.compiler.is_compiling()
+        )
         if self.use_fused_qkv:
             qkv, _ = self.to_qkv(hidden_states)
             q, k, v = qkv.split(
@@ -334,8 +398,9 @@ class ZImageAttention(nn.Module):
                 ],
                 dim=-1,
             )
-            q = q.contiguous()
-            k = k.contiguous()
+            if not try_native_qk_norm:
+                q = q.contiguous()
+                k = k.contiguous()
             v = v.contiguous()
         else:
             q, _ = self.to_q(hidden_states)
@@ -347,17 +412,37 @@ class ZImageAttention(nn.Module):
 
         if rope_cos_sin_cache is not None:
             if self.qk_norm:
-                q, k = apply_qk_norm_with_optional_rope(
-                    q=q,
-                    k=k,
-                    q_norm=self.norm_q,
-                    k_norm=self.norm_k,
-                    head_dim=self.head_dim,
-                    cos_sin_cache=rope_cos_sin_cache,
-                    is_neox=False,
-                    positions=rope_positions,
-                    allow_inplace=False,
-                )
+                fused_qk = None
+                if try_native_qk_norm:
+                    fused_qk = zimage_native_qk_rmsnorm(
+                        q, k, self.norm_q, self.norm_k, self.head_dim
+                    )
+                if fused_qk is not None:
+                    q, k = fused_qk
+                    # positions=None is handled identically to the eager
+                    # fallback (arange over seqlen, repeated across batch).
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q,
+                        k,
+                        rope_cos_sin_cache,
+                        head_size=self.head_dim,
+                        is_neox=False,
+                        positions=rope_positions,
+                    )
+                else:
+                    q = q.contiguous()
+                    k = k.contiguous()
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=rope_cos_sin_cache,
+                        is_neox=False,
+                        positions=rope_positions,
+                        allow_inplace=False,
+                    )
             else:
                 q, k = apply_flashinfer_rope_qk_inplace(
                     q,
