@@ -245,27 +245,34 @@ async def health_check():
     return Response(status_code=200)
 
 
+async def _broadcast_to_backends(
+    endpoint: str, method: str = "POST", json: Optional[dict] = None
+) -> None:
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            session.request(method, f"{server}/{endpoint}", json=json)
+            for server in chain(lb.prefill_urls, lb.decode_urls)
+        ]
+        for response in asyncio.as_completed(tasks):
+            await response
+
+
 @app.get("/health_generate")
 async def health_generate():
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.get(f"{server}/health_generate"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
+    await _broadcast_to_backends("health_generate", method="GET")
     return Response(status_code=200)
 
 
 @app.post("/flush_cache")
 async def flush_cache():
-    async with aiohttp.ClientSession() as session:
-        # Create the tasks
-        tasks = []
-        for server in chain(lb.prefill_urls, lb.decode_urls):
-            tasks.append(session.post(f"{server}/flush_cache"))
-        for i, response in enumerate(asyncio.as_completed(tasks)):
-            await response
+    await _broadcast_to_backends("flush_cache")
+    return Response(status_code=200)
+
+
+@app.post("/abort_request")
+async def abort_request(request_data: dict):
+    # LB doesn't track rid ownership, so broadcast to every backend
+    await _broadcast_to_backends("abort_request", json=request_data)
     return Response(status_code=200)
 
 
