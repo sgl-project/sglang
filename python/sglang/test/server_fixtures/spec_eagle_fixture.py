@@ -58,7 +58,12 @@ class SpecEagleServerBase(CustomTestCase):
     attention_backend = "flashinfer"
     # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
-    mem_fraction_static = 0.85
+    # 0.85 was picked when only 8 requests ran at once. At 64 the verify logits,
+    # activations and the wider capture need the room back: measured on a 5090,
+    # 0.85 leaves 1.9GB free (CI saw 1.67GB and OOM'd on a 502MB alloc) while
+    # 0.80 leaves 3.3GB and costs 1s. Below 0.80 the KV pool starts capping the
+    # batch instead, with no further speedup.
+    mem_fraction_static = 0.80
     # The eval kits drive 128 client threads; admitting only a handful serializes
     # them for no coverage. 64 also matches the capture bound popen_launch_server
     # sets -- capture_bs is clipped by req_to_token_pool.size (max_running + 1),
