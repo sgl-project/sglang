@@ -111,6 +111,50 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
+def unified_memory_disagg_move_gate(scheduler):
+    """Compaction move gate for a PD node running the unified memory pool.
+
+    Returns a predicate that is True only when no transfer can be in flight, so
+    compaction never relocates a page the RDMA engine is reading or writing.
+    Safe to read this state from here: every mover runs on the scheduler thread.
+
+    A page is exposed from the moment its address reaches the peer until the
+    transfer concludes, and for part of that lifetime the request is in NEITHER
+    end's queue -- so queue emptiness alone is not enough:
+
+    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
+      chunks may still be draining, and the request only reaches the inflight
+      queue later, in the result path.
+    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
+      allocating for the next, whose allocation can urgently flush the peer
+      sub-allocator; the batch reaches the transfer queue only after the loop.
+    """
+    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+
+        def prefill_gate() -> bool:
+            return not (
+                scheduler.disagg_prefill_inflight_queue
+                or scheduler.disagg_prefill_pending_chunk_rids
+            )
+
+        return prefill_gate
+
+    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+
+        def decode_gate() -> bool:
+            return not (
+                scheduler.disagg_decode_transfer_queue.queue
+                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+            )
+
+        return decode_gate
+
+    raise ValueError(
+        "unified_memory_disagg_move_gate: scheduler is not a PD node "
+        f"(mode={scheduler.disaggregation_mode})"
+    )
+
+
 #########################
 # Synchronization
 #########################
