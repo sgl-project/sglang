@@ -1011,8 +1011,7 @@ class _ServerArgsOverride:
 
     def install(self) -> ServerArgs:
         """Publish a fresh dummy-boundary ``ServerArgs`` carrying the
-        overrides (written through ``ServerArgs.override`` for provenance);
-        returns the published instance."""
+        overrides; returns the published instance."""
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
@@ -1025,7 +1024,7 @@ class _ServerArgsOverride:
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         server_args = ServerArgs(model_path="dummy")
         if self._fields:
-            server_args.override(source="test-override", **self._fields)
+            server_args = server_args.derive("test-override", **self._fields)
         # The dummy boundary skips materialization, which would leave the
         # strict mutation guard unarmed on the published object — mark it
         # materialized so bare post-publish writes raise like they do on a

@@ -111,7 +111,7 @@ def test_activation_default_backend(monkeypatch, device, expect):
     from sglang.kernels.ops.activation import _SILU_AND_MUL
 
     monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
-    assert _SILU_AND_MUL._resolve_backend().value == expect
+    assert _SILU_AND_MUL.auto_selected_backend().value == expect
 
 
 @pytest.mark.parametrize(
@@ -130,7 +130,7 @@ def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
     # CUDA-only, so HIP falls to aiter and NPU to torch_npu.
     ln = importlib.import_module("sglang.kernels.ops.layernorm")
     monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
-    assert getattr(ln, op_attr)._resolve_backend().value == expect
+    assert getattr(ln, op_attr).auto_selected_backend().value == expect
 
 
 def test_per_op_backend_subset():
