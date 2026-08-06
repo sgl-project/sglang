@@ -267,12 +267,14 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
+        is_draft_quantization_explicit: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -568,6 +570,10 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            is_draft_quantization_explicit=(
+                is_draft_model
+                and server_args._speculative_draft_quantization_explicitly_set
+            ),
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             speculative_algorithm=server_args.speculative_algorithm,
@@ -632,6 +638,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTP"
         if is_draft_model and self.hf_config.architectures[0] in MIMO_V2_MODEL_ARCHS:
             self.hf_config.architectures[0] = "MiMoV2MTP"
+            self.hf_config.num_nextn_predict_layers = 1
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
@@ -1249,8 +1256,34 @@ class ModelConfig:
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
-        elif quant_algo and "FP8" in quant_algo:
+        elif quant_algo == "FP8":
             return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
+        elif quant_algo == "MXFP8":
+            group_size = json_quant_configs.get("group_size", 32)
+            ignored_layers = json_quant_configs.get(
+                "exclude_modules", json_quant_configs.get("ignore")
+            )
+            kv_cache_quant_algo = json_quant_configs.get("kv_cache_quant_algo")
+            if kv_cache_quant_algo is None:
+                kv_cache_scheme = json_quant_configs.get("kv_cache_scheme")
+                if (
+                    isinstance(kv_cache_scheme, dict)
+                    and kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
+            parsed = {
+                "quant_method": "mxfp8",
+                "quant_algo": quant_algo,
+                "activation_scheme": "dynamic",
+                "weight_block_size": [1, group_size],
+                "scale_fmt": "ue8m0",
+            }
+            if ignored_layers is not None:
+                parsed["modules_to_not_convert"] = ignored_layers
+            if kv_cache_quant_algo is not None:
+                parsed["kv_cache_quant_algo"] = kv_cache_quant_algo
+            return parsed
         else:
             return None
 
@@ -1398,7 +1431,9 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            # Keep explicit or inherited modelopt_fp4 for literal FP8 checkpoints
+            # so eligible MoE experts are requantized online.
+            "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
@@ -1440,7 +1475,6 @@ class ModelConfig:
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
-
             # Detect which checkpoint is it
             if not preserve_online_draft_quantization:
                 for _, method in QUANTIZATION_METHODS.items():
