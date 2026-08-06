@@ -1249,8 +1249,34 @@ class ModelConfig:
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
-        elif quant_algo and "FP8" in quant_algo:
+        elif quant_algo == "FP8":
             return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
+        elif quant_algo == "MXFP8":
+            group_size = json_quant_configs.get("group_size", 32)
+            ignored_layers = json_quant_configs.get(
+                "exclude_modules", json_quant_configs.get("ignore")
+            )
+            kv_cache_quant_algo = json_quant_configs.get("kv_cache_quant_algo")
+            if kv_cache_quant_algo is None:
+                kv_cache_scheme = json_quant_configs.get("kv_cache_scheme")
+                if (
+                    isinstance(kv_cache_scheme, dict)
+                    and kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
+            parsed = {
+                "quant_method": "mxfp8",
+                "quant_algo": quant_algo,
+                "activation_scheme": "dynamic",
+                "weight_block_size": [1, group_size],
+                "scale_fmt": "ue8m0",
+            }
+            if ignored_layers is not None:
+                parsed["modules_to_not_convert"] = ignored_layers
+            if kv_cache_quant_algo is not None:
+                parsed["kv_cache_quant_algo"] = kv_cache_quant_algo
+            return parsed
         else:
             return None
 
