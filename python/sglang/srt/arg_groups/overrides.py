@@ -1725,6 +1725,9 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
         if (
             view.moe_a2a_backend == "none"
             and view.moe_runner_backend == "auto"
+            # LongCat top-k spans the zero-expert logits, which trtllm-gen's
+            # fused routing cannot see.
+            and not model_arch.startswith("LongcatFlash")
             and (
                 quantization
                 in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
