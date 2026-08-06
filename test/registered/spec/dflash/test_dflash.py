@@ -6,11 +6,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import (
     gen_radix_tree,
     run_radix_attention_test,
 )
+from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -20,11 +22,18 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
+register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
+class TestDFlashServerBase(
+    CustomTestCase,
+    MatchedStopMixin,
+    GSM8KMixin,
+    JSONConstrainedMixin,
+    SpecGrammarKit,
+    SpecLogprobKit,
+):
     max_running_requests = 64
     attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
@@ -152,7 +161,7 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
     other_launch_args = ["--disable-cuda-graph"]
 
 
-class TestDFlashServerSpecV2(TestDFlashServerBase):
+class TestDFlashServerOverlap(TestDFlashServerBase):
     disable_overlap = False
 
     def test_radix_attention(self):
@@ -160,7 +169,7 @@ class TestDFlashServerSpecV2(TestDFlashServerBase):
         assert self.process.poll() is None
 
 
-class TestDFlashServerSpecV2PlanStream(TestDFlashServerSpecV2):
+class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
     overlap_plan_stream = True
 
 

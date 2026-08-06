@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.server_args import ServerArgs
@@ -54,6 +55,8 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        allocator_type = get_allocator_type(server_args)
+
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
                 kv_cache,
@@ -61,6 +64,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
@@ -69,6 +73,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
@@ -104,6 +109,9 @@ class DecodeKVCacheOffloadManager:
         self.offloaded_state = {}
         self.offload_inflight = {}
         logger.info("Enable offload kv cache for decode side")
+
+    def release_host_resources(self) -> None:
+        self.decode_host_mem_pool.destroy()
 
     def _mark_offload_started(self, rid):
         self.offload_inflight[rid] = self.offload_inflight.get(rid, 0) + 1

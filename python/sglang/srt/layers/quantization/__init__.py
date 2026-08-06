@@ -27,7 +27,6 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
@@ -49,7 +48,6 @@ from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
 from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
-from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
@@ -60,13 +58,12 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_hip,
+    is_gfx95_supported,
     is_mps,
     is_npu,
-    mxfp_supported,
 )
 
-_is_mxfp_supported = mxfp_supported()
+_is_gfx95_supported = is_gfx95_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -91,10 +88,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
-    "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
-    "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
     "quark_mxfp4": QuarkConfig,
     "auto-round": AutoRoundConfig,
@@ -106,7 +101,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or _is_gfx95_supported:
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

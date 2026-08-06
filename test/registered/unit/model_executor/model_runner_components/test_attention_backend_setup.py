@@ -19,11 +19,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _FakeBackend:
     def __init__(self, name):
         self.name = name
+        # Real backends always carry this (AttentionBackend class attribute).
+        self.needs_cpu_seq_lens = True
 
 
 def test_split_full_attention_applies_model_wrapper_once():
     runner = SimpleNamespace(
         server_args=SimpleNamespace(speculative_attention_mode="prefill"),
+        model_config=SimpleNamespace(context_len=2048),
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
         req_to_token_pool=object(),
