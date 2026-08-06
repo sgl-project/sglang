@@ -264,6 +264,82 @@ class TestMlxRunnerRowRelease(CustomTestCase):
             writes, [], "retracted A must not write into C's reused KV slots"
         )
 
+    def test_deferred_retraction_blocks_stale_flush_write_to_reused_slots(self):
+        """defer_retraction's invalidation, not the row-generation guard, must
+        block this write.
+
+        R keeps a *different* row from C, so the row-generation guard (which
+        only catches same-row reuse) is blind here; the KV allocator instead
+        recycles R's freed KV slots onto C's row. R has a committed-but-unsynced
+        tail before retraction. The scheduler's OOM path calls
+        ``defer_retraction`` (not ``prepare_for_retraction``): it invalidates R
+        without discarding its runner state, so R's stale ``req_pool_idx``
+        survives into the next extend batch, per its deferred-removal contract.
+        A further committed decode on the runner's still-live view of R (one
+        more ``_req_committed_len`` bump, as a real scheduler-built decode step
+        would do) extends the read window into the slots C's data now lives in.
+        Only ``_req_invalidated`` — not ``_row_still_owned`` — stops the
+        resulting flush from overwriting C.
+
+        Drives a real ``MlxAttentionKVPool`` instead of spying
+        ``_sync_new_kv_to_pool``, so the assertion is on final pool contents,
+        not on whether a write was attempted.
+        """
+        import mlx.core as mx
+
+        from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_pool import (
+            MlxAttentionKVPool,
+        )
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+
+        req_pool, kv = self._pools(rows=2, kv=4)
+        runner, _writes = self._runner(req_pool)
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=5, num_layers=1, n_kv_heads=1, head_dim=1, dtype=mx.float32
+        )
+        runner._sync_new_kv_to_pool = MlxModelRunner._sync_new_kv_to_pool.__get__(
+            runner
+        )
+        worker = self._worker(runner)
+
+        req_r, r_row, r_slots = self._alloc(req_pool, kv, 4)  # slots [1, 2, 3, 4]
+        self._activate(runner, "R", row=r_row, offset=4, synced=2, committed=3)
+        r_cache = runner._req_caches["R"][0]
+        r_cache.keys = mx.full((1, 1, 8, 1), 903.0, dtype=mx.float32)
+        r_cache.values = mx.full((1, 1, 8, 1), 903.0, dtype=mx.float32)
+
+        # Real OOM-retraction path: invalidate R, but keep its runner state
+        # alive for an already-launched overlap step to finalize.
+        worker.defer_retraction(SimpleNamespace(rid="R"))
+        self.assertFalse(runner.has_request("R"))
+        self.assertIn("R", runner._req_caches)
+
+        # Scheduler frees R's row and its un-synced KV tail [3, 4]; C takes a
+        # *different* row while the KV allocator recycles [3, 4].
+        req_pool.free(req_r)
+        kv.free(r_slots[2:])
+        _req_c, c_row, c_slots = self._alloc(req_pool, kv, 2)
+        self.assertNotEqual(r_row, c_row)
+        self.assertEqual(c_slots.tolist(), [3, 4])
+
+        # C's own decode already wrote its real KV into its own slots.
+        c_slots_mx = mx.array(c_slots.tolist(), dtype=mx.int32)
+        sentinel = mx.full((1, 2, 1, 1), 777.0, dtype=mx.float32)
+        runner._attention_kv_pool.set_kv_all_layers(c_slots_mx, sentinel, sentinel)
+
+        # One further committed decode on the runner's still-live view of R
+        # (mirrors the +1 decode_batch_start does per scheduler-built step).
+        runner._req_committed_len["R"] += 1
+
+        runner.flush_decode_kv_for_slots(set(c_slots.tolist()))
+
+        k_after, v_after = runner._attention_kv_pool.get_kv_all_layers(c_slots_mx)
+        self.assertTrue(
+            bool(mx.all(k_after == 777.0).item()),
+            "R's stale KV must not overwrite C's reused slots",
+        )
+        self.assertTrue(bool(mx.all(v_after == 777.0).item()))
+
     def test_retraction_reschedules_as_fresh_prefill(self):
         """After the retraction hook, a re-scheduled A routes as prefill.
 
