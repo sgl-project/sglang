@@ -23,8 +23,7 @@ cell coordinate::
 The coordinate names *what data the object holds* (a model-global layer-range x
 kv-head-range rectangle of one page), never *who wrote it*. Any deployment
 whose shard tiles the namespace grid derives identical keys for identical
-data, which makes cross-topology reuse a pure key-selection problem. Design:
-``DESIGN_l3_canonical_shard_grid.md``.
+data, which makes cross-topology reuse a pure key-selection problem.
 
 Without partition knobs, a rank owns one cell per page (its absolute layer
 range, its head shard) and objects keep the raw pool-layout bytes. Setting
@@ -474,3 +473,116 @@ def plan_canonical_cells(
         layer_ranges=layer_ranges,
         head_ranges=head_ranges,
     )
+
+
+class CellAdapter:
+    """Backend-neutral staging machinery for canonical cell IO.
+
+    The host pools expose the canonical gather/scatter primitives; this
+    class owns everything else a backend needs to serve a partitioned
+    (cell-v1) namespace: the per-cell key fan-out, the sub-batch geometry,
+    and one pinned staging arena per IO direction (backup and prefetch run
+    on concurrent controller threads). A backend brings only its own
+    pointer-based batch put/get and, for RDMA transports, a
+    ``register_buffer`` hook for the arenas.
+
+    When every slab is already pool-contiguous no arena is allocated and
+    all transfers resolve to pool addresses (pure zero-copy).
+    """
+
+    def __init__(self, mem_pool_host, storage_config, register_buffer=None):
+        self.pool = mem_pool_host
+        self.page_size = mem_pool_host.page_size
+        self.layer_ranges = storage_config.canonical_layer_ranges
+        self.head_ranges = storage_config.canonical_head_ranges
+        suffixes = storage_config.canonical_suffix
+        assert isinstance(suffixes, list) and self.layer_ranges is not None
+        self.suffixes = suffixes
+        # Rank-replicated (MLA-family) cells are single objects; sharded
+        # pools store one K and one V object per cell.
+        self.split_kv = self.head_ranges is not None
+        self.keys_per_page = len(suffixes) * (2 if self.split_kv else 1)
+        self.arena_set = None
+        self.arena_get = None
+        self.arena_pages = 0
+        if self.pool.cells_all_direct(self.layer_ranges, self.head_ranges):
+            logger.info(
+                "HiCache cell adapter: all cells pool-contiguous, zero-copy "
+                "(no staging arenas)."
+            )
+            return
+        extra = storage_config.extra_config or {}
+        arena_mb = extra.get("cell_arena_mb", 256)
+        page_cell_bytes = self.pool.cell_bytes(self.layer_ranges, self.head_ranges)
+        arena_bytes = max(int(arena_mb) << 20, page_cell_bytes)
+        self.arena_pages = arena_bytes // page_cell_bytes
+        arena_numel = self.arena_pages * page_cell_bytes
+        self.arena_set = self._alloc_arena(arena_numel)
+        self.arena_get = self._alloc_arena(arena_numel)
+        if register_buffer is not None:
+            register_buffer(self.arena_set)
+            register_buffer(self.arena_get)
+        logger.info(
+            "HiCache cell adapter: 2 x %d-page staging arenas (%.1f MB each) "
+            "for the backup and prefetch threads.",
+            self.arena_pages,
+            arena_numel / (1 << 20),
+        )
+
+    def _alloc_arena(self, numel):
+        # Pinned so RDMA transports can register and DMA it directly.
+        # (Overridable seam: CPU-only tests allocate unpinned.)
+        import torch
+
+        return torch.empty(numel, dtype=torch.uint8, pin_memory=True)
+
+    def cell_keys(self, page_keys: list) -> list:
+        """Fan page keys out to cell keys, in the pools' slab order:
+        page-major, suffix (layer-major, head-minor), K then V."""
+        key_list = []
+        if not self.split_kv:
+            for key_ in page_keys:
+                for suffix in self.suffixes:
+                    key_list.append(f"{key_}_{suffix}_k")
+            return key_list
+        for key_ in page_keys:
+            for suffix in self.suffixes:
+                key_list.append(f"{key_}_{suffix}_k")
+                key_list.append(f"{key_}_{suffix}_v")
+        return key_list
+
+    def sub_batches(self, keys: list, host_indices):
+        """Split a batch into arena-sized (page_keys, indices) chunks; each
+        chunk reuses the arenas from offset 0."""
+        if not keys:
+            return
+        pages_per_batch = self.arena_pages or len(keys)
+        for start in range(0, len(keys), pages_per_batch):
+            page_keys = keys[start : start + pages_per_batch]
+            indices = host_indices[
+                start * self.page_size : (start + len(page_keys)) * self.page_size
+            ]
+            yield page_keys, indices
+
+    def gather(self, indices):
+        """Write path: (ptrs, sizes) per slab — canonical bytes, staged into
+        arena_set only where the pool view is not already contiguous."""
+        return self.pool.gather_cells_canonical(
+            indices, self.layer_ranges, self.head_ranges, self.arena_set
+        )
+
+    def read_metas(self, indices):
+        """Read path targets: direct slabs fetch straight into the pool,
+        staged slabs into arena_get."""
+        return self.pool.cell_read_metas(
+            indices, self.layer_ranges, self.head_ranges, self.arena_get
+        )
+
+    def scatter(self, indices, page_ok):
+        """Read path finalize: copy staged slabs of successful pages from
+        arena_get into the pool (direct slabs already landed in place)."""
+        if self.arena_get is None or not any(page_ok):
+            return
+        self.pool.scatter_cells_canonical(
+            indices, self.layer_ranges, self.head_ranges, self.arena_get, page_ok
+        )
