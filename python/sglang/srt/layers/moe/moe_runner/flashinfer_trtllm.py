@@ -142,6 +142,22 @@ def _get_packed_topk_ids_for_flashinfer_routed(topk_output) -> torch.Tensor:
     )
 
 
+def _get_routing_for_flashinfer_routed(
+    topk_output,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return ``(topk_ids, topk_weights)``; a ``None`` weight means packed ids."""
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    if TopKOutputChecker.format_is_packed(topk_output):
+        return topk_output.packed_topk_ids, None
+
+    assert TopKOutputChecker.format_is_standard(topk_output)
+    return (
+        topk_output.topk_ids.contiguous(),
+        topk_output.topk_weights.contiguous(),
+    )
+
+
 def _align_fp8_moe_weights(
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -735,10 +751,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert (
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
-            packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
+            topk_ids, topk_weights = _get_routing_for_flashinfer_routed(topk_output)
 
             trtllm_fp8_block_scale_routed_moe_out_wrapper(
-                topk_ids=packed_topk_ids,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
                 routing_bias=None,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
@@ -1214,9 +1231,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
-            packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
+            topk_ids, topk_weights = _get_routing_for_flashinfer_routed(topk_output)
             final_hidden_states = trtllm_bf16_routed_moe(
-                topk_ids=packed_topk_ids,
+                topk_ids=topk_ids if topk_weights is None else (topk_ids, topk_weights),
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
