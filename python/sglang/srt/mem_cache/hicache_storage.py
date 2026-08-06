@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -21,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+
+
+class LayerShardInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Layer-shard identity used to isolate external-storage keys."""
+
+    rank: int
+    size: int
+
+    def __post_init__(self) -> None:
+        if self.size <= 1:
+            raise ValueError("Layer sharding requires size > 1")
+        if not 0 <= self.rank < self.size:
+            raise ValueError(f"Invalid layer shard rank {self.rank}/{self.size}")
+
+    @property
+    def key(self) -> str:
+        return f"layer{self.rank}_{self.size}"
 
 
 @dataclass
@@ -38,6 +56,14 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    layer_shard: Optional[LayerShardInfo] = None
+    is_storage_writer: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.layer_shard is not None and not self.is_mla_model:
+            raise ValueError("Layer-sharded storage currently requires MLA layout")
+        if self.is_storage_writer is None:
+            self.is_storage_writer = not self.is_mla_model or self.tp_rank == 0
 
 
 @dataclass
@@ -152,6 +178,8 @@ class HiCacheStorage(ABC):
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    supports_layer_sharded_mla = False
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -360,6 +388,8 @@ class MetadataCache:
 
 class HiCacheFile(HiCacheStorage):
 
+    supports_layer_sharded_mla = True
+
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -375,6 +405,7 @@ class HiCacheFile(HiCacheStorage):
         )
         attn_cp_rank = storage_config.attn_cp_rank
         attn_cp_size = storage_config.attn_cp_size
+        layer_shard = storage_config.layer_shard
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
         self.config_suffix = f"_{model_name}"
@@ -382,9 +413,11 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
+        if layer_shard is not None:
+            self.config_suffix += f"_{layer_shard.key}"
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
+        elif attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
@@ -425,7 +458,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            is_storage_writer=bool(storage_config.is_storage_writer),
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

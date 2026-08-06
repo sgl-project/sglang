@@ -12,7 +12,11 @@ from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheO
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    LayerShardInfo,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
@@ -186,6 +190,26 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
     def tearDown(self):
         manager_cache_controller._timing_events_supported.cache_clear()
+
+    def test_layer_shard_selects_one_writer_per_attention_tp_group(self):
+        shard = LayerShardInfo(rank=1, size=2)
+
+        self.assertTrue(
+            manager_cache_controller._is_storage_writer(
+                is_mla_model=True,
+                layer_shard=shard,
+                tp_rank=2,
+                attn_tp_rank=0,
+            )
+        )
+        self.assertFalse(
+            manager_cache_controller._is_storage_writer(
+                is_mla_model=True,
+                layer_shard=shard,
+                tp_rank=3,
+                attn_tp_rank=1,
+            )
+        )
 
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None

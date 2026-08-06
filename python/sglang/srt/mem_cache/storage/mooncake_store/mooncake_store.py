@@ -330,6 +330,7 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+    supports_layer_sharded_mla = True
 
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
@@ -575,6 +576,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+
+            layer_shard = storage_config.layer_shard
+            if layer_shard is not None:
+                shard_key = layer_shard.key
+                self.mla_suffix = (
+                    f"{self.mla_suffix}_{shard_key}" if self.mla_suffix else shard_key
+                )
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
