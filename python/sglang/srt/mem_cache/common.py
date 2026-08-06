@@ -88,9 +88,8 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        # Both ends are page aligned (the floor above, and swa_evicted_seqlen only
-        # ever advances to an aligned value), and the range is exactly what this
-        # request kept alive until now, so it satisfies free_swa_segment's contract.
+        # Contract holds: both ends are page aligned (swa_evicted_seqlen only ever
+        # advances to an aligned value), and the range is what this req kept alive.
         token_to_kv_pool_allocator.free_swa_segment(
             free_slots, start_pos=req.kv.swa_evicted_seqlen
         )

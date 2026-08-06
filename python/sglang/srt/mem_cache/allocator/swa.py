@@ -360,19 +360,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Fixed-shape counterpart of free_swa(): none of unique, the ``> 0``
-        filter, or the inner allocator's unique runs, so no output shape depends
-        on device data and the call stays a pure async launch.
+        """Fixed-shape counterpart of free_swa(): no output shape depends on
+        device data, so the call stays a pure async launch.
 
-        Contract, beyond base: ``start_pos`` is page aligned, and every page the
-        slice touches still holds a live SWA mapping -- i.e. the caller owns the
-        range exclusively and has not freed it before. Ranges that may already be
-        dead must keep using ``free_swa``.
+        Beyond base's contract: ``start_pos`` is page aligned, and every page the
+        slice touches still holds a live SWA mapping -- the caller owns the range
+        and has not freed it before. Ranges that may already be dead keep using
+        ``free_swa``, which filters them.
 
-        Like ``free_swa``, this does not participate in the free group: with no
-        data-dependent op left there is nothing to amortize, and deferring would
-        mean reading the caller's ``req_to_token`` view after the call, which is
-        only valid while nobody rewrites that row.
+        Not part of the free group: nothing left to amortize, and deferring would
+        read the caller's ``req_to_token`` view after the call returns.
         """
         if free_index.numel() == 0:
             return
@@ -391,11 +388,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._clear_mapping_pages(full_reps)
 
     def _clear_mapping_pages(self, page_reps: torch.Tensor) -> None:
-        """Zero full_to_swa_index_mapping for the whole page of each rep, with a
-        broadcast index instead of unique-then-expand.
+        """Zero the mapping for each rep's whole page.
 
         index_fill_ rather than ``mapping[idx] = 0``: the scalar setitem form
-        synchronizes on CUDA, index_fill_ does not.
+        synchronizes on CUDA.
         """
         page_reps = page_reps.to(torch.int64)
         ps = self.page_size
@@ -543,10 +539,9 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(free_index[free_index > 0])
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Here full == swa and the mapping is a constant identity table, so the
-        base fast path's gather and page clearing are both wrong: never zero the
-        table, and the slot is its own SWA rep. Drops the ``> 0`` padding filter,
-        which the contract's exclusive-ownership requirement already covers."""
+        """full == swa and the mapping is a constant identity table, so the base
+        path's gather and page clearing are both wrong: a slot is its own SWA rep
+        and the table is never zeroed."""
         if free_index.numel() == 0:
             return
         if self.debug_mode:
