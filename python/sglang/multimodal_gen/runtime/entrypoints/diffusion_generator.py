@@ -472,7 +472,7 @@ class DiffGenerator:
     def _log_summary(self, results: list[GenerationResult]) -> None:
         if not results:
             return
-        if self.server_args.warmup:
+        if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
             logger.info(
                 f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
