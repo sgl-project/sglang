@@ -73,21 +73,13 @@ def register_fake_ops():
         num_kv_splits,
         pack_gqa,
         sm_margin,
-        out=None,
+        out,
+        softmax_lse,
     ):
-        total_q = q.shape[0]
-        num_heads_q = q.shape[1]
-        head_size_v = v.shape[-1]
-        if out is None:
-            out = q.new_empty(total_q, num_heads_q, head_size_v)
-        softmax_lse = q.new_empty(num_heads_q, total_q, dtype=torch.float32)
-        # out_accum and softmax_lse_accum are intermediate split-kv buffers;
-        # they are only read when num_kv_splits > 1, which is determined at
-        # runtime.  Return empty tensors with correct rank so downstream ops
-        # that index into the list do not fail shape propagation.
-        out_accum = q.new_empty(0)
-        softmax_lse_accum = q.new_empty(0, dtype=torch.float32)
-        return (out, softmax_lse, out_accum, softmax_lse_accum)
+        # The op writes into the caller-provided ``out`` and ``softmax_lse``
+        # buffers in place and returns nothing. ``softmax_lse`` is ``None`` when
+        # the caller does not request the logsumexp.
+        return None
 
     @torch.library.register_fake("sgl_kernel::flash_mla_decode")
     def _(
