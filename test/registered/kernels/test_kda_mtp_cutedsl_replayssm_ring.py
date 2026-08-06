@@ -20,16 +20,15 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-# The verify backend this kernel serves is pinned to nv_cutedsl for any Kimi
-# hybrid model running speculative decoding, with no architecture gate (see
-# ``arg_groups/kimi_k3_hook.apply_kimi_k3_spec_backend_defaults``), so the
-# kernel is reachable on pre-Blackwell parts too and the parity check follows
-# it there. The GDN CuTe ring-verify parity test runs on the same pool.
-if not torch.cuda.is_available():
+# SM100-only, and hard: libNVVM refuses the generated device IR when the CuTe
+# DSL kernel is compiled for sm_90a, so this is a build failure rather than a
+# numeric one. The SM100 pool has no single-GPU runner_config, hence 4-gpu-b200
+# for a one-GPU test.
+if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
     pytest.skip(
-        "KDA CuTe MTP ReplaySSM ring parity needs CUDA.",
+        "KDA CuTe MTP ReplaySSM ring parity needs SM100 (CuTe DSL kernel).",
         allow_module_level=True,
     )
 
