@@ -8,6 +8,7 @@ import logging
 from typing import Tuple
 
 import torch
+
 try:
     from cuda.bindings import driver as cuda
 except ImportError:
