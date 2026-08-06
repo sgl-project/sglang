@@ -63,6 +63,8 @@ export const benchmarks = [
     sglang_version: "PR #27944",
     speed: [
       // bench_serving --flush-cache, bf16 Triton path; warm steady-state (3-run, cold-start run-1 excluded).
+      // NOTE: these TTFT/TPOT are the original MEAN measurement (config latencyPercentile
+      // is P50 for the 0.5.16-re-benched cells) — h200 pending an 8x-node re-bench to P50.
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
         ttft_ms: 1054, tpot_ms: 70.8, tokens_per_sec_per_gpu: 1044 },
     ],

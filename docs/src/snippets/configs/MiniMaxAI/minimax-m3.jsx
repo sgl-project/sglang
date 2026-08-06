@@ -1,8 +1,8 @@
 // MiniMax-M3 cookbook config. Consumed by _deployment.jsx + _playground.jsx;
 // see _deployment.jsx header for the field contract.
 //
-// MXFP8 MoE: validated single-node tp4 on NVIDIA Blackwell — B200 (sm_100),
-// B300 (sm_103), GB300 (sm_103, aarch64 Grace); GB200 (sm_100, aarch64) is
+// MXFP8 MoE: validated single-node on NVIDIA Blackwell — B200 (sm_100, tp8),
+// B300 (sm_103, tp4), GB300 (sm_103, tp4, aarch64 Grace); GB200 (sm_100, aarch64) is
 // inferred-supported (both axes validated above) but not directly benchmarked.
 // AMD: validated single-node tp8 — MI355X (gfx950, CDNA4) serves MXFP8
 // natively; MI300X (gfx942, CDNA3) auto-converts MXFP8 -> block-fp8 [128,128]
@@ -97,8 +97,8 @@ sgl-eval run mmmu_pro \\
   dockerImages: {
     // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
     // (B300/GB300) + Grace arm64 builds; cu12 is the Hopper/CUDA-12 build;
-    // dev-minimax-m3 is the rolling default. M3 model support is not yet in a
-    // tagged release, so :latest cannot serve it.
+    // dev-minimax-m3 is the rolling default. (M3 support is in sglang 0.5.16; these
+    // dev images carry the arch-specific CUDA-13/CUDA-12 + Grace arm64 builds.)
     b200: "lmsysorg/sglang:dev-minimax-m3",
     b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
     gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
@@ -213,7 +213,9 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      // On 0.5.16 the deep_gemm MoE runner OOMs at cuda-graph capture at
+      // mem-fraction 0.65 without expandable segments; this env is required.
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
