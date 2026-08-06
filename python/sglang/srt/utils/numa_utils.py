@@ -134,11 +134,17 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
         if len(queried_numa_node) == 0:
             return None
         if len(queried_numa_node) > 1:
-            # get_numa_node_for_gpu could return multiple nodes, we use the first one for now.
-            # I don't think there any hardware configs that would have more than one.
+            local_worker_index = (
+                gpu_id - server_args.base_gpu_id
+            ) // server_args.gpu_id_step
+            selected_node = queried_numa_node[
+                local_worker_index % len(queried_numa_node)
+            ]
             logger.warning(
-                f"Multiple NUMA nodes found for GPU {gpu_id}: {queried_numa_node}. Using the first one."
+                f"Multiple NUMA nodes found for GPU {gpu_id}: "
+                f"{queried_numa_node}. Selecting node {selected_node}."
             )
+            return selected_node
         return queried_numa_node[0]
     return None
 
