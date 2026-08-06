@@ -469,8 +469,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
-            _processor = _get_processor_wrapper(server_args)
-            transport_mode = _determine_tensor_transport_mode(self.server_args)
+            _processor = get_processor_wrapper(server_args)
+            transport_mode = determine_tensor_transport_mode(self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
@@ -3699,7 +3699,7 @@ async def print_exception_wrapper(func):
         sys.exit(1)
 
 
-def _get_processor_wrapper(server_args):
+def get_processor_wrapper(server_args):
     try:
         processor = get_processor(
             server_args.tokenizer_path,
@@ -3730,7 +3730,7 @@ def _get_processor_wrapper(server_args):
     return processor
 
 
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:

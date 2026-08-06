@@ -7,7 +7,7 @@
 # You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
-"""CuTe DSL TGV BF16 GEMM (low-latency Blackwell GEMM, SM100/SM103 only).
+"""CuTe DSL TGV BF16 GEMM (low-latency SM10x GEMM).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
 fp32 accumulation, bf16 output. The kernel writes M-contiguous output, so the
@@ -39,7 +39,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import get_device_sm
+from sglang.srt.utils import is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -1205,7 +1205,9 @@ def _to_cute_swap(
     M_ce = c_swap.shape[1]  # == PyTorch N
     N_ce = c_swap.shape[2]  # == PyTorch M
     bias_3d = bias_pt.as_strided(size=(L, M_ce, N_ce), stride=(0, 1, 0))
-    bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
+    bias_ = from_dlpack(bias_3d.detach(), assumed_align=2).mark_layout_dynamic(
+        leading_dim=1
+    )
     return a_, b_, c_, bias_, layout
 
 
@@ -1352,8 +1354,8 @@ def _tgv_bf16_gemm_run(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if get_device_sm() not in (100, 103):
-        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
@@ -1380,8 +1382,8 @@ def _tgv_bf16_gemm_out_run(
     out: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> None:
-    if get_device_sm() not in (100, 103):
-        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16 and out.device == x.device
     assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2

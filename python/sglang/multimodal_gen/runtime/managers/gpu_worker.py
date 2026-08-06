@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     trace_slice,
 )
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -136,6 +137,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ):
         self.local_rank = local_rank
         self.rank = rank
+        # the rank that materializes output and replies to the client: the
+        # first rank of this DP replica, which is global rank 0 only at dp=1
+        gpus_per_replica = max(1, server_args.num_gpus // (server_args.dp_size or 1))
+        self.is_output_rank = rank % gpus_per_replica == 0
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
@@ -175,12 +180,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
         tmp_root = tempfile.gettempdir()
+        sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (
             ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
             ("TRITON_CACHE_DIR", "triton"),
         ):
             current = os.environ.get(env_name)
-            if current and not current.startswith(tmp_root):
+            if (
+                current
+                and current != sglang_defaults.get(env_name)
+                and not current.startswith(tmp_root)
+            ):
                 # Respect an explicit, non-ephemeral user-provided cache dir.
                 continue
             cache_path = os.path.join(compile_cache_root, sub)
@@ -454,7 +464,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch = None
         forward_failed = False
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            if self.is_output_rank and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = (
@@ -468,7 +478,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
-            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
+            if (
+                self.is_output_rank
+                and request_metrics
+                and not current_platform.is_cpu()
+            ):
                 baseline_snapshot = capture_memory_snapshot()
                 for metrics in request_metrics:
                     metrics.record_memory_snapshot("before_forward", baseline_snapshot)
@@ -495,13 +509,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
-            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
+            if self.is_output_rank and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
                 for metrics in output_metrics:
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
 
             if (
-                self.rank == 0
+                self.is_output_rank
                 and not req.suppress_logs
                 and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
@@ -575,7 +589,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
-        if self.rank != 0:
+        if not self.is_output_rank:
             return
         if output_batch.output is not None:
             output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
@@ -597,7 +611,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch: OutputBatch,
         save_output_paths: Callable[[OutputBatch], None],
     ) -> None:
-        if self.rank == 0:
+        if self.is_output_rank:
             save_output_paths(output_batch)
         output_batch.output = None
         output_batch.audio = None
@@ -608,7 +622,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
         if (
-            self.rank != 0
+            not self.is_output_rank
             or output_batch.output is None
             or not getattr(req, "return_frames", False)
         ):
@@ -672,7 +686,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return np.asarray(materialized.frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+        if not self.is_output_rank or current_platform.is_cpu():
             return
         peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
@@ -685,7 +699,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
         """save outputs to files"""
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
 
         dynamic_output_paths = None
@@ -736,7 +750,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         reqs: list[Req],
         output_batch: OutputBatch,
     ) -> None:
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
         if len(output_batch.output) != len(reqs):
             raise RuntimeError(

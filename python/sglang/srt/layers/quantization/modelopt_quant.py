@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear_bmm_flashinfer,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
+    flashinfer_per_tensor_fp8_supported,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -66,8 +67,6 @@ from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
-    is_flashinfer_available,
-    is_sm100_supported,
     is_sm120_supported,
     round_up,
     set_weight_attrs,
@@ -465,11 +464,11 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             raise ValueError(
                 "Cannot find 'quant_algo' in the model's quantization config. "
             )
-        if "FP8" not in quant_method:
+        if quant_method != "FP8":
             raise ValueError(
-                "ModelOptFp8Config only supports static FP8 quantization in SGLang. "
-                "For FP4 quantization, use ModelOptFp4Config. "
-                "Check the quantization config for your model's configuration."
+                "ModelOptFp8Config only supports regular FP8 quantization, "
+                f"but found {quant_method!r}. Use the native 'mxfp8' "
+                "quantization method for MXFP8 or ModelOptFp4Config for FP4."
             )
 
         return cls(
@@ -505,9 +504,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.enable_flashinfer_bmm = (
-            is_sm100_supported() or is_sm120_supported()
-        ) and is_flashinfer_available()
+        self.enable_flashinfer_bmm = flashinfer_per_tensor_fp8_supported()
         self.use_marlin = False
         if is_cuda():
             self.use_marlin = (
@@ -565,13 +562,20 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
                 layer.register_parameter(scale_name, scale)
 
+    def _can_use_flashinfer_bmm(self, layer: torch.nn.Module) -> bool:
+        if not self.enable_flashinfer_bmm or layer.input_scale is None:
+            return False
+        k, n = layer.weight.shape
+        return k % 16 == 0 and n % 16 == 0
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
-        if self.cutlass_fp8_supported and not self.enable_flashinfer_bmm:
+        layer.use_flashinfer_bmm = self._can_use_flashinfer_bmm(layer)
+        if self.cutlass_fp8_supported and not layer.use_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
@@ -597,7 +601,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
-        if self.enable_flashinfer_bmm and layer.input_scale is not None:
+        if layer.use_flashinfer_bmm:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
                 weight=layer.weight,

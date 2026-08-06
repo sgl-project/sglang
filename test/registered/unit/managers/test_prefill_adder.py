@@ -58,11 +58,13 @@ class TestPrefillAdder(CustomTestCase):
         full_available_size: int = 0,
         swa_available_size: int = 0,
         available_size: int = 0,
+        size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
+        allocator.size_swa = size_swa
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
@@ -91,6 +93,8 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.host_hit_length = 0
+        req.storage_hit_length = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req

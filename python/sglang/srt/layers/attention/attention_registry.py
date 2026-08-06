@@ -398,23 +398,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
                     allowed = {"triton", "trtllm_mha", "fa4"}
-                attn_be = runner.server_args.attention_backend
-                prefill_be = runner.server_args.prefill_attention_backend
-                decode_be = runner.server_args.decode_attention_backend
-                # When using split prefill/decode backends, check each individually
-                if prefill_be and decode_be:
-                    assert prefill_be in allowed and decode_be in allowed, (
-                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
-                        f"Got prefill={prefill_be}, decode={decode_be}."
-                    )
-                else:
-                    assert attn_be in allowed, (
-                        f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
-                        f"Got attention_backend={attn_be}."
-                    )
+                prefill_be = runner.prefill_attention_backend_str
+                decode_be = runner.decode_attention_backend_str
+                assert prefill_be in allowed and decode_be in allowed, (
+                    f"Only {allowed} backends are supported on Blackwell GPUs for hybrid GDN models. "
+                    f"Got prefill={prefill_be}, decode={decode_be}."
+                )
             elif is_npu():
                 assert (
-                    runner.server_args.attention_backend == "ascend"
+                    runner.prefill_attention_backend_str == "ascend"
+                    and runner.decode_attention_backend_str == "ascend"
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)

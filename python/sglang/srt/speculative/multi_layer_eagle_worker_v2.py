@@ -159,6 +159,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
+                # The draft runs at absolute target positions.
+                context_length=target_worker.model_runner.model_config.context_len,
             )
 
         # Alias for better readability

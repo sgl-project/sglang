@@ -138,6 +138,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                # The draft runs at absolute target positions.
+                context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()

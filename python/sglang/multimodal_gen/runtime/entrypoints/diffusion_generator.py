@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
+    globally_suppress_loggers,
     init_logger,
     log_batch_completion,
     log_generation_timer,
@@ -125,12 +126,13 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
+        globally_suppress_loggers()
         instance = cls(
             server_args=server_args,
         )
         init_diffusion_tracing(server_args, "DiffGenerator")
 
-        logger.info(f"Local mode: {local_mode}")
+        logger.info("Local mode: %s", local_mode)
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
             instance.owns_scheduler_client = True
@@ -470,7 +472,7 @@ class DiffGenerator:
     def _log_summary(self, results: list[GenerationResult]) -> None:
         if not results:
             return
-        if self.server_args.warmup:
+        if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
             logger.info(
                 f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",

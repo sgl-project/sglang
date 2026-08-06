@@ -208,12 +208,47 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
 def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
     """Write fields on behalf of the pipeline (bypasses the strict bare-
     assignment guard that protects post-resolution mutation)."""
-    object.__setattr__(server_args, "_in_override", True)
+    object.__setattr__(server_args, "_internal_write", True)
     try:
         for field, value in fields.items():
             setattr(server_args, field, value)
     finally:
-        object.__setattr__(server_args, "_in_override", False)
+        object.__setattr__(server_args, "_internal_write", False)
+
+
+def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
+    """Resolve fields on a config that is **not published yet**.
+
+    A few resolution rules cannot run inside ``__post_init__``: LoRA
+    normalization and the auto-parser detection need the launcher's validation
+    stage (and, for the parsers, a tokenizer / chat-template load). They still
+    belong to the resolution pipeline — they decide what the process will run
+    with — so they write the fields in place, before anything publishes the
+    object. Writing in place is the point: every holder of that instance (the
+    HTTP server, the multi-tokenizer workers it serializes for, the schedulers
+    it forks) must see the resolved value.
+
+    Refuses to touch the published instance: after publish the bags exist and a
+    field write would desync them, which is what ``get_context().override`` is
+    for.
+    """
+    from sglang.srt.runtime_context import get_context
+
+    try:
+        published = get_context().server_args
+    except ValueError:
+        published = None
+    if published is server_args:
+        raise ValueError(
+            f"declare_late_resolution({source!r}) called on the published config; "
+            "post-publish changes go to the bags via get_context().override(...)"
+        )
+    log = getattr(server_args, "_runtime_mutations", None)
+    if log is None:
+        log = []
+        object.__setattr__(server_args, "_runtime_mutations", log)
+    log.append((source, dict(fields)))
+    _apply_fields(server_args, fields)
 
 
 def materialize_declarations(server_args: Any) -> None:
@@ -1725,6 +1760,9 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
         if (
             view.moe_a2a_backend == "none"
             and view.moe_runner_backend == "auto"
+            # LongCat top-k spans the zero-expert logits, which trtllm-gen's
+            # fused routing cannot see.
+            and not model_arch.startswith("LongcatFlash")
             and (
                 quantization
                 in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]

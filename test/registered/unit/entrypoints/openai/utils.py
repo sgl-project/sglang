@@ -52,6 +52,7 @@ class MockTokenizerManager:
             tool_call_parser=None,
             incremental_streaming_output=False,
         )
+        self._config_updates = []
         self.tokenizer = Mock()
         self.tokenizer.encode.return_value = [1, 2, 3]
         self.tokenizer.chat_template = None
@@ -59,6 +60,13 @@ class MockTokenizerManager:
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()
+
+    def config_value(self, name: str):
+        """The manager's overlay accessor: no control-plane update recorded."""
+        for _source, fields in reversed(self._config_updates):
+            if name in fields:
+                return fields[name]
+        return getattr(self.server_args, name)
 
 
 class MockTemplateManager:

@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=7200, suite="nightly-perf-vlm-2-gpu", nightly=True)
 
-PROFILE_DIR = "performance_profiles_vlms"
+RESULT_DIR = "performance_results_vlms"
 
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
@@ -52,8 +52,8 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
 
     def test_bench_one_batch(self):
         all_model_succeed = True
