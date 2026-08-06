@@ -47,26 +47,6 @@ class ParallelExecutor(PipelineExecutor):
         cfg_group = get_cfg_group()
         group = get_world_group()
 
-        # When CFG parallel is enabled, consolidate ALL Gloo communication
-        # (broadcasts and barriers) into the CFG group's process groups.
-        #
-        # On 4+ GPUs with DP>1, the WORLD group spans ALL ranks (e.g. [0,1,2,3])
-        # while each CFG group only contains 2 ranks (e.g. [0,1] and [2,3]).
-        # Broadcasting on the WORLD group with `src=0` causes both rank 0 and
-        # rank 2 (both CFG rank 0) to act as senders, producing conflicting
-        # data on the same Gloo collective — a preamble/data size mismatch.
-        #
-        # Using the CFG group ensures each DP replica broadcasts only within
-        # its own 2-rank CFG pair.
-        if server_args.enable_cfg_parallel:
-            barrier_group = cfg_group.device_group
-            cpu_group_for_broadcast = cfg_group.cpu_group
-            broadcast_src_rank = cfg_group.ranks[0]
-        else:
-            barrier_group = group.device_group
-            cpu_group_for_broadcast = group.cpu_group
-            broadcast_src_rank = 0
-
         use_nvtx = self._should_use_stage_nvtx(batch, server_args)
 
         with self._component_residency_request(stages, batch, server_args):
@@ -85,7 +65,7 @@ class ParallelExecutor(PipelineExecutor):
                             run_stage,
                             use_nvtx,
                         )
-                    torch.distributed.barrier(group=barrier_group)
+                    torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.CFG_PARALLEL:
                     local_batch = batch
@@ -129,7 +109,7 @@ class ParallelExecutor(PipelineExecutor):
                         use_nvtx,
                     )
 
-                    torch.distributed.barrier(group=barrier_group)
+                    torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.REPLICATED:
                     batch = self._run_stage_with_executor_hooks(
@@ -157,16 +137,9 @@ class ParallelExecutor(PipelineExecutor):
                         except Exception as e:
                             obj_list = [False, e]
 
-                    # Send batch to other ranks.
-                    # Use the CFG group (not WORLD) so each DP replica broadcasts
-                    # only within its own CFG pair. With 4+ GPUs, using the WORLD
-                    # group causes rank 0 and rank 2 (both CFG rank 0) to conflict
-                    # as simultaneous senders on the same Gloo collective.
+                    # Send batch to other ranks
                     broadcasted_list = broadcast_pyobj(
-                        obj_list,
-                        rank=get_world_rank(),
-                        dist_group=cpu_group_for_broadcast,
-                        src=broadcast_src_rank,
+                        obj_list, rank=rank, dist_group=group.cpu_group, src=0
                     )
                     if rank != 0:
                         success, batch = broadcasted_list[0], broadcasted_list[1]
@@ -176,7 +149,7 @@ class ParallelExecutor(PipelineExecutor):
                     if not success:
                         raise RuntimeError(f"Error on rank 0") from batch
 
-                    torch.distributed.barrier(group=barrier_group)
+                    torch.distributed.barrier()
         return batch
 
     def execute(
@@ -204,4 +177,3 @@ class ParallelExecutor(PipelineExecutor):
             server_args,
             lambda stage, current: stage.run_grouped_requests(current, server_args),
         )
-
