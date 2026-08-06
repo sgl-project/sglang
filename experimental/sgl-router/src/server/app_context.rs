@@ -32,8 +32,8 @@ pub struct AppContext {
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
     /// Per-session prefill/decode/acting timing stats (router-side idleness
-    /// signal). The chat handler stamps turn start / first token / turn end;
-    /// an optional JSONL debug dump is driven by env config. See
+    /// signal). The chat handler stamps turn start / first token / turn end.
+    /// Disabled by default; opt in with `SGL_ROUTER_SESSION_STATS_DUMP`. See
     /// [`crate::session_stats`].
     pub session_stats: Arc<SessionStats>,
     ready: AtomicBool,
@@ -80,9 +80,9 @@ impl AppContext {
         // after the policy registry, so inject it now. No-op for policies
         // that don't emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
-        // Per-session idleness collector. Config (window K, TTL, optional JSONL
-        // dump path) comes from the environment so nothing has to be threaded
-        // through the CLI. The dump writer task, if enabled, is spawned here.
+        // Per-session idleness collector. Enabled by a single env var,
+        // `SGL_ROUTER_SESSION_STATS_DUMP` (the session_timestamp.json path) —
+        // nothing to thread through the CLI. Disabled → all hooks are no-ops.
         let session_stats = SessionStats::from_env();
         Self {
             config,
