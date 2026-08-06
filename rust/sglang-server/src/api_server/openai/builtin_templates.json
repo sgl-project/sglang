@@ -1,0 +1,539 @@
+[
+  {
+    "names": [
+      "llama-2"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "[INST] <<SYS>>\n{system_message}\n<</SYS>>\n\n",
+      "system_message": "",
+      "roles": [
+        "[INST]",
+        "[/INST]"
+      ],
+      "style": "LLAMA2",
+      "sep": " ",
+      "sep2": " </s><s>",
+      "stop_str": [
+        "[INST]",
+        "[/INST]",
+        "<<SYS>>",
+        "<</SYS>>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "mistral",
+      "devstral"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+      "system_message": "",
+      "roles": [
+        "[INST]",
+        "[/INST]"
+      ],
+      "style": "LLAMA2",
+      "sep": " ",
+      "sep2": " </s><s>",
+      "stop_str": [
+        "[INST]",
+        "[/INST]",
+        "[SYSTEM_PROMPT]",
+        "[/SYSTEM_PROMPT]"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "llama-4"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|header_start|>system<|header_end|>\n\n{system_message}<|eot|>",
+      "system_message": "",
+      "roles": [
+        "user",
+        "assistant"
+      ],
+      "style": "LLAMA4",
+      "sep": "",
+      "sep2": null,
+      "stop_str": [
+        "<|end_of_text|>",
+        "<|eot|>",
+        "<|eom|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "phi-4-mm"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "{system_message}",
+      "system_message": "",
+      "roles": [
+        "<|user|>",
+        "<|assistant|>"
+      ],
+      "style": "NO_COLON_SINGLE",
+      "sep": "<|end|>",
+      "sep2": null,
+      "stop_str": "<|end|>",
+      "image_token": "<|endoftext10|>",
+      "audio_token": "<|endoftext11|>"
+    }
+  },
+  {
+    "names": [
+      "chatml",
+      "chatml-llava"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "You are a helpful assistant.",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "CHATML",
+      "sep": "<|im_end|>",
+      "sep2": null,
+      "stop_str": [
+        "<|endoftext|>",
+        "<|im_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "vicuna_v1.1"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "{system_message}",
+      "system_message": "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.",
+      "roles": [
+        "USER",
+        "ASSISTANT"
+      ],
+      "style": "ADD_COLON_TWO",
+      "sep": " ",
+      "sep2": "</s>",
+      "stop_str": null,
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "llama_3_vision",
+      "llava_llama_3"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+      "system_message": "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+      "roles": [
+        "user",
+        "assistant"
+      ],
+      "style": "LLAMA3",
+      "sep": "",
+      "sep2": null,
+      "stop_str": [
+        "<|end_of_text|>",
+        "<|eot_id|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "internlm2-chat"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "ADD_COLON_SINGLE",
+      "sep": "\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>",
+        "<|action_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "internvl-2-5"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+      "roles": [
+        "<|im_start|>user\n",
+        "<|im_start|>assistant\n"
+      ],
+      "style": "MPT",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>",
+        "<|action_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "qwen2-vl"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "You are a helpful assistant.",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "ADD_NEW_LINE_SINGLE",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "deepseek-ocr"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "",
+      "system_message": "",
+      "roles": [
+        "",
+        ""
+      ],
+      "style": "NO_COLON_SINGLE",
+      "sep": "",
+      "sep2": null,
+      "stop_str": [
+        "<｜end▁of▁sentence｜>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "unlimited-ocr"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "{system_message}",
+      "system_message": "",
+      "roles": [
+        "",
+        ""
+      ],
+      "style": "UNLIMITED_OCR",
+      "sep": "",
+      "sep2": "",
+      "stop_str": null,
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "paddle-ocr"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|begin_of_sentence|>{system_message}",
+      "system_message": "",
+      "roles": [
+        "User",
+        "Assistant"
+      ],
+      "style": "PADDLE_OCR",
+      "sep": "<|end_of_sentence|>",
+      "sep2": null,
+      "stop_str": [
+        "<|end_of_sentence|>"
+      ],
+      "image_token": "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "deepseek-vl2"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "{system_message}",
+      "system_message": "",
+      "roles": [
+        "<|User|>",
+        "<|Assistant|>"
+      ],
+      "style": "DeepSeekVL2",
+      "sep": "\n\n",
+      "sep2": "<｜end▁of▁sentence｜>",
+      "stop_str": [
+        "User:",
+        "<｜end▁of▁sentence｜>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "gemma-it"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<start_of_turn>user\n{system_message}\n\n",
+      "system_message": "You are a helpful assistant.",
+      "roles": [
+        "<start_of_turn>user\n",
+        "<start_of_turn>model\n"
+      ],
+      "style": "GEMMA3",
+      "sep": "<end_of_turn>\n",
+      "sep2": null,
+      "stop_str": [
+        "<end_of_turn>"
+      ],
+      "image_token": "<start_of_image>",
+      "audio_token": "<start_of_audio>"
+    }
+  },
+  {
+    "names": [
+      "gme-qwen2-vl"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "You are a helpful assistant.",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "QWEN2_VL_EMBED",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": "<|endoftext|>",
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "minicpmv"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}.",
+      "system_message": "You are a helpful assistant",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "ADD_NEW_LINE_SINGLE",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>",
+        "<|endoftext|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "janus-pro"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "{system_message}.",
+      "system_message": "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language",
+      "roles": [
+        "User",
+        "Assistant"
+      ],
+      "style": "ADD_COLON_TWO",
+      "sep": "\n\n",
+      "sep2": "<｜end▁of▁sentence｜>",
+      "stop_str": [
+        "<|User|>",
+        "<｜end▁of▁sentence｜>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "minicpmo"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "ADD_NEW_LINE_SINGLE",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>",
+        "<|endoftext|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "kimi-vl"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_system|>system<|im_middle|>{system_message}",
+      "system_message": "You are a helpful assistant",
+      "roles": [
+        "<|im_user|>user<|im_middle|>",
+        "<|im_assistant|>assistant<|im_middle|>"
+      ],
+      "style": "NO_COLON_SINGLE",
+      "sep": "<|im_end|>",
+      "sep2": null,
+      "stop_str": "<|im_end|>",
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "qwen2-audio"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "You are a helpful assistant.",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "QWEN2_AUDIO",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "Audio {idx}: <|audio_bos|><|AUDIO|><|audio_eos|>\n"
+    }
+  },
+  {
+    "names": [
+      "moss-vl"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "<|im_start|>system\n{system_message}",
+      "system_message": "",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "ADD_NEW_LINE_SINGLE",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "points-v15-chat"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "",
+      "system_message": "",
+      "roles": [
+        "<|im_start|>user",
+        "<|im_start|>assistant"
+      ],
+      "style": "ADD_NEW_LINE_SINGLE",
+      "sep": "<|im_end|>\n",
+      "sep2": null,
+      "stop_str": [
+        "<|im_end|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": "<audio>"
+    }
+  },
+  {
+    "names": [
+      "whisper"
+    ],
+    "spec": {
+      "name": "",
+      "system_template": "",
+      "system_message": "",
+      "roles": [
+        "",
+        ""
+      ],
+      "style": "NO_COLON_SINGLE",
+      "sep": "",
+      "sep2": null,
+      "stop_str": [
+        "<|endoftext|>"
+      ],
+      "image_token": "<image>",
+      "audio_token": ""
+    }
+  }
+]

@@ -822,10 +822,11 @@ mod tests {
     /// the request's own stops.
     #[test]
     fn template_stops_merge_before_request_stops() {
-        let chatml = super::super::template::builtin_template("chatml").unwrap();
-        let formatter = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter { spec: chatml },
-        ));
+        // Resolve chatml through the template module's real entry point (the
+        // same one `load_chat_support` uses) instead of reaching into the
+        // private builtin registry.
+        let formatter = super::super::template::load_chat_formatter(None, None, Some("chatml"))
+            .expect("chatml is a builtin template");
         assert_eq!(
             formatter.stop_strs(),
             Some(crate::message::OneOrMany::Many(vec![
@@ -881,14 +882,12 @@ mod tests {
     fn huggingface_formatter_leaves_request_stops_alone() {
         let mut req = request();
         req.stop = Some(Stop::String("x".into()));
-        // A prompt formatter is not constructible here without a tokenizer; the
-        // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
-        let legacy = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter {
-                spec: super::super::template::LegacySpec::default(),
-            },
-        ));
+        // A prompt formatter is not constructible here without a tokenizer;
+        // vicuna_v1.1 — a builtin with no template stops — is the twin that
+        // proves the merge is formatter-gated, and the `HuggingFace` arm
+        // returns `None` by construction (see `stop_strs`).
+        let legacy = super::super::template::load_chat_formatter(None, None, Some("vicuna_v1.1"))
+            .expect("vicuna_v1.1 is a builtin template");
         assert!(legacy.stop_strs().is_none());
         merge_template_stops(&mut req, &legacy);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
