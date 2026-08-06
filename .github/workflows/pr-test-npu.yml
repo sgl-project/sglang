@@ -626,8 +626,6 @@ jobs:
         base-c-test-perf-4-npu-a3,
         base-c-test-perf-8-npu-a3,
         base-c-test-perf-16-npu-a3,
-
-        pr-single-node-tests,
       ]
     if: always()
     runs-on: ubuntu-latest
