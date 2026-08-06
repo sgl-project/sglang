@@ -234,14 +234,8 @@ class DSparkAttention(MqaAttentionBase):
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
         if self.n_local_heads < _PAD_NUM_HEADS:
-            q_padded = (
-                hidden_states.new_zeros(
-                    hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
-                )
-                if _is_npu
-                else hidden_states.new_empty(
-                    hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
-                )
+            q_padded = hidden_states.new_empty(
+                hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
