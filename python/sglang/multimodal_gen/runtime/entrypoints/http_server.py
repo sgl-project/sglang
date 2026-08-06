@@ -38,7 +38,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     run_async_client_warmup,
     should_run_synthetic_server_warmup,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    globally_suppress_loggers,
+    init_logger,
+)
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -374,6 +377,7 @@ def create_app(server_args: ServerArgs):
     """
     Create and configure the FastAPI application instance.
     """
+    globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
