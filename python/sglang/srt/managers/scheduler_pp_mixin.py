@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
+PPTransferStatus = Tuple[List[str], List[str]]
+PPReleasePayload = Union[List[str], PPTransferStatus]
+
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
@@ -57,6 +60,35 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
+    right_set = set(right)
+    return [rid for rid in left if rid in right_set]
+
+
+def _pp_ordered_union(left: List[str], right: List[str]) -> List[str]:
+    seen = set(left)
+    merged = list(left)
+    for rid in right:
+        if rid not in seen:
+            seen.add(rid)
+            merged.append(rid)
+    return merged
+
+
+def _pp_merge_transfer_status(
+    previous: PPTransferStatus,
+    current: PPTransferStatus,
+) -> PPTransferStatus:
+    previous_success, previous_failed = previous
+    current_success, current_failed = current
+    failed = _pp_ordered_union(previous_failed, current_failed)
+    success = _pp_ordered_intersection(previous_success, current_success)
+    if failed:
+        failed_set = set(failed)
+        success = [rid for rid in success if rid not in failed_set]
+    return success, failed
 
 
 @dataclass
@@ -218,8 +250,8 @@ class SchedulerPPMixin:
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
         consensus_bootstrapped_rids: Optional[List[str]] = None
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
+        transferred_rids: PPTransferStatus = ([], [])
+        release_rids: Optional[PPTransferStatus] = None
         send_bootstrapped_work = []
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
@@ -817,18 +849,20 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
+            return [
+                [req.rid for req in good_reqs],
+                _pp_ordered_union(
+                    bad_consensus_bootstrapped_rids,
+                    [req.rid for req in failed_reqs],
+                ),
+            ]
         return None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            good_bootstrapped_rids, bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -836,17 +870,16 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = _pp_ordered_intersection(
+                prev_good_bootstrapped_rids,
+                curr_good_bootstrapped_rids,
             )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            bad_bootstrapped_rids = _pp_ordered_union(
+                prev_bad_bootstrapped_rids,
+                curr_bad_bootstrapped_rids,
             )
         # Route locally-aborted reqs through the bad-union consensus so every PP
         # rank flushes them in the same consensus round, regardless of when the
@@ -862,28 +895,21 @@ class SchedulerPPMixin:
         )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+    def _pp_pd_get_prefill_transferred_ids(
+        self: Scheduler,
+    ) -> PPTransferStatus:
         # get the current stage transfer success
+        current_status = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = current_status
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            previous_status = self._pp_recv_pyobj_from_prev_stage()
+            transferred_rids = _pp_merge_transfer_status(
+                previous=previous_status,
+                current=current_status,
             )
         return transferred_rids
 
@@ -912,10 +938,10 @@ class SchedulerPPMixin:
 
     def _pp_pd_send_consensus_release_ids(
         self: Scheduler,
-        tmbs: List[List[str]],
+        tmbs: List[Optional[PPReleasePayload]],
         next_first_rank_mb_id: int,
-        release_rids: List[str],
-        transferred_rids: List[str],
+        release_rids: Optional[PPReleasePayload],
+        transferred_rids: PPReleasePayload,
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
@@ -1148,13 +1174,30 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        # PP outputs may be on CPU after result processing, while draft state is
+        # filtered with device-resident batch indices.
+        next_token_ids = pp_outputs["next_token_ids"].to(
+            device=batch.device,
+            dtype=torch.int64,
+            non_blocking=True,
+        )
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
+        next_draft_input = None
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1163,6 +1206,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
         return output_result
 
@@ -1291,7 +1335,15 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if cur_batch.spec_algorithm.is_dspark():
+                    self.model_worker.set_pp_proxy_tensors_for_next_forward(
+                        pp_proxy_tensors
+                    )
+                try:
+                    result = self.run_batch(cur_batch, pp_proxy_tensors)
+                finally:
+                    if cur_batch.spec_algorithm.is_dspark():
+                        self.model_worker.set_pp_proxy_tensors_for_next_forward(None)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

@@ -666,6 +666,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer IDs aligned with the compressed KV entry layout."""
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        c4_layer_ids = [
+            self._stage_start + local_layer_id
+            for local_layer_id, ratio in enumerate(stage_ratios)
+            if ratio == 4
+        ]
+        c128_layer_ids = [
+            self._stage_start + local_layer_id
+            for local_layer_id, ratio in enumerate(stage_ratios)
+            if ratio == 128
+        ]
+        # get_contiguous_buf_infos orders entries as C4, C4 indexer, C128.
+        return c4_layer_ids + c4_layer_ids + c128_layer_ids
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []

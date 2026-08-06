@@ -279,6 +279,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
 
+    if server_args.attn_cp_size > 1:
+        raise ValueError(
+            "DSpark does not support context parallel "
+            f"(attn_cp_size={server_args.attn_cp_size})."
+        )
+
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
@@ -286,11 +292,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             raise ValueError(
                 "DSpark with dp attention only supports the built-in TP MoE "
                 f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
-            )
-        if server_args.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={server_args.attn_cp_size})."
             )
         if (
             server_args.speculative_moe_a2a_backend is not None
@@ -302,9 +303,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if server_args.pp_size != 1:
+    if server_args.pp_size != 1 and server_args.disaggregation_mode not in (
+        "prefill",
+        "decode",
+    ):
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "Currently DSpark speculative decoding with pp_size > 1 is only "
+            "supported under PD disaggregation."
         )
 
     if server_args.speculative_draft_model_path is None:

@@ -2454,7 +2454,17 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                if dspark_aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -2543,14 +2553,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0

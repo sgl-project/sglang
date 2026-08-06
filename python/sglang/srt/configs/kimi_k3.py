@@ -1,6 +1,46 @@
+import os
+
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+
+
+def _apply_keep_num_experts_override(text_config: KimiLinearConfig) -> None:
+    raw = os.getenv("SGLANG_KIMI_K3_KEEP_NUM_EXPERTS")
+    if raw is None or raw.strip() in ("", "0"):
+        return
+
+    keep_num_experts = int(raw)
+    if keep_num_experts <= 0:
+        raise ValueError(
+            "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS must be a positive integer, "
+            f"got {keep_num_experts}."
+        )
+
+    original_num_experts = int(text_config.num_experts or 0)
+    if original_num_experts <= 0:
+        # Transformers builds a default config instance during __repr__ /
+        # to_diff_dict(). That default text config is dense (num_experts=None),
+        # so the debug-only expert truncation must not make config logging fail.
+        return
+    if keep_num_experts > original_num_experts:
+        raise ValueError(
+            "SGLANG_KIMI_K3_KEEP_NUM_EXPERTS cannot exceed the checkpoint "
+            f"expert count ({original_num_experts}), got {keep_num_experts}."
+        )
+    if keep_num_experts == original_num_experts:
+        return
+
+    text_config.num_experts = keep_num_experts
+    text_config.n_routed_experts = keep_num_experts
+    if text_config.num_experts_per_token is not None:
+        text_config.num_experts_per_token = min(
+            int(text_config.num_experts_per_token), keep_num_experts
+        )
+    # Debug expert truncation keeps only a prefix of experts. Collapse grouped
+    # top-k to a single group so arbitrary small expert counts remain legal.
+    text_config.num_expert_group = 1
+    text_config.topk_group = 1
 
 
 class KimiK3VisionConfig(PretrainedConfig):
@@ -95,6 +135,8 @@ class KimiK3Config(PretrainedConfig):
             self.text_config = KimiLinearConfig(**text_config)
         else:
             self.text_config = text_config
+
+        _apply_keep_num_experts_override(self.text_config)
 
         if vision_config is None:
             self.vision_config = KimiK3VisionConfig()

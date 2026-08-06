@@ -112,8 +112,9 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # Target verify expands each request into num_tokens_per_req rows.
             pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
