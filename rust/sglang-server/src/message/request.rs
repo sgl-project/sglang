@@ -425,6 +425,9 @@ impl GenerateBody {
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
                 mm: pack_mm(image_data, video_data, audio_data),
+                // OpenAI-completions-only (echo for token-id prompts); the
+                // native `/generate` wire has no such field.
+                return_prompt_text: false,
             },
         )
         .collect();
@@ -553,12 +556,15 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the egress is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
-    /// Internal service call: decode a complete token-id sequence to text. Walks
-    /// the same FSM as every request (validate → register → Queued), but the
-    /// stage that answers it is the detok shard itself, never the scheduler
+    /// Standalone service call: decode a complete token-id sequence to text.
+    /// Walks the same FSM as every request (validate → register → Queued), but
+    /// the stage that answers it is the detok shard itself, never the scheduler
     /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
+    /// (the raw UTF-8 text). Deferred surface for the `/detokenize` parity
+    /// endpoint (Python serves one), exercised by the ingress/shard tests until
+    /// it lands — completions echo rides the generation instead
+    /// (`GenerateRequest::return_prompt_text`).
+    #[allow(dead_code)]
     Detokenize { token_ids: TokenIds },
 }
 
@@ -636,6 +642,8 @@ pub struct GenerateRequest {
     /// serialized onto the scheduler header. Boxed so the common text-only
     /// request doesn't grow every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
+    /// Deliver this request's decoded `input_ids` text as an `EgressItem::Data`.
+    pub return_prompt_text: bool,
 }
 
 /// The opaque multimodal fields of one request (see [`GenerateRequest::mm`]).

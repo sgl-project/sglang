@@ -561,6 +561,27 @@ impl Ingress {
             }
         };
 
+        // Prompt-echo prologue, dispatched BEFORE the ring push on the channel
+        // that carried `Register`: a chunk can only enter that channel after
+        // the scheduler has seen the request at all, so shard FIFO guarantees
+        // the `Data` item precedes every chunk. The decode then runs on the
+        // shard while the GPU prefills.
+        if let RequestKind::Generate(g) = &req.kind
+            && g.return_prompt_text
+            && let Some(prompt_ids) = &g.input_ids
+        {
+            // Lossless: `validate` pinned every id to [0, vocab) at `Received`.
+            let token_ids = prompt_ids.iter().map(|&id| id as u32).collect();
+            let msg = DetokMsg::PromptText {
+                rid: req.rid.clone(),
+                token_ids,
+            };
+            if self.senders.detok_for(&req.rid).send(msg).is_err() {
+                self.fail(&mut req, Error::Internal("detok shard gone".into()), true);
+                return;
+            }
+        }
+
         if !self.ingress.try_push(IngressMsg { header, ids }) {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
@@ -1118,6 +1139,49 @@ mod tests {
         assert!(
             consumer.drain(16).headers.is_empty(),
             "must not reach the scheduler"
+        );
+    }
+
+    /// `return_prompt_text`: the prompt-echo prologue is dispatched to the
+    /// shard BEFORE the ring push — Register, then PromptText with the prompt
+    /// ids, then the request on the ring. That channel order is the whole
+    /// guarantee that the `Data` item precedes every generation chunk (the
+    /// completions drain consumes the first sink item as the echo, so a
+    /// PromptText sent after the push could race a chunk and misdeliver).
+    /// Unflagged requests must dispatch no PromptText at all.
+    #[test]
+    fn prompt_text_dispatches_between_register_and_ring_push() {
+        let (mut ingress, detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress();
+        let mut req = generate_req(61, SamplingParams::default());
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.return_prompt_text = true;
+        }
+        ingress.drive(req);
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "61"),
+        );
+        assert!(
+            matches!(
+                detok_rx.try_recv(),
+                Ok(DetokMsg::PromptText { rid, token_ids })
+                    if rid.as_str() == "61" && token_ids == [1, 2, 3]
+            ),
+            "the echo prologue follows Register, carrying the prompt ids",
+        );
+        assert_eq!(
+            consumer.drain(16).headers.len(),
+            1,
+            "the generation itself still reaches the scheduler"
+        );
+
+        // Default (flag off): no prologue.
+        ingress.drive(generate_req(62, SamplingParams::default()));
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "62"),
+        );
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "unflagged generate must not dispatch PromptText"
         );
     }
 

@@ -85,6 +85,14 @@ pub enum DetokMsg {
     /// delivers the text through the registered sink like a control `Result`
     /// and drops the entry.
     Decode { rid: Rid, token_ids: Vec<u32> },
+    /// A generation's prompt-echo prologue (`GenerateRequest::return_prompt_text`):
+    /// decode the prompt ids and deliver the text as one `Data` item, KEEPING the
+    /// entry — this is the generation's own registration and its chunks follow.
+    /// Sent by tm-ingress after `Register` and BEFORE the ring push, so shard
+    /// FIFO guarantees the `Data` precedes every chunk. A decode failure fails
+    /// the request (`Error` to the sink, entry dropped, scheduler aborted — the
+    /// generation is already running).
+    PromptText { rid: Rid, token_ids: Vec<u32> },
     /// Control result: one already-serialized payload delivered to the sink verbatim.
     Result { rid: Rid, payload: bytes::Bytes },
     /// Terminal per-request failure → an `Error` to the sink (a 400, not a crash).

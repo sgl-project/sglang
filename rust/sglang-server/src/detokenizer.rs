@@ -212,6 +212,9 @@ impl Runnable for DetokenizerWorker {
                 DetokMsg::Decode { rid, token_ids } => {
                     handle_decode(&mut table, &rid, &token_ids, &self.backend)
                 }
+                DetokMsg::PromptText { rid, token_ids } => {
+                    handle_prompt_text(&mut table, &rid, &token_ids, &self.backend, &self.abort)
+                }
                 DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
                 DetokMsg::Fail { rid, message } => {
                     handle_fail(&mut table, &rid, message, &self.abort)
@@ -242,6 +245,47 @@ fn handle_decode(
         };
         let _ = st.sink.try_send(item);
         st.fsm = RequestState::Completed;
+    }
+}
+
+/// A generation's prompt-echo prologue (`GenerateRequest::return_prompt_text`):
+/// deliver the decoded prompt as one `Data` item and KEEP the entry — it is the
+/// generation's own registration and its chunks follow (shard FIFO puts them
+/// after this). Any failure — decode error, or a sink that can't take the item
+/// — fails the whole request like a chunk-delivery failure would: the entry is
+/// dropped and the scheduler aborted, since the generation is already running
+/// and its consumer is gone or doomed.
+fn handle_prompt_text(
+    table: &mut HashMap<Rid, DetokState>,
+    rid: &Rid,
+    token_ids: &[u32],
+    backend: &DetokenizerBackend,
+    abort: &flume::Sender<AbortSource>,
+) {
+    if !table.contains_key(rid) {
+        return; // raced with an abort's Deregister — nothing to answer to
+    }
+    match backend.decode_once(token_ids) {
+        Ok(text) => {
+            let st = table.get_mut(rid).expect("checked above");
+            if st.sink.try_send(EgressItem::Data(text.into())).is_ok() {
+                return; // entry retained: the generation's chunks follow
+            }
+            // Undeliverable (client backpressure/disconnect): same treatment
+            // as a chunk-delivery failure — abort first (`try_send` already
+            // failed, nothing released the handler), then drop the entry.
+            let _ = abort.send(AbortSource::Detok(rid.clone()));
+            table.remove(rid);
+        }
+        Err(e) => {
+            // Abort first: `try_send` can release the handler, which frees the
+            // rid for reuse (same ordering as `handle_fail`).
+            let _ = abort.send(AbortSource::Detok(rid.clone()));
+            if let Some(mut st) = table.remove(rid) {
+                let _ = st.sink.try_send(EgressItem::Error(e));
+                st.fsm = RequestState::Completed;
+            }
+        }
     }
 }
 
@@ -552,6 +596,60 @@ mod tests {
             &DetokenizerBackend::Skip,
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A failed prompt-echo prologue fails the WHOLE generation: `Error` to the
+    /// sink, entry dropped, and — unlike the standalone `Decode` — a scheduler
+    /// abort, because by prologue time the generation is already running (the
+    /// ring push follows the dispatch). Leaving the entry would deliver chunks
+    /// after a terminal `Error`; skipping the abort would keep the GPU
+    /// generating for a request whose response is already dead. (The
+    /// retain-on-success half needs a real tokenizer — pinned by the e2e echo
+    /// test, which only produces generation text if the entry survives the
+    /// prologue.)
+    #[test]
+    fn failed_prompt_text_fails_the_generation_and_aborts() {
+        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let mut table = HashMap::new();
+        table.insert(
+            Rid::from("p1"),
+            DetokState {
+                sink: EgressSink::Local(tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                decoder: None,
+                fsm: RequestState::Queued,
+            },
+        );
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+
+        handle_prompt_text(
+            &mut table,
+            &Rid::from("p1"),
+            &[1],
+            &DetokenizerBackend::Skip, // decode_once always errors in skip mode
+            &abort_tx,
+        );
+
+        assert!(matches!(
+            abort_rx.try_recv(),
+            Ok(AbortSource::Detok(rid)) if rid == Rid::from("p1")
+        ));
+        let Ok(EgressItem::Error(err)) = rx.try_recv() else {
+            panic!("the decode error must reach the sink");
+        };
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(!table.contains_key(&Rid::from("p1")), "entry dropped");
+
+        // Unregistered rid: no-op, no abort.
+        handle_prompt_text(
+            &mut table,
+            &Rid::from("p2"),
+            &[1],
+            &DetokenizerBackend::Skip,
+            &abort_tx,
+        );
+        assert!(abort_rx.try_recv().is_err());
     }
 
     /// Two requests on the SAME shard keep separate entries. This is what a

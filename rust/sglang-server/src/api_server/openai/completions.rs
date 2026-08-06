@@ -21,15 +21,14 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
-use super::super::submit::submit;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
     submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{
-    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
-    SamplingParams, TokenIds,
+    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, SamplingParams,
+    TokenIds,
 };
 use crate::utils::response::error_response;
 
@@ -183,27 +182,24 @@ async fn completions(
     let created = unix_seconds_u32();
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(choice_count);
+    // Choices whose echo arrives as a `Data` prologue on their own sink.
+    let mut pending_echo = Vec::new();
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-        let (text, input_ids, mut prompt_echo) = match prompt {
+        let (text, input_ids, prompt_echo) = match prompt {
             PromptSpec::Text(text) => {
                 let prompt_echo = if echo { text.clone() } else { String::new() };
                 (Some(text), None, prompt_echo)
             }
             PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
         };
+        // A token-id prompt's echo text rides the generation itself: the shard
+        // decodes it while the GPU prefills and delivers it as the sink's
+        // first item (see `GenerateRequest::return_prompt_text`).
+        let echo_from_sink = echo && input_ids.is_some();
         for sample_index in 0..n {
             let index = prompt_index * n + sample_index;
             let rid = Rid::from_client(&format!("{response_id}-{index}"));
-            if echo
-                && sample_index == 0
-                && let Some(token_ids) = &input_ids
-            {
-                prompt_echo = match decode_prompt_echo(&state, token_ids.clone()).await {
-                    Ok(echo) => echo,
-                    Err(response) => return response,
-                };
-            }
             let native = GenerateRequest {
                 rid: rid.clone(),
                 text: text.clone(),
@@ -218,6 +214,7 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
+                return_prompt_text: echo_from_sink,
                 ..Default::default()
             };
             let rx = match submit_generation(&state, native, stream, &mut guard).await {
@@ -231,6 +228,59 @@ async fn completions(
                 echo: prompt_echo.clone(),
                 rx,
             });
+            if echo_from_sink {
+                pending_echo.push(submitted.len() - 1);
+            }
+        }
+    }
+
+    // Resolve the sink-delivered echoes AFTER every submit, so the decodes
+    // overlapped with prefill. `push_to_ring` dispatched each decode before its
+    // ring push, so the `Data` prologue is guaranteed to be the first item on
+    // the receiver — the generic drains below never see one. An early return
+    // here drops `guard`, aborting every in-flight generation.
+    for &slot in &pending_echo {
+        let choice = &mut submitted[slot];
+        match choice.rx.recv().await {
+            Some(EgressItem::Data(payload)) => match String::from_utf8(payload.to_vec()) {
+                Ok(text) => choice.echo = text,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_payload(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "detokenized prompt is not valid UTF-8",
+                        ),
+                        false,
+                    );
+                }
+            },
+            Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    error_payload(StatusCode::BAD_REQUEST, message),
+                    false,
+                );
+            }
+            Some(EgressItem::Error(error)) => {
+                let status = StatusCode::from_u16(error.http_status())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return error_response(
+                    status,
+                    error_payload(status, format!("failed to decode prompt for echo: {error}")),
+                    false,
+                );
+            }
+            _ => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_payload(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to decode prompt for echo: no prologue before generation output",
+                    ),
+                    false,
+                );
+            }
         }
     }
 
@@ -269,57 +319,6 @@ async fn completions(
             request.logprobs.is_some(),
         )
         .await
-    }
-}
-
-/// Decode a token-id prompt back to text for `echo=true`, via a
-/// `RequestKind::Detokenize` request through the regular submit path — the
-/// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
-/// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
-async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    let Ok((_rid, mut rx)) = submit(state, RequestKind::Detokenize { token_ids }, false).await
-    else {
-        // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
-        // error shape rather than forwarding the native-shaped response.
-        return Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_payload(StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
-            false,
-        ));
-    };
-    match rx.recv().await {
-        Some(EgressItem::Data(payload)) => String::from_utf8(payload.to_vec()).map_err(|_| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_payload(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "detokenized prompt is not valid UTF-8",
-                ),
-                false,
-            )
-        }),
-        Some(EgressItem::Error(crate::error::Error::Validation(message))) => Err(error_response(
-            StatusCode::BAD_REQUEST,
-            error_payload(StatusCode::BAD_REQUEST, message),
-            false,
-        )),
-        Some(EgressItem::Error(error)) => {
-            let status = StatusCode::from_u16(error.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            Err(error_response(
-                status,
-                error_payload(status, format!("failed to decode prompt for echo: {error}")),
-                false,
-            ))
-        }
-        Some(_) | None => Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error_payload(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to decode prompt for echo: reply channel closed",
-            ),
-            false,
-        )),
     }
 }
 
