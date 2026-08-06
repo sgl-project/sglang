@@ -60,11 +60,11 @@ jobs:
     container:
       image: ${{ inputs.image }}
     timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(inputs.partitions).max_parallel }}
-      matrix:
-        partition: ${{ fromJson(inputs.partitions).arr }}
+    # strategy:
+    #   fail-fast: false
+    #   max-parallel: ${{ fromJson(inputs.partitions).max_parallel }}
+    #   matrix:
+    #     partition: ${{ fromJson(inputs.partitions).arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -80,7 +80,7 @@ jobs:
         env:
           SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
         with:
-          github-token: ${{ inputs.github-token }}
+          github-token: ${{ inputs.github-token || github.token }}
           script: |
             // Skip when explicitly requested via env var (e.g. release branch cut)
             if (process.env.SKIP_PR_TEST_HEALTH_CHECK === 'true') {
@@ -189,7 +189,7 @@ jobs:
         run: |
           cd test
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
-            --auto-partition-id ${{ matrix.partition }} \
-            --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
+            --auto-partition-id 0 \
+            --auto-partition-size 1 \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
