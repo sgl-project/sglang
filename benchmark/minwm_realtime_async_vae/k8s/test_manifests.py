@@ -430,6 +430,8 @@ def test_coordinator_is_an_independent_durable_cpu_control_plane():
     assert service["spec"]["type"] == "ClusterIP"
     assert "--backend=dynamodb" in command
     assert "--table-name=$(COORDINATOR_TABLE)" in command
+    assert "--denoiser-capacity-limit=4" in command
+    assert "--vae-capacity-limit=16" in command
     assert "nvidia.com/gpu" not in container["resources"]["requests"]
 
 
@@ -767,6 +769,7 @@ def test_coordinator_candidate_window_covers_the_full_gpu_session_pool():
     command = " ".join(_container(coordinator, "coordinator")["args"])
 
     assert "--candidate-limit=64" in command
+    assert "--denoiser-capacity-limit=4" in command
 
 
 def test_trace_uses_otlp_and_cloudwatch_with_five_day_retention():

@@ -73,7 +73,7 @@ spec:
               --worker-ttl-s=15
               --wait-timeout-s=10
               --candidate-limit=64
-              --denoiser-capacity-limit=1
+              --denoiser-capacity-limit=4
               --vae-capacity-limit=16
           env:
             - name: COORDINATOR_TABLE

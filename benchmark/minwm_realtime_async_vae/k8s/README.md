@@ -13,9 +13,11 @@ On-Demand 保存短期用户、Session 和 Worker slot Lease；GPU KV、latent h
 TAEHV context 只保存在绑定 Worker 本地。H100 与 L4 使用独立 Spot NodePool，并可独立
 缩容到 0。L4 不满足延迟门禁时，使用不在 base kustomization 中的 `l40s-vae.yaml`。
 
-当前模型的生产低延迟准入按实测固定为 `1 Session/H100`，8 个 H100 Worker 共 8 个
-Denoiser slot。Worker 内部 `max_sessions=4` 只保留给吞吐实验和回滚，不作为生产准入
-容量。单 L4 VAE 广播 16 个 Context slot，整体链路目前先受 H100 的 8 个 slot 限制。
+当前模型的生产准入上限为 `4 Session/H100`，8 个 H100 Worker 共 32 个
+Denoiser slot。Coordinator 会按 Worker 的有效占用率、队列深度和服务耗时选择 slot，
+使同一批新 Session 尽量平均分布到 8 张 H100。单 L4 VAE 广播 16 个 Context slot；
+如果只部署 1 个 L4 VAE Worker，整体链路会先受 VAE 的 16 个 slot 限制，需要 2 个
+L4 VAE Worker 才能完整释放 32 个 Denoiser slot。
 
 ## 不可变依赖与模型
 
@@ -74,8 +76,9 @@ Coordinator TTL 自动回收 Lease。
 
 ## 验收门禁
 
-- 单用户和 2/4/8 并发 Session 全部完成且错误率为 0；12 并发时 8 个准入、4 个明确
-  返回 `CAPACITY_EXHAUSTED`。
+- 单用户和 2/4/8 并发 Session 全部完成且错误率为 0；当部署 8 个 H100 Denoiser
+  Worker 和 2 个 L4 VAE Worker 时，32 并发应全部准入，超过 32 的请求明确返回
+  `CAPACITY_EXHAUSTED`。
 - 视频 WebSocket 不包含 Trace payload；Trace 仅通过 OTLP 和独立 HTTP Query API。
 - Warm session Display Lag P95 不高于 250ms。
 - 每个 Session 的 latent、Gateway 输出队列和 Trace 查询并发均有硬上限。

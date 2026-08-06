@@ -1008,6 +1008,47 @@ def test_dynamodb_heartbeat_clamps_advertised_denoiser_capacity():
     }
 
 
+def test_dynamodb_heartbeat_allows_four_sessions_per_denoiser_gpu():
+    class TransactionConflictException(Exception):
+        pass
+
+    class FakeExceptions:
+        pass
+
+    FakeExceptions.TransactionConflictException = TransactionConflictException
+
+    class FakeClient:
+        exceptions = FakeExceptions()
+
+        def __init__(self):
+            self.worker_item = None
+            self.slot_updates = []
+
+        def put_item(self, *, Item, **_kwargs):
+            self.worker_item = Item
+
+        def update_item(self, **kwargs):
+            self.slot_updates.append(kwargs)
+
+    client = FakeClient()
+    store = DynamoDBCoordinatorStore(
+        "minwm-realtime-coordinator",
+        ttl_s=60,
+        worker_ttl_s=30,
+        client=client,
+        capacity_limits={"denoiser": 4},
+    )
+
+    store._heartbeat_sync(_heartbeat("denoiser-a", "denoiser", capacity=4))
+
+    assert client.worker_item["capacity"] == {"N": "4"}
+    assert len(client.slot_updates) == 4
+    assert {
+        update["ExpressionAttributeValues"][":slot_index"]["N"]
+        for update in client.slot_updates
+    } == {"0", "1", "2", "3"}
+
+
 def test_dynamodb_heartbeat_persists_epoch_lifecycle_and_worker_load():
     class TransactionConflictException(Exception):
         pass

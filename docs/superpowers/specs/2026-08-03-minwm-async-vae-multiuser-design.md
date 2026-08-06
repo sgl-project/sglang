@@ -923,12 +923,16 @@ Trace 完整性或公开交互 SLO。
 ### 20.1 准入容量
 
 - Denoiser Worker 内部仍允许最多 4 个 Session，用于吞吐模式实验和回滚；生产低延迟
-  Coordinator 只广播并准入 `1 Session/H100`。
-- 8 个 H100 Worker 的当前硬准入上限是 8 个并发生成 Session。12 并发边界测试中 8 个
-  成功，另外 4 个收到明确的 `CAPACITY_EXHAUSTED`，没有进入无界等待。
-- L4 VAE Worker 驻留 16 个 Session Context，但当前整体容量先受 8 个 H100 slot 限制。
-- 低延迟模式选择每卡 1 Session，是因为每卡 4 Session 时单会话约 10 FPS，不能满足
-  16 FPS SLO；每卡 1 Session 后 8 并发最慢会话约 34 FPS。
+  Coordinator 广播并准入 `4 Session/H100`。
+- 8 个 H100 Worker 的 Denoiser 硬准入上限是 32 个并发生成 Session。Coordinator
+  按 Worker 有效占用率、队列深度和服务耗时选择 slot，让 Session 尽量平均分布到
+  每张 H100。整体并发上限还受 VAE Worker 数影响：单个 L4 VAE Worker 默认 16 个
+  slot，若要完全释放 32 个 Denoiser slot，需要部署 2 个 L4 VAE Worker。
+- L4 VAE Worker 默认驻留 16 个 Session Context。部署 1 个 L4 时，整体准入为
+  `min(32 Denoiser slots, 16 VAE slots)=16`；部署 2 个 L4 时，整体准入为 32。
+- 当前配置选择每卡最多 4 Session 是偏吞吐优先的调试/内部验证模式；如后续重新要求
+  严格低延迟 SLO，可以把 `--denoiser-capacity-limit` 回调到 1 或 2，并用压测数据重新
+  确定 P95 action-to-frame 门禁。
 
 ### 20.2 稳态 SLO
 
