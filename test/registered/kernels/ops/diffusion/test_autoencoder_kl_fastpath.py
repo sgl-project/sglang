@@ -1,5 +1,7 @@
 """Install-path checks for the generic AutoencoderKL CUDA fast path."""
 
+import sys
+
 import pytest
 import torch
 
@@ -48,3 +50,7 @@ def test_autoencoder_kl_fastpath_install():
     torch.testing.assert_close(opt.decode(z).float(), ref.float(), atol=0.1, rtol=0)
     gate.enabled = False
     assert torch.equal(opt.decode(z), ref)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
