@@ -24,6 +24,7 @@ class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
 
     min_input_samples: int
     window_samples: int
+    window_frames: int
     window_tokens: int
     feature_output_key: str = "input_features"
     attention_mask_output_key: str = "attention_mask"
@@ -72,6 +73,7 @@ def resolve_audio_encoder_window_config(
     return AudioEncoderWindowConfig(
         min_input_samples=int(feature_extractor.n_fft),
         window_samples=spec.window_frames * int(feature_extractor.hop_length),
+        window_frames=spec.window_frames,
         window_tokens=int(output_length_fn([spec.window_frames])[0]),
         feature_output_key=spec.feature_output_key,
         attention_mask_output_key=spec.attention_mask_output_key,
@@ -128,14 +130,22 @@ def _extract_audio_window_features(
     if any(count <= 0 for count in token_counts):
         raise ValueError("audio window produced no encoder tokens")
 
-    window_features = [
-        _AudioWindowFeatures(
-            feature=processed_features[row : row + 1].clone(),
-            attention_mask=processed_masks[row : row + 1].clone(),
-            token_count=token_counts[row],
+    window_features = []
+    for row in range(len(windows)):
+        # A longer mutable tail may increase batch padding. Trim complete
+        # windows back to their declared geometry so their hash stays stable.
+        feature_frames = (
+            config.window_frames
+            if row < complete_count
+            else processed_features.shape[-1]
         )
-        for row in range(len(windows))
-    ]
+        window_features.append(
+            _AudioWindowFeatures(
+                feature=processed_features[row : row + 1, :, :feature_frames].clone(),
+                attention_mask=processed_masks[row : row + 1, :feature_frames].clone(),
+                token_count=token_counts[row],
+            )
+        )
     return window_features, complete_count
 
 
@@ -193,6 +203,12 @@ def _build_audio_window_items(
                 offsets=[(offset_start, offset_end)],
                 feature=window.feature,
                 use_embedding_cache=use_embedding_cache,
+                encoder_batch_key=(
+                    tuple(window.feature.shape[1:]),
+                    str(window.feature.dtype),
+                    tuple(window.attention_mask.shape[1:]),
+                    str(window.attention_mask.dtype),
+                ),
                 model_specific_data={
                     config.item_attention_mask_key: window.attention_mask,
                 },

@@ -13,6 +13,9 @@ import numpy as np
 from sglang.srt.entrypoints.openai.realtime.asr_processor import (
     RealtimeASRProcessor,
 )
+from sglang.srt.entrypoints.openai.realtime.decoder_suffix import (
+    DecoderSuffixState,
+)
 from sglang.srt.entrypoints.openai.realtime.protocol import SessionUpdateEvent
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.streaming_asr import (
@@ -28,7 +31,10 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _AUDIO = np.zeros(1600, dtype=np.float32)
 _ENCODER_WINDOW_GEOMETRY = AudioEncoderWindowConfig(
-    min_input_samples=4, window_samples=16, window_tokens=8
+    min_input_samples=4,
+    window_samples=16,
+    window_frames=8,
+    window_tokens=8,
 )
 _ENCODER_WINDOW_POLICY = {
     "decoder_prefix_max_tokens": 3,
@@ -191,7 +197,7 @@ def _realtime_connection(transcripts, finish_reasons, *, encoder_windows=True):
 
 class TestStreamingASR(CustomTestCase):
     def test_cumulative_prompt_and_word_reconciliation(self):
-        state = _state(emitted_text="hello", decode_count=5)
+        state = _state(emitted_text="hello", chunk_index=5)
         tokenizer_manager, _ = _chunk(state, "hello world foo")
         self.assertEqual(tokenizer_manager.requests[0].text, "PROMPT:hello")
 
@@ -200,28 +206,7 @@ class TestStreamingASR(CustomTestCase):
             unfixed_token_num=1,
             confirmed_text="hello world",
         )
-        self.assertEqual(_chunk(state, "hello worldly test tail")[1], "worldly test")
-
-        state = _state(confirmed_text="hello world", emitted_text="hello world")
-        self.assertEqual(_chunk(state, "Hello world again", is_last=True)[1], "again")
-
-    def test_cumulative_cjk_reconciliation(self):
-        state = _state(unfixed_token_num=1)
-        self.assertEqual(_chunk(state, "你好世界")[1], "你好世")
-        _chunk(state, "你好世界好")
-        self.assertEqual(state.emitted_text, "你好世界")
-
-        repeated = "你好世界" * 10
-        self.assertEqual(
-            state.reconcile_cumulative_transcript(repeated, is_last=False), ""
-        )
-        state.latest_text = repeated
-        state.flush_cumulative_transcript()
-        self.assertEqual(state.emitted_text, repeated)
-
-        state = _state(emitted_text="你好，世界。你好")
-        state.latest_text = "你好。世界。你好世界"
-        self.assertEqual(state.flush_cumulative_transcript(), "世界")
+        self.assertEqual(_chunk(state, "hello world test tail")[1], "test")
 
     def test_encoder_window_path_emits_only_the_agreed_suffix(self):
         tokenizer_manager, processor, state = _encoder_window_processor(
@@ -239,7 +224,7 @@ class TestStreamingASR(CustomTestCase):
         )
         self.assertEqual(tokenizer_manager.requests[0].text, "PROMPT:one two three")
         self.assertEqual(
-            tokenizer_manager.requests[0].sampling_params["max_new_tokens"], 32
+            tokenizer_manager.requests[0].sampling_params["max_new_tokens"], 256
         )
         state.audio.append_pcm(b"\x03\x00\x04\x00")
         self.assertEqual(
@@ -257,25 +242,25 @@ class TestStreamingASR(CustomTestCase):
             "five six seven",
         )
         self.assertEqual(
-            state.transcript.emitted_text, "one two three four five six seven"
+            state.decoder_suffix.emitted_text,
+            "one two three four five six seven",
         )
         self.assertEqual(
             tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
         )
 
-        echo_state = _state(chunk_size_sec=2.0)
         emitted_words = [f"w{i}" for i in range(50)]
-        echo_state.emitted_text = " ".join(emitted_words)
+        echo_state = DecoderSuffixState(emitted_text=" ".join(emitted_words))
         decoder_prefix = " ".join(emitted_words[-35:])
         self.assertEqual(
-            echo_state.trim_decoder_prefix_echo(decoder_prefix, decoder_prefix), ""
+            echo_state.trim_prefix_echo(decoder_prefix, decoder_prefix), ""
         )
         self.assertEqual(
-            echo_state.trim_decoder_prefix_echo("yeah yeah", "yeah yeah"),
+            echo_state.trim_prefix_echo("yeah yeah", "yeah yeah"),
             "yeah yeah",
         )
         self.assertEqual(
-            echo_state.trim_decoder_prefix_echo(
+            echo_state.trim_prefix_echo(
                 "one two three four five",
                 "one two three four",
                 trim_short_prefix=True,
@@ -289,9 +274,7 @@ class TestStreamingASR(CustomTestCase):
         )
         state.audio.append_pcm(bytes(120))
         _run(processor.process(state, is_last=False, sampling_params={}))
-        self.assertIsNone(
-            tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"]
-        )
+        self.assertIsNone(tokenizer_manager.processor_kwargs[0])
 
         tokenizer_manager, processor, state = _encoder_window_processor(
             "four five", min_audio_sec=60.0
@@ -331,7 +314,7 @@ class TestStreamingASR(CustomTestCase):
 
         delta = _run(processor.process(state, is_last=False, sampling_params={}))
 
-        self.assertEqual(delta, "你好世")
+        self.assertEqual(delta, "")
         self.assertTrue(state.encoder_window_disabled)
         self.assertFalse(state.encoder_window_active)
         self.assertEqual(len(tokenizer_manager.requests), 2)
@@ -339,9 +322,7 @@ class TestStreamingASR(CustomTestCase):
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
             _ENCODER_WINDOW_GEOMETRY,
         )
-        self.assertIsNone(
-            tokenizer_manager.processor_kwargs[1]["audio_encoder_window_config"]
-        )
+        self.assertIsNone(tokenizer_manager.processor_kwargs[1])
 
         thai = "ฉันมีความฝันว่าวันหนึ่งประเทศนี้จะลุกขึ้น"
         tokenizer_manager, processor, state = _encoder_window_processor([thai, thai])
@@ -353,103 +334,19 @@ class TestStreamingASR(CustomTestCase):
         self.assertFalse(state.encoder_window_active)
         self.assertEqual(len(tokenizer_manager.requests), 2)
 
-    def test_length_limited_decode_replays_with_full_budget(self):
-        tokenizer_manager, connection = _realtime_connection(
-            ["three four", "three four five"],
-            ["length", "stop"],
-        )
+    def test_length_limited_decode_fails_closed(self):
+        for encoder_windows in (True, False):
+            _, connection = _realtime_connection(
+                "three four",
+                ["length"],
+                encoder_windows=encoder_windows,
+            )
+            with self.assertLogs(level="ERROR"):
+                self.assertFalse(_run(connection._run_inference(is_last=False)))
+            connection.websocket.close.assert_awaited_with(code=1011)
 
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        self.assertFalse(connection.asr_state.has_new_audio)
+        _, connection = _realtime_connection("three four", ["length"])
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-
-        self.assertEqual(len(tokenizer_manager.requests), 2)
-        self.assertEqual(
-            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
-        )
-
-        tokenizer_manager, connection = _realtime_connection("three four", ["stop"])
-
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-
-        self.assertEqual(len(tokenizer_manager.requests), 1)
-
-        tokenizer_manager, connection = _realtime_connection(
-            ["one two three", "", "three four five", "four five six"],
-            ["length", "stop", "stop", "stop"],
-        )
-        connection.asr_state.audio.append_pcm(bytes(96))
-
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        self.assertTrue(connection.asr_state.final_replay_required)
-        connection.asr_state.audio.append_pcm(bytes(4))
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        self.assertTrue(connection.asr_state.final_replay_required)
-        self.assertEqual(connection.asr_state.audio.base_offset_bytes, 0)
-        self.assertEqual(
-            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
-        )
-
-        connection.asr_state.audio.append_pcm(bytes(4))
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        self.assertFalse(connection.asr_state.final_replay_required)
-        self.assertEqual(connection.asr_state.audio.base_offset_bytes, 32)
-        self.assertEqual(
-            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
-        )
-
-        connection.asr_state.audio.append_pcm(bytes(4))
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        self.assertEqual(tokenizer_manager.requests[-1].audio_data.size, 40)
-        self.assertEqual(
-            tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 36
-        )
-
-        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-        self.assertEqual(len(tokenizer_manager.requests), 4)
-
-        tokenizer_manager, connection = _realtime_connection(
-            ["three four", "three four five"],
-            ["length", "length"],
-        )
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-        self.assertEqual(len(tokenizer_manager.requests), 2)
-        sent_event_types = [
-            call.args[0].type for call in connection._send.call_args_list
-        ]
-        self.assertIn(
-            "conversation.item.input_audio_transcription.failed", sent_event_types
-        )
-        self.assertNotIn(
-            "conversation.item.input_audio_transcription.completed", sent_event_types
-        )
-
-        tokenizer_manager, connection = _realtime_connection(
-            ["hello world", "hello world tail"],
-            ["length", "stop"],
-            encoder_windows=False,
-        )
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        self.assertTrue(connection.asr_state.final_replay_required)
-        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-        self.assertEqual(len(tokenizer_manager.requests), 2)
-        sent_event_types = [
-            call.args[0].type for call in connection._send.call_args_list
-        ]
-        self.assertIn(
-            "conversation.item.input_audio_transcription.completed", sent_event_types
-        )
-
-        tokenizer_manager, connection = _realtime_connection(
-            ["hello world", "hello world tail"],
-            ["length", "length"],
-            encoder_windows=False,
-        )
-        self.assertTrue(_run(connection._run_inference(is_last=False)))
-        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
-        self.assertEqual(len(tokenizer_manager.requests), 2)
         sent_event_types = [
             call.args[0].type for call in connection._send.call_args_list
         ]
@@ -469,9 +366,7 @@ class TestStreamingASR(CustomTestCase):
         _run(processor.process(state, is_last=False, sampling_params={}))
 
         self.assertEqual(tokenizer_manager.requests[0].text, "PROMPT:")
-        self.assertIsNone(
-            tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"]
-        )
+        self.assertIsNone(tokenizer_manager.processor_kwargs[0])
 
         tokenizer_manager = _MockTokenizerManager(
             "hello world", supports_encoder_windows=True
@@ -484,9 +379,7 @@ class TestStreamingASR(CustomTestCase):
         state = processor.create_state()
         state.audio.append_pcm(b"\x01\x00\x02\x00")
         _run(processor.process(state, is_last=False, sampling_params={}))
-        self.assertIsNone(
-            tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"]
-        )
+        self.assertIsNone(tokenizer_manager.processor_kwargs[0])
 
         tokenizer_manager = _MockTokenizerManager(
             "hello world", supports_encoder_windows=True
@@ -502,9 +395,7 @@ class TestStreamingASR(CustomTestCase):
         state = processor.create_state()
         state.audio.append_pcm(b"\x01\x00\x02\x00")
         _run(processor.process(state, is_last=False, sampling_params={}))
-        self.assertIsNone(
-            tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"]
-        )
+        self.assertIsNone(tokenizer_manager.processor_kwargs[0])
 
     def test_session_update_preserves_omitted_nested_fields(self):
         connection = RealtimeConnection(
@@ -564,15 +455,15 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(connection.asr_state.audio.last_attempted_offset_bytes, 0)
         self.assertEqual(connection.asr_state.audio.last_processed_offset_bytes, 0)
 
-        voiced_pcm = (1000).to_bytes(2, "little", signed=True) * 2
+        pcm = (1000).to_bytes(2, "little", signed=True) * 2
         _, processor, state = _encoder_window_processor(["", ""])
-        state.audio.append_pcm(voiced_pcm)
+        state.audio.append_pcm(pcm)
         self.assertEqual(
             _run(processor.process(state, is_last=False, sampling_params={})), ""
         )
         self.assertEqual(state.audio.last_processed_offset_bytes, 0)
 
-        state.audio.append_pcm(voiced_pcm * 8)
+        state.audio.append_pcm(pcm)
         self.assertEqual(
             _run(processor.process(state, is_last=False, sampling_params={})), ""
         )
@@ -582,8 +473,8 @@ class TestStreamingASR(CustomTestCase):
         self.assertTrue(state.encoder_window_active)
 
         _, processor, state = _encoder_window_processor("")
-        state.audio.append_pcm(voiced_pcm)
-        state.encoder_window_active = True
+        state.audio.append_pcm(pcm)
+        state.decoder_suffix = DecoderSuffixState(emitted_text="")
         self.assertEqual(
             _run(processor.process(state, is_last=True, sampling_params={})), ""
         )

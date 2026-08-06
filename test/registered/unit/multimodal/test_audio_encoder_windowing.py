@@ -97,6 +97,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
 
     def test_placeholder_layout_keeps_the_tail_uncached(self):
         items, input_ids = self._build(36)
+        complete_items, _ = self._build(32)
         tiny_tail_items, _ = self._build(33)
 
         self.assertEqual(
@@ -110,6 +111,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
         self.assertEqual(
             [item.use_embedding_cache for item in tiny_tail_items], [True, False]
         )
+        self.assertEqual(tiny_tail_items[0].hash, complete_items[0].hash)
 
     def test_tail_mask_prevents_complete_window_identity_collision(self):
         processor = SimpleNamespace(

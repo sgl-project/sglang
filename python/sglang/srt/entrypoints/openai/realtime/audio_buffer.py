@@ -11,10 +11,6 @@ import numpy as np
 # Realtime input is validated as PCM16; keep all byte offsets sample-aligned.
 PCM_SAMPLE_WIDTH_BYTES = 2
 
-# Only skip windows that are effectively digital silence. This avoids empty
-# audio-feature requests without treating low-volume speech as silence.
-NEAR_SILENCE_RMS_THRESHOLD = 0.005
-
 
 def resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
     if src_rate == target_rate or not pcm:
@@ -36,15 +32,6 @@ def pcm_to_float_samples(pcm: bytes) -> np.ndarray:
     # /32768.0 matches soundfile.read's default int16 normalization so the
     # samples are bit-equal to the prior PCM->WAV->sf.read path.
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def is_near_silent_pcm(pcm: bytes) -> bool:
-    if not pcm:
-        return True
-    samples = np.frombuffer(pcm, dtype=np.int16)
-    float_samples = samples.astype(np.float32) / 32768.0
-    rms = float(np.sqrt(np.mean(float_samples * float_samples)))
-    return rms < NEAR_SILENCE_RMS_THRESHOLD
 
 
 class AudioBuffer(msgspec.Struct):

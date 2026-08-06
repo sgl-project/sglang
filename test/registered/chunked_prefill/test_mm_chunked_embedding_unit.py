@@ -180,78 +180,69 @@ def test_tensor_cache_entries_own_storage():
         assert emb.untyped_storage().nbytes() == own_bytes
 
 
-def test_cross_request_misses_group_incompatible_trailing_shapes():
+def test_noncacheable_item_is_reencoded():
     mm_schedule.init_mm_embedding_cache(1 << 30)
-    calls = []
-
-    def encoder(items):
-        calls.append([tuple(item.feature.shape) for item in items])
-        torch.cat([item.feature for item in items], dim=0)
-        return torch.cat(
-            [torch.zeros(_num_tokens(item), HIDDEN) for item in items], dim=0
-        )
-
-    requests = []
-    for index, width in enumerate((800, 801)):
-        offset = (0, 3 + index)
-        item = MultimodalDataItem(
+    offsets = [(0, 1), (2, 2)]
+    items = [
+        MultimodalDataItem(
             modality=Modality.AUDIO,
             hash=2000 + index,
-            feature=torch.zeros(1, 128, width),
+            feature=torch.zeros(1),
             offsets=[offset],
-            model_specific_data={"feature_attention_mask": torch.ones(1, width)},
+            use_embedding_cache=index == 0,
         )
-        requests.append(
-            mm_schedule.PerImageRequestInfo(
-                req_idx=index,
-                items=[item],
-                items_offset=[offset],
-                extend_prefix_len=0,
-                extend_seq_len=offset[1] + 1,
-            )
-        )
-
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
-
-    assert len(embeddings) == 2
-    assert calls == [[(1, 128, 800)], [(1, 128, 801)]]
-
-
-def test_cross_request_misses_batch_ragged_leading_shapes():
-    mm_schedule.init_mm_embedding_cache(1 << 30)
-    calls = []
+        for index, offset in enumerate(offsets)
+    ]
+    encoded_item_counts = []
 
     def encoder(items):
-        calls.append([tuple(item.feature.shape) for item in items])
-        torch.cat([item.feature for item in items], dim=0)
-        return torch.cat(
-            [torch.zeros(_num_tokens(item), HIDDEN) for item in items], dim=0
+        encoded_item_counts.append(len(items))
+        return _encoder_tensor(items)
+
+    for _ in range(2):
+        mm_schedule._get_chunked_embedding_by_item(
+            encoder,
+            items,
+            offsets,
+            0,
+            3,
+            _CPU,
         )
 
-    requests = []
-    for index, patch_count in enumerate((5, 7)):
-        offset = (0, 3 + index)
-        item = MultimodalDataItem(
-            modality=Modality.IMAGE,
+    assert encoded_item_counts == [2, 1]
+    assert mm_schedule.embedding_cache.has(items[0].hash)
+    assert not mm_schedule.embedding_cache.has(items[1].hash)
+
+
+def test_encoder_batch_key_separates_incompatible_items():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [
+        MultimodalDataItem(
+            modality=Modality.AUDIO,
             hash=3000 + index,
-            feature=torch.zeros(patch_count, 128),
-            offsets=[offset],
-            model_specific_data={"image_grid_thw": torch.ones(1, 3)},
+            feature=torch.zeros(1, 2, width),
+            offsets=[(index, index)],
+            encoder_batch_key=(width,),
         )
-        requests.append(
-            mm_schedule.PerImageRequestInfo(
-                req_idx=index,
-                items=[item],
-                items_offset=[offset],
-                extend_prefix_len=0,
-                extend_seq_len=offset[1] + 1,
-            )
-        )
+        for index, width in enumerate((3, 4))
+    ]
+    encoder_calls = []
 
-    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+    def encoder(batch):
+        encoder_calls.append([item.encoder_batch_key for item in batch])
+        return _encoder_tensor(batch)
 
-    assert len(embeddings) == 2
-    assert calls == [[(5, 128), (7, 128)]]
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=items,
+        items_offset=[item.offsets[0] for item in items],
+        extend_prefix_len=0,
+        extend_seq_len=2,
+    )
+    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
+
+    assert encoder_calls == [[(3,)], [(4,)]]
+    assert set(embeddings) == {item.hash for item in items}
 
 
 if __name__ == "__main__":

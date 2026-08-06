@@ -331,6 +331,9 @@ class MultimodalDataItem:
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
     # One-use items skip the embedding cache so they cannot evict reusable entries.
     use_embedding_cache: bool = True
+    # Only items with equal keys may share one encoder call; None keeps the
+    # existing default batching behavior.
+    encoder_batch_key: Optional[tuple] = None
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
