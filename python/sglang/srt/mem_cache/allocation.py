@@ -19,9 +19,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
-    MAMBA_STATE_PER_REQ_NO_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
     available_and_evictable_str,
     evict_from_tree_cache,
 )
@@ -267,20 +264,27 @@ def alloc_req_slots(
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
+        mamba_state_needed = sum(
+            req_to_token_pool.mamba_slots_needed_for_req(req) for req in reqs
+        )
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                shortfall = max(0, mamba_state_needed - mamba_available_size)
+                mamba_num = min(shortfall, tree_cache.mamba_evictable_size())
+                full_shortfall = shortfall - mamba_num
+                full_token_cost_fn = getattr(
+                    tree_cache.token_to_kv_pool_allocator,
+                    "mamba_slot_full_token_cost",
+                    None,
+                )
+                full_tokens = (
+                    full_shortfall * full_token_cost_fn()
+                    if full_shortfall and full_token_cost_fn
+                    else 0
+                )
+                tree_cache.evict(
+                    EvictParams(num_tokens=full_tokens, mamba_num=mamba_num)
+                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(

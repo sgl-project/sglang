@@ -530,19 +530,26 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
             )
 
+        # Caching an unfinished request allocates a replacement state before
+        # donating its tracking state to the radix tree. Reserve that transient
+        # handoff peak for running requests; newly admitted requests reserve it
+        # in ``_mamba_gap_budget_for_req``.
+        running_mamba_handoff_slots = 0
+        if self._mamba_slot_cost and self.is_hybrid_ssm_cache:
+            running_mamba_handoff_slots = len(running_batch.reqs)
+            running_mamba_handoff_tokens = (
+                running_mamba_handoff_slots * self._mamba_slot_cost
+            )
+            self.rem_total_token_offset += running_mamba_handoff_tokens
+            self.cur_rem_token_offset += running_mamba_handoff_tokens
+
         # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
         # `full_evictable_size()` — but `alloc_req_slots` can only recover
         # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
         # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
         # that mamba-recoverable budget separately or an over-admit hits the
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
-        self.rem_mamba_slots = None
-        if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
-            if self.is_hybrid_ssm_cache:
-                self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+        self._rem_mamba_slot_offset = running_mamba_handoff_slots
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -589,6 +596,10 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
             )
+            if self._mamba_slot_cost:
+                available_and_evictable += (
+                    self.tree_cache.mamba_evictable_size() * self._mamba_slot_cost
+                )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -603,6 +614,17 @@ class PrefillAdder:
             + self.tree_cache.swa_evictable_size()
             - self.rem_swa_token_offset
         )
+
+    @property
+    def rem_mamba_slots(self):
+        if not self._mamba_slot_cost:
+            return None
+        available_and_evictable = (
+            self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
+        )
+        if self.is_hybrid_ssm_cache:
+            available_and_evictable += self.tree_cache.mamba_evictable_size()
+        return available_and_evictable - self._rem_mamba_slot_offset
 
     @property
     def cur_rem_tokens(self):
@@ -621,6 +643,10 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
             )
+            if self._mamba_slot_cost:
+                available_and_evictable += (
+                    self.tree_cache.mamba_evictable_size() * self._mamba_slot_cost
+                )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -705,19 +731,14 @@ class PrefillAdder:
         return cap // self.page_size * self.page_size
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
+        """Shared-gap reservation for allocations and radix handoff peak."""
+        if not self._mamba_slot_cost:
+            return 0
 
-        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
-        radix COW headroom or locked-but-evictable bytes — that residual is
-        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
-        over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and req.mamba_pool_idx is None:
-            return self._mamba_slot_cost
-        return 0
+        slots = self.tree_cache.req_to_token_pool.mamba_slots_needed_for_req(req)
+        if self.is_hybrid_ssm_cache:
+            slots += 1
+        return self._mamba_slot_cost * slots
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -773,7 +794,7 @@ class PrefillAdder:
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+            self._rem_mamba_slot_offset += mamba_gap_reserve // self._mamba_slot_cost
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:

@@ -1289,6 +1289,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def mamba_slots_needed_for_req(self, req: Req) -> int:
+        """Return the Mamba slots that ``alloc([req])`` will still allocate."""
+        if req.req_pool_idx is not None:
+            return 0
+
+        needed = int(req.mamba_pool_idx is None)
+        if self.enable_mamba_extra_buffer and req.mamba_ping_pong_track_buffer is None:
+            needed += (
+                1
+                if self.enable_mamba_extra_buffer_lazy
+                else self.mamba_ping_pong_track_buffer_size
+            )
+        return needed
+
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
