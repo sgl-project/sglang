@@ -1034,12 +1034,6 @@ class Envs:
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
-    # DSA prefill CP + TBO (HIP only): issue the attention-side CP all-gathers
-    # (kv_score, unified_kv KV) early and collect them right before their
-    # consumer, so the q/kv projections and the indexer/compressor hide them.
-    # Unlike the flag above this actually creates overlap -- there is real
-    # compute between the launch and the wait.
-    SGLANG_OPT_CP_TBO_ATTN_GATHER_PREFETCH = EnvBool(False)
     # ====================================================================
 
     # ====================================================================
