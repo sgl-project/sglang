@@ -1631,6 +1631,24 @@ class ModelRunner:
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+            if (
+                forward_batch.forward_mode.is_decode()
+                and self.decode_cuda_graph_runner is not None
+                and forward_batch.batch_size > self.decode_cuda_graph_runner.max_bs
+                and not getattr(self, "_warned_decode_cuda_graph_overflow", False)
+            ):
+                logger.warning(
+                    "Decode batch size %d exceeds the largest captured CUDA "
+                    "graph shape (%d); falling back to eager decode. Per-token "
+                    "latency may degrade substantially, and sustained overload "
+                    "can keep the running batch above the captured range. "
+                    "Consider raising --cuda-graph-max-bs or lowering "
+                    "--max-running-requests toward the largest captured shape.",
+                    forward_batch.batch_size,
+                    self.decode_cuda_graph_runner.max_bs,
+                )
+                self._warned_decode_cuda_graph_overflow = True
+
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
             # early; split prefill, the prefill cuda graph, and the eager
