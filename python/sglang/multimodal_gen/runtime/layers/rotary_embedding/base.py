@@ -171,15 +171,12 @@ class RotaryEmbedding(CustomOp):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if cos_sin_cache is None and cos is not None and sin is not None:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-        can_use_cuda = cos_sin_cache is not None and not hasattr(self, "cos_sin_cache")
+        can_use_cuda = (
+            (cos_sin_cache is not None or cos is not None and sin is not None)
+            and not hasattr(self, "cos_sin_cache")
+            and query.dim() == 4
+            and key.dim() == 4
+        )
 
         if not can_use_cuda:
             return self.forward_native(
@@ -194,11 +191,13 @@ class RotaryEmbedding(CustomOp):
                 offsets=offsets,
                 **kwargs,
             )
-
-        if query.dim() != 4 or key.dim() != 4:
-            raise ValueError(
-                f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
-                f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
+        if cos_sin_cache is None:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
 
         batch_size, seq_len, _, head_dim = query.shape
