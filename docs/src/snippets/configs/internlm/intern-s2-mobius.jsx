@@ -60,7 +60,7 @@ sgl-eval run gpqa \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 16`,
     },
-    numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512 },
+    numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 1024 },
   },
 
   // Per-variant accuracy applied to every cell; per-cell `accuracy` overrides.
@@ -133,9 +133,9 @@ sgl-eval run gpqa \\
 
   cells: [
     // ==== H200, 2 GPUs, BF16, low-latency (MTP NEXTN on) — VERIFIED ====
-    // GSM8K 1319 leg: 96.66 % acc / 100 % stop. Bench 8K-in / 1K-out:
-    //   conc=1  tput=2571 tok/s, TTFT p50=166ms, TPOT p50=3.13ms, accept_len=3.96
-    //   conc=16 tput=16061 tok/s, TTFT p50=1414ms, TPOT p50=7.35ms, accept_len=3.97
+    // GSM8K 1319 leg: 96.66 % acc / 100 % stop. Bench 8K-in / 1K-out (see
+    // intern-s2-mobius-benchmarks.jsx for the full 1/16/64 sweep; per conc=16
+    // spec reaches 18029 total tok/s vs 9358 no-spec).
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: true,
@@ -156,10 +156,9 @@ sgl-eval run gpqa \\
       ],
     },
     // ==== H200, 2 GPUs, BF16, high-throughput (no speculative) — VERIFIED ====
-    // GSM8K 1319 leg: 96.82 % acc / 100 % stop. Bench 8K-in / 1K-out:
-    //   conc=1  tput=904 tok/s,  TTFT p50=175ms,  TPOT p50=9.79ms
-    //   conc=16 tput=9256 tok/s, TTFT p50=1115ms, TPOT p50=14.47ms
-    //   conc=64 tput=20969 tok/s, TTFT p50=4121ms, TPOT p50=23.45ms
+    // GSM8K 1319 leg: 96.82 % acc / 100 % stop. Bench 8K-in / 1K-out — the
+    // spec-off recipe scales cleanly to conc=256 (34786 tok/s total at
+    // saturation), >1.3× the spec-on peak at conc=64. See benchmarks.jsx.
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
