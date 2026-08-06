@@ -119,7 +119,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         await MESH_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Mesh job %s failed", job_id)
         await MESH_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )

@@ -489,7 +489,7 @@ async def _dispatch_job_async(
         update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Video job %s failed", job_id)
         await VIDEO_STORE.update_fields(
             job_id,
             {
