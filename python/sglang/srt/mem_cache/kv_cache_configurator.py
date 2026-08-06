@@ -311,6 +311,13 @@ class KVCacheConfigurator:
     def pool_page_size(self) -> int:
         return get_schedule().page_size * self.loc_space_scale
 
+    def _dsa_pool_geometry(self, max_total_num_tokens: int) -> tuple[int, int]:
+        physical_page_size = get_schedule().page_size
+        # CUDA DSA kernels require physical 64-slot pages, while replicated draft
+        # pools must still back the wider DCP allocator's final virtual page.
+        pool_size = max_total_num_tokens + self.pool_page_size - physical_page_size
+        return pool_size, physical_page_size
+
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
         max_running_requests = config.max_running_requests
@@ -1290,6 +1297,9 @@ class KVCacheConfigurator:
     ) -> KVCache:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
+        max_total_num_tokens, pool_page_size = self._dsa_pool_geometry(
+            max_total_num_tokens
+        )
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
@@ -1322,7 +1332,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
+            page_size=pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
