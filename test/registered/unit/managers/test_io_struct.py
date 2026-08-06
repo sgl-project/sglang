@@ -305,6 +305,38 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_keeps_one_logical_rid_per_prompt(self):
+        """Test logical RID and reasoning control preservation across parallel samples."""
+        single = GenerateReqInput(
+            text="Hello",
+            rid="single",
+            sampling_params={"n": 3},
+            require_reasoning=True,
+            max_thinking_tokens=128,
+        )
+        single.normalize_batch_and_arguments()
+
+        self.assertEqual(single.rid, ["single"])
+        self.assertEqual([single[i].rid for i in range(3)], ["single"] * 3)
+        self.assertTrue(all(single[i].require_reasoning for i in range(3)))
+        self.assertEqual(
+            [single[i].max_thinking_tokens for i in range(3)],
+            [128] * 3,
+        )
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            rid="batch",
+            sampling_params={"n": 2},
+        )
+        batch.normalize_batch_and_arguments()
+
+        self.assertEqual(batch.rid, ["batch_0", "batch_1"])
+        self.assertEqual(
+            [batch[i].rid for i in range(4)],
+            ["batch_0", "batch_1", "batch_0", "batch_1"],
+        )
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
@@ -647,6 +679,15 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
+
+    def test_regenerate_rid_with_parent_prefix(self):
+        """Test RID regeneration with a logical parent prefix."""
+        req = GenerateReqInput(text="Hello", rid="logical")
+        req.normalize_batch_and_arguments()
+
+        new_rid = req.regenerate_rid(prefix="logical")
+
+        self.assertTrue(new_rid.startswith("logical_"))
 
     def test_error_cases(self):
         """Test various error cases."""
