@@ -26,7 +26,7 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import mxfp_supported
+from sglang.srt.utils.common import is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -83,7 +83,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         self.with_bias = False
 
         if not self.is_checkpoint_mxfp4_serialized:
-            if not mxfp_supported():
+            if not is_gfx95_supported():
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE layers requires an AMD ROCm "
                     "device with FP4 hardware support (gfx95x, e.g. MI355x)."
