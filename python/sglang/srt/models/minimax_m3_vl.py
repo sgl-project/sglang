@@ -134,6 +134,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
+        self.capture_aux_hidden_states = False
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
@@ -183,6 +184,19 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        for layer_id in self.model.layers_to_capture:
+            if self.model.start_layer <= layer_id < self.model.end_layer:
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
@@ -217,12 +231,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 
