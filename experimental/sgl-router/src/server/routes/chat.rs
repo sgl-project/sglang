@@ -291,8 +291,12 @@ pub async fn chat_completions(
     let metrics_model = model_str.clone();
 
     // Builds the time-to-first-token hook the SSE pump fires when the first
-    // upstream chunk lands. Installed only on the streaming arms below —
-    // non-streaming "first token" equals total latency, already captured by
+    // upstream chunk carrying an actual content token lands — the SGLang
+    // role-prelude / empty-delta / keepalive frames that precede the first
+    // generated token are skipped (see `sse::sse_chunk_has_content_token`), and
+    // a stream that ends with no content token records no TTFT sample at all.
+    // Installed only on the streaming arms below — non-streaming "first token"
+    // equals total latency, already captured by
     // `sgl_router_request_duration_seconds`. The proxy drops the hook for
     // non-2xx responses so error bodies don't pollute TTFT.
     let make_ttft_hook = || -> Box<dyn FnOnce() + Send + 'static> {
