@@ -7335,6 +7335,19 @@ class ServerArgs:
         )
 
     def _resolve_layout_io_compatibility(self):
+        # Every hicache host<->device transfer path (both the "kernel" and
+        # "direct" io backends) resolves its movers from sgl_kernel.kvcacheio,
+        # which is CUDA/HIP-only — the XPU wheel does not ship the module at all.
+        # Without this check the server dies deep inside the host pool with a
+        # bare `NameError: transfer_kv_all_layer_lf_pf is not defined` several
+        # minutes into startup, which says nothing about the real cause.
+        if self.enable_hierarchical_cache and is_xpu():
+            raise ValueError(
+                "--enable-hierarchical-cache is not supported on XPU: the KV "
+                "transfer kernels live in sgl_kernel.kvcacheio, which is not "
+                "built for this platform. Run without hierarchical cache."
+            )
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"

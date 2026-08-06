@@ -179,9 +179,11 @@ class AiterAttnBackend(AttentionBackend):
             # layer_id=0 may not be a full attention layer
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            # This rank's first local layer, not global layer 0: the pool indexes
+            # as `layer_id - start_layer`, so under PP a non-first rank would
+            # read a negative index for layer 0 and raise IndexError.
+            pool = model_runner.token_to_kv_pool
+            self.v_head_dim = pool.get_value_buffer(pool.start_layer).shape[-1]
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len

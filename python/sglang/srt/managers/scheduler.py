@@ -310,7 +310,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import empty_device_cache, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -4653,11 +4653,15 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
-            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            torch.cuda.empty_cache()
-            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            # Go through device_module, not torch.cuda: on a non-CUDA device the
+            # torch.cuda calls silently no-op (they early-return when CUDA was
+            # never initialized), so the cache was never actually freed and the
+            # log claimed otherwise.
+            before_mb = self.device_module.memory_reserved() / (1024 * 1024)
+            empty_device_cache(self.device_module)
+            after_mb = self.device_module.memory_reserved() / (1024 * 1024)
             logger.info(
-                f"[continue_generation] torch.cuda.empty_cache() called: "
+                f"[continue_generation] {self.device}: empty_cache() called: "
                 f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
