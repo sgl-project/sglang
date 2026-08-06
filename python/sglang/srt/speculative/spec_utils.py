@@ -935,8 +935,70 @@ def commit_mamba_states_after_verify(
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
+        return
+
+    # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
+    # for the OUTPUT, so we replay the accepted window into the fp32 checkpoint
+    # (`temporal`) here on commit -- `temporal` is always the current committed
+    # state. The draft window's raw inputs were written to the ring during verify
+    # by the KDA backend. Gate on the fold flag + is_kda (the cursor tensors are
+    # never allocated under fold, so they cannot serve as the signal).
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "replayssm_spec_fold", False)
+        and getattr(mamba_pool, "replayssm_is_kda", False)
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        accept_indices_offset = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+        # extra_buffer: the interval-crossing step whose state must snapshot into
+        # the track ping-pong slot (mirrors the regular commit's
+        # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
+        # `temporal` stays current and no device-side force-flush is needed.
+        mamba_track_indices = batch.mamba_track_indices
+        mamba_steps_to_track = None
+        if mamba_track_indices is not None:
+            ti = get_exec().mamba.mamba_track_interval
+            seq_pre = batch.seq_lens
+            seq_post = batch.seq_lens + accept_lens
+            to_track_mask = seq_pre // ti != seq_post // ti
+            tracking_point = seq_post // ti * ti
+            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
+                torch.int64
+            )
+            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
+            mamba_steps_to_track = torch.where(
+                to_track_mask, candidate, torch.full_like(candidate, -1)
+            )
+        commit_kda_replayssm_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,  # incl. bonus token
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
         return
 
     attn_backend = model_runner.attn_backend

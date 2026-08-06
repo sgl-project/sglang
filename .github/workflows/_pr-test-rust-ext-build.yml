@@ -36,9 +36,9 @@ on:
         type: string
         default: rust-ext-x86_64
       cache_key_prefix:
-        description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch, since the modules are not portable across architectures.'
+        description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch and the interpreter ABI set, since the modules are portable across neither.'
         type: string
-        default: rust-ext-x86_64
+        default: rust-ext-x86_64-cp310-cp312
       max_glibc:
         description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
         type: string
@@ -88,6 +88,11 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # A no-op on the hosted default, which ships zstd; here for whatever
+      # restore_runs_on is pointed at, since a reader without it sees no entry.
+      - name: Ensure zstd so the saved entry is readable
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
       # setup.py counts because it selects which crates get built. pyproject.toml
       # is left out - it churns on bumps that cannot affect these modules.
       - name: Restore built modules
@@ -96,6 +101,26 @@ jobs:
         with:
           path: python/sglang/srt/*/_core*.so
           key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+
+      # On a miss: different hash = rust/setup.py moved; no entries = evicted.
+      - name: Report cache lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          KEY_PREFIX: ${{ inputs.cache_key_prefix }}
+        run: |
+          if [ -n "${MATCHED_KEY}" ]; then
+              echo "hit: ${MATCHED_KEY}"
+              ls -l python/sglang/srt/*/_core*.so
+          else
+              echo "miss: ${PRIMARY_KEY}"
+              echo "entries under ${KEY_PREFIX}- (created / ref / size / key):"
+              gh cache list --repo "${GITHUB_REPOSITORY}" --key "${KEY_PREFIX}-" \
+                  --limit 15 --json createdAt,ref,sizeInBytes,key \
+                  --jq '.[] | [.createdAt, .ref, ((.sizeInBytes / 1048576 | floor | tostring) + " MiB"), .key] | @tsv' \
+                  || echo "(gh cache list unavailable: token lacks actions:read)"
+          fi
 
       # No MAX_GLIBC: these are the bytes the compile job already checked before
       # saving them under this key. The module count is still worth re-checking,
@@ -134,14 +159,19 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No crate sets abi3, so the ABI tag is minor-version specific and only the
-      # pools on this version can use the result - h20 ships 3.12 and falls back to
-      # compiling during install. Pinned rather than left to the image so the tag is
-      # at least predictable.
+      # No crate sets abi3, so build one module set per interpreter the pools
+      # run (h100 ships 3.10, h20 ships 3.12); EXT_SUFFIX keeps them apart.
       - name: Set up Python 3.10
+        id: py310
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Set up Python 3.12
+        id: py312
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Install protoc and Rust toolchain
         run: bash scripts/ci/utils/install_rust_protoc.sh
@@ -150,47 +180,46 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # Same path ci_install_dependency.sh uses, so a runner that also runs test
-          # stages keeps one warm cache. Its guard is repeated here because nothing
-          # prunes the tree on a runner that only ever builds.
-          export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
-          mkdir -p "${CARGO_TARGET_DIR}"
-          used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+          # Per-interpreter subdirs (set in the loop): PyO3's fingerprint tracks
+          # the interpreter, so a shared dir rebuilds on every ABI switch.
+          cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+          mkdir -p "${cargo_target_root}"
+          used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
           if [ "${used:-0}" -ge 85 ]; then
-              echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
-              rm -rf "${CARGO_TARGET_DIR}"
-              mkdir -p "${CARGO_TARGET_DIR}"
+              echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
+              rm -rf "${cargo_target_root}"
+              mkdir -p "${cargo_target_root}"
           fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
-          uv venv /tmp/rust-ext-build --python python3.10 --seed
-          # shellcheck disable=SC1091
-          source /tmp/rust-ext-build/bin/activate
-          uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
-          cd python
-          SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace
+          # Per-job path: these runners are persistent and shared, so a fixed one
+          # both inherits the previous job's venv and races a concurrent build.
+          venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
+          # would fail the step, and nothing here is worth keeping for a postmortem.
+          trap 'rm -rf "${venv_root}" || true' EXIT
+          for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
+              minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+              export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
+              venv="${venv_root}/py${minor}"
+              uv venv "${venv}" --python "${python_bin}" --seed
+              # shellcheck disable=SC1091
+              source "${venv}/bin/activate"
+              uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
+              (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+              deactivate
+          done
 
       - name: Verify modules and stage for upload
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
 
-      # actions/cache identifies an entry by key *and* a version derived from the
-      # compression tool, so a runner without zstd saves what the hosted restore job
-      # cannot find - a silent miss every run. Warn, not fail: a cold build still works.
+      # Without it the entry saved below lands under a version no reader with zstd
+      # can find. This runner's image ships without it.
       - name: Ensure zstd so the restore job can read what this job saves
-        run: |
-          set -uo pipefail
-          if ! command -v zstd >/dev/null 2>&1; then
-              if [ "$(id -u)" = "0" ]; then SUDO=""
-              elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
-              else SUDO=""; fi
-              ${SUDO} apt-get update || true
-              ${SUDO} apt-get install -y --no-install-recommends zstd || true
-          fi
-          command -v zstd >/dev/null 2>&1 \
-              || echo "::warning::zstd unavailable on ${RUNNER_NAME:-this runner}; the cache entry saved below will not be readable by the restore job"
+        run: bash scripts/ci/utils/ensure_zstd.sh
 
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.

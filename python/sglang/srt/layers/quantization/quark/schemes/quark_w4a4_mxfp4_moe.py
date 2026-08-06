@@ -21,10 +21,10 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import is_gfx1250_supported, mxfp_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -100,7 +100,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         self.with_bias = False
 
         if not self.is_checkpoint_mxfp4_serialized:
-            if not mxfp_supported():
+            if not is_gfx95_supported():
                 raise NotImplementedError(
                     "Online MXFP4 quantization for MoE layers requires an AMD ROCm "
                     "device with FP4 hardware support (gfx95x, e.g. MI355x)."
