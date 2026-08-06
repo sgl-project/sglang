@@ -27,6 +27,10 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
+from sglang.kernels.ops.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
+)
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -75,6 +79,40 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+_FLUX_RESIDUAL_GATE_CUDA_DISABLED = False
+
+
+def _flux_residual_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
+
+    Restricted to half dtypes: there the kernel reproduces the eager pair's
+    two-step rounding exactly (verified by ``torch.equal``), while for fp32 it
+    would contract to an fma (one rounding) and stop being bit-exact. The
+    kernel's row-broadcast gate only covers ``[1, ..., 1, D]``; batched
+    ``[B>1, 1, D]`` gates fail ``can_use_residual_gate_add_cuda`` and take the
+    eager fallback below.
+    """
+    global _FLUX_RESIDUAL_GATE_CUDA_DISABLED
+
+    if (
+        not _FLUX_RESIDUAL_GATE_CUDA_DISABLED
+        and residual.dtype in (torch.float16, torch.bfloat16)
+        and can_use_residual_gate_add_cuda(residual, update, gate)
+    ):
+        try:
+            return residual_gate_add_cuda(residual, update, gate)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling FLUX residual-gate CUDA fast path: {exc}")
+            _FLUX_RESIDUAL_GATE_CUDA_DISABLED = True
+
+    return residual + gate * update
 
 
 try:
@@ -737,8 +775,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
             gate = gate.unsqueeze(1)
             proj_out, _ = self.proj_out(hidden_states)
-            hidden_states = gate * proj_out
-            hidden_states = residual + hidden_states
+            hidden_states = _flux_residual_gate_add(residual, proj_out, gate)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -869,8 +906,9 @@ class FluxTransformerBlock(nn.Module):
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
+        hidden_states = _flux_residual_gate_add(
+            hidden_states, attn_output, gate_msa.unsqueeze(1)
+        )
         norm_hidden_states = self.norm2(hidden_states)
         if self.use_nunchaku_structure:
             norm_hidden_states = (
@@ -882,15 +920,16 @@ class FluxTransformerBlock(nn.Module):
             )
 
         ff_output = self.ff(norm_hidden_states)
-        ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-        hidden_states = hidden_states + ff_output
+        hidden_states = _flux_residual_gate_add(
+            hidden_states, ff_output, gate_mlp.unsqueeze(1)
+        )
 
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
+        encoder_hidden_states = _flux_residual_gate_add(
+            encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
+        )
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         if self.use_nunchaku_structure:
@@ -904,8 +943,8 @@ class FluxTransformerBlock(nn.Module):
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = (
-            encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        encoder_hidden_states = _flux_residual_gate_add(
+            encoder_hidden_states, context_ff_output, c_gate_mlp.unsqueeze(1)
         )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
