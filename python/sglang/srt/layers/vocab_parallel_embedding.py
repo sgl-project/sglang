@@ -259,10 +259,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
         # Support the case where the vocab size is not divisible by the TP size.
-        if (
-            _is_cpu
-            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
-        ):
+        if pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0:
             padding_size *= self.tp_size
         self.padding_size = padding_size
 
