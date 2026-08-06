@@ -324,23 +324,9 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             sin=sin,
             cos_sin_cache=cos_sin_cache,
         )
-        if _is_cuda and q.dim() == 4 and q.shape == k.shape:
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            roped_query, roped_key = apply_flashinfer_rope_qk_inplace(
-                q, k, cos_sin_cache, is_neox=False
-            )
-            roped_query = roped_query.type_as(v)
-            roped_key = roped_key.type_as(v)
-        else:
-            roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        roped_query = roped_query.type_as(v)
+        roped_key = roped_key.type_as(v)
+
         forward_batch = get_forward_context().forward_batch
         seq_splits = None
         uniform_seq_splits = False
