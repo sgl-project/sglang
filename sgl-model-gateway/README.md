@@ -27,7 +27,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Advanced load balancing with cache-aware request reuse, load-aware (power-of-two) selection, and per-model policy overrides.
 
 ## Feature Highlights
-- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`, `bucket`) with DP-aware scheduling.
+- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`, `bucket`, `consistent_hashing`, `bounded_consistent_hashing`) with DP-aware scheduling.
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, GLM4.7 and other reasoning-capable models.
@@ -738,6 +738,8 @@ Router flags map to these values:
 - `round_robin`: sequential rotation with atomic counters.
 - `cache_aware`: maintains a prefix tree of prompts to route repeat traffic and evens load with configurable thresholds (`--cache-threshold`, `--balance-abs-threshold`, `--balance-rel-threshold`, `--eviction-interval`, `--max-tree-size`).
 - `power_of_two`: chooses the lighter worker among two random candidates; integrates with `LoadMonitor`.
+- `consistent_hashing`: keeps an explicit `X-SMG-Routing-Key` on its preferred healthy worker and does not consider load.
+- `bounded_consistent_hashing`: an opt-in variant of consistent hashing. With an explicit `X-SMG-Routing-Key`, it keeps the preferred worker while its active load is at most `max_load_skew` times the healthy-worker average (default `1.5`); otherwise it walks the ring clockwise to the first eligible worker. `X-SMG-Target-Worker` and implicit keys from `Authorization`, `X-Forwarded-For`, or `Cookie` remain strict. Configure it with `--policy bounded_consistent_hashing --max-load-skew 1.5`.
   Per-model overrides are available in PD mode (`--prefill-policy`, `--decode-policy`) and IGW mode via the worker registry.
 
 ## Observability

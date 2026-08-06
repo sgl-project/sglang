@@ -108,6 +108,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn bounded_consistent_hashing_policy(mut self, max_load_skew: f64) -> Self {
+        self.config.policy = PolicyConfig::BoundedConsistentHashing { max_load_skew };
+        self
+    }
+
     pub fn cache_aware_policy(
         mut self,
         cache_threshold: f32,
