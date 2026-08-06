@@ -1684,6 +1684,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
                             with self.session_lock:
