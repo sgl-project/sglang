@@ -2529,7 +2529,13 @@ def _dllm_attention_backend(view: Any) -> dict:
             raise ValueError("GFusion only supports CUDA and HIP GPUs.")
         supported_backends = {"triton"} if is_hip() else {"fa3", "triton"}
         if view.is_attention_backend_not_set():
-            attention_backend = "triton" if is_hip() else "fa3"
+            # Keep the hardware-aware default (FA3 on Hopper, Triton on older
+            # CUDA). HIP/unsupported defaults fall back to Triton.
+            attention_backend = (
+                view.attention_backend
+                if view.attention_backend in supported_backends
+                else "triton"
+            )
             logger.info(f"Attention backend is set to {attention_backend} for GFusion.")
             return {"attention_backend": attention_backend}
         unsupported_backends = set(attention_backends_of(view)) - supported_backends
