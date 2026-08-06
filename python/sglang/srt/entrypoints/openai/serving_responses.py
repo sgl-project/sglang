@@ -2061,6 +2061,123 @@ class OpenAIServingResponses(OpenAIServingChat):
             state["done"] = True
             return events
 
+        def _emit_reasoning_delta(text: str):
+            """Yield SSE events for a reasoning-text delta, opening/closing
+            items as needed so reasoning and message items never overlap."""
+            if not text:
+                return
+            if message_state["open"]:
+                for ev in _close_message_item():
+                    yield ev
+            if not reasoning_state["open"]:
+                item_id = _open_reasoning_item()
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        item=ResponseReasoningItem(
+                            id=item_id,
+                            type="reasoning",
+                            summary=[],
+                            content=[],
+                            status="in_progress",
+                        ),
+                    )
+                )
+                if wants_summary:
+                    yield _send_event(
+                        openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                            type="response.reasoning_summary_part.added",
+                            item_id=item_id,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            part=ResponseReasoningSummaryAddedPart(
+                                type="summary_text", text=""
+                            ),
+                            sequence_number=-1,
+                        )
+                    )
+            reasoning_state["text"] += text
+            if wants_summary:
+                yield _send_event(
+                    openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                        type="response.reasoning_summary_text.delta",
+                        item_id=reasoning_state["item_id"],
+                        output_index=reasoning_state["output_index"],
+                        summary_index=0,
+                        delta=text,
+                        sequence_number=-1,
+                    )
+                )
+            else:
+                yield _send_event(
+                    openai_responses_types.ResponseReasoningTextDeltaEvent(
+                        type="response.reasoning_text.delta",
+                        item_id=reasoning_state["item_id"],
+                        output_index=reasoning_state["output_index"],
+                        content_index=0,
+                        delta=text,
+                        sequence_number=-1,
+                    )
+                )
+
+        def _emit_normal_delta(text: str):
+            """Yield SSE events for a normal-text delta, opening/closing
+            items as needed so reasoning, tool-call, and message items
+            never overlap."""
+            if not text:
+                return
+            if reasoning_state["open"]:
+                for ev in _close_reasoning_item():
+                    yield ev
+            for tool_index in list(tool_call_states):
+                for ev in _close_tool_call_state(tool_index):
+                    yield ev
+            if not message_state["open"]:
+                item_id = _open_message_item()
+                yield _send_event(
+                    openai_responses_types.ResponseOutputItemAddedEvent(
+                        type="response.output_item.added",
+                        sequence_number=-1,
+                        output_index=message_state["output_index"],
+                        item=ResponseOutputMessage(
+                            id=item_id,
+                            type="message",
+                            role="assistant",
+                            content=[],
+                            status="in_progress",
+                        ),
+                    )
+                )
+                yield _send_event(
+                    openai_responses_types.ResponseContentPartAddedEvent(
+                        type="response.content_part.added",
+                        sequence_number=-1,
+                        output_index=message_state["output_index"],
+                        item_id=message_state["item_id"],
+                        content_index=0,
+                        part=openai_responses_types.ResponseOutputText(
+                            type="output_text",
+                            text="",
+                            annotations=[],
+                            logprobs=None,
+                        ),
+                    )
+                )
+            message_state["text"] += text
+            yield _send_event(
+                openai_responses_types.ResponseTextDeltaEvent(
+                    type="response.output_text.delta",
+                    sequence_number=-1,
+                    content_index=0,
+                    output_index=message_state["output_index"],
+                    item_id=message_state["item_id"],
+                    delta=text,
+                    logprobs=[],
+                )
+            )
+
         try:
             async for ctx in result_generator:
                 if isinstance(ctx, dict):
@@ -2096,64 +2213,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     reasoning_chunk = None
 
                 if reasoning_chunk:
-                    if message_state["open"]:
-                        for ev in _close_message_item():
-                            yield ev
-                    if not reasoning_state["open"]:
-                        item_id = _open_reasoning_item()
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=reasoning_state["output_index"],
-                                item=ResponseReasoningItem(
-                                    id=item_id,
-                                    type="reasoning",
-                                    summary=[],
-                                    content=[],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                        # Clients that opt into ``reasoning.summary`` render
-                        # off the ``reasoning_summary_text.*`` event stream,
-                        # so mirror the trace into a summary part.
-                        if wants_summary:
-                            yield _send_event(
-                                openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
-                                    type="response.reasoning_summary_part.added",
-                                    item_id=item_id,
-                                    output_index=reasoning_state["output_index"],
-                                    summary_index=0,
-                                    part=ResponseReasoningSummaryAddedPart(
-                                        type="summary_text", text=""
-                                    ),
-                                    sequence_number=-1,
-                                )
-                            )
-                    reasoning_state["text"] += reasoning_chunk
-                    if wants_summary:
-                        yield _send_event(
-                            openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
-                                type="response.reasoning_summary_text.delta",
-                                item_id=reasoning_state["item_id"],
-                                output_index=reasoning_state["output_index"],
-                                summary_index=0,
-                                delta=reasoning_chunk,
-                                sequence_number=-1,
-                            )
-                        )
-                    else:
-                        yield _send_event(
-                            openai_responses_types.ResponseReasoningTextDeltaEvent(
-                                type="response.reasoning_text.delta",
-                                item_id=reasoning_state["item_id"],
-                                output_index=reasoning_state["output_index"],
-                                content_index=0,
-                                delta=reasoning_chunk,
-                                sequence_number=-1,
-                            )
-                        )
+                    for ev in _emit_reasoning_delta(reasoning_chunk):
+                        yield ev
 
                 if not delta:
                     continue
@@ -2169,55 +2230,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # Close any open tool-call item before opening a message so
                 # ``output_item.done`` lands before the next ``added``.
                 if normal_text:
-                    if reasoning_state["open"]:
-                        for ev in _close_reasoning_item():
-                            yield ev
-                    for tool_index in list(tool_call_states):
-                        for ev in _close_tool_call_state(tool_index):
-                            yield ev
-                    if not message_state["open"]:
-                        item_id = _open_message_item()
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item=ResponseOutputMessage(
-                                    id=item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                        yield _send_event(
-                            openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item_id=message_state["item_id"],
-                                content_index=0,
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text",
-                                    text="",
-                                    annotations=[],
-                                    logprobs=None,
-                                ),
-                            )
-                        )
-                    message_state["text"] += normal_text
-                    yield _send_event(
-                        openai_responses_types.ResponseTextDeltaEvent(
-                            type="response.output_text.delta",
-                            sequence_number=-1,
-                            content_index=0,
-                            output_index=message_state["output_index"],
-                            item_id=message_state["item_id"],
-                            delta=normal_text,
-                            logprobs=[],
-                        )
-                    )
+                    for ev in _emit_normal_delta(normal_text):
+                        yield ev
 
                 if not tool_calls:
                     continue
@@ -2299,6 +2313,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
             )
             return
+
+        # Finalize the reasoning parser, matching Chat Completions semantics:
+        # skip on abort, otherwise call parse_stream_end() exactly once and
+        # emit any buffered visible text through the same event-emission
+        # helpers used for normal parsed chunks.
+        finish_reason_type = finish_reason.get("type") if finish_reason else None
+        if reasoning_parser_obj is not None and finish_reason_type != "abort":
+            end_reasoning, end_normal = reasoning_parser_obj.parse_stream_end()
+            if end_reasoning:
+                for ev in _emit_reasoning_delta(end_reasoning):
+                    yield ev
+            if end_normal:
+                for ev in _emit_normal_delta(end_normal):
+                    yield ev
 
         for ev in _close_reasoning_item():
             yield ev

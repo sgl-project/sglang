@@ -223,5 +223,271 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
 
 
+class ReasoningParserFinalizationTestCase(unittest.TestCase):
+    """Test that the Responses streaming path calls parse_stream_end() and
+    emits any buffered visible text returned by the reasoning parser's
+    finish() method.
+
+    Chat Completions calls parse_stream_end() when a stream finishes.
+    The non-Harmony Responses streaming path must do the same to avoid
+    silently dropping visible text that some reasoning detectors buffer
+    until finalization.
+    """
+
+    def test_final_reasoning_text_emitted(self):
+        """parse_stream_end() returns final reasoning text -> must appear
+        as a reasoning delta event and in the completed response."""
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+        )
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        chunks = [
+            _engine_chunk("partial", 1),
+            _engine_chunk("partial more", 3, finish=True),
+        ]
+
+        async def gen():
+            for ch in chunks:
+                yield ch
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            # Per-chunk: no visible output (parser is buffering)
+            parser_cls.return_value.parse_stream_chunk.return_value = (None, None)
+            # Finalization: flush buffered reasoning
+            parser_cls.return_value.parse_stream_end.return_value = (
+                "final reasoning",
+                None,
+            )
+
+            async def collect():
+                return await collect_stream_events(
+                    serving.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params={},
+                        result_generator=gen(),
+                        model_name="x",
+                        tokenizer=Mock(),
+                        request_metadata=request_metadata,
+                    )
+                )
+
+            events = asyncio.run(collect())
+
+        types = event_types(events)
+        # Must have a reasoning text delta event for the final text
+        self.assertIn("response.reasoning_text.delta", types)
+
+        # The final reasoning text must appear exactly once as a delta
+        deltas = [
+            p.get("delta", "")
+            for p in event_payloads(events)
+            if p.get("type") == "response.reasoning_text.delta"
+        ]
+        self.assertEqual(deltas, ["final reasoning"])
+
+        # Must also appear in the completed response output
+        completed = find_completed_event(events)
+        output = completed["response"]["output"]
+        reasoning_items = [item for item in output if item.get("type") == "reasoning"]
+        self.assertEqual(len(reasoning_items), 1)
+        self.assertEqual(reasoning_items[0]["content"][0]["text"], "final reasoning")
+
+    def test_final_normal_text_emitted(self):
+        """parse_stream_end() returns final normal text -> must appear
+        as an output_text.delta event and in the completed response."""
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+        )
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        chunks = [
+            _engine_chunk("partial", 1),
+            _engine_chunk("partial more", 3, finish=True),
+        ]
+
+        async def gen():
+            for ch in chunks:
+                yield ch
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            # Per-chunk: no visible output (parser is buffering)
+            parser_cls.return_value.parse_stream_chunk.return_value = (None, None)
+            # Finalization: flush buffered normal text
+            parser_cls.return_value.parse_stream_end.return_value = (
+                None,
+                "final answer",
+            )
+
+            async def collect():
+                return await collect_stream_events(
+                    serving.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params={},
+                        result_generator=gen(),
+                        model_name="x",
+                        tokenizer=Mock(),
+                        request_metadata=request_metadata,
+                    )
+                )
+
+            events = asyncio.run(collect())
+
+        types = event_types(events)
+        # Must have an output_text.delta event for the final text
+        self.assertIn("response.output_text.delta", types)
+
+        # The final normal text must appear exactly once as a delta
+        deltas = [
+            p.get("delta", "")
+            for p in event_payloads(events)
+            if p.get("type") == "response.output_text.delta"
+        ]
+        self.assertEqual(deltas, ["final answer"])
+
+        # Must also appear in the completed response output
+        completed = find_completed_event(events)
+        output = completed["response"]["output"]
+        message_items = [item for item in output if item.get("type") == "message"]
+        self.assertEqual(len(message_items), 1)
+        self.assertEqual(message_items[0]["content"][0]["text"], "final answer")
+
+    def test_empty_finalization_emits_no_extra_events(self):
+        """parse_stream_end() returns (None, None) -> no extra delta events."""
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+        )
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        chunks = [
+            _engine_chunk("hello", 1, finish=True),
+        ]
+
+        async def gen():
+            for ch in chunks:
+                yield ch
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            # Per-chunk: emit reasoning immediately
+            parser_cls.return_value.parse_stream_chunk.return_value = (
+                "hello",
+                None,
+            )
+            # Finalization: nothing buffered
+            parser_cls.return_value.parse_stream_end.return_value = (None, None)
+
+            async def collect():
+                return await collect_stream_events(
+                    serving.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params={},
+                        result_generator=gen(),
+                        model_name="x",
+                        tokenizer=Mock(),
+                        request_metadata=request_metadata,
+                    )
+                )
+
+            events = asyncio.run(collect())
+
+        types = event_types(events)
+        # Exactly one reasoning delta from the chunk, none from finalization
+        reasoning_deltas = [t for t in types if t == "response.reasoning_text.delta"]
+        self.assertEqual(len(reasoning_deltas), 1)
+
+    def test_abort_skips_finalization(self):
+        """When finish_reason is 'abort', parse_stream_end() must not be called."""
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.tool_call_parser = None
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+        )
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+        chunks = [
+            {
+                "text": "partial",
+                "meta_info": {
+                    "id": "rid",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "finish_reason": {"type": "abort"},
+                },
+            },
+        ]
+
+        async def gen():
+            for ch in chunks:
+                yield ch
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            parser_cls.return_value.parse_stream_chunk.return_value = (
+                "partial",
+                None,
+            )
+            parser_cls.return_value.parse_stream_end.return_value = (
+                "should not appear",
+                None,
+            )
+
+            async def collect():
+                return await collect_stream_events(
+                    serving.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params={},
+                        result_generator=gen(),
+                        model_name="x",
+                        tokenizer=Mock(),
+                        request_metadata=request_metadata,
+                    )
+                )
+
+            events = asyncio.run(collect())
+
+        # parse_stream_end must NOT have been called
+        parser_cls.return_value.parse_stream_end.assert_not_called()
+
+        # "should not appear" must not be in any delta
+        payloads = event_payloads(events)
+        for p in payloads:
+            self.assertNotIn("should not appear", str(p))
+
+
 if __name__ == "__main__":
     unittest.main()
