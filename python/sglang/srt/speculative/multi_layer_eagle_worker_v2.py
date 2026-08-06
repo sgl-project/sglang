@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, List
 
@@ -76,7 +77,12 @@ from sglang.srt.speculative.spec_utils import (
     sample_draft_proposal,
     select_top_k_tokens,
 )
-from sglang.srt.utils import is_cpu, is_npu, require_gathered_buffer
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cpu,
+    is_npu,
+    require_gathered_buffer,
+)
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -106,6 +112,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -151,6 +159,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
+                # The draft runs at absolute target positions.
+                context_length=target_worker.model_runner.model_config.context_len,
             )
 
         # Alias for better readability
@@ -372,6 +382,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get():
             return
 
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
         if not _is_npu:
             # The single-CG runner replays with no Python between steps, so the
             # attn backend must fully rebuild its per-step metadata as captured
@@ -403,10 +416,21 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend = (
                 MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
             )
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self._specialized_graph_memory_usage["draft_extend"] = (
+            self._specialized_graph_memory_usage.get("draft_extend", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_extend"] = (
+            self._specialized_graph_time_usage.get("draft_extend", 0.0)
+            + time.perf_counter()
+            - tic
+        )
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -732,7 +756,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
+        can_run_decode_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
@@ -742,7 +766,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ret_draft_probs = None
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
-        if can_cuda_graph:
+        if can_run_decode_cuda_graph:
             # Graph replay bypasses ModelRunner.forward, which emits the
             # step[...] trace span for every other phase; emit it here.
             with profile_range(build_step_span_name(forward_batch)):
@@ -894,6 +918,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
@@ -905,12 +931,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
         )
 
         self._draft_worker = MultiLayerEagleDraftWorker(

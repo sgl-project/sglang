@@ -12,10 +12,10 @@ _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.dsa.dsa_indexer import (
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
-    Indexer,
-    rotate_activation,
+    DSAIndexerMetadata,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 )
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
-    DSAIndexerMetadata,
     DSAMetadata,
 )
 from sglang.srt.layers.layernorm import LayerNorm
@@ -394,8 +393,7 @@ class TestDSAIndexer(CustomTestCase):
 
         # Pool refs + attn_backend are now resolved via the ForwardContext;
         # publish ``self.backend`` for the duration of this fixture call so
-        # ``get_attn_backend()`` / ``get_token_to_kv_pool()`` /
-        # ``get_req_to_token_pool()`` resolve correctly.
+        # ``get_attn_backend()`` / ``get_token_to_kv_pool()`` resolve correctly.
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             set_forward_context,
