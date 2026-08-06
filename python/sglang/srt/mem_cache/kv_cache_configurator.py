@@ -101,11 +101,22 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 _is_npu = is_npu()
 
 
-def _should_enable_lazy_compaction() -> bool:
+def _should_enable_lazy_compaction(spec_algorithm=None) -> bool:
     """Lazy compaction default — ON unless
     `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
     Centralized here so both unified-memory-pool factory call sites stay in sync.
+
+    Forced OFF under speculative decoding: DSPARK rewrites
+    ``batch.out_cache_loc`` inside the verify executor (alloc_verify_window)
+    AFTER the scheduler registered the batch's write-set with
+    ``set_inflight_forward``, so lazy compaction's in-flight WAR protection
+    would not cover the verify-window writes — a page could be moved while the
+    captured verify forward still writes its old physical location. Eager
+    compaction frees/moves only on the schedule stream behind a
+    ``wait_stream(forward_stream)``, which orders it after the whole forward.
     """
+    if spec_algorithm is not None and not spec_algorithm.is_none():
+        return False
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
@@ -381,6 +392,45 @@ class KVCacheConfigurator:
                 unified_memory_pool=bundle.unified_memory_pool,
             )
 
+        # Draft worker sharing a UNIFIED target allocator (DSPARK + unified
+        # memory): the shared allocator hands out VIRTUAL token ids that range
+        # over the full sub-pool's whole virtual space (max_slots =
+        # total_bytes // entry_bytes — see MultiEndedAllocator.clear's
+        # free_virtual_ids = arange(min_page_index, num_pages)), which is
+        # LARGER than the scheduler's max_total_num_tokens. The draft pool is
+        # direct-indexed with those virtual ids (no v2p translate), so it must
+        # be sized by the virtual-id space — sizing it by max_total_num_tokens
+        # (the static-pool convention, where physical ids are bounded by the
+        # token budget) writes out of bounds at high virtual ids. Memory cost
+        # is small: the draft is a shallow dense model, entry bytes per token
+        # are a few percent of the target's.
+        draft_virtual_id_space: Optional[int] = None
+        if self.is_draft_worker and token_to_kv_pool_allocator is not None:
+            from sglang.srt.mem_cache.multi_ended_allocator import (
+                UnifiedMambaTokenToKVPoolAllocator,
+            )
+
+            if isinstance(
+                token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            ):
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
+                    "unified allocator virtual space smaller than the token "
+                    f"budget: size_full={draft_virtual_id_space} < "
+                    f"max_total_num_tokens={sizes.max_total_num_tokens}"
+                )
+                # Paged draft backends view the pool as (-1, page_size, H, D),
+                # so the pool size must stay page-aligned; size_full
+                # (= max_slots - 1) is not. Round UP so every virtual id
+                # (< max_slots) stays in bounds after alignment.
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
+
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
@@ -422,6 +472,17 @@ class KVCacheConfigurator:
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
         )
+
+        # Loud invariant for the unified draft-pool sizing above: every virtual
+        # id the shared allocator can emit must index inside the draft pool.
+        if draft_virtual_id_space is not None:
+            assert token_to_kv_pool.size >= draft_virtual_id_space, (
+                "draft token_to_kv_pool smaller than the shared unified "
+                f"allocator's virtual-id space: pool size="
+                f"{token_to_kv_pool.size} < size_full={draft_virtual_id_space}; "
+                "verify-window writes at high virtual ids would go out of "
+                "bounds."
+            )
 
         token_to_kv_pool_allocator = self._build_token_to_kv_pool_allocator(
             sizes=sizes,
@@ -519,7 +580,7 @@ class KVCacheConfigurator:
             # v2p/KV reads. Near-no-op in normal mode.
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
-            lazy_compaction=_should_enable_lazy_compaction(),
+            lazy_compaction=_should_enable_lazy_compaction(self.spec_algorithm),
         )
         return bundle
 
@@ -608,7 +669,7 @@ class KVCacheConfigurator:
             # `_init_unified_mamba_pools`.
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
-            lazy_compaction=_should_enable_lazy_compaction(),
+            lazy_compaction=_should_enable_lazy_compaction(self.spec_algorithm),
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
@@ -848,6 +909,14 @@ class KVCacheConfigurator:
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
         enable_page_major = get_memory().enable_page_major_kv_layout
+        if self.is_draft_worker and get_memory().enable_unified_memory:
+            # Unified memory implies page-major, but that is a TARGET-pool
+            # layout choice: the draft (DSPARK dense MQA) owns a standalone
+            # pool direct-indexed by the shared allocator's virtual ids, and
+            # its attention backend reads the plain per-layer contiguous
+            # layout — page-major strided views are Triton-only. Keep the
+            # draft pool dense.
+            enable_page_major = False
         mha_pool_class = (
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )

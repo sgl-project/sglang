@@ -616,8 +616,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Unified pool: precompute the DENSE KV write loc into the capture-stable
         # buffer (both capture and each replay-prep run this out of the graph),
         # so the in-graph set_mla_kv_buffer writes a dense loc without capturing a
-        # translate. Only decode writes KV under unified (spec is gated off).
-        if self._unified_mla and forward_mode.is_decode_or_idle():
+        # translate. Covers decode AND target-verify (DSPARK chain verify runs
+        # under CUDA graph with num_tokens_per_req = draft_token_num; its
+        # out_cache_loc comes from alloc_verify_window and is VIRTUAL, same rail
+        # as decode). init_cuda_graph_state sizes the buffer with the runner's
+        # max_num_tokens = max_bs * captured_req_width, which already accounts
+        # for the verify width. draft_extend_v2 never runs on the unified target
+        # backend (the draft pool is a plain dense pool, _unified_mla is False).
+        if self._unified_mla and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
             out_cache_loc = forward_batch.out_cache_loc
             n = out_cache_loc.shape[0]
             dst = self.cuda_graph_out_cache_loc_dense[:n]
@@ -1236,9 +1244,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if self._decode_dense_loc is not None:
+                # cuda-graph target-verify path (unified pool): dense write loc
+                # precomputed out-of-graph in init_forward_metadata_out_graph,
+                # so the in-graph write captures no translate allocation.
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                )
+            else:
+                # eager (or static pool): the pool's _full_translate handles it.
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline

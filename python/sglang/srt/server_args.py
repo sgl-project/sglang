@@ -7887,10 +7887,24 @@ class ServerArgs:
         assert self.disaggregation_mode == "null", (
             "--enable-unified-memory is not yet compatible with PD " "disaggregation."
         )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
+        # Speculative decoding: only chain DSPARK is wired for the unified pool
+        # (dense-loc verify writes in trtllm_mla, strided mamba scatter after
+        # verify, draft pool sized to the allocator's virtual space). EAGLE /
+        # tree / DFLASH / NGRAM are unaudited against virtual-vs-dense loc
+        # translation and stay blocked.
+        assert self.speculative_algorithm in (None, "DSPARK"), (
+            "--enable-unified-memory only supports --speculative-algorithm "
+            "DSPARK (chain draft); other speculative algorithms are not yet "
+            "audited for the unified pool's virtual/dense loc translation. Got "
+            f"--speculative-algorithm={self.speculative_algorithm!r}."
         )
+        if self.speculative_algorithm == "DSPARK":
+            assert self.speculative_eagle_topk in (None, 1), (
+                "--enable-unified-memory + DSPARK supports a linear draft "
+                "chain only (--speculative-eagle-topk in {None, 1}); tree "
+                "verify is not audited for the unified pool. Got "
+                f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+            )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
