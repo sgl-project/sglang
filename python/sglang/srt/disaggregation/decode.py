@@ -104,6 +104,14 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+def prepare_pd_rebootstrap(req: Req) -> None:
+    """Prepare a released decode request for prefix recomputation by prefill."""
+    if req.output_ids:
+        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+    req.pd_rebootstrap_in_progress = True
+    req.time_stats.set_retract_time()
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()

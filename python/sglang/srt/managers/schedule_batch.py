@@ -1733,6 +1733,18 @@ class Req(ReqDllmMixin):
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
+    def supports_pd_rebootstrap(self) -> bool:
+        """Whether token-only prefill recomputation can reproduce this request."""
+        return (
+            self.multimodal_inputs is None
+            and self.input_embeds is None
+            and self.positional_embed_overrides is None
+            and self.token_type_ids is None
+            and self.lora_id is None
+            and self.session is None
+            and self.session_id is None
+        )
+
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
         if self.has_log_time_stats:
@@ -2748,15 +2760,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def retract_decode(
         self, server_args: ServerArgs
-    ) -> Tuple[List[Req], float, List[Req]]:
+    ) -> Tuple[List[Req], List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
-        retracted_reqs_can_resume = (
+        retracted_reqs_use_cpu_copy = (
             server_args.disaggregation_mode != "decode"
             or self.token_to_kv_pool_allocator.supports_cpu_copy()
         )
         retracted_reqs = []
+        rebootstrap_reqs = []
         reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
@@ -2774,13 +2787,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 idx,
                 len(sorted_indices),
                 server_args,
-                offload_kv=retracted_reqs_can_resume,
+                offload_kv=retracted_reqs_use_cpu_copy,
             )
-            if not retracted_reqs_can_resume:
+            if retracted_reqs_use_cpu_copy:
+                retracted_reqs.append(req)
+            elif req.supports_pd_rebootstrap():
+                rebootstrap_reqs.append(req)
+            else:
                 req.to_finish = FINISH_ABORT(
                     "Request was retracted due to out-of-memory and cannot be "
                     "resumed because this KV cache does not support synchronous "
-                    "CPU save and restore.",
+                    "CPU save and restore and this request cannot be safely "
+                    "recomputed by PD rebootstrap.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                     err_type="InternalServerError",
                 )
@@ -2790,8 +2808,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     "support synchronous CPU save and restore)",
                     req.rid,
                 )
-            else:
-                retracted_reqs.append(req)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
@@ -2819,7 +2835,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
         )
 
-        return retracted_reqs, new_estimate_ratio, reqs_to_abort
+        return retracted_reqs, rebootstrap_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod
     def _get_decode_retraction_order(
