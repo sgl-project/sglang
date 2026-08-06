@@ -703,8 +703,8 @@ class Envs:
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
-    # token count.
-    SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    # token count; larger calls can wedge under multi-stream CUDA graph replay.
+    SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(4096)
     # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
     # ABI headers + overlay/). Unset means the path is unavailable, not empty.
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
