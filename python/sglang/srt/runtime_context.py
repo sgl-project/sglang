@@ -376,6 +376,20 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # The shared-experts-fusion decision, per runner — the runner_backend /
+    # speculative_runner_backend shape. Both leaves are seeded from the config
+    # intent by ``initialize_moe_config``; each MoE model's gate
+    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
+    # before its layers build and read it. ``speculative_moe_backend_context``
+    # brackets a draft's build: on exit the draft's effective decision is
+    # persisted onto the speculative leaf (inspectable afterwards) and the
+    # target's ACTIVE value returns.
+    disable_shared_experts_fusion: bool | None = None
+    speculative_disable_shared_experts_fusion: bool | None = None
+    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
+    # speculative_moe_backend_context is active, so a draft gate's write also
+    # lands on the speculative leaf.
+    in_speculative_scope: bool = False
 
 
 @dataclasses.dataclass

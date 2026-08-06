@@ -69,7 +69,7 @@ class TestServerArgsMutationRatchet(CustomTestCase):
                 f"server_args mutations outside the resolution pipeline grew: "
                 f"{count} > baseline {_BASELINE}. Configuration is resolved in "
                 "ServerArgs.__post_init__; declare through the pipeline "
-                "(passes / declare_load_time_override), change resolved config "
+                "(passes / declare_late_resolution), change resolved config "
                 "with get_context().override(source, ...), or hand the value "
                 "to its runner as a constructor argument — do not assign fields."
             )
