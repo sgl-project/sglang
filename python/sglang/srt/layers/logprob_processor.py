@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -412,6 +413,18 @@ def compute_spec_v2_logprobs(
         )
 
 
+def _deterministic_inference_enabled() -> bool:
+    """True when serving with --enable-deterministic-inference.
+
+    Fails open: bare constructions (unit tests) have no published config
+    namespaces, and plain serving is the not-deterministic case.
+    """
+    try:
+        return bool(get_exec().deterministic.enable_deterministic_inference)
+    except ValueError:
+        return False
+
+
 class InputLogprobProcessor:
     """Input (prefill) logprob processing: single-pass or chunked.
 
@@ -425,9 +438,15 @@ class InputLogprobProcessor:
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
-        # compute logprobs from logits + logsumexp, skipping the full-vocab
-        # log-softmax materialization
-        self.enable_fast_input_logprobs = envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
+        # Compute input logprobs from logits + logsumexp, skipping the
+        # full-vocab log-softmax materialization. Deterministic inference
+        # keeps the exact log_softmax path: the fused logsumexp reduces in a
+        # different order, which breaks the prefill/decode logprob
+        # bit-identity that mode guarantees.
+        self.enable_fast_input_logprobs = (
+            envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
+            and not _deterministic_inference_enabled()
+        )
 
     def forward(
         self,
