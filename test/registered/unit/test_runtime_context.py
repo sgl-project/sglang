@@ -965,5 +965,53 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
 
+class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):
+    """A named accessor must *call* a member that is a method.
+
+    `return get_server_args().x` hands back a bound method when `x` is defined
+    with `def`; the failure then lands far away, in whatever arithmetic the
+    caller does with it. Checked statically so accessors that need a real model
+    config are covered too.
+    """
+
+    def test_accessors_that_wrap_methods_call_them(self):
+        import ast
+        import inspect
+
+        import sglang.srt.runtime_context as rc
+        from sglang.srt.server_args import ServerArgs
+
+        tree = ast.parse(inspect.getsource(rc))
+        wrong = []
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if not (isinstance(inner, ast.Return) and inner.value is not None):
+                    continue
+                value = inner.value
+                called = isinstance(value, ast.Call)
+                target = value.func if called else value
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Call)
+                    and isinstance(target.value.func, ast.Name)
+                    and target.value.func.id == "get_server_args"
+                ):
+                    continue
+                member = getattr(ServerArgs, target.attr, None)
+                if inspect.isfunction(member) and not called:
+                    wrong.append(
+                        f"{node.name}(): returns ServerArgs.{target.attr} without "
+                        "calling it, so callers get a bound method"
+                    )
+                if not inspect.isfunction(member) and called:
+                    wrong.append(
+                        f"{node.name}(): calls ServerArgs.{target.attr}, which is "
+                        "not a method"
+                    )
+        self.assertEqual([], wrong, "\n".join(wrong))
+
+
 if __name__ == "__main__":
     unittest.main()

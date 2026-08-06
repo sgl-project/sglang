@@ -48,10 +48,10 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_server_args,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -765,7 +765,6 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
-    server_args = get_server_args()
     if not mamba_extra_buffer_enabled():
         return
     track_positions = None
@@ -1031,12 +1030,11 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    server_args = get_server_args()
     if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             get_exec().mamba.mamba_track_interval,
-            server_args.max_speculative_num_draft_tokens,
+            max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
