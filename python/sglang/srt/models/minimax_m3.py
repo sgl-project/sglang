@@ -1529,6 +1529,20 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+        # MiniMaxM3Model.forward reads the per-layer ``_is_layer_to_capture``
+        # flag (via getattr) to decide which layers append to aux_hidden_states.
+        # Setting only self.model.layers_to_capture (a list) left that flag
+        # unset on every layer, so no aux states were ever captured and EAGLE3
+        # verify received no target hidden states. Set the flag here (and clear
+        # it on layers not in the capture set, in case this is called more than
+        # once with a different layer set).
+        capture_set = set(self.model.layers_to_capture)
+        for i, layer in enumerate(self.model.layers):
+            if i in capture_set:
+                setattr(layer, "_is_layer_to_capture", True)
+            elif getattr(layer, "_is_layer_to_capture", False):
+                setattr(layer, "_is_layer_to_capture", False)
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
