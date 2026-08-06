@@ -570,8 +570,14 @@ class C4IndexerBackendMixin:
             or indexer_metadata.use_prefill_cuda_graph
         ):
             return False
+        # FP4 indexer K buffers pack 68 B/token (index_head_dim // 2 + 4),
+        # but get_index_k_scale_buffer reads at FP8 strides (128 B/token K +
+        # page_size * 128 scale offset).  Routing FP4 into the non-paged path
+        # silently corrupts the gathered K.  Keep FP4 on the paged path which
+        # uses get_index_k_with_scale_buffer with the correct head_dim_with_sf.
         if (
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            c4_indexer.use_fp4_indexer
+            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
@@ -764,28 +770,20 @@ class C4IndexerBackendMixin:
                 end = start + int(extend_seq_lens[i].item())
                 request_ranges.append((i, start, end))
 
-        # Use real-time free memory for the chunk budget instead of the
-        # cached value from ``_get_mqa_logits_budget_bytes``.  The cached
-        # budget is calculated once (typically right after CUDA-graph
-        # capture when free memory is near its peak) and never updated.
-        # At prefill time the actual free memory can be significantly
-        # lower due to KV-cache occupancy and prefill activations, so a
-        # chunk sized from the stale cache can still OOM.
-        #
-        # ``mem_get_info`` is a lightweight CUDA runtime query (~1-10 µs)
-        # that does NOT synchronise the device.  We call it once per
-        # request (not per chunk) and apply a conservative 0.5 factor to
-        # leave headroom for the KV gather and other intermediates that
-        # are allocated between the query and the logits allocation.
-        if get_is_capture_mode():
-            # During CUDA-graph capture we cannot call mem_get_info; fall
-            # back to the (already conservative) static budget.
+        # Use the caller-provided budget (from _should_chunk_mqa_logits) as
+        # the primary chunking limit.  On CUDA, also clamp by real-time free
+        # memory to avoid OOM when KV cache has grown since the budget was
+        # computed.  On CPU (test mode) or during CUDA-graph capture, use
+        # budget_bytes directly — mem_get_info is unavailable or would stall
+        # the capture.
+        if get_is_capture_mode() or device.type != "cuda":
             realtime_budget = budget_bytes
         else:
             free_mem, _ = torch.cuda.mem_get_info(device.index)
             total_mem = torch.cuda.get_device_properties(device.index).total_memory
             static_cap = int(total_mem * _MQA_LOGITS_TOTAL_MEM_FRACTION)
-            realtime_budget = min(int(free_mem * 0.5), static_cap)
+            mem_based_budget = min(int(free_mem * 0.5), static_cap)
+            realtime_budget = min(budget_bytes, mem_based_budget)
             realtime_budget = max(1, realtime_budget)
 
         bytes_per_row = max_c4_seq_len * _MQA_LOGITS_BYTES_PER_ELEM
@@ -1056,28 +1054,44 @@ class C4IndexerBackendMixin:
         # import deep_gemm but the kernel refuses at runtime, so the varlen
         # routing must not fire there.  See sgl-project/sglang#33246.
         _varlen_arch_ok = is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+        # FP4 is excluded from the oversize varlen path for the same reason
+        # it is rejected in _can_use_nonpaged_indexer: get_index_k_scale_buffer
+        # reads K at FP8 strides (128 B/token), but FP4 buffers pack only
+        # 68 B/token — silent data corruption.
         _is_deep_gemm_path = _varlen_arch_ok and (
-            use_fp4_indexer
-            or (
-                not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-                and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-                and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-                and not is_xpu()
-            )
+            not use_fp4_indexer
+            and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and not is_xpu()
         )
         _is_cp = get_parallel().attn_cp_size != 1
         _is_capture = get_is_capture_mode() or indexer_metadata.use_prefill_cuda_graph
         max_c4_seq_len = indexer_metadata.max_c4_seq_len
 
+        # Guard the oversize path with the same env flag and structural guards
+        # that _can_use_nonpaged_indexer enforces for the normal non-paged
+        # path (review comment 1 on PR #33288).  Without SGLANG_OPT_DSV4_NONPAGED_INDEXER
+        # the operator has disabled the feature; TBO / hisparse / piecewise /
+        # breakable graph / non-EXTEND contexts are incompatible with the
+        # varlen gather.
         need_chunk = False
         budget_bytes = 0
-        if _is_deep_gemm_path and not _is_cp and not _is_capture:
-            if use_fp4_indexer:
-                assert isinstance(q_indexer, tuple)
-                device = q_indexer[0].device
-            else:
-                assert isinstance(q_indexer, torch.Tensor)
-                device = q_indexer.device
+        if (
+            _is_deep_gemm_path
+            and not _is_cp
+            and not _is_capture
+            and envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get()
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.tbo_parent_token_range is None
+            and self.hisparse_coordinator is None
+            and not is_in_tc_piecewise_cuda_graph()
+            and not is_in_breakable_cuda_graph()
+        ):
+            # FP4 is excluded by _is_deep_gemm_path above; q_indexer is a
+            # plain tensor here.
+            assert isinstance(q_indexer, torch.Tensor)
+            device = q_indexer.device
             device_index = device.index
             if device_index is not None:
                 need_chunk, budget_bytes = self._should_chunk_mqa_logits(
