@@ -113,15 +113,13 @@ class DmdDenoisingStage(DenoisingStage):
                 ):
                     t_int = int(t.item())
                     if self.transformer_2 is not None:
-                        current_model, _ = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=self._handle_boundary_ratio(
-                                    server_args, batch, scheduler
-                                ),
-                                server_args=server_args,
-                                batch=batch,
-                            )
+                        current_model, _ = self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=self._handle_boundary_ratio(
+                                server_args, batch, scheduler
+                            ),
+                            server_args=server_args,
+                            batch=batch,
                         )
                     else:
                         current_model = self.transformer
