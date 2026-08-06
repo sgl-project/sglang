@@ -180,13 +180,3 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           exit ${test_exit_code}
-
-      - name: Upload metrics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-${{ inputs.test_suite }}
-          path: |
-            /root/.cache/tests/output/
-          if-no-files-found: ignore
-          retention-days: 7
