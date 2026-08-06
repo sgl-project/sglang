@@ -319,9 +319,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
 def test_validate_server_args_requires_packed_varlen_backend():
     config = SimpleNamespace(
         vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
-        dit_config=SimpleNamespace(
-            arch_config=SimpleNamespace(attention_head_dim=128)
-        ),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
         _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
     )
     server_args = SimpleNamespace(
