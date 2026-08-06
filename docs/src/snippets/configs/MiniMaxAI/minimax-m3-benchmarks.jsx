@@ -1,6 +1,15 @@
 // MiniMax-M3 per-cell benchmark numbers, keyed by the same `match` tuple as
 // minimax-m3.jsx cells. See _deployment.jsx for the speed/accuracy schema.
 //
+// 2026-08 RE-BENCH (sglang 0.5.16, pinned release): b200 / b300 / gb300 speed
+// re-measured cache-cold (--flush-cache), P50, standardized to isl 2048 / osl 256
+// at conc 24 & 64. b200 required PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+// (shipped --mem-fraction-static 0.65 OOMs at cuda-graph capture on 0.5.16).
+// STILL PENDING a 0.5.16 re-bench (numbers below are the original "PR #27944"
+// measurement): h200 (no 8x-h200 whole-node currently placeable), gb200 (no box),
+// and the AMD cells mi300x/mi325x/mi350x/mi355x (no AMD devbox in the fleet).
+// The provenance notes below describe those original measurements.
+//
 // SPEED — bench_serving --flush-cache, random isl2048/osl256, max_concurrency 64,
 // CUDA graph on. B200 (tp8, MXFP8, MSA fmha_sm100 path; re-measured 2026-06-15
 // with piecewise CUDA graph default-on) and H200 (tp8, bf16, built-in Triton
@@ -35,11 +44,15 @@ export const benchmarks = [
     // #27944 tp4 speed + GSM8K drift were pre-fix; the merged MSA decode fix
     // resolves the drift (stable single-run greedy 96.89% / recommended 96.51%).
     match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "0.5.16",
     speed: [
-      // bench_serving --flush-cache, MSA path, tp8; warm steady-state (3-run, identical).
+      // Re-bench on 0.5.16 (cache-cold, --flush-cache, tp8; P50). NOTE: required
+      // PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — the shipped
+      // --mem-fraction-static 0.65 OOMs at cuda-graph capture on 0.5.16 without it.
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 24, num_prompts: 24 },
+        ttft_ms: 784, tpot_ms: 14.4, tokens_per_sec_per_gpu: 1549 },
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 1580, tpot_ms: 24.1, tokens_per_sec_per_gpu: 2385 },
+        ttft_ms: 1459, tpot_ms: 21.3, tokens_per_sec_per_gpu: 2662 },
     ],
     accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.5, mmmu_pro_pct: 72.7 }, // 2026-06-15, sgl-eval --thinking, recommended sampling (temp 1.0/top_p 0.95), tp8. GSM8K full 1319 = 96.51% (greedy 96.89%). GPQA Diamond 198, n-repeats 4 = pass@1[avg-of-4] 89.14% +/-1.73% (pass@4 95.45%, majority@4 93.52%). MMMU-Pro 2026-06-18, sgl-eval "standard (10 options)" test split, full 1730, single-shot 72.66% (thinking, temp 1.0/top_p 0.95).
   },
@@ -57,10 +70,13 @@ export const benchmarks = [
   },
   {
     match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "0.5.16",
     speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: null, tpot_ms: 32.8, tokens_per_sec_per_gpu: 3285 },
+      // Re-bench on 0.5.16 (cache-cold, --flush-cache, tp4; P50).
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 24, num_prompts: 24 },
+        ttft_ms: 916, tpot_ms: 17.4, tokens_per_sec_per_gpu: 2578 },
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
+        ttft_ms: 1764, tpot_ms: 26.2, tokens_per_sec_per_gpu: 4331 },
     ],
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on B300 (legacy few_shot 200: 87.5)
   },
@@ -68,12 +84,14 @@ export const benchmarks = [
   { match: { hw: "gb200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" } },
   {
     match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "PR #27944",
+    sglang_version: "0.5.16",
     speed: [
-      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: 4746, tpot_ms: 39.3, tokens_per_sec_per_gpu: 2493 },
-      { workload: { dataset: "random", isl: 8192, osl: 256, max_concurrency: 24 },
-        ttft_ms: 3324, tpot_ms: 32.9, tokens_per_sec_per_gpu: 4323 },
+      // Re-bench on 0.5.16 (cache-cold, --flush-cache, tp4; P50). Standardized to
+      // isl 2048 / osl 256 at conc 24 & 64 (dropped the old isl-8192 conc-24 row).
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 24, num_prompts: 24 },
+        ttft_ms: 902, tpot_ms: 16.9, tokens_per_sec_per_gpu: 2638 },
+      { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
+        ttft_ms: 1545, tpot_ms: 25.2, tokens_per_sec_per_gpu: 4583 },
     ],
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on GB300 (legacy few_shot 200: 87.5)
   },

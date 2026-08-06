@@ -14,8 +14,11 @@
 export const config = {
   modelName: "MiniMax-M3",
 
-  // TTFT/TPOT were recorded as Mean (no percentile restated in the source runs).
-  latencyPercentile: "Mean",
+  // TTFT/TPOT are P50 (median_ttft_ms / median_tpot_ms from bench_serving). The
+  // 0.5.16 re-benched cells (b200/b300/gb300) are measured P50; legacy cells not
+  // yet re-benched carried Mean numbers (~P50 for these steady-state balanced runs)
+  // pending re-measurement.
+  latencyPercentile: "P50",
 
   supportedHardware: ["b200", "b300", "gb200", "gb300", "mi300x", "mi325x", "mi350x", "mi355x", "h200"],
 
@@ -214,8 +217,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 8",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -232,8 +233,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -251,8 +250,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -269,8 +266,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -288,8 +283,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -307,8 +300,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -328,8 +319,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -351,8 +340,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -379,8 +366,6 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--reasoning-parser auto",
-        "--tool-call-parser auto",
         "--tp 8",
         "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
