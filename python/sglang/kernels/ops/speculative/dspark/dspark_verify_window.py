@@ -408,10 +408,13 @@ def _compact_verify_ids_gather_kernel(
     draft_tokens_ptr,
     out_ptr,
     bs,
-    gamma,
+    block_w,
+    draft_w,
     n,
     BLOCK: tl.constexpr,
 ):
+    # block_w = draft_block_ids row width (block rows); draft_w = drafts per
+    # request. Legacy AR heads: equal; mask-filling heads: draft_w = block_w-1.
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
@@ -419,9 +422,9 @@ def _compact_verify_ids_gather_kernel(
     within = tl.load(within_ptr + offs, mask=mask, other=0)
     valid = req < bs
     safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
+    anchor = tl.load(draft_block_ids_ptr + safe_req * block_w, mask=mask, other=0)
     wcol = tl.maximum(within - 1, 0)
-    draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
+    draft = tl.load(draft_tokens_ptr + safe_req * draft_w + wcol, mask=mask, other=0)
     v = tl.where(within == 0, anchor, draft)
     v = tl.where(valid, v, 0)
     tl.store(out_ptr + offs, v.to(tl.int64), mask=mask)
@@ -440,15 +443,16 @@ def compact_verify_ids_triton(
         device=device,
     )
     bs = layout.verify_lens.shape[0]
-    gamma = draft_tokens.shape[1]
+    draft_w = draft_tokens.shape[1]
     draft_block_ids = draft_block_ids.to(device=device, dtype=torch.int64).contiguous()
+    block_w = draft_block_ids.shape[1]
     draft_tokens = draft_tokens.to(device=device, dtype=torch.int64).contiguous()
     n = layout.graph_num_tokens
     out = torch.empty(n, dtype=torch.int64, device=device)
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
+        req, within, draft_block_ids, draft_tokens, out, bs, block_w, draft_w, n, BLOCK=BLOCK
     )
     return out
 

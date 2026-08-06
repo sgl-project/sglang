@@ -130,7 +130,9 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
-        self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._schedule_cfg = DSparkScheduleConfig(
+            gamma=self.gamma, verify_width=int(self.verify_num_draft_tokens)
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
@@ -927,17 +929,23 @@ class DSparkScheduleConfig(msgspec.Struct):
     min_verify_len: int = 1
     max_verify_len: int = 0
     survival_eps: float = 1e-6
+    # Verify rows per request. Legacy AR drafts: gamma + 1; mask-filling
+    # drafts: gamma (runtime verify_num_draft_tokens). 0 = legacy default.
+    verify_width: int = 0
+
+    def resolved_verify_width(self) -> int:
+        return self.verify_width or (self.gamma + 1)
 
     def resolved_max_verify_len(self) -> int:
-        return self.max_verify_len or (self.gamma + 1)
+        return self.max_verify_len or self.resolved_verify_width()
 
     def validate(self) -> None:
         max_len = self.resolved_max_verify_len()
         if self.gamma < 1:
             raise ValueError(f"DSpark gamma must be >= 1, got {self.gamma}.")
-        if not (0 <= self.min_verify_len <= max_len <= self.gamma + 1):
+        if not (0 <= self.min_verify_len <= max_len <= self.resolved_verify_width()):
             raise ValueError(
-                "DSpark verify-len config must satisfy 0 <= min <= max <= gamma+1, "
+                "DSpark verify-len config must satisfy 0 <= min <= max <= verify_width, "
                 f"got min={self.min_verify_len}, max={max_len}, gamma={self.gamma}."
             )
         if self.survival_eps < 0:
