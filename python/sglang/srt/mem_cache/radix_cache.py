@@ -512,7 +512,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free_segment(
-            kv_indices[req.cache_protected_len : new_prefix_len],
+            values[req.cache_protected_len : new_prefix_len],
             start_pos=req.cache_protected_len,
         )
 
