@@ -19,7 +19,7 @@ ENV PYTHON_BIN=/opt/python/${PYTHON_TAG}/bin/python
 # These mirror the build and RDMA dependencies used by ci_install_deepep.sh.
 # The image builds only GDRCopy's user-space library: the host owns gdrdrv and
 # passes /dev/gdrdrv through at runtime.
-RUN yum install -y --nogpgcheck \
+RUN yum install -y --nogpgcheck --enablerepo=powertools \
         cmake \
         curl \
         gcc \
@@ -54,6 +54,7 @@ RUN set -eux; \
 RUN git clone --depth 1 --branch "v${GDRCOPY_VERSION}" \
         https://github.com/NVIDIA/gdrcopy.git /opt/gdrcopy \
     && make -C /opt/gdrcopy CUDA="${CUDA_HOME}" prefix=/usr/local lib_install \
+    && printf '%s\n' /usr/local/lib > /etc/ld.so.conf.d/gdrcopy.conf \
     && ldconfig \
     && test -f /usr/local/include/gdrapi.h \
     && ldconfig -p | grep -q libgdrapi
