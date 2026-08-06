@@ -305,7 +305,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     during later CUDA graph capture, which runs outside inference_mode. The
     resolved scale tensors share this scope because reload updates them in place.
     """
-    if getattr(layer, "_cutedsl_wrapper", None) is not None:
+    if layer._cutedsl_wrapper is not None:
         return
 
     try:

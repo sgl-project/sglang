@@ -2561,7 +2561,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         sf_vec_size=sf_vec_size,
                     ),
                 )
-                if getattr(layer, "_cutedsl_wrapper", None) is not None:
+                if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
     @property
@@ -2590,6 +2590,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+
+            layer._cutedsl_wrapper = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401

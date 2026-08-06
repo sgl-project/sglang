@@ -179,8 +179,6 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
         {
             "name": "flashinfer_trtllm_routed_mxfp8",
             "other_args": (
-                "--base-gpu-id",
-                "0",
                 "--tp-size",
                 "4",
                 "--dp-size",
@@ -202,8 +200,6 @@ class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTest
         {
             "name": "flashinfer_trtllm_nvfp4",
             "other_args": (
-                "--base-gpu-id",
-                "0",
                 "--tp-size",
                 "4",
                 "--fp4-gemm-backend",
@@ -231,8 +227,6 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
         {
             "name": "flashinfer_cutedsl_nvfp4",
             "other_args": (
-                "--base-gpu-id",
-                "0",
                 "--tp-size",
                 "4",
                 "--ep-size",
