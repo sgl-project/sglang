@@ -149,7 +149,8 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
-        "--mem-fraction-static=0.40",
+        # Weights alone need ~0.39; 0.40 left <0.001 headroom and flaked at load.
+        "--mem-fraction-static=0.42",
     ]
 
     def test_video_images_chat_completion(self):
