@@ -7,7 +7,7 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional, Protocol, cast
 
 import torch
 import torch.distributed as dist
@@ -36,45 +36,6 @@ from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
 _original_similarity = None
-_MINIMAX_H3_OUT_OF_PLACE_ATTR = "_sglang_cache_dit_force_out_of_place_residual"
-_MINIMAX_H3_TRACKED_BLOCKS_ATTR = "_sglang_cache_dit_out_of_place_blocks"
-
-
-def _set_minimax_h3_cache_dit_compat(
-    transformer: torch.nn.Module, *, enabled: bool
-) -> bool:
-    """Keep Cache-DiT residual snapshots valid for MiniMax-H3.
-
-    MiniMax-H3 normally applies its gated residual with an in-place Triton
-    kernel. Cache-DiT's Pattern_3 adapter retains block inputs by reference when
-    it measures the first-block residual and when it stores the middle-block
-    residual. Mark the H3 blocks so they use their out-of-place fallback while
-    caching is attached; otherwise both snapshots alias the mutated output.
-    """
-
-    # Match through the MRO rather than comparing the concrete class name: a
-    # subclass would otherwise silently keep the in-place residual and the only
-    # symptom would be that caching stops hitting, which is exactly the failure
-    # this compat shim exists to prevent.
-    if not any(
-        base.__name__ == "MiniMaxH3DiTModel" for base in type(transformer).__mro__
-    ):
-        return False
-
-    if enabled:
-        blocks = tuple(transformer.blocks)
-        for block in blocks:
-            setattr(block, _MINIMAX_H3_OUT_OF_PLACE_ATTR, True)
-        setattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR, blocks)
-        return True
-
-    blocks = getattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR, ())
-    for block in blocks:
-        if hasattr(block, _MINIMAX_H3_OUT_OF_PLACE_ATTR):
-            delattr(block, _MINIMAX_H3_OUT_OF_PLACE_ATTR)
-    if hasattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR):
-        delattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR)
-    return bool(blocks)
 
 
 def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
@@ -83,7 +44,7 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     logger.info("Disabling cache-dit on %s", type(transformer).__name__)
     target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
     cache_dit.disable_cache(target)
-    _set_minimax_h3_cache_dit_compat(transformer, enabled=False)
+    _configure_custom_cache_compat(transformer, None)
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
     for name in ("_is_parallelized", "_parallelism_config"):
@@ -313,17 +274,63 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 }
 
 
-# Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern). forward_pattern must
-# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg follows the run (passed by
-# enable_cache_on_transformer); cache-dit auto-resolves the remaining
-# fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
-    "MiniMaxH3DiTModel": ("blocks", ForwardPattern.Pattern_3),
+class _CacheDitInputPreservingTransformer(Protocol):
+    def configure_cache_dit_input_preservation(
+        self,
+        *,
+        fn_compute_blocks: Optional[int],
+        bn_compute_blocks: int,
+    ) -> None: ...
+
+
+CacheCompatConfigurator = Callable[[torch.nn.Module, Optional[CacheDitConfig]], None]
+
+
+@dataclass(frozen=True)
+class CustomBlockAdapterSpec:
+    blocks_attr: str
+    forward_pattern: ForwardPattern
+    configure_cache_compat: Optional[CacheCompatConfigurator] = None
+
+
+def _configure_minimax_h3_cache_compat(
+    transformer: torch.nn.Module, config: Optional[CacheDitConfig]
+) -> None:
+    model = cast(_CacheDitInputPreservingTransformer, transformer)
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=None if config is None else config.Fn_compute_blocks,
+        bn_compute_blocks=0 if config is None else config.Bn_compute_blocks,
+    )
+
+
+# Custom BlockAdapter metadata for models absent from cache-dit's registry.
+# Compatibility callbacks also apply if a future cache-dit release registers
+# the model itself.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "ErnieImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "Krea2Transformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "MiniMaxH3DiTModel": CustomBlockAdapterSpec(
+        blocks_attr="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+        configure_cache_compat=_configure_minimax_h3_cache_compat,
+    ),
 }
+
+
+def _configure_custom_cache_compat(
+    transformer: torch.nn.Module, config: Optional[CacheDitConfig]
+) -> bool:
+    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
+    if spec is None or spec.configure_cache_compat is None:
+        return False
+    spec.configure_cache_compat(transformer, config)
+    return True
 
 
 def _build_custom_block_adapter(
@@ -335,17 +342,16 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern = spec
-    blocks = getattr(transformer, blocks_attr, None)
+    blocks = getattr(transformer, spec.blocks_attr, None)
     if blocks is None:
         raise ValueError(
             f"Transformer {transformer.__class__.__name__} has no attribute "
-            f"{blocks_attr!r} for cache-dit blocks."
+            f"{spec.blocks_attr!r} for cache-dit blocks."
         )
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        forward_pattern=forward_pattern,
+        forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
     )
 
@@ -461,7 +467,7 @@ def enable_cache_on_transformer(
             model_name,
             custom_adapter.forward_pattern,
         )
-    h3_compat_enabled = _set_minimax_h3_cache_dit_compat(transformer, enabled=True)
+    cache_compat_enabled = _configure_custom_cache_compat(transformer, config)
     try:
         cache_dit.enable_cache(
             target,
@@ -470,8 +476,8 @@ def enable_cache_on_transformer(
             parallelism_config=None,
         )
     except Exception:
-        if h3_compat_enabled:
-            _set_minimax_h3_cache_dit_compat(transformer, enabled=False)
+        if cache_compat_enabled:
+            _configure_custom_cache_compat(transformer, None)
         raise
     if custom_adapter is not None:
         transformer._sglang_cache_dit_adapter = custom_adapter

@@ -109,6 +109,7 @@ class _KwargIdentity(torch.nn.Module):
 def test_cache_dit_compat_flag_only_spares_the_block_input():
     block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
     torch.nn.Module.__init__(block)
+    block.preserve_input_for_cache_dit = False
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
@@ -145,7 +146,7 @@ def test_cache_dit_compat_flag_only_spares_the_block_input():
         # Without the flag both gated residuals may reuse their input buffer.
 
         gate_modes.clear()
-        block._sglang_cache_dit_force_out_of_place_residual = True
+        block.preserve_input_for_cache_dit = True
         block(
             x,
             adaln_input=torch.zeros(1, 4),
@@ -160,6 +161,42 @@ def test_cache_dit_compat_flag_only_spares_the_block_input():
         assert gate_modes == [False, True]
 
 
+def test_cache_dit_preserves_only_fn_and_mn_inputs():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=2,
+        bn_compute_blocks=1,
+    )
+    assert [block.preserve_input_for_cache_dit for block in model.blocks] == [
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]
+
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=4,
+        bn_compute_blocks=1,
+    )
+    assert [block.preserve_input_for_cache_dit for block in model.blocks] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=None,
+        bn_compute_blocks=0,
+    )
+    assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
@@ -167,6 +204,14 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     gate = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
     other = torch.randn_like(x)
     indices = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
+    expected = _modulate_gate(
+        x.clone(),
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=True,
+    )
 
     output = _modulate_gate(
         x,
@@ -179,6 +224,7 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
 
     assert output.data_ptr() != x.data_ptr()
     torch.testing.assert_close(x, original, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():

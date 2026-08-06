@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion.qknorm_rope import (
     fused_inplace_qknorm_rope,
 )
 from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
+    indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
@@ -261,11 +262,10 @@ def _modulate_gate(
     dtype: torch.dtype,
     allow_inplace: bool = True,
 ) -> torch.Tensor:
-    """Apply indexed gated residual, reusing disposable CUDA BF16 input."""
+    """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
-        allow_inplace
-        and x.is_cuda
+        x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and gate.dtype == _BF16_DTYPE
@@ -273,7 +273,9 @@ def _modulate_gate(
         and x.is_contiguous()
         and other.is_contiguous()
     ):
-        return indexed_gate_bf16_(x, gate, other, indices)
+        if allow_inplace:
+            return indexed_gate_bf16_(x, gate, other, indices)
+        return indexed_gate_bf16(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -893,6 +895,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
         )
+        self.preserve_input_for_cache_dit = False
 
     def forward(
         self,
@@ -917,15 +920,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         if adaln_params is None:
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
-        # Cache-DiT keeps the block-stack input by reference to measure its
-        # Fn/Bn residuals. Only the first gated residual writes to that tensor,
-        # so only it has to give up the fused in-place kernel; the second one
-        # operates on a buffer this block just allocated and nothing outside
-        # holds a reference to it.
-        preserve_input = getattr(
-            self, "_sglang_cache_dit_force_out_of_place_residual", False
-        )
-
+        # Cache-DiT retains the inputs to its Fn and Mn block ranges. Only the
+        # first gated residual writes to that tensor; the second one operates on
+        # a block-local buffer.
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(
@@ -945,7 +942,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
-            allow_inplace=not preserve_input,
+            allow_inplace=not self.preserve_input_for_cache_dit,
         )
 
         residual = x
@@ -1194,6 +1191,37 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
+
+    def configure_cache_dit_input_preservation(
+        self,
+        *,
+        fn_compute_blocks: int | None,
+        bn_compute_blocks: int,
+    ) -> None:
+        """Preserve the two block-stack inputs retained by Cache-DiT Pattern 3."""
+        for block in self.blocks:
+            block.preserve_input_for_cache_dit = False
+
+        if fn_compute_blocks is None:
+            return
+
+        num_blocks = len(self.blocks)
+        if not 1 <= fn_compute_blocks <= num_blocks:
+            raise ValueError(
+                f"Fn_compute_blocks must be in [1, {num_blocks}], "
+                f"got {fn_compute_blocks}."
+            )
+        if not 0 <= bn_compute_blocks <= num_blocks:
+            raise ValueError(
+                f"Bn_compute_blocks must be in [0, {num_blocks}], "
+                f"got {bn_compute_blocks}."
+            )
+
+        self.blocks[0].preserve_input_for_cache_dit = True
+        first_middle_block = fn_compute_blocks
+        middle_end = num_blocks - bn_compute_blocks
+        if first_middle_block < middle_end:
+            self.blocks[first_middle_block].preserve_input_for_cache_dit = True
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
