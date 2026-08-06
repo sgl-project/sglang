@@ -421,6 +421,38 @@ class TestCandidateLifecycle(unittest.TestCase):
             "released the sole host copy of a device-evicted node",
         )
 
+    def test_recomputed_node_reenters_candidates(self):
+        """A durable node demoted to host-only and later recomputed on device
+        holds a redundant mirror again.  The insert() recomputation path must
+        re-register it, or the mirror stays pinned forever — quietly
+        rebuilding the very leak this feature removes under
+        evict-then-recompute churn."""
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+
+        cache = _build_cache()
+        cache.is_eagle = False
+        node = _node(n_pages=1, tag="a", parent=cache.root_node)
+        _ack_node(cache, node)
+        cache.drain_storage_control_queues()  # durable + candidate
+        self.assertIn(node, cache.redundant_host_nodes)
+
+        cache._evict_backuped(node)  # demote: host copy is the only copy
+        self.assertNotIn(node, cache.redundant_host_nodes)
+
+        # KV recomputation restores the device copy for the same prefix
+        cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids=list(range(PAGE))),
+                value=torch.arange(PAGE),
+            )
+        )
+        self.assertIsNotNone(node.value)
+        self.assertIn(
+            node,
+            cache.redundant_host_nodes,
+            "recomputed durable node never re-entered the release candidates",
+        )
+
     def test_released_parent_with_demoted_children_restages(self):
         """Load-test regression: released-mirror parent + host-only children.
         1) the all-children-evicted re-push hands the parent to the

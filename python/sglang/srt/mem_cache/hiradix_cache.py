@@ -2449,6 +2449,10 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
+                    # recomputation restored the device copy: a durable host
+                    # copy is a redundant mirror again and must re-enter the
+                    # release candidates, or it stays pinned forever.
+                    self._update_redundant_host_status(node)
                 else:
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
@@ -2464,6 +2468,8 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
+                    # see the full-match recomputation branch above
+                    self._update_redundant_host_status(new_node)
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
