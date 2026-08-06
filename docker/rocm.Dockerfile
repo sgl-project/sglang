@@ -160,7 +160,7 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 ARG BRANCH_TYPE=remote
 
 # Version override for setuptools_scm (used in nightly builds)
-ARG SGLANG_VERSION=""
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
@@ -362,7 +362,7 @@ ARG BUILD_TYPE=all
 
 # Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
 # pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
-ARG SGLANG_VERSION
+ARG SETUPTOOLS_SCM_PRETEND_VERSION
 
 RUN pip install IPython \
     && pip install orjson \
@@ -411,9 +411,9 @@ RUN cd sglang \
          *)           CT_EXTRA="rocm_legacy" ;; \
        esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
        else \
-         SETUPTOOLS_SCM_PRETEND_VERSION="${SGLANG_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip,${CT_EXTRA}]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip,${CT_EXTRA}]"; \
        fi
 
 RUN python -m pip cache purge
