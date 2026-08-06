@@ -9194,12 +9194,14 @@ class ServerArgs:
         """Transport backend for modelexpress."""
         return self._parsed_modelexpress_config.get("transport", "nixl")
 
-    def remote_instance_weight_loader_use_transfer_engine(self):
+    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
+        """``load_format`` overrides the seed's: a draft runner loading under
+        ``--speculative-draft-load-format`` needs its own transfer engine."""
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # Use TransferEngine as client backend.
-        if self.load_format == "remote_instance" and (
+        if (load_format or self.load_format) == "remote_instance" and (
             self.remote_instance_weight_loader_backend == "transfer_engine"
             or (
                 self.remote_instance_weight_loader_backend == "modelexpress"

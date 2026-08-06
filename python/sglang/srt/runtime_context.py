@@ -636,8 +636,13 @@ class _ConfigBag:
 
     @contextmanager
     def override(self, **kwargs):
-        """Scoped, transactional test-only override of this bag's own leaves
-        (keys validated before any write; restored on exit)."""
+        """Scoped, transactional override of this bag's own leaves (keys
+        validated before any write; restored on exit).
+
+        For a window where one runner's value differs from the process's — a
+        draft model loading under ``--speculative-draft-load-format`` while the
+        target keeps ``--load-format`` — and for tests forcing a code path.
+        A permanent change goes through ``get_context().override``."""
         fields = object.__getattribute__(self, "_fields")
         unknown = set(kwargs) - set(fields)
         if unknown:
