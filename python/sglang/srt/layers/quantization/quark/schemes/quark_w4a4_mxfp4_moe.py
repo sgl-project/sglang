@@ -444,8 +444,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             )
             inter_pad = max(0, w2_down_dim * 2 - real_inter)
 
-        quantized_weights, quantized_scales = [], []
-        for expert_idx in range(packed_weight.shape[0]):
+        num_experts = packed_weight.shape[0]
+        # Write each expert's MXFP4 result into a preallocated destination
+        mxfp4_weight = None
+        mxfp4_scale = None
+        for expert_idx in range(num_experts):
             if prefix == "w13":
                 # weight_scale_2[expert_idx] = [gate_scale, up_scale]; the fused
                 # weight is [gate_rows; up_rows] so expand each scalar over its
@@ -485,17 +488,28 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             requantized_weight, requantized_scale = dynamic_mxfp4_quant(
                 dequantized_weight
             )
-            quantized_weights.append(requantized_weight)
-            quantized_scales.append(requantized_scale)
+            if mxfp4_weight is None:
+                mxfp4_weight = torch.empty(
+                    (num_experts, *requantized_weight.shape),
+                    dtype=requantized_weight.dtype,
+                    device=requantized_weight.device,
+                )
+                mxfp4_scale = torch.empty(
+                    (num_experts, *requantized_scale.shape),
+                    dtype=requantized_scale.dtype,
+                    device=requantized_scale.device,
+                )
+            mxfp4_weight[expert_idx] = requantized_weight
+            mxfp4_scale[expert_idx] = requantized_scale
         setattr(
             layer,
             f"{prefix}_weight",
-            torch.nn.Parameter(torch.stack(quantized_weights), requires_grad=False),
+            torch.nn.Parameter(mxfp4_weight, requires_grad=False),
         )
         setattr(
             layer,
             f"{prefix}_weight_scale",
-            torch.nn.Parameter(torch.stack(quantized_scales), requires_grad=False),
+            torch.nn.Parameter(mxfp4_scale, requires_grad=False),
         )
 
     def get_online_weight_loader(self, layer, original_weight_loader):
