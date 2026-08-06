@@ -418,7 +418,7 @@ class SchedulePolicy:
     def _sort_by_priority_and_fcfs(
         waiting_queue: List[Req], priority_sign: int
     ) -> None:
-        """Sorts the waiting queue based on the request priority then received titmestamp."""
+        """Sorts the waiting queue based on the request priority then received timestamp."""
         waiting_queue.sort(
             key=lambda x: (
                 x.priority * priority_sign,
