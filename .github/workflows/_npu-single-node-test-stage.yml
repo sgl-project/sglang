@@ -68,7 +68,7 @@ jobs:
         env:
           SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
         with:
-          github-token: ${{ inputs.github-token }}
+          github-token: ${{ inputs.github-token || github.token }}
           script: |
             // Skip when explicitly requested via env var (e.g. release branch cut)
             if (process.env.SKIP_PR_TEST_HEALTH_CHECK === 'true') {
