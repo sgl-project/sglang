@@ -94,8 +94,6 @@ async fn model_info(State(state): State<AppState>) -> Response {
 /// `GET /server_info` — surface only an allowlist ([`INTERNAL_STATE_ALLOWLIST`] +
 /// curated [`ServerArgs`] accessors), never the raw server-args dump (embeds
 /// `api_key`/`admin_api_key`; see [`shape_server_info`]).
-///
-/// TODO(server_info): Python also includes `kv_events`; add once plumbed.
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(
         &state,
@@ -162,6 +160,7 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "max_context_length": server_args.model_config.context_len,
         "max_total_num_tokens": server_args.max_total_num_tokens,
         "version": server_args.version,
+        "kv_events": server_args.describe_kv_events_publisher(),
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())
@@ -171,6 +170,21 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
 mod tests {
     use super::*;
 
+    fn msgpack_with_internal_state(entries: Vec<(rmpv::Value, rmpv::Value)>) -> Vec<u8> {
+        let internal = rmpv::Value::Map(entries);
+        let outer = rmpv::Value::Map(vec![(rmpv::Value::from("internal_state"), internal)]);
+        let mut msgpack = Vec::new();
+        rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
+        msgpack
+    }
+
+    fn shape_for_args(args: serde_json::Value) -> serde_json::Value {
+        let msgpack = msgpack_with_internal_state(Vec::new());
+        let sa = ServerArgs::from_json(&args.to_string()).unwrap();
+        let out = shape_server_info(&msgpack, &sa).unwrap();
+        serde_json::from_slice(&out).unwrap()
+    }
+
     /// The scheduler's `internal_state` embeds the full server-args dump (incl.
     /// `api_key`/`admin_api_key`). `/server_info` must surface only the allowlisted
     /// runtime metrics + curated config — never the secrets — and must not re-nest
@@ -178,7 +192,8 @@ mod tests {
     #[test]
     fn shape_server_info_excludes_secrets_and_dump() {
         // GetInternalStateReqOutput.asdict → { "internal_state": { …dump+metrics… } }.
-        let internal = rmpv::Value::Map(vec![
+        let raw_kv_events_config = r#"{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv","password":"nested-secret"}"#;
+        let msgpack = msgpack_with_internal_state(vec![
             (
                 rmpv::Value::from("api_key"),
                 rmpv::Value::from("secret-token"),
@@ -189,6 +204,10 @@ mod tests {
             ),
             (rmpv::Value::from("model_path"), rmpv::Value::from("/m")),
             (
+                rmpv::Value::from("kv_events_config"),
+                rmpv::Value::from(raw_kv_events_config),
+            ),
+            (
                 rmpv::Value::from("last_gen_throughput"),
                 rmpv::Value::from(1.5),
             ),
@@ -197,12 +216,18 @@ mod tests {
                 rmpv::Value::from(32),
             ),
         ]);
-        let outer = rmpv::Value::Map(vec![(rmpv::Value::from("internal_state"), internal)]);
-        let mut msgpack = Vec::new();
-        rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
 
-        let sa =
-            ServerArgs::from_json(r#"{"model_path": "/m", "api_key": "secret-token"}"#).unwrap();
+        let sa = ServerArgs::from_json(
+            &serde_json::json!({
+                "model_path": "/m",
+                "api_key": "secret-token",
+                "kv_events_config": raw_kv_events_config,
+                "page_size": 64,
+                "dp_size": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
         let out = shape_server_info(&msgpack, &sa).unwrap();
         let text = String::from_utf8(out.clone()).unwrap();
         // No secret leaks anywhere in the serialized response.
@@ -210,6 +235,14 @@ mod tests {
         assert!(
             !text.contains("admin-token"),
             "admin_api_key leaked: {text}"
+        );
+        assert!(
+            !text.contains("nested-secret"),
+            "kv_events_config leaked: {text}"
+        );
+        assert!(
+            !text.contains("kv_events_config"),
+            "raw kv_events_config key leaked: {text}"
         );
 
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -224,5 +257,142 @@ mod tests {
         assert!(state0.get("api_key").is_none());
         // Curated top-level config comes from typed accessors, not the dump.
         assert_eq!(v["model_path"], "/m");
+        assert_eq!(v["kv_events"]["publisher"], "zmq");
+    }
+
+    #[test]
+    fn shape_server_info_includes_kv_events_descriptor_when_enabled() {
+        let v = shape_for_args(serde_json::json!({
+            "model_path": "/m",
+            "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}"#,
+            "page_size": 64,
+            "dp_size": 2,
+        }));
+
+        assert_eq!(
+            v["kv_events"],
+            serde_json::json!({
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn shape_server_info_includes_kv_events_descriptor_with_explicit_host() {
+        let v = shape_for_args(serde_json::json!({
+            "model_path": "/m",
+            "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://0.0.0.0:7777","topic":"kv"}"#,
+            "page_size": 128,
+            "dp_size": 1,
+        }));
+
+        assert_eq!(v["kv_events"]["endpoint_host"], "0.0.0.0");
+        assert_eq!(v["kv_events"]["endpoint_port_base"], 7777);
+        assert_eq!(v["kv_events"]["topic"], "kv");
+        assert_eq!(v["kv_events"]["block_size"], 128);
+        assert_eq!(v["kv_events"]["dp_size"], 1);
+    }
+
+    #[test]
+    fn shape_server_info_kv_events_null_for_disabled_or_invalid_config() {
+        let good_cfg = r#"{"publisher":"zmq","endpoint":"tcp://*:5557","topic":""}"#;
+        let cases = [
+            (
+                "no config",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "publisher null",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": r#"{"publisher":"null"}"#,
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "malformed json",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": "not-json",
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "non-tcp endpoint",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"inproc://cache","topic":""}"#,
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "missing port",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://0.0.0.0","topic":""}"#,
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "non-integer port",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://0.0.0.0:abc","topic":""}"#,
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "zero port",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://0.0.0.0:0","topic":""}"#,
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "port too large",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": r#"{"publisher":"zmq","endpoint":"tcp://0.0.0.0:65536","topic":""}"#,
+                    "page_size": 64,
+                }),
+            ),
+            (
+                "missing page size",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": good_cfg,
+                }),
+            ),
+            (
+                "zero page size",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": good_cfg,
+                    "page_size": 0,
+                }),
+            ),
+            (
+                "negative page size",
+                serde_json::json!({
+                    "model_path": "/m",
+                    "kv_events_config": good_cfg,
+                    "page_size": -1,
+                }),
+            ),
+        ];
+
+        for (name, args) in cases {
+            let v = shape_for_args(args);
+            assert!(v["kv_events"].is_null(), "{name}: {:?}", v["kv_events"]);
+        }
     }
 }

@@ -144,6 +144,17 @@ pub struct ServerArgs {
     pub version: Option<String>,
     #[serde(default)]
     pub max_total_num_tokens: Option<u64>,
+    /// Raw Python `--kv-events-config`; parsed only into the safe `/server_info`
+    /// descriptor, never exposed verbatim.
+    #[serde(default)]
+    pub kv_events_config: Option<String>,
+    /// KV cache page size, advertised as the KV-events block size when the
+    /// scheduler-side publisher is enabled.
+    #[serde(default)]
+    pub page_size: Option<i64>,
+    /// Number of data-parallel KV-event publishers a consumer should subscribe to.
+    #[serde(default = "default_dp_size")]
+    pub dp_size: i64,
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
@@ -218,6 +229,25 @@ fn default_disaggregation_mode() -> String {
 }
 fn default_worker_num() -> usize {
     1
+}
+fn default_dp_size() -> i64 {
+    1
+}
+fn default_kv_events_publisher() -> String {
+    "null".into()
+}
+fn default_kv_events_endpoint() -> String {
+    "tcp://*:5557".into()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct KvEventsConfig {
+    #[serde(default = "default_kv_events_publisher")]
+    publisher: String,
+    #[serde(default = "default_kv_events_endpoint")]
+    endpoint: String,
+    #[serde(default)]
+    topic: String,
 }
 
 impl ServerArgs {
@@ -296,5 +326,37 @@ impl ServerArgs {
     pub fn api_worker_num(&self) -> usize {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
+    }
+
+    /// Structured KV-event publisher descriptor for `/server_info`.
+    ///
+    /// Mirrors Python `ServerArgs.describe_kv_events_publisher`: malformed or
+    /// non-routable configs are reported as `null` so `/server_info` remains
+    /// available, and raw config strings are never exposed.
+    pub fn describe_kv_events_publisher(&self) -> Option<serde_json::Value> {
+        let raw = self.kv_events_config.as_deref().filter(|s| !s.is_empty())?;
+        let page_size = self.page_size.filter(|page_size| *page_size > 0)?;
+
+        let cfg: KvEventsConfig = serde_json::from_str(raw).ok()?;
+        if cfg.publisher == "null" || cfg.endpoint.is_empty() {
+            return None;
+        }
+
+        let body = cfg.endpoint.strip_prefix("tcp://")?;
+        let last_colon = body.rfind(':')?;
+        let host = &body[..last_colon];
+        let port = body[last_colon + 1..].trim().parse::<i64>().ok()?;
+        if host.is_empty() || !(1..=65535).contains(&port) {
+            return None;
+        }
+
+        Some(serde_json::json!({
+            "publisher": cfg.publisher,
+            "endpoint_host": host,
+            "endpoint_port_base": port,
+            "topic": cfg.topic,
+            "block_size": page_size,
+            "dp_size": self.dp_size,
+        }))
     }
 }
