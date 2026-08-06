@@ -504,6 +504,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.captured_req_width
+        raw_out_cache_loc = forward_batch.out_cache_loc
 
         # Pad to nearest captured shape
         if self.require_mlp_tp_gather:
@@ -580,6 +581,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
+
+        # CUDA-graph metadata and the captured draft forwards must read the
+        # static, bucket-padded cache-location buffer.  Keeping the live raw
+        # tensor here makes batch_size refer to the padded graph bucket while
+        # out_cache_loc still has raw_bs * topk * num_steps entries.  Hybrid
+        # SWA then cannot select one draft step and may overflow its per-step
+        # metadata buffer.
+        forward_batch.out_cache_loc = buffers.out_cache_loc[
+            : num_tokens * self.speculative_num_steps
+        ]
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
@@ -681,5 +692,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
             forward_batch.seq_lens_sum = raw_seq_lens_sum
+
+        forward_batch.out_cache_loc = raw_out_cache_loc
 
         return out

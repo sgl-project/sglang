@@ -143,13 +143,22 @@ class DotsHybridAttnBackend(AttentionBackend):
 
         bs = forward_batch.batch_size
         block_table = normalize_page_table_rows(block_table, bs)
+        cache_seqlens = metadata.cache_seqlens_int32
+        if cache_seqlens.shape[0] != bs:
+            # A DP-idle row can be appended after draft metadata is planned.
+            # Use its normalized dummy length solely to keep row shapes equal.
+            cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         output = forward_dense_kvlora_swa_torch_fallback(
             reshape_q=reshape_q,
             k_cache=k_cache,
             block_table=block_table,
-            cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+            # Use the backend's phase-adjusted length: target verify includes
+            # every proposed token, while draft step i includes its prefix of
+            # speculative tokens.  forward_batch.seq_lens is the unadjusted
+            # prefix and shifts both the gather and causal mask backwards.
+            cache_seqlens=cache_seqlens,
             layer=layer,
             kv_cache_dim=layer.head_dim,
             head_dim_v=layer.v_head_dim,

@@ -3202,13 +3202,23 @@ class FlashAttentionBackend(AttentionBackend):
             raise RuntimeError("SWA latent attention requires an SWA page table.")
         bs = forward_batch.batch_size
         block_table = normalize_page_table_rows(metadata.swa_page_table, bs)
+        cache_seqlens = metadata.cache_seqlens_int32
+        if cache_seqlens.shape[0] != bs:
+            # DP may synthesize an idle row after per-step metadata planning.
+            # It has no semantic KV state, but the fallback still requires all
+            # row-shaped inputs to agree so the rank can join collectives.
+            cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         output = forward_dense_kvlora_swa_torch_fallback(
             reshape_q=reshape_q,
             k_cache=k_cache,
             block_table=block_table,
-            cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+            # Metadata carries the phase-adjusted KV length.  In particular,
+            # target verify includes all proposed tokens and each draft
+            # backend includes the tokens produced up to its step.  The raw
+            # ForwardBatch length is only the pre-speculation prefix.
+            cache_seqlens=cache_seqlens,
             layer=layer,
             kv_cache_dim=layer.head_dim,
             head_dim_v=layer.v_head_dim,
