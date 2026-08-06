@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 
-import psutil
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
@@ -31,13 +30,13 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import memory_available_bytes
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -657,9 +656,8 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
