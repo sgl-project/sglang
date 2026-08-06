@@ -13,6 +13,7 @@ after an intervening spin_wait, which orders the rewrite after the peer's
 read of that slot.
 """
 
+import inspect
 import logging
 import os
 from collections import OrderedDict
@@ -127,11 +128,32 @@ class IpcA2AState:
         pf, pa = theirs[0]
         pa = list(pa)
         dev = torch.cuda.current_device()
+        # The peer's reduce_tensor tuple targets the producer's device. Torch's
+        # rebuild_*_tensor API carries the storage device both as a positional
+        # `storage_device` argument and inside the `torch.device` entries, so
+        # locate it by parameter name rather than by hard-coded index: the arg
+        # order of torch's internal rebuild functions may change between
+        # versions, and silently mapping the wrong slot onto this device would
+        # dereference peer mappings on the wrong GPU.
+        storage_device_index = None
+        try:
+            names = list(inspect.signature(pf).parameters)
+            storage_device_index = (
+                names.index("storage_device") if "storage_device" in names else None
+            )
+        except (TypeError, ValueError):
+            # Builtin/opaque rebuild callables without an introspectable
+            # signature fall back to no index rewrite; the torch.device entries
+            # below still get remapped.
+            pass
         for i, v in enumerate(pa):
             if isinstance(v, torch.device):
                 pa[i] = torch.device(f"cuda:{dev}")
-            elif isinstance(v, int) and i == 6:
-                # rebuild_cuda_tensor positional device index
+            elif (
+                storage_device_index is not None
+                and isinstance(v, int)
+                and i == storage_device_index
+            ):
                 pa[i] = dev
         return pf(*pa)
 
