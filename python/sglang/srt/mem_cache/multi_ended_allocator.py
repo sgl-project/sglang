@@ -136,6 +136,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
         # that space. 1 for sub-pools whose kernels take real physical ids.
         self.kernel_page_multiplier = kernel_page_multiplier
+        # Zero page envelopes on hand-out — see _maybe_zero_pages. Enabled for
+        # the MLA-dense full pool (kernel_page_multiplier > 1), whose consumer
+        # kernels arithmetically mask (NaN-unsafe) the unwritten tail rows.
+        self._zero_pages_on_alloc = kernel_page_multiplier > 1 and hasattr(
+            kvcache, "zero_physical_pages"
+        )
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -617,6 +623,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
                 if self.lazy_compaction:  # live_page_count tracked only in lazy mode
                     self.live_page_count += N
+                self._maybe_zero_pages(phys_pages)
                 return phys_pages
 
             # SLOW PATH: holes exist — drain them first, then bind.
@@ -624,7 +631,29 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if phys_pages is None:
                 return None
             self.bind(v_pages, phys_pages)
+            self._maybe_zero_pages(phys_pages)
             return phys_pages
+
+    def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero the page ENVELOPES on hand-out (MLA-dense full pool only).
+
+        The trtllm MLA attention kernel reads whole pages and masks rows
+        beyond seq_len ARITHMETICALLY — NaN (and exp-overflow-huge) garbage in
+        the never-written tail rows of a request's last partial page leaks
+        straight into the output (unit sentinel + in-system poison run: pool
+        NaN-fill => GSM8K collapses with an all-NaN victim-row signature).
+        Static pools are safe by construction (torch.zeros + only finite KV
+        ever written); give the shared pool the same guarantee at the alloc
+        boundary: every page leaves the allocator zeroed, whether fresh
+        (watermark) or recycled (old bytes discarded). Cost: one contiguous
+        page-envelope memset per handed-out page, on the schedule stream,
+        ordered before the consuming forward by the run_batch wait_stream
+        fence.
+        """
+        if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
+            return
+        with record_function("MultiEndedAlloc._maybe_zero_pages"):
+            self._kvcache.zero_physical_pages(phys_pages)
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 

@@ -685,6 +685,22 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
             )
             env[tgt_pages] = env[src_pages]
 
+    def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator hand-out.
+
+        Guarantees the never-written tail rows of a request's last partial
+        page read as 0.0: the trtllm MLA kernel masks those rows
+        arithmetically, so NaN / exp-overflow-huge garbage there leaks into
+        the attention output (proven by the NaN-poison harness). Zeros give
+        the shared pool the same safety static pools get from torch.zeros.
+        """
+        if phys_pages.numel() == 0:
+            return
+        env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
+            self._num_pages, self._page_bytes
+        )
+        env[phys_pages.to(torch.long)] = 0
+
 
 class UnifiedMambaPool(MambaPool):
     """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
