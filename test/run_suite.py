@@ -109,6 +109,10 @@ PER_COMMIT_SUITES = {
         "base-c-test-acc-4-npu-a3",
         "base-c-test-acc-8-npu-a3",
         "base-c-test-acc-16-npu-a3",
+        "base-c-test-perf-2-npu-a3",
+        "base-c-test-perf-4-npu-a3",
+        "base-c-test-perf-8-npu-a3",
+        "base-c-test-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
         "stage-a-test-1-gpu-xpu",
