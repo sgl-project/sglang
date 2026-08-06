@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
@@ -39,10 +40,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
 )
+
+_is_npu = current_platform.is_npu()
 
 LTX23_RES2S_STEP_NOISE_SEED = -1
 LTX23_RES2S_SUBSTEP_NOISE_SEED = 9999
@@ -521,7 +527,7 @@ class LTX2DenoisingStage(DenoisingStage):
         noise = torch.randn(
             reference_tensor.shape,
             generator=generator,
-            dtype=torch.float64,
+            dtype= torch.float32 if _is_npu else torch.float64,
             device=reference_tensor.device,
         )
         noise = (noise - noise.mean()) / noise.std()
