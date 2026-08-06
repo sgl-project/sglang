@@ -13,6 +13,14 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+from sglang.srt.utils import is_hip
+
+# On DCU/ROCm (e.g. Hygon K100_AI, gfx928) the shared-memory budget is 64 KB
+# per workgroup. The multi-stage pipelined configs below (num_stages >= 2)
+# request ~68 KB of shared memory and crash with
+# "OutOfResources: shared memory 69632 > 65536". Restrict to num_stages=1 on
+# HIP so the kernel fits; CUDA keeps the wider autotune grid.
+_PREFILL_NUM_STAGES = (1,) if is_hip() else (2, 3, 4)
 
 
 @triton.heuristics(
@@ -36,7 +44,7 @@ from ..common.utils import (
     configs=[
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in (2, 4, 8)
-        for ns in (2, 3, 4)
+        for ns in _PREFILL_NUM_STAGES
     ],
     key=[
         "BLOCK_SIZE_Q",
