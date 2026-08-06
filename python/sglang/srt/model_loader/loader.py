@@ -586,7 +586,6 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_server_args()
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             weight_loader_prefetch = get_model().weight_loader_prefetch_checkpoints
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads

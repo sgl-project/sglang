@@ -43,7 +43,7 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -134,7 +134,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
-        server_args = get_server_args()
         if get_exec().moe.disable_shared_experts_fusion:
             return
 
