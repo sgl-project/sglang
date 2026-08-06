@@ -242,6 +242,8 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+    import deep_gemm
+
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
