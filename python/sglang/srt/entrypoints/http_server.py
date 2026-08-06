@@ -421,12 +421,14 @@ async def lifespan(fast_api_app: FastAPI):
 
                 sidecar = start_sidecar(server_args)
 
+        # Execute the general warmup
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             kwargs=warmup_thread_kwargs,
         )
         warmup_thread.start()
 
+        # Start the HTTP server
         yield
     finally:
         if sidecar is not None:
