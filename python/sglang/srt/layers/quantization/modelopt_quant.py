@@ -1257,8 +1257,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return 80
 
     @staticmethod
-    def common_group_size(cfg: dict) -> int:
-        """Return the unique group_size across the config; raise if missing/mismatched."""
+    def common_group_size(cfg: dict, *, allow_missing: bool = False) -> Optional[int]:
+        """Return the unique group_size, or None when missing is allowed."""
         sizes = set()
 
         # Top-level and 'quantization' block
@@ -1284,6 +1284,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                             sizes.add(v)
 
         if not sizes:
+            if allow_missing:
+                return None
             raise ValueError("No group_size found in config.")
         if len(sizes) > 1:
             raise ValueError(f"Inconsistent group_size values: {sorted(sizes)}")
@@ -1327,15 +1329,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             else:
                 kv_cache_quant_algo = config.get("kv_cache_quant_algo") or "auto"
 
-            group_size = config.get("group_size")
-            # If group_size is not at top level, try to extract from config_groups
-            if group_size is None:
-                config_groups = config.get("config_groups", {})
-                if config_groups:
-                    # Get group_size from the first group's weights config
-                    first_group = next(iter(config_groups.values()), {})
-                    weights_config = first_group.get("weights", {})
-                    group_size = weights_config.get("group_size")
+            group_size = cls.common_group_size(config, allow_missing=True)
             # NVFP4 (incl. NVFP4_AWQ) always uses group_size 16
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
