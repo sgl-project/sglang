@@ -2,6 +2,7 @@ import logging
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,7 +16,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     Rules enforced when clipping a request's max_new_tokens:
       1. context: input_len + max_new_tokens < max_req_len
       2. admission budget (PrefillAdder):
-         ceil_page(input_len) + max_new_tokens + page_size < max_total_num_tokens
+         ceil_page(input_len) + max_new_tokens + page_size < generation capacity
+         (logical per-request capacity for HiSparse decode, physical otherwise)
       3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
       4. never above the requested value
       5. min_new_tokens <= max_new_tokens afterwards
@@ -40,12 +42,22 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         self,
         max_req_len: int = 128,
         max_total_num_tokens: int = 1024,
+        max_req_token_capacity: int | None = None,
         page_size: int = 1,
+        enable_hisparse: bool = False,
+        disaggregation_mode: DisaggregationMode = DisaggregationMode.NULL,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
+        scheduler.max_req_token_capacity = (
+            max_total_num_tokens
+            if max_req_token_capacity is None
+            else max_req_token_capacity
+        )
         scheduler.page_size = page_size
+        scheduler.enable_hisparse = enable_hisparse
+        scheduler.disaggregation_mode = disaggregation_mode
         scheduler.server_args = SimpleNamespace(dcp_size=1)
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
@@ -71,11 +83,17 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         paged_input_len = -(-input_len // page_size) * page_size
         limit = scheduler.max_new_tokens_limit
         limit_active = limit is not None and limit > 0
+        generation_token_capacity = (
+            scheduler.max_req_token_capacity
+            if scheduler.enable_hisparse
+            and scheduler.disaggregation_mode == DisaggregationMode.DECODE
+            else scheduler.max_total_num_tokens * scheduler.server_args.dcp_size
+        )
 
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate < scheduler.max_req_len
             budget_ok = (
-                paged_input_len + candidate + page_size < scheduler.max_total_num_tokens
+                paged_input_len + candidate + page_size < generation_token_capacity
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -135,6 +153,30 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 self._init_and_check(scheduler, req),
                 max_total_num_tokens - paged_input_len - page_size - 1,
             )
+
+    def test_hisparse_decode_uses_logical_generation_capacity(self):
+        scheduler = self._new_scheduler(
+            max_req_len=4095,
+            max_total_num_tokens=1024,
+            max_req_token_capacity=4096,
+            enable_hisparse=True,
+            disaggregation_mode=DisaggregationMode.DECODE,
+        )
+        req = self._new_req(max_new_tokens=128, input_len=2048)
+
+        self.assertEqual(self._init_and_check(scheduler, req), 128)
+        self.assertEqual(scheduler.max_total_num_tokens, 1024)
+
+    def test_hisparse_aggregate_keeps_physical_generation_capacity(self):
+        scheduler = self._new_scheduler(
+            max_req_len=4095,
+            max_total_num_tokens=1024,
+            max_req_token_capacity=4096,
+            enable_hisparse=True,
+        )
+        req = self._new_req(max_new_tokens=128, input_len=900)
+
+        self.assertEqual(self._init_and_check(scheduler, req), 122)
 
     def test_min_new_tokens_clamped_to_limit(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
