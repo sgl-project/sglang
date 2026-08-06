@@ -1779,7 +1779,8 @@ class ServerArgs:
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
                 "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "temporarily skips mxfp8_gemm by default due to an IMA, "
+                "except for the FlashInfer CuTeDSL backend."
             ),
             nargs="+",
         ),
