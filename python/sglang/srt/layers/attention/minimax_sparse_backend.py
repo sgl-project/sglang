@@ -19,6 +19,11 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    build_ragged_target_verify_geometry,
+    resolve_ragged_verify_layout,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -195,8 +200,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
-        # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
-        # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
+        # cuda-graph replay views may not carry extend_seq_lens_cpu;
+        # getattr covers those replay-only views.
         self._msa_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
@@ -334,37 +339,61 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         extend_seq_lens = forward_batch.extend_seq_lens
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        ragged_layout = (
+            resolve_ragged_verify_layout(forward_batch)
+            if forward_batch.forward_mode.is_target_verify()
+            else None
+        )
 
-        if extend_seq_lens is None and forward_batch.forward_mode.is_target_verify():
-            spec_info = forward_batch.spec_info
-            if spec_info is None:
+        if ragged_layout is not None:
+            ragged_geometry = build_ragged_target_verify_geometry(
+                seq_lens=forward_batch.seq_lens,
+                layout=ragged_layout,
+            )
+            cu_seqlens = ragged_geometry.cu_seqlens_q
+            seq_lens = ragged_geometry.cache_seqlens_int32
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = ragged_layout.verify_lens_cpu
+        elif extend_seq_lens is not None:
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=extend_seq_lens.device),
+                    extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                ]
+            )
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            if forward_batch.extend_prefix_lens is not None:
+                prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+            else:
+                prefix_lens = torch.zeros_like(seq_lens)
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = int(forward_batch.seq_lens.shape[0])
+            if bs <= 0 or q.shape[0] % bs != 0:
                 raise ValueError(
-                    "MiniMax sparse TARGET_VERIFY requires spec_info when "
-                    "extend_seq_lens is absent."
+                    "MiniMax sparse TARGET_VERIFY capture requires q rows to be "
+                    f"divisible by batch size, got q.shape[0]={q.shape[0]}, bs={bs}."
                 )
-            verify_len = spec_info.draft_token_num
-            extend_seq_lens = torch.full(
-                (forward_batch.batch_size,),
+            verify_len = q.shape[0] // bs
+            verify_lens = torch.full(
+                (bs,),
                 verify_len,
                 dtype=torch.int32,
                 device=q.device,
             )
-            extend_seq_lens_cpu = [verify_len] * forward_batch.batch_size
-
-        if extend_seq_lens is None:
-            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
-
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=extend_seq_lens.device),
-                extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
-            ]
-        )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
-            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+            capture_layout = RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=verify_lens,
+                graph_num_tokens=q.shape[0],
+            )
+            ragged_geometry = build_ragged_target_verify_geometry(
+                seq_lens=forward_batch.seq_lens,
+                layout=capture_layout,
+            )
+            cu_seqlens = ragged_geometry.cu_seqlens_q
+            seq_lens = ragged_geometry.cache_seqlens_int32
+            prefix_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = [verify_len] * bs
         else:
-            prefix_lens = torch.zeros_like(seq_lens)
+            raise ValueError("MiniMax sparse forward_extend requires extend_seq_lens.")
 
         # DP attention pads q beyond the real token count for collective alignment;
         # trim to actual tokens so the sparse kernel sees consistent shapes.
