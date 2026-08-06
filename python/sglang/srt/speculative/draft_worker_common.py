@@ -14,7 +14,6 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -68,10 +67,11 @@ def build_draft_tp_worker(
     gpu_id: int,
     ps: ParallelState,
     nccl_port: int,
-    target_model_config: ModelConfig,
+    target_model_runner: ModelRunner,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
 ) -> DraftWorkerBundle:
+    target_model_config = target_model_runner.model_config
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
     # supported-backend fallback below.
@@ -93,6 +93,20 @@ def build_draft_tp_worker(
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
+
+    # Pool sizing runs after the draft worker is built, so record the loaded
+    # draft's actual KV geometry and resolved dtype for both DFLASH and DSPARK.
+    draft_model_config = draft_model_runner.model_config
+    target_spec_aux_config = target_model_runner.spec_aux_config
+    target_spec_aux_config.dflash_draft_total_num_kv_heads = int(
+        draft_model_config.get_total_num_kv_heads()
+    )
+    target_spec_aux_config.dflash_draft_head_dim = int(draft_model_config.head_dim)
+    target_spec_aux_config.dflash_draft_v_head_dim = int(draft_model_config.v_head_dim)
+    target_spec_aux_config.dflash_draft_kv_element_size = torch._utils._element_size(
+        draft_model_runner.kv_cache_dtype
+    )
+
     return DraftWorkerBundle(
         draft_worker=draft_worker,
         draft_model_runner=draft_model_runner,

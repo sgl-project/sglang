@@ -197,7 +197,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             gpu_id=gpu_id,
             ps=replace(ps, pp_rank=0),
             nccl_port=nccl_port,
-            target_model_config=target_worker.model_runner.model_config,
+            target_model_runner=target_worker.model_runner,
             algo_label="DFLASH",
         )
         self._draft_worker = bundle.draft_worker

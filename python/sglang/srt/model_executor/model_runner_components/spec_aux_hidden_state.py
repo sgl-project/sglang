@@ -23,6 +23,7 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_draft_total_num_kv_heads: Optional[int] = None
     dflash_draft_head_dim: Optional[int] = None
     dflash_draft_v_head_dim: Optional[int] = None
+    dflash_draft_kv_element_size: Optional[int] = None
     dflash_target_layer_ids: Any = None
 
 
@@ -162,12 +163,6 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
-
-            config.dflash_draft_total_num_kv_heads = int(
-                draft_model_config.get_total_num_kv_heads()
-            )
-            config.dflash_draft_head_dim = int(draft_model_config.head_dim)
-            config.dflash_draft_v_head_dim = int(draft_model_config.v_head_dim)
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
