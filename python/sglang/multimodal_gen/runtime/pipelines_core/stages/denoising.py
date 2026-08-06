@@ -101,8 +101,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -118,11 +116,7 @@ from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_ra
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
-)
-from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
-)
-from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
