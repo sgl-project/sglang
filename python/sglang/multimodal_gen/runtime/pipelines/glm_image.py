@@ -19,7 +19,7 @@ logger = init_logger(__name__)
 
 class GlmImageTerminalDecodingStage(DecodingStage):
     @property
-    def role_affinity(self):
+    def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
 
