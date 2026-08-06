@@ -48,12 +48,13 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    maybe_precompile_model_kernels_after_loading,
+)
 from sglang.srt.model_loader import get_model
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -83,6 +84,7 @@ async def _get_receive_condition(req_id: str) -> asyncio.Condition:
 
 
 ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
+ENCODER_MAX_BATCH_SIZE_EXPLICIT = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.is_set()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
@@ -426,10 +428,15 @@ def _normalize_aux_value(val):
 
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
-    return {
+    aux = {
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
     }
+    if model_type == "kimi_k3":
+        aux["original_image_sizes"] = _normalize_aux_value(
+            mm_inputs.get("original_image_sizes")
+        )
+    return aux
 
 
 class MMEncoder:
@@ -442,9 +449,9 @@ class MMEncoder:
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
-        self.transfer_backend = server_args.encoder_transfer_backend
+        publish(server_args, role="encoder")
+        self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
-        set_global_server_args_for_scheduler(server_args)
         self.rank = rank
         # DP rank for metric labels; overridden by encoder_runtime.run_dp_worker.
         # 0 in the single-instance (non-DP) path.
@@ -491,6 +498,7 @@ class MMEncoder:
             load_config=self.load_config,
             device_config=self.device_config,
         )
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
         # CPU preprocessing pipeline (Rust-replaceable)
         self.preprocessor = EncoderPreprocessor(
@@ -501,6 +509,8 @@ class MMEncoder:
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
+        self.scheduler_send_sockets = {}
+        self.scheduler_send_locks = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
@@ -523,19 +533,14 @@ class MMEncoder:
         ).element_size()
         self._embedding_dims = self._infer_embedding_dims()
 
-        if self.server_args.enable_mm_global_cache:
-            from sglang.srt.mem_cache.embedding_cache_controller import (
+        if get_mm().enable_mm_global_cache:
+            from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
-            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
 
-            embedding_store = EmbeddingStoreFactory.create_backend(
-                self.server_args.mm_global_cache_backend,
-            )
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
-                embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
@@ -545,9 +550,11 @@ class MMEncoder:
             self.mm_global_cache = None
 
         if self.rank == 0:
-            logger.info(f"Using transfer backend: {self.transfer_backend}")
+            logger.info(
+                f"Using transfer backend: {get_disagg().encoder_transfer_backend}"
+            )
 
-            if self.use_mooncake:
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
@@ -560,8 +567,8 @@ class MMEncoder:
                         hostname=self.local_ip,
                         gpu_id=self.gpu_id,
                         ib_device=(
-                            self.server_args.disaggregation_ib_device
-                            or self.server_args.mooncake_ib_device
+                            get_disagg().disaggregation_ib_device
+                            or get_exec().moe.mooncake_ib_device
                         ),
                     )
 
@@ -569,7 +576,7 @@ class MMEncoder:
             # Need to ensure the NCCL launch order on rank0 matches the dispatch order rank>0
             self.encode_dispatch_lock = asyncio.Lock()
 
-            if self.use_mooncake:
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 self.delivery = MooncakeDelivery(self)
                 # Embeddings live here, so registry cleanup uses the common release.
                 meta_registry.on_release = self.release_request
@@ -577,7 +584,9 @@ class MMEncoder:
             else:
                 self.delivery = ZmqDelivery(
                     self,
-                    cleanup_receive_state=(self.transfer_backend == "zmq_to_scheduler"),
+                    cleanup_receive_state=(
+                        get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
+                    ),
                 )
 
         logger.info(f"rank {rank} init finish ")
@@ -791,53 +800,14 @@ class MMEncoder:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        mm_inputs = preprocess_result.mm_inputs
-        grid_thw = preprocess_result.grid_thw
         token_counts = preprocess_result.token_counts
-
-        # Audio features are per-item (list of mels for mimo_v2, or batched
-        # N x n_mels x T_max for qwen2_audio); slice by item index and keep
-        # per-item shape. Image/video features are concatenated along the
-        # patch dim; slice by cumulative patch offsets and cat.
-        if modality == Modality.AUDIO:
-            if isinstance(mm_feature, list):
-                sub_feature = [mm_feature[i] for i in indices]
-            else:
-                sub_feature = mm_feature[list(indices)]
-        else:
-            sub_feature_list = []
-            offsets = [0]
-            curr = 0
-            for g in grid_thw:
-                curr += self.preprocessor.get_num_patches(g, modality)
-                offsets.append(curr)
-            for idx in indices:
-                sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
-            sub_feature = torch.cat(sub_feature_list, dim=0)
-
-        mm_item = MultimodalDataItem.from_dict(
-            {
-                "modality": modality,
-                "feature": (
-                    sub_feature
-                    if isinstance(sub_feature, list)
-                    else _convert(sub_feature)
-                ),
-            }
+        mm_items = self._build_model_mm_items(
+            mm_feature, preprocess_result, indices, modality
         )
-
-        for k, v in mm_inputs.items():
-            if k in _mm_feature_attrs.get(modality, []):
-                continue
-            val = _convert(v)
-            if k in _mm_grid_attrs.get(modality, []):
-                mm_item.set(k, val[indices])
-            else:
-                mm_item.set(k, val)
 
         forward_start = time.perf_counter()
         with torch.inference_mode():
-            new_embeddings = get_feature_fn([mm_item])
+            new_embeddings = get_feature_fn(mm_items)
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
         if encoder_metrics_collector is not None:
@@ -846,6 +816,73 @@ class MMEncoder:
             )
 
         return self.slice_embedding(new_embeddings, (token_counts[i] for i in indices))
+
+    def _build_model_mm_items(
+        self,
+        mm_feature,
+        preprocess_result: EncoderPreprocessResult,
+        indices: List[int],
+        modality: Modality,
+    ) -> List[MultimodalDataItem]:
+        """Build model inputs, keeping one logical K3 image per item."""
+        mm_inputs = preprocess_result.mm_inputs
+        grid_thw = preprocess_result.grid_thw
+        split_kimi_k3_images = (
+            self.model_type == "kimi_k3" and modality == Modality.IMAGE
+        )
+
+        if modality == Modality.AUDIO:
+            if isinstance(mm_feature, list):
+                sub_feature = [mm_feature[i] for i in indices]
+            else:
+                sub_feature = mm_feature[list(indices)]
+        else:
+            feature_slices = []
+            offsets = [0]
+            curr = 0
+            for grid in grid_thw:
+                curr += self.preprocessor.get_num_patches(grid, modality)
+                offsets.append(curr)
+            for idx in indices:
+                feature_slices.append(mm_feature[offsets[idx] : offsets[idx + 1]])
+            if not split_kimi_k3_images:
+                sub_feature = torch.cat(feature_slices, dim=0)
+
+        if split_kimi_k3_images:
+            mm_items = [
+                MultimodalDataItem.from_dict(
+                    {"modality": modality, "feature": _convert(feature)}
+                )
+                for feature in feature_slices
+            ]
+        else:
+            mm_items = [
+                MultimodalDataItem.from_dict(
+                    {
+                        "modality": modality,
+                        "feature": (
+                            sub_feature
+                            if isinstance(sub_feature, list)
+                            else _convert(sub_feature)
+                        ),
+                    }
+                )
+            ]
+
+        for key, value in mm_inputs.items():
+            if key in _mm_feature_attrs.get(modality, []):
+                continue
+            value = _convert(value)
+            if key in _mm_grid_attrs.get(modality, []):
+                if split_kimi_k3_images:
+                    for mm_item, idx in zip(mm_items, indices):
+                        mm_item.set(key, value[idx : idx + 1])
+                else:
+                    mm_items[0].set(key, value[indices])
+            else:
+                for mm_item in mm_items:
+                    mm_item.set(key, value)
+        return mm_items
 
     async def _prepare_encode_context(
         self,
@@ -1269,31 +1306,29 @@ class MMEncoder:
             mm_embedding = None
             mm_hash = None
 
-            mm_item = MultimodalDataItem.from_dict(
-                {
-                    "modality": modality,
-                    "feature": ctx.mm_feature,
-                }
+            mm_items = self._build_model_mm_items(
+                ctx.mm_feature,
+                ctx.preprocess_result,
+                list(range(ctx.num_items)),
+                modality,
             )
-            for k, v in ctx.preprocess_result.mm_inputs.items():
-                if k in _mm_feature_attrs[modality]:
-                    continue
-                mm_item.set(k, _convert(v))
 
             cache_hit = False
             # The prefix cache hashes the whole request; a fused multi-request
             # batch has no per-request key, so only N=1 contexts use it.
             use_mm_cache = (
-                self.server_args.enable_prefix_mm_cache
+                get_mm().enable_prefix_mm_cache
                 and not ctx.is_health_check
                 and not keep_on_gpu
                 and len(ctx.items_per_req) == 1
             )
             if use_mm_cache:
-                mm_item.set_pad_value()
-                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+                for mm_item in mm_items:
+                    mm_item.set_pad_value()
+                mm_hashes = [mm_item.hash for mm_item in mm_items]
+                mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get([mm_item.hash])
+                    mm_cache = self.mm_cache.get(mm_hashes)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                         cache_hit = True
@@ -1301,7 +1336,7 @@ class MMEncoder:
             if mm_embedding is None:
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn([mm_item])
+                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
                     if not keep_on_gpu:
                         mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
@@ -1311,7 +1346,7 @@ class MMEncoder:
                         time.perf_counter() - forward_start, modality=modality_str
                     )
 
-            # Per-request cache hit metrics: tokens = embedding rows, files = 1 item.
+            # Per-request cache hit metrics: tokens = embedding rows.
             if use_mm_cache and encoder_metrics_collector is not None:
                 total_tokens = int(mm_embedding.shape[0])
                 hit_tokens = total_tokens if cache_hit else 0
@@ -1319,7 +1354,9 @@ class MMEncoder:
                     hit_tokens, total_tokens, modality=modality_str
                 )
                 encoder_metrics_collector.record_cache_files(
-                    1 if cache_hit else 0, 1, modality=modality_str
+                    len(mm_items) if cache_hit else 0,
+                    len(mm_items),
+                    modality=modality_str,
                 )
 
             if use_mm_cache:
@@ -1440,7 +1477,7 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if self.use_mooncake:
+        if get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
             req_id = mm_data.req_id
             if embedding is None:
@@ -1497,7 +1534,7 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if self.use_mooncake:
+        if get_disagg().encoder_transfer_backend == "mooncake":
             # Mooncake already pushed the embedding via RDMA;
             new_mm_data = mm_data.copy_without_embedding()
             serialized_data = pickle.dumps(new_mm_data)
@@ -1512,25 +1549,84 @@ class MMEncoder:
                 serialized_data = pickle.dumps(new_mm_data)
                 buffer = embedding_tensor.__buffer__()
 
-        # Use thread pool executor for parallel ZMQ send operations
+        transfer_start = time.perf_counter()
+        if self.transfer_backend == "zmq_to_scheduler" and url is not None:
+            lock = self.scheduler_send_locks.get(endpoint)
+            if lock is None:
+                lock = asyncio.Lock()
+                self.scheduler_send_locks[endpoint] = lock
+
+            async with lock:
+                sock = self.scheduler_send_sockets.get(endpoint)
+                if sock is None:
+                    sock = self.context.socket(zmq.PUSH)
+                    config_socket(sock, zmq.PUSH)
+                    sock.setsockopt(zmq.IMMEDIATE, 1)
+                    sock.setsockopt(zmq.SNDTIMEO, int(self.send_timeout * 1000))
+                    sock.connect(endpoint)
+                    self.scheduler_send_sockets[endpoint] = sock
+                try:
+                    frames = (
+                        [serialized_data, buffer]
+                        if buffer is not None
+                        else [serialized_data]
+                    )
+                    tracker = await sock.send_multipart(frames, copy=False, track=True)
+                except Exception:
+                    if self.scheduler_send_sockets.get(endpoint) is sock:
+                        self.scheduler_send_sockets.pop(endpoint, None)
+                    sock.close(linger=0)
+                    raise
+
+            # MessageTracker.wait() protects the zero-copy source buffer; it
+            # is not a receiver acknowledgement. Waiting under the per-peer
+            # lock serialized every large embedding on that TCP connection.
+            # Queue sends in order under the lock, then wait for buffer
+            # ownership independently so libzmq can pipeline the connection.
+            try:
+                await asyncio.to_thread(tracker.wait, self.send_timeout)
+            except Exception:
+                if self.scheduler_send_sockets.get(endpoint) is sock:
+                    self.scheduler_send_sockets.pop(endpoint, None)
+                    sock.close(linger=0)
+                raise
+
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_transfer(
+                    time.perf_counter() - transfer_start,
+                    backend=self.transfer_backend,
+                )
+            return
+
+        # Per-request sockets remain for zmq_to_tokenizer and legacy direct
+        # scheduler sends. Scheduler URL sends use persistent sockets above.
         def send_with_socket():
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
+            sock.setsockopt(zmq.IMMEDIATE, 1)
+            sock.setsockopt(zmq.SNDTIMEO, int(self.send_timeout * 1000))
             try:
                 sock.connect(endpoint)
                 if buffer is not None:
-                    sock.send_multipart([serialized_data, buffer], copy=False)
+                    tracker = sock.send_multipart(
+                        [serialized_data, buffer], copy=False, track=True
+                    )
                 else:
-                    sock.send_multipart([serialized_data], copy=False)
+                    tracker = sock.send_multipart(
+                        [serialized_data], copy=False, track=True
+                    )
+                tracker.wait(timeout=self.send_timeout)
             finally:
                 sock.close(linger=5000)
 
-        _zmq_xfer_start = time.perf_counter()
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
-        if encoder_metrics_collector is not None and not self.use_mooncake:
+        if (
+            encoder_metrics_collector is not None
+            and get_disagg().encoder_transfer_backend != "mooncake"
+        ):
             encoder_metrics_collector.observe_transfer(
-                time.perf_counter() - _zmq_xfer_start,
-                backend=self.transfer_backend,
+                time.perf_counter() - transfer_start,
+                backend=get_disagg().encoder_transfer_backend,
             )
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
@@ -1573,6 +1669,11 @@ class MMEncoder:
             if keep_on_gpu and len(requests) > 1:
                 # A view would pin the whole batch tensor until the last transfer.
                 embedding = embedding.clone()
+            req_aux_data = dict(ctx.aux_data)
+            if ctx.aux_data.get("original_image_sizes") is not None:
+                req_aux_data["original_image_sizes"] = ctx.aux_data[
+                    "original_image_sizes"
+                ][item_offset:item_end]
             mm_data = EmbeddingData(
                 req["req_id"],
                 req["num_parts"],
@@ -1580,7 +1681,7 @@ class MMEncoder:
                 ctx.preprocess_result.grid_thw[item_offset:item_end],
                 ctx.modality,
                 embedding,
-                **ctx.aux_data,
+                **req_aux_data,
             )
             # Global-cache embeddings keep registering per /send instead.
             if keep_on_gpu and not ctx.use_global_cache:

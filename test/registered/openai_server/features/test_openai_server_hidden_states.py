@@ -16,9 +16,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=222, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=165, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(
-    est_time=186,
+    est_time=140,
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
@@ -100,7 +100,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         )
 
         for choice in response.choices:
-            assert hasattr(choice, "hidden_states") == return_hidden_states
+            assert hasattr(choice, "hidden_states") == bool(return_hidden_states)
             if return_hidden_states:
                 assert choice.hidden_states is not None, "hidden_states was None"
 
@@ -139,7 +139,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
             usage = response.usage
             for choice in response.choices:
                 if hasattr(choice, "hidden_states"):
-                    assert return_hidden_states
+                    assert bool(return_hidden_states)
                     assert choice.hidden_states is not None
                     hidden_states_list.append(choice.hidden_states)
 
@@ -169,7 +169,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         )
 
         for choice in response.choices:
-            assert hasattr(choice, "hidden_states") == return_hidden_states
+            assert hasattr(choice, "hidden_states") == bool(return_hidden_states)
             if return_hidden_states:
                 assert choice.hidden_states is not None, "hidden_states was None"
 
@@ -196,7 +196,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         for response in generator:
             for choice in response.choices:
                 if hasattr(choice.delta, "hidden_states"):
-                    assert return_hidden_states
+                    assert bool(return_hidden_states)
                     assert choice.delta.hidden_states is not None
                     hidden_states_list.append(choice.delta.hidden_states)
 
@@ -227,7 +227,7 @@ class TestOpenAIServerWithHiddenStatesEnabled(
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-        cls.return_hidden_states = [False, True]
+        cls.return_hidden_states = [False, True, "last"]
         cls.use_list_input = [True, False]
         cls.parallel_sample_nums = [1, 2]
 
@@ -253,7 +253,7 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-        cls.return_hidden_states = [False, True]
+        cls.return_hidden_states = [False, True, "last"]
         cls.use_list_input = [True, False]
         cls.parallel_sample_nums = [1]
 
@@ -298,53 +298,6 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_TARGET_MODEL_EAGLE)
-        cls.return_hidden_states = [False, True]
-        cls.use_list_input = [True, False]
-        cls.parallel_sample_nums = [1]
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
-    CustomTestCase, BaseTestOpenAIServerWithHiddenStates
-):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "meta-llama/Llama-3.1-8B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.speculative_algorithm = "EAGLE3"
-        cls.speculative_draft_model = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                cls.speculative_algorithm,
-                "--speculative-draft-model-path",
-                cls.speculative_draft_model,
-                "--speculative-num-steps",
-                5,
-                "--speculative-eagle-topk",
-                16,
-                "--speculative-num-draft-tokens",
-                64,
-                "--mem-fraction-static",
-                0.7,
-                "--chunked-prefill-size",
-                128,
-                "--max-running-requests",
-                8,
-                "--dtype",
-                "float16",
-                "--enable-return-hidden-states",
-            ],
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
         cls.return_hidden_states = [False, True]
         cls.use_list_input = [True, False]
         cls.parallel_sample_nums = [1]

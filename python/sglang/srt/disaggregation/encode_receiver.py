@@ -468,6 +468,7 @@ _GENERAL_VIDEO_META_ATTRS = (
     "video_timestamps",
     "second_per_grid_ts",
 )
+_GENERAL_IMAGE_META_ATTRS = ("original_image_sizes",)
 # MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
 _MIMO_VIDEO_AUDIO_META_ATTRS = (
     "video_audio_feature_lens",
@@ -538,6 +539,8 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
         self.audio_feature_lens = [None] * num_parts
+        for attr in _GENERAL_IMAGE_META_ATTRS:
+            setattr(self, attr, [None] * num_parts)
         self.modality_list = [
             modality if part_idx == i else None for i in range(num_parts)
         ]
@@ -554,6 +557,18 @@ class MultiModalEmbeddingData(EmbeddingData):
         self._set_part_grid(part_idx, modality, self.get_grid())
         if modality == Modality.VIDEO:
             self._set_video_meta_for_part(part_idx, kwargs)
+        if modality == Modality.IMAGE:
+            self._set_image_meta_for_part(part_idx, kwargs)
+
+    def _set_image_meta_for_part(self, part_idx, source):
+        for attr_name in _GENERAL_IMAGE_META_ATTRS:
+            val = (
+                source.get(attr_name)
+                if isinstance(source, dict)
+                else getattr(source, attr_name, None)
+            )
+            if val is not None:
+                getattr(self, attr_name)[part_idx] = val
 
     def _set_part_grid(self, part_idx, modality, grid):
         """Set the grid for one part according to modality (IMAGE/VIDEO/AUDIO)."""
@@ -585,6 +600,10 @@ class MultiModalEmbeddingData(EmbeddingData):
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
         for attr in video_meta_attrs_for(model_type):
+            val = getattr(embedding_data, attr, None)
+            if val is not None:
+                extra[attr] = val
+        for attr in _GENERAL_IMAGE_META_ATTRS:
             val = getattr(embedding_data, attr, None)
             if val is not None:
                 extra[attr] = val
@@ -638,6 +657,10 @@ class MultiModalEmbeddingData(EmbeddingData):
                 kwargs[attr] = torch.cat(valid, dim=0)
             else:
                 kwargs[attr] = list(itertools.chain(*valid))
+        for attr in _GENERAL_IMAGE_META_ATTRS:
+            valid = [value for value in getattr(self, attr) if value is not None]
+            if valid:
+                kwargs[attr] = list(itertools.chain(*valid))
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
@@ -656,6 +679,8 @@ class MultiModalEmbeddingData(EmbeddingData):
         self._set_part_grid(pid, embedding_data.modality, embedding_data.get_grid())
         if embedding_data.modality == Modality.VIDEO:
             self._set_video_meta_for_part(pid, embedding_data)
+        if embedding_data.modality == Modality.IMAGE:
+            self._set_image_meta_for_part(pid, embedding_data)
 
 
 def _aggregate_embedding_part(current, recv_obj, model_type):
@@ -673,6 +698,13 @@ class WaitingMMRequestStatus(IntEnum):
     PENDING = 0
     SUCCESS = 1
     TIMEOUT = -2
+
+
+def _select_mm_processor_prompt(recv_req, mm_processor):
+    """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
+    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
+        return list(recv_req.input_ids)
+    return recv_req.input_text or recv_req.input_ids
 
 
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:
@@ -727,6 +759,8 @@ class WaitingMMRequestBase(ABC):
         host_name,
         receive_count,
         embedding_pool: Optional["EmbeddingPool"] = None,
+        zmq_context=None,
+        embedding_port=None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -739,9 +773,14 @@ class WaitingMMRequestBase(ABC):
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
-        self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL, host=host_name
-        )
+        self.zmq_context = zmq_context or zmq.Context()
+        if embedding_port is None:
+            self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
+                self.zmq_context, zmq.PULL, host=host_name
+            )
+        else:
+            self.embedding_port = embedding_port
+            self.recv_socket = None
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
         # ok=1 pending=0 fail=-1
@@ -766,6 +805,17 @@ class WaitingMMRequestBase(ABC):
     def _try_recv_mm_data(self):
         if self.status != WaitingMMRequestStatus.PENDING:
             return
+
+        # A complete request can remain pending while the GPU pool is full.
+        # Retry assembly on every scheduler tick, including shared-socket mode.
+        if self.recv_embedding_data is not None and self.recv_embedding_data.ready:
+            if self._assemble_mm_inputs_from_embeddings():
+                self.close_recv_socket()
+            return
+
+        if self.recv_socket is None:
+            return
+
         while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
             try:
                 parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
@@ -776,39 +826,47 @@ class WaitingMMRequestBase(ABC):
                 # Socket closed by another path (e.g. the RDMA receive thread
                 # after an encoder error); status is already terminal.
                 return
-            try:
-                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-                if getattr(recv_obj, "error_msg", None) is not None:
-                    logger.warning(
-                        f"Received error signal from encoder for {self.rid}: "
-                        f"{recv_obj.error_msg} {recv_obj.error_code = }"
-                    )
-                    self._fail_and_release(recv_obj.error_msg, recv_obj.error_code)
-                    return
-                if not self._is_valid_embedding_part(recv_obj):
-                    continue
-                # For zmq backend, _extract_embedding_from_buffer deserializes the numpy buffer.
-                # For RDMA backend, this is effectively a no-op because the buffer is ready for use.
-                self._extract_embedding_from_buffer(recv_obj, parts)
-                self.recv_embedding_data = _aggregate_embedding_part(
-                    self.recv_embedding_data, recv_obj, self.model_type
-                )
-            except Exception as e:
-                # A message the scheduler cannot decode (blocked unpickle,
-                # bad shape/dtype, ...) must fail this request, not crash the
-                # scheduler event loop; FAIL still reaches the TP-wide status
-                # all-reduce in _process_waiting_requests.
-                logger.exception(
-                    "Failed to decode embedding message for rid=%s", self.rid
-                )
-                self._fail_and_release(f"Failed to decode embedding message: {e}")
+            self.consume_parts(parts)
+            if self.status != WaitingMMRequestStatus.PENDING:
                 return
 
-        # For zmq backend, this stages CPU parts into the pool (False = pool full, retry next tick).
-        # For RDMA backend, this views the GPU buffer its receive thread already landed.
-        if not self._assemble_mm_inputs_from_embeddings():
+    def consume_parts(self, parts) -> None:
+        """Consume one message from either a per-request or shared ZMQ socket."""
+        if self.status != WaitingMMRequestStatus.PENDING:
             return
-        self.recv_socket.close()
+
+        try:
+            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+            if getattr(recv_obj, "error_msg", None) is not None:
+                logger.warning(
+                    f"Received error signal from encoder for {self.rid}: "
+                    f"{recv_obj.error_msg} {recv_obj.error_code = }"
+                )
+                self._fail_and_release(recv_obj.error_msg, recv_obj.error_code)
+                return
+            if not self._is_valid_embedding_part(recv_obj):
+                return
+            # ZMQ materializes frame 1; RDMA already wrote the registered buffer.
+            self._extract_embedding_from_buffer(recv_obj, parts)
+            self.recv_embedding_data = _aggregate_embedding_part(
+                self.recv_embedding_data, recv_obj, self.model_type
+            )
+        except Exception as e:
+            # A malformed message must fail this request, not the scheduler loop.
+            logger.exception("Failed to decode embedding message for rid=%s", self.rid)
+            self._fail_and_release(f"Failed to decode embedding message: {e}")
+            return
+
+        if (
+            self.recv_embedding_data.ready
+            and self._assemble_mm_inputs_from_embeddings()
+        ):
+            self.close_recv_socket()
+
+    def close_recv_socket(self) -> None:
+        if self.recv_socket is not None:
+            self.recv_socket.close()
+            self.recv_socket = None
 
     def _fail_and_release(self, error_msg, error_code=None) -> None:
         """Terminal failure: record the error, free buffers, close the socket."""
@@ -816,7 +874,7 @@ class WaitingMMRequestBase(ABC):
         self.error_code = error_code
         self.status = WaitingMMRequestStatus.FAIL
         self._cleanup_gpu_buffer()
-        self.recv_socket.close()
+        self.close_recv_socket()
 
     async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
         """Validate gathered encoder responses; on the first error, FAIL the
@@ -885,7 +943,7 @@ class WaitingMMRequestBase(ABC):
     def _finish_assemble(self, recv_embedding) -> None:
         """get_mm_data → bind pool slot → publish onto recv_req → SUCCESS."""
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
+            _select_mm_processor_prompt(self.recv_req, self.mm_processor),
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
@@ -1013,12 +1071,10 @@ class WaitingZmqRequest(WaitingMMRequestBase):
                     # A rank without a registered receive URL can never be
                     # pushed to; fail via the normal completion path now
                     # instead of pending until the embedding wait times out.
-                    self.status = WaitingMMRequestStatus.FAIL
-                    self.error_msg = (
-                        f"Failed to register receive URL with encoder: {failed[0]!r}"
+                    self._fail_and_release(
+                        f"Failed to register receive URL with encoder: {failed[0]!r}",
+                        int(HTTPStatus.BAD_GATEWAY),
                     )
-                    self.error_code = int(HTTPStatus.BAD_GATEWAY)
-                    self.recv_socket.close()
 
         asyncio.run(
             send_embedding_port(
@@ -1141,11 +1197,13 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         encoder_urls,
         host_name,
         receive_count,
+        zmq_context,
         embeddings_engine,
         dtype,
         gpu_id=0,
         model_type: Optional[str] = None,
         embedding_pool=None,
+        embedding_port=None,
     ):
         super().__init__(
             rid=rid,
@@ -1156,6 +1214,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             host_name=host_name,
             receive_count=receive_count,
             embedding_pool=embedding_pool,
+            zmq_context=zmq_context,
+            embedding_port=embedding_port,
         )
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
@@ -1178,10 +1238,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             asyncio.run(self._pull_meta_and_receive_embedding())
         except Exception as e:
             logger.error(f"RDMA receive failed for rid={self.rid}: {e}")
-            self.status = WaitingMMRequestStatus.FAIL
-            self.error_msg = str(e)
-            self._cleanup_gpu_buffer()
-            self.recv_socket.close()
+            self._fail_and_release(str(e))
         finally:
             with self._buffer_lock:
                 self._receive_running = False
@@ -1647,6 +1704,10 @@ class MMReceiverBase(ABC):
         encode_urls: Optional[List[str]] = None,
     ):
         self.context = zmq.asyncio.Context(20)
+        # Scheduler-side receive is polled synchronously. Keep one regular ZMQ
+        # context alive for the process instead of creating a temporary context
+        # whose destruction also closes its per-request socket.
+        self.scheduler_context = zmq.Context()
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         # When ``encode_urls`` is shared with an :class:`EncoderBootstrapServer`
         # (tokenizer manager process), it grows / shrinks in place as encoders
@@ -1665,6 +1726,24 @@ class MMReceiverBase(ABC):
         self.nnodes = server_args.nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
+        self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
+        self.scheduler_embedding_port = None
+        self.scheduler_recv_socket = None
+        if (
+            self.encoder_transfer_backend == "zmq_to_scheduler"
+            and scheduler is not None
+        ):
+            (
+                self.scheduler_embedding_port,
+                self.scheduler_recv_socket,
+            ) = get_zmq_socket_on_host(
+                self.scheduler_context, zmq.PULL, host=self.hostname
+            )
+            logger.info(
+                "Scheduler TP rank %s reuses ZMQ embedding port %s",
+                self.tp_rank,
+                self.scheduler_embedding_port,
+            )
         self.scheduler = scheduler
         self.gpu_id = scheduler.ps.gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
@@ -2007,6 +2086,28 @@ class MMReceiverBase(ABC):
         waiting_req.error_code = best_code
 
     # For zmq_to_scheduler
+    def _drain_scheduler_embeddings(self):
+        if self.scheduler_recv_socket is None:
+            return
+
+        while True:
+            try:
+                parts = self.scheduler_recv_socket.recv_multipart(
+                    flags=zmq.NOBLOCK, copy=False
+                )
+            except zmq.Again:
+                return
+
+            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+            rid = extract_original_req_id(recv_obj.req_id)
+            waiting_req = self.waiting_by_rid.get(rid)
+            if waiting_req is None:
+                logger.warning(
+                    "Dropping embedding data for inactive request %s", recv_obj.req_id
+                )
+                continue
+            waiting_req.consume_parts(parts)
+
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
         for recv_req in recv_reqs:
@@ -2029,8 +2130,16 @@ class MMReceiverBase(ABC):
                     model_type=self.model_type,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
+                    zmq_context=(
+                        None
+                        if self.scheduler_recv_socket is not None
+                        else self.scheduler_context
+                    ),
+                    embedding_port=self.scheduler_embedding_port,
                     **extra_kwargs,
                 )
+                if self.scheduler_recv_socket is not None:
+                    self.waiting_by_rid[waiting_req.rid] = waiting_req
                 waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
             else:
@@ -2039,14 +2148,17 @@ class MMReceiverBase(ABC):
         if len(self.waiting_list) == 0:
             return new_recv_reqs, []
 
+        self._drain_scheduler_embeddings()
         current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:
+            # Per-request sockets receive here; shared-socket requests use this
+            # tick to retry pool staging after _drain_scheduler_embeddings().
             waiting_req._try_recv_mm_data()
             if current_time - waiting_req.start_time > self.wait_timeout:
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
-                waiting_req.recv_socket.close()
+                waiting_req.close_recv_socket()
             local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
@@ -2092,6 +2204,8 @@ class MMReceiverBase(ABC):
                 )
             else:  # status_value == WaitingMMRequestStatus.PENDING
                 new_waiting.append(waiting_req)
+                continue
+            self.waiting_by_rid.pop(waiting_req.rid, None)
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
