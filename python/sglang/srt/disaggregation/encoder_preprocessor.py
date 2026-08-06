@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 _mm_grid_attrs = {
+    # Kimi K2.5/K3 HF processors use grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
     Modality.IMAGE: ("image_grid_thw", "image_grid_hws", "grid_thws"),
     Modality.VIDEO: ("video_grid_thw",),
     Modality.AUDIO: ("audio_feature_lens_raw",),
@@ -51,6 +52,20 @@ def _convert(data):
         return torch.tensor(data)
     else:
         return data
+
+
+def _get_original_image_size(image):
+    """Return an image's original (width, height) before encoder preprocessing."""
+    if isinstance(image, dict):
+        image = image.get("image")
+    if isinstance(image, torch.Tensor):
+        if image.ndim < 2:
+            raise ValueError(f"Invalid image tensor shape: {tuple(image.shape)}")
+        return [int(image.shape[-1]), int(image.shape[-2])]
+    if hasattr(image, "size"):
+        width, height = image.size
+        return [int(width), int(height)]
+    raise TypeError(f"Cannot determine original image size from {type(image)}")
 
 
 @dataclass
@@ -415,6 +430,9 @@ class EncoderPreprocessor:
     def _flatten_batch_requests(
         self, requests: List[dict], modality: Modality
     ) -> tuple[List, List[int]]:
+        # items_per_req counts grid entries (post-expansion) so per-request
+        # slicing of grid_dim/final_slices stays aligned for processors that
+        # expand one leaf into multiple grids (e.g. Kimi-VL/K2.5/K3 dict-of-images).
         flat_items = []
         items_per_req = []
         for req in requests:
@@ -430,12 +448,16 @@ class EncoderPreprocessor:
         if model_preprocessor:
             return model_preprocessor(images, Modality.IMAGE, self.vision_config)
         image_config = self.vision_config.get("image", {})
-        if self.model_type in ["kimi_k25", "kimi_vl"]:
+        original_image_sizes = [_get_original_image_size(item) for item in images]
+        if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-        return await asyncio.get_running_loop().run_in_executor(
+        processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
         )
+        if self.model_type == "kimi_k3":
+            processor_input["original_image_sizes"] = original_image_sizes
+        return processor_input
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
@@ -550,13 +572,18 @@ class EncoderPreprocessor:
             return (input_length - 2) // 2 + 1
 
     def _get_mm_grid_dim(self, mm_inputs: dict, modality: Modality):
+        # Kimi K2.5/K3 vision processors only emit `grid_thws`; prefer it over generic keys
+        # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
         attrs = _mm_grid_attrs[modality]
         model_type = (self.model_type or "").lower()
         if modality == Modality.IMAGE:
-            if model_type == "kimi_k25":
+            # Kimi K2.5/K3 emit grid_thws, while Kimi-VL emits image_grid_hws.
+            # Other model types keep the generic attr order above.
+            if model_type in ("kimi_k25", "kimi_k3"):
                 attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
             elif model_type == "kimi_vl":
                 attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
+
         for attr in attrs:
             if attr in mm_inputs and mm_inputs[attr] is not None:
                 return _convert(mm_inputs[attr])
@@ -609,7 +636,7 @@ class EncoderPreprocessor:
             return self._get_feat_extract_output_lengths(input_length)
         else:
             if (
-                self.model_type in ["kimi_k25", "kimi_vl"]
+                self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
@@ -639,6 +666,7 @@ class EncoderPreprocessor:
     # ------------------------------------------------------------------
 
     def _normalize_kimi_encoder_images(self, images):
+        """Normalize Kimi image inputs for the image processor call."""
         from PIL import Image as PILImage
 
         def wrap_one(img):
@@ -651,6 +679,7 @@ class EncoderPreprocessor:
         if not images:
             return images
 
+        # Disagg may supply nested lists from grouped routing.
         images = self._flatten_nested_items(images)
 
         if self.model_type == "kimi_vl":
@@ -670,6 +699,7 @@ class EncoderPreprocessor:
                     normalized.append(img)
             return normalized
 
+        # Kimi-K2.5/K3 vision processors expect media dicts.
         normalized = []
         for img in images:
             wrapped = wrap_one(img)
@@ -706,10 +736,13 @@ class EncoderPreprocessor:
     def _grid_count_per_leaf(self, leaves: List, modality: Modality) -> List[int]:
         """Number of grid entries each leaf produces under the model's processor.
 
-        Most processors map 1 leaf -> 1 grid. Kimi-VL/K25 image processors expand
+        Most processors map 1 leaf -> 1 grid. Kimi-VL/K2.5/K3 image processors expand
         a leaf shaped {"type": "image", "image": [pil1, pil2, ...]} into N grids.
         """
-        if self.model_type not in ("kimi_k25", "kimi_vl") or modality != Modality.IMAGE:
+        if (
+            self.model_type not in ("kimi_k25", "kimi_k3", "kimi_vl")
+            or modality != Modality.IMAGE
+        ):
             return [1] * len(leaves)
 
         def count(leaf):

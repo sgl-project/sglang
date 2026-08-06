@@ -9,7 +9,6 @@ reuse that backend topology without importing the HTTP server.
 import asyncio
 import atexit
 import contextlib
-import copy
 import logging
 import multiprocessing as mp
 import os
@@ -28,6 +27,7 @@ import sglang.srt.disaggregation.encode_server as encode_server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_server import (
     ENCODER_MAX_BATCH_SIZE,
+    ENCODER_MAX_BATCH_SIZE_EXPLICIT,
     EncoderProfiler,
     MMEncoder,
     MMError,
@@ -69,6 +69,21 @@ class PendingRequest:
 # VIDEO excluded: per-video preprocess kwargs (do_sample_frames, video_metadata)
 # vary per request and can't merge into one HF processor call.
 _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
+_KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
+
+
+def _resolve_encoder_batch_policy(
+    model_type: str,
+    configured_max_batch_size: int,
+    max_batch_size_is_explicit: bool,
+) -> Tuple[int, bool]:
+    """Return effective batch size and same-turn coalescing policy."""
+    max_batch_size = max(1, int(configured_max_batch_size))
+    coalesce_same_turn = model_type == "kimi_k3"
+    if coalesce_same_turn and not max_batch_size_is_explicit:
+        max_batch_size = min(max_batch_size, _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE)
+    return max_batch_size, coalesce_same_turn
+
 
 # Minimal 32x32 black PNG for health check dummy encode
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
@@ -85,11 +100,13 @@ class EncoderScheduler:
         encoder: "MMEncoder",
         send_sockets: List[zmq.Socket],
         max_batch_size: int,
+        coalesce_same_turn: bool = False,
         request_timeout: float = encode_server_module.ENCODER_REQ_TIMEOUT,
     ):
         self.encoder = encoder
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
+        self.coalesce_same_turn = bool(coalesce_same_turn)
         self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
@@ -98,7 +115,9 @@ class EncoderScheduler:
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._batch_worker())
             logger.info(
-                f"EncoderScheduler started with max_batch_size={self.max_batch_size}"
+                "EncoderScheduler started with "
+                f"max_batch_size={self.max_batch_size}, "
+                f"coalesce_same_turn={self.coalesce_same_turn}"
             )
 
     async def stop(self) -> None:
@@ -135,6 +154,17 @@ class EncoderScheduler:
 
     async def _collect_batch(self) -> List[PendingRequest]:
         batch = [await self.pending_queue.get()]
+        first_modality = Modality.from_str(batch[0].request.get("modality", "image"))
+        should_yield = (
+            self.coalesce_same_turn
+            and self.max_batch_size > 1
+            and first_modality in _BATCHABLE_MODALITIES
+        )
+        if should_yield:
+            # Let HTTP handlers that arrived in the same event-loop turn enqueue
+            # before dispatch. Unlike a fixed sleep, this adds no millisecond-scale
+            # tax to an isolated request.
+            await asyncio.sleep(0)
         while len(batch) < self.max_batch_size:
             try:
                 batch.append(self.pending_queue.get_nowait())
@@ -224,23 +254,29 @@ class EncoderScheduler:
                 encode_server_module.encoder_metrics_collector.observe_queue_wait(
                     max(0.0, start - p.submit_time), modality=modality_str
                 )
-        for sock in self.send_sockets:
-            sock_send(
-                sock,
-                wrap_as_pickle(
-                    {
-                        "type": "batch_encode",
-                        "modality": modality.name,
-                        "requests": requests,
-                        "enter_time": start,
-                    }
-                ),
-            )
-
-        logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
-
         try:
-            results = await self.encoder.batch_encode(requests, modality)
+            # The scheduler is the sole owner of batched dispatch order. Keep
+            # the collective broadcast and rank-0 execution under the same
+            # lock, while allowing concurrent HTTP handlers to enqueue before
+            # waiting on their individual futures.
+            async with self.encoder.encode_dispatch_lock:
+                for sock in self.send_sockets:
+                    sock_send(
+                        sock,
+                        wrap_as_pickle(
+                            {
+                                "type": "batch_encode",
+                                "modality": modality.name,
+                                "requests": requests,
+                                "enter_time": start,
+                            }
+                        ),
+                    )
+
+                logger.info(
+                    f"Dispatching batch of {len(group)} {modality.name} requests"
+                )
+                results = await self.encoder.batch_encode(requests, modality)
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -944,7 +980,10 @@ async def execute_encode_pipeline(
         if sched is not None and modality in _BATCHABLE_MODALITIES:
             result = await sched.submit(request)
         elif send_sockets is not None:
-            # Non-DP TP followers must enter collectives in the same order as rank 0.
+            # Non-batched requests still own their collective dispatch order
+            # directly; batched requests take this lock in _dispatch_group.
+            # Locking direct dispatch together with the rank0 await keeps its
+            # NCCL launch order matching the ZMQ dispatch order rank>0 sees.
             async with enc.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
@@ -1046,13 +1085,6 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
     the non-DP /health path. Raises on encode failure so the worker envelope
     carries ``_error`` back to the dispatcher.
     """
-    # Busy worker: in-flight traffic already proves liveness, so skip the probe
-    # and report healthy — the same pending-embedding signal the non-DP
-    # /health path uses. A wedged-but-busy worker never reaches here because
-    # it can't service the recv, so the dispatcher's broadcast still times out → 503.
-    if enc.has_pending_embeddings():
-        return None
-
     if enc.supports_modality(Modality.IMAGE):
         mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
         modality = Modality.IMAGE
@@ -1066,13 +1098,17 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
     # uuid keeps rids unique across workers; a bare time.time() can collide.
     req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
     try:
-        _, _, _, error_msg, error_code = await enc.encode(
-            mm_items=mm_items,
-            modality=modality,
-            req_id=req_id,
-            num_parts=1,
-            part_idx=0,
-        )
+        async with enc.encode_dispatch_lock:
+            # Traffic may have started while the probe waited for the lock.
+            if enc.has_pending_embeddings():
+                return None
+            _, _, _, error_msg, error_code = await enc.encode(
+                mm_items=mm_items,
+                modality=modality,
+                req_id=req_id,
+                num_parts=1,
+                part_idx=0,
+            )
     finally:
         # Never leave the dummy embedding sitting in the send map.
         await enc.release_request(req_id)
@@ -1221,10 +1257,7 @@ async def run_dp_worker(
     # gpu_id is the device chosen by maybe_reindex_device_id in the parent:
     # 0 when CVD is pinned to one GPU, else the absolute id. rank=0, so
     # MMEncoder runs set_device(base_gpu_id).
-    args = copy.deepcopy(server_args)
-    # The copy is already resolved (read-only); route the per-worker
-    # specialization through the audited mutation entry.
-    args.override("encode_server.dp_worker", base_gpu_id=gpu_id, tp_size=1)
+    args = server_args.derive("encode_server.dp_worker", base_gpu_id=gpu_id, tp_size=1)
     enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
 
     if server_args.enable_metrics:
@@ -1238,8 +1271,16 @@ async def run_dp_worker(
         encode_server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
         enc.dp_rank = dp_rank
 
+    max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
+        enc.model_type,
+        ENCODER_MAX_BATCH_SIZE,
+        ENCODER_MAX_BATCH_SIZE_EXPLICIT,
+    )
     sched = EncoderScheduler(
-        encoder=enc, send_sockets=[], max_batch_size=ENCODER_MAX_BATCH_SIZE
+        encoder=enc,
+        send_sockets=[],
+        max_batch_size=max_batch_size,
+        coalesce_same_turn=coalesce_same_turn,
     )
 
     ctx = zmq.asyncio.Context(2)
@@ -1247,11 +1288,13 @@ async def run_dp_worker(
     send_sock = get_zmq_socket(ctx, zmq.PUSH, result_path, False)
     send_lock = asyncio.Lock()
     inflight: Set[asyncio.Task] = set()
+    # Acquire-before-recv → back-pressure propagates to the dispatcher
+    # PUSH buffer. Must be at least max_batch_size or batching degrades.
     max_inflight = envs.SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT.get()
-    if max_inflight < ENCODER_MAX_BATCH_SIZE:
+    if max_inflight < max_batch_size:
         logger.warning(
             f"SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT={max_inflight} is below "
-            f"ENCODER_MAX_BATCH_SIZE={ENCODER_MAX_BATCH_SIZE}; the encoder "
+            f"the effective encoder max_batch_size={max_batch_size}; the encoder "
             f"will never assemble a full batch."
         )
     inflight_sem = asyncio.Semaphore(max_inflight)
@@ -1375,10 +1418,16 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
         tp_processes.append(process)
 
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+    max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
+        encoder.model_type,
+        ENCODER_MAX_BATCH_SIZE,
+        ENCODER_MAX_BATCH_SIZE_EXPLICIT,
+    )
     scheduler = EncoderScheduler(
         encoder,
         send_sockets,
-        max_batch_size=ENCODER_MAX_BATCH_SIZE,
+        max_batch_size=max_batch_size,
+        coalesce_same_turn=coalesce_same_turn,
     )
     return EncoderRuntime(
         encoder=encoder,

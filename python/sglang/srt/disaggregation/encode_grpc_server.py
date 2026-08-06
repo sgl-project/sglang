@@ -24,6 +24,7 @@ from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.disaggregation.encode_server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import random_uuid
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket
@@ -110,13 +111,13 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 context.set_details(error_msg)
                 return sglang_encoder_pb2.EncodeResponse()
 
-            if self.server_args.encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 return sglang_encoder_pb2.EncodeResponse(
                     embedding_size=nbytes,
                     embedding_len=embedding_len,
                     embedding_dim=embedding_dim,
                 )
-            elif self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            elif get_disagg().encoder_transfer_backend == "zmq_to_scheduler":
                 embedding_ports = list(request.embedding_port)
                 logger.info(f"embedding_port = {embedding_ports}")
                 if not embedding_ports:
@@ -134,7 +135,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     await asyncio.gather(*tasks)
                     await self.encoder.release_request(request.req_id)
                 return sglang_encoder_pb2.EncodeResponse()
-            elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+            elif get_disagg().encoder_transfer_backend == "zmq_to_tokenizer":
                 embedding_port = (
                     request.embedding_port[0] if request.embedding_port else 0
                 )
