@@ -53,6 +53,19 @@ def apply_all():
         return
     _applied = True
 
+    # Every patch below targets APIs added, changed, or removed in
+    # transformers v5. Importing the v5-only model modules on a v4 runtime is
+    # not a harmless no-op: optional packages can take over those imports and
+    # reject the older transformers dataclasses. Keep source-tree SGLang
+    # usable in model images that intentionally pin transformers v4.
+    if int(transformers.__version__.split(".", 1)[0]) < 5:
+        patch_is_base_mistral_in_ci()
+        logger.debug(
+            "transformers v5 compatibility patches skipped for transformers %s",
+            transformers.__version__,
+        )
+        return
+
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
@@ -228,8 +241,8 @@ def _patch_removed_symbols():
 
         if not hasattr(_u, "is_flash_attn_greater_or_equal_2_10"):
             if hasattr(_u, "is_flash_attn_greater_or_equal"):
-                _u.is_flash_attn_greater_or_equal_2_10 = (
-                    lambda: _u.is_flash_attn_greater_or_equal("2.10.0")
+                _u.is_flash_attn_greater_or_equal_2_10 = lambda: (
+                    _u.is_flash_attn_greater_or_equal("2.10.0")
                 )
             else:
                 _u.is_flash_attn_greater_or_equal_2_10 = lambda: False

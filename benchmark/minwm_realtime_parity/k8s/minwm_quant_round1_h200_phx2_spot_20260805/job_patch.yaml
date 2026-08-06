@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-quant-r1-b200-20260805-01
+  labels:
+    app.kubernetes.io/name: minwm-quant-r1-h200-phx2-20260805-06
+    seedleap.ai/run-id: minwm-quant-r1-h200-phx2-20260805-06
+  annotations:
+    seedleap.ai/cluster: minwm-test-phx2
+    seedleap.ai/instance-type: p5e.48xlarge
+    seedleap.ai/submatrix: bf16-and-fp8-only
+spec:
+  activeDeadlineSeconds: 25200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-quant-r1-h200-phx2-20260805-06
+        seedleap.ai/run-id: minwm-quant-r1-h200-phx2-20260805-06
+    spec:
+      containers:
+        - name: benchmark
+          env:
+            - name: MATRIX_ID
+              value: minwm-quant-r1-h200-phx2-20260805-06
+            - name: MINWM_RESULTS_ROOT
+              value: /results/quantization/20260805/round1-fixed-720p
+            - name: MINWM_QUANT_R1_SKIP_NVFP4
+              value: "1"

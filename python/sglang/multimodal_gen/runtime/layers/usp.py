@@ -35,16 +35,166 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+def _usp_all_to_all_single(
+    x: torch.Tensor, output_buffer: torch.Tensor | None = None
+) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
-    output = torch.empty_like(x)
+    if output_buffer is None:
+        output = torch.empty_like(x)
+    else:
+        if (
+            output_buffer.numel() != x.numel()
+            or output_buffer.dtype != x.dtype
+            or output_buffer.device != x.device
+        ):
+            raise ValueError("Ulysses output buffer must match the collective input")
+        output = output_buffer.reshape(-1)
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
     return output.reshape(x_shape)
+
+
+def _usp_pack_peer_first_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    world_size: int,
+    output_buffer: torch.Tensor | None,
+) -> torch.Tensor:
+    h_local = query.shape[2] // world_size
+    packed_shape = (
+        world_size,
+        query.shape[0],
+        query.shape[1],
+        h_local,
+        3 * query.shape[3],
+    )
+    if (
+        query.is_cuda
+        and torch.version.hip is None
+        and query.is_contiguous()
+        and key.is_contiguous()
+        and value.is_contiguous()
+    ):
+        try:
+            from sglang.jit_kernel.diffusion.triton.ulysses_qkv_pack import (
+                fused_pack_peer_first_qkv,
+            )
+        except ImportError:
+            pass
+        else:
+            return fused_pack_peer_first_qkv(
+                query, key, value, world_size, output_buffer
+            )
+
+    qkv_peer_first = (
+        query.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+        key.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+        value.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+    )
+    if output_buffer is None:
+        return torch.cat(qkv_peer_first, dim=-1)
+    packed = output_buffer.view(packed_shape)
+    torch.cat(qkv_peer_first, dim=-1, out=packed)
+    return packed
+
+
+def _usp_input_all_to_all_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    input_buffer: torch.Tensor | None = None,
+    output_buffer: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pack and exchange [B, S_local, H, D] Q/K/V with one layout copy."""
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return torch.cat((query, key, value), dim=-1)
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError("Ulysses Q/K/V shapes must match")
+    if query.ndim != 4:
+        raise ValueError("Ulysses Q/K/V must have shape [B, S, H, D]")
+
+    b, s_local, h_global, d = query.shape
+    if h_global % world_size != 0:
+        raise ValueError(
+            f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+        )
+    h_local = h_global // world_size
+    packed_shape = (world_size, b, s_local, h_local, 3 * d)
+    if input_buffer is not None:
+        if (
+            input_buffer.numel() != 3 * query.numel()
+            or input_buffer.dtype != query.dtype
+            or input_buffer.device != query.device
+        ):
+            raise ValueError("Ulysses input buffer must match packed Q/K/V")
+    packed = _usp_pack_peer_first_qkv(query, key, value, world_size, input_buffer).view(
+        packed_shape
+    )
+
+    exchanged = _usp_all_to_all_single(packed, output_buffer=output_buffer)
+    # Keep each destination's head shard sequence-major in the collective.
+    # For MinWM realtime's batch=1 this permutation is contiguous, so reshape
+    # aliases the receive buffer instead of launching a full QKV layout copy.
+    return exchanged.permute(1, 0, 2, 3, 4).reshape(
+        b, s_local * world_size, h_local, 3 * d
+    )
+
+
+def _usp_input_all_to_all_varlen_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seq_lens: list[int],
+) -> torch.Tensor:
+    """Varlen counterpart of :func:`_usp_input_all_to_all_qkv`."""
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return torch.cat((query, key, value), dim=-1)
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError("Ulysses Q/K/V shapes must match")
+    if query.ndim != 4:
+        raise ValueError("Ulysses Q/K/V must have shape [B, S, H, D]")
+    if len(seq_lens) != world_size:
+        raise ValueError(f"seq_lens must have length {world_size}")
+
+    b, s_local, h_global, d = query.shape
+    rank = get_ulysses_parallel_rank()
+    if s_local != seq_lens[rank]:
+        raise ValueError(f"s_local ({s_local}) must equal seq_lens[{rank}]")
+    if h_global % world_size != 0:
+        raise ValueError(
+            f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+        )
+
+    h_local = h_global // world_size
+    packed = torch.cat(
+        (
+            query.permute(2, 0, 1, 3),
+            key.permute(2, 0, 1, 3),
+            value.permute(2, 0, 1, 3),
+        ),
+        dim=-1,
+    ).reshape(world_size, h_local, b, s_local, 3 * d)
+    input_split_sizes = [h_local * b * s_local * 3 * d] * world_size
+    output_split_sizes = [h_local * b * seq_len * 3 * d for seq_len in seq_lens]
+    exchanged = _usp_all_to_all_single_varlen(
+        packed, output_split_sizes, input_split_sizes
+    )
+    chunks = []
+    offset = 0
+    for seq_len, split_size in zip(seq_lens, output_split_sizes):
+        chunks.append(
+            exchanged[offset : offset + split_size].reshape(h_local, b, seq_len, 3 * d)
+        )
+        offset += split_size
+    return torch.cat(chunks, dim=2).permute(1, 2, 0, 3).contiguous()
 
 
 def _usp_all_to_all_single_varlen(
@@ -199,7 +349,11 @@ def _usp_input_all_to_all_varlen(
     return x
 
 
-def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_output_all_to_all(
+    x: torch.Tensor,
+    head_dim: int = 1,
+    output_buffer: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
@@ -241,7 +395,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     s_local, h_global = s_global // world_size, h_local * world_size
 
     x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+    x = _usp_all_to_all_single(x, output_buffer=output_buffer)
     x = x.reshape(world_size, s_local, b, h_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'

@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -28,6 +29,77 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 # plan_text_strategy). 0 = always shard when legal; H100 bench showed sharding
 # wins from trivial lengths on, so the knob exists only as an escape hatch.
 _TEXT_SHARD_MIN = int(os.environ.get("SGLANG_SP_TEXT_SHARD_MIN", "0"))
+
+
+def compute_sequence_splits(total_len: int, world_size: int) -> list[int]:
+    """Split a sequence contiguously without padding, assigning the remainder first."""
+    if total_len < 0:
+        raise ValueError(f"total_len must be non-negative, got {total_len}")
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    base, remainder = divmod(total_len, world_size)
+    return [base + (rank < remainder) for rank in range(world_size)]
+
+
+def sequence_splits_are_uniform(seq_splits: list[int] | tuple[int, ...]) -> bool:
+    return len(seq_splits) <= 1 or all(
+        seq_len == seq_splits[0] for seq_len in seq_splits
+    )
+
+
+def shard_sequence_varlen(
+    x: torch.Tensor,
+    seq_splits: list[int] | tuple[int, ...],
+    rank: int,
+    *,
+    dim: int = 1,
+) -> torch.Tensor:
+    """Take one contiguous, unpadded sequence shard described by ``seq_splits``."""
+    if len(seq_splits) == 0:
+        raise ValueError("seq_splits must not be empty")
+    if rank < 0 or rank >= len(seq_splits):
+        raise ValueError(f"rank {rank} is outside {len(seq_splits)} sequence splits")
+    if sum(seq_splits) != x.shape[dim]:
+        raise ValueError(
+            f"sequence splits sum to {sum(seq_splits)}, "
+            f"but tensor dim {dim} has length {x.shape[dim]}"
+        )
+    start = sum(seq_splits[:rank])
+    return x.narrow(dim, start, seq_splits[rank]).contiguous()
+
+
+def gather_sequence_varlen(
+    x: torch.Tensor,
+    seq_splits: list[int] | tuple[int, ...],
+    group: dist.ProcessGroup,
+    *,
+    dim: int = 1,
+) -> torch.Tensor:
+    """All-gather contiguous sequence shards whose lengths may differ by rank."""
+    if len(seq_splits) == 0:
+        raise ValueError("seq_splits must not be empty")
+    rank = get_sp_parallel_rank()
+    if x.shape[dim] != seq_splits[rank]:
+        raise ValueError(
+            f"local sequence length {x.shape[dim]} does not match "
+            f"seq_splits[{rank}]={seq_splits[rank]}"
+        )
+    if sequence_splits_are_uniform(seq_splits):
+        return sequence_model_parallel_all_gather(x.contiguous(), dim=dim)
+
+    max_seq = max(seq_splits)
+    if x.shape[dim] < max_seq:
+        pad_shape = list(x.shape)
+        pad_shape[dim] = max_seq - x.shape[dim]
+        x = torch.cat(
+            [x, torch.zeros(pad_shape, dtype=x.dtype, device=x.device)], dim=dim
+        )
+    gathered = [torch.empty_like(x) for _ in seq_splits]
+    dist.all_gather(gathered, x.contiguous(), group=group)
+    return torch.cat(
+        [chunk.narrow(dim, 0, seq_len) for chunk, seq_len in zip(gathered, seq_splits)],
+        dim=dim,
+    )
 
 
 @dataclass(frozen=True)

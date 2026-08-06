@@ -16,6 +16,9 @@ from typing import Callable, Optional
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -34,7 +37,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
-from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
 

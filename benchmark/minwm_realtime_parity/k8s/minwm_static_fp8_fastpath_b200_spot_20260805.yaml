@@ -1,0 +1,139 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-static-fp8-fastpath-b200-20260806-17
+  namespace: ray
+  labels:
+    app.kubernetes.io/name: minwm-static-fp8-fastpath-b200-20260806-17
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-static-fp8-2x
+    seedleap.ai/run-id: minwm-static-fp8-fastpath-b200-20260806-17
+  annotations:
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/repo: seedleap/sglang
+    seedleap.ai/branch: codex/minwm-realtime-api
+    seedleap.ai/sglang-git-ref: "417d47cace97b450b536cf855536e8d9f44c1eba"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-static-fp8-fastpath-b200-20260806-17
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/task: minwm-static-fp8-2x
+        seedleap.ai/run-id: minwm-static-fp8-fastpath-b200-20260806-17
+      annotations:
+        seedleap.ai/repo: seedleap/sglang
+        seedleap.ai/branch: codex/minwm-realtime-api
+        seedleap.ai/sglang-git-ref: "417d47cace97b450b536cf855536e8d9f44c1eba"
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        karpenter.sh/capacity-type: spot
+        karpenter.sh/nodepool: minwm-test-b200-spot
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+        seedleap.ai/capacity-pool: minwm-test-b200-karpenter
+      tolerations:
+        - key: seedleap.ai/workload
+          operator: Equal
+          value: wan22-ti2v
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: SGLANG_GIT_REF
+              value: "417d47cace97b450b536cf855536e8d9f44c1eba"
+            - name: RUN_ID
+              value: minwm-static-fp8-fastpath-b200-20260806-17
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
+
+              result_dir="/s3/world-model/evals/minwm/quantization/20260805/static-fp8-2x/${RUN_ID}"
+              mkdir -p "${result_dir}"
+              exec > >(tee -a "${result_dir}/job.log") 2>&1
+              {
+                echo "run_id=${RUN_ID}"
+                echo "image=829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a"
+                echo "sglang=${SGLANG_GIT_REF}"
+                echo "node=${NODE_NAME:-unknown}"
+                date --iso-8601=seconds
+              } > "${result_dir}/provenance.txt"
+              nvidia-smi -q > "${result_dir}/nvidia-smi.txt"
+
+              python3 - /workspace/sglang/python/pyproject.toml <<'PY'
+              from pathlib import Path
+              import sys
+
+              path = Path(sys.argv[1])
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC Rust extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pip install --force-reinstall --no-deps \
+                --index-url https://flashinfer.ai/whl/cu130 \
+                'flashinfer-jit-cache==0.6.12+cu130'
+
+              cd /workspace/sglang
+              export PYTHONPATH=/workspace/sglang/python
+              python3 -m pytest -q \
+                test/registered/jit/diffusion/test_diffusion_modelopt_fp8_scaled_mm.py \
+                2>&1 | tee "${result_dir}/pytest.log"
+              python3 benchmark/minwm_realtime_parity/benchmark_static_fp8_linear.py \
+                --deterministic \
+                --warmup 10 \
+                --iterations 30 \
+                --output "${result_dir}/linear-benchmark.json" \
+                2>&1 | tee "${result_dir}/linear-benchmark.log"
+          resources:
+            requests:
+              cpu: "16"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: 128Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi

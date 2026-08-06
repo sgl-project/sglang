@@ -1,0 +1,151 @@
+{
+  "contract": {
+    "case_count": 14,
+    "width": 832,
+    "height": 480,
+    "fps": 24,
+    "seed": 0,
+    "reference_pixel_frames": 0,
+    "generated_pixel_frames": 725,
+    "generated_latent_frames": 182,
+    "chunks": 47,
+    "latent_chunk_sizes": [
+      1,
+      4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+      4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+      4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+      4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+      4, 4, 4, 4, 4,
+      1
+    ],
+    "action_output_format": "label_81",
+    "checkpoint": "s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-22-0724-5eba381389f/global_step_001600/ema_student/model.pt",
+    "baseline_prefix": "s3://leap-world-us-west-2/world-model/evals/minwm/wan22-5B-stage3-dmd-22-0724-5eba381389f/step-1600-30s/"
+  },
+  "cases": [
+    {
+      "id": "01_explorer_w181",
+      "prompt": "third-person fantasy action-game scene. A lone armored explorer in a dark green cloak travels through an ancient overgrown stone citadel at dawn, with wet flagstones, moss-covered arches, shallow reflective water, drifting mist, golden sunlight, distant waterfalls, and ruined towers. The route connects a long passage, a courtyard on the right, and another passage beyond it. Realistic footsteps, cloth motion, equipment physics, light splashes, falling leaves, circling birds, swaying grass, and floating dust. AAA game graphics, cinematic lighting, smooth animation, consistent character and environment, no combat, no cuts, no teleportation, no HUD, no text, no logos.",
+      "trajectory": "w*181",
+      "input_provenance": "reconstructed_from_output_filename_and_archived_prompt",
+      "archived_baseline": "A_lone_armored_explorer_in_a_dark_green_cloak_travels_through_an__w181.mp4"
+    },
+    {
+      "id": "02_explorer_w30j60l60a31",
+      "prompt": "third-person fantasy action-game scene. A lone armored explorer in a dark green cloak travels through an ancient overgrown stone citadel at dawn, with wet flagstones, moss-covered arches, shallow reflective water, drifting mist, golden sunlight, distant waterfalls, and ruined towers. The route connects a long passage, a courtyard on the right, and another passage beyond it. Realistic footsteps, cloth motion, equipment physics, light splashes, falling leaves, circling birds, swaying grass, and floating dust. AAA game graphics, cinematic lighting, smooth animation, consistent character and environment, no combat, no cuts, no teleportation, no HUD, no text, no logos.",
+      "trajectory": "w*30,j*60,l*60,a*31",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "A_lone_armored_explorer_in_a_dark_green_cloak_travels_through_an__w30j60l60a31.mp4"
+    },
+    {
+      "id": "03_ronin_a40l40j40d41",
+      "prompt": "third-person samurai adventure-game scene. A wandering ronin wearing layered black robes and a straw rain cape crosses a misty mountain temple during light rain. Stone paths, red torii gates, bamboo forests, lanterns, koi ponds, wooden shrines, and distant waterfalls surround the route. The level design features a long temple approach, a garden terrace on the right, and another stone path beyond the terrace. Realistic footsteps, wet fabric, sword sheath movement, rain splashes, drifting petals, swaying bamboo, and rippling water. Detailed AAA graphics, cinematic natural lighting, smooth character animation, consistent architecture, no fighting, no cuts, no teleportation, no interface, no text, no logos.",
+      "trajectory": "a*40,l*40,j*40,d*41",
+      "contract": {
+        "generated_pixel_frames": 645,
+        "generated_latent_frames": 162,
+        "chunks": 42,
+        "latent_chunk_sizes": [
+          1,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          1
+        ]
+      },
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "A_wandering_ronin_wearing_layered_black_robes_and_a_straw_rain_c__a40l40j40d41.mp4"
+    },
+    {
+      "id": "04_ronin_a80d81",
+      "prompt": "third-person samurai adventure-game scene. A wandering ronin wearing layered black robes and a straw rain cape crosses a misty mountain temple during light rain. Stone paths, red torii gates, bamboo forests, lanterns, koi ponds, wooden shrines, and distant waterfalls surround the route. The level design features a long temple approach, a garden terrace on the right, and another stone path beyond the terrace. Realistic footsteps, wet fabric, sword sheath movement, rain splashes, drifting petals, swaying bamboo, and rippling water. Detailed AAA graphics, cinematic natural lighting, smooth character animation, consistent architecture, no fighting, no cuts, no teleportation, no interface, no text, no logos.",
+      "trajectory": "a*80,d*81",
+      "contract": {
+        "generated_pixel_frames": 645,
+        "generated_latent_frames": 162,
+        "chunks": 42,
+        "latent_chunk_sizes": [
+          1,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+          1
+        ]
+      },
+      "input_provenance": "reconstructed_from_output_filename_and_archived_prompt",
+      "archived_baseline": "A_wandering_ronin_wearing_layered_black_robes_and_a_straw_rain_c__a80d81.mp4"
+    },
+    {
+      "id": "05_fantasy_w60a60d61",
+      "prompt": "fantasy game sequence inside an ancient flooded temple at dawn. Gloved hands hold a weathered lantern while moss-covered pillars, shallow reflective water, broken statues, hanging vines, drifting mist, and warm sunlight fill the ruins. The environment connects a long stone hall, an open chamber on the right, and another passage beyond it. Natural hand motion, subtle breathing, realistic footsteps, water splashes, swaying plants, floating dust, and distant birds. AAA game graphics, cinematic lighting, seamless continuity, consistent architecture, no combat, no cuts, no teleportation, no HUD, no text, no subtitles, no logos.",
+      "trajectory": "W*60,a*60,d*61",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "fantasy_game_sequence_inside_an_ancient_flooded_temple_at_dawn____W60a60d61.mp4"
+    },
+    {
+      "id": "06_fantasy_w60a60w61",
+      "prompt": "fantasy game sequence inside an ancient flooded temple at dawn. Gloved hands hold a weathered lantern while moss-covered pillars, shallow reflective water, broken statues, hanging vines, drifting mist, and warm sunlight fill the ruins. The environment connects a long stone hall, an open chamber on the right, and another passage beyond it. Natural hand motion, subtle breathing, realistic footsteps, water splashes, swaying plants, floating dust, and distant birds. AAA game graphics, cinematic lighting, seamless continuity, consistent architecture, no combat, no cuts, no teleportation, no HUD, no text, no subtitles, no logos.",
+      "trajectory": "W*60,a*60,w*61",
+      "input_provenance": "reconstructed_from_output_filename_and_archived_prompt",
+      "archived_baseline": "fantasy_game_sequence_inside_an_ancient_flooded_temple_at_dawn____W60a60w61.mp4"
+    },
+    {
+      "id": "07_postapoc_s30j60l60w31",
+      "prompt": "post-apocalyptic game sequence inside a city overtaken by vegetation. Weathered gloves hold a small flashlight while cracked streets, abandoned vehicles, collapsed buildings, vines, puddles, faded storefronts, drifting dust, and golden sunset light create a quiet atmosphere. The environment links a broad ruined avenue, an overgrown plaza on the right, and another street beyond it. Realistic hand and flashlight motion, natural footsteps, puddle splashes, loose paper blowing, birds taking flight, plants swaying, and distant smoke. Photorealistic AAA visuals, cinematic lighting, coherent geometry, stable environmental details, no zombies, no combat, no cuts, no HUD, no text, no logos.",
+      "trajectory": "s*30,j*60,l*60,w*31",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "post-apocalyptic_game_sequence_inside_a_city_overtaken_by_vegeta__s30j60l60w31.mp4"
+    },
+    {
+      "id": "08_postapoc_w181",
+      "prompt": "post-apocalyptic game sequence inside a city overtaken by vegetation. Weathered gloves hold a small flashlight while cracked streets, abandoned vehicles, collapsed buildings, vines, puddles, faded storefronts, drifting dust, and golden sunset light create a quiet atmosphere. The environment links a broad ruined avenue, an overgrown plaza on the right, and another street beyond it. Realistic hand and flashlight motion, natural footsteps, puddle splashes, loose paper blowing, birds taking flight, plants swaying, and distant smoke. Photorealistic AAA visuals, cinematic lighting, coherent geometry, stable environmental details, no zombies, no combat, no cuts, no HUD, no text, no logos.",
+      "trajectory": "w*181",
+      "input_provenance": "reconstructed_from_output_filename_and_archived_prompt",
+      "archived_baseline": "post-apocalyptic_game_sequence_inside_a_city_overtaken_by_vegeta__w181.mp4"
+    },
+    {
+      "id": "09_samurai_w181",
+      "prompt": "samurai game sequence through a mountain shrine during gentle rainfall. One hand rests near the wrapped hilt of a sheathed katana while wet stone paths, red torii gates, bamboo groves, lanterns, wooden temples, koi ponds, and drifting fog surround the route. The level contains a long shrine approach, a garden courtyard on the right, and another stone path beyond it. Natural hand movement, realistic footsteps, rain splashes, swaying bamboo, fluttering paper charms, falling petals, and rippling water. Detailed AAA graphics, atmospheric lighting, smooth animation, seamless world continuity, no fighting, no cuts, no teleportation, no interface, no subtitles, no logos.",
+      "trajectory": "w*181",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "samurai_game_sequence_through_a_mountain_shrine_during_gentle_ra__w181.mp4"
+    },
+    {
+      "id": "10_station_w181",
+      "prompt": "sci-fi game sequence aboard an abandoned research station orbiting a blue gas giant. Armored gloves and a compact scanning device remain naturally visible while metallic corridors, cracked observation windows, blinking consoles, exposed cables, drifting steam, and rotating machinery define the station. The connected environment includes a long laboratory corridor, a circular control room on the right, and another illuminated passage beyond it. Realistic hand animation, subtle suit movement, reflective surfaces, sparks, floating particles, and distant mechanical sounds. High-end real-time visuals, cinematic lighting, stable geometry, no enemies, no combat, no cuts, no HUD, no readable text, no logos.",
+      "trajectory": "w*181",
+      "input_provenance": "reconstructed_from_output_filename_and_archived_prompt",
+      "archived_baseline": "sci-fi_game_sequence_aboard_an_abandoned_research_station_orbiti__w181.mp4"
+    },
+    {
+      "id": "11_station_w30i60k60s31",
+      "prompt": "sci-fi game sequence aboard an abandoned research station orbiting a blue gas giant. Armored gloves and a compact scanning device remain naturally visible while metallic corridors, cracked observation windows, blinking consoles, exposed cables, drifting steam, and rotating machinery define the station. The connected environment includes a long laboratory corridor, a circular control room on the right, and another illuminated passage beyond it. Realistic hand animation, subtle suit movement, reflective surfaces, sparks, floating particles, and distant mechanical sounds. High-end real-time visuals, cinematic lighting, stable geometry, no enemies, no combat, no cuts, no HUD, no readable text, no logos.",
+      "trajectory": "w*30,i*60,k*60,s*31",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "sci-fi_game_sequence_aboard_an_abandoned_research_station_orbiti__w30i60k60s31.mp4"
+    },
+    {
+      "id": "12_survival_w60a30w60d31",
+      "prompt": "third-person post-apocalyptic survival-game sequence. A scavenger in a weathered hooded jacket and backpack moves through an abandoned city reclaimed by nature. Cracked asphalt, rusted vehicles, collapsed buildings, vines, puddles, faded signs, drifting dust, and warm sunset light create a quiet atmosphere. The navigable route includes a broad ruined avenue, an open marketplace to the right, and another avenue continuing beyond it. Realistic walking, backpack physics, cloth movement, puddle splashes, birds taking flight, loose paper blowing, plants swaying, and distant smoke. Photorealistic AAA game visuals, seamless continuity, stable world geometry, no zombies, no combat, no cuts, no HUD, no subtitles, no logos.",
+      "trajectory": "W*60,a*30,w*60,d*31",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "third-person_post-apocalyptic_survival-game_sequence__A_scavenge__W60a30w60d31.mp4"
+    },
+    {
+      "id": "13_soldier_w30k60i60d31",
+      "prompt": "third-person sci-fi game sequence. A futuristic soldier in white and graphite armor explores an abandoned orbital colony beneath a giant ringed planet. Metallic walkways, holographic panels, exposed cables, blue emergency lights, drifting steam, distant spacecraft, and panoramic glass walls define the environment. The traversable layout includes a long docking corridor, a spacious control platform to the right, and a second illuminated corridor. Natural walking animation, reactive armor parts, subtle reflections, moving machinery, sparks, dust particles, and atmospheric fog. High-end Unreal Engine visuals, realistic materials, seamless continuity, stable character design, no enemies, no combat, no cuts, no HUD, no subtitles, no logos.",
+      "trajectory": "W*30,k*60,i*60,d*31",
+      "input_provenance": "archived_inputs",
+      "archived_baseline": "third-person_sci-fi_game_sequence__A_futuristic_soldier_in_white__W30k60i60d31.mp4"
+    },
+    {
+      "id": "14_soldier_w60k30w60d31",
+      "prompt": "third-person sci-fi game sequence. A futuristic soldier in white and graphite armor explores an abandoned orbital colony beneath a giant ringed planet. Metallic walkways, holographic panels, exposed cables, blue emergency lights, drifting steam, distant spacecraft, and panoramic glass walls define the environment. The traversable layout includes a long docking corridor, a spacious control platform to the right, and a second illuminated corridor. Natural walking animation, reactive armor parts, subtle reflections, moving machinery, sparks, dust particles, and atmospheric fog. High-end Unreal Engine visuals, realistic materials, seamless continuity, stable character design, no enemies, no combat, no cuts, no HUD, no subtitles, no logos.",
+      "trajectory": "W*60,k*30,w*60,d*31",
+      "input_provenance": "reconstructed_from_output_filename_and_archived_prompt",
+      "archived_baseline": "third-person_sci-fi_game_sequence__A_futuristic_soldier_in_white__W60k30w60d31.mp4"
+    }
+  ]
+}

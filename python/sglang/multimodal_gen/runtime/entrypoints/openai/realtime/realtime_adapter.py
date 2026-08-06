@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RawRGBRealtimeOutputAdapter,
     RealtimeFrameSendStats,
+    normalize_realtime_output_format,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
@@ -233,18 +234,26 @@ class BaseRealtimeModelAdapter:
         event_id: int | None,
     ) -> None:
         batch.realtime_session_id = session.id
+        batch.realtime_trace_id = session.trace_id
+        batch.realtime_trace_started_at = session.trace_started_at
         batch.return_raw_frames = True
         batch.block_idx = chunk.index
         batch.realtime_event_id = event_id
         if session.request is None:
             return
-        batch.realtime_output_format = session.request.realtime_output_format
+        batch.realtime_output_format = normalize_realtime_output_format(
+            session.request.realtime_output_format
+        )
         batch.realtime_preview_max_width = session.request.realtime_preview_max_width
         batch.realtime_output_pacing = bool(session.request.realtime_output_pacing)
         batch.realtime_causal_sink_size = session.request.realtime_causal_sink_size
         batch.realtime_causal_kv_cache_num_frames = (
             session.request.realtime_causal_kv_cache_num_frames
         )
+        if session.request.max_chunks is not None:
+            batch.extra["realtime_is_final_chunk"] = (
+                chunk.index == session.request.max_chunks - 1
+            )
 
     async def send_output(
         self,

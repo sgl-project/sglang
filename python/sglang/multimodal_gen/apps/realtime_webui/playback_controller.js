@@ -1,38 +1,41 @@
 (function attachRealtimePlaybackController(global) {
   const DEFAULT_CONFIG = {
+    mode: "live",
     targetFps: 25,
+    lowLatencyPlayback: false,
+    holdForTargetLead: false,
     minSourceFps: 1,
     serverFpsAlphaUp: 0.28,
     serverFpsAlphaDown: 0.2,
     deliveryFpsAlphaUp: 0.08,
     deliveryFpsAlphaDown: 0.55,
-    targetLeadChunkRatio: 1.5,
-    minTargetLeadMs: 1500,
-    maxTargetLeadMs: 2600,
-    maxLeadExtraChunkRatio: 8.0,
-    startLeadChunkRatio: 1.85,
-    minStartLeadMs: 1700,
-    resumeLeadChunkRatio: 2.5,
-    minResumeLeadMs: 1000,
-    maxResumeLeadMs: 1800,
-    rebufferLeadBoostMs: 250,
+    targetLeadChunkRatio: 0.45,
+    minTargetLeadMs: 180,
+    maxTargetLeadMs: 360,
+    maxLeadExtraChunkRatio: 0.8,
+    startLeadChunkRatio: 0.45,
+    minStartLeadMs: 180,
+    resumeLeadChunkRatio: 0.45,
+    minResumeLeadMs: 120,
+    maxResumeLeadMs: 360,
+    rebufferLeadBoostMs: 0,
     rebufferLeadBoostDecayMsPerSecond: 120,
     deliveryLeadBoostDecayMsPerSecond: 80,
-    maxDeliveryLeadBoostMs: 2000,
+    maxDeliveryLeadBoostMs: 0,
     deliveryStallExpectedMultiplier: 1.25,
-    receiveStallPlaybackRateMin: 0.65,
+    receiveStallPlaybackRateMin: 0.86,
     receiveStallPlaybackRateSlewPerSecond: 0.5,
-    lowWaterRatio: 0.4,
-    playbackRateGain: 0.14,
+    lowWaterRatio: 0.15,
+    playbackRateGain: 0.16,
     playbackRateMin: 0.92,
-    playbackRateMax: 1.08,
-    emergencyPlaybackRateMin: 0.9,
-    emergencyPlaybackRateMax: 1.12,
-    playbackRateSlewPerSecond: 0.08,
-    eventCutoverMaxMs: 420,
-    eventCutoverMaxFrames: 10,
-    settleEventCutoverMaxMs: 720,
-    settleEventCutoverMaxFrames: 18,
+    playbackRateMax: 1.12,
+    emergencyPlaybackRateMin: 0.86,
+    emergencyPlaybackRateMax: 1.3,
+    playbackRateSlewPerSecond: 0.35,
+    eventCutoverMaxMs: 180,
+    eventCutoverMaxFrames: 3,
+    settleEventCutoverMaxMs: 260,
+    settleEventCutoverMaxFrames: 4,
     startupWarmupMinMs: 1500,
     startupWarmupExpectedMultiplier: 3,
   };
@@ -48,10 +51,14 @@
   class RealtimePlaybackController {
     constructor(config = {}) {
       this.config = { ...DEFAULT_CONFIG, ...config };
-      this.reset({ targetFps: this.config.targetFps });
+      this.reset({
+        targetFps: this.config.targetFps,
+        mode: this.config.mode,
+      });
     }
 
-    reset({ targetFps } = {}) {
+    reset({ targetFps, mode } = {}) {
+      this.mode = this.#normalizeMode(mode || this.mode || this.config.mode);
       this.targetFps = Math.max(1, Number(targetFps || this.config.targetFps));
       this.sourceFps = this.targetFps;
       this.serverFps = this.targetFps;
@@ -80,6 +87,12 @@
       this.serverStatChunks = new Set();
       this.lastFinalReceiveAt = 0;
       this.receiveStalled = false;
+    }
+
+    setMode(mode) {
+      this.mode = this.#normalizeMode(mode);
+      this.#updatePlaybackRate(this.lastRateUpdateAt || 0);
+      return this.snapshot();
     }
 
     setTargetFps(targetFps) {
@@ -148,17 +161,20 @@
         chunk: Number(frame.chunk ?? chunkIndex),
         chunkIndex,
         eventId,
+        receivedAt: Number(frame.receivedAt || receivedAt),
       }));
       const droppedFrames = [];
       let cutover = null;
 
       if (this.pendingEventId && eventId >= this.pendingEventId) {
         const oldEventFrameCount = this.#oldEventFrameCount(eventId);
-        const graceFrames = this.#eventGraceFrames();
-        const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
-        if (dropCount > 0) {
-          droppedFrames.push(...this.queue.splice(graceFrames, dropCount));
-          this.#recordDrop(dropCount, "event cutover", now);
+        if (this.mode === "live") {
+          const graceFrames = this.#eventGraceFrames();
+          const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
+          if (dropCount > 0) {
+            droppedFrames.push(...this.queue.splice(graceFrames, dropCount));
+            this.#recordDrop(dropCount, "event cutover", now);
+          }
         }
         cutover = {
           eventId,
@@ -192,6 +208,9 @@
 
       const bufferMs = this.bufferDurationMs;
       if (
+        this.mode === "live" &&
+        !this.config.lowLatencyPlayback &&
+        this.config.holdForTargetLead &&
         hasPendingInput &&
         this.receiveStalled &&
         this.renderedFrames &&
@@ -203,6 +222,8 @@
       }
 
       if (
+        !this.config.lowLatencyPlayback &&
+        this.config.holdForTargetLead &&
         hasPendingInput &&
         this.buffering &&
         bufferMs < (this.renderedFrames ? this.#resumeLeadMs() : this.#startLeadMs())
@@ -261,6 +282,7 @@
 
     snapshot() {
       return {
+        mode: this.mode,
         queueFrames: this.queue.length,
         bufferMs: this.bufferDurationMs,
         targetLeadMs: this.targetLeadMs,
@@ -378,6 +400,16 @@
     }
 
     #updatePlaybackRate(now) {
+      if (this.mode === "timeline") {
+        this.playbackRate = 1;
+        this.renderFps = clamp(
+          this.sourceFps,
+          this.config.minSourceFps,
+          this.targetFps,
+        );
+        this.lastRateUpdateAt = now;
+        return;
+      }
       const bufferMs = this.bufferDurationMs;
       const targetLeadMs = Math.max(1, this.targetLeadMs);
       const error = (bufferMs - targetLeadMs) / targetLeadMs;
@@ -418,8 +450,11 @@
         );
       }
       this.lastRateUpdateAt = now;
+      const baseRenderFps = this.config.lowLatencyPlayback
+        ? this.targetFps
+        : this.sourceFps;
       this.renderFps = clamp(
-        this.sourceFps * this.playbackRate,
+        baseRenderFps * this.playbackRate,
         this.config.minSourceFps,
         this.targetFps * this.config.emergencyPlaybackRateMax,
       );
@@ -427,6 +462,8 @@
 
     #trimBacklog(now) {
       const droppedFrames = [];
+      if (this.mode === "timeline") return droppedFrames;
+      droppedFrames.push(...this.#trimStaleBacklog(now));
       while (this.queue.length && this.bufferDurationMs > this.maxLeadMs) {
         const firstChunk = this.queue[0].chunkIndex;
         let dropCount = 0;
@@ -443,6 +480,42 @@
       return droppedFrames;
     }
 
+    #normalizeMode(mode) {
+      return mode === "timeline" ? "timeline" : "live";
+    }
+
+    #trimStaleBacklog(now) {
+      const droppedFrames = [];
+      const maxAgeMs = Math.max(this.maxLeadMs, this.targetLeadMs + this.latestChunkDurationMs);
+      while (this.queue.length > 1) {
+        const receivedAt = Number(this.queue[0].receivedAt || 0);
+        if (!receivedAt || now - receivedAt <= maxAgeMs) break;
+
+        const firstChunk = this.queue[0].chunkIndex;
+        let dropCount = 0;
+        while (
+          dropCount < this.queue.length &&
+          this.queue[dropCount].chunkIndex === firstChunk
+        ) {
+          dropCount += 1;
+        }
+        if (!dropCount) break;
+        if (dropCount >= this.queue.length) {
+          dropCount = Math.max(0, this.queue.length - 1);
+        }
+        if (!dropCount) break;
+        droppedFrames.push(...this.queue.splice(0, dropCount));
+        this.#recordDrop(dropCount, "stale", now);
+      }
+
+      if (droppedFrames.length) {
+        this.deliveryLeadBoostMs = 0;
+        this.rebufferLeadBoostMs = 0;
+        this.receiveStalled = false;
+      }
+      return droppedFrames;
+    }
+
     #oldEventFrameCount(nextEventId) {
       let count = 0;
       while (count < this.queue.length && this.queue[count].eventId < nextEventId) {
@@ -452,6 +525,7 @@
     }
 
     #eventGraceFrames() {
+      if (this.config.lowLatencyPlayback) return 0;
       const byTime = Math.max(
         1,
         Math.round(this.sourceFps * this.#eventCutoverMaxMs() / 1000),

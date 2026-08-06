@@ -1,0 +1,29 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-tianpeng-gap12-same-host-20260731-01
+  namespace: default
+  annotations:
+    seedleap.ai/sglang-git-ref: 0754173044bcccae838d3b54a61df2e32c858052
+spec:
+  template:
+    spec:
+      containers:
+        - name: native-minwm
+          env:
+            - name: SGLANG_GIT_REF
+              value: 0754173044bcccae838d3b54a61df2e32c858052
+          resources:
+            requests:
+              ephemeral-storage: 80Gi
+            limits:
+              ephemeral-storage: 300Gi
+        - name: sglang-minwm
+          env:
+            - name: SGLANG_GIT_REF
+              value: 0754173044bcccae838d3b54a61df2e32c858052
+          resources:
+            requests:
+              ephemeral-storage: 80Gi
+            limits:
+              ephemeral-storage: 300Gi

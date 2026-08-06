@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../minwm_tianpeng_gap12_realtime_h100_east2.yaml
+  - nodeclass-use1.yaml
+patches:
+  - path: nodepool-use1.yaml
+  - path: deployment-use1.yaml
+  - path: service-use1.yaml

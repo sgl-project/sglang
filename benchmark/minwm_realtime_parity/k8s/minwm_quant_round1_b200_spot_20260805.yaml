@@ -1,0 +1,370 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minwm-quant-r1-results-20260805
+  namespace: default
+  labels:
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-quantization
+    seedleap.ai/run-id: minwm-quant-r1-b200-20260805-01
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: minwm-sp12-gp3-20260731
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-quant-r1-b200-20260805-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-quant-r1-b200-20260805-01
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-quantization
+    seedleap.ai/run-id: minwm-quant-r1-b200-20260805-01
+  annotations:
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/repo: seedleap/sglang
+    seedleap.ai/branch: codex/minwm-realtime-api
+    seedleap.ai/sglang-git-ref: "ca2509f03432d07f183f8f1816c1ae1f218ec6a0"
+    seedleap.ai/minwm-git-ref: "2efc6485f65e8fcab506665efde79bc41406385e"
+    seedleap.ai/checkpoint-version-id: "wduScksw2f3yPErnG9lBioOuE2AToyAP"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-quant-r1-b200-20260805-01
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/task: minwm-realtime-quantization
+        seedleap.ai/run-id: minwm-quant-r1-b200-20260805-01
+      annotations:
+        seedleap.ai/repo: seedleap/sglang
+        seedleap.ai/branch: codex/minwm-realtime-api
+        seedleap.ai/sglang-git-ref: "ca2509f03432d07f183f8f1816c1ae1f218ec6a0"
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        karpenter.sh/capacity-type: spot
+        karpenter.sh/nodepool: minwm-test-atl2-p6-spot
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+        seedleap.ai/capacity-pool: minwm-test-atl2-karpenter
+        topology.kubernetes.io/zone: us-east-1-atl-2a
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-test-atl2-karpenter
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: MATRIX_ID
+              value: minwm-quant-r1-b200-20260805-01
+            - name: SGLANG_GIT_REF
+              value: "ca2509f03432d07f183f8f1816c1ae1f218ec6a0"
+            - name: MINWM_GIT_REF
+              value: "2efc6485f65e8fcab506665efde79bc41406385e"
+            - name: MINWM_STAGE_FROM_MOUNT
+              value: "1"
+            - name: MINWM_CHECKPOINT_MOUNT_PATH
+              value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_PRETRAINED_MOUNT_PATH
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_CHECKPOINT_S3_EAST
+              value: s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_CHECKPOINT_VERSION_EAST
+              value: wduScksw2f3yPErnG9lBioOuE2AToyAP
+            - name: MINWM_CHECKPOINT_SOURCE_URI
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_CHECKPOINT_SOURCE_VERSION
+              value: x.2zYaRRNzyqngI7O_cYSrsK3NvgPKKt
+            - name: MINWM_CHECKPOINT_SOURCE_ETAG
+              value: 5c29d614972e06fd0df859abfd1d6f4d-191
+            - name: MINWM_CHECKPOINT_BYTES
+              value: "10007171771"
+            - name: MINWM_CHECKPOINT_CRC64
+              value: I0IQ+p0pREI=
+            - name: MINWM_PRETRAINED_S3
+              value: s3://leap-world-us-east-2/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_RESULTS_ROOT
+              value: /results
+            - name: MINWM_CASES_PATH
+              value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_720p_compile_smoke.json
+            - name: MINWM_THROUGHPUT_CASES_PATH
+              value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_720p_compile_smoke.json
+            - name: MINWM_THROUGHPUT_CASE
+              value: 00_forward_080_pottery_720p
+            - name: MINWM_THROUGHPUT_WARMUP_CHUNKS
+              value: "20"
+            - name: MINWM_THROUGHPUT_MEASURED_CHUNKS
+              value: "200"
+            - name: MINWM_INCLUDE_COMPILE_PROFILE
+              value: "true"
+            - name: MINWM_THROUGHPUT_PROFILES
+              value: dense-optimized-components-kv45,dense-optimized-compile-kv45
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+              clone_at minWM /workspace/minWM "${MINWM_GIT_REF}"
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
+
+              matrix_id="${MATRIX_ID}"
+              matrix_results_root="${MINWM_RESULTS_ROOT%/}"
+              base_run="${matrix_id}-bf16-eager"
+              static_fp8_run="${matrix_id}-static-fp8-eager"
+              nvfp4_run="${matrix_id}-nvfp4-trtllm-eager"
+              entrypoint=/workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
+              failures=()
+              mkdir -p "${matrix_results_root}"
+              {
+                echo "pod=${POD_NAME}"
+                echo "node=${NODE_NAME}"
+                echo "image=829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a"
+                echo "sglang=${SGLANG_GIT_REF}"
+                echo "minwm=${MINWM_GIT_REF}"
+              } > "${matrix_results_root}/${matrix_id}-provenance.txt"
+              nvidia-smi -q > "${matrix_results_root}/${matrix_id}-nvidia-smi.txt"
+
+              run_lane() {
+                local lane="$1"
+                shift
+                echo "MINWM_QUANT_R1_LANE_START lane=${lane} timestamp=$(date --iso-8601=seconds)"
+                set +e
+                env "$@" bash "${entrypoint}"
+                local status=$?
+                set -e
+                echo "MINWM_QUANT_R1_LANE_END lane=${lane} status=${status} timestamp=$(date --iso-8601=seconds)"
+                if (( status != 0 )); then
+                  failures+=("${lane}:${status}")
+                fi
+              }
+
+              run_reused_lane() {
+                local lane="$1"
+                shift
+                run_lane "${lane}" \
+                  MINWM_RUN_ID="${matrix_id}-${lane}" \
+                  MINWM_REUSE_INPUT_RUN_ID="${base_run}" \
+                  MINWM_REUSE_MODEL_RUN_ID="${base_run}" \
+                  MINWM_SKIP_INSTALL=1 \
+                  "$@"
+              }
+
+              eager_profile=dense-optimized-components-kv45
+              compile_profile=dense-optimized-compile-kv45
+
+              run_lane bf16-eager \
+                MINWM_RUN_ID="${base_run}" \
+                MINWM_BENCHMARK_MODE=profiles \
+                MINWM_PROFILE_QUANTIZATION_LABEL=bf16 \
+                MINWM_THROUGHPUT_PROFILES="${eager_profile}"
+
+              [[ -f "/work/minwm-realtime/${base_run}/checkpoint/model.pt" ]]
+              [[ -f "/work/minwm-realtime/${base_run}/sglang-model/minwm_conversion_manifest.json" ]]
+
+              run_reused_lane online-fp8-eager \
+                MINWM_BENCHMARK_MODE=profiles \
+                MINWM_PROFILE_QUANTIZATION=fp8 \
+                MINWM_PROFILE_QUANTIZATION_LABEL=online_fp8_dynamic \
+                MINWM_THROUGHPUT_PROFILES="${eager_profile}"
+
+              run_reused_lane static-fp8-eager \
+                MINWM_BENCHMARK_MODE=calibratedfp8 \
+                MINWM_PROFILE_QUANTIZATION_LABEL=static_fp8_calibrated \
+                MINWM_THROUGHPUT_PROFILES="${eager_profile}"
+
+              if [[ "${MINWM_QUANT_R1_SKIP_NVFP4:-0}" != "1" ]]; then
+                run_reused_lane nvfp4-trtllm-eager \
+                  MINWM_BENCHMARK_MODE=nvfp4 \
+                  MINWM_PROFILE_QUANTIZATION_LABEL=nvfp4_flashinfer_trtllm \
+                  SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=flashinfer_trtllm \
+                  MINWM_THROUGHPUT_PROFILES="${eager_profile}"
+
+                if [[ -f "/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer/minwm_nvfp4_manifest.json" ]]; then
+                  run_reused_lane nvfp4-cutlass-eager \
+                    MINWM_BENCHMARK_MODE=profiles \
+                    MINWM_PROFILE_TRANSFORMER_PATH="/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer" \
+                    MINWM_PROFILE_QUANTIZATION_LABEL=nvfp4_flashinfer_cutlass \
+                    SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=flashinfer_cutlass \
+                    MINWM_THROUGHPUT_PROFILES="${eager_profile}"
+
+                  run_reused_lane nvfp4-cudnn-eager \
+                    MINWM_BENCHMARK_MODE=profiles \
+                    MINWM_PROFILE_TRANSFORMER_PATH="/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer" \
+                    MINWM_PROFILE_QUANTIZATION_LABEL=nvfp4_flashinfer_cudnn \
+                    SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=flashinfer_cudnn \
+                    MINWM_THROUGHPUT_PROFILES="${eager_profile}"
+                else
+                  failures+=("nvfp4-transformer-missing:1")
+                fi
+              else
+                echo "MINWM_QUANT_R1_SKIP lanes=nvfp4-* reason=hardware-not-supported"
+              fi
+
+              run_reused_lane online-fp8-compile \
+                MINWM_BENCHMARK_MODE=profiles \
+                MINWM_PROFILE_QUANTIZATION=fp8 \
+                MINWM_PROFILE_QUANTIZATION_LABEL=online_fp8_dynamic \
+                MINWM_THROUGHPUT_PROFILES="${compile_profile}"
+
+              run_reused_lane bf16-compile \
+                MINWM_BENCHMARK_MODE=profiles \
+                MINWM_PROFILE_QUANTIZATION_LABEL=bf16 \
+                MINWM_THROUGHPUT_PROFILES="${compile_profile}"
+
+              if [[ -f "/work/minwm-realtime/${static_fp8_run}/static-fp8-transformer/minwm_static_fp8_manifest.json" ]]; then
+                run_reused_lane static-fp8-compile \
+                  MINWM_BENCHMARK_MODE=profiles \
+                  MINWM_PROFILE_TRANSFORMER_PATH="/work/minwm-realtime/${static_fp8_run}/static-fp8-transformer" \
+                  MINWM_PROFILE_QUANTIZATION_LABEL=static_fp8_calibrated \
+                  MINWM_THROUGHPUT_PROFILES="${compile_profile}"
+              else
+                failures+=("static-fp8-transformer-missing:1")
+              fi
+
+              if [[ "${MINWM_QUANT_R1_SKIP_NVFP4:-0}" != "1" && -f "/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer/minwm_nvfp4_manifest.json" ]]; then
+                run_reused_lane nvfp4-trtllm-compile \
+                  MINWM_BENCHMARK_MODE=profiles \
+                  MINWM_PROFILE_TRANSFORMER_PATH="/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer" \
+                  MINWM_PROFILE_QUANTIZATION_LABEL=nvfp4_flashinfer_trtllm \
+                  SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=flashinfer_trtllm \
+                  MINWM_THROUGHPUT_PROFILES="${compile_profile}"
+
+                run_reused_lane nvfp4-cutlass-compile \
+                  MINWM_BENCHMARK_MODE=profiles \
+                  MINWM_PROFILE_TRANSFORMER_PATH="/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer" \
+                  MINWM_PROFILE_QUANTIZATION_LABEL=nvfp4_flashinfer_cutlass \
+                  SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=flashinfer_cutlass \
+                  MINWM_THROUGHPUT_PROFILES="${compile_profile}"
+
+                run_reused_lane nvfp4-cudnn-compile \
+                  MINWM_BENCHMARK_MODE=profiles \
+                  MINWM_PROFILE_TRANSFORMER_PATH="/work/minwm-realtime/${nvfp4_run}/nvfp4-transformer" \
+                  MINWM_PROFILE_QUANTIZATION_LABEL=nvfp4_flashinfer_cudnn \
+                  SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=flashinfer_cudnn \
+                  MINWM_THROUGHPUT_PROFILES="${compile_profile}"
+              fi
+
+              python3 - "${matrix_results_root}" "${matrix_id}" <<'PY'
+              import csv
+              import json
+              import os
+              import sys
+              from pathlib import Path
+
+              root = Path(sys.argv[1])
+              matrix_id = sys.argv[2]
+              lanes = [
+                  "bf16-eager",
+                  "online-fp8-eager",
+                  "static-fp8-eager",
+                  "nvfp4-trtllm-eager",
+                  "nvfp4-cutlass-eager",
+                  "nvfp4-cudnn-eager",
+                  "online-fp8-compile",
+                  "bf16-compile",
+                  "static-fp8-compile",
+                  "nvfp4-trtllm-compile",
+                  "nvfp4-cutlass-compile",
+                  "nvfp4-cudnn-compile",
+              ]
+              matrix = {"matrix_id": matrix_id, "lanes": {}}
+              for lane in lanes:
+                  run_root = root / f"{matrix_id}-{lane}"
+                  summary_path = run_root / "throughput-summary.json"
+                  item = {"result_root": str(run_root), "summary_exists": summary_path.is_file()}
+                  if os.environ.get("MINWM_QUANT_R1_SKIP_NVFP4") == "1" and lane.startswith("nvfp4-"):
+                      item["skipped"] = "hardware-not-supported"
+                  if summary_path.is_file():
+                      item.update(json.loads(summary_path.read_text()))
+                  peak_memory = {}
+                  for path in sorted((run_root / "throughput").glob("*/gpu-memory.csv")):
+                      values = []
+                      with path.open(newline="") as handle:
+                          for row in csv.reader(handle):
+                              if len(row) >= 3:
+                                  try:
+                                      values.append(float(row[2].strip()))
+                                  except ValueError:
+                                      pass
+                      peak_memory[path.parent.name] = max(values) if values else None
+                  item["peak_gpu_memory_mib"] = peak_memory
+                  matrix["lanes"][lane] = item
+              output = root / f"{matrix_id}-matrix-summary.json"
+              output.write_text(json.dumps(matrix, indent=2, sort_keys=True) + "\n")
+              print(json.dumps(matrix, indent=2, sort_keys=True))
+              PY
+
+              printf '%s\n' "${failures[@]:-}" > "${matrix_results_root}/${matrix_id}-failures.txt"
+              if (( ${#failures[@]} != 0 )); then
+                echo "MINWM_QUANT_R1_FAILED failures=${failures[*]}" >&2
+                exit 1
+              fi
+              echo "MINWM_QUANT_R1_COMPLETE summary=${matrix_results_root}/${matrix_id}-matrix-summary.json"
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: results
+              mountPath: /results
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+        - name: work
+          emptyDir: {}
+        - name: results
+          persistentVolumeClaim:
+            claimName: minwm-quant-r1-results-20260805
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi

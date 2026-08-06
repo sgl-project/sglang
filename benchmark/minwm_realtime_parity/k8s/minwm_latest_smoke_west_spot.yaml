@@ -1,0 +1,141 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-realtime-latest-profiles-west-20260722-08
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-realtime-latest-profiles-west-20260722-08
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/run-id: latest-ckpt-v7-profiles-attempt08-west-spot
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: "d9a7e0e6630ea8aea135191115a13e6451618a6f"
+    seedleap.ai/minwm-git-ref: "2efc6485f65e8fcab506665efde79bc41406385e"
+    seedleap.ai/checkpoint-version-id: "wduScksw2f3yPErnG9lBioOuE2AToyAP"
+    seedleap.ai/capacity-type: spot
+spec:
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-realtime-latest-profiles-west-20260722-08
+        seedleap.ai/task: minwm-realtime-parity
+        seedleap.ai/run-id: latest-ckpt-v7-profiles-attempt08-west-spot
+        seedleap.ai/owner: chenshengdong
+      annotations:
+        seedleap.ai/sglang-git-ref: "d9a7e0e6630ea8aea135191115a13e6451618a6f"
+        seedleap.ai/minwm-git-ref: "2efc6485f65e8fcab506665efde79bc41406385e"
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: seedleap.ai/workload
+          operator: Equal
+          value: wan22-ti2v
+          effect: NoSchedule
+      nodeSelector:
+        eks.amazonaws.com/capacityType: SPOT
+        eks.amazonaws.com/nodegroup: minwm-spot-p6-b200-0703
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+        seedleap.ai/workload: wan22-ti2v
+      containers:
+        - name: benchmark
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+                  optional: true
+            - name: SGLANG_GIT_REF
+              value: "d9a7e0e6630ea8aea135191115a13e6451618a6f"
+            - name: MINWM_GIT_REF
+              value: "2efc6485f65e8fcab506665efde79bc41406385e"
+            - name: OVERLAY_SHA256
+              value: "f594ae8f2fa36e675281d303abd4a1aa25cd5488d870367d85250b5b12e4891b"
+            - name: MINWM_BENCHMARK_MODE
+              value: profiles
+            - name: MINWM_RUN_ID
+              value: latest-ckpt-v7-profiles-attempt08-west-spot
+            - name: MINWM_STAGE_FROM_MOUNT
+              value: "1"
+            - name: MINWM_S3_MOUNT
+              value: /s3
+            - name: MINWM_CHECKPOINT_MOUNT_PATH
+              value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_PRETRAINED_MOUNT_PATH
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_CHECKPOINT_S3_EAST
+              value: s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_CHECKPOINT_VERSION_EAST
+              value: wduScksw2f3yPErnG9lBioOuE2AToyAP
+            - name: MINWM_CHECKPOINT_SOURCE_URI
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_CHECKPOINT_SOURCE_VERSION
+              value: x.2zYaRRNzyqngI7O_cYSrsK3NvgPKKt
+            - name: MINWM_CHECKPOINT_SOURCE_ETAG
+              value: 5c29d614972e06fd0df859abfd1d6f4d-191
+            - name: MINWM_CHECKPOINT_BYTES
+              value: "10007171771"
+            - name: MINWM_CHECKPOINT_CRC64
+              value: I0IQ+p0pREI=
+            - name: MINWM_PRETRAINED_S3
+              value: s3://leap-world-us-east-2/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_RESULTS_ROOT
+              value: /s3/world-model/evals/minwm/realtime-parity/20260722-codex-578d/results
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              [[ -n "${GITHUB_TOKEN:-}" ]] || {
+                echo "Private seedleap repositories require github-token." >&2
+                exit 2
+              }
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+              clone_at minWM /workspace/minWM "${MINWM_GIT_REF}"
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+              echo "${OVERLAY_SHA256}  /opt/minwm-overlay/overlay.tar.gz" | sha256sum -c -
+              tar -xzf /opt/minwm-overlay/overlay.tar.gz -C /workspace/sglang
+              exec bash /workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+            - name: overlay
+              mountPath: /opt/minwm-overlay
+              readOnly: true
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+        - name: work
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: overlay
+          configMap:
+            name: minwm-realtime-overlay-20260722-v7

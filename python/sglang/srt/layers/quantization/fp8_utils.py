@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -1578,6 +1579,29 @@ def _process_scaled_mm_output(output, input_2d_shape, output_shape):
     return torch.narrow(output, 0, 0, input_2d_shape[0]).view(*output_shape)
 
 
+@contextmanager
+def _skip_deterministic_fill_for_full_overwrite():
+    """Avoid deterministic-mode poison fills for fully overwritten FP8 buffers.
+
+    PyTorch fills every ``empty`` allocation when deterministic algorithms and
+    ``fill_uninitialized_memory`` are both enabled.  The static FP8 quantizer
+    and scaled GEMM overwrite their complete outputs, so those fills cannot
+    affect the result; on minWM they otherwise add two kernels per linear.
+    Keep the override scoped to the two full-overwrite operations and restore
+    the process setting even if either operation raises.
+    """
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    fill_was_enabled = torch.utils.deterministic.fill_uninitialized_memory
+    should_skip = deterministic and fill_was_enabled
+    if should_skip:
+        torch.utils.deterministic.fill_uninitialized_memory = False
+    try:
+        yield
+    finally:
+        if should_skip:
+            torch.utils.deterministic.fill_uninitialized_memory = fill_was_enabled
+
+
 def _apply_fallback_scaled_mm(
     qinput,
     weight,
@@ -1623,6 +1647,52 @@ def apply_fp8_linear_bmm_flashinfer(
     output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
     if bias is not None:
         output = output + bias
+    return output.view(*output_shape)
+
+
+def apply_fp8_linear_scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-tensor static FP8 linear via the native scaled-mm backend."""
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+    input_2d = input.view(-1, input.shape[-1])
+    with _skip_deterministic_fill_for_full_overwrite():
+        # B200 measurements show the row-wise Triton kernel is faster once M is
+        # large (the minWM self-attention and both FFN projections), while the
+        # flat JIT kernel remains better for the small-M cross-attention shape.
+        if input_2d.is_contiguous() and input_2d.shape[0] >= 8192:
+            qinput, x_scale = static_quant_fp8(
+                input_2d, input_scale, repeat_scale=False
+            )
+        else:
+            qinput, x_scale = scaled_fp8_quant(input_2d, input_scale)
+        output_size = weight.shape[1]
+        needs_padding = weight.shape[0] % 16 != 0 or output_size % 16 != 0
+        if needs_padding:
+            padded_k = ceil_align(weight.shape[0], 16)
+            padded_n = ceil_align(output_size, 16)
+            padded_qinput = qinput.new_zeros((qinput.shape[0], padded_k))
+            padded_qinput[:, : qinput.shape[1]] = qinput
+            padded_weight = weight.new_zeros((padded_n, padded_k)).t()
+            padded_weight[: weight.shape[0], :output_size] = weight
+            qinput = padded_qinput
+            weight = padded_weight
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            scale_a=x_scale.reshape(1),
+            scale_b=weight_scale.reshape(1),
+            out_dtype=input.dtype,
+            bias=None if needs_padding else bias,
+        )
+    if needs_padding:
+        output = output[:, :output_size]
+        if bias is not None:
+            output = output + bias
     return output.view(*output_shape)
 
 

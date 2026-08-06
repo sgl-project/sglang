@@ -1,0 +1,145 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-0724-prompt-switch-20260727-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-0724-prompt-switch-20260727-01
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/run-id: 0724-window18-sink9-5s-prompt-switch-b200-attempt01
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: 294c224b487049d4c57951f2f62b03951b26043f
+    seedleap.ai/minwm-git-ref: 0796bc201fae4c86f100620cb23402ae21c8f3b5
+    seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/kv-contract: window18-including-sink9-and-current-chunk
+spec:
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-0724-prompt-switch-20260727-01
+        seedleap.ai/task: minwm-realtime-parity
+        seedleap.ai/run-id: 0724-window18-sink9-5s-prompt-switch-b200-attempt01
+        seedleap.ai/owner: chenshengdong
+      annotations:
+        seedleap.ai/sglang-git-ref: 294c224b487049d4c57951f2f62b03951b26043f
+        seedleap.ai/minwm-git-ref: 0796bc201fae4c86f100620cb23402ae21c8f3b5
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-test-usw2d-karpenter
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-test-usw2d-karpenter
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: SGLANG_GIT_REF
+              value: 294c224b487049d4c57951f2f62b03951b26043f
+            - name: MINWM_GIT_REF
+              value: 0796bc201fae4c86f100620cb23402ae21c8f3b5
+            - name: MINWM_BENCHMARK_MODE
+              value: bounded5s
+            - name: MINWM_RUN_ID
+              value: 0724-window18-sink9-5s-prompt-switch-b200-attempt01
+            - name: MINWM_REUSE_INPUT_RUN_ID
+              value: 0724-window18-sink9-5s-b200-attempt01
+            - name: MINWM_REUSE_MODEL_RUN_ID
+              value: 0724-window18-sink9-5s-b200-attempt03
+            - name: MINWM_CASES_PATH
+              value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_prompt_switch_kv_roll_832x480.json
+            - name: MINWM_LOCAL_ATTN_SIZE
+              value: "18"
+            - name: MINWM_SINK_SIZE
+              value: "9"
+            - name: MINWM_STAGE_FROM_MOUNT
+              value: "1"
+            - name: MINWM_S3_MOUNT
+              value: /s3
+            - name: MINWM_CHECKPOINT_MOUNT_PATH
+              value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
+            - name: MINWM_PRETRAINED_MOUNT_PATH
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_CHECKPOINT_S3_EAST
+              value: s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
+            - name: MINWM_CHECKPOINT_VERSION_EAST
+              value: yX2Wlgz70mNgNUa0maBe0yyXShIo2wjk
+            - name: MINWM_CHECKPOINT_SOURCE_URI
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
+            - name: MINWM_CHECKPOINT_SOURCE_VERSION
+              value: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
+            - name: MINWM_CHECKPOINT_SOURCE_ETAG
+              value: d76d7a982b7eca7908e4b2a0fb4a4f6b-2386
+            - name: MINWM_CHECKPOINT_BYTES
+              value: "20014135255"
+            - name: MINWM_CHECKPOINT_CRC64
+              value: 8KS+pbHYSjY=
+            - name: MINWM_PRETRAINED_S3
+              value: s3://leap-world-us-east-2/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_RESULTS_ROOT
+              value: /work/parity-results
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+              clone_at minWM /workspace/minWM "${MINWM_GIT_REF}"
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+              exec bash /workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+            readOnly: true
+        - name: work
+          persistentVolumeClaim:
+            claimName: minwm-dmd-0724-p6-work
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

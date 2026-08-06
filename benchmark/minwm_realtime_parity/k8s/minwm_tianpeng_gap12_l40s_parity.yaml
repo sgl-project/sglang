@@ -1,0 +1,404 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-tianpeng-l40s-ondemand
+  labels:
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+spec:
+  limits:
+    nvidia.com/gpu: "1"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-tianpeng-l40s-ondemand
+        seedleap.ai/task: minwm-realtime-parity
+    spec:
+      expireAfter: 2h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ray-gpu-ec2-all
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - on-demand
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values:
+            - us-east-2a
+            - us-east-2b
+            - us-east-2c
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - g6e.4xlarge
+            - g6e.8xlarge
+      taints:
+        - key: seedleap.ai/capacity-pool
+          value: minwm-tianpeng-l40s-ondemand
+          effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: minwm-tianpeng-nvidia-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-nvidia-device-plugin
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-tianpeng-nvidia-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-nvidia-device-plugin
+        seedleap.ai/task: minwm-realtime-parity
+    spec:
+      priorityClassName: system-node-critical
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-tianpeng-l40s-ondemand
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-tianpeng-l40s-ondemand
+          effect: NoSchedule
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.19.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - nvidia-device-plugin
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: kubelet-device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: kubelet-device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-tianpeng-gap12-l40s-20260731-02
+  namespace: ray
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-gap12-l40s
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: c3bbadfa443592d5a9b7f90fa648bebbef0b5472
+    seedleap.ai/minwm-git-ref: 4220c8a
+    seedleap.ai/alignment-code-ref: 386f8c242704db4c848bae14097b89cfebc5ae4e
+    seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
+    seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+    seedleap.ai/capacity-type: on-demand
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-gap12-l40s
+        seedleap.ai/task: minwm-realtime-parity
+        seedleap.ai/owner: chenshengdong
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-tianpeng-l40s-ondemand
+        karpenter.sh/capacity-type: on-demand
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-tianpeng-l40s-ondemand
+          effect: NoSchedule
+      containers:
+        - name: parity
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_GIT_REF
+              value: c3bbadfa443592d5a9b7f90fa648bebbef0b5472
+            - name: MINWM_GIT_REF
+              value: 4220c8a
+            - name: ALIGNMENT_GIT_REF
+              value: 386f8c242704db4c848bae14097b89cfebc5ae4e
+            - name: CHECKPOINT_SHA256
+              value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+            - name: CHECKPOINT_BYTES
+              value: "20014120667"
+            - name: RESULT_RUN_ID
+              value: 20260731-l40s-02
+            - name: MINWM_PARITY_DETERMINISTIC
+              value: "0"
+            - name: MINWM_DETERMINISTIC_ATTENTION
+              value: "false"
+            - name: SGLANG_ENABLE_DETERMINISTIC_INFERENCE
+              value: "0"
+            - name: SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D
+              value: "false"
+            - name: MINWM_ATTENTION_IMPL
+              value: packed
+            - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
+              value: "false"
+            - name: MINWM_NATIVE_COMPONENTS
+              value: text_encoder,vae
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+
+              python3 - <<'PY'
+              from pathlib import Path
+
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC Rust extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+
+              python3 -m pytest -q \
+                /workspace/sglang/python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py
+
+              WORK_ROOT=/work/tianpeng-gap12
+              CHECKPOINT="${WORK_ROOT}/checkpoint/model.pt"
+              PRETRAINED="${WORK_ROOT}/pretrained"
+              MODEL_DIR="${WORK_ROOT}/sglang-model"
+              RESULTS="${WORK_ROOT}/results"
+              PUBLISH="/results-east/world-model/sft/prompt_compare/detailmix_director_gap12_20260729_094145/sglang-alignment/${RESULT_RUN_ID}"
+              mkdir -p \
+                "${WORK_ROOT}/checkpoint" \
+                "${PRETRAINED}" \
+                "${RESULTS}" \
+                "${PUBLISH}"
+
+              cp \
+                /checkpoint-west/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-0725detailed-mix-dccb050-dmd-0724-5eba381389f-merge/global_step_010000/generator/model.pt \
+                "${CHECKPOINT}"
+              [[ "$(stat -c '%s' "${CHECKPOINT}")" == "${CHECKPOINT_BYTES}" ]]
+              echo "${CHECKPOINT_SHA256}  ${CHECKPOINT}" | sha256sum --check -
+              cp -a \
+                /results-east/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers/. \
+                "${PRETRAINED}/"
+
+              python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+                --minwm-checkpoint "${CHECKPOINT}" \
+                --donor-diffusers-dir "${PRETRAINED}" \
+                --output-dir "${MODEL_DIR}" \
+                --link-donor \
+                --source-uri \
+                  s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-0725detailed-mix-dccb050-dmd-0724-5eba381389f-merge/global_step_010000/generator/model.pt \
+                --source-version-id sL6CTylRv4QWY98mVTkuLoe5REbKHlvd \
+                --action-type auto \
+                --local-attn-size 32 \
+                --sink-size 8 \
+                --sliding-window-num-frames 32 \
+                --rope-position-mode block_relative \
+                --rope-max-frame-gap 12 \
+                --prompt-first-frame-pin-enabled \
+                | tee "${RESULTS}/conversion.log"
+
+              cp "${MODEL_DIR}/minwm_conversion_manifest.json" "${RESULTS}/"
+              python3 - "${MODEL_DIR}/transformer/config.json" <<'PY'
+              import json
+              import sys
+              from pathlib import Path
+
+              config = json.loads(Path(sys.argv[1]).read_text())
+              expected = {
+                  "action_type": "primitive_token_residual",
+                  "local_attn_size": 32,
+                  "sink_size": 8,
+                  "sliding_window_num_frames": 32,
+                  "rope_position_mode": "block_relative",
+                  "rope_max_frame_gap": 12,
+                  "prompt_first_frame_pin_enabled": True,
+              }
+              actual = {key: config.get(key) for key in expected}
+              assert actual == expected, {"actual": actual, "expected": expected}
+              print(json.dumps(actual, sort_keys=True))
+              PY
+
+              python3 - "${RESULTS}" <<'PY'
+              import json
+              import os
+              import platform
+              import subprocess
+              import sys
+              from pathlib import Path
+
+              gpu = subprocess.check_output(
+                  [
+                      "nvidia-smi",
+                      "--query-gpu=name,uuid,driver_version,memory.total",
+                      "--format=csv,noheader",
+                  ],
+                  text=True,
+              ).strip()
+              image = (
+                  "829115578968.dkr.ecr.us-east-2.amazonaws.com/"
+                  "leap-world/minwm-training@sha256:"
+                  "bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a"
+              )
+              Path(sys.argv[1], "runtime.json").write_text(
+                  json.dumps(
+                      {
+                          "attention_impl": os.environ["MINWM_ATTENTION_IMPL"],
+                          "attention_deterministic": os.environ[
+                              "MINWM_PACKED_ATTENTION_DETERMINISTIC"
+                          ],
+                          "checkpoint_sha256": os.environ["CHECKPOINT_SHA256"],
+                          "image": image,
+                          "gpu": gpu,
+                          "minwm_git_ref": os.environ["MINWM_GIT_REF"],
+                          "alignment_git_ref": os.environ["ALIGNMENT_GIT_REF"],
+                          "node": platform.node(),
+                          "sglang_git_ref": os.environ["SGLANG_GIT_REF"],
+                      },
+                      indent=2,
+                      sort_keys=True,
+                  )
+                  + "\n"
+              )
+              PY
+
+              sglang serve \
+                --model-path "${MODEL_DIR}" \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile false \
+                --warmup-mode off \
+                --host 127.0.0.1 \
+                --port 30000 \
+                > "${RESULTS}/sglang-server.log" 2>&1 &
+              SERVER_PID=$!
+              cleanup() {
+                kill "${SERVER_PID}" 2>/dev/null || true
+                wait "${SERVER_PID}" 2>/dev/null || true
+              }
+              trap cleanup EXIT INT TERM
+
+              for _ in $(seq 1 600); do
+                if curl --fail --silent http://127.0.0.1:30000/health >/dev/null; then
+                  break
+                fi
+                if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+                  tail -300 "${RESULTS}/sglang-server.log"
+                  exit 1
+                fi
+                sleep 2
+              done
+              curl --fail --silent http://127.0.0.1:30000/health >/dev/null
+
+              python3 \
+                /workspace/sglang/benchmark/minwm_realtime_parity/tianpeng_alignment.py \
+                --results "${RESULTS}" \
+                --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
+                --timeout 7200 \
+                | tee "${RESULTS}/client.log"
+
+              cleanup
+              trap - EXIT INT TERM
+
+              find "${RESULTS}" -maxdepth 1 -type f \
+                ! -name sglang.npy \
+                -exec cp '{}' "${PUBLISH}/" ';'
+              touch "${PUBLISH}/SUCCESS"
+              echo \
+                "https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/prompt_compare/detailmix_director_gap12_20260729_094145/sglang-alignment/${RESULT_RUN_ID}/index.html"
+          resources:
+            requests:
+              cpu: "12"
+              memory: 96Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "14"
+              memory: 112Gi
+              ephemeral-storage: 140Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: checkpoint-west
+              mountPath: /checkpoint-west
+              readOnly: true
+            - name: results-east
+              mountPath: /results-east
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: checkpoint-west
+          persistentVolumeClaim:
+            claimName: minwm-ckpt100g-west-s3
+            readOnly: true
+        - name: results-east
+          persistentVolumeClaim:
+            claimName: s3-claim
+        - name: work
+          emptyDir:
+            sizeLimit: 140Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi

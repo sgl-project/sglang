@@ -1,0 +1,349 @@
+# MinWM 5B realtime parity harness
+
+This harness compares the current minWM `main` V3 inference path with SGLang's
+realtime WebSocket API. The formal ten cases lock prompt, seed, first frame,
+geometry, chunk count, and the exact 81-class `primitive_token_residual` action
+label. `cases_720p_5s.json` is a separate three-case long-video regression using
+continuous primitive weights.
+
+For an architecture-first review of the implementation, numerical-parity
+decisions, sequence-parallel status, and the required comprehension quiz, read
+[`CHANGE_GUIDE.zh-CN.md`](CHANGE_GUIDE.zh-CN.md).
+The 0724 same-session prompt-switch bitwise run, boundary semantics, event-id
+evidence, and one-time cutover cost are recorded in
+[`PROMPT_SWITCH_PARITY_5S.zh-CN.md`](PROMPT_SWITCH_PARITY_5S.zh-CN.md).
+The 60-second Dragon Ride UniPC run, exact W/S/idle timeline, native-scheduler
+decision, throughput result, and comprehension quiz are recorded in
+[`DRAGON_RIDE_60S_BITWISE.zh-CN.md`](DRAGON_RIDE_60S_BITWISE.zh-CN.md).
+The 2026-07-29 Tianpeng detailmix checkpoint, block-relative RoPE/cache port,
+per-block director replay contract, and synchronized comparison runner are
+documented in
+[`TIANPENG_GAP12_ALIGNMENT.zh-CN.md`](TIANPENG_GAP12_ALIGNMENT.zh-CN.md).
+
+## Inputs
+
+- Latest rerun checkpoint:
+  `wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt`,
+  identified by byte count, VersionId, ETag, and CRC64NVME in the companion
+  implementation document. The older `global_step_005600` result below remains a
+  historical accepted artifact.
+- minWM checkout: commit from `main`, recorded by the baseline runner.
+- Complete Wan2.2 TI2V 5B donor directory. Current minWM V3 first constructs its
+  DiT from donor `transformer/` before replacing it with `model.pt`, so the baseline
+  requires that directory even though its final generator weights come entirely
+  from the requested checkpoint. The SGLang converter links only `text_encoder`,
+  `tokenizer`, `vae`, and `scheduler`; it never copies the donor transformer into
+  the serving model.
+- One NVIDIA GPU. Run baseline and SGLang sequentially on the same machine and
+  keep the GPU type, PyTorch/CUDA versions, and attention backend fixed.
+
+Convert the native student checkpoint next to the AWS-local 10 GB file:
+
+```bash
+python python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+  --minwm-checkpoint /fsx/minwm/model.pt \
+  --donor-diffusers-dir /fsx/minwm/Wan2.2-TI2V-5B-from-diffusers \
+  --output-dir /fsx/minwm/sglang-model \
+  --link-donor \
+  --source-version-id FbCvgw5rl1UXt9MKBgpxYpb4BJoUyUEi \
+  --source-etag 56dbc7ce13f26c55d0bfd255e471d318-191
+```
+
+## One-command ten-case run
+
+```bash
+export MINWM_ROOT=/workspace/minWM
+export MINWM_CHECKPOINT=/fsx/minwm/model.pt
+export MINWM_PRETRAINED_DIR=/fsx/minwm/Wan2.2-TI2V-5B-from-diffusers
+export MINWM_MODEL_DIR=/fsx/minwm/sglang-model
+export MINWM_PARITY_PROFILE=bitwise
+./benchmark/minwm_realtime_parity/run_all.sh /fsx/minwm/results/run-001
+```
+
+The server is launched with `--performance-mode speed` so the 5B DiT stays GPU
+resident when memory permits. Whole-model `torch.compile` defaults to `false`
+because it changes this checkpoint's numerical trajectory; opt in with
+`MINWM_ENABLE_TORCH_COMPILE=true` only after treating it as a separate parity
+profile. The default attention backend is `fa`; override it with
+`MINWM_ATTENTION_BACKEND`. A failed bitwise profile is evidence to inspect, not
+permission to silently relax the threshold. Select a numerical profile only
+after its bound has been reviewed against results from the same backend matrix.
+
+`primitive_token_residual` does not require a magnitude. `action_labels` and
+`camera_actions` are binary inputs; continuous magnitude is sent as flattened
+per-decoded-frame `action_weights` rows ordered `[w,a,s,d,i,j,k,l]`, each in
+`[0,1]`. For example, `w=0.8` is `[0.8,0,0,0,0,0,0,0]`. The adapter groups four
+rows into each latent-frame window. An init/event must select only one action form.
+The 0721 checkpoint inherited `action_output_format=label_81` during training, so
+binary `w` remains its canonical in-distribution input. Fractional values exercise
+the continuous interpolation path in current minWM `main`; they are not calibrated
+physical speeds without a separate controllability study.
+
+Native minWM KV is unbounded (`local_attn_size=-1`, `sink_size=0`). For bounded
+`max_chunks=N`, SGLang allocates the complete `1 + 4N` latent-frame horizon; an
+unbounded session grows the cache. `--kv-cache-num-frames 45` and 128 are explicit
+performance ablations, not native minWM windows.
+
+Packed attention follows minWM `main`'s hardware fallback: FA4 on Blackwell when
+available, FA3 on Hopper when available, otherwise FA2. Forcing FA4 on the H200
+while the baseline selected FA2 caused first-generated-frame drift, so backend
+identity is part of the parity contract rather than an implementation detail.
+
+For a smoke run, pass `--case CASE_ID` separately to both Python runners before
+running `compare_results.py` on a full manifest. The official report always
+contains all ten cases.
+
+## Throughput comparison
+
+`benchmark_realtime_throughput.py` measures one persistent API session with 20
+warmup chunks and 200 measured chunks. It reports GPU scheduler-forward FPS,
+whole-server chunk FPS, client-observed FPS, and p50/p95/p99 stage latencies without
+retaining the multi-gigabyte raw frame stream:
+
+```bash
+python benchmark/minwm_realtime_parity/benchmark_realtime_throughput.py \
+  --output /fsx/minwm/results/exact-kv45.json \
+  --profile-name exact-packed-det-kv45 \
+  --kv-cache-num-frames 45
+```
+
+TTFF is measured from the start of the init send through the last frame payload of
+chunk zero. It includes first-frame/T5/VAE setup and first-shape compilation when
+enabled; steady FPS excludes that startup boundary.
+
+The long-video contract uses current minWM eval's valid 720p tier, 1248x704. Exact
+1280x720 is incompatible with the `/16` VAE followed by the DiT's 2x2 spatial
+patch. At 24 FPS, eight fixed 16-frame chunks plus the reference produce 129 frames
+or 5.375 seconds; the harness does not resize or trim that boundary.
+`MINWM_LONG_ENABLE_TORCH_COMPILE` defaults to `false` for the exact lane.
+The 1248x704 non-parity speed lane can now compile the transformer module after
+disabling the nested minWM segment compilers. SGLang calls `module.compile` with
+`fullgraph=False`, so “whole-DiT” describes compilation scope, not a single
+graph without breaks. minWM's native compiled fused segments remain enabled in
+the exact baseline/serving paths. The compiled lane must be evaluated as a
+separate numerical and cold-start profile.
+
+`MINWM_BENCHMARK_MODE=triptych720p` runs one warmed 1248x704, 129-frame case
+through minWM baseline, the accepted SGLang bitwise path, and the combined
+SGLang speed path. It writes lossless arrays, MP4s, timing/metric JSON, GPU
+memory samples, and a self-contained `player/index.html`. The speed path uses
+dense attention, SGLang VAE/T5 components, nondeterministic execution,
+whole-DiT compile, and no nested segment compilers; its delta from the exact
+path therefore must not be attributed to compile alone.
+
+Use the same converted MinWM 5B checkpoint for each server profile. A MinWM
+checkpoint cannot be loaded into the LingBot model class: MinWM is a 30-layer,
+width-3072, 48-channel model with token-residual action, while LingBot World 2 is a
+40-layer, width-5120, 36-to-16-channel model with Plucker/camera conditioning. The
+fair same-5B implementation A/B is therefore the exact source-shaped MinWM path
+versus its SGLang dense/optimized ablations. Keep hardware, weights, request,
+action label, KV window, and software image fixed.
+
+The official LingBot World 2 release currently lists a 14B causal-fast checkpoint
+and future 1.3B checkpoints, but no 5B checkpoint. Do not relabel a differently
+shaped community model as a same-architecture 5B control.
+
+For context, one MinWM 5B replica and one LingBot 14B SP8 stream have similar
+per-GPU dense-compute proxies: about 33.86 versus 34.96 TMAC per chunk per GPU.
+Thus similar single-stream latency is plausible even though MinWM is smaller; the
+node-level capacity comparison is eight independent 5B replicas versus one SP8
+LingBot stream, and must be measured separately from single-stream latency.
+
+## Synchronized player
+
+After comparison, one command validates all ten baseline/SGLang pairs and opens
+the generated `player/index.html`. All ten cases are laid out on the page; use a
+case card's **Play both** button for synchronized play/pause. Seek, speed, and
+frame stepping also control that pair.
+The page shows both relative MP4 paths and a ready/error state so a missing or
+unreadable visualization artifact is explicit:
+
+```bash
+./benchmark/minwm_realtime_parity/play.sh /fsx/minwm/results/run-001
+```
+
+The generated page embeds the ten-case report, so `player/index.html` can also be
+opened directly with a `file://` URL; it does not depend on a local HTTP server.
+Keep the `player/` and sibling `cases/` directories together so the relative MP4
+paths remain valid.
+
+Lossless `baseline.npy` and `sglang.npy` arrays are the metric source; MP4 files
+are only visualization artifacts and are never used for numeric acceptance.
+
+## Local Zone Spot SP matrix
+
+The 2026-07-23 formal SP1/SP2/SP4/SP8 run used one Spot
+`p6-b300.48xlarge` in Local Zone `us-east-1-atl-2a`: eight NVIDIA B300
+SXM6 GPUs with full `NV18` connectivity. The fixed workload is the latest 0721
+checkpoint, deterministic packed causal attention, full-history KV, one warmup
+clip, and one measured 1248x704 clip containing 129 frames at 24 FPS
+(5.375 seconds). Client FPS excludes chunk zero and measures the remaining seven
+16-frame chunks.
+
+| SP | Scheduler FPS | Client FPS | Client speedup vs SP1 | TTFF | Peak/GPU |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 15.896 | 15.891 | 1.000x | 1.541 s | 51,588 MiB |
+| 2 | 15.191 | 15.207 | 0.957x | 1.543 s | 50,560 MiB |
+| 4 | 15.158 | 15.191 | 0.956x | 1.569 s | 48,826 MiB |
+| 8 | 15.107 | 15.109 | 0.951x | 1.756 s | 48,918 MiB |
+
+All SP2/SP4/SP8 generated uint8 frames are bitwise identical to SP1:
+`max_abs=0`, `RMSE=0`, `SSIM=1`, and `changed_value_fraction=0`. SP therefore
+passes the requested numerical-parity matrix, but it does **not** improve
+single-stream throughput for this workload. SP2 is 4.30% slower than SP1, while
+SP4 and SP8 are 4.40% and 4.92% slower. The measured steady-stage medians explain
+the regression:
+
+| SP | DMD/DiT per chunk | VAE decode | Remaining scheduler time |
+| ---: | ---: | ---: | ---: |
+| 1 | 441.6 ms | 268.5 ms | 292.9 ms |
+| 2 | 505.6 ms | 268.5 ms | 280.8 ms |
+| 4 | 507.8 ms | 268.6 ms | 272.9 ms |
+| 8 | 512.6 ms | 268.5 ms | 270.8 ms |
+
+Sequence sharding is active across each transformer block, including local-token
+QKV, cross-attention, and FFN work. The current Ulysses path nevertheless runs a
+synchronous packed-QKV input all-to-all and reverse output all-to-all for every
+block and DMD forward. One chunk therefore executes `30 blocks × 4 forwards × 2`
+= 240 synchronous collectives, each surrounded by large layout/contiguous copies.
+That overhead is larger than the local-token compute saving on this B300 shape.
+VAE decode and RGB/output work also remain serial, but the measured regression
+itself is inside DMD/DiT rather than VAE. Per-GPU peak memory falls only 1.99% at
+SP2 and about 5.3% at SP4/SP8 because the model weights remain replicated, while
+node-total memory increases with the number of replicas.
+
+The copied local artifact is under
+`results/latest-checkpoint-sp-matrix-720p-b300-spot/sp-matrix-720p/`.
+Its `player/index.html` defaults to a synchronized SP1/SP2 pair and can switch
+the right-hand video to SP4 or SP8. It works through `file://` and has also been
+browser-tested through a local HTTP server: one click started both 5.375-second
+videos with less than 0.1 ms observed start-time skew.
+
+### H200 SP, Parallel VAE, and fused-layout follow-up
+
+The 2026-08-03 follow-up used Local Zone Spot `p5e.48xlarge` nodes in
+`us-west-2-phx-2a` (8x H200, NV18), the same step-3200 checkpoint, 1248x704,
+129 frames, and one full warmup. Unlike the historical B300 result above, the
+optimized H200 path removes repeated Ulysses layout work and parallelizes the
+causal VAE decode at the useful SP2/SP4 degrees:
+
+| SP | Client FPS | vs SP1 | DiT CUDA | VAE CUDA | Result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 10.072 | 1.000x | 761.0 ms | 703.4 ms | reference |
+| 2 | 14.605 | 1.450x | 611.0 ms | 419.9 ms | fast-lane PSNR 64.46 dB; parity lane exact |
+| 4 | 16.951 | 1.683x | 610.4 ms | 232.7 ms | fast-lane PSNR 68.60 dB; parity lane exact |
+| 8 | 11.424 | 1.134x | 602.2 ms | 707.6 ms | fast and parity lanes bitwise exact |
+
+SP4 is the throughput optimum for this workload. SP8 no longer reduces DiT
+meaningfully and its 4-frame decode shard falls below the Parallel VAE work
+threshold, so VAE decode intentionally falls back to the serial path. It is a
+correct scaling option, but not the recommended low-latency degree.
+
+The isolated SP2 serial-versus-parallel VAE comparison improves client FPS from
+`11.668` to `14.605` (`+25.2%`) and reduces VAE CUDA time from `695.6` to
+`419.9 ms` (`1.657x`). The fused peer-first Ulysses QKV pack reuses one workspace
+and removes 7,380 `cudaLaunchKernel` calls (`-3.10%`) in the SP2 Nsight run;
+NCCL SendRecv remains 4,920 calls, the algorithmic collective floor.
+
+On Hopper SP8, the 30 transformer blocks and the normalized output-head input
+were already bitwise identical to SP1. The first difference was the final
+`Linear(3072, 192)`: the short local BF16 row bucket selected a different GEMM
+reduction (`max_abs=0.0078125`), which causal rollout amplified. The fix pads
+each local shard into its exact SP1 global row position for this small output
+projection, projects once, then crops before the existing gather. The final
+H200 jobs restore both the 129-frame array and MP4 to the SP1 SHA-256 values
+`b2a2f333...12a87` and `63c14d45...ec32c`, without a measurable DiT regression.
+
+Run provenance is pinned in
+`k8s/minwm_sp12_vae_ulysses_h200_phx2_spot.yaml` and
+`k8s/minwm_sp12_720p_nsys_h200_phx2_spot.yaml`. The local self-contained
+SP1/SP2 player is under `results/h200-sp12-vae-final-20260803/player/index.html`.
+
+## Latest-checkpoint formal run
+
+The 2026-07-22 Spot B200 formal result for the requested latest checkpoint is:
+
+```text
+s3://leap-world-us-east-2/world-model/evals/minwm/realtime-parity/20260722-codex-578d/results/latest-ckpt-v6-full-attempt07-west-spot/ten-case/
+```
+
+All ten strict-bitwise cases pass: generated max absolute error `0`, RMSE `0`,
+minimum SSIM `1.0`, and 10/10 byte-identical generated-frame arrays. It contains
+ten baseline/SGLang pairs and 20 MP4 files. This checkpoint's native matching
+config is non-varlen causal T2V without a first-frame processor; the formal API
+run is intentionally the V3 first-frame/action compatibility contract and must
+not be relabeled as native eval.
+
+On a host with the project S3 mount, open the latest pair player with:
+
+```bash
+./benchmark/minwm_realtime_parity/play.sh \
+  /s3/world-model/evals/minwm/realtime-parity/20260722-codex-578d/results/latest-ckpt-v6-full-attempt07-west-spot/ten-case
+```
+
+The latest throughput matrix is kept separately under
+`latest-ckpt-v7-profiles-attempt08-west-spot` so a profiles-only rerun cannot
+overwrite the accepted videos or parity report. All six profiles completed. On one
+B200, exact KV45 measured `23.075 FPS`; same-weight LingBot-style dense measured
+`24.713 FPS`; dense plus optimized components measured `25.541 FPS`; and the
+non-bitwise whole-compile speed ceiling measured `32.222 FPS`. Exact loses `6.63%`
+to dense attention and `9.65%` to the optimized non-whole-compiled path. The pure
+deterministic flag showed no measurable penalty. Full TTFF, p50/p95/p99, memory,
+stage timing, and isolated deltas are in `throughput-summary.json` and the companion
+implementation document.
+
+The separate 720p long-video H200 attempt 15 used 1248x704, 24 FPS, 129 frames
+(5.375 seconds), eight chunks, and native full-history KV. Its three continuous
+action cases (`w=0.8`, idle, and `w=0.6+l=0.4`) all pass strict bitwise with zero
+generated-frame error. Aggregate steady client/scheduler throughput is
+`10.393/10.365 FPS`, chunk p50 is `1525.20 ms`, and peak memory is `53,159 MB`.
+First-case TTFF is `10.343 s` because it includes first-shape fused-segment
+compilation; the next two are `1.963 s` and `1.960 s`. The verified flat player is
+at `results/latest-checkpoint-720p-5s-h200/latest/player/index.html`. These H200
+720p values are not substituted for the formal B200 832x480 matrix.
+
+The later single-case H200 triptych run is under
+`results/latest-checkpoint-720p-triptych-h200/latest/`. Its accepted bitwise
+lane measured `10.822` steady client FPS. A dense/SGLang-components/
+nondeterministic eager control measured `10.853` FPS, while the otherwise
+identical whole-DiT-compiled lane measured `12.711` FPS. This isolates a
+`17.12%` compile gain at 1248x704; the full compiled speed lane is `17.46%`
+faster than the bitwise lane. The first compiled chunk took `235.6 s` in the
+scheduler, whereas the warmed compiled TTFF was `1.701 s`. Peak memory was
+`53,159 MiB` for bitwise and `51,269 MiB` for compiled optimized.
+
+The bitwise video still has zero generated-frame error. The optimized video is
+intentionally non-parity (`RMSE=29.466`, `SSIM=0.838568`, `PSNR=18.744 dB`).
+All three MP4 files were probed as 1248x704, 24 FPS, 129 frames, and 5.375
+seconds. The local player embeds its report and exposes one-button synchronized
+playback for all three lanes.
+
+Artifact export publishes `720p-artifacts-ready` only after the complete result
+tree has been copied and can optionally retain the pod for a capture window. The
+metric collector also short-circuits exact-equal lossless arrays instead of
+recomputing float64 cosine and per-frame SSIM identities.
+
+## Historical accepted run
+
+The previous checkpoint's same-runtime B200 ten-case artifact is:
+
+```text
+/s3/world-model/evals/minwm/realtime-parity/20260721-codex-578d/results/ten-case-main-same-env-final-attempt34
+```
+
+On a host with the project S3 mount, open its 20 synchronized videos with:
+
+```bash
+./benchmark/minwm_realtime_parity/play.sh \
+  /s3/world-model/evals/minwm/realtime-parity/20260721-codex-578d/results/ten-case-main-same-env-final-attempt34
+```
+
+All ten reference and generated lossless arrays are byte-for-byte identical. The
+checked-in strict `bitwise` profile passes 10/10 cases with generated max absolute
+error `0`, RMSE `0`, and SSIM `1.0`; no numerical fallback profile is used. The
+effective serving overlay SHA-256 is
+`42ef254699d6e7837e7c0caaac077e1ce20bee78aa4a2aec4e3850b0af7bf4bc`.
+
+The earlier failed `ten-case-main-same-env-final-attempt23` artifact is retained as
+diagnostic history for the pre-layout/packed-attention implementation. Its observed
+errors were not used to widen `thresholds.json`.

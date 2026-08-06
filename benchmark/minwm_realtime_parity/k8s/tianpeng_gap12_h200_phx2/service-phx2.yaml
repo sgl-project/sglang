@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-tianpeng-realtime
+  namespace: default
+  annotations:
+    # NLBs cannot use Local Zone subnets. The regional gateway below is the
+    # NLB target and forwards traffic to the H200 backend in us-west-2-phx-2a.
+    service.beta.kubernetes.io/aws-load-balancer-subnets: null
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: traffic-port
+spec:
+  loadBalancerClass: eks.amazonaws.com/nlb
+  selector:
+    $patch: replace
+    app.kubernetes.io/name: minwm-tianpeng-gateway
+  ports:
+    - name: webui
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: api
+      port: 30000
+      targetPort: http
+      protocol: TCP

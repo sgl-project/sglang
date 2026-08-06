@@ -1,0 +1,6 @@
+$patch: delete
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minwm-tianpeng-gap12-parity-work-20260731
+  namespace: default

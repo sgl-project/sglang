@@ -212,7 +212,7 @@ class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, is_cross_attention=True)
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, crossattn_cache=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -226,15 +226,21 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
-        if self.tp_rmsnorm:
-            k = tensor_parallel_rms_norm(k, self.norm_k)
+        if crossattn_cache is not None and crossattn_cache.is_init:
+            k = crossattn_cache.k
+            v = crossattn_cache.v
         else:
-            k = self.norm_k(k)
-        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
+            k, _ = self.to_k(context)
+            if self.tp_rmsnorm:
+                k = tensor_parallel_rms_norm(k, self.norm_k)
+            else:
+                k = self.norm_k(k)
+            k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        v, _ = self.to_v(context)
-        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+            v, _ = self.to_v(context)
+            v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+            if crossattn_cache is not None:
+                crossattn_cache.store(k, v)
 
         # compute attention
         x = self.attn(q, k, v)
@@ -575,9 +581,10 @@ class WanTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -589,9 +596,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -600,9 +608,10 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -822,9 +831,10 @@ class WanTransformerBlock_VSA(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+            query, key = (
+                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
+                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            )
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
@@ -835,9 +845,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -846,9 +857,10 @@ class WanTransformerBlock_VSA(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)

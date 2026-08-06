@@ -1,0 +1,41 @@
+[Unit]
+Description=SGLang MinWM Tianpeng realtime service
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+TimeoutStopSec=120
+ExecStartPre=-/usr/bin/docker rm -f minwm-tianpeng-final
+ExecStart=/usr/bin/docker run --name minwm-tianpeng-final \
+  --network host \
+  --ipc host \
+  --gpus device=3 \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --env PYTHONUNBUFFERED=1 \
+  --env MINWM_ATTENTION_IMPL=packed \
+  --env MINWM_PACKED_ATTENTION_DETERMINISTIC=false \
+  --env MINWM_NATIVE_COMPONENTS= \
+  --env MINWM_SEGMENT_COMPILE=true \
+  --env MINWM_ENABLE_TORCH_COMPILE=false \
+  --env MINWM_CACHE_ROTATED_K=true \
+  --env MINWM_PRECOMPUTE_CACHE_ROPE=true \
+  --env MINWM_CACHE_PACKED_METADATA=true \
+  --env MINWM_API_PORT=30060 \
+  --env MINWM_WEBUI_PORT=18060 \
+  --env SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=false \
+  --env TORCHINDUCTOR_CACHE_DIR=/work/cache/torchinductor \
+  --volume /opt/dlami/nvme/minwm-tianpeng:/work \
+  --volume /opt/dlami/nvme/minwm-tianpeng/src/sglang-9be09c5352:/workspace/sglang \
+  --volume /nas/leap_world/sunhaoze/models/Wan2.2-TI2V-5B-from-diffusers:/donor:ro \
+  --volume /opt/dlami/nvme/minwm-tianpeng/run_server.sh:/bootstrap/run_server.sh:ro \
+  829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a \
+  /bin/bash /bootstrap/run_server.sh
+ExecStop=/usr/bin/docker stop --time 90 minwm-tianpeng-final
+
+[Install]
+WantedBy=multi-user.target

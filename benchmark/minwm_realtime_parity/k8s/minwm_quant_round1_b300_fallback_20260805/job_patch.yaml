@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-quant-r1-b200-20260805-01
+  labels:
+    app.kubernetes.io/name: minwm-quant-r1-b300-20260805-01
+    seedleap.ai/run-id: minwm-quant-r1-b300-20260805-01
+  annotations:
+    seedleap.ai/instance-type: p6-b300.48xlarge
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-quant-r1-b300-20260805-01
+        seedleap.ai/run-id: minwm-quant-r1-b300-20260805-01
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: p6-b300.48xlarge
+      containers:
+        - name: benchmark
+          env:
+            - name: MATRIX_ID
+              value: minwm-quant-r1-b300-20260805-01

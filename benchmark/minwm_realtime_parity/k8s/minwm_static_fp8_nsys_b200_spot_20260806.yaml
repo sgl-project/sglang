@@ -1,0 +1,175 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-static-fp8-nsys-b200-20260806-01
+  namespace: ray
+  labels:
+    app.kubernetes.io/name: minwm-static-fp8-nsys-b200-20260806-01
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/run-id: minwm-static-fp8-nsys-b200-20260806-01
+    seedleap.ai/task: minwm-static-fp8-2x
+  annotations:
+    seedleap.ai/repo: seedleap/sglang
+    seedleap.ai/branch: codex/minwm-realtime-api
+    seedleap.ai/sglang-git-ref: efcfdb25825211238ed1de2d848ede1db7e6e9c5
+    seedleap.ai/capacity-type: spot
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-static-fp8-nsys-b200-20260806-01
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/run-id: minwm-static-fp8-nsys-b200-20260806-01
+        seedleap.ai/task: minwm-static-fp8-2x
+      annotations:
+        seedleap.ai/repo: seedleap/sglang
+        seedleap.ai/branch: codex/minwm-realtime-api
+        seedleap.ai/sglang-git-ref: efcfdb25825211238ed1de2d848ede1db7e6e9c5
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        karpenter.sh/capacity-type: spot
+        karpenter.sh/nodepool: minwm-test-b200-spot
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+        seedleap.ai/capacity-pool: minwm-test-b200-karpenter
+      tolerations:
+        - key: seedleap.ai/workload
+          operator: Equal
+          value: wan22-ti2v
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          securityContext:
+            capabilities:
+              add:
+                - SYS_ADMIN
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: SGLANG_GIT_REF
+              value: efcfdb25825211238ed1de2d848ede1db7e6e9c5
+            - name: MINWM_GIT_REF
+              value: 2efc6485f65e8fcab506665efde79bc41406385e
+            - name: MINWM_STAGE_FROM_MOUNT
+              value: "1"
+            - name: MINWM_CHECKPOINT_MOUNT_PATH
+              value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_PRETRAINED_MOUNT_PATH
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_CHECKPOINT_S3_EAST
+              value: s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_CHECKPOINT_VERSION_EAST
+              value: wduScksw2f3yPErnG9lBioOuE2AToyAP
+            - name: MINWM_CHECKPOINT_SOURCE_URI
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
+            - name: MINWM_CHECKPOINT_SOURCE_VERSION
+              value: x.2zYaRRNzyqngI7O_cYSrsK3NvgPKKt
+            - name: MINWM_CHECKPOINT_SOURCE_ETAG
+              value: 5c29d614972e06fd0df859abfd1d6f4d-191
+            - name: MINWM_CHECKPOINT_BYTES
+              value: "10007171771"
+            - name: MINWM_CHECKPOINT_CRC64
+              value: I0IQ+p0pREI=
+            - name: MINWM_PRETRAINED_S3
+              value: s3://leap-world-us-east-2/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_CASES_PATH
+              value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_720p_compile_smoke.json
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+              clone_at minWM /workspace/minWM "${MINWM_GIT_REF}"
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+
+              result_root=/s3/world-model/evals/minwm/quantization/20260805/static-fp8-2x/nsys-static-fp8-01
+              setup_run=minwm-static-fp8-nsys-b200-20260806-01-setup
+              static_run=minwm-static-fp8-nsys-b200-20260806-01-static-build
+              profile_run=minwm-static-fp8-nsys-b200-20260806-01-profile
+              entrypoint=/workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
+              mkdir -p "${result_root}"
+              exec > >(tee -a "${result_root}/job.log") 2>&1
+              {
+                echo "capacity=spot"
+                echo "node=${NODE_NAME}"
+                echo "sglang=${SGLANG_GIT_REF}"
+                echo "minwm=${MINWM_GIT_REF}"
+                date -Iseconds
+              } > "${result_root}/provenance.txt"
+              nvidia-smi -q > "${result_root}/nvidia-smi.txt"
+
+              CUDA_VISIBLE_DEVICES=0 \
+                MINWM_RUN_ID="${setup_run}" \
+                MINWM_RESULTS_ROOT="${result_root}" \
+                MINWM_BENCHMARK_MODE=setup_only \
+                bash "${entrypoint}"
+
+              CUDA_VISIBLE_DEVICES=0 \
+                MINWM_RUN_ID="${static_run}" \
+                MINWM_RESULTS_ROOT="${result_root}" \
+                MINWM_REUSE_INPUT_RUN_ID="${setup_run}" \
+                MINWM_REUSE_MODEL_RUN_ID="${setup_run}" \
+                MINWM_SKIP_INSTALL=1 \
+                MINWM_BENCHMARK_MODE=calibratedfp8 \
+                MINWM_PROFILE_QUANTIZATION_LABEL=static_fp8_nsys_build \
+                MINWM_THROUGHPUT_PROFILES=dense-optimized-components-kv45 \
+                MINWM_THROUGHPUT_CASES_PATH="${MINWM_CASES_PATH}" \
+                MINWM_THROUGHPUT_CASE=00_forward_080_pottery_720p \
+                MINWM_THROUGHPUT_WARMUP_CHUNKS=1 \
+                MINWM_THROUGHPUT_MEASURED_CHUNKS=1 \
+                bash "${entrypoint}"
+
+              CUDA_VISIBLE_DEVICES=0 \
+                MINWM_RUN_ID="${profile_run}" \
+                MINWM_RESULTS_ROOT="${result_root}" \
+                MINWM_MODEL_DIR="/work/minwm-realtime/${setup_run}/sglang-model" \
+                MINWM_STATIC_TRANSFORMER="/work/minwm-realtime/${static_run}/static-fp8-transformer" \
+                bash /workspace/sglang/benchmark/minwm_realtime_parity/run_static_fp8_nsys.sh
+          resources:
+            requests:
+              cpu: "32"
+              memory: 160Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 320Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+        - name: work
+          emptyDir:
+            sizeLimit: 240Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

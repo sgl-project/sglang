@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-tianpeng-realtime
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - name: server
+          resources:
+            requests:
+              ephemeral-storage: 100Gi
+            limits:
+              ephemeral-storage: 300Gi

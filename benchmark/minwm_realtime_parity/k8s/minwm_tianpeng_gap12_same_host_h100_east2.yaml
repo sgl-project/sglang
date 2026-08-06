@@ -1,0 +1,381 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minwm-tianpeng-gap12-parity-work-20260731
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-gap12-same-host
+    seedleap.ai/owner: chenshengdong
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 200Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-tianpeng-gap12-same-host-20260731-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-gap12-same-host
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: 15d5d95449adb26360bffa629f429eebd2b9041a
+    seedleap.ai/minwm-git-ref: 4220c8a
+    seedleap.ai/checkpoint-source-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
+    seedleap.ai/checkpoint-staged-version-id: yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq
+    seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/gpu-partition: native=1,sglang=1
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 27000
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-gap12-same-host
+        seedleap.ai/task: minwm-realtime-parity
+        seedleap.ai/owner: chenshengdong
+      annotations:
+        seedleap.ai/gpu-partition: native=1,sglang=1
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        karpenter.sh/capacity-type: spot
+        karpenter.sh/nodepool: minwm-test-h100-spot
+        seedleap.ai/capacity-pool: minwm-test-h100-karpenter
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      containers:
+        - name: native-minwm
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MINWM_GIT_REF
+              value: 4220c8a
+            - name: SGLANG_GIT_REF
+              value: 15d5d95449adb26360bffa629f429eebd2b9041a
+            - name: CHECKPOINT_SHA256
+              value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+            - name: CHECKPOINT_BYTES
+              value: "20014120667"
+            - name: CUBLAS_WORKSPACE_CONFIG
+              value: :4096:8
+            - name: PYTHONHASHSEED
+              value: "0"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              mkdir -p /parity/native
+              rm -f /parity/native/FAILED /parity/native/SUCCESS
+              trap 'touch /parity/native/FAILED; sleep infinity' ERR
+
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" \
+                  == "$(git -C "${destination}" rev-parse "${revision}")" ]]
+              }
+              clone_at minWM /workspace/minWM "${MINWM_GIT_REF}"
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+
+              INPUT_STAMP="/parity/input/.ready-yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq"
+              if [[ ! -f "${INPUT_STAMP}" ]]; then
+                rm -rf /parity/input
+                mkdir -p /parity/input/checkpoint /parity/input/pretrained
+                cp \
+                  /s3/world-model/evals/minwm/checkpoint-staging/tianpeng-detailmix-gap12-20260729/global_step_010000/generator/model.pt \
+                  /parity/input/checkpoint/model.pt
+                [[ "$(stat -c '%s' /parity/input/checkpoint/model.pt)" \
+                  == "${CHECKPOINT_BYTES}" ]]
+                echo "${CHECKPOINT_SHA256}  /parity/input/checkpoint/model.pt" \
+                  | sha256sum --check -
+                cp -a \
+                  /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers/. \
+                  /parity/input/pretrained/
+                curl --fail --silent --show-error \
+                  https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/prompt_compare/detailmix_director_gap12_20260729_094145/inference-alignment/config_gap12.redacted.yaml \
+                  -o /parity/input/config_gap12.redacted.yaml
+                sed -i \
+                  's#^pretrained_dir:.*#pretrained_dir: /parity/input/pretrained#' \
+                  /parity/input/config_gap12.redacted.yaml
+                touch "${INPUT_STAMP}"
+              fi
+
+              python3 - <<'PY'
+              import importlib.metadata
+              import json
+              from pathlib import Path
+
+              names = (
+                  "diffusers",
+                  "flash-attn-4",
+                  "torch",
+                  "transformers",
+                  "torchvision",
+              )
+              Path("/parity/native/numerical-packages.json").write_text(
+                  json.dumps(
+                      {name: importlib.metadata.version(name) for name in names},
+                      indent=2,
+                      sort_keys=True,
+                  )
+                  + "\n"
+              )
+              PY
+
+              PYTHONPATH=/workspace/sglang/benchmark/minwm_realtime_parity \
+                python3 \
+                /workspace/sglang/benchmark/minwm_realtime_parity/tianpeng_minwm_director_baseline.py \
+                --alignment-url \
+                  https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/prompt_compare/detailmix_director_gap12_20260729_094145/inference-alignment/ \
+                --minwm-root /workspace/minWM \
+                --checkpoint /parity/input/checkpoint/model.pt \
+                --config /parity/input/config_gap12.redacted.yaml \
+                --results /parity/native \
+                | tee /parity/native/client.log
+
+              rm -f /parity/native/FAILED
+              touch /parity/native/SUCCESS
+              trap - ERR
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              ephemeral-storage: 50Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: parity
+              mountPath: /parity
+            - name: native-shm
+              mountPath: /dev/shm
+        - name: sglang-minwm
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONPATH
+              value: /workspace/sglang/python
+            - name: MINWM_GIT_REF
+              value: 4220c8a
+            - name: SGLANG_GIT_REF
+              value: 15d5d95449adb26360bffa629f429eebd2b9041a
+            - name: CHECKPOINT_SHA256
+              value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+            - name: MINWM_PARITY_DETERMINISTIC
+              value: "0"
+            - name: MINWM_DETERMINISTIC_ATTENTION
+              value: "false"
+            - name: SGLANG_ENABLE_DETERMINISTIC_INFERENCE
+              value: "0"
+            - name: SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D
+              value: "false"
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: MINWM_ATTENTION_IMPL
+              value: packed
+            - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
+              value: "false"
+            - name: MINWM_NATIVE_COMPONENTS
+              value: text_encoder,vae
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              mkdir -p /parity/sglang /parity/player
+              rm -f /parity/sglang/FAILED /parity/sglang/SUCCESS
+              trap 'touch /parity/sglang/FAILED; sleep infinity' ERR
+
+              for _ in $(seq 1 2700); do
+                if [[ -f /parity/native/SUCCESS ]]; then
+                  break
+                fi
+                if [[ -f /parity/native/FAILED ]]; then
+                  echo "native minWM lane failed"
+                  touch /parity/sglang/FAILED
+                  sleep infinity
+                fi
+                sleep 10
+              done
+              [[ -f /parity/native/SUCCESS ]]
+
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" \
+                == "${SGLANG_GIT_REF}" ]]
+
+              python3 \
+                /workspace/sglang/benchmark/minwm_realtime_parity/install_parity_dependencies.py \
+                --pyproject /workspace/sglang/python/pyproject.toml
+
+              python3 - <<'PY'
+              import importlib.metadata
+              import json
+              from pathlib import Path
+
+              expected = json.loads(
+                  Path("/parity/native/numerical-packages.json").read_text()
+              )
+              actual = {
+                  name: importlib.metadata.version(name) for name in expected
+              }
+              if actual != expected:
+                  raise RuntimeError(
+                      f"numerical package drift: {actual} != {expected}"
+                  )
+              Path("/parity/sglang/numerical-packages.json").write_text(
+                  json.dumps(actual, indent=2, sort_keys=True) + "\n"
+              )
+              PY
+
+              python3 -m pytest -q \
+                /workspace/sglang/python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py
+
+              rm -rf /parity/sglang-model
+              python3 \
+                /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+                --minwm-checkpoint /parity/input/checkpoint/model.pt \
+                --donor-diffusers-dir /parity/input/pretrained \
+                --output-dir /parity/sglang-model \
+                --link-donor \
+                --source-uri \
+                  s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-0725detailed-mix-dccb050-dmd-0724-5eba381389f-merge/global_step_010000/generator/model.pt \
+                --source-version-id sL6CTylRv4QWY98mVTkuLoe5REbKHlvd \
+                --action-type auto \
+                --local-attn-size 32 \
+                --sink-size 8 \
+                --sliding-window-num-frames 32 \
+                --rope-position-mode block_relative \
+                --rope-max-frame-gap 12 \
+                --prompt-first-frame-pin-enabled \
+                | tee /parity/sglang/conversion.log
+
+              python3 -m sglang.multimodal_gen.runtime.launch_server \
+                --model-path /parity/sglang-model \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile false \
+                --warmup-mode off \
+                --realtime-causal-sink-size 8 \
+                --realtime-causal-kv-cache-num-frames 32 \
+                --host 127.0.0.1 \
+                --port 30000 \
+                > /parity/sglang/server.log 2>&1 &
+              SERVER_PID=$!
+              cleanup() {
+                kill -TERM "${SERVER_PID}" 2>/dev/null || true
+                wait "${SERVER_PID}" 2>/dev/null || true
+              }
+              trap 'cleanup; touch /parity/sglang/FAILED; sleep infinity' ERR
+              trap cleanup EXIT INT TERM
+
+              for _ in $(seq 1 900); do
+                if curl --fail --silent \
+                  http://127.0.0.1:30000/health >/dev/null; then
+                  break
+                fi
+                if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+                  tail -300 /parity/sglang/server.log
+                  touch /parity/sglang/FAILED
+                  sleep infinity
+                fi
+                sleep 2
+              done
+              curl --fail --silent \
+                http://127.0.0.1:30000/health >/dev/null
+
+              python3 \
+                /workspace/sglang/benchmark/minwm_realtime_parity/tianpeng_alignment.py \
+                --results /parity/sglang \
+                --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
+                --timeout 7200 \
+                | tee /parity/sglang/client.log
+
+              cleanup
+              trap - EXIT INT TERM
+
+              python3 \
+                /workspace/sglang/benchmark/minwm_realtime_parity/compare_tianpeng_triptych.py \
+                --native-results /parity/native \
+                --sglang-results /parity/sglang \
+                --output /parity/player \
+                | tee /parity/player/compare.log
+
+              rm -f /parity/sglang/FAILED
+              touch /parity/sglang/SUCCESS
+              echo "parity artifacts are ready; waiting for external harvest"
+              sleep infinity
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              ephemeral-storage: 50Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: parity
+              mountPath: /parity
+            - name: sglang-shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+            readOnly: true
+        - name: parity
+          persistentVolumeClaim:
+            claimName: minwm-tianpeng-gap12-parity-work-20260731
+        - name: native-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+        - name: sglang-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi

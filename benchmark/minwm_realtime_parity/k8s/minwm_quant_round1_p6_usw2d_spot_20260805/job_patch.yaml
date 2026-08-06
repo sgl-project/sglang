@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-quant-r1-b200-20260805-01
+  labels:
+    app.kubernetes.io/name: minwm-quant-r1-p6-usw2d-20260805-03
+    seedleap.ai/run-id: minwm-quant-r1-p6-usw2d-20260805-03
+  annotations:
+    seedleap.ai/cluster: minwm-test-phx2
+    seedleap.ai/eligible-instance-types: p6-b200.48xlarge,p6-b300.48xlarge
+spec:
+  activeDeadlineSeconds: 25200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-quant-r1-p6-usw2d-20260805-03
+        seedleap.ai/run-id: minwm-quant-r1-p6-usw2d-20260805-03
+    spec:
+      containers:
+        - name: benchmark
+          env:
+            - name: MATRIX_ID
+              value: minwm-quant-r1-p6-usw2d-20260805-03
+            - name: MINWM_RESULTS_ROOT
+              value: /results/quantization/20260805/round1-fixed-720p

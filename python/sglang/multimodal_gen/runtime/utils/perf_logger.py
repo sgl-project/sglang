@@ -100,8 +100,12 @@ def get_diffusion_perf_log_dir() -> str:
     if log_dir:
         return os.path.abspath(log_dir)
     if log_dir is None:
-        sglang_path = Path(sglang.__file__).resolve()
-        target_path = (sglang_path.parent / "../../.cache/logs").resolve()
+        sglang_file = getattr(sglang, "__file__", None)
+        if sglang_file:
+            sglang_path = Path(sglang_file).resolve()
+            target_path = (sglang_path.parent / "../../.cache/logs").resolve()
+        else:
+            target_path = (Path.cwd() / ".cache" / "logs").resolve()
         return str(target_path)
     return ""
 

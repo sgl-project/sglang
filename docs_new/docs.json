@@ -1240,7 +1240,16 @@
                     "group": "LingBot World",
                     "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LingBot-World/LingBot-World"
+                      "cookbook/diffusion/LingBot-World/LingBot-World",
+                      "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
+                    ]
+                  },
+                  {
+                    "group": "MinWM",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/MinWM/MinWM-Realtime",
+                      "cookbook/diffusion/MinWM/MinWM-Realtime.zh-CN"
                     ]
                   },
                   {

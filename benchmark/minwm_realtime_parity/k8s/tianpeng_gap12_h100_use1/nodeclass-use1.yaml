@@ -1,0 +1,18 @@
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: minwm-tianpeng-h100-use1
+spec:
+  ephemeralStorage:
+    iops: 3000
+    size: 400Gi
+    throughput: 125
+  networkPolicy: DefaultAllow
+  networkPolicyEventLogs: Disabled
+  role: AmazonEKSAutoNodeRole
+  securityGroupSelectorTerms:
+    - id: sg-001e18b5c753b39b3
+  snatPolicy: Random
+  subnetSelectorTerms:
+    - id: subnet-04c3517ba5a04303c
+    - id: subnet-00bfb61f4542441b4

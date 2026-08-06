@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "seed": 42,
+    "width": 832,
+    "height": 480,
+    "fps": 24,
+    "generated_latent_frames": 16,
+    "chunks": 4,
+    "latent_frames_per_chunk": 4,
+    "generated_pixel_frames": 64,
+    "reference_pixel_frames": 1,
+    "action_type": "primitive_token_residual",
+    "action_order": ["w", "a", "s", "d", "i", "j", "k", "l"]
+  },
+  "cases": [
+    {
+      "id": "00_forward_pottery",
+      "source_id": "testset100_v2/G1/G1_short_w_p02",
+      "prompt": "Inside a dim, rustic pottery workshop, a pair of wet clay-covered hands cups a spinning lump of grey clay on a wheel, shaping it into a small vessel. A bowl of murky water sits nearby, and shelves of finished pots and tools line the warm, earthy-toned room behind.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p02.png",
+      "action_label": 9,
+      "keys": ["w"]
+    },
+    {
+      "id": "01_backward_ocean",
+      "source_id": "testset100_v2/G1/G1_short_s_p15",
+      "prompt": "Through a round porthole window, the dark blue depths of the ocean glow faintly. A translucent jellyfish drifts near the glass with another floating above, while pale specks and small creatures hover in the murky water. The heavy metal frame around the window keeps the mood dim and mysterious.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p15.png",
+      "action_label": 18,
+      "keys": ["s"]
+    },
+    {
+      "id": "02_strafe_left_forest",
+      "source_id": "testset100_v2/G1/G1_short_a_p24",
+      "prompt": "In a misty old-growth forest, a narrow dirt trail winds between tall, straight tree trunks. Bright sunlight burns through the fog at the center, casting soft rays among the trees, while lush green ferns and undergrowth carpet the ground. The atmosphere is cool, hushed, and ethereal.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p24.png",
+      "action_label": 27,
+      "keys": ["a"]
+    },
+    {
+      "id": "03_strafe_right_street",
+      "source_id": "testset100_v2/G1/G1_short_d_p87",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 36,
+      "keys": ["d"]
+    },
+    {
+      "id": "04_yaw_left_kitchen",
+      "source_id": "testset100_v2/G1/G1_short_j_p47",
+      "prompt": "In a busy restaurant kitchen, a chef in black tosses a flaming wok over a roaring burner, bright flames leaping from the pan. Copper-toned surfaces, hanging utensils, stacked bowls, and rows of sauce bottles surround the cooking station. Another cook works in the background. Warm firelight glows across the steamy, energetic scene full of motion and heat.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p47.png",
+      "action_label": 2,
+      "keys": ["j"]
+    },
+    {
+      "id": "05_yaw_right_canyon",
+      "source_id": "testset100_v2/G1/G1_short_l_p59",
+      "prompt": "A bald eagle soars with wings fully outstretched high above the vast layered cliffs of a deep canyon. Reddish rock walls and ridges recede into the hazy distance, a thin river winding along the canyon floor below. Warm low sunlight bathes the rugged terrain in golden tones beneath a pale sky.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p59.png",
+      "action_label": 1,
+      "keys": ["l"]
+    },
+    {
+      "id": "06_pitch_up_alley",
+      "source_id": "testset100_v2/G1/G1_short_i_p94",
+      "prompt": "A dark, wet city alley glows at night under scattered neon signs in pink and purple, their colors reflecting on the rain-slicked cobbles. Steam rises from a sewer grate in the foreground between weathered brick buildings. A single street lamp glows further down, the mood moody and quiet under a hazy sky.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p94.png",
+      "action_label": 3,
+      "keys": ["i"]
+    },
+    {
+      "id": "07_pitch_down_temple",
+      "source_id": "testset100_v2/G1/G1_short_k_p98",
+      "prompt": "Deep in a dense jungle, an ancient moss-covered stone temple rises among towering trees and hanging vines, its weathered tower draped in roots. Broken steps and a stone path lead toward its dark doorway through thick ferns. Shafts of soft light filter through the canopy, lending a quiet, mysterious gloom.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p98.png",
+      "action_label": 4,
+      "keys": ["k"]
+    },
+    {
+      "id": "08_idle_pottery",
+      "source_id": "testset100_v2/G1/G1_standard_idle_p02",
+      "prompt": "Inside a dim, rustic pottery workshop, a pair of wet clay-covered hands cups a spinning lump of grey clay on a wheel, shaping it into a small vessel. A bowl of murky water sits nearby, and shelves of finished pots and tools line the warm, earthy-toned room behind.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p02.png",
+      "action_label": 0,
+      "keys": []
+    },
+    {
+      "id": "09_forward_yaw_right_pottery",
+      "source_id": "testset100_v2/G3/G3_p02",
+      "prompt": "Inside a dim, rustic pottery workshop, a pair of wet clay-covered hands cups a spinning lump of grey clay on a wheel, shaping it into a small vessel. A bowl of murky water sits nearby, and shelves of finished pots and tools line the warm, earthy-toned room behind.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p02.png",
+      "action_label": 10,
+      "keys": ["w", "l"]
+    }
+  ]
+}

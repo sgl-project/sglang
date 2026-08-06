@@ -941,12 +941,28 @@ class ImageVAEEncodingStage(PipelineStage):
                         self.vae.enable_tiling()
                     # if server_args.vae_sp:
                     #     self.vae.enable_parallel()
+                    preprocess_before_cast = bool(
+                        getattr(
+                            server_args.pipeline_config,
+                            "preprocess_vae_encode_before_dtype_cast",
+                            False,
+                        )
+                    )
+                    if preprocess_before_cast:
+                        video_condition = (
+                            server_args.pipeline_config.preprocess_vae_encode(
+                                video_condition, self.vae
+                            )
+                        )
                     should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         video_condition = video_condition.to(vae_dtype)
-                    video_condition = server_args.pipeline_config.preprocess_vae_encode(
-                        video_condition, self.vae
-                    )
+                    if not preprocess_before_cast:
+                        video_condition = (
+                            server_args.pipeline_config.preprocess_vae_encode(
+                                video_condition, self.vae
+                            )
+                        )
                     with temporary_module_dtype(
                         self.vae, vae_dtype, enabled=should_cast_vae
                     ) as vae:

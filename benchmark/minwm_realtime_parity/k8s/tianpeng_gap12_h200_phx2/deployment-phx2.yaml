@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-tianpeng-realtime
+  namespace: default
+  annotations:
+    seedleap.ai/capacity-type: spot-existing-h200
+spec:
+  template:
+    spec:
+      serviceAccountName: minwm-test-s3-reader
+      nodeSelector:
+        $patch: replace
+        karpenter.sh/nodepool: minwm-test-phx2-p5e-spot
+        node.kubernetes.io/instance-type: p5e.48xlarge
+        seedleap.ai/capacity-pool: minwm-test-phx2-karpenter
+      tolerations:
+        - effect: NoSchedule
+          key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-test-phx2-karpenter
+      containers:
+        - name: server
+          resources:
+            requests:
+              ephemeral-storage: 100Gi
+            limits:
+              ephemeral-storage: 500Gi

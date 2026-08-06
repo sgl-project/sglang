@@ -206,6 +206,8 @@ class Req:
 
     # realtime
     realtime_session_id: str | None = None
+    realtime_trace_id: str | None = None
+    realtime_trace_started_at: float | None = None
     session: RealtimeSession | None = None
     block_idx: int = 0
     realtime_chunk_size: int | None = None
@@ -413,6 +415,9 @@ class OutputBatch:
     raw_frame_batches: list[list[bytes]] | None = None
     raw_frame_content_type: str = "application/x-raw-rgb"
     raw_frame_metadata: dict[str, Any] | None = None
+    remote_vae_request: dict[str, Any] | None = None
+    realtime_output_chunk_index_start: int | None = None
+    realtime_output_event_id: int | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
@@ -439,4 +444,5 @@ class OutputBatch:
         self.trajectory_decoded = None
         self.output_file_paths = None
         self.raw_frame_batches = None
+        self.remote_vae_request = None
         self.noise_pred = None

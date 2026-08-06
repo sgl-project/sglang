@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minwm-dragon60-artifact-helper-v2
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-dragon60-artifact-helper-v2
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+spec:
+  restartPolicy: Never
+  securityContext:
+    seLinuxOptions:
+      type: spc_t
+  nodeSelector:
+    seedleap.ai/capacity-pool: minwm-test-usw2d-karpenter
+  tolerations:
+    - key: seedleap.ai/capacity-pool
+      operator: Equal
+      value: minwm-test-usw2d-karpenter
+      effect: NoSchedule
+  containers:
+    - name: helper
+      image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc", "sleep 3600"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: work
+      persistentVolumeClaim:
+        claimName: minwm-dmd-0724-p6-work

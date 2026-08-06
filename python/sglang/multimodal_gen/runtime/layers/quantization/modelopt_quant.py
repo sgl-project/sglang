@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_linear_scaled_mm,
     cutlass_fp8_supported,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -37,7 +38,11 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import is_flashinfer_available, round_up
+from sglang.srt.utils.common import (
+    is_flashinfer_available,
+    is_sm100_supported,
+    round_up,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +356,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.enable_sm100_scaled_mm = is_sm100_supported()
 
     def create_weights(
         self,
@@ -411,7 +417,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         # transposed FP8 view expected by the runtime.
         layer.weight.data = quantized_weight.t().detach()
         layer.weight.requires_grad_(False)
-        if self.cutlass_fp8_supported:
+        if self.cutlass_fp8_supported and not self.enable_sm100_scaled_mm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         copy_or_rebind_param(layer, "weight_scale", max_w_scale)
         copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
@@ -422,6 +428,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.enable_sm100_scaled_mm and layer.input_scale is not None:
+            return apply_fp8_linear_scaled_mm(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,

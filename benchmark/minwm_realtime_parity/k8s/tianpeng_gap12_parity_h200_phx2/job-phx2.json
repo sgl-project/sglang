@@ -1,0 +1,41 @@
+[
+  {
+    "op": "replace",
+    "path": "/metadata/annotations/seedleap.ai~1capacity-type",
+    "value": "spot-existing-h200"
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/nodeSelector",
+    "value": {
+      "karpenter.sh/nodepool": "minwm-test-phx2-p5e-spot",
+      "node.kubernetes.io/instance-type": "p5e.48xlarge",
+      "seedleap.ai/capacity-pool": "minwm-test-phx2-karpenter"
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/serviceAccountName",
+    "value": "minwm-test-s3-reader"
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/tolerations",
+    "value": [
+      {
+        "effect": "NoSchedule",
+        "key": "seedleap.ai/capacity-pool",
+        "operator": "Equal",
+        "value": "minwm-test-phx2-karpenter"
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/volumes/1",
+    "value": {
+      "emptyDir": {},
+      "name": "parity"
+    }
+  }
+]

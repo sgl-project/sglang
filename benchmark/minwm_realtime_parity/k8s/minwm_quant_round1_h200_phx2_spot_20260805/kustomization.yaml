@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../minwm_quant_round1_b200_spot_20260805.yaml
+nameSuffix: -h200-phx2-v6
+patches:
+  - path: pvc_patch.yaml
+  - path: job_patch.yaml
+  - target:
+      group: batch
+      version: v1
+      kind: Job
+      name: minwm-quant-r1-b200-20260805-01
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/nodeSelector
+        value:
+          karpenter.sh/capacity-type: spot
+          karpenter.sh/nodepool: minwm-test-phx2-p5e-spot
+          node.kubernetes.io/instance-type: p5e.48xlarge
+          topology.kubernetes.io/zone: us-west-2-phx-2a
+      - op: replace
+        path: /spec/template/spec/tolerations
+        value:
+          - key: seedleap.ai/capacity-pool
+            operator: Equal
+            value: minwm-test-phx2-karpenter
+            effect: NoSchedule

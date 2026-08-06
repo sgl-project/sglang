@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>MinWM 三路同帧对比</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #0b0e14; color: #e8ecf2; }
+    header, main { max-width: 1900px; margin: auto; padding: 16px 22px; }
+    header { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+    button, input, select { font: inherit; }
+    button, select { background: #202634; color: #fff; border: 1px solid #3a4355; border-radius: 7px; padding: 7px 10px; }
+    #summary, .case-meta, .status { color: #aeb7c8; }
+    .case-list { display: grid; gap: 22px; }
+    .case-card { background: #10151f; border: 1px solid #2a3140; border-radius: 12px; padding: 14px; }
+    .case-heading { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin-bottom: 12px; }
+    .case-heading h2 { margin: 0; font-size: 18px; }
+    .videos { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .panel { background: #141924; border: 1px solid #2a3140; border-radius: 10px; overflow: hidden; }
+    .label { padding: 8px 12px; font-weight: 700; }
+    .baseline .label { color: #8bd5ff; }
+    .bitwise .label { color: #66d9a3; }
+    .optimized .label { color: #ffd166; }
+    video { width: 100%; display: block; background: #000; }
+    .controls { display: grid; grid-template-columns: auto auto auto 1fr auto auto; align-items: center; gap: 9px; margin-top: 14px; }
+    .seek { width: 100%; }
+    .time { min-width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+    details { margin-top: 10px; color: #aeb7c8; }
+    pre { white-space: pre-wrap; background: #141924; border: 1px solid #2a3140; padding: 12px; border-radius: 9px; }
+    .good { color: #66d9a3; } .warn, .error { color: #ffd166; }
+    @media (max-width: 1050px) {
+      .videos { grid-template-columns: 1fr; }
+      .controls { grid-template-columns: repeat(3, auto); }
+      .seek { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>MinWM：baseline ↔ bitwise ↔ optimized</strong>
+    <span id="summary">正在读取报告…</span>
+  </header>
+  <main><div id="cases" class="case-list"></div></main>
+  <script id="embedded-report" type="application/json">__MINWM_EMBEDDED_TRIPTYCH_REPORT__</script>
+  <script>
+    const caseList = document.querySelector('#cases');
+    const summary = document.querySelector('#summary');
+
+    function formatTime(seconds) {
+      if (!Number.isFinite(seconds)) return '0:00';
+      return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+    }
+
+    function waitUntilReady(video, label) {
+      return new Promise((resolve, reject) => {
+        video.addEventListener('canplay', resolve, {once: true});
+        video.addEventListener('error', () => reject(new Error(`${label} 加载失败`)), {once: true});
+      });
+    }
+
+    function createCaseCard(item, index, contract) {
+      const card = document.createElement('section');
+      card.className = 'case-card';
+      card.innerHTML = `
+        <div class="case-heading">
+          <h2></h2><strong class="exact"></strong><span class="case-meta"></span><span class="status">正在加载视频…</span>
+        </div>
+        <div class="videos">
+          <div class="panel baseline"><div class="label">1. minWM main / V3 baseline</div><video muted playsinline preload="metadata"></video></div>
+          <div class="panel bitwise"><div class="label">2. SGLang bitwise 一致路径</div><video muted playsinline preload="metadata"></video></div>
+          <div class="panel optimized"><div class="label">3. SGLang 性能路径（whole-DiT compile）</div><video muted playsinline preload="metadata"></video></div>
+        </div>
+        <div class="controls">
+          <button class="play">三路同时播放</button>
+          <button class="prev">−1 帧</button>
+          <button class="next">+1 帧</button>
+          <input class="seek" aria-label="三路同步定位" type="range" min="0" max="1" step="0.001" value="0">
+          <span class="time">0:00 / 0:00</span>
+          <select class="rate" aria-label="播放速度"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select>
+        </div>
+        <details><summary>性能、误差与输入</summary><pre></pre></details>`;
+
+      const videos = [...card.querySelectorAll('video')];
+      const baseline = videos[0];
+      const seek = card.querySelector('.seek');
+      const time = card.querySelector('.time');
+      const play = card.querySelector('.play');
+      const status = card.querySelector('.status');
+      let pendingSeek = null;
+      card.querySelector('h2').textContent = `${index + 1}. ${item.id}`;
+      const exact = item.bitwise_comparison.generated_frames.bitwise_equal;
+      const exactLabel = card.querySelector('.exact');
+      exactLabel.className = exact ? 'exact good' : 'exact warn';
+      exactLabel.textContent = exact ? 'BITWISE EXACT' : 'BITWISE MISMATCH';
+      const optimizedFps = item.performance.optimized.steady_client_fps;
+      const bitwiseFps = item.performance.bitwise.steady_client_fps;
+      card.querySelector('.case-meta').textContent =
+        `${contract.width}×${contract.height} · ${contract.fps} FPS · ${contract.reference_pixel_frames + contract.generated_pixel_frames} 帧 · ` +
+        `bitwise ${bitwiseFps.toFixed(2)} / optimized ${optimizedFps.toFixed(2)} client FPS`;
+      card.querySelector('pre').textContent = JSON.stringify({
+        prompt: item.prompt,
+        action_label: item.action_label,
+        action_weights: item.action_weights,
+        keys: item.keys,
+        performance: item.performance,
+        bitwise_generated_frames: item.bitwise_comparison.generated_frames,
+        optimized_generated_frames: item.optimized_comparison.generated_frames,
+        videos: item.videos
+      }, null, 2);
+
+      const ready = Promise.all(videos.map((video, i) => waitUntilReady(video, ['baseline', 'bitwise', 'optimized'][i])));
+      videos.forEach((video, i) => {
+        video.src = [item.videos.baseline, item.videos.bitwise, item.videos.optimized][i];
+        video.load();
+      });
+
+      function sync(force=false) {
+        if (pendingSeek === null) {
+          videos.slice(1).forEach(video => {
+            if (force || Math.abs(video.currentTime - baseline.currentTime) > 0.025) video.currentTime = baseline.currentTime;
+          });
+        }
+        const duration = Number.isFinite(baseline.duration) ? baseline.duration : 0;
+        const current = pendingSeek ?? baseline.currentTime;
+        seek.max = duration || 1;
+        seek.value = current;
+        time.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
+      }
+
+      function seekAll(seconds) {
+        const duration = Number.isFinite(baseline.duration) ? baseline.duration : seconds;
+        pendingSeek = Math.min(Math.max(0, seconds), duration);
+        videos.forEach(video => { video.currentTime = pendingSeek; });
+        seek.value = pendingSeek;
+        time.textContent = `${formatTime(pendingSeek)} / ${formatTime(duration)}`;
+      }
+
+      ready.then(() => { status.textContent = '三路已就绪'; sync(true); })
+        .catch(error => { status.className = 'status error'; status.textContent = error.message; });
+      play.onclick = async () => {
+        if (baseline.paused) {
+          try {
+            await ready;
+            sync(true);
+            await Promise.all(videos.map(video => video.play()));
+            play.textContent = '三路同时暂停';
+          } catch (error) {
+            videos.forEach(video => video.pause());
+            status.className = 'status error';
+            status.textContent = error.message;
+          }
+        } else {
+          videos.forEach(video => video.pause());
+        }
+      };
+      baseline.ontimeupdate = () => sync(false);
+      baseline.onseeked = () => { pendingSeek = null; sync(true); };
+      baseline.onpause = () => { videos.slice(1).forEach(video => video.pause()); play.textContent = '三路同时播放'; };
+      seek.oninput = () => seekAll(Number(seek.value));
+      card.querySelector('.rate').onchange = event => videos.forEach(video => { video.playbackRate = Number(event.target.value); });
+      card.querySelector('.prev').onclick = () => { videos.forEach(video => video.pause()); seekAll(Number(seek.value) - 1 / contract.fps); };
+      card.querySelector('.next').onclick = () => { videos.forEach(video => video.pause()); seekAll(Number(seek.value) + 1 / contract.fps); };
+      return card;
+    }
+
+    function render(report) {
+      const speedup = report.summary.mean_optimized_speedup_over_bitwise;
+      summary.textContent =
+        `${report.summary.case_count} case · bitwise exact ${report.summary.bitwise_exact_count}/${report.summary.case_count}` +
+        (speedup === null ? '' : ` · optimized / bitwise ${speedup.toFixed(2)}×`);
+      report.cases.forEach((item, index) => caseList.append(createCaseCard(item, index, report.contract)));
+    }
+
+    const embeddedText = document.querySelector('#embedded-report').textContent.trim();
+    let embedded = null;
+    try { embedded = JSON.parse(embeddedText); } catch (_) {}
+    const reportPromise = embedded
+      ? Promise.resolve(embedded)
+      : fetch('../triptych_report.json').then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        });
+    reportPromise.then(render).catch(error => {
+      summary.className = 'error';
+      summary.textContent = `报告加载失败：${error.message}`;
+    });
+  </script>
+</body>
+</html>

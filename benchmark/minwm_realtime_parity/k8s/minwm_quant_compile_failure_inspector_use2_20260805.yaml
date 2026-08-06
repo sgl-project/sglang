@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-quant-compile-inspector-20260805-01
+  namespace: ray
+  labels:
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-quantization
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/task: minwm-realtime-quantization
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        karpenter.sh/nodepool: ray-cpu-spot-primary-clean
+      tolerations:
+        - key: ray.io/node-type
+          operator: Equal
+          value: worker
+          effect: NoSchedule
+      containers:
+        - name: inspect
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -c
+            - |
+              import json
+              from pathlib import Path
+
+              root = Path("/s3/world-model/evals/minwm/quantization/20260805/results")
+              run_ids = [
+                  "minwm-quant-bf16-b200-20260805-01",
+                  "minwm-quant-fp8-b200-20260805-01",
+              ]
+              report = {}
+              for run_id in run_ids:
+                  run_root = root / run_id
+                  item = {}
+                  for filename in ("server.log", "client.log"):
+                      path = run_root / "throughput/dense-optimized-compile-kv45" / filename
+                      if path.is_file():
+                          lines = path.read_text(errors="replace").splitlines()
+                          item[filename] = lines[-160:]
+                  report[run_id] = item
+              print(json.dumps(report, indent=2, sort_keys=True))
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim

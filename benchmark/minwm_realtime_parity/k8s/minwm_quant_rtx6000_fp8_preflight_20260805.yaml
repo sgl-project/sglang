@@ -1,0 +1,163 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-quant-fp8-rtx6000-wheel-20260805-13
+  namespace: ray
+  labels:
+    app.kubernetes.io/name: minwm-quant-fp8-rtx6000-wheel-20260805-13
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-quantization
+  annotations:
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/repo: seedleap/sglang
+    seedleap.ai/branch: codex/minwm-realtime-api
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-quant-fp8-rtx6000-wheel-20260805-13
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/task: minwm-realtime-quantization
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-quant-rtx6000-spot
+        karpenter.sh/capacity-type: spot
+        node.kubernetes.io/instance-type: g7e.4xlarge
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-quant-rtx6000-spot
+          effect: NoSchedule
+      containers:
+        - name: preflight
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: SGLANG_GIT_REF
+              value: "17924c42d21be2c62d4d503757dfa9c567760cb1"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              python3 - /workspace/sglang/python/pyproject.toml <<'PY'
+              from pathlib import Path
+              import sys
+              path = Path(sys.argv[1])
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC Rust extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+              python3 -m pip install -e /workspace/sglang/python \
+                --no-deps --root-user-action=ignore
+              python3 -m pip install \
+                'compressed-tensors' \
+                'diffusers==0.37.0' \
+                'fastapi==0.141.1' \
+                'gguf' \
+                'IPython==9.16.0' \
+                'partial-json-parser' \
+                'pyzmq==27.1.0' \
+                'transformers==5.12.1' \
+                --root-user-action=ignore
+              python3 -m pip install --no-deps \
+                'addict==2.4.0' \
+                'msgspec==0.21.1' \
+                'orjson==3.11.9' \
+                'prometheus-client==0.26.0' \
+                'pybase64==1.4.3' \
+                'python-multipart==0.0.32' \
+                'sgl-deep-gemm==0.1.4' \
+                'setproctitle==1.3.7' \
+                'uvicorn==0.52.0' \
+                'uvloop==0.22.1' \
+                'watchfiles==1.2.0' \
+                'websockets==17.0.1' \
+                'zstandard==0.25.0' \
+                --root-user-action=ignore
+              python3 -m pip install \
+                'cmake>=3.31' \
+                ninja \
+                'nvidia-cuda-cccl==13.0.85' \
+                'nvidia-cuda-crt==13.0.88' \
+                'nvidia-cuda-nvcc==13.0.88' \
+                'nvidia-nvvm==13.0.88' \
+                scikit-build-core \
+                uv \
+                --root-user-action=ignore
+              export CUDA_HOME=/opt/minwm/venv/lib/python3.12/site-packages/nvidia/cu13
+              export CUDACXX="${CUDA_HOME}/bin/nvcc"
+              export PATH="${CUDA_HOME}/bin:${PATH}"
+              if [[ ! -e "${CUDA_HOME}/lib64" ]]; then
+                ln -s lib "${CUDA_HOME}/lib64"
+              fi
+              if [[ ! -e "${CUDA_HOME}/lib/libcudart.so" ]]; then
+                ln -s libcudart.so.13 "${CUDA_HOME}/lib/libcudart.so"
+              fi
+              nvcc --version
+              wheel_dir=/tmp/sglang-kernel-wheel
+              artifact=/s3/world-model/evals/minwm/quantization/20260805/artifacts/sglang_kernel-0.4.4-torch2.12.1-cu130-sm120.whl
+              mkdir -p "${wheel_dir}" "${artifact%/*}"
+              CMAKE_ARGS="-DCMAKE_CUDA_COMPILER=${CUDACXX} -DCUDA_VERSION=13.0 -DCUDA_nvrtc_LIBRARY=${CUDA_HOME}/lib/libnvrtc.so.13 -DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_ENABLE_FA3=OFF -DSGL_KERNEL_COMPILE_THREADS=2" \
+                CMAKE_BUILD_PARALLEL_LEVEL=8 \
+                MAX_JOBS=8 \
+                python3 -m pip wheel /workspace/sglang/sgl-kernel \
+                  --no-build-isolation --no-deps --wheel-dir "${wheel_dir}"
+              wheel_path="$(find "${wheel_dir}" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+              [[ -n "${wheel_path}" ]]
+              python3 -m pip install "${wheel_path}" \
+                --no-deps --root-user-action=ignore
+              cp "${wheel_path}" "${artifact}"
+              stat "${artifact}"
+              python3 -m pip uninstall -y peft
+              python3 - <<'PY'
+              import json
+              import torch
+              from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+              config = Fp8Config()
+              print(json.dumps({
+                  "cuda": torch.version.cuda,
+                  "gpu": torch.cuda.get_device_name(0),
+                  "online_fp8": config.get_name(),
+                  "torch": torch.__version__,
+              }, sort_keys=True))
+              PY
+          resources:
+            requests:
+              cpu: "8"
+              memory: 64Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "14"
+              memory: 112Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim

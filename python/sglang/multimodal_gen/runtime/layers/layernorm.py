@@ -35,9 +35,19 @@ _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_sgl_kernel_norm = False
 
 if _is_cuda or _is_xpu:
-    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+    try:
+        from sgl_kernel import fused_add_rmsnorm, rmsnorm
+    except (ImportError, OSError):
+        # A parity environment may intentionally retain a different Torch
+        # version than SGLang's prebuilt kernel wheel. Keep diffusion models
+        # usable through the native implementation instead of failing during
+        # module import on an ABI mismatch.
+        pass
+    else:
+        _has_sgl_kernel_norm = True
 
 if _is_npu:
     import torch_npu
@@ -94,6 +104,9 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not _has_sgl_kernel_norm:
+            return self.forward_native(x, residual)
+
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
@@ -275,6 +288,9 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not _has_sgl_kernel_norm:
+            return self.forward_native(x, residual)
+
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:

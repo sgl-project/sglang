@@ -1,0 +1,471 @@
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: minwm-test-usw2d
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+spec:
+  ephemeralStorage:
+    iops: 3000
+    size: 160Gi
+    throughput: 125
+  advancedNetworking:
+    associatePublicIPAddress: true
+  networkPolicy: DefaultAllow
+  networkPolicyEventLogs: Disabled
+  role: AmazonEKSAutoNodeRole
+  securityGroupSelectorTerms:
+    - id: sg-01dc86c32f0be6c0c
+  snatPolicy: Random
+  subnetSelectorTerms:
+    - id: subnet-05f94519b218b0f37
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-test-usw2d-p6-spot
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+spec:
+  disruption:
+    budgets:
+      - nodes: 100%
+    consolidateAfter: 10m
+    consolidationPolicy: WhenEmpty
+  limits:
+    cpu: "384"
+    nvidia.com/gpu: "16"
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-test-usw2d-karpenter
+    spec:
+      expireAfter: 8h
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: minwm-test-usw2d
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - spot
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - p6-b300.48xlarge
+            - p6-b200.48xlarge
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values:
+            - us-west-2d
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+      taints:
+        - key: seedleap.ai/capacity-pool
+          value: minwm-test-usw2d-karpenter
+          effect: NoSchedule
+      terminationGracePeriod: 10m
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: minwm-dmd-0724-p6-gp3
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+provisioner: ebs.csi.eks.amazonaws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minwm-dmd-0724-p6-work-v2
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: minwm-dmd-0724-p6-gp3
+  resources:
+    requests:
+      storage: 200Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-dmd-0724-p6
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/checkpoint: global_step_011000
+    seedleap.ai/checkpoint-bytes: "20014135255"
+    seedleap.ai/checkpoint-crc64nvme: "8KS+pbHYSjY="
+    seedleap.ai/checkpoint-source: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
+    seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
+    seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
+    seedleap.ai/sglang-git-ref: 94d76bba471cd8fd62fd7984c53c041cdbe11942
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  progressDeadlineSeconds: 5400
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minwm-dmd-0724-p6
+  template:
+    metadata:
+      labels:
+        app: minwm-dmd-0724-p6
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/task: minwm-realtime-serving
+      annotations:
+        cloudwatch.aws.amazon.com/auto-annotate-dotnet: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-java: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-nodejs: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-python: "false"
+        instrumentation.opentelemetry.io/inject-dotnet: "false"
+        instrumentation.opentelemetry.io/inject-java: "false"
+        instrumentation.opentelemetry.io/inject-nodejs: "false"
+        instrumentation.opentelemetry.io/inject-python: "false"
+        seedleap.ai/checkpoint: global_step_011000
+        seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
+        seedleap.ai/sglang-git-ref: 94d76bba471cd8fd62fd7984c53c041cdbe11942
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 60
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - spot
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values:
+                      - us-west-2d
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - p6-b300.48xlarge
+                      - p6-b200.48xlarge
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-test-usw2d-karpenter
+          effect: NoSchedule
+      containers:
+        - name: server
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: SGLANG_GIT_REF
+              value: 94d76bba471cd8fd62fd7984c53c041cdbe11942
+            - name: MINWM_CHECKPOINT
+              value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
+            - name: MINWM_CHECKPOINT_SOURCE
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
+            - name: MINWM_CHECKPOINT_BYTES
+              value: "20014135255"
+            - name: MINWM_CHECKPOINT_VERSION_ID
+              value: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
+            - name: MINWM_DONOR
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_ATTENTION_IMPL
+              value: dense
+            - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
+              value: "false"
+            - name: MINWM_NATIVE_COMPONENTS
+              value: ""
+            - name: TORCHINDUCTOR_CACHE_DIR
+              # Keep compiler artifacts pod-local. Sharing this directory with
+              # benchmark Pods through the model PVC can relabel the volume and
+              # make a running serving Pod lose access to its compile cache.
+              value: /tmp/torchinductor
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              [[ -f "${MINWM_CHECKPOINT}" ]]
+              [[ -d "${MINWM_DONOR}/transformer" ]]
+              [[ "$(stat -c '%s' "${MINWM_CHECKPOINT}")" == "${MINWM_CHECKPOINT_BYTES}" ]]
+              stat -c 'checkpoint_bytes=%s' "${MINWM_CHECKPOINT}"
+
+              git clone --filter=blob:none \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
+
+              # The MinWM serving path does not use SGLang's native gRPC
+              # extension.  This image intentionally has no Rust toolchain, so
+              # make that extension optional instead of failing the editable
+              # Python install.
+              sed -i '/binding = "PyO3"/a optional = true' \
+                /workspace/sglang/python/pyproject.toml
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pip install --force-reinstall --no-deps \
+                --index-url https://flashinfer.ai/whl/cu130 \
+                'flashinfer-jit-cache==0.6.12+cu130'
+
+              MODEL_STAMP="/work/model/.ready-${SGLANG_GIT_REF}-${MINWM_CHECKPOINT_VERSION_ID}"
+              if [[ ! -f "${MODEL_STAMP}" ]]; then
+                rm -rf /work/checkpoint /work/pretrained /work/model
+                mkdir -p /work/checkpoint /work/pretrained /work/model
+                cp "${MINWM_CHECKPOINT}" /work/checkpoint/model.pt
+                cp -a "${MINWM_DONOR}/." /work/pretrained/
+                sha256sum /work/checkpoint/model.pt | tee /work/checkpoint/model.pt.sha256
+
+                python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+                  --minwm-checkpoint /work/checkpoint/model.pt \
+                  --donor-diffusers-dir /work/pretrained \
+                  --output-dir /work/model \
+                  --link-donor \
+                  --source-uri "${MINWM_CHECKPOINT_SOURCE}"
+                touch "${MODEL_STAMP}"
+              fi
+              mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
+
+              WEBUI_DIR=/workspace/sglang/python/sglang/multimodal_gen/apps/realtime_webui
+              # This MinWM deployment uses sink=4/window=20 as its bounded
+              # serving preset. Exact MinWM full-history parity tests omit
+              # these request overrides in the benchmark harness.
+              # Also make the visible playback target match the 24 FPS test and
+              # avoid presenting LingBot's geometric step sizes as MinWM units.
+              sed -i \
+                -e 's/const DEFAULT_TARGET_FPS = 25;/const DEFAULT_TARGET_FPS = 24;/' \
+                -e 's/fps: 25/fps: 24/g' \
+                -e 's/"0.05\/frame"/"checkpoint-relative"/g' \
+                -e 's/"4deg\/frame"/"checkpoint-relative"/g' \
+                -e 's/"6deg\/frame"/"checkpoint-relative"/g' \
+                "${WEBUI_DIR}/app.js"
+              sed -i \
+                -e 's/id="fps" type="number" value="25"/id="fps" type="number" value="24"/' \
+                -e 's/id="sinkSize" type="number" value="9"/id="sinkSize" type="number" value="4"/' \
+                -e 's/id="windowFrames" type="number" value="18"/id="windowFrames" type="number" value="20"/' \
+                -e 's/value="live" selected/value="live"/' \
+                -e 's/value="timeline"/value="timeline" selected/' \
+                -e 's/<b>25 fps<\/b> target/<b>24 fps<\/b> target/' \
+                -e 's/<div class="section-title">LingBot<\/div>/<div class="section-title">MinWM<\/div>/' \
+                "${WEBUI_DIR}/index.html"
+              python3 "${WEBUI_DIR}/server.py" >/tmp/minwm-webui.log 2>&1 &
+
+              # Keep Bash as PID 1. SGLang's worker orphan guard intentionally
+              # SIGKILLs itself when its parent PID is 1, so `exec sglang`
+              # would make every multiprocessing scheduler die at startup.
+              sglang serve \
+                --model-path /work/model \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile true \
+                --warmup-mode off \
+                --realtime-causal-sink-size 4 \
+                --realtime-causal-kv-cache-num-frames 20 \
+                --host 0.0.0.0 \
+                --port 30000 &
+              SERVER_PID=$!
+              trap 'kill -TERM "${SERVER_PID}" 2>/dev/null || true' TERM INT
+              wait "${SERVER_PID}"
+          ports:
+            - name: api
+              containerPort: 30000
+              protocol: TCP
+            - name: webui
+              containerPort: 18080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 240
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              ephemeral-storage: 60Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            # The cached claim uses a 64 GiB node-local emptyDir.  This model
+            # reads about 54 GiB during staging, which is too close to the P6
+            # node class's 80 GiB ephemeral disk once the image is included.
+            claimName: s3-claim
+            readOnly: true
+        - name: work
+          persistentVolumeClaim:
+            claimName: minwm-dmd-0724-p6-work-v2
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-dmd-0724-p6
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0b6a784859ea30d13,subnet-02296f99e90de96b2,subnet-05f94519b218b0f37
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-dmd-0724
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  allocateLoadBalancerNodePorts: false
+  selector:
+    app: minwm-dmd-0724-p6
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
+      protocol: TCP
+    - name: api
+      port: 30000
+      targetPort: api
+      protocol: TCP
+---
+# Open internal entry point. There is intentionally no
+# loadBalancerSourceRanges: routability to the VPC remains the access boundary.
+# This separate Service avoids mutating the legacy NLB security group, because
+# the EKS Auto Mode load-balancing role currently lacks ec2:DeleteTags.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-dmd-0724-p6-open
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0b6a784859ea30d13,subnet-02296f99e90de96b2,subnet-05f94519b218b0f37
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-dmd-0724-open
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  allocateLoadBalancerNodePorts: false
+  selector:
+    app: minwm-dmd-0724-p6
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
+      protocol: TCP
+    - name: api
+      port: 30000
+      targetPort: api
+      protocol: TCP
+---
+# Public fallback for clients whose corporate proxy cannot route to the
+# internal NLB. There is intentionally no loadBalancerSourceRanges.
+# The inference API currently has no application-level authentication, so this
+# endpoint should be treated as temporary unless auth is added separately.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-dmd-0724-p6-public
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0b6a784859ea30d13,subnet-02296f99e90de96b2,subnet-05f94519b218b0f37
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-dmd-0724-public
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  allocateLoadBalancerNodePorts: false
+  selector:
+    app: minwm-dmd-0724-p6
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
+      protocol: TCP

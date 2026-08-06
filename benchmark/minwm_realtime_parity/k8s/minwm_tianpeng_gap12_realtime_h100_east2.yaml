@@ -1,0 +1,342 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-tianpeng-h100-single-fast
+spec:
+  disruption:
+    budgets:
+      - nodes: 10%
+    consolidateAfter: 10m
+    consolidationPolicy: WhenEmpty
+  limits:
+    cpu: "64"
+    nvidia.com/gpu: "4"
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-tianpeng-h100-single-fast
+    spec:
+      expireAfter: 6h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: minwm-test-h100-single-ec2
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - spot
+            - on-demand
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - p5.4xlarge
+      taints:
+        - effect: NoSchedule
+          key: seedleap.ai/task
+          value: minwm-tianpeng-h100-single
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-tianpeng-realtime
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-realtime
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    seedleap.ai/alignment-status: numerical-parity-h200-20260731
+    seedleap.ai/capacity-type: spot-preferred-on-demand-fallback
+    seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+    seedleap.ai/checkpoint-staged-version-id: yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq
+    seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
+    seedleap.ai/minwm-git-ref: 4220c8a
+    seedleap.ai/sglang-git-ref: 8a4e94992e2d3a4ea4b9a30cfc60873830314482
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  progressDeadlineSeconds: 5400
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-tianpeng-realtime
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-realtime
+        seedleap.ai/owner: chenshengdong
+        seedleap.ai/task: minwm-realtime-serving
+      annotations:
+        seedleap.ai/alignment-status: numerical-parity-h200-20260731
+        seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
+        seedleap.ai/sglang-git-ref: 8a4e94992e2d3a4ea4b9a30cfc60873830314482
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        karpenter.sh/nodepool: minwm-tianpeng-h100-single-fast
+        seedleap.ai/capacity-pool: minwm-tianpeng-h100-single-fast
+      tolerations:
+        - effect: NoSchedule
+          key: seedleap.ai/task
+          operator: Equal
+          value: minwm-tianpeng-h100-single
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      containers:
+        - name: server
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_GIT_REF
+              value: 8a4e94992e2d3a4ea4b9a30cfc60873830314482
+            - name: MINWM_GIT_REF
+              value: 4220c8a
+            - name: MINWM_CHECKPOINT
+              value: /s3/world-model/evals/minwm/checkpoint-staging/tianpeng-detailmix-gap12-20260729/global_step_010000/generator/model.pt
+            - name: MINWM_CHECKPOINT_SOURCE
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-0725detailed-mix-dccb050-dmd-0724-5eba381389f-merge/global_step_010000/generator/model.pt
+            - name: MINWM_CHECKPOINT_VERSION_ID
+              value: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
+            - name: MINWM_CHECKPOINT_STAGED_VERSION_ID
+              value: yPbAthXMihZVEbfNFK4Ew2AVYs0FGDUq
+            - name: MINWM_CHECKPOINT_BYTES
+              value: "20014120667"
+            - name: MINWM_CHECKPOINT_SHA256
+              value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+            - name: MINWM_DONOR
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: MINWM_ATTENTION_IMPL
+              value: packed
+            - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
+              value: "false"
+            - name: MINWM_NATIVE_COMPONENTS
+              value: text_encoder,vae
+            - name: SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D
+              value: "false"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/minwm-tianpeng-torchinductor
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              for _ in $(seq 1 360); do
+                if [[ -f "${MINWM_CHECKPOINT}" ]] \
+                  && [[ -d "${MINWM_DONOR}/transformer" ]]; then
+                  break
+                fi
+                echo "waiting for checkpoint and donor objects to become visible"
+                sleep 15
+              done
+              [[ -f "${MINWM_CHECKPOINT}" ]]
+              [[ -d "${MINWM_DONOR}/transformer" ]]
+              [[ "$(stat -c '%s' "${MINWM_CHECKPOINT}")" == "${MINWM_CHECKPOINT_BYTES}" ]]
+
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
+
+              python3 - <<'PY'
+              from pathlib import Path
+
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pytest -q \
+                /workspace/sglang/python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py
+
+              MODEL_STAMP="/work/model/.ready-${SGLANG_GIT_REF}-${MINWM_CHECKPOINT_VERSION_ID}"
+              if [[ ! -f "${MODEL_STAMP}" ]]; then
+                rm -rf /work/checkpoint /work/pretrained /work/model
+                mkdir -p /work/checkpoint /work/pretrained /work/model
+                cp "${MINWM_CHECKPOINT}" /work/checkpoint/model.pt
+                [[ "$(stat -c '%s' /work/checkpoint/model.pt)" == "${MINWM_CHECKPOINT_BYTES}" ]]
+                echo "${MINWM_CHECKPOINT_SHA256}  /work/checkpoint/model.pt" \
+                  | sha256sum --check -
+                cp -a "${MINWM_DONOR}/." /work/pretrained/
+
+                python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+                  --minwm-checkpoint /work/checkpoint/model.pt \
+                  --donor-diffusers-dir /work/pretrained \
+                  --output-dir /work/model \
+                  --link-donor \
+                  --source-uri "${MINWM_CHECKPOINT_SOURCE}" \
+                  --source-version-id "${MINWM_CHECKPOINT_VERSION_ID}" \
+                  --action-type auto \
+                  --local-attn-size 32 \
+                  --sink-size 8 \
+                  --sliding-window-num-frames 32 \
+                  --rope-position-mode block_relative \
+                  --rope-max-frame-gap 12 \
+                  --prompt-first-frame-pin-enabled
+                touch "${MODEL_STAMP}"
+              fi
+
+              WEBUI_DIR=/workspace/sglang/python/sglang/multimodal_gen/apps/realtime_webui
+              sed -i \
+                -e 's/const DEFAULT_TARGET_FPS = 16;/const DEFAULT_TARGET_FPS = 24;/' \
+                -e 's/fps: 16/fps: 24/g' \
+                -e 's/"0.05\/frame"/"checkpoint-relative"/g' \
+                -e 's/"4deg\/frame"/"checkpoint-relative"/g' \
+                -e 's/"6deg\/frame"/"checkpoint-relative"/g' \
+                "${WEBUI_DIR}/app.js"
+              sed -i \
+                -e 's/Realtime Studio/Realtime Studio · MinWM gap12 · H200 Spot/g' \
+                -e 's/id="fps" type="number" value="16"/id="fps" type="number" value="24"/' \
+                -e 's/id="guidance" type="number" value="1"/id="guidance" type="number" value="0"/' \
+                -e 's/id="sinkSize" type="number" value="9"/id="sinkSize" type="number" value="8"/' \
+                -e 's/id="windowFrames" type="number" value="18"/id="windowFrames" type="number" value="32"/' \
+                -e 's/<div class="section-title">LingBot<\/div>/<div class="section-title">MinWM<\/div>/' \
+                "${WEBUI_DIR}/index.html"
+
+              python3 "${WEBUI_DIR}/server.py" >/tmp/minwm-webui.log 2>&1 &
+              WEBUI_PID=$!
+              mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
+
+              python3 -m sglang.multimodal_gen.runtime.launch_server \
+                --model-path /work/model \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile false \
+                --warmup-mode off \
+                --realtime-causal-sink-size 8 \
+                --realtime-causal-kv-cache-num-frames 32 \
+                --host 0.0.0.0 \
+                --port 30000 &
+              SERVER_PID=$!
+              cleanup() {
+                kill -TERM "${SERVER_PID}" "${WEBUI_PID}" 2>/dev/null || true
+                wait "${SERVER_PID}" "${WEBUI_PID}" 2>/dev/null || true
+              }
+              trap cleanup EXIT INT TERM
+              wait "${SERVER_PID}"
+          ports:
+            - name: api
+              containerPort: 30000
+              protocol: TCP
+            - name: webui
+              containerPort: 18080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 240
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "8"
+              memory: 128Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "14"
+              memory: 230Gi
+              ephemeral-storage: 50Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+            readOnly: true
+        - name: work
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-tianpeng-realtime
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-realtime
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0e620ab50b1526027,subnet-088ba5d2aed6aebbe,subnet-071af04f93cf04b0c
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-tianpeng-realtime
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  allocateLoadBalancerNodePorts: false
+  loadBalancerSourceRanges:
+    - 5.34.217.44/32
+    - 13.250.53.242/32
+    - 45.8.204.4/32
+    - 54.255.94.0/32
+  selector:
+    app.kubernetes.io/name: minwm-tianpeng-realtime
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
+      protocol: TCP
+    - name: api
+      port: 30000
+      targetPort: api
+      protocol: TCP

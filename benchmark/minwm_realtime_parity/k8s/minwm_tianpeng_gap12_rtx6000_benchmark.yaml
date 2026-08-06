@@ -1,0 +1,559 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-tianpeng-rtx6000-spot
+  labels:
+    seedleap.ai/task: minwm-realtime-benchmark
+    seedleap.ai/owner: chenshengdong
+spec:
+  limits:
+    nvidia.com/gpu: "1"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-tianpeng-rtx6000-spot
+        seedleap.ai/task: minwm-realtime-benchmark
+    spec:
+      expireAfter: 2h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ray-gpu-ec2-all
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - spot
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values:
+            - us-east-2a
+            - us-east-2b
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - g7e.4xlarge
+      taints:
+        - key: seedleap.ai/capacity-pool
+          value: minwm-tianpeng-rtx6000-spot
+          effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: minwm-tianpeng-rtx6000-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-rtx6000-device-plugin
+    seedleap.ai/task: minwm-realtime-benchmark
+    seedleap.ai/owner: chenshengdong
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-tianpeng-rtx6000-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-rtx6000-device-plugin
+        seedleap.ai/task: minwm-realtime-benchmark
+    spec:
+      priorityClassName: system-node-critical
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-tianpeng-rtx6000-spot
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-tianpeng-rtx6000-spot
+          effect: NoSchedule
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.19.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - nvidia-device-plugin
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: kubelet-device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: kubelet-device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-tianpeng-rtx6000-20260801-07
+  namespace: ray
+  labels:
+    app.kubernetes.io/name: minwm-tianpeng-rtx6000
+    seedleap.ai/task: minwm-realtime-benchmark
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: 56b48f769be2bed674c9504a32ed49bd9c8d3a32
+    seedleap.ai/minwm-git-ref: 4220c8a
+    seedleap.ai/checkpoint-version-id: sL6CTylRv4QWY98mVTkuLoe5REbKHlvd
+    seedleap.ai/checkpoint-sha256: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+    seedleap.ai/capacity-type: spot
+    seedleap.ai/benchmark-contract: 832x480-and-1248x704-69-chunks
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-tianpeng-rtx6000
+        seedleap.ai/task: minwm-realtime-benchmark
+        seedleap.ai/owner: chenshengdong
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-tianpeng-rtx6000-spot
+        karpenter.sh/capacity-type: spot
+        node.kubernetes.io/instance-type: g7e.4xlarge
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-tianpeng-rtx6000-spot
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_GIT_REF
+              value: 56b48f769be2bed674c9504a32ed49bd9c8d3a32
+            - name: CHECKPOINT_SHA256
+              value: 18a48a2709d74b93ce26f0b808f381d191553853aae81dd72d2438430251d379
+            - name: CHECKPOINT_BYTES
+              value: "20014120667"
+            - name: RESULT_RUN_ID
+              value: 20260801-rtx6000-480-704-07
+            - name: MINWM_ATTENTION_IMPL
+              value: dense
+            - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
+              value: "false"
+            - name: MINWM_NATIVE_COMPONENTS
+              value: ""
+            - name: MINWM_SEGMENT_COMPILE
+              value: "true"
+            - name: MINWM_CACHE_ROTATED_K
+              value: "true"
+            - name: MINWM_PRECOMPUTE_CACHE_ROPE
+              value: "true"
+            - name: MINWM_CACHE_PACKED_METADATA
+              value: "true"
+            - name: SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D
+              value: "false"
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /work/torchinductor-cache
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+
+              clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
+              git -C /workspace/sglang rev-parse HEAD
+
+              python3 - <<'PY'
+              from pathlib import Path
+
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC Rust extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+
+              # Preserve the RTX 6000 image's matched Blackwell stack (Torch
+              # 2.12, FA4 b20, CUTLASS DSL 4.6 and quack 0.5.3).  Resolving the
+              # diffusion extra currently downgrades that stack to versions
+              # whose varlen FA4 kernel cannot be constructed on SM120.
+              python3 -m pip install -e "/workspace/sglang/python" \
+                --no-deps --root-user-action=ignore
+              python3 -m pip install \
+                'fastapi==0.141.1' \
+                'IPython==9.16.0' \
+                'pyzmq==27.1.0' \
+                --root-user-action=ignore
+              python3 -m pip install --no-deps \
+                'addict==2.4.0' \
+                'msgspec==0.21.1' \
+                'orjson==3.11.9' \
+                'prometheus-client==0.26.0' \
+                'pybase64==1.4.3' \
+                'python-multipart==0.0.32' \
+                'setproctitle==1.3.7' \
+                'uvicorn==0.52.0' \
+                'uvloop==0.22.1' \
+                'watchfiles==1.2.0' \
+                'websockets==17.0.1' \
+                'zstandard==0.25.0' \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+
+              python3 - <<'PY'
+              import torch
+              import torch.nn.functional as F
+
+              print("torch", torch.__version__, flush=True)
+              q = torch.randn(1, 40, 128, 128, device="cuda", dtype=torch.bfloat16)
+              k = torch.randn_like(q)
+              v = torch.randn_like(q)
+              output = F.scaled_dot_product_attention(q, k, v)
+              torch.cuda.synchronize()
+              assert torch.isfinite(output).all()
+              print("SDPA_SM120_PREFLIGHT=PASS", flush=True)
+              PY
+
+              WORK_ROOT=/work/tianpeng-gap12
+              CHECKPOINT="${WORK_ROOT}/checkpoint/model.pt"
+              PRETRAINED="${WORK_ROOT}/pretrained"
+              MODEL_DIR="${WORK_ROOT}/sglang-model"
+              RESULTS="${WORK_ROOT}/results"
+              PUBLISH="/results-east/world-model/evals/minwm/sglang-tianpeng-gap12-4220c8a/${RESULT_RUN_ID}"
+              mkdir -p \
+                "${WORK_ROOT}/checkpoint" \
+                "${PRETRAINED}" \
+                "${MODEL_DIR}" \
+                "${RESULTS}" \
+                "${PUBLISH}" \
+                "${TORCHINDUCTOR_CACHE_DIR}"
+
+              cp \
+                /checkpoint-west/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-0725detailed-mix-dccb050-dmd-0724-5eba381389f-merge/global_step_010000/generator/model.pt \
+                "${CHECKPOINT}"
+              [[ "$(stat -c '%s' "${CHECKPOINT}")" == "${CHECKPOINT_BYTES}" ]]
+              echo "${CHECKPOINT_SHA256}  ${CHECKPOINT}" | sha256sum --check -
+              cp -a \
+                /results-east/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers/. \
+                "${PRETRAINED}/"
+
+              python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+                --minwm-checkpoint "${CHECKPOINT}" \
+                --donor-diffusers-dir "${PRETRAINED}" \
+                --output-dir "${MODEL_DIR}" \
+                --link-donor \
+                --source-uri \
+                  s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-0725detailed-mix-dccb050-dmd-0724-5eba381389f-merge/global_step_010000/generator/model.pt \
+                --source-version-id sL6CTylRv4QWY98mVTkuLoe5REbKHlvd \
+                --action-type auto \
+                --local-attn-size 32 \
+                --sink-size 8 \
+                --sliding-window-num-frames 32 \
+                --rope-position-mode block_relative \
+                --rope-max-frame-gap 12 \
+                --prompt-first-frame-pin-enabled \
+                | tee "${RESULTS}/conversion.log"
+
+              python3 - "${RESULTS}/runtime.json" <<'PY'
+              import json
+              import platform
+              import subprocess
+              import sys
+              import torch
+
+              gpu = subprocess.check_output(
+                  [
+                      "nvidia-smi",
+                      "--query-gpu=name,uuid,driver_version,memory.total,power.limit",
+                      "--format=csv,noheader",
+                  ],
+                  text=True,
+              ).strip()
+              payload = {
+                  "cuda": torch.version.cuda,
+                  "gpu": gpu,
+                  "node": platform.node(),
+                  "torch": torch.__version__,
+              }
+              with open(sys.argv[1], "w") as output:
+                  json.dump(payload, output, indent=2, sort_keys=True)
+                  output.write("\n")
+              print(json.dumps(payload, sort_keys=True))
+              PY
+
+              python3 -m sglang.multimodal_gen.runtime.launch_server \
+                --model-path "${MODEL_DIR}" \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile false \
+                --warmup-mode off \
+                --realtime-causal-sink-size 8 \
+                --realtime-causal-kv-cache-num-frames 32 \
+                --host 127.0.0.1 \
+                --port 30000 \
+                > "${RESULTS}/sglang-server.log" 2>&1 &
+              SERVER_PID=$!
+              cleanup() {
+                kill "${SERVER_PID}" 2>/dev/null || true
+                wait "${SERVER_PID}" 2>/dev/null || true
+              }
+              trap cleanup EXIT INT TERM
+
+              for _ in $(seq 1 600); do
+                if curl --fail --silent http://127.0.0.1:30000/health >/dev/null; then
+                  break
+                fi
+                if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+                  tail -300 "${RESULTS}/sglang-server.log"
+                  exit 1
+                fi
+                sleep 2
+              done
+              curl --fail --silent http://127.0.0.1:30000/health >/dev/null
+
+              PYTHONPATH=/workspace/sglang/benchmark/minwm_realtime_parity \
+                python3 - "${RESULTS}/benchmark.json" <<'PY' \
+                | tee "${RESULTS}/benchmark.log"
+              import asyncio
+              import copy
+              import json
+              import statistics
+              import sys
+              import time
+
+              import msgspec.msgpack
+              import websockets
+
+              from tianpeng_alignment import DEFAULT_ALIGNMENT_URL, load_contract
+
+              WS_URL = "ws://127.0.0.1:30000/v1/realtime_video/generate"
+              FULL_CHUNKS = 69
+              WARMUP_CHUNKS = 5
+
+
+              def request_for_size(base_request, size, chunks):
+                  request = copy.deepcopy(base_request)
+                  request["generation_mode"] = "t2v"
+                  request["size"] = size
+                  request["max_chunks"] = chunks
+                  request["num_frames"] = 1 + 16 * (chunks - 1)
+                  request["realtime_output_format"] = "raw"
+                  conditions = request["condition_inputs"]
+                  conditions["action_weights"] = conditions["action_weights"][
+                      : request["num_frames"] - 1
+                  ]
+                  conditions["minwm_chunk_seeds"] = conditions["minwm_chunk_seeds"][
+                      :chunks
+                  ]
+                  conditions["minwm_prompt_schedule"] = [
+                      item
+                      for item in conditions["minwm_prompt_schedule"]
+                      if int(item["target_chunk"]) < chunks
+                  ]
+                  return request
+
+
+              async def stream_request(request):
+                  stats = []
+                  completed = set()
+                  frame_count = 0
+                  payload_bytes = 0
+                  started = time.perf_counter()
+                  async with websockets.connect(
+                      WS_URL,
+                      max_size=None,
+                      ping_interval=None,
+                      open_timeout=1800,
+                  ) as websocket:
+                      await websocket.send(msgspec.msgpack.encode(request))
+                      while (
+                          len(completed) < int(request["max_chunks"])
+                          or len(stats) < int(request["max_chunks"])
+                      ):
+                          packed = await asyncio.wait_for(websocket.recv(), timeout=1800)
+                          header = msgspec.msgpack.decode(packed)
+                          message_type = header.get("type")
+                          if message_type == "error":
+                              raise RuntimeError(header.get("content", "unknown error"))
+                          if message_type == "chunk_stats":
+                              stats.append(header)
+                              continue
+                          if message_type == "frame_batch":
+                              payload = header.get("payload", b"")
+                          elif message_type == "frame_batch_header":
+                              payload = await asyncio.wait_for(
+                                  websocket.recv(), timeout=1800
+                              )
+                          else:
+                              raise RuntimeError(f"unexpected message: {header}")
+                          frame_count += int(header["num_frames"])
+                          payload_bytes += len(payload)
+                          if header.get("is_final_frame_batch", True):
+                              completed.add(int(header["chunk_index"]))
+                  return {
+                      "frame_count": frame_count,
+                      "payload_bytes": payload_bytes,
+                      "stats": stats,
+                      "wall_seconds": time.perf_counter() - started,
+                  }
+
+
+              def summarize(size, result):
+                  stats = sorted(result["stats"], key=lambda item: int(item["chunk_index"]))
+                  steady = [item for item in stats if int(item["chunk_index"]) >= 10]
+
+                  def aggregate(rows, field):
+                      frames = sum(int(item["num_frames"]) for item in rows)
+                      milliseconds = sum(float(item[field]) for item in rows)
+                      return frames / (milliseconds / 1000)
+
+                  chunk_totals = [float(item["chunk_total_ms"]) for item in steady]
+                  return {
+                      "size": size,
+                      "frames": result["frame_count"],
+                      "chunks": len(stats),
+                      "wall_seconds": result["wall_seconds"],
+                      "client_fps": result["frame_count"] / result["wall_seconds"],
+                      "all_chunk_source_fps": aggregate(stats, "chunk_total_ms"),
+                      "steady_source_fps": aggregate(steady, "chunk_total_ms"),
+                      "steady_scheduler_fps": aggregate(steady, "scheduler_forward_ms"),
+                      "steady_chunk_total_ms_p50": statistics.median(chunk_totals),
+                      "steady_chunk_total_ms_min": min(chunk_totals),
+                      "steady_chunk_total_ms_max": max(chunk_totals),
+                      "payload_bytes": result["payload_bytes"],
+                      "steady_start_chunk": 10,
+                  }
+
+
+              async def main():
+                  contract = load_contract(DEFAULT_ALIGNMENT_URL)
+                  base_request = contract["request"]
+                  summaries = []
+                  warmups = []
+                  for size in ("832x480", "1248x704"):
+                      warm = await stream_request(
+                          request_for_size(base_request, size, WARMUP_CHUNKS)
+                      )
+                      warmups.append(
+                          {
+                              "size": size,
+                              "frames": warm["frame_count"],
+                              "wall_seconds": warm["wall_seconds"],
+                          }
+                      )
+                      measured = await stream_request(
+                          request_for_size(base_request, size, FULL_CHUNKS)
+                      )
+                      summary = summarize(size, measured)
+                      summaries.append(summary)
+                      print(json.dumps(summary, sort_keys=True), flush=True)
+                  output = {
+                      "contract": {
+                          "checkpoint_sha256": contract["expected"][
+                              "checkpoint_sha256"
+                          ],
+                          "local_attn_size": 32,
+                          "sink_size": 8,
+                          "rope_position_mode": "block_relative",
+                          "rope_max_frame_gap": 12,
+                          "dmd_steps": 4,
+                          "profile": "speed-dense-segment-compile-sm120-image-stack",
+                          "sglang_git_ref": "56b48f769be2bed674c9504a32ed49bd9c8d3a32",
+                      },
+                      "warmups": warmups,
+                      "results": summaries,
+                  }
+                  with open(sys.argv[1], "w") as target:
+                      json.dump(output, target, indent=2, sort_keys=True)
+                      target.write("\n")
+
+
+              asyncio.run(main())
+              PY
+
+              cleanup
+              trap - EXIT INT TERM
+
+              cp "${RESULTS}/runtime.json" "${PUBLISH}/"
+              cp "${RESULTS}/benchmark.json" "${PUBLISH}/"
+              cp "${RESULTS}/benchmark.log" "${PUBLISH}/"
+              cp "${RESULTS}/conversion.log" "${PUBLISH}/"
+              tail -200 "${RESULTS}/sglang-server.log" > "${PUBLISH}/sglang-server-tail.log"
+              touch "${PUBLISH}/SUCCESS"
+              echo "RESULTS_S3=s3://leap-world-us-east-2/world-model/evals/minwm/sglang-tianpeng-gap12-4220c8a/${RESULT_RUN_ID}/"
+          resources:
+            requests:
+              cpu: "12"
+              memory: 96Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "14"
+              memory: 112Gi
+              ephemeral-storage: 150Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: checkpoint-west
+              mountPath: /checkpoint-west
+              readOnly: true
+            - name: results-east
+              mountPath: /results-east
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: checkpoint-west
+          persistentVolumeClaim:
+            claimName: minwm-ckpt100g-west-s3
+            readOnly: true
+        - name: results-east
+          persistentVolumeClaim:
+            claimName: s3-claim
+        - name: work
+          emptyDir:
+            sizeLimit: 150Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi

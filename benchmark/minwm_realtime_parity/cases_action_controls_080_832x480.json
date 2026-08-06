@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "case_count": 8,
+    "seed": 42,
+    "width": 832,
+    "height": 480,
+    "fps": 24,
+    "generated_latent_frames": 16,
+    "chunks": 4,
+    "latent_frames_per_chunk": 4,
+    "generated_pixel_frames": 64,
+    "reference_pixel_frames": 1,
+    "action_type": "primitive_token_residual",
+    "action_output_format": "primitive_float",
+    "action_order": ["w", "a", "s", "d", "i", "j", "k", "l"]
+  },
+  "cases": [
+    {
+      "id": "01_forward_w080_street",
+      "source_id": "action-control-diagnostic/p87/w080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 9,
+      "keys": ["w"],
+      "action_weights": [0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "02_backward_s080_street",
+      "source_id": "action-control-diagnostic/p87/s080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 18,
+      "keys": ["s"],
+      "action_weights": [0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "03_strafe_left_a080_street",
+      "source_id": "action-control-diagnostic/p87/a080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 27,
+      "keys": ["a"],
+      "action_weights": [0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "04_strafe_right_d080_street",
+      "source_id": "action-control-diagnostic/p87/d080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 36,
+      "keys": ["d"],
+      "action_weights": [0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "05_pitch_up_i080_street",
+      "source_id": "action-control-diagnostic/p87/i080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 3,
+      "keys": ["i"],
+      "action_weights": [0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "06_pitch_down_k080_street",
+      "source_id": "action-control-diagnostic/p87/k080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 4,
+      "keys": ["k"],
+      "action_weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0]
+    },
+    {
+      "id": "07_yaw_left_j080_street",
+      "source_id": "action-control-diagnostic/p87/j080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 2,
+      "keys": ["j"],
+      "action_weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0]
+    },
+    {
+      "id": "08_yaw_right_l080_street",
+      "source_id": "action-control-diagnostic/p87/l080",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 1,
+      "keys": ["l"],
+      "action_weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8]
+    }
+  ]
+}

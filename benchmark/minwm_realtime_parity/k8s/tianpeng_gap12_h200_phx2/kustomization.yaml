@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../minwm_tianpeng_gap12_realtime_h100_east2.yaml
+  - gateway.yaml
+patches:
+  - path: delete-single-h100-nodepool.yaml
+  - path: deployment-phx2.yaml
+  - path: service-phx2.yaml
