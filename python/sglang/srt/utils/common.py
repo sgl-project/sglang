@@ -309,6 +309,13 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
+
+
 try:
     import sgl_kernel  # noqa: F401
 
@@ -844,6 +851,18 @@ def get_device_name(device_id: int = 0) -> str:
 
 
 @lru_cache(maxsize=1)
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
@@ -1004,21 +1023,11 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName

@@ -55,9 +55,13 @@ on:
         type: string
         default: ''
       rust_ext_artifact:
-        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, means this stage compiles them during install.'
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
         type: string
         default: ''
+      skip_prebuilt_rust_ext:
+        description: 'Take neither the artifact nor the cache, and compile during install. For a stage no prebuild targets: the cache key is arch-blind, so an aarch64 stage would be handed x86_64 modules.'
+        type: boolean
+        default: false
 
 # Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
@@ -124,23 +128,15 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      # continue-on-error: the artifact expires in a day, so a later re-run just
-      # compiles during install. download-artifact creates srt/server/, which
-      # exists only as build output.
-      - name: Download prebuilt Rust extensions
-        id: rust_ext
-        if: ${{ inputs.rust_ext_artifact != '' }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-rust-ext
+        if: ${{ !inputs.skip_prebuilt_rust_ext }}
         with:
-          name: ${{ inputs.rust_ext_artifact }}
-          path: python/sglang/srt/
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         env:
           GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
-          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 

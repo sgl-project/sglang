@@ -90,6 +90,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
+                    "enable_symm_mem",
+                    "speculative_attention_mode",
                 }
             ),
         )

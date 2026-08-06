@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ipc_input_a2a_qkv,
     _usp_input_all_to_all,
+    _usp_input_all_to_all_qkv,
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
@@ -784,9 +785,7 @@ class USPAttention(nn.Module):
                 if qkv_fast is not None:
                     q, k, v = qkv_fast
                 else:
-                    q = _usp_input_all_to_all(q, head_dim=2)
-                    k = _usp_input_all_to_all(k, head_dim=2)
-                    v = _usp_input_all_to_all(v, head_dim=2)
+                    q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
             if (
                 _VARLEN_FA_ENABLED
@@ -981,9 +980,7 @@ class USPAttention(nn.Module):
                 k = k.contiguous()
                 v = v.contiguous()
             else:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:

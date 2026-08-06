@@ -57,17 +57,21 @@ def pack_qkv_destination_major(
     k: torch.Tensor,
     v: torch.Tensor,
     world_size: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows, global_heads, head_size = q.shape
     local_heads = global_heads // world_size
-    output = torch.empty(
-        world_size,
-        rows,
-        local_heads,
-        3 * head_size,
-        dtype=q.dtype,
-        device=q.device,
-    )
+    expected_shape = (world_size, rows, local_heads, 3 * head_size)
+    if out is not None:
+        assert out.shape == expected_shape and out.is_contiguous()
+        assert out.dtype == q.dtype and out.device == q.device
+        output = out
+    else:
+        output = torch.empty(
+            expected_shape,
+            dtype=q.dtype,
+            device=q.device,
+        )
     total_elements = rows * global_heads * head_size
     if total_elements == 0:
         return output

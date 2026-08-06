@@ -301,8 +301,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.sampling_params.quality = "lossless"
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
-    with pytest.raises(ValueError, match="does not support SageAttention"):
-        stage.forward(batch, server_args)
+    assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
     server_args.attention_backend = None

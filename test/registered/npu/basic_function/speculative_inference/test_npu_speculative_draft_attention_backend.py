@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH,
 )
@@ -87,6 +88,9 @@ class TestAscendSpeculativeDraftAttentionAndMoeRunner(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_a_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         args = SimpleNamespace(
             base_url=self.base_url,
             eval_name="gsm8k",

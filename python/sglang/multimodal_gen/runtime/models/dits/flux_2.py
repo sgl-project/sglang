@@ -52,7 +52,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -548,9 +547,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
+        cos_sin_cache = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -560,9 +557,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
+
+        # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
+        # here too — the single-stream block previously ran norm and RoPE as separate ops.
+        query, key = apply_qk_norm_with_optional_rope(
+            q=query,
+            k=key,
+            q_norm=self.norm_q,
+            k_norm=self.norm_k,
+            head_dim=self.head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            allow_inplace=True,
+        )
         hidden_states = self.attn(
             query,
             key,

@@ -1,7 +1,7 @@
 import math
 import re
 from collections import defaultdict
-from typing import Dict, List, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -194,15 +194,24 @@ def _process_single_image(
     image_scale: torch.Tensor,
     image_bias: torch.Tensor,
     patch_size: int,
+    to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
+    post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
-    image = _to_cuda_chw(image)
+    """Process a single image on GPU: resize -> pad -> normalize -> patchify.
+
+    ``to_chw`` converts the input to a CUDA CHW tensor (a model may keep an
+    alpha channel here); ``post_resize`` runs on the resized ``(B, C, H, W)``
+    batch before patchify (K3 composites transparent backgrounds there).
+    """
+    image = to_chw(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
     padded_h = new_h + config["pad_height"]
     padded_w = new_w + config["pad_width"]
 
     x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
+    if post_resize is not None:
+        x = post_resize(x)
 
     return normalize_and_patchify(
         x, image_scale, image_bias, patch_size, padded_h, padded_w
@@ -250,6 +259,8 @@ def _gpu_preprocess_images(
     image_scale: torch.Tensor,
     image_bias: torch.Tensor,
     patch_size: int,
+    to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
+    post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
@@ -278,21 +289,30 @@ def _gpu_preprocess_images(
         if len(group) == 1:
             idx, image, config = group[0]
             patches = _process_single_image(
-                image, config, image_scale, image_bias, patch_size
+                image,
+                config,
+                image_scale,
+                image_bias,
+                patch_size,
+                to_chw=to_chw,
+                post_resize=post_resize,
             )
             all_patches[idx] = patches
             all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
         else:
-            indexed_images = [(idx, _to_cuda_chw(image)) for idx, image, _ in group]
+            indexed_images = [(idx, to_chw(image)) for idx, image, _ in group]
 
             # One NaViT target group can include several original resolutions.
             # Batch only source-compatible images, which removes redundant
             # bicubic launches for common multi-image requests without padding
             # random-size inputs to a larger source resolution.
-            batch = torch.cat(
-                _resize_images_by_source_shape(indexed_images, target_h, target_w),
-                dim=0,
-            )
+            resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
+            if post_resize is not None:
+                # Before the concat: a hook may change the channel count (K3
+                # composites RGBA onto a background and returns RGB), and mixed
+                # 3/4-channel sources cannot be concatenated first.
+                resized = [post_resize(part) for part in resized]
+            batch = torch.cat(resized, dim=0)
 
             T = 1
             gh, gw = padded_h // patch_size, padded_w // patch_size

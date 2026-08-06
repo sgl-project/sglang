@@ -835,11 +835,26 @@ class DefaultModelLoader(BaseModelLoader):
 
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        if is_mxfp8:
+            weights = (
+                (
+                    f"{name}_inv" if name.endswith(".weight_scale") else name,
+                    loaded_weight,
+                )
+                for name, loaded_weight in weights
+            )
 
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
-            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
+            with temp_set_env(
+                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
+                FLASHINFER_NVFP4_4OVER6="1",
+                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
+                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
+                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
+            ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
                 torch.cuda.synchronize()

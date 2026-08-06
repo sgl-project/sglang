@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     FR_SPEC_TOKEN_MAP_PATH,
     LLAMA_3_8B_EAGLE_WEIGHTS_PATH,
@@ -77,24 +78,26 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             env=env,
         )
         try:
-            eval_args = SimpleNamespace(
-                base_url=DEFAULT_URL_FOR_TEST,
-                eval_name="gsm8k",
-                api="completion",
-                num_examples=1319,
-                num_threads=128,
-                max_tokens=512,
-                num_shots=5,
-                temperature=0.0,
-            )
-            metrics = run_eval(eval_args)
-            self.assertGreaterEqual(metrics["score"], 0.83)
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            else:
+                eval_args = SimpleNamespace(
+                    base_url=DEFAULT_URL_FOR_TEST,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=1319,
+                    num_threads=128,
+                    max_tokens=512,
+                    num_shots=5,
+                    temperature=0.0,
+                )
+                metrics = run_eval(eval_args)
+                self.assertGreaterEqual(metrics["score"], 0.83)
         finally:
             kill_process_tree(process.pid)
 
     def test_eagle_with_valid_token_map_gsm8k(self):
         """EAGLE (EAGLE-2) with valid token map; GSM8K accuracy should meet threshold."""
-
         args = [
             "--trust-remote-code",
             "--attention-backend",
@@ -135,20 +138,23 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             env=env,
         )
         try:
-            eval_args = SimpleNamespace(
-                base_url=DEFAULT_URL_FOR_TEST,
-                eval_name="gsm8k",
-                api="completion",
-                num_examples=1319,
-                num_threads=128,
-                max_tokens=512,
-                num_shots=5,
-                temperature=0.0,
-            )
-            metrics = run_eval(eval_args)
-            self.assertGreaterEqual(
-                metrics["score"], 0.75
-            )  # adjust threshold as needed
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            else:
+                eval_args = SimpleNamespace(
+                    base_url=DEFAULT_URL_FOR_TEST,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=1319,
+                    num_threads=128,
+                    max_tokens=512,
+                    num_shots=5,
+                    temperature=0.0,
+                )
+                metrics = run_eval(eval_args)
+                self.assertGreaterEqual(
+                    metrics["score"], 0.75
+                )  # adjust threshold as needed
         finally:
             kill_process_tree(process.pid)
 

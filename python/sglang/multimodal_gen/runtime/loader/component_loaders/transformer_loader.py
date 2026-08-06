@@ -1,21 +1,32 @@
 import copy
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    TransformerQuantLoadSpec,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -26,6 +37,21 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
+
+
+def _default_quantized_attention_backend(
+    quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
+) -> AttentionBackendEnum | None:
+    """Preserve stable NVFP4 numerics unless the user selected a backend."""
+    if not current_platform.is_blackwell() or not quant_spec.is_modelopt_fp4:
+        return None
+    if (
+        get_global_forced_attn_backend() is not None
+        or get_component_forced_attn_backend() is not None
+        or server_args.attention_backend is not None
+    ):
+        return None
+    return AttentionBackendEnum.FA
 
 
 def _warn_if_expected_param_dtype_missing(
@@ -178,23 +204,41 @@ class TransformerLoader(ComponentLoader):
             component_cpu_offload=bool(component_server_args.dit_cpu_offload),
         )
 
-        # Load the model using FSDP loader
-        model = maybe_load_fsdp_model(
-            model_cls=model_cls,
-            init_params=init_params,
-            weight_dir_list=safetensors_list,
-            device=local_torch_device,
-            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
-            hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=component_server_args.dit_cpu_offload,
-            pin_cpu_memory=component_server_args.pin_cpu_memory,
-            fsdp_inference=component_server_args.use_fsdp_inference,
-            param_dtype=quant_spec.param_dtype,
-            reduce_dtype=torch.float32,
-            output_dtype=None,
-            strict=False,
-            weight_load_plan=weight_load_plan,
+        quantized_attn_backend = _default_quantized_attention_backend(
+            quant_spec, component_server_args
         )
+        if quantized_attn_backend is not None:
+            logger.info(
+                "Using %s attention for ModelOpt NVFP4 to preserve output precision",
+                quantized_attn_backend.name.lower(),
+            )
+        attn_backend_context = (
+            component_attn_backend_context_manager(
+                quantized_attn_backend, component_name=component_name
+            )
+            if quantized_attn_backend is not None
+            else nullcontext()
+        )
+
+        # Model construction resolves attention implementations, so apply the
+        # quantization-specific default around FSDP initialization and loading.
+        with attn_backend_context:
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params=init_params,
+                weight_dir_list=safetensors_list,
+                device=local_torch_device,
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
+                cpu_offload=component_server_args.dit_cpu_offload,
+                pin_cpu_memory=component_server_args.pin_cpu_memory,
+                fsdp_inference=component_server_args.use_fsdp_inference,
+                param_dtype=quant_spec.param_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=False,
+                weight_load_plan=weight_load_plan,
+            )
 
         # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:

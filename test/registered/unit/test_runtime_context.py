@@ -299,12 +299,13 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
-        # raise under the strict harness; override() stays the entry point.
+        # raise, and a differing value lives on a derived variant.
         published = get_context().override_server_args(tp_size=2).install()
         with self.assertRaises(AttributeError):
             published.tp_size = 4
-        published.override(source="test", tp_size=4)
-        self.assertEqual(published.tp_size, 4)
+        variant = published.derive("test", tp_size=4)
+        self.assertEqual(variant.tp_size, 4)
+        self.assertEqual(published.tp_size, 2)
 
     def test_restore_resets_the_capture_seed(self):
         # install() seeds flags.capture from the published dummy; restore()
