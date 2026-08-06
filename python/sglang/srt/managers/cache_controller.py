@@ -700,34 +700,21 @@ class HiCacheController:
         is_rank_replicated: bool,
         attn_cp_size: int,
         head_group_knob: Optional[int] = None,
-        layer_partition: Optional[List[int]] = None,
+        layer_partition: Optional[int] = None,
     ):
-        """Attach-time construction of the canonical-grid cell suffix(es).
+        """Attach-time canonical-grid planning.
 
-        Fail-fast attach validation: every unsupported combination raises with
-        the remedy in the message; nothing degrades silently to rank-suffix
-        keys (see DESIGN_l3_canonical_shard_grid.md section 2.2).
-
-        Returns ``(suffix, layer_ranges, head_ranges)``: one suffix string
-        when this rank owns a single cell per page under a zero-copy scheme,
-        or the list of owned-cell suffixes under fan-out (always a list in
-        adapter mode, whose objects use the layout-neutral canonical byte
-        order); ``layer_ranges``/``head_ranges`` carry the LOCAL cell grid
-        for the buffer metas when set. The two fleet agreements are canonical-grid's own knobs in
-        the extra config — no coupling to the legacy split-heads flags:
-        ``head_group`` (heads per cell; a rank owns local/head_group cells,
-        enabling cross-TP read-back) and ``layer_partition`` (canonical layer
-        boundaries; a stage owns one cell per contained range, enabling
-        cross-PP read-back — rank-replicated pools on mooncake with the
-        page_first_direct layout). ``layer_ranges`` carries the LOCAL
-        (start, end) ranges for the per-cell buffer metas when layer fan-out
-        is active, else None.
+        Controller-only guards live here; the namespace/grid derivation is
+        hicache_key_scheme.plan_canonical_cells. Everything unsupported
+        raises with the remedy in the message — nothing degrades silently
+        to rank-suffix keys. Returns (suffix, layer_ranges, head_ranges):
+        a single suffix string without partition knobs, else the owned-cell
+        suffix list plus the LOCAL cell grid for the adapter.
         """
         from sglang.srt.mem_cache.hicache_key_scheme import (
-            build_canonical_cell_suffixes,
-            derive_namespace,
             namespace_digest,
             normalize_dtype,
+            plan_canonical_cells,
         )
 
         if type(self) is not HiCacheController:
@@ -746,200 +733,48 @@ class HiCacheController:
                 "canonical-grid does not cover speculative-decoding draft "
                 "pools yet (the draft model needs its own namespace identity)."
             )
-
-        # Cell-adapter mode: BOTH fleet grids declared on a sharded-KV pool.
-        # Objects then use the layout-neutral canonical byte order, gathered
-        # through a registered staging arena, so no host-layout requirement
-        # applies (any page-first-family layout interops).
-        adapter_mode = (
-            head_group_knob is not None
-            and layer_partition is not None
-            and not is_rank_replicated
-        )
-        if adapter_mode:
-            # The adapter waives the zero-copy layout requirements, but its
-            # gather/scatter supports only single-tensor pools with a known
-            # layout — fail at attach, not on the first backup (a raise on
-            # the storage threads would silently wedge write-back).
-            if self.mem_pool_host.layout not in (
-                "layer_first",
-                "page_first",
-                "page_first_direct",
-                "page_head",
-            ):
-                raise ValueError(
-                    f"the cell adapter does not support the "
-                    f"{self.mem_pool_host.layout!r} host layout; use a "
-                    f"page-first-family --hicache-mem-layout."
-                )
-            if not torch.is_tensor(self.mem_pool_host.kv_buffer):
-                raise NotImplementedError(
-                    "the cell adapter does not support split K/V host pools "
-                    "(asymmetric MHA)."
-                )
-
-        # Head fan-out: head_group is canonical-grid's fleet head-grid
-        # agreement (heads per cell). These prerequisite checks run before
-        # any pool access so misconfiguration fails on config alone.
-        if head_group_knob is not None and not is_rank_replicated:
-            if head_group_knob <= 0:
-                raise ValueError(f"head_group must be positive: {head_group_knob}")
-            # head_group pins the whole fleet, single-cell members included:
-            # every participant must serialize objects in the same byte
-            # order — page_head for zero-copy head cells, or the canonical
-            # adapter order when layer_partition is also set. (The
-            # object_layout namespace field backstops this by digest, but
-            # the shared fleet keyspace only forms when everyone complies.)
-            if self.storage_backend_type != "mooncake":
-                raise NotImplementedError(
-                    "canonical-grid with head_group needs a "
-                    "multi-key-per-page backend; only mooncake supports it "
-                    "(the file backend stores one object per page)."
-                )
-            if not adapter_mode and self.mem_pool_host.layout != "page_head":
-                raise ValueError(
-                    "canonical-grid with head_group requires "
-                    "--hicache-mem-layout page_head on every participating "
-                    "deployment (fan-out and single-cell members alike must "
-                    "serialize objects in the same byte order)."
-                )
-
-        # Logical KV dtype, not the storage view: fp8 variants all store as
-        # uint8, and e4m3/e5m2 deployments must land in distinct keyspaces.
-        dtype = normalize_dtype(self.mem_pool_device.dtype)
-        start_layer = self.mem_pool_host.start_layer
-        end_layer = self.mem_pool_host.end_layer
-        local_kv_heads = 0 if is_rank_replicated else self.mem_pool_host.head_num
-        model_id = model_name or ""
-
-        head_group = local_kv_heads
-        if head_group_knob is not None and not is_rank_replicated:
-            if (
-                local_kv_heads % head_group_knob != 0
-                or head_group_knob > local_kv_heads
-            ):
-                raise ValueError(
-                    f"head_group={head_group_knob} must divide this rank's "
-                    f"{local_kv_heads} kv heads (grids coarser than a rank's "
-                    f"shard would need sub-object writes)."
-                )
-            head_group = head_group_knob
-
         if (
-            not is_rank_replicated
-            and local_kv_heads == 1
-            and self.tp_size > 1
-            and head_group_knob is None
-        ):
-            # An explicit head_group is the operator's attestation that the
-            # head grid is a true sharding of the model's kv heads (it is set
-            # fleet-wide with the model in hand), so the max-TP member of a
-            # head_group=1 fleet attaches with H index == tp_rank. Without
-            # it, 1 head/rank is indistinguishable from kv-head replication.
-            # One kv head per rank is ambiguous without model-level info: the
-            # model may have exactly tp_size kv heads (sharded, safe) or
-            # fewer (heads REPLICATED across ranks — several ranks hold the
-            # same head, and per-rank H indices would mislabel it). The
-            # derived namespace fabricates total_kv_heads = local*tp, so it
-            # cannot tell these apart.
+            head_group_knob is not None or layer_partition is not None
+        ) and self.storage_backend_type != "mooncake":
             raise NotImplementedError(
-                "canonical-grid cannot derive a namespace at 1 kv head per "
-                "rank (possible kv-head replication when tp_size exceeds the "
-                "model's kv heads); use --hicache-storage-key-scheme "
-                "rank-suffix for this deployment."
+                "canonical-grid partition knobs (head_group / layer_partition) "
+                "need a multi-key-per-page backend; only mooncake supports "
+                "them (the file backend stores one object per page)."
             )
-        # The namespace is derived from deployment facts; its digest prefixes
-        # every key, so deployments agree on a keyspace iff model, logical KV
-        # dtype (fp8 variants stay distinct), page size, and head grid all
-        # match. Deployments passing the same head_group derive the same
-        # head grid and thereby share cache across TP sizes.
-        namespace = derive_namespace(
-            model_id=model_id,
-            dtype=dtype,
+
+        plan = plan_canonical_cells(
+            model_id=model_name or "",
+            # Logical KV dtype, not the storage view: fp8 variants all store
+            # as uint8 but must land in distinct keyspaces.
+            dtype=normalize_dtype(self.mem_pool_device.dtype),
             page_size=self.page_size,
             rank_replicated=is_rank_replicated,
-            total_kv_heads=local_kv_heads * self.tp_size,
-            head_group=0 if is_rank_replicated else head_group,
-            # Adapter cells are layout-neutral: any page-first-family pool
-            # produces identical canonical bytes, so the identity field is a
-            # constant and mixed-layout fleets share one keyspace.
-            object_layout="cell-v1" if adapter_mode else self.mem_pool_host.layout,
-            layer_group=layer_partition or 0,
-        )
-
-        suffixes = build_canonical_cell_suffixes(
-            namespace,
+            local_kv_heads=0 if is_rank_replicated else self.mem_pool_host.head_num,
             attn_tp_rank=self.tp_rank,
             attn_tp_size=self.tp_size,
             attn_cp_size=attn_cp_size,
-            start_layer=start_layer,
-            end_layer=end_layer,
-            local_kv_heads=local_kv_heads,
-            dtype=dtype,
-            page_size=self.page_size,
-            model_id=model_id,
-            rank_replicated=is_rank_replicated,
-            object_layout="cell-v1" if adapter_mode else self.mem_pool_host.layout,
+            start_layer=self.mem_pool_host.start_layer,
+            end_layer=self.mem_pool_host.end_layer,
             is_final_stage=self.pp_rank == self.pp_size - 1,
+            pool_layout=self.mem_pool_host.layout,
+            head_group_knob=head_group_knob,
+            layer_partition=layer_partition,
         )
-
-        canonical_layer_ranges = None
-        canonical_head_ranges = None
-        if layer_partition and (
-            adapter_mode
-            or (
-                len(suffixes) > 1
-                and (is_rank_replicated or head_group == local_kv_heads)
+        if plan.adapter and not torch.is_tensor(self.mem_pool_host.kv_buffer):
+            # Fail at attach, not on the first backup — a raise on the
+            # storage threads would silently wedge write-back.
+            raise NotImplementedError(
+                "the cell adapter does not support split K/V host pools "
+                "(asymmetric MHA)."
             )
-        ):
-            # Layer fan-out (PP read-back) and/or the cell adapter: the
-            # module validated boundary alignment; here the physical
-            # prerequisites. Local ranges feed the buffer metas in the same
-            # order as the suffix list.
-            if self.storage_backend_type != "mooncake":
-                raise NotImplementedError(
-                    "canonical-grid layer fan-out needs a multi-key-per-page "
-                    "backend; only mooncake supports it."
-                )
-            if not adapter_mode and self.mem_pool_host.layout != "page_first_direct":
-                raise ValueError(
-                    "canonical-grid layer fan-out requires "
-                    "--hicache-mem-layout page_first_direct (layer-major "
-                    "page blocks give one contiguous slab per cell)."
-                )
-            canonical_layer_ranges = [
-                (
-                    a - start_layer,
-                    min(a + layer_partition, end_layer) - start_layer,
-                )
-                for a in range(start_layer, end_layer, layer_partition)
-            ]
-            if adapter_mode:
-                # Cell adapter: objects are canonical-order gathers, so the
-                # backend also needs the local head ranges; the suffix list
-                # is the (layer-major, head-minor) cross product and stays a
-                # list even for a single cell (the byte format differs from
-                # the raw-layout fast paths regardless of cell count).
-                cells = local_kv_heads // head_group
-                canonical_head_ranges = [
-                    (i * head_group, (i + 1) * head_group) for i in range(cells)
-                ]
-                assert len(suffixes) == len(canonical_layer_ranges) * len(
-                    canonical_head_ranges
-                )
-            else:
-                assert len(canonical_layer_ranges) == len(suffixes)
 
         logger.info(
             "HiCache canonical-grid L3 keys: namespace=%s cells=%s",
-            namespace_digest(namespace),
-            suffixes,
+            namespace_digest(plan.namespace),
+            plan.suffixes,
         )
-        if adapter_mode:
-            suffix = list(suffixes)
-        else:
-            suffix = suffixes[0] if len(suffixes) == 1 else suffixes
-        return suffix, canonical_layer_ranges, canonical_head_ranges
+        suffix = list(plan.suffixes) if plan.adapter else plan.suffixes[0]
+        return suffix, plan.layer_ranges, plan.head_ranges
 
     def reset(self):
         self.storage_stop_event.set()

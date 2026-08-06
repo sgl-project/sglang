@@ -47,17 +47,11 @@ class HiCacheStorageConfig:
     # in HiCacheController._generate_storage_config via hicache_key_scheme.py;
     # None under the legacy rank-suffix scheme.
     canonical_suffix: Optional[Union[str, List[str]]] = None
-    # Layer fan-out (PP read-back): the LOCAL half-open layer ranges of this
-    # rank's cells, one per canonical range the stage spans, in the same
-    # order as the canonical_suffix list; None when the stage spans a single
-    # range and the cell adapter is off.
+    # Cell adapter (set iff any partition knob is set): the LOCAL half-open
+    # layer / kv-head ranges of this rank's cells, layer-major and in the
+    # canonical_suffix order. Objects then use the layout-neutral canonical
+    # byte order. head ranges stay None for rank-replicated pools.
     canonical_layer_ranges: Optional[List[Tuple[int, int]]] = None
-    # Cell adapter (head x layer fan-out): the LOCAL half-open kv-head ranges
-    # of this rank's cells. When set, objects use the layout-neutral
-    # canonical byte order and the backend gathers/scatters them through a
-    # registered staging arena — any host layout participates, layer_first
-    # included (canonical_layer_ranges is then always set too, possibly a
-    # single range). None outside adapter namespaces.
     canonical_head_ranges: Optional[List[Tuple[int, int]]] = None
 
 

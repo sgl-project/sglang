@@ -562,122 +562,117 @@ class MHATokenToKVPoolHost(HostKVCache):
         raise ValueError(f"cell adapter does not support the {self.layout!r} layout.")
 
     def cell_bytes(self, layer_ranges, head_ranges) -> int:
-        """Total staging bytes for one page's cells (K and V halves)."""
+        """Staging bytes for one page's cells (K and V halves)."""
         layers = sum(end - start for start, end in layer_ranges)
         heads = sum(end - start for start, end in head_ranges)
         return 2 * layers * heads * self.page_size * self.head_dim * self.dtype.itemsize
 
-    def gather_cells_canonical(self, indices, layer_ranges, head_ranges, arena):
-        """Pack cells into ``arena`` in canonical order; return per-slab sizes.
-
-        Order: page-major, layer-range-major, head-range-minor, K slab then V
-        slab per cell — matching the canonical suffix list and the mooncake
-        key fan-out. Returns (offsets, sizes) of the packed slabs within
-        ``arena`` (a pinned uint8 tensor registered with the store).
-        """
+    def _check_adapter_pool(self):
         if not torch.is_tensor(self.kv_buffer):
             raise NotImplementedError(
                 "cell adapter is not supported for split K/V host pools "
                 "(asymmetric MHA)."
             )
-        assert len(indices) % self.page_size == 0
-        itemsize = self.dtype.itemsize
-        offsets = []
-        sizes = []
-        cursor = 0
-        indices = indices.tolist()
-        for index in range(0, len(indices), self.page_size):
-            view = self._page_kv_view_canonical(indices[index])
-            for l0, l1 in layer_ranges:
-                for h0, h1 in head_ranges:
-                    slab_elems = (h1 - h0) * (l1 - l0) * self.page_size * self.head_dim
-                    slab_bytes = slab_elems * itemsize
-                    for kv in range(2):  # K slab, then V slab
-                        dst = arena[cursor : cursor + slab_bytes].view(self.dtype)
-                        dst.view(h1 - h0, l1 - l0, self.page_size, self.head_dim).copy_(
-                            view[kv, h0:h1, l0:l1]
-                        )
-                        offsets.append(cursor)
-                        sizes.append(slab_bytes)
-                        cursor += slab_bytes
-        return offsets, sizes
 
-    def scatter_cells_canonical(self, indices, layer_ranges, head_ranges, arena):
-        """Inverse of gather_cells_canonical: arena slabs into the pool."""
-        if not torch.is_tensor(self.kv_buffer):
-            raise NotImplementedError(
-                "cell adapter is not supported for split K/V host pools "
-                "(asymmetric MHA)."
-            )
-        assert len(indices) % self.page_size == 0
-        itemsize = self.dtype.itemsize
-        cursor = 0
-        indices = indices.tolist()
-        for index in range(0, len(indices), self.page_size):
-            view = self._page_kv_view_canonical(indices[index])
-            for l0, l1 in layer_ranges:
-                for h0, h1 in head_ranges:
-                    slab_bytes = (
-                        (h1 - h0)
-                        * (l1 - l0)
-                        * self.page_size
-                        * self.head_dim
-                        * itemsize
-                    )
-                    for kv in range(2):
-                        src = (
-                            arena[cursor : cursor + slab_bytes]
-                            .view(self.dtype)
-                            .view(h1 - h0, l1 - l0, self.page_size, self.head_dim)
-                        )
-                        view[kv, h0:h1, l0:l1].copy_(src)
-                        cursor += slab_bytes
-        return cursor
+    def _cell_slabs(self, layer_ranges, head_ranges):
+        """Per-page slab schedule: (l0, l1, h0, h1, kv, nbytes, direct).
 
-    def get_layer_range_page_buffer_meta(self, indices, layer_ranges):
-        """Zero-copy metas for canonical-grid layer fan-out cells (MHA/GQA).
-
-        ``layer_ranges`` are half-open (start, end) ranges in LOCAL layer
-        indices. Under ``page_first_direct`` the page block is layer-major
-        ``(2, page, layer, page_size, head, dim)``, so each
-        (page, layer-range) cell is one contiguous slab per K/V half. Order:
-        page-major, range-minor, K then V per range — matching the storage
-        key fan-out order (``.._L{a}-{b}_H{j}_k`` / ``_v``).
+        Order: layer-range-major, head-range-minor, K then V — matching the
+        canonical suffix list. ``direct`` marks slabs whose canonical view is
+        already contiguous in the pool (same strides on every page), so the
+        adapter can skip the staging copy for them.
         """
-        if self.layout != "page_first_direct":
-            raise ValueError(
-                "layer-range cells require the page_first_direct layout "
-                f"(layer-major page blocks); got {self.layout!r}."
-            )
-        if not torch.is_tensor(self.kv_buffer):
-            # Asymmetric MHA pools hold a (k_buffer, v_buffer) tuple.
-            raise NotImplementedError(
-                "layer-range cells are not supported for split K/V host "
-                "pools (asymmetric MHA)."
-            )
-        assert len(indices) % self.page_size == 0
-        for start, end in layer_ranges:
-            if not 0 <= start < end <= self.layer_num:
-                raise ValueError(
-                    f"local layer range ({start}, {end}) outside this pool's "
-                    f"{self.layer_num} layers."
+        sample = self._page_kv_view_canonical(0)
+        itemsize = self.dtype.itemsize
+        slabs = []
+        for l0, l1 in layer_ranges:
+            for h0, h1 in head_ranges:
+                nbytes = (
+                    (h1 - h0) * (l1 - l0) * self.page_size * self.head_dim * itemsize
                 )
-        base_ptr = self.kv_buffer.data_ptr()
-        itemsize = self.dtype.itemsize
-        layer_stride = self.page_size * self.head_num * self.head_dim * itemsize
-        page_stride = self.layer_num * layer_stride
-        v_offset = self.layer_num * self.size * self.head_num * self.head_dim * itemsize
-        ptr_list = []
-        element_size_list = []
-        indices = indices.tolist()
-        for index in range(0, len(indices), self.page_size):
-            real_index = indices[index] // self.page_size
-            for start, end in layer_ranges:
-                k_ptr = base_ptr + real_index * page_stride + start * layer_stride
-                ptr_list.append(k_ptr)
-                ptr_list.append(k_ptr + v_offset)
-                element_size_list.extend([(end - start) * layer_stride] * 2)
-        return ptr_list, element_size_list
+                for kv in range(2):
+                    direct = sample[kv, h0:h1, l0:l1].is_contiguous()
+                    slabs.append((l0, l1, h0, h1, kv, nbytes, direct))
+        return slabs
+
+    def cells_all_direct(self, layer_ranges, head_ranges) -> bool:
+        """True when every cell slab is pool-contiguous (no arena needed)."""
+        self._check_adapter_pool()
+        return all(s[6] for s in self._cell_slabs(layer_ranges, head_ranges))
+
+    def gather_cells_canonical(self, indices, layer_ranges, head_ranges, arena):
+        """Write-side adapter: canonical-order (ptr, size) per cell slab.
+
+        Direct slabs point straight into the pool; the rest are packed into
+        ``arena`` (pinned, store-registered). Arena slots are reserved for
+        every slab so per-page geometry stays uniform.
+        """
+        self._check_adapter_pool()
+        assert len(indices) % self.page_size == 0
+        slabs = self._cell_slabs(layer_ranges, head_ranges)
+        ptrs, sizes = [], []
+        cursor = 0
+        for index in indices.tolist()[:: self.page_size]:
+            view = self._page_kv_view_canonical(index)
+            for l0, l1, h0, h1, kv, nbytes, direct in slabs:
+                src = view[kv, h0:h1, l0:l1]
+                if direct:
+                    ptrs.append(src.data_ptr())
+                else:
+                    dst = arena[cursor : cursor + nbytes].view(self.dtype)
+                    dst.view(h1 - h0, l1 - l0, self.page_size, self.head_dim).copy_(src)
+                    ptrs.append(arena.data_ptr() + cursor)
+                sizes.append(nbytes)
+                cursor += nbytes
+        return ptrs, sizes
+
+    def cell_read_metas(self, indices, layer_ranges, head_ranges, arena):
+        """Read-side targets in gather's slab order: direct slabs are fetched
+        straight into the pool, the rest into ``arena`` for the scatter."""
+        self._check_adapter_pool()
+        assert len(indices) % self.page_size == 0
+        slabs = self._cell_slabs(layer_ranges, head_ranges)
+        ptrs, sizes = [], []
+        cursor = 0
+        for index in indices.tolist()[:: self.page_size]:
+            view = self._page_kv_view_canonical(index)
+            for l0, l1, h0, h1, kv, nbytes, direct in slabs:
+                if direct:
+                    ptrs.append(view[kv, h0:h1, l0:l1].data_ptr())
+                else:
+                    ptrs.append(arena.data_ptr() + cursor)
+                sizes.append(nbytes)
+                cursor += nbytes
+        return ptrs, sizes
+
+    def scatter_cells_canonical(
+        self, indices, layer_ranges, head_ranges, arena, page_ok=None
+    ):
+        """Copy fetched arena slabs of successful pages into the pool.
+
+        Direct slabs already landed in place via cell_read_metas pointers.
+        ``page_ok`` filters by page position (None means all succeeded).
+        """
+        self._check_adapter_pool()
+        assert len(indices) % self.page_size == 0
+        slabs = self._cell_slabs(layer_ranges, head_ranges)
+        page_bytes = sum(s[5] for s in slabs)
+        cursor = 0
+        for pos, index in enumerate(indices.tolist()[:: self.page_size]):
+            if page_ok is not None and not page_ok[pos]:
+                cursor += page_bytes
+                continue
+            view = self._page_kv_view_canonical(index)
+            for l0, l1, h0, h1, kv, nbytes, direct in slabs:
+                if not direct:
+                    src = (
+                        arena[cursor : cursor + nbytes]
+                        .view(self.dtype)
+                        .view(h1 - h0, l1 - l0, self.page_size, self.head_dim)
+                    )
+                    view[kv, h0:h1, l0:l1].copy_(src)
+                cursor += nbytes
+        return cursor
 
     def get_page_buffer_meta(self, indices):
         """

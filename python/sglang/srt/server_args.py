@@ -7216,11 +7216,11 @@ class ServerArgs:
                 "CP ranks hold sub-page slices or replicated pages (needs "
                 "token-granule cells / writer election)."
             )
-        # Best-effort early check of head fan-out prerequisites when the
-        # extra config is inline JSON (the '@file' form is re-validated at
-        # attach). head_group is the fleet head-grid agreement (tp_lcm_size
-        # is the legacy rank-suffix knob and is rejected below); fan-out
-        # needs a multi-key backend and per-head-group contiguous layout.
+        # Best-effort early check of the partition knobs when the extra
+        # config is inline JSON (the '@file' form is re-validated at attach).
+        # Any knob selects the cell adapter: objects use the layout-neutral
+        # canonical byte order, so there is no host-layout requirement, but
+        # the per-cell key fan-out needs a multi-key backend.
         extra = self.hicache_storage_backend_extra_config
         if extra and not extra.startswith("@"):
             try:
@@ -7238,43 +7238,17 @@ class ServerArgs:
                     "canonical-grid uses head_group in the extra config "
                     "(heads per cell)."
                 )
-            # Rank-replicated (MLA-family) pools ignore head_group at attach
-            # (no head axis), so a shared fleet extra-config must not be
-            # rejected for them here.
-            if head_group and not self.use_mla_backend():
-                if self.hicache_storage_backend != "mooncake":
-                    raise NotImplementedError(
-                        "canonical-grid with head_group needs a "
-                        "multi-key-per-page backend; only mooncake supports "
-                        "it."
-                    )
-                # With layer_partition also set, the cell adapter serializes
-                # objects in the layout-neutral canonical order — no host
-                # layout requirement. Without it, zero-copy head cells need
-                # page_head fleet-wide.
-                if layer_partition is None and self.hicache_mem_layout != "page_head":
-                    raise ValueError(
-                        "canonical-grid with head_group requires "
-                        "--hicache-mem-layout page_head on every "
-                        "participating deployment (single-cell members "
-                        "included: object byte order must match fleet-wide)."
-                    )
-            if layer_partition is not None:
-                # Layer fan-out (PP read-back) prerequisites. layer_partition
-                # only matters when a stage spans >1 canonical range, which
-                # depends on the PP split — but the backend requirement is
-                # static; the page_first_direct layout requirement binds only
-                # under actual fan-out and is validated at attach.
-                if self.hicache_storage_backend != "mooncake":
-                    raise NotImplementedError(
-                        "canonical-grid layer_partition needs a "
-                        "multi-key-per-page backend; only mooncake supports "
-                        "it."
-                    )
-                # head_group + layer_partition together selects the cell
-                # adapter (layout-neutral canonical object bytes staged
-                # through a registered arena); pool prerequisites are
-                # validated at attach.
+            # head_group is ignored on rank-replicated (MLA-family) pools, so
+            # a shared fleet extra-config must not be rejected for them here.
+            adapter = layer_partition is not None or (
+                head_group and not self.use_mla_backend()
+            )
+            if adapter and self.hicache_storage_backend != "mooncake":
+                raise NotImplementedError(
+                    "canonical-grid partition knobs (head_group / "
+                    "layer_partition) need a multi-key-per-page backend; "
+                    "only mooncake supports them."
+                )
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:

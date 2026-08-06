@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     load_namespace_descriptor,
     namespace_digest,
     normalize_dtype,
+    plan_canonical_cells,
 )
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -406,19 +407,127 @@ class TestDeriveNamespace(CustomTestCase):
         self.assertEqual(normalize_dtype(torch.float8_e5m2), "float8_e5m2")
 
 
+class TestCanonicalCellPlan(CustomTestCase):
+    """plan_canonical_cells: any partition knob selects the adapter, whose
+    canonical byte order makes the namespace layout-neutral (cell-v1)."""
+
+    def _plan(self, **overrides):
+        kwargs = dict(
+            model_id="meta-llama/Llama-3-70B",
+            dtype="bfloat16",
+            page_size=64,
+            rank_replicated=False,
+            local_kv_heads=4,
+            attn_tp_rank=0,
+            attn_tp_size=2,
+            attn_cp_size=1,
+            start_layer=0,
+            end_layer=61,
+            is_final_stage=True,
+            pool_layout="page_first",
+        )
+        kwargs.update(overrides)
+        return plan_canonical_cells(**kwargs)
+
+    def test_no_knobs_keeps_raw_layout(self):
+        plan = self._plan()
+        self.assertFalse(plan.adapter)
+        self.assertEqual(plan.namespace.object_layout, "page_first")
+        self.assertEqual(len(plan.suffixes), 1)
+        self.assertIsNone(plan.layer_ranges)
+        self.assertIsNone(plan.head_ranges)
+
+    def test_any_knob_selects_adapter(self):
+        # head knob alone: adapter, single layer window, head cells.
+        plan = self._plan(head_group_knob=2)
+        self.assertTrue(plan.adapter)
+        self.assertEqual(plan.namespace.object_layout, "cell-v1")
+        self.assertEqual(plan.layer_ranges, [(0, 61)])
+        self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
+        self.assertEqual(len(plan.suffixes), 2)
+        # layer knob alone: adapter with the rank's full head span as one cell.
+        plan = self._plan(layer_partition=30)
+        self.assertTrue(plan.adapter)
+        self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
+        self.assertEqual(plan.head_ranges, [(0, 4)])
+        self.assertEqual(len(plan.suffixes), 3)
+        # both: full cross product, layer-major.
+        plan = self._plan(head_group_knob=2, layer_partition=30)
+        self.assertEqual(len(plan.suffixes), 6)
+
+    def test_rank_replicated_layer_partition_uses_adapter(self):
+        # MLA fleets may still need the adapter: the layer grid must be
+        # byte-uniform regardless of each deployment's host layout.
+        plan = self._plan(
+            rank_replicated=True,
+            local_kv_heads=0,
+            pool_layout="layer_first",
+            layer_partition=30,
+        )
+        self.assertTrue(plan.adapter)
+        self.assertEqual(plan.namespace.object_layout, "cell-v1")
+        self.assertIsNone(plan.head_ranges)
+        self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
+        # head_group alone is a no-op for replicated pools (no head axis).
+        plan = self._plan(rank_replicated=True, local_kv_heads=0, head_group_knob=2)
+        self.assertFalse(plan.adapter)
+
+    def test_adapter_digest_is_layout_neutral(self):
+        digests = {
+            namespace_digest(self._plan(layer_partition=30, pool_layout=lay).namespace)
+            for lay in ("layer_first", "page_first", "page_first_direct", "page_head")
+        }
+        self.assertEqual(len(digests), 1)
+        # Without a knob the layout stays in the identity: disjoint keyspaces.
+        raw = {
+            namespace_digest(self._plan(pool_layout=lay).namespace)
+            for lay in ("page_first", "page_head")
+        }
+        self.assertEqual(len(raw), 2)
+
+    def test_plan_validation(self):
+        with self.assertRaisesRegex(ValueError, "cell adapter"):
+            self._plan(pool_layout="page_first_kv_split", layer_partition=30)
+        with self.assertRaisesRegex(ValueError, "divide"):
+            self._plan(head_group_knob=3)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self._plan(head_group_knob=0)
+        with self.assertRaisesRegex(NotImplementedError, "1 kv head"):
+            self._plan(local_kv_heads=1, attn_tp_size=8)
+        # An explicit head_group attests the sharding and lifts the 1-head
+        # ambiguity.
+        plan = self._plan(local_kv_heads=1, attn_tp_size=8, head_group_knob=1)
+        self.assertEqual(plan.head_ranges, [(0, 1)])
+
+
 class TestControllerGuards(CustomTestCase):
-    """Attach-time guards of HiCacheController._build_canonical_suffix that
-    fire before any storage or runtime-context access."""
+    """Attach-time guards of HiCacheController._build_canonical_suffix."""
 
     class _StubHostPool:
         def __init__(self, layout: str):
             self.layout = layout
+            self.head_num = 4
+            self.start_layer = 0
+            self.end_layer = 61
+            import torch
+
+            self.kv_buffer = torch.zeros(1)
+
+    class _StubDevicePool:
+        def __init__(self):
+            import torch
+
+            self.dtype = torch.bfloat16
 
     def _stub_controller(self, controller_cls, backend_type: str, has_draft: bool):
         controller = controller_cls.__new__(controller_cls)
         controller.storage_backend_type = backend_type
         controller.has_draft = has_draft
         controller.mem_pool_host = self._StubHostPool("page_first")
+        controller.mem_pool_device = self._StubDevicePool()
+        controller.page_size = 64
+        controller.tp_rank, controller.tp_size = 0, 2
+        controller.pp_rank, controller.pp_size = 0, 1
         return controller
 
     def _build(self, controller, **overrides):
@@ -457,40 +566,54 @@ class TestControllerGuards(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "hybrid"):
             self._build(hybrid)
 
-    def test_fan_out_requires_page_head_and_mooncake(self):
+    def test_partition_knobs_require_mooncake(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        file_stub = self._stub_controller(HiCacheController, "file", has_draft=False)
+        with self.assertRaisesRegex(NotImplementedError, "multi-key"):
+            self._build(file_stub, is_rank_replicated=False, head_group_knob=2)
+        with self.assertRaisesRegex(NotImplementedError, "multi-key"):
+            self._build(file_stub, layer_partition=30)
+
+    def test_adapter_plan_from_any_layout(self):
+        # No host-layout requirement: head_group on a page_first pool
+        # attaches through the adapter (list suffix + local cell grid).
         from sglang.srt.managers.cache_controller import HiCacheController
 
         stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
-        stub.tp_size = 2
-        # head_group on a page_first pool: the layout prerequisite fails
-        # before any pool-geometry access.
-        with self.assertRaisesRegex(ValueError, "page_head"):
-            self._build(stub, is_rank_replicated=False, head_group_knob=2)
-
-        file_stub = self._stub_controller(HiCacheController, "file", has_draft=False)
-        file_stub.tp_size = 2
-        with self.assertRaisesRegex(NotImplementedError, "multi-key"):
-            self._build(file_stub, is_rank_replicated=False, head_group_knob=2)
+        suffix, layer_ranges, head_ranges = self._build(
+            stub, is_rank_replicated=False, head_group_knob=2
+        )
+        self.assertIsInstance(suffix, list)
+        self.assertEqual(len(suffix), 2)
+        self.assertEqual(layer_ranges, [(0, 61)])
+        self.assertEqual(head_ranges, [(0, 2), (2, 4)])
 
     def test_adapter_rejects_unsupported_layout_at_attach(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 
         stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
-        stub.tp_size = 2
-        stub.mem_pool_host = self._StubHostPool("layer_first")
+        stub.mem_pool_host = self._StubHostPool("page_first_kv_split")
         with self.assertRaisesRegex(ValueError, "cell adapter"):
             self._build(
                 stub,
                 is_rank_replicated=False,
                 head_group_knob=2,
-                layer_partition=[0, 30, 61],
+                layer_partition=30,
             )
+
+    def test_adapter_rejects_split_kv_pools(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
+        stub.mem_pool_host.kv_buffer = (1, 2)
+        with self.assertRaisesRegex(NotImplementedError, "split K/V"):
+            self._build(stub, is_rank_replicated=False, head_group_knob=2)
 
     def test_nonpositive_head_group_rejected(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 
         stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
-        stub.tp_size = 2
         with self.assertRaisesRegex(ValueError, "positive"):
             self._build(stub, is_rank_replicated=False, head_group_knob=0)
 
@@ -626,18 +749,18 @@ class TestLayerPartition(CustomTestCase):
 
     def test_cross_product_cells_cover_both_axes(self):
         # The cell adapter: TP2/PP1 owns the full H x L cross product
-        # (layer-major, head-minor), exactly the union of the four
-        # TP4/PP2 members' single cells.
-        quad = self._gqa_partition_suffixes(
+        # (layer-major, head-minor; short final window included), exactly
+        # the union of the four TP4/PP2 members' cells.
+        cross = self._gqa_partition_suffixes(
             tp_rank=0, tp_size=2, start_layer=0, end_layer=61
         )
-        self.assertEqual(len(quad), 4)
-        singles = (
+        self.assertEqual(len(cross), 6)
+        members = (
             self._gqa_partition_suffixes(
-                tp_rank=0, tp_size=4, start_layer=0, end_layer=30
+                tp_rank=0, tp_size=4, start_layer=0, end_layer=30, final=False
             )
             + self._gqa_partition_suffixes(
-                tp_rank=1, tp_size=4, start_layer=0, end_layer=30
+                tp_rank=1, tp_size=4, start_layer=0, end_layer=30, final=False
             )
             + self._gqa_partition_suffixes(
                 tp_rank=0, tp_size=4, start_layer=30, end_layer=61
@@ -646,12 +769,18 @@ class TestLayerPartition(CustomTestCase):
                 tp_rank=1, tp_size=4, start_layer=30, end_layer=61
             )
         )
-        self.assertEqual(sorted(quad), sorted(singles))
-        # Order within the quad is layer-major, head-minor.
-        self.assertTrue(quad[0].endswith("_L0-30_H0"))
-        self.assertTrue(quad[1].endswith("_L0-30_H1"))
-        self.assertTrue(quad[2].endswith("_L30-61_H0"))
-        self.assertTrue(quad[3].endswith("_L30-61_H1"))
+        self.assertEqual(sorted(cross), sorted(members))
+        # Order is layer-major, head-minor.
+        tails = [
+            "_L0-30_H0",
+            "_L0-30_H1",
+            "_L30-60_H0",
+            "_L30-60_H1",
+            "_L60-61_H0",
+            "_L60-61_H1",
+        ]
+        for sfx, tail in zip(cross, tails):
+            self.assertTrue(sfx.endswith(tail), sfx)
 
     def test_partition_enters_digest(self):
         self.assertNotEqual(
@@ -677,107 +806,184 @@ class TestLayerPartition(CustomTestCase):
             )
 
 
-class TestMlaLayerRangeBufferMeta(CustomTestCase):
-    """Pointer math of the layer fan-out zero-copy metas (page_first_direct:
-    layer-major page blocks, one contiguous slab per cell)."""
+class TestMlaCellAdapter(CustomTestCase):
+    """MLA cell adapter: page_first_direct is already canonical order, so its
+    slabs skip the staging copy (pointer math == the pool address); other
+    layouts stage byte-identical canonical cells through the arena."""
 
-    def _stub_pool(self, layout="page_first_direct"):
+    _PS, _LAYERS, _DIM, _PAGES = 4, 6, 8, 3
+
+    def _logical(self):
+        import torch
+
+        torch.manual_seed(0)
+        # L[layer, token, 1, dim] per page — the canonical MLA cell order.
+        return [
+            torch.randn(self._LAYERS, self._PS, 1, self._DIM, dtype=torch.bfloat16)
+            for _ in range(self._PAGES)
+        ]
+
+    def _pool(self, layout, logical):
         import torch
 
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
         pool.layout = layout
-        pool.page_size = 4
-        pool.kv_cache_dim = 8
-        pool.layer_num = 6
+        pool.page_size = self._PS
+        pool.kv_cache_dim = self._DIM
+        pool.layer_num = self._LAYERS
         pool.dtype = torch.bfloat16
-        pool.kv_buffer = torch.zeros(
-            (3, pool.layer_num, pool.page_size, 1, pool.kv_cache_dim),
-            dtype=pool.dtype,
-        )
+        pool.size = self._PAGES * self._PS
+        if layout == "layer_first":
+            pool.kv_buffer = torch.zeros(
+                self._LAYERS, pool.size, 1, self._DIM, dtype=pool.dtype
+            )
+            for p, L in enumerate(logical):
+                pool.kv_buffer[:, p * self._PS : (p + 1) * self._PS] = L
+        elif layout == "page_first":
+            pool.kv_buffer = torch.zeros(
+                pool.size, self._LAYERS, 1, self._DIM, dtype=pool.dtype
+            )
+            for p, L in enumerate(logical):
+                pool.kv_buffer[p * self._PS : (p + 1) * self._PS] = L.permute(
+                    1, 0, 2, 3
+                )
+        elif layout == "page_first_direct":
+            pool.kv_buffer = torch.zeros(
+                self._PAGES, self._LAYERS, self._PS, 1, self._DIM, dtype=pool.dtype
+            )
+            for p, L in enumerate(logical):
+                pool.kv_buffer[p] = L
         return pool
 
-    def test_pointer_math(self):
+    _RANGES = [(0, 2), (2, 6)]
+
+    def test_page_first_direct_is_zero_copy(self):
         import torch
 
-        pool = self._stub_pool()
+        pool = self._pool("page_first_direct", self._logical())
+        self.assertTrue(pool.cells_all_direct(self._RANGES))
         itemsize = pool.dtype.itemsize
         layer_stride = pool.page_size * pool.kv_cache_dim * itemsize
         page_stride = pool.layer_num * layer_stride
         base = pool.kv_buffer.data_ptr()
-        # Two pages (host indices 8..11 -> page 2, 0..3 -> page 0), two ranges.
+        # Pages 2 and 0; no arena needed for direct slabs.
         indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
-        ptrs, sizes = pool.get_layer_range_page_buffer_meta(indices, [(0, 2), (2, 6)])
-        self.assertEqual(
-            ptrs,
-            [
-                base + 2 * page_stride,
-                base + 2 * page_stride + 2 * layer_stride,
-                base,
-                base + 2 * layer_stride,
-            ],
-        )
-        self.assertEqual(
-            sizes,
-            [2 * layer_stride, 4 * layer_stride] * 2,
-        )
+        for meta in (pool.gather_cells_canonical, pool.cell_read_metas):
+            ptrs, sizes = meta(indices, self._RANGES, None, None)
+            self.assertEqual(
+                ptrs,
+                [
+                    base + 2 * page_stride,
+                    base + 2 * page_stride + 2 * layer_stride,
+                    base,
+                    base + 2 * layer_stride,
+                ],
+            )
+            self.assertEqual(sizes, [2 * layer_stride, 4 * layer_stride] * 2)
 
-    def test_rejects_wrong_layout_and_range(self):
+    def test_all_layouts_gather_identical_canonical_bytes(self):
+        import ctypes
+
         import torch
 
-        with self.assertRaisesRegex(ValueError, "page_first_direct"):
-            self._stub_pool(layout="page_first").get_layer_range_page_buffer_meta(
-                torch.tensor([0, 1, 2, 3]), [(0, 2)]
+        logical = self._logical()
+        indices = torch.arange(self._PAGES * self._PS)
+        expected = b"".join(
+            bytes(L[l0:l1].contiguous().view(torch.uint8).flatten().tolist())
+            for L in logical
+            for l0, l1 in self._RANGES
+        )
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            pool = self._pool(layout, logical)
+            arena = torch.zeros(
+                self._PAGES * pool.cell_bytes(self._RANGES), dtype=torch.uint8
             )
-        with self.assertRaisesRegex(ValueError, "outside"):
-            self._stub_pool().get_layer_range_page_buffer_meta(
-                torch.tensor([0, 1, 2, 3]), [(0, 7)]
+            ptrs, sizes = pool.gather_cells_canonical(
+                indices, self._RANGES, None, arena
             )
+            got = b"".join(
+                ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
+            )
+            self.assertEqual(got, expected, layout)
+
+    def test_scatter_inverts_fetch_for_staged_layouts(self):
+        import ctypes
+
+        import torch
+
+        logical = self._logical()
+        indices = torch.arange(self._PAGES * self._PS)
+        writer = self._pool("page_first_direct", logical)
+        src_ptrs, src_sizes = writer.gather_cells_canonical(
+            indices, self._RANGES, None, None
+        )
+        reader = self._pool("layer_first", [torch.zeros_like(l) for l in logical])
+        self.assertFalse(reader.cells_all_direct(self._RANGES))
+        arena = torch.zeros(
+            self._PAGES * reader.cell_bytes(self._RANGES), dtype=torch.uint8
+        )
+        dst_ptrs, dst_sizes = reader.cell_read_metas(indices, self._RANGES, None, arena)
+        self.assertEqual(src_sizes, dst_sizes)
+        # Emulate the store fetch, then scatter; page 1 "failed".
+        for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
+            ctypes.memmove(dst, src, size)
+        page_ok = [True, False, True]
+        reader.scatter_cells_canonical(indices, self._RANGES, None, arena, page_ok)
+        for p, L in enumerate(logical):
+            got = reader._page_view_canonical(p * self._PS)
+            for l0, l1 in self._RANGES:
+                if page_ok[p]:
+                    self.assertTrue(torch.equal(got[l0:l1], L[l0:l1]))
+                else:
+                    self.assertEqual(got[l0:l1].abs().sum().item(), 0)
 
 
-class TestMhaLayerRangeBufferMeta(CustomTestCase):
-    """MHA/GQA layer fan-out metas: one K slab and one V slab per
-    (page, range), page-major, range-minor, K then V."""
+class TestMhaDirectCells(CustomTestCase):
+    """MHA skip-convert: canonical order is (head, layer, token, dim), so a
+    multi-head pool always stages — but a single-kv-head page_first_direct
+    pool is degenerate-contiguous and goes zero-copy."""
 
-    def _stub_pool(self, layout="page_first_direct"):
+    def _pool(self, head_num):
         import torch
 
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
         pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
-        pool.layout = layout
+        pool.layout = "page_first_direct"
         pool.page_size = 4
-        pool.head_num = 2
+        pool.head_num = head_num
         pool.head_dim = 8
         pool.layer_num = 6
         pool.dtype = torch.bfloat16
         page_num = 3
         pool.size = page_num * pool.page_size
         pool.kv_buffer = torch.zeros(
-            (
-                2,
-                page_num,
-                pool.layer_num,
-                pool.page_size,
-                pool.head_num,
-                pool.head_dim,
-            ),
+            2,
+            page_num,
+            pool.layer_num,
+            pool.page_size,
+            head_num,
+            pool.head_dim,
             dtype=pool.dtype,
         )
         return pool
 
-    def test_pointer_math(self):
+    def test_single_head_layer_cells_are_direct(self):
         import torch
 
-        pool = self._stub_pool()
+        pool = self._pool(head_num=1)
+        ranges, heads = [(0, 2), (2, 6)], [(0, 1)]
+        self.assertTrue(pool.cells_all_direct(ranges, heads))
         itemsize = pool.dtype.itemsize
-        layer_stride = pool.page_size * pool.head_num * pool.head_dim * itemsize
+        layer_stride = pool.page_size * pool.head_dim * itemsize
         page_stride = pool.layer_num * layer_stride
-        v_offset = pool.layer_num * pool.size * pool.head_num * pool.head_dim * itemsize
+        v_offset = pool.layer_num * pool.size * pool.head_dim * itemsize
         base = pool.kv_buffer.data_ptr()
-        indices = torch.tensor([8, 9, 10, 11])  # page 2
-        ptrs, sizes = pool.get_layer_range_page_buffer_meta(indices, [(0, 2), (2, 6)])
+        ptrs, sizes = pool.cell_read_metas(
+            torch.tensor([8, 9, 10, 11]), ranges, heads, None
+        )
         k0 = base + 2 * page_stride
         self.assertEqual(
             ptrs,
@@ -793,35 +999,32 @@ class TestMhaLayerRangeBufferMeta(CustomTestCase):
             [2 * layer_stride, 2 * layer_stride, 4 * layer_stride, 4 * layer_stride],
         )
 
-    def test_rejects_wrong_layout(self):
-        import torch
-
-        with self.assertRaisesRegex(ValueError, "page_first_direct"):
-            self._stub_pool(layout="page_head").get_layer_range_page_buffer_meta(
-                torch.tensor([0, 1, 2, 3]), [(0, 2)]
-            )
+    def test_multi_head_cells_stage(self):
+        pool = self._pool(head_num=2)
+        self.assertFalse(pool.cells_all_direct([(0, 2)], [(0, 2)]))
 
     def test_rejects_split_kv_pools(self):
         import torch
 
-        pool = self._stub_pool()
-        # Asymmetric MHA pools hold a (k_buffer, v_buffer) tuple.
+        pool = self._pool(head_num=2)
         pool.kv_buffer = (pool.kv_buffer, pool.kv_buffer)
-        with self.assertRaisesRegex(NotImplementedError, "asymmetric"):
-            pool.get_layer_range_page_buffer_meta(torch.tensor([0, 1, 2, 3]), [(0, 2)])
+        with self.assertRaisesRegex(NotImplementedError, "split K/V"):
+            pool.gather_cells_canonical(
+                torch.tensor([0, 1, 2, 3]), [(0, 2)], [(0, 2)], None
+            )
 
 
 class TestCellAdapterGatherScatter(CustomTestCase):
     """The layout-neutrality property the cell adapter exists for: every
-    page-first-family layout gathers to byte-identical canonical cells
-    ((head, layer, token, dim) per K/V half), and scatter inverts gather."""
+    supported layout gathers byte-identical canonical cells ((head, layer,
+    token, dim) per K/V half), and the fetch + scatter path inverts them."""
 
     _PS, _HEADS, _LAYERS, _DIM, _PAGES = 4, 4, 6, 8, 2
 
     def _logical(self):
         import torch
 
-        # L[kv, head, layer, token, dim], distinct value per element, per page.
+        # L[kv, head, layer, token, dim] per page.
         torch.manual_seed(0)
         return [
             torch.randn(
@@ -848,7 +1051,20 @@ class TestCellAdapterGatherScatter(CustomTestCase):
         pool.layer_num = self._LAYERS
         pool.dtype = torch.bfloat16
         pool.size = self._PAGES * self._PS
-        if layout == "page_first":
+        if layout == "layer_first":
+            pool.kv_buffer = torch.zeros(
+                2,
+                self._LAYERS,
+                pool.size,
+                self._HEADS,
+                self._DIM,
+                dtype=pool.dtype,
+            )
+            for p, L in enumerate(logical):
+                pool.kv_buffer[:, :, p * self._PS : (p + 1) * self._PS] = L.permute(
+                    0, 2, 3, 1, 4
+                )
+        elif layout == "page_first":
             pool.kv_buffer = torch.zeros(
                 2,
                 pool.size,
@@ -887,65 +1103,80 @@ class TestCellAdapterGatherScatter(CustomTestCase):
                 pool.kv_buffer[:, p] = L.permute(0, 1, 3, 2, 4)
         return pool
 
+    _LAYOUTS = ("layer_first", "page_first", "page_first_direct", "page_head")
+
     def _grid(self):
         return [(0, 2), (2, 6)], [(0, 2), (2, 4)]  # layer ranges, head ranges
 
     def test_all_layouts_gather_identical_canonical_bytes(self):
+        import ctypes
+
         import torch
 
         logical = self._logical()
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
-        arenas = {}
-        for layout in ("layer_first", "page_first", "page_first_direct", "page_head"):
+        # Canonical bytes computed straight from the logical tensor:
+        # page-major, layer-range, head-range, K then V.
+        expected = b"".join(
+            bytes(L[kv, h0:h1, l0:l1].contiguous().view(torch.uint8).flatten().tolist())
+            for L in logical
+            for l0, l1 in layer_ranges
+            for h0, h1 in head_ranges
+            for kv in range(2)
+        )
+        for layout in self._LAYOUTS:
             pool = self._pool(layout, logical)
             arena = torch.zeros(
                 self._PAGES * pool.cell_bytes(layer_ranges, head_ranges),
                 dtype=torch.uint8,
             )
-            offsets, sizes = pool.gather_cells_canonical(
+            ptrs, sizes = pool.gather_cells_canonical(
                 indices, layer_ranges, head_ranges, arena
             )
-            self.assertEqual(sum(sizes), arena.numel())
-            arenas[layout] = arena
-        self.assertTrue(torch.equal(arenas["page_first"], arenas["page_first_direct"]))
-        self.assertTrue(torch.equal(arenas["page_first"], arenas["page_head"]))
-        # And the bytes equal the canonical order computed directly from the
-        # logical tensor: page-major, layer-range, head-range, K then V.
-        expected = []
-        for L in logical:
-            for l0, l1 in layer_ranges:
-                for h0, h1 in head_ranges:
-                    for kv in range(2):
-                        expected.append(
-                            L[kv, h0:h1, l0:l1].contiguous().view(torch.uint8).flatten()
-                        )
-        self.assertTrue(torch.equal(arenas["page_first"], torch.cat(expected)))
+            got = b"".join(
+                ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
+            )
+            self.assertEqual(got, expected, layout)
 
-    def test_scatter_inverts_gather_across_layouts(self):
+    def test_fetch_and_scatter_invert_gather_across_layouts(self):
+        import ctypes
+
         import torch
 
         logical = self._logical()
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
         writer = self._pool("page_head", logical)
-        arena = torch.zeros(
+        arena_w = torch.zeros(
             self._PAGES * writer.cell_bytes(layer_ranges, head_ranges),
             dtype=torch.uint8,
         )
-        writer.gather_cells_canonical(indices, layer_ranges, head_ranges, arena)
+        src_ptrs, src_sizes = writer.gather_cells_canonical(
+            indices, layer_ranges, head_ranges, arena_w
+        )
 
-        # Scatter into an EMPTY pool of a different layout; the covered
-        # rectangles must reproduce the writer's logical values.
-        reader = self._pool("layer_first", [torch.zeros_like(l) for l in logical])
-        reader.scatter_cells_canonical(indices, layer_ranges, head_ranges, arena)
-        for p, L in enumerate(logical):
-            got = reader._page_kv_view_canonical(p * self._PS)
-            for l0, l1 in layer_ranges:
-                for h0, h1 in head_ranges:
-                    self.assertTrue(
-                        torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
-                    )
+        # Emulate a fetch into an EMPTY pool of a different layout, then
+        # scatter; the covered rectangles must reproduce the writer's values.
+        for layout in ("layer_first", "page_first_direct"):
+            reader = self._pool(layout, [torch.zeros_like(l) for l in logical])
+            arena_r = torch.zeros_like(arena_w)
+            dst_ptrs, dst_sizes = reader.cell_read_metas(
+                indices, layer_ranges, head_ranges, arena_r
+            )
+            self.assertEqual(src_sizes, dst_sizes)
+            for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
+                ctypes.memmove(dst, src, size)
+            reader.scatter_cells_canonical(
+                indices, layer_ranges, head_ranges, arena_r, [True] * self._PAGES
+            )
+            for p, L in enumerate(logical):
+                got = reader._page_kv_view_canonical(p * self._PS)
+                for l0, l1 in layer_ranges:
+                    for h0, h1 in head_ranges:
+                        self.assertTrue(
+                            torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
+                        )
 
 
 if __name__ == "__main__":

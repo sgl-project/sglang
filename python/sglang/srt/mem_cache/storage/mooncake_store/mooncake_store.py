@@ -596,22 +596,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 and storage_config.canonical_suffix is not None
             ):
                 # canonical-grid key scheme: topology-free cell coordinates
-                # replace the rank/pp suffixes for both pool families. A list
-                # means fan-out — for MHA a list of head-group cells (same
-                # ascending-head order as the split-heads virtual-rank list
-                # it replaces), for rank-replicated pools a list of
-                # layer-range cells (page-major/range-minor order shared with
-                # get_layer_range_page_buffer_meta). CP and side pools are
-                # rejected upstream at attach.
+                # replace the rank/pp suffixes. A list means the cell adapter
+                # is active (one suffix per owned cell).
                 self.mha_suffix = storage_config.canonical_suffix
                 self.mla_suffix = storage_config.canonical_suffix
 
             self.registered_pools = {}
-            # Cell-adapter staging arenas; allocated in register_mem_pool_host
-            # when the config carries canonical_head_ranges. One arena per
-            # direction: backup (set) and prefetch (get) run on independent
-            # controller threads, and sharing one arena would race a gather
-            # against a concurrent RDMA get.
+            # Cell adapter state; set up in register_mem_pool_host. Two
+            # arenas because the backup and prefetch threads run
+            # concurrently; both stay None when every cell is
+            # pool-contiguous (pure zero-copy).
+            self.cell_adapter = False
             self.cell_arena_set = None
             self.cell_arena_get = None
             self.cell_arena_pages = 0
@@ -717,17 +712,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if (
             self.storage_config is not None
-            and self.storage_config.canonical_head_ranges is not None
+            and self.storage_config.canonical_layer_ranges is not None
         ):
-            # Cell-adapter namespaces: objects use the layout-neutral
-            # canonical byte order, gathered/scattered through this pinned,
-            # store-registered staging arena. Sized by extra-config
-            # cell_arena_mb (default 256), floored at one page's cells.
-            extra = self.storage_config.extra_config or {}
+            # Cell adapter: objects use the layout-neutral canonical byte
+            # order. Slabs already pool-contiguous transfer zero-copy; the
+            # rest stage through pinned, store-registered arenas (sized by
+            # extra-config cell_arena_mb, default 256, floored at one page).
+            self.cell_adapter = True
+            cfg = self.storage_config
+            if self.mem_pool_host.cells_all_direct(
+                cfg.canonical_layer_ranges, cfg.canonical_head_ranges
+            ):
+                logger.info(
+                    "HiCache cell adapter: all cells pool-contiguous, "
+                    "zero-copy (no staging arenas)."
+                )
+                return
+            extra = cfg.extra_config or {}
             arena_mb = extra.get("cell_arena_mb", 256)
             page_cell_bytes = self.mem_pool_host.cell_bytes(
-                self.storage_config.canonical_layer_ranges,
-                self.storage_config.canonical_head_ranges,
+                cfg.canonical_layer_ranges, cfg.canonical_head_ranges
             )
             arena_bytes = max(int(arena_mb) << 20, page_cell_bytes)
             self.cell_arena_pages = arena_bytes // page_cell_bytes
@@ -980,7 +984,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         # One cell per entry of the mha_suffix list (legacy split-heads
-        # virtual ranks or canonical head-group cells alike).
+        # virtual ranks).
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
                 indices, len(self.mha_suffix)
@@ -1030,39 +1034,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return key_list, ptr_list, element_size_list
 
-    def _get_mha_layer_ranges_buffer_meta(self, keys, indices):
-        # Canonical-grid layer fan-out (PP read-back) for MHA/GQA: per
-        # (page, canonical layer range) one K slab and one V slab; key and
-        # pointer lists are both page-major, range-minor, K then V.
-        ptr_list, element_size_list = (
-            self.mem_pool_host.get_layer_range_page_buffer_meta(
-                indices, self.storage_config.canonical_layer_ranges
-            )
-        )
-        key_list = []
-        for key_ in keys:
-            for suffix in self.mha_suffix:
-                key_list.append(f"{key_}_{suffix}_k")
-                key_list.append(f"{key_}_{suffix}_v")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
-
-    def _get_mla_layer_ranges_buffer_meta(self, keys, indices):
-        # Canonical-grid layer fan-out (PP read-back): one key and one
-        # contiguous slab per (page, canonical layer range); both sides are
-        # page-major, range-minor.
-        ptr_list, element_size_list = (
-            self.mem_pool_host.get_layer_range_page_buffer_meta(
-                indices, self.storage_config.canonical_layer_ranges
-            )
-        )
-        key_list = []
-        for key_ in keys:
-            for suffix in self.mla_suffix:
-                key_list.append(f"{key_}_{suffix}_k")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
-
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
@@ -1078,19 +1049,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.is_mla_backend:
-            if isinstance(self.mla_suffix, list):
-                return self._get_mla_layer_ranges_buffer_meta(keys, host_indices)
             return self._get_mla_buffer_meta(keys, host_indices)
-        else:
-            if isinstance(self.mha_suffix, list):
-                if (
-                    self.storage_config is not None
-                    and self.storage_config.canonical_layer_ranges is not None
-                ):
-                    return self._get_mha_layer_ranges_buffer_meta(keys, host_indices)
-                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
-            else:
-                return self._get_mha_buffer_meta(keys, host_indices)
+        if isinstance(self.mha_suffix, list):
+            # Legacy split-heads (rank-suffix tp_lcm_size); canonical cell
+            # fan-out goes through the adapter path instead.
+            return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+        return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(
         self, results: List[int], is_set_operate=False, key_multiplier=None
@@ -1126,9 +1090,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
 
     def _adapter_cell_keys(self, page_keys: List[str]) -> List[str]:
-        # Page-major, then the (layer-major, head-minor) suffix list, K then
-        # V per cell — the exact order of gather_cells_canonical's slabs.
+        # Page-major, then the suffix list (layer-major, head-minor); MHA
+        # splits each cell into K and V slabs — matching the pool adapter's
+        # slab order exactly.
         key_list = []
+        if self.is_mla_backend:
+            for key_ in page_keys:
+                for suffix in self.mla_suffix:
+                    key_list.append(f"{key_}_{suffix}_k")
+            return key_list
         for key_ in page_keys:
             for suffix in self.mha_suffix:
                 key_list.append(f"{key_}_{suffix}_k")
@@ -1136,29 +1106,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return key_list
 
     def _batch_set_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Cell-adapter write: gather canonical cells into the registered
-        arena per sub-batch, then zero-copy put from arena pointers."""
+        """Cell-adapter write: gather canonical cells (zero-copy where the
+        pool is already contiguous, staged through the arena otherwise) and
+        put per sub-batch."""
         start_time = time.perf_counter()
         cfg = self.storage_config
-        arena = self.cell_arena_set
-        arena_ptr = arena.data_ptr()
+        page_size = self.mem_pool_host.page_size
         results: List[bool] = []
-        pages_per_batch = self.cell_arena_pages
+        pages_per_batch = self.cell_arena_pages or len(keys)
         for start in range(0, len(keys), pages_per_batch):
             page_keys = keys[start : start + pages_per_batch]
             indices = host_indices[
-                start
-                * self.mem_pool_host.page_size : (start + len(page_keys))
-                * self.mem_pool_host.page_size
+                start * page_size : (start + len(page_keys)) * page_size
             ]
-            offsets, sizes = self.mem_pool_host.gather_cells_canonical(
+            ptrs, sizes = self.mem_pool_host.gather_cells_canonical(
                 indices,
                 cfg.canonical_layer_ranges,
                 cfg.canonical_head_ranges,
-                arena,
+                self.cell_arena_set,
             )
             key_strs = self._adapter_cell_keys(page_keys)
-            assert len(key_strs) == len(offsets)
+            assert len(key_strs) == len(ptrs)
             multiplier = len(key_strs) // len(page_keys)
             exist_result = self._batch_exist(key_strs)
             put_keys, put_ptrs, put_sizes, put_slots = [], [], [], []
@@ -1166,7 +1134,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i, key_str in enumerate(key_strs):
                 if exist_result[i] != 1:
                     put_keys.append(key_str)
-                    put_ptrs.append(arena_ptr + offsets[i])
+                    put_ptrs.append(ptrs[i])
                     put_sizes.append(sizes[i])
                     put_slots.append(i)
                 else:
@@ -1197,18 +1165,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return results
 
     def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Cell-adapter read: zero-copy get into the arena per sub-batch,
-        then scatter successful pages' canonical cells into the host pool."""
+        """Cell-adapter read: fetch each slab straight into the pool when it
+        is contiguous there, else into the arena; then scatter the staged
+        slabs of successful pages."""
         start_time = time.perf_counter()
         cfg = self.storage_config
-        arena = self.cell_arena_get
-        arena_ptr = arena.data_ptr()
         page_size = self.mem_pool_host.page_size
-        page_cell_bytes = self.mem_pool_host.cell_bytes(
-            cfg.canonical_layer_ranges, cfg.canonical_head_ranges
-        )
         results: List[bool] = []
-        pages_per_batch = self.cell_arena_pages
+        pages_per_batch = self.cell_arena_pages or len(keys)
         for start in range(0, len(keys), pages_per_batch):
             page_keys = keys[start : start + pages_per_batch]
             indices = host_indices[
@@ -1216,38 +1180,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ]
             key_strs = self._adapter_cell_keys(page_keys)
             multiplier = len(key_strs) // len(page_keys)
-            # Slab geometry is identical to the gather's (uniform per page).
-            offsets, sizes = [], []
-            cursor = 0
-            for _ in page_keys:
-                for l0, l1 in cfg.canonical_layer_ranges:
-                    for h0, h1 in cfg.canonical_head_ranges:
-                        slab = (
-                            (h1 - h0)
-                            * (l1 - l0)
-                            * page_size
-                            * self.mem_pool_host.head_dim
-                            * self.mem_pool_host.dtype.itemsize
-                        )
-                        for _kv in range(2):
-                            offsets.append(cursor)
-                            sizes.append(slab)
-                            cursor += slab
-            get_results = self._get_batch_zero_copy_impl(
-                key_strs, [arena_ptr + off for off in offsets], sizes
+            ptrs, sizes = self.mem_pool_host.cell_read_metas(
+                indices,
+                cfg.canonical_layer_ranges,
+                cfg.canonical_head_ranges,
+                self.cell_arena_get,
             )
+            assert len(key_strs) == len(ptrs)
+            get_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
             page_ok = self._batch_postprocess(
                 get_results, is_set_operate=False, key_multiplier=multiplier
             )
-            # Scatter only fully-fetched pages; consecutive-prefix semantics
-            # upstream stop at the first failure anyway.
-            ok_positions = [i for i, ok in enumerate(page_ok) if ok]
-            for i in ok_positions:
+            if self.cell_arena_get is not None and any(page_ok):
                 self.mem_pool_host.scatter_cells_canonical(
-                    indices[i * page_size : (i + 1) * page_size],
+                    indices,
                     cfg.canonical_layer_ranges,
                     cfg.canonical_head_ranges,
-                    arena[i * page_cell_bytes : (i + 1) * page_cell_bytes],
+                    self.cell_arena_get,
+                    page_ok,
                 )
             results.extend(page_ok)
         if self.enable_storage_metrics:
@@ -1270,7 +1220,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.cell_arena_get is not None:
+        if self.cell_adapter:
             return self._batch_get_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -1302,7 +1252,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.cell_arena_set is not None:
+        if self.cell_adapter:
             return self._batch_set_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)

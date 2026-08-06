@@ -26,36 +26,23 @@ whose shard tiles the namespace grid derives identical keys for identical
 data, which makes cross-topology reuse a pure key-selection problem. Design:
 ``DESIGN_l3_canonical_shard_grid.md``.
 
-Scope (enforced in :func:`build_canonical_cell_suffixes`): the layer
-coordinate is the rank's absolute layer range — any pipeline partition works,
-uneven stages included (61-layer models at any pp_size); partitions that
-differ simply derive disjoint keys and miss instead of colliding. On the head
-axis a rank owns ``local_kv_heads // head_group`` cells per page (head
-fan-out): fleets agree on the head grid via the ``head_group`` extra-config
-knob (heads per cell — e.g. ``total_kv_heads / lcm`` of the fleet's TP
-sizes). The multi-key read/write transport
-(``get_split_heads_page_buffer_meta``, mooncake list-suffix fan-out) is
-shared with, but not coupled to, the legacy split-heads mechanism. Rank-replicated pools (MLA-family) have no head axis,
-so cross-TP-size reuse needs no head-grid agreement at all. Layer
-fan-out applies to both families (MLA single-slab cells; MHA/GQA K+V slab
-pairs) under the page_first_direct layout. Combining head and layer fan-out
-switches the namespace to the **cell adapter**: objects carry a
-layout-neutral canonical byte order ((head, layer, token, dim) per K/V
-half — the page_head_layer_direct order, so a future zero-copy layout is
-byte-compatible), gathered/scattered through a registered staging arena;
-``object_layout`` is then the constant ``cell-v1`` and members may run any
-page-first-family host layout.
+Without partition knobs, a rank owns one cell per page (its absolute layer
+range, its head shard) and objects keep the raw pool-layout bytes. Setting
+``head_group`` (heads per cell) and/or ``layer_partition`` (layers per cell)
+in the extra config switches the namespace to the **cell adapter**
+(:func:`plan_canonical_cells`): a rank owns the (layer window x head group)
+cross product of cells, and every object carries a layout-neutral canonical
+byte order — (head, layer, token, dim) per K/V half — regardless of the host
+pool layout (``object_layout`` becomes the constant ``cell-v1``). The pool
+adapters convert on the fly and skip the copy for slabs that are already
+canonical-contiguous (e.g. MLA on page_first_direct stays zero-copy).
 
-The namespace is derived from deployment facts (model, logical KV dtype,
-page size, head grid) and its digest prefixes every key: deployments share
-objects iff every identity field matches, so configuration differences
-partition into disjoint keyspaces instead of colliding (fail-safe, and
-observable via the digest logged at attach). Notably the *logical* dtype is
-an identity field — fp8_e4m3 and fp8_e5m2 caches never share a keyspace even
-though both store as uint8. :func:`load_namespace_descriptor` is the
-out-of-band fleet-descriptor API (a JSON file shared by deployments that
-must agree on a head grid finer than their own shards); it becomes reachable
-from the CLI together with head fan-out.
+The namespace digest prefixes every key: deployments share objects iff every
+identity field matches, so configuration differences partition into disjoint
+keyspaces instead of colliding. Notably the *logical* dtype is an identity
+field — fp8_e4m3 and fp8_e5m2 never share a keyspace even though both store
+as uint8. :func:`load_namespace_descriptor` is the out-of-band descriptor
+API, kept for richer future identities (numerics_id pinning).
 """
 
 from __future__ import annotations
@@ -361,3 +348,129 @@ def _check_identity(
 def normalize_dtype(dtype: object) -> str:
     """``torch.bfloat16`` -> ``"bfloat16"`` (descriptor-file friendly)."""
     return str(dtype).removeprefix("torch.")
+
+
+class CanonicalCellPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """Everything the storage layer needs for one rank's canonical cells."""
+
+    namespace: KVCacheNamespace
+    # One suffix per owned cell (layer-major, head-minor).
+    suffixes: list[str]
+    # True when any partition knob is set: objects then use the canonical
+    # byte order via the gather/scatter adapter (which skips the copy when
+    # the pool view already matches).
+    adapter: bool
+    # LOCAL half-open cell ranges for the adapter, or None without it.
+    layer_ranges: Optional[list[tuple[int, int]]] = None
+    head_ranges: Optional[list[tuple[int, int]]] = None
+
+
+# Host layouts the adapter can view canonically.
+ADAPTER_LAYOUTS = ("layer_first", "page_first", "page_first_direct", "page_head")
+
+
+def plan_canonical_cells(
+    *,
+    model_id: str,
+    dtype: str,
+    page_size: int,
+    rank_replicated: bool,
+    local_kv_heads: int,
+    attn_tp_rank: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+    start_layer: int,
+    end_layer: int,
+    is_final_stage: bool,
+    pool_layout: str,
+    head_group_knob: Optional[int] = None,
+    layer_partition: Optional[int] = None,
+) -> CanonicalCellPlan:
+    """Derive the namespace and this rank's cell plan from deployment facts.
+
+    Any partition knob switches the namespace to adapter mode: objects carry
+    the layout-neutral canonical byte order (object_layout "cell-v1"), so
+    the pool layout never constrains which fleets can share.
+    """
+    adapter = layer_partition is not None or (
+        head_group_knob is not None and not rank_replicated
+    )
+    if adapter and pool_layout not in ADAPTER_LAYOUTS:
+        raise ValueError(
+            f"the cell adapter does not support the {pool_layout!r} host "
+            f"layout; use one of {ADAPTER_LAYOUTS}."
+        )
+
+    head_group = local_kv_heads
+    if head_group_knob is not None and not rank_replicated:
+        if head_group_knob <= 0:
+            raise ValueError(f"head_group must be positive: {head_group_knob}")
+        if local_kv_heads % head_group_knob != 0 or head_group_knob > local_kv_heads:
+            raise ValueError(
+                f"head_group={head_group_knob} must divide this rank's "
+                f"{local_kv_heads} kv heads."
+            )
+        head_group = head_group_knob
+    if (
+        not rank_replicated
+        and local_kv_heads == 1
+        and attn_tp_size > 1
+        and head_group_knob is None
+    ):
+        # 1 head/rank is ambiguous (could be kv-head replication); an
+        # explicit head_group is the operator's attestation of sharding.
+        raise NotImplementedError(
+            "canonical-grid cannot derive a namespace at 1 kv head per rank; "
+            "set head_group in the extra config, or use "
+            "--hicache-storage-key-scheme rank-suffix."
+        )
+
+    object_layout = "cell-v1" if adapter else pool_layout
+    namespace = derive_namespace(
+        model_id=model_id,
+        dtype=dtype,
+        page_size=page_size,
+        rank_replicated=rank_replicated,
+        total_kv_heads=local_kv_heads * attn_tp_size,
+        head_group=0 if rank_replicated else head_group,
+        object_layout=object_layout,
+        layer_group=layer_partition or 0,
+    )
+    suffixes = build_canonical_cell_suffixes(
+        namespace,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_size=attn_cp_size,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        local_kv_heads=local_kv_heads,
+        dtype=dtype,
+        page_size=page_size,
+        model_id=model_id,
+        rank_replicated=rank_replicated,
+        object_layout=object_layout,
+        is_final_stage=is_final_stage,
+    )
+
+    layer_ranges = None
+    head_ranges = None
+    if adapter:
+        lg = layer_partition or (end_layer - start_layer)
+        layer_ranges = [
+            (a - start_layer, min(a + lg, end_layer) - start_layer)
+            for a in range(start_layer, end_layer, lg)
+        ]
+        if not rank_replicated:
+            cells = local_kv_heads // head_group
+            head_ranges = [(i * head_group, (i + 1) * head_group) for i in range(cells)]
+            assert len(suffixes) == len(layer_ranges) * len(head_ranges)
+        else:
+            assert len(suffixes) == len(layer_ranges)
+
+    return CanonicalCellPlan(
+        namespace=namespace,
+        suffixes=list(suffixes),
+        adapter=adapter,
+        layer_ranges=layer_ranges,
+        head_ranges=head_ranges,
+    )
