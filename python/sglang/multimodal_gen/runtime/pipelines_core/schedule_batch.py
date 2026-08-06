@@ -206,6 +206,7 @@ class Req:
 
     # stage logging
     metrics: Optional[RequestMetrics] = None
+    usage: dict[str, Any] | None = None
 
     # tracing context (TraceReqContext or TraceNullContext)
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
@@ -466,6 +467,7 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+    usage: dict[str, Any] | None = None
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None
