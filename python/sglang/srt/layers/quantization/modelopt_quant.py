@@ -1330,7 +1330,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
       and checkpoint-provided scales.
     - Serialized + per-token FP32 activation scales: set
       `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1`; use
-      `flashinfer_trtllm` or `flashinfer_trtllm_routed`.
+      `flashinfer_trtllm`, `flashinfer_trtllm_routed`, or `flashinfer_cutedsl`
+      v2 with no A2A or FlashInfer A2A.
     - BF16/FP16/FP8 MoE + per-tensor FP32 activation scales: quantize expert
       weights on load, keep dense weights in source precision or FP8, and use
       1.0 when the checkpoint has no NVFP4 activation scale.
