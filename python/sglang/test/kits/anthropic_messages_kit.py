@@ -1,61 +1,29 @@
-"""
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_simple_messages
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_simple_messages_stream
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_multi_turn_messages
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_system_message_string
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_system_message_blocks
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_max_tokens
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_temperature
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_stop_sequences
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_error_invalid_max_tokens
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_error_empty_messages
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_non_streaming
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_streaming
-python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_tool_result_image_content_conversion
+"""Anthropic /v1/messages API test mixin.
+
+Host class must provide ``self.base_url`` (with or without a trailing /v1),
+``self.api_key``, and ``self.model``.
 """
 
 import json
-import unittest
 
 import anthropic
 import requests
 
 from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
-
-register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestAnthropicServer(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.messages_url = cls.base_url + "/v1/messages"
+class AnthropicMessagesMixin:
+    @property
+    def anthropic_base_url(self):
+        base = self.base_url
+        return base[: -len("/v1")] if base.endswith("/v1") else base
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+    @property
+    def messages_url(self):
+        return self.anthropic_base_url + "/v1/messages"
 
     def _make_request(self, payload, stream=False):
-        """Send a request to the /v1/messages endpoint."""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -233,7 +201,7 @@ class TestAnthropicServer(CustomTestCase):
         clients, e.g. Claude Code) must be accepted — not rejected with 400.
         Uses the Anthropic SDK the way a real client would."""
         client = anthropic.Anthropic(
-            base_url=self.base_url,
+            base_url=self.anthropic_base_url,
             auth_token=self.api_key,  # Bearer header — SGLang's --api-key checks Authorization
         )
         message = client.messages.create(
@@ -503,7 +471,7 @@ class TestAnthropicServer(CustomTestCase):
             ],
         }
         resp = requests.post(
-            self.base_url + "/v1/messages/count_tokens",
+            self.anthropic_base_url + "/v1/messages/count_tokens",
             headers=headers,
             json=payload,
         )
@@ -534,12 +502,12 @@ class TestAnthropicServer(CustomTestCase):
             "system": "You are a helpful assistant with a very long system prompt that adds tokens.",
         }
         resp1 = requests.post(
-            self.base_url + "/v1/messages/count_tokens",
+            self.anthropic_base_url + "/v1/messages/count_tokens",
             headers=headers,
             json=payload_no_system,
         )
         resp2 = requests.post(
-            self.base_url + "/v1/messages/count_tokens",
+            self.anthropic_base_url + "/v1/messages/count_tokens",
             headers=headers,
             json=payload_with_system,
         )
@@ -576,7 +544,3 @@ class TestAnthropicServer(CustomTestCase):
                     pass
 
         return events
-
-
-if __name__ == "__main__":
-    unittest.main()
