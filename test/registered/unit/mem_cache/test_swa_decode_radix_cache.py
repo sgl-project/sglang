@@ -558,7 +558,17 @@ class _SWADecodeRadixScenarios:
         cache, allocator, req_to_token_pool = self._build()
         tokens = self._seq(1)
         total = len(tokens)
-        swa_tail_len = self.sliding_window_size
+        # Mirror DecodePreallocQueue._swa_tail_len: the window is page-aligned
+        # *downwards*, so the tail is the window rounded out to the page it
+        # starts in -- equal to the window only when window % page_size == 0.
+        # Passing the raw window instead would hand the allocator a length it
+        # then rounds up on its own (num_swa_pages = ceil(tail / page_size)),
+        # and the debit would no longer equal what was asked for.
+        window_start = ((total - self.sliding_window_size) // self.page_size) * (
+            self.page_size
+        )
+        swa_tail_len = total - window_start
+        self.assertEqual(swa_tail_len % self.page_size, 0)
         self.assertLess(swa_tail_len, total)
 
         full_before = allocator.full_available_size()
@@ -682,6 +692,24 @@ class TestSWADecodeRadixLargePage(_SWADecodeRadixScenarios, CustomTestCase):
 class TestSWADecodeRadixProductionPage(_SWADecodeRadixScenarios, CustomTestCase):
     page_size = 256
     sliding_window_size = 256
+    kv_size = 8192
+    max_context_len = 8192
+
+
+class TestSWADecodeRadixWindowSmallerThanPage(_SWADecodeRadixScenarios, CustomTestCase):
+    """The geometry DeepSeek-V4-Pro actually serves: window 128 < page 256.
+
+    Every other parameterization has ``sliding_window_size >= page_size``, which
+    hides a whole regime of ``_swa_tail_len``: page-aligning ``seq_len - window``
+    downwards lands at a different distance from ``seq_len`` once the window is
+    shorter than a page, so the tail spans window..window+page rather than
+    page..2*page. That length is the threshold in ``_takes_swa_tail_path``, i.e.
+    it decides tail-only versus the full ``alloc_extend`` fallback -- so the
+    untested regime is the one where the decision boundary actually sits.
+    """
+
+    page_size = 256
+    sliding_window_size = 128
     kv_size = 8192
     max_context_len = 8192
 
