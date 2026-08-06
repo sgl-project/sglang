@@ -715,8 +715,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
-        # Initial budget says the request fits; post-lock budget says it does not.
-        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3])
+        # Initial budget says the request fits; post-lock budget says it does
+        # not. The third read is the post-release retry, which still rejects
+        # here -- this case is about the recheck happening, not about recovery.
+        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3, 3])
 
         preallocated, failed = queue.pop_preallocated()
 
@@ -729,7 +731,97 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 swa_uuid_for_lock=17, skip_lock_node_ids={ComponentType.SWA: {41}}
             ),
         )
-        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
+        self.assertEqual(queue._allocatable_token_budgets.call_count, 3)
+
+    def test_miss_retry_is_judged_against_the_budget_the_release_restored(self):
+        """The retry after dropping the prefix must re-read the pool.
+
+        `_release_prefix_lock` hands the matched pages back to the evictable
+        pool, and `_allocatable_token_budgets` counts evictable pages as
+        available. Reusing the budget captured while the prefix was still
+        locked therefore judges the miss against a pool that no longer exists,
+        and rejects a request that now fits -- which is exactly the head-of-line
+        block the retry was added to break, except now the queue stalls on the
+        retry instead of on the hit.
+
+        Budgets: the post-lock 3 rejects the hit, and the post-release read is
+        64 because the release returned the pages -- enough for the miss, which
+        needs `origin_input_len + max_new_tokens` = 24. Reaching `_pre_alloc` is
+        the observable: with the stale 3 the loop breaks instead.
+        """
+
+        class _Admitted(Exception):
+            """Raised from the `_pre_alloc` stub to mark the admission point."""
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+
+        req = MagicMock()
+        req.rid = "req-1"
+        req.origin_input_ids = list(range(8))
+        req.output_ids = [99]
+        req.last_node = object()
+        req.finished_reason = None
+        req.cache_protected_len = 0
+        req.sampling_params.max_new_tokens = 16
+        req.swa_uuid_for_lock = 17
+        req.skip_lock_node_ids = {ComponentType.SWA: {41}}
+
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.waiting_for_input = True
+        decode_req.is_rebootstrap = False
+
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._match_prefix_and_lock = MagicMock(
+            return_value=DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=req.last_node,
+            )
+        )
+        queue._pre_alloc = MagicMock(side_effect=_Admitted)
+        queue.transfer_queue = MagicMock(queue=[], enable_staging=False)
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.dec_lock_ref = MagicMock()
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        queue.token_to_kv_pool = MagicMock()
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue.token_to_kv_pool_allocator.page_size = 4
+
+        running_batch = MagicMock()
+        running_batch.reqs = []
+        server_args = MagicMock()
+        server_args.disaggregation_decode_enable_radix_cache = True
+        scheduler = MagicMock()
+        scheduler.running_batch = running_batch
+        scheduler.server_args = server_args
+        scheduler.enable_hisparse = False
+        scheduler.enable_decode_hicache = False
+        scheduler.waiting_queue = []
+        scheduler.last_batch = None
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3, 64])
+
+        with self.assertRaises(_Admitted):
+            queue.pop_preallocated()
+
+        # The prefix was dropped before the retry, and the retry read the pool
+        # again rather than reusing the locked-pool number.
+        queue.tree_cache.dec_lock_ref.assert_called_once()
+        self.assertEqual(queue._allocatable_token_budgets.call_count, 3)
+        self.assertEqual(queue._pre_alloc.call_args.args[2], 0)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

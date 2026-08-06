@@ -1199,16 +1199,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 **budget_kwargs
             )
             if not fits and prefix_len > 0:
-                # A radix hit costs MORE SWA than a miss: `_pre_alloc` only takes
-                # the tail-only path from an empty prefix. Breaking here would
-                # head-of-line-block the whole queue on a request a miss would
-                # have admitted -- forever, since the next poll re-derives the
-                # same hit. Drop the prefix and retry this request as a miss.
+                # A hit can still cost more than a miss: the tail-only path needs
+                # the window to fit inside the delta it allocates, so a prefix
+                # long enough to push the window back into reused pages falls
+                # back to `alloc_extend` and is charged the whole delta. Breaking
+                # here would head-of-line-block the whole queue on a request a
+                # miss would have admitted -- forever, since the next poll
+                # re-derives the same hit. Drop the prefix and retry as a miss.
                 self._release_prefix_lock(decode_req.req)
                 prefix_match = None
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
+                # Releasing the lock hands those pages back to the evictable
+                # pool, which `_allocatable_token_budgets` counts as available.
+                # Re-reading is not an optimization: judging the miss against the
+                # budget captured while the prefix was still locked can reject a
+                # request that now fits, which is the very head-of-line block
+                # this branch exists to break. Only the FULL budget moves --
+                # `_swa_tail_allocatable_token_budget` reads `swa_available_size`,
+                # which counts allocated pages regardless of lock state.
+                budget_kwargs["full_allocatable_tokens"] = (
+                    self._allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
+                        hicache_reserved_tokens=reserved_restore_tokens,
+                    )
+                )
                 fits, required_alloc_tokens = self._admission_fits(
                     decode_req.req,
                     prefix_len=0,
