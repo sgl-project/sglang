@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from copy import deepcopy
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -10,7 +9,6 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -22,13 +20,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
+# earlier, at arg resolution (speculative_hook.py) -- its draft path needs
+# per-layer DFlash attention -- so it never reaches this gate with it.
 _SUPPORTED_DRAFT_BACKENDS = (
     "flashinfer",
     "fa3",
     "fa4",
     "triton",
-    "trtllm_mha",
     "ascend",
+    "trtllm_mha",
 )
 
 
@@ -40,11 +41,11 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 
 
 def _resolve_draft_attention_backend_fallback(
-    *, draft_server_args: ServerArgs, algo_label: str
+    *, server_args: ServerArgs, algo_label: str
 ) -> str:
-    draft_backend = draft_server_args.speculative_draft_attention_backend
+    draft_backend = server_args.speculative_draft_attention_backend
     if draft_backend is None:
-        draft_backend, _ = draft_server_args.get_attention_backends()
+        draft_backend, _ = server_args.get_attention_backends()
     if draft_backend is None:
         return "triton" if torch.version.hip else "flashinfer"
     if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
@@ -71,43 +72,24 @@ def build_draft_tp_worker(
     algo_label: str,
     attention_backend_override: Optional[str] = None,
 ) -> DraftWorkerBundle:
-    draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
     # supported-backend fallback below.
     draft_backend = attention_backend_override or (
         _resolve_draft_attention_backend_fallback(
-            draft_server_args=draft_server_args, algo_label=algo_label
+            server_args=server_args, algo_label=algo_label
         )
     )
-    # Post-resolution ServerArgs rejects bare assignment; route the draft-copy
-    # adjustments through the audited mutation point. Keep the resolved value
-    # on speculative_draft_attention_backend: downstream draft-worker logic
-    # keys on that field (backend selection in _get_attention_backend and the
-    # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
-    # would silently skip those paths. context_length keeps the draft aligned
-    # with the target.
-    draft_server_args.override(
-        "draft_worker.build",
-        skip_tokenizer_init=True,
-        speculative_draft_attention_backend=draft_backend,
-        prefill_attention_backend=None,
-        decode_attention_backend=None,
-        attention_backend=draft_backend,
+    draft_worker = TpModelWorker(
+        server_args=server_args,
+        gpu_id=gpu_id,
+        ps=ps,
+        nccl_port=nccl_port,
+        is_draft_worker=True,
+        # The draft runs at absolute target positions.
         context_length=target_model_config.context_len,
+        draft_attention_backend=draft_backend,
     )
-
-    saved_server_args = get_server_args()
-    try:
-        draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            ps=ps,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-        )
-    finally:
-        get_context().set_server_args(saved_server_args)
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner

@@ -20,9 +20,10 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class _StreamFixture:
-    def __init__(self, serving, request):
+    def __init__(self, serving, request, *, require_reasoning=False):
         self.serving = serving
         self.request = request
+        self.require_reasoning = require_reasoning
         self.request_metadata = RequestResponseMetadata(request_id=request.request_id)
 
     def run(self, chunks):
@@ -39,6 +40,7 @@ class _StreamFixture:
                     model_name="x",
                     tokenizer=Mock(),
                     request_metadata=self.request_metadata,
+                    require_reasoning=self.require_reasoning,
                 )
             )
 
@@ -60,6 +62,20 @@ def _engine_chunk(text, completion_tokens, *, finish=False):
 
 
 class NonHarmonyStreamTestCase(unittest.TestCase):
+    def test_reasoning_parser_uses_processed_reasoning_state(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            parser_cls.return_value.parse_stream_chunk.return_value = (None, "done")
+            fixture = _StreamFixture(serving, request, require_reasoning=True)
+            fixture.run([_engine_chunk("done", 1, finish=True)])
+
+        self.assertTrue(parser_cls.call_args.kwargs["force_reasoning"])
+
     def test_emits_typed_sse_events_in_order(self):
         serving = make_serving()
         serving.reasoning_parser = None

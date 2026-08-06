@@ -398,6 +398,9 @@ def build_warmup_reqs(
                 req.suppress_logs = True
                 req.metrics.suppress_stage_breakdown = True
                 req.extra["server_internal_prewarm"] = True
+            req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+                req, server_args
+            )
             if return_warmup_result:
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:

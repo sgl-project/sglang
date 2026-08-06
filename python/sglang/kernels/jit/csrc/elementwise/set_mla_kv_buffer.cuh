@@ -27,6 +27,7 @@
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <cuda/ptx>
 #include <dlpack/dlpack.h>
@@ -46,40 +47,6 @@ struct SetMlaKVBufferParams {
   int64_t stride_buffer_bytes;
   uint32_t batch_size;
 };
-
-// Warp-cooperative gmem -> smem copy. Picks the widest vec width that divides
-// both the per-thread share and the byte total. Caller guarantees src is
-// 16-byte aligned (PyTorch tensors are) and dst is the start of a per-warp
-// smem slot (also 16-byte aligned by ``alignas(16)``).
-template <int64_t kBytes>
-SGL_DEVICE void warp_g2s_copy(const void* __restrict__ src, void* __restrict__ dst) {
-  using namespace device;
-  constexpr int64_t kAlignment = (kBytes % (16 * kWarpThreads) == 0)  ? 16
-                                 : (kBytes % (8 * kWarpThreads) == 0) ? 8
-                                 : (kBytes % (4 * kWarpThreads) == 0) ? 4
-                                 : (kBytes % 4 == 0)                  ? 4
-                                                                      : 0;
-  static_assert(kAlignment > 0, "kBytes must be a multiple of 4");
-
-  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
-  constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
-  constexpr auto kLoopCount = kBytes / kLoopBytes;
-  constexpr int64_t kTailVecs = (kBytes - kLoopCount * kLoopBytes) / sizeof(vec_t);
-
-  const auto gmem = tile::Memory<vec_t>::warp();
-
-#pragma unroll
-  for (int64_t i = 0; i < kLoopCount; ++i) {
-    const auto v = gmem.load(src, i);
-    gmem.store(dst, v, i);
-  }
-  if constexpr (kTailVecs > 0) {
-    if (gmem.in_bound(kLoopCount * kWarpThreads + kTailVecs, kLoopCount)) {
-      const auto v = gmem.load(src, kLoopCount);
-      gmem.store(dst, v, kLoopCount);
-    }
-  }
-}
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, int kNumWarps, bool kUsePDL, typename TLoc>
 __global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferParams params) {
@@ -104,8 +71,8 @@ __global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferP
   void* const gmem_dst = pointer::offset(params.kv_buffer, loc * params.stride_buffer_bytes);
 
   // Warp-cooperative load (nope, rope) into the per-warp smem slot.
-  warp_g2s_copy<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
-  warp_g2s_copy<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
+  warp::copy_bytes<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
+  warp::copy_bytes<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
 
   // Fence required: TMA reads smem via the async proxy, normal sts writes
   // through the generic proxy. Without this the TMA engine can observe stale

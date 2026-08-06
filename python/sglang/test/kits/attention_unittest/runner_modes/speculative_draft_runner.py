@@ -295,7 +295,6 @@ def _configure_runner_for_eagle_draft(
     *,
     speculative_attention_mode: str = "decode",
 ) -> None:
-    server_args = runner.server_args
     updates = {
         "attention_backend": case.backend,
         "cuda_graph_config": CudaGraphConfig(
@@ -326,7 +325,12 @@ def _configure_runner_for_eagle_draft(
         "torch_compile_max_bs": 0,
         "use_mla_backend": runner.use_mla_backend,
     }
-    server_args.override(source="attention-unittest-eagle-draft", **updates)
+    from sglang.srt.runtime_context import get_context
+
+    runner.server_args = runner.server_args.derive(
+        "attention-unittest-eagle-draft", **updates
+    )
+    get_context().set_server_args(runner.server_args)
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
@@ -387,9 +391,12 @@ def _build_frozen_kv_mtp_fixture(
         runner_batch_size=settings.capture_batch_size,
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
-    fixture.runner.server_args.override(
+    from sglang.srt.runtime_context import get_context
+
+    fixture.runner.server_args = fixture.runner.server_args.derive(
         "attention_unittest.frozen_kv_draft", speculative_algorithm="FROZEN_KV_MTP"
     )
+    get_context().set_server_args(fixture.runner.server_args)
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend

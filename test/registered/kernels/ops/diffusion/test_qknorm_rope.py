@@ -122,7 +122,7 @@ def test_qknorm_rope(
         if is_neox:
             elems_per_thread = head_dim // 32
             rotary_lanes = rope_dim // elems_per_thread
-            if rotary_lanes < 2 or rotary_lanes & (rotary_lanes - 1):
+            if rotary_lanes < 2 or rotary_lanes % 2:
                 continue
 
         q = torch.randn(batch_size, num_heads, head_dim, device=DEVICE, dtype=DTYPE)
@@ -148,6 +148,61 @@ def test_qknorm_rope(
         # which differs from the fused path by about one BF16 rounding step on H200.
         triton.testing.assert_close(q_ref, q_fused, atol=ATOL, rtol=RTOL)
         triton.testing.assert_close(k_ref, k_fused, atol=ATOL, rtol=RTOL)
+
+
+def test_qknorm_rope_preserves_split_bf16_rounding() -> None:
+    from sgl_kernel import rotary_embedding
+
+    from sglang.kernels.ops.diffusion.qknorm_rope import (
+        fused_inplace_qknorm_rope,
+    )
+    from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+
+    num_tokens, num_heads, head_dim, rope_dim = 257, 28, 128, 96
+    inner_dim = num_heads * head_dim
+    qkv = torch.randn(
+        num_tokens,
+        3 * inner_dim,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.arange(num_tokens, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, num_tokens).to(DTYPE)
+
+    qkv_ref, qkv_fused = qkv.clone(), qkv.clone()
+    q_ref, k_ref, _ = qkv_ref.split(inner_dim, dim=-1)
+    q_fused, k_fused, _ = qkv_fused.split(inner_dim, dim=-1)
+    q_ref = q_ref.view(num_tokens, num_heads, head_dim)
+    k_ref = k_ref.view(num_tokens, num_heads, head_dim)
+    q_fused = q_fused.view(num_tokens, num_heads, head_dim)
+    k_fused = k_fused.view(num_tokens, num_heads, head_dim)
+
+    fused_inplace_qknorm(q_ref, k_ref, q_weight, k_weight, eps=1e-5)
+    rotary_embedding(
+        positions,
+        q_ref.view(num_tokens, -1),
+        k_ref.view(num_tokens, -1),
+        head_dim,
+        cos_sin_cache,
+        True,
+    )
+    fused_inplace_qknorm_rope(
+        q_fused,
+        k_fused,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox=True,
+        eps=1e-5,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+    )
+
+    assert torch.equal(q_ref, q_fused)
+    assert torch.equal(k_ref, k_fused)
 
 
 if __name__ == "__main__":

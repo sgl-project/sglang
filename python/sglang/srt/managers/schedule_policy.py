@@ -5,6 +5,7 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -37,7 +38,11 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    split_cached_prefix_by_tier,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -56,7 +61,6 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -195,7 +199,7 @@ class SchedulePolicy:
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
-            and get_server_args().disaggregation_mode != "decode"
+            and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
@@ -483,6 +487,9 @@ class PrefillAdder:
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
+        self.log_device_hit_tokens = 0
+        self.log_host_hit_tokens = 0
+        self.log_storage_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -745,6 +752,8 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        host_hit_len: int = 0,
+        storage_hit_len: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -784,6 +793,15 @@ class PrefillAdder:
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
+        elif prefix_len > 0:
+            device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
+                prefix_len=prefix_len,
+                host_hit_len=host_hit_len,
+                storage_hit_len=storage_hit_len,
+            )
+            self.log_device_hit_tokens += device_hit
+            self.log_host_hit_tokens += host_hit
+            self.log_storage_hit_tokens += storage_hit
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -816,12 +834,17 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            host_hit_len=req.host_hit_length,
+            storage_hit_len=req.storage_hit_length,
         )
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # match locks this node's components, so clear any stale skip set
+        # carried from a previous scheduling of this req.
+        req.skip_lock_node_ids = {}
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -1206,6 +1229,8 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    host_hit_len=req.host_hit_length,
+                    storage_hit_len=req.storage_hit_length,
                 )
             else:
                 # Make sure at least one page is available
@@ -1247,6 +1272,8 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    host_hit_len=req.host_hit_length,
+                    storage_hit_len=req.storage_hit_length,
                 )
 
         return self.budget_state()

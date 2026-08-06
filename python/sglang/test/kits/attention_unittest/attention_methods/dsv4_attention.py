@@ -287,6 +287,9 @@ class TinyDSV4ModelConfig:
         self.hf_text_config = self.hf_config
         self.linear_attn_registry_result = None
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
 
 class MockDSV4ModelRunner:
     """Minimal runner exposing what `DeepseekV4AttnBackend.__init__` reads.
@@ -329,6 +332,11 @@ class MockDSV4ModelRunner:
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size

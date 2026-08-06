@@ -9,6 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
+        type: string
+        default: ''
       runner_config:
         required: true
         type: string
@@ -56,16 +60,20 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -94,16 +102,20 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -134,16 +146,20 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -174,16 +190,20 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: 20

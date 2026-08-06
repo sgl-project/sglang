@@ -165,6 +165,7 @@ async def get_models(request: Request):
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
+        "vae_decode_precision": server_args.pipeline_config.vae_decode_precision,
     }
 
     if model_info:

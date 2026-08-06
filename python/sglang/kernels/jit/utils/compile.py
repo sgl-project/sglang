@@ -169,10 +169,18 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+# JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
+# `os.lstat`, etc.) that Dynamo cannot trace. When a lazily-loaded kernel is
+# first reached from inside a `@torch.compile`d region, tracing into it produces
+# spurious "Dynamo does not know how to trace the builtin `posix.lstat`" graph
+# breaks. The load happens once and is memoized, so keep it out of the graph.
+@torch.compiler.disable
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
     cuda_files: List[str] | None = None,
+    external_cpp_files: List[str] | None = None,
+    external_cuda_files: List[str] | None = None,
     cpp_wrappers: List[Tuple[str, str]] | None = None,
     cuda_wrappers: List[Tuple[str, str]] | None = None,
     extra_cflags: List[str] | None = None,
@@ -195,6 +203,12 @@ def load_jit(
     :type cpp_files: List[str] | None
     :param cuda_files: A list of CUDA source files.
     :type cuda_files: List[str] | None
+    :param external_cpp_files: A list of caller-resolved C++ source paths outside
+                               the in-tree JIT source directory.
+    :type external_cpp_files: List[str] | None
+    :param external_cuda_files: A list of caller-resolved CUDA source paths outside
+                                the in-tree JIT source directory.
+    :type external_cuda_files: List[str] | None
     :param cpp_wrappers: A list of C++ wrappers, defining the export name and kernel name.
     :type cpp_wrappers: List[Tuple[str, str]] | None
     :param cuda_wrappers: A list of CUDA wrappers, defining the export name and kernel name.
@@ -222,13 +236,26 @@ def load_jit(
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
+    external_cpp_files = external_cpp_files or []
+    external_cuda_files = external_cuda_files or []
     extra_cflags = extra_cflags or []
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 
-    cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
-    cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
+    if torch.version.hip is not None:
+        extra_cuda_cflags = [
+            flag
+            for flag in extra_cuda_cflags
+            if flag not in ("--use_fast_math", "-use_fast_math")
+        ]
+
+    cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files] + [
+        str(pathlib.Path(f).resolve()) for f in external_cpp_files
+    ]
+    cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files] + [
+        str(pathlib.Path(f).resolve()) for f in external_cuda_files
+    ]
 
     for dep in set(extra_dependencies or []):
         if dep not in REGISTERED_DEPENDENCIES:

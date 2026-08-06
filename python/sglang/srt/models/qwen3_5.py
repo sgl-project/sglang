@@ -87,13 +87,14 @@ from sglang.srt.models.qwen2_moe import (
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import (
+    WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 
@@ -138,7 +139,7 @@ cached_get_processor = lru_cache(get_processor)
 def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
-    return get_server_args().disable_shared_experts_fusion
+    return get_exec().moe.disable_shared_experts_fusion
 
 
 if _is_cuda:
@@ -180,7 +181,7 @@ def _enable_qwen35_fused_ar_quant() -> bool:
         return False
     if get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", default="false"):
         return False
-    return bool(get_server_args().enable_aiter_allreduce_fusion)
+    return bool(get_exec().comm.enable_aiter_allreduce_fusion)
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -700,13 +701,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        linear_attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, layer_id, linear_attn_quant_config, alt_stream, prefix
+            config, layer_id, quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
@@ -886,19 +882,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
-
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=attn_quant_config,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -908,7 +898,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            quant_config=attn_quant_config,
+            quant_config=quant_config,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -922,6 +912,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
+            quant_config=quant_config,
         )
 
         # Dense MLP for non-MoE variant
@@ -1236,6 +1227,17 @@ ALL_DECODER_LAYER_TYPES = {
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
 
+# ModelOpt FP4 checkpoints bake the per-layer KV-cache scales under the HF
+# attention projections; in sglang they live on RadixAttention. Apply this to the
+# weight stream at the top of load_weights(), before ".self_attn" is stripped and
+# before the stacked qkv_proj matching would consume the name.
+QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".self_attn.k_proj.k_scale": ".attn.k_scale",
+        ".self_attn.v_proj.v_scale": ".attn.v_scale",
+    },
+)
+
 
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
@@ -1311,7 +1313,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # so the model still gets the #25885 multi-streaming path. ROCm-only.
         if (
             config.model_type == "qwen3_5_moe_text"
-            and not get_server_args().disable_shared_experts_fusion
+            and not get_exec().moe.disable_shared_experts_fusion
             and not can_fuse_shared_expert(config, quant_config)
         ):
             from sglang.srt.arg_groups.overrides import declare_load_time_override
@@ -1476,6 +1478,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1564,6 +1567,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1825,6 +1829,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1984,6 +1989,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2288,9 +2294,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
             }
         )
 

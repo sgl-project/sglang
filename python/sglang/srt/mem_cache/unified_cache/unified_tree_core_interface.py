@@ -102,13 +102,13 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components import (
+        CacheTransferPhase,
+        ComponentType,
+    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
         UnifiedTreeNode,
-    )
-    from sglang.srt.mem_cache.unified_cache_components import (
-        CacheTransferPhase,
-        ComponentType,
     )
 
 
@@ -166,8 +166,21 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
-        """Bump the reference count on a node's component locks."""
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash values owned by this node, excluding its ancestors."""
+        ...
+
+    @abstractmethod
+    def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
+        """The NodeId anchoring matches for the namespace."""
+        ...
+
+    @abstractmethod
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
+        """Bump the reference count on a node's component locks, leaving any
+        component in skip_lock_components evictable and recorded in the result."""
         ...
 
     @abstractmethod
@@ -182,7 +195,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def dec_swa_lock_only(
-        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+        self,
+        node_id: NodeId,
+        swa_uuid_for_lock: Optional[int],
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> DecSwaLockOnlyResult:
         """Decrease only the SWA (and lower-priority co-located) reference
         counts; the result carries the freed slots."""
@@ -337,6 +353,17 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
+        ...
+
+    @abstractmethod
+    def evict_excess_path_states(
+        self,
+        tail_node_id: NodeId,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Evict shallow Mamba device checkpoints beyond the per-path cap on the
+        tail's root path, collecting freed values into the caller's dicts."""
         ...
 
     # ==== HiCache ====

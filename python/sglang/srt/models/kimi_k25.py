@@ -8,6 +8,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import PytorchGELUTanh
 
+from sglang.kernels.ops.attention.vision_rope import (
+    PreparedInplaceComplexRoPE,
+    apply_fused_qk_complex_rope_inplace,
+    prepare_fused_qk_complex_rope_inplace,
+)
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.vision import (
@@ -33,31 +38,45 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import MLP2
+from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
+    concat_or_single,
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_server_args,
+)
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor | PreparedInplaceComplexRoPE,
+    x_shape=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: tensor of shape (..., head_dim/2), dtype=torch.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
+        freqs_cis: Complex frequencies for the portable path, or inputs
+            prepared once for the contiguous in-place CUDA kernel.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
+
+    if isinstance(freqs_cis, tuple):
+        return apply_fused_qk_complex_rope_inplace(xq, xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -66,36 +85,6 @@ def apply_rope(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
     return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def tpool_patch_merger(
-    x: torch.Tensor,
-    grid_thws: torch.Tensor,
-    merge_kernel_size: tuple[int, int] = (2, 2),
-) -> list[torch.Tensor]:
-    d_model = x.size(-1)
-
-    outputs = []
-    pre_sum = 0
-    for t, h, w in grid_thws.tolist():
-        # Get the current sequence
-        seq = x[pre_sum : pre_sum + t * h * w]
-        # Reshape along self.merge_kernel_size and concat to the last dimension
-        kernel_height, kernel_width = merge_kernel_size
-        new_height, new_width = h // kernel_height, w // kernel_width
-        reshaped_seq = seq.view(
-            t, new_height, kernel_height, new_width, kernel_width, d_model
-        )
-        reshaped_seq = (
-            reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
-        )  # temporal pooling
-        padded_seq = reshaped_seq.view(
-            new_height * new_width, kernel_height * kernel_width, -1
-        )
-        outputs.append(padded_seq)
-        pre_sum += t * h * w
-
-    return outputs
 
 
 class MoonViTEncoderLayer(nn.Module):
@@ -433,6 +422,9 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 class MoonViT3dEncoder(nn.Module):
+    # Class-level default so forward() stays usable on instances built with
+    # __new__ (unit tests skip __init__).
+    use_fused_rope = False
 
     def __init__(
         self,
@@ -451,6 +443,9 @@ class MoonViT3dEncoder(nn.Module):
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
+        )
+        self.use_fused_rope = (
+            _is_cuda and get_exec().deterministic.rl_on_policy_target is None
         )
         self.blocks = nn.ModuleList(
             [
@@ -472,8 +467,18 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
+        # The in-place kernel is a JIT template on the q/k dtype, and only
+        # fp16/bf16 are exercised by test_vision_rope_inplace. Leave other
+        # dtypes on the portable path rather than ship an untested one.
+        if self.use_fused_rope and hidden_states.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            rope_freqs_cis = prepare_fused_qk_complex_rope_inplace(rope_freqs_cis)
 
-        sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
+        sequence_lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
+        max_seqlen = int(sequence_lengths.max().item())
+        sequence_lengths = sequence_lengths.to(
             device=hidden_states.device, dtype=torch.int32
         )
         lengths = torch.cat(
@@ -483,14 +488,12 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        # FlashAttention needs a host integer.  Compute it once per MoonViT
-        # forward and pass it to every encoder block instead of synchronizing
-        # once per block inside the attention backend.
-        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=hidden_states.device
+            cu_seqlens,
+            device=hidden_states.device,
+            max_seqlen=max_seqlen,
         )
 
         for block in self.blocks:
@@ -625,18 +628,12 @@ class K2VLMultiModalProjector(nn.Module):
 
 @torch.inference_mode()
 def mm_projection_auto(
-    mm_projector: torch.nn.Module | None, vt_output: list[torch.Tensor]
-):
-    """Apply MM projector to vision tower outputs."""
-    if mm_projector is None:
-        return vt_output
-
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
-    proj_out = mm_projector(batched) if mm_projector else batched
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+    mm_projector: torch.nn.Module,
+    vt_output: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Project MoonViT's per-image outputs into one flattened (tokens, dim) feature."""
+    projected = mm_projector(concat_or_single(vt_output, dim=0))
+    return projected.reshape(-1, projected.shape[-1])
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
@@ -659,7 +656,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
             config.vision_config,
@@ -769,9 +766,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return image_features
 
         pixel_values = materialize_item_features(list(range(len(items))))
-        image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
-        proj_out = mm_projection_auto(self.mm_projector, image_embeds)
-        return torch.cat(proj_out, dim=0)
+        # grid_thws stays on the host: MoonViT3d only reads it as shape metadata
+        # (.tolist() in the pos-emb, RoPE and merger), so a device copy would
+        # buy one sync per read. Same contract the encoder-DP path relies on.
+        image_embeds = self.vision_tower(pixel_values, grid_thws)
+        return mm_projection_auto(self.mm_projector, image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

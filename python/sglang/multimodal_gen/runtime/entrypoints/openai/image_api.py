@@ -225,6 +225,8 @@ def _build_image_response_kwargs(
         )
 
     ret = add_common_data_to_response(ret, request_id=request_id, result=result)
+    if ret.get("usage") is not None:
+        ret["usage"]["image_count"] = len(save_file_path_list)
 
     return ret
 

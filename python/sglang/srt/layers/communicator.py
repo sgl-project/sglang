@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -72,7 +73,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -168,7 +169,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
-        and get_server_args().flashinfer_allreduce_fusion_backend is not None
+        and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
         # Symbolic size checks stay last: under Dynamo tracing they guard on
         # the dynamic token dim, so statically-off configs must short-circuit
@@ -189,7 +190,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
-        and get_server_args().enable_aiter_allreduce_fusion
+        and get_exec().comm.enable_aiter_allreduce_fusion
     )
 
 
@@ -268,7 +269,7 @@ class AttnTpContext:
     def init_context(self, q_lora_rank, is_dsa):
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
-            get_server_args().enable_attn_tp_input_scattered
+            get_parallel().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_dsa
@@ -277,9 +278,9 @@ class AttnTpContext:
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            and get_server_args().speculative_algorithm != "EAGLE3"
+            and get_spec().speculative_algorithm != "EAGLE3"
         )
-        if get_server_args().enable_attn_tp_input_scattered:
+        if get_parallel().enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:
                 logging.info(
                     "attn_tp_input_scattered is not enabled while other conditions are not met"
@@ -410,7 +411,7 @@ class LayerScatterModes:
             not context.is_layer_sparse
             and context.is_next_layer_sparse
             and enable_moe_dense_fully_dp()
-            and get_server_args().enable_two_batch_overlap
+            and get_exec().overlap.enable_two_batch_overlap
         )
 
     @classmethod
@@ -437,11 +438,11 @@ class LayerScatterModes:
 
 
 def enable_moe_dense_fully_dp():
-    return get_server_args().moe_dense_tp_size == 1
+    return get_parallel().moe_dense_tp_size == 1
 
 
 def enable_dwdp():
-    return get_server_args().dwdp_size > 1
+    return get_parallel().dwdp_size > 1
 
 
 class LayerCommunicator:
@@ -474,7 +475,7 @@ class LayerCommunicator:
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
-            get_server_args().speculative_algorithm
+            get_spec().speculative_algorithm
         )
 
     def _post_init_communicate(self):
@@ -506,7 +507,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
     ):
@@ -525,6 +526,8 @@ class LayerCommunicator:
             )
             if (
                 gathered_last_layer_output is residual
+                # An accumulator that copies on append already holds a snapshot.
+                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
                 and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()
@@ -843,7 +846,7 @@ class LayerCommunicator:
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
                     and get_moe_a2a_backend().is_none()
-                    and get_server_args().enable_aiter_allreduce_fusion
+                    and get_exec().comm.enable_aiter_allreduce_fusion
                 )
             )
             and (not self.is_last_layer)
@@ -1148,7 +1151,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not handled:
                 quantize_communications = (
                     not forward_batch.forward_mode.is_decode_or_idle()
-                    and get_server_args().enable_quant_communications
+                    and get_exec().comm.enable_quant_communications
                 )
                 if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(

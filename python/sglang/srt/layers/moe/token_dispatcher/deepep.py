@@ -38,12 +38,13 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
-    if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+    if _use_zbal:
         from zbal.zbal.deepep_adaptor import Config
         from zbal.zbal_buffer import Buffer
     else:
@@ -753,7 +754,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
-                **(dict(topk_weights=topk_weights) if _is_npu else dict()),
+                **(
+                    dict(topk_weights=topk_weights)
+                    if _is_npu and not _use_zbal
+                    else dict()
+                ),
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)

@@ -7,12 +7,16 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
 register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-gb300")
+
+# Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
+NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 110
 
 DEEPSEEK_V3_FP4_MODEL = "nvidia/DeepSeek-V3-0324-FP4"
 GLM52_NVFP4_MODEL = "nvidia/GLM-5.2-NVFP4"
@@ -42,6 +46,8 @@ class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--nccl-port",
+                str(NCCL_PORT_BASE),
                 "--moe-a2a-backend",
                 "flashinfer",
                 "--moe-runner-backend",
@@ -93,6 +99,8 @@ class TestFlashinferA2ACutedslStaticFP4(CustomTestCase):
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--nccl-port",
+                str(NCCL_PORT_BASE + 1),
                 "--moe-a2a-backend",
                 "flashinfer",
                 "--moe-runner-backend",
@@ -152,6 +160,8 @@ class TestFlashinferA2ATrtllmRoutedFP8(CustomTestCase):
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--nccl-port",
+                str(NCCL_PORT_BASE + 2),
                 "--moe-a2a-backend",
                 "flashinfer",
                 "--moe-runner-backend",

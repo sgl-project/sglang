@@ -1,6 +1,6 @@
-"""Diffusion-model kernels (group-norm+silu, residual-gate-add, qk-norm+rope).
+"""Registered diffusion-model kernels and their public wrappers.
 
-These are JIT CUDA kernels; the wrappers forward to ``sglang.kernels.ops.diffusion``.
+Implementations use the backend recorded by each kernel specification.
 """
 
 from __future__ import annotations
@@ -25,11 +25,11 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 register_kernel(
     KernelSpec(
         op="diffusion.apply_group_norm_silu",
-        backend=KernelBackend.JIT,
+        backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.diffusion.group_norm_silu:apply_group_norm_silu",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="fused GroupNorm + SiLU"),
-        description="Fused group-norm + SiLU (sglang.kernels.jit).",
+        description="Fused group-norm + SiLU (Triton).",
     )
 )
 register_kernel(
@@ -40,6 +40,18 @@ register_kernel(
         capabilities=_CUDA,
         format_signature=FormatSignature(description="residual + gate * update"),
         description="Fused residual gate-add (sglang.kernels.jit).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="diffusion.fused_linear_gelu_tanh",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.diffusion.fused_linear_gelu:fused_linear_gelu_tanh",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            description="linear + tanh-GELU via the cublasLt GELU epilogue"
+        ),
+        description="Fused up-proj GEMM + tanh-GELU (torch._addmm_activation).",
     )
 )
 register_kernel(
@@ -60,7 +72,7 @@ def apply_group_norm_silu(
     x: torch.Tensor, norm: nn.Module, activation: nn.Module
 ) -> torch.Tensor:
     """Fused GroupNorm + SiLU (falls back to eager when unsupported)."""
-    return get_kernel("diffusion.apply_group_norm_silu", KernelBackend.JIT)(
+    return get_kernel("diffusion.apply_group_norm_silu", KernelBackend.TRITON)(
         x, norm, activation
     )
 
@@ -114,6 +126,6 @@ register_kernel(
     KernelSpec(
         op="diffusion.sparse_linear_attn_fwd",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:get_block_map",
+        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:_attn_fwd",
     )
 )

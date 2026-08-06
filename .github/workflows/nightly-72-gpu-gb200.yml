@@ -132,7 +132,7 @@ jobs:
       image_tag: ${{ steps.build.outputs.image_tag }}
     steps:
       # Self-hosted runners retain the workspace across jobs. Prior `docker buildx`
-      # runs on this node leave root-owned build artifacts (e.g. sgl-kernel/build/)
+      # runs on this node leave root-owned build artifacts (e.g. python/sglang/kernels/aot/build/)
       # that actions/checkout cannot remove, causing EACCES on rmdir. Wipe them
       # via a throwaway root container before checkout recreates the workspace.
       - name: Clean workspace (remove root-owned files from prior runs)

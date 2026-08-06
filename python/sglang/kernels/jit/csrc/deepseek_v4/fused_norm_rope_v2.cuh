@@ -64,7 +64,7 @@ enum class ForwardMode : bool {
 // Each warp's 32 lanes cover the full 128-elem head_dim (kVecSize = 4 each).
 // Cache layout: 132 bytes/token (128 fp8 nope + 4 fp32 scale).
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, int32_t kPreshuffleSize = 0>
 INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -213,7 +213,19 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
     result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
     PDLTriggerSecondary<kUsePDL>();
-    result.store(value_ptr, lane_id);
+    if constexpr (kPreshuffleSize != 0) {
+      constexpr int32_t kTile = kPreshuffleSize;
+      const int32_t dim_base = lane_id * kVecSize;
+      const int32_t token_tile_id = offset / kTile;
+      const int32_t token_in_tile = offset % kTile;
+      const int32_t col_tile_id = dim_base / kTile;
+      const int32_t col_in_tile = dim_base % kTile;
+      const int32_t value_offset = token_tile_id * (kTile * static_cast<int32_t>(kHeadDim)) +
+                                   col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
+      result.store(page_ptr + value_offset, 0);
+    } else {
+      result.store(value_ptr, lane_id);
+    }
     // The single fp32 scale is identical across all lanes -- write from any lane.
     if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
   }
@@ -499,7 +511,14 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL, bool kBf16Store = false>
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    bool kUsePDL,
+    int32_t kPreshuffleSize = 0,
+    bool kBf16Store = false>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
@@ -516,7 +535,7 @@ struct FusedNormRopeKernel {
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
-      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL>;
+      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
     } else {
       return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
     }

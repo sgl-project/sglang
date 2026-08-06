@@ -35,33 +35,37 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
-# defaults instead of est_time. max_parallel = size (no throttle).
+# Single-shard sanity gate on the critical path; pinned rather than sized
+# from est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
-    "base-a-test-cpu": 8,
     "base-a-test-1-gpu-small": 1,
 }
 
-_REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
+# Every stage dispatches through one of these; CPU has its own because its
+# hosted-runner install shares no step with the self-hosted GPU stages.
+_REUSABLE_STAGE_USES = {
+    "./.github/workflows/_pr-test-stage.yml",
+    "./.github/workflows/_pr-test-stage-cpu.yml",
+}
 
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
-    is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
-    Inline base-a-test-cpu is skipped (uses `_BASE_A_OVERRIDES`)."""
+    is required in both reusable stage workflows -- KeyError surfaces missing."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
+    jobs = wf.get("jobs") or {}
     timeouts = {}
-    for job_id, job in (wf.get("jobs") or {}).items():
-        if not isinstance(job, dict) or job.get("uses") != _REUSABLE_STAGE_USES:
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict) or job.get("uses") not in _REUSABLE_STAGE_USES:
             continue
         with_ = job.get("with") or {}
         suite = with_.get("self_name", job_id)
         timeouts[suite] = int(with_["run_timeout_minutes"])
     if not timeouts:
         raise RuntimeError(
-            f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
-            f"in {pr_test_yml_path}. The reusable workflow path likely "
+            f"load_run_timeouts: no jobs matched uses in {_REUSABLE_STAGE_USES!r} "
+            f"in {pr_test_yml_path}. A reusable workflow path likely "
             "changed -- update _REUSABLE_STAGE_USES."
         )
     return timeouts
@@ -70,7 +74,10 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
 def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
     """Per-shard wall budget = 0.75 * stage timeout. 0.75 is the inverse
     of LPT's 4/3 worst-case approximation ratio, so the most imbalanced
-    LPT shard fills exactly the timeout."""
+    LPT shard fills exactly the timeout.
+
+    A stage's `run_timeout_minutes` therefore drives its fanout rather than
+    capping it: shrinking it buys more shards, not shorter ones."""
     return 0.75 * run_timeouts[suite] * 60
 
 
@@ -176,7 +183,13 @@ def compute_partitions(
                     f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
                 )
             size = max(1, ideal_size)
-            max_parallel = size if full_parallel else compute_max_parallel(size)
+            # The throttle rations scarce self-hosted GPU runners; hosted
+            # ubuntu-latest is elastic, so capping CPU shards only serializes
+            # them.
+            unthrottled = full_parallel or all(
+                t.backend == HWBackend.CPU for t in group
+            )
+            max_parallel = size if unthrottled else compute_max_parallel(size)
         result[suite] = {
             "size": size,
             "arr": list(range(size)),

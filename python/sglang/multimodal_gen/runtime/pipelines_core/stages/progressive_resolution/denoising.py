@@ -50,9 +50,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.upsample import (
     apply_upsample,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 
 logger = init_logger(__name__)
 
@@ -537,9 +539,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
         # ── Stage loop ────────────────────────────────────────────────────────
         # DenoisingStage.forward() wraps its denoising loop in torch.autocast;
         # we bypass that path, so we must apply the same context here.
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=ctx.target_dtype,
+        with precision_autocast_context(
+            ctx.target_dtype,
+            server_args.disable_autocast,
             enabled=ctx.autocast_enabled,
         ):
             for stage in range(1, num_stages + 1):

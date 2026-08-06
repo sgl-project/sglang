@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.arg_utils import A, Arg
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_flags,
     get_parallel,
+    get_schedule,
     get_server_args,
     reset_context,
 )
@@ -215,8 +216,10 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         self.assertIs(get_server_args(), sentinel)
         self.assertIs(get_context().server_args, sentinel)
 
-    def test_tokenizer_alias_is_same_function(self):
-        self.assertIs(
+    def test_tokenizer_alias_is_distinct_role_shim(self):
+        # Deliberately NOT an alias: the two legacy setters publish with
+        # different process roles (scheduler vs tokenizer).
+        self.assertIsNot(
             server_args_module.set_global_server_args_for_tokenizer,
             server_args_module.set_global_server_args_for_scheduler,
         )
@@ -296,12 +299,13 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
-        # raise under the strict harness; override() stays the entry point.
+        # raise, and a differing value lives on a derived variant.
         published = get_context().override_server_args(tp_size=2).install()
         with self.assertRaises(AttributeError):
             published.tp_size = 4
-        published.override(source="test", tp_size=4)
-        self.assertEqual(published.tp_size, 4)
+        variant = published.derive("test", tp_size=4)
+        self.assertEqual(variant.tp_size, 4)
+        self.assertEqual(published.tp_size, 2)
 
     def test_restore_resets_the_capture_seed(self):
         # install() seeds flags.capture from the published dummy; restore()
@@ -373,8 +377,10 @@ class TestFlagsTier(_IsolatedServerArgs):
 class _FakeResolvedArgs:
     """Publishable fixture with a resolvable whitelist (real flat leaves)."""
 
-    page_size: A[int | None, Arg(help="p", resolvable=True)] = None
-    sampling_backend: A[str | None, Arg(help="s", resolvable=True)] = None
+    page_size: A[int | None, Arg(help="p", resolvable=True), NS("schedule")] = None
+    sampling_backend: A[
+        str | None, Arg(help="s", resolvable=True), NS("exec.kernel")
+    ] = None
     _resolved_overrides: list = dataclasses.field(default_factory=list)
 
 
@@ -755,6 +761,33 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertEqual(probe(torch.zeros(())).item(), 28)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
+    def test_parallel_config_leaves_trace_under_torch_compile(self):
+        # Regression: parallel config leaves resolve through
+        # ``ParallelContext.__getattr__`` (the bag fallback), and gate helpers
+        # such as ``enable_moe_dense_fully_dp()`` read them inside compiled
+        # model forwards — the fallback body must stay dynamo-traceable
+        # (``object.__getattribute__`` graph-breaks). fullgraph=True turns any
+        # graph break back into a failure.
+        import torch
+
+        from sglang.srt.runtime_context import get_parallel
+
+        reset_context()
+        with get_context().override_server_args(moe_dense_tp_size=1, dwdp_size=4):
+
+            @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+            def probe(x):
+                par = get_parallel()
+                if par.enable_prefill_context_parallel:
+                    x = x + 1
+                if par.moe_dense_tp_size == 1:
+                    x = x + 2
+                if par.dwdp_size > 1:
+                    x = x + 4
+                return x
+
+            self.assertEqual(probe(torch.zeros(())).item(), 6)
+
     def test_graph_visible_flags_are_process_visible_across_threads(self):
         # Documented divergence from the contextvar-backed flags: plain slots
         # are process-global (the storage form these flags had before the
@@ -894,6 +927,23 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
 
+    def test_dp_reduce_scatterv_requires_single_rank_attention_dp_shards(self):
+        from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
+
+        reset_context()
+        with patch(
+            "sglang.srt.layers.moe.utils.is_dp_attention_enabled",
+            return_value=True,
+        ):
+            # The optimized path is valid when the collective group and the
+            # variable-split list have the same number of entries.
+            with get_parallel().override(tp_size=8, attn_dp_size=8, moe_ep_size=8):
+                self.assertTrue(should_use_dp_reduce_scatterv())
+
+            # Otherwise the standard all-reduce plus scatter path must be used.
+            with get_parallel().override(tp_size=8, attn_dp_size=2, moe_ep_size=2):
+                self.assertFalse(should_use_dp_reduce_scatterv())
+
 
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""
@@ -916,12 +966,15 @@ class TestPublishLifecycle(_IsolatedServerArgs):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
 
-    def test_declare_load_time_override_writes_through(self):
+    def test_declare_load_time_override_writes_the_bag(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
 
         args = self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)
+        # The declaration lands on the config bag; the pristine startup record
+        # (server_args) is untouched.
+        self.assertEqual(get_schedule().page_size, 64)
+        self.assertEqual(args.page_size, 1)
 
     def test_declare_load_time_override_validates_whitelist(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
@@ -933,16 +986,14 @@ class TestPublishLifecycle(_IsolatedServerArgs):
 
     def test_declare_load_time_override_records_provenance(self):
         from sglang.srt.arg_groups.overrides import declare_load_time_override
-        from sglang.srt.server_args import ServerArgs
 
-        class _Args(_FakeResolvedArgs):
-            override = ServerArgs.override
-
-        args = _Args(page_size=1)
-        get_context().set_server_args(args)
+        self._publish(page_size=1)
         declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(args.page_size, 64)
-        self.assertIn(("model.load_time", {"page_size": 64}), args._resolved_overrides)
+        self.assertEqual(get_schedule().page_size, 64)
+        self.assertIn(
+            ("model.load_time", {"page_size": 64}),
+            get_context().overrides_log(),
+        )
 
 
 if __name__ == "__main__":

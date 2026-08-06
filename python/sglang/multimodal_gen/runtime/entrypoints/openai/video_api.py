@@ -83,6 +83,120 @@ def _parse_form_extra_value(value: Any) -> Any:
         return value
 
 
+_MULTIPART_EXTRA_FORM_FIELDS = (
+    "use_duration_template",
+    "use_resolution_template",
+    "use_system_prompt",
+    "use_guardrails",
+    "guardrails",
+    "video_path",
+    "video_url",
+    "generate_sound",
+    "sound_duration",
+    "condition_frame_indexes",
+    "action_mode",
+    "domain_id",
+    "domain_name",
+    "raw_action_dim",
+    "action_fps",
+    "action",
+    "action_view_point",
+    "action_normalization",
+    "condition_frame_indexes_vision",
+    "condition_video_keep",
+)
+
+
+def _video_sampling_params_cls(server_args) -> type[SamplingParams]:
+    """Resolve the params type selected for the current server."""
+
+    sampling_params_cls = SamplingParams
+    if server_args.pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    if sampling_params_cls is SamplingParams:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            sampling_params_cls = model_info.sampling_param_cls
+    return sampling_params_cls
+
+
+def _multipart_extra_form_keys(
+    sampling_params_cls: type[SamplingParams],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *VideoGenerationsRequest.model_fields,
+                *_MULTIPART_EXTRA_FORM_FIELDS,
+                *sorted(sampling_params_cls.video_request_extra_fields()),
+            )
+        )
+    )
+
+
+def _filter_multipart_declared_fields(
+    extra_from_form: Dict[str, Any],
+    sampling_params_cls: type[SamplingParams],
+) -> Dict[str, Any]:
+    declared = set(_multipart_extra_form_keys(sampling_params_cls))
+    return {key: value for key, value in extra_from_form.items() if key in declared}
+
+
+def _merge_multipart_extra_form_fields(
+    raw_form: Any,
+    extra_from_form: Dict[str, Any],
+    sampling_params_cls: type[SamplingParams],
+) -> None:
+    for key in _multipart_extra_form_keys(sampling_params_cls):
+        if key in raw_form and key not in extra_from_form:
+            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+
+
+def _multipart_video_extras(
+    raw_form: Any,
+    *,
+    extra_body: Any,
+    extra_params: Any,
+    sampling_params_cls: type[SamplingParams],
+) -> Dict[str, Any]:
+    """Build and validate multipart extras once for request construction."""
+
+    extra_from_form: Dict[str, Any] = {}
+    if extra_body:
+        try:
+            extra_from_form = flatten_extra_params(json.loads(extra_body))
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_body is not valid JSON"
+            ) from exc
+    if extra_params:
+        try:
+            extra_from_form.update(
+                flatten_extra_params({"extra_params": json.loads(extra_params)})
+            )
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_params is not valid JSON"
+            ) from exc
+    _merge_multipart_extra_form_fields(
+        raw_form,
+        extra_from_form,
+        sampling_params_cls,
+    )
+    flatten_extra_params(extra_from_form)
+    return _filter_multipart_declared_fields(extra_from_form, sampling_params_cls)
+
+
 def _is_probably_video_source(source: Any) -> bool:
     content_type = (getattr(source, "content_type", "") or "").lower()
     if content_type.startswith("video/"):
@@ -224,45 +338,52 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
                 server_args.pipeline_config.action_stats_path
             )
 
-    return build_sampling_params(
-        request_id,
-        prompt=request.prompt,
-        num_outputs_per_prompt=max(1, min(int(num_outputs), 10)),
-        size=request.size,
-        width=request.width,
-        height=request.height,
-        num_frames=num_frames,
-        fps=fps,
-        image_path=image_path,
-        video_path=video_path,
-        output_file_name=request_id,
-        seed=request.seed,
-        generator_device=request.generator_device,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
-        guidance_scale_2=request.guidance_scale_2,
-        negative_prompt=request.negative_prompt,
-        max_sequence_length=request.max_sequence_length,
-        flow_shift=request.flow_shift,
-        use_duration_template=_extra_value(request, "use_duration_template"),
-        use_resolution_template=_extra_value(request, "use_resolution_template"),
-        use_system_prompt=_extra_value(request, "use_system_prompt"),
-        use_guardrails=_extra_value(request, "use_guardrails"),
-        enable_teacache=request.enable_teacache,
-        enable_frame_interpolation=request.enable_frame_interpolation,
-        frame_interpolation_exp=request.frame_interpolation_exp,
-        frame_interpolation_scale=request.frame_interpolation_scale,
-        frame_interpolation_model_path=request.frame_interpolation_model_path,
-        enable_upscaling=request.enable_upscaling,
-        upscaling_model_path=request.upscaling_model_path,
-        upscaling_scale=request.upscaling_scale,
-        output_path=request.output_path,
-        output_compression=request.output_compression,
-        output_quality=request.output_quality,
-        perf_dump_path=request.perf_dump_path,
-        diffusers_kwargs=request.diffusers_kwargs,
+    kwargs = {
+        "prompt": request.prompt,
+        "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
+        "size": request.size,
+        "width": request.width,
+        "height": request.height,
+        "num_frames": num_frames,
+        "fps": fps,
+        "image_path": image_path,
+        "video_path": video_path,
+        "output_file_name": request_id,
+        "seed": request.seed,
+        "generator_device": request.generator_device,
+        "num_inference_steps": request.num_inference_steps,
+        "guidance_scale": request.guidance_scale,
+        "guidance_scale_2": request.guidance_scale_2,
+        "true_cfg_scale": request.true_cfg_scale,
+        "negative_prompt": request.negative_prompt,
+        "max_sequence_length": request.max_sequence_length,
+        "flow_shift": request.flow_shift,
+        "use_duration_template": _extra_value(request, "use_duration_template"),
+        "use_resolution_template": _extra_value(request, "use_resolution_template"),
+        "use_system_prompt": _extra_value(request, "use_system_prompt"),
+        "use_guardrails": _extra_value(request, "use_guardrails"),
+        "enable_teacache": request.enable_teacache,
+        "enable_frame_interpolation": request.enable_frame_interpolation,
+        "frame_interpolation_exp": request.frame_interpolation_exp,
+        "frame_interpolation_scale": request.frame_interpolation_scale,
+        "frame_interpolation_model_path": request.frame_interpolation_model_path,
+        "enable_upscaling": request.enable_upscaling,
+        "upscaling_model_path": request.upscaling_model_path,
+        "upscaling_scale": request.upscaling_scale,
+        "output_path": request.output_path,
+        "output_compression": request.output_compression,
+        "output_quality": request.output_quality,
+        "perf_dump_path": request.perf_dump_path,
+        "profile": request.profile,
+        "num_profiled_timesteps": request.num_profiled_timesteps,
+        "profile_all_stages": request.profile_all_stages,
+        "diffusers_kwargs": request.diffusers_kwargs,
         **cosmos3_kwargs,
-    )
+    }
+
+    sampling_params_cls = _video_sampling_params_cls(server_args)
+    kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
+    return build_sampling_params(request_id, **kwargs)
 
 
 # extract metadata which http_server needs to know
@@ -311,6 +432,7 @@ async def _dispatch_job_async(
     job_id: str,
     batch: Req,
     *,
+    scheduler_batches: list[Req] | None = None,
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
 ) -> None:
@@ -318,9 +440,30 @@ async def _dispatch_job_async(
 
     try:
         save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
+            async_scheduler_client,
+            batch,
+            scheduler_batches=scheduler_batches,
         )
         save_file_path = save_file_path_list[0]
+        try:
+            final_media_fields = await asyncio.to_thread(
+                batch.sampling_params.validate_video_final_outputs,
+                save_file_path_list,
+                batch,
+            )
+        except Exception:
+            for output_path in save_file_path_list:
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning(
+                        "Failed to remove rejected video output %s",
+                        output_path,
+                        exc_info=True,
+                    )
+            raise
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
@@ -343,13 +486,32 @@ async def _dispatch_job_async(
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
         )
+        update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": str(e)},
+                "url": None,
+                "file_path": None,
+                "file_paths": None,
+                "num_outputs": None,
+            },
         )
     finally:
+        try:
+            await asyncio.to_thread(
+                batch.sampling_params.cleanup_video_request,
+                batch,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clean up model-owned video request resources",
+                exc_info=True,
+            )
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
 
@@ -376,6 +538,8 @@ async def create_video(
     generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
     guidance_scale: Optional[float] = Form(None),
+    guidance_scale_2: Optional[float] = Form(None),
+    true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
@@ -398,6 +562,22 @@ async def create_video(
 
     server_args = get_global_server_args()
     task_type = server_args.pipeline_config.task_type
+    is_multipart = "multipart/form-data" in content_type
+    raw_form: Any = None
+    extra_from_form: Dict[str, Any] = {}
+
+    # Parse model-specific multipart metadata before creating request-owned
+    # directories or saving uploads, so malformed JSON leaves no resources.
+    if is_multipart:
+        if not prompt:
+            raise HTTPException(status_code=400, detail="prompt is required")
+        raw_form = await request.form()
+        extra_from_form = _multipart_video_extras(
+            raw_form,
+            extra_body=extra_body,
+            extra_params=extra_params,
+            sampling_params_cls=_video_sampling_params_cls(server_args),
+        )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
     temp_dirs: list[str] = []
@@ -411,14 +591,11 @@ async def create_video(
     # Resolve output directory
     effective_output_path = server_args.output_path
     output_persistent = True
-    if "multipart/form-data" not in content_type:
+    if not is_multipart:
         # JSON body may carry a per-request output_path; checked after parsing below
         pass
 
-    if "multipart/form-data" in content_type:
-        if not prompt:
-            raise HTTPException(status_code=400, detail="prompt is required")
-
+    if is_multipart:
         video_input_path = None
         image_sources = merge_image_input_list(input_reference, reference_url)
         if video_reference is not None:
@@ -462,51 +639,9 @@ async def create_video(
                     status_code=400, detail=f"Failed to process image source: {str(e)}"
                 )
 
-        # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
-        extra_from_form: Dict[str, Any] = {}
-        if extra_body:
-            try:
-                extra_from_form = flatten_extra_params(json.loads(extra_body))
-            except Exception:
-                extra_from_form = {}
-        if extra_params:
-            try:
-                extra_from_form.update(
-                    flatten_extra_params({"extra_params": json.loads(extra_params)})
-                )
-            except Exception:
-                pass
-
         def form_value(name: str, value: Any) -> Any:
             selected = value if value is not None else extra_from_form.get(name)
             return _parse_form_extra_value(selected)
-
-        raw_form = await request.form()
-        for key in (
-            "use_duration_template",
-            "use_resolution_template",
-            "use_system_prompt",
-            "use_guardrails",
-            "guardrails",
-            "video_path",
-            "video_url",
-            "generate_sound",
-            "sound_duration",
-            "condition_frame_indexes",
-            "action_mode",
-            "domain_id",
-            "domain_name",
-            "raw_action_dim",
-            "action_fps",
-            "action",
-            "action_view_point",
-            "action_normalization",
-            "condition_frame_indexes_vision",
-            "condition_video_keep",
-        ):
-            if key in raw_form and key not in extra_from_form:
-                extra_from_form[key] = _parse_form_extra_value(raw_form[key])
-        flatten_extra_params(extra_from_form)
 
         request_field_names = set(VideoGenerationsRequest.model_fields)
         extra_request_fields = {
@@ -536,6 +671,8 @@ async def create_video(
             negative_prompt=form_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),
+            guidance_scale_2=form_value("guidance_scale_2", guidance_scale_2),
+            true_cfg_scale=form_value("true_cfg_scale", true_cfg_scale),
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
@@ -639,30 +776,59 @@ async def create_video(
     try:
         sampling_params = _build_video_sampling_params(request_id, req)
     except (ValueError, TypeError) as e:
+        for td in temp_dirs:
+            shutil.rmtree(td, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
 
-    job = _video_job_from_sampling(request_id, req, sampling_params)
-    await VIDEO_STORE.upsert(request_id, job)
+    batch: Req | None = None
+    scheduler_batches: list[Req] | None = None
+    try:
+        # Build Req for scheduler.
+        trace_headers = extract_trace_headers(request.headers)
+        batch = prepare_request(
+            server_args=server_args,
+            sampling_params=sampling_params,
+            external_trace_header=trace_headers,
+        )
+        # Add diffusers_kwargs if provided.
+        if req.diffusers_kwargs:
+            batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
+            if "max_sequence_length" in req.diffusers_kwargs:
+                batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
+            if "flow_shift" in req.diffusers_kwargs:
+                batch.flow_shift = req.diffusers_kwargs["flow_shift"]
+        await asyncio.to_thread(
+            sampling_params.prepare_video_request_for_queue,
+            batch,
+        )
+        scheduler_batches = sampling_params.expand_video_request_outputs_for_queue(
+            batch
+        )
+        job = _video_job_from_sampling(request_id, req, sampling_params)
+        job.update(sampling_params.project_video_queued_job_fields(batch))
+        await VIDEO_STORE.upsert(request_id, job)
+    except Exception as e:
+        if batch is not None:
+            try:
+                await asyncio.to_thread(sampling_params.cleanup_video_request, batch)
+            except Exception:
+                logger.warning(
+                    "Failed to clean up rejected video request resources",
+                    exc_info=True,
+                )
+        for td in temp_dirs:
+            shutil.rmtree(td, ignore_errors=True)
+        if isinstance(e, (TypeError, ValueError)):
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        raise
 
-    # Build Req for scheduler
-    trace_headers = extract_trace_headers(request.headers)
-    batch = prepare_request(
-        server_args=server_args,
-        sampling_params=sampling_params,
-        external_trace_header=trace_headers,
-    )
-    # Add diffusers_kwargs if provided
-    if req.diffusers_kwargs:
-        batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
-        if "max_sequence_length" in req.diffusers_kwargs:
-            batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
-        if "flow_shift" in req.diffusers_kwargs:
-            batch.flow_shift = req.diffusers_kwargs["flow_shift"]
+    assert batch is not None
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(
         _dispatch_job_async(
             request_id,
             batch,
+            scheduler_batches=scheduler_batches,
             temp_dirs=temp_dirs or None,
             output_persistent=output_persistent,
         )
@@ -717,6 +883,21 @@ async def delete_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
+def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
+    file_paths = job.get("file_paths")
+    if file_paths:
+        try:
+            variant_index = 0 if variant is None else int(variant)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= variant_index < len(file_paths):
+            return file_paths[variant_index]
+        return None
+    if variant not in (None, "0", 0):
+        return None
+    return job.get("file_path")
+
+
 @router.get("/{video_id}/content")
 async def download_video_content(
     video_id: str = Path(...), variant: Optional[str] = Query(None)
@@ -731,9 +912,13 @@ async def download_video_content(
             detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
         )
 
-    file_path = job.get("file_path")
-    if not file_path or not os.path.exists(file_path):
+    file_path = _select_video_variant_path(job, variant)
+    if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404, detail=f"Video variant {variant} not found"
+        )
 
     media_type = "video/mp4"  # default variant
     return FileResponse(

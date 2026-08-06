@@ -1,5 +1,4 @@
 from enum import IntEnum
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -8,26 +7,17 @@ import triton.language as tl
 from einops import rearrange
 from torch.nn.parameter import Parameter
 
-from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.kernels.sconv import (
-    HIS_ONES,
-    HIS_PREFIX,
-    HIS_SEQ_MINUS_EXT,
-    HIS_ZEROS,
     SconvDecodeMetadata,
     SconvExtendMetadata,
     causal_conv1d,
     fused_causal_conv1d_update_decode,
-    fused_decode_sconv_metadata,
-    fused_extend_sconv_metadata,
-    precompute_helion_extend_metadata,
     save_intermediate_conv_windows,
     update_sconv_cache,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
 
@@ -38,10 +28,6 @@ class SconvType(IntEnum):
     V_LOCAL = 3
     ATTN = 4
     MLP = 5
-
-
-# Module-level cache for sconv metadata (shared across layers in the same forward pass)
-_metadata_cache: dict = {}
 
 
 class ShortConvolution(nn.Module):
@@ -135,145 +121,24 @@ class ShortConvolution(nn.Module):
         )
         param_data.copy_(loaded_weight)
 
-    def _owns_extend_metadata(self, forward_batch: ForwardBatch) -> bool:
-        # layer 0 computes the shared _metadata_cache for all layers within one
-        # forward. Under de-tied draft_extend_v2 each STEP is its own forward
-        # against its own pool, and only step 0's model carries layer_id == 0 —
-        # steps 1..N-1 would silently reuse a previous forward's cached (freed
-        # or wrong-pool) tensors, so every step must own its metadata.
-        return self.layer_id == 0 or forward_batch.forward_mode.is_draft_extend_v2()
+    def _conv_state(self, forward_batch: ForwardBatch):
+        """The step's conv-state metadata, resolved once by the attention backend."""
+        return get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
 
-    def _prepare_extend_common_metadata(
-        self, forward_batch: ForwardBatch, cache_indices: torch.Tensor
-    ):
-        """Compute ALL extend sconv metadata (query_start_loc, has_initial_state,
-        and the SconvExtendMetadata) in one fused launch and stash it in
-        _metadata_cache; _prepare_extend_sconv_metadata is then a cache read.
-        Falls back to the original unfused op sequence off-CUDA or past the
-        fused kernel's batch bound."""
-        if self._owns_extend_metadata(forward_batch):
-            B = forward_batch.batch_size
-            is_verify = forward_batch.forward_mode.is_target_verify()
-            if is_verify:
-                # target_verify does not populate extend_seq_lens/extend_prefix_lens;
-                # the lens are a constant draft_token_num per request.
-                draft_token_num = forward_batch.spec_info.draft_token_num
-                num_tokens = B * draft_token_num
-                fused = fused_extend_sconv_metadata(
-                    B=B,
-                    T=num_tokens,
-                    cache_indices=cache_indices,
-                    his_mode=HIS_ONES,
-                    draft_token_num=draft_token_num,
-                )
-            else:
-                num_tokens = forward_batch.extend_num_tokens
-                spec_info = forward_batch.spec_info
-                if (
-                    isinstance(spec_info, EagleDraftExtendInput)
-                    and spec_info.num_front_tokens > 0
-                ):
-                    # Boundary-KV fix: run conv fresh so warm-up rows rebuild
-                    # the window.
-                    his_mode, his_src = HIS_ZEROS, None
-                elif forward_batch.extend_prefix_lens is not None:
-                    his_mode, his_src = HIS_PREFIX, forward_batch.extend_prefix_lens
-                else:
-                    # draft_extend_v2 capture has no extend_prefix_lens.
-                    his_mode, his_src = HIS_SEQ_MINUS_EXT, forward_batch.seq_lens
-                fused = fused_extend_sconv_metadata(
-                    B=B,
-                    T=num_tokens,
-                    cache_indices=cache_indices,
-                    his_mode=his_mode,
-                    extend_seq_lens=forward_batch.extend_seq_lens,
-                    his_src=his_src,
-                )
-            if fused is not None:
-                query_start_loc, has_initial_state, precomputed = fused
-            else:
-                query_start_loc, has_initial_state = (
-                    self._unfused_extend_common_metadata(forward_batch)
-                )
-                precomputed = precompute_helion_extend_metadata(
-                    B=B,
-                    T=num_tokens,
-                    W=self.kernel_size[0],
-                    cache_indices=cache_indices,
-                    has_initial_state=has_initial_state,
-                    query_start_loc=query_start_loc,
-                )
-            _metadata_cache["query_start_loc"] = query_start_loc
-            _metadata_cache["has_initial_state"] = has_initial_state
-            _metadata_cache["helion_precomputed_extend"] = precomputed
-        return _metadata_cache["query_start_loc"], _metadata_cache["has_initial_state"]
-
-    def _unfused_extend_common_metadata(self, forward_batch: ForwardBatch):
-        """Original multi-kernel query_start_loc/has_initial_state prep; fused
-        fallback only."""
-        device = forward_batch.req_pool_indices.device
-        if forward_batch.forward_mode.is_target_verify():
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            query_start_loc = torch.arange(
-                0,
-                (forward_batch.batch_size + 1) * draft_token_num,
-                draft_token_num,
-                dtype=torch.int32,
-                device=device,
-            )
-            has_initial_state = torch.ones(
-                forward_batch.batch_size, dtype=torch.bool, device=device
-            )
-            return query_start_loc, has_initial_state
-        query_start_loc = torch.zeros(
-            forward_batch.batch_size + 1,
-            dtype=torch.int32,
-            device=device,
+    def _sconv_cache(self) -> torch.Tensor:
+        """This module's own conv-state stream for this layer."""
+        return get_attn_backend().sconv_state(
+            layer_id=self.layer_id, stream=self.sconv_type.value
         )
-        query_start_loc[1:] = forward_batch.extend_seq_lens.cumsum(dim=0)
-        spec_info = forward_batch.spec_info
-        if (
-            isinstance(spec_info, EagleDraftExtendInput)
-            and spec_info.num_front_tokens > 0
-        ):
-            has_initial_state = torch.zeros(
-                forward_batch.batch_size, dtype=torch.bool, device=device
-            )
-        elif forward_batch.extend_prefix_lens is not None:
-            has_initial_state = forward_batch.extend_prefix_lens > 0
-        else:
-            has_initial_state = (
-                forward_batch.seq_lens[: forward_batch.batch_size]
-                - forward_batch.extend_seq_lens
-            ) > 0
-        return query_start_loc, has_initial_state
 
-    def _prepare_extend_sconv_metadata(
-        self, forward_batch: ForwardBatch, cache_indices: torch.Tensor
-    ) -> SconvExtendMetadata | Any:
-        # Filled by _prepare_extend_common_metadata, which every caller invokes
-        # first with the same cache_indices (the fused kernel produces the
-        # whole metadata set in one launch).
-        del forward_batch, cache_indices
-        return _metadata_cache["helion_precomputed_extend"]
-
-    def _prepare_decode_sconv_metadata(
-        self, forward_batch: ForwardBatch, cache_indices: torch.Tensor
-    ):
-        if self.layer_id == 0:
-            query_start_loc, has_initial_state, precomputed = (
-                fused_decode_sconv_metadata(
-                    B=forward_batch.batch_size, cache_indices=cache_indices
-                )
-            )
-            _metadata_cache["query_start_loc_decode"] = query_start_loc
-            _metadata_cache["has_initial_state_decode"] = has_initial_state
-            _metadata_cache["helion_precomputed_decode"] = precomputed
-        return (
-            _metadata_cache["query_start_loc_decode"],
-            _metadata_cache["has_initial_state_decode"],
-            _metadata_cache["helion_precomputed_decode"],
+    def _intermediate_window(self) -> torch.Tensor:
+        """This module's per-draft-token conv windows. TARGET_VERIFY only."""
+        return get_attn_backend().sconv_intermediate_window(
+            layer_id=self.layer_id, stream=self.sconv_type.value
         )
+
+    def _weight_2d(self) -> torch.Tensor:
+        return rearrange(self.weight, "d 1 w -> d w")
 
     def _apply_training_sconv_kernel(
         self,
@@ -304,129 +169,27 @@ class ShortConvolution(nn.Module):
         )
         return y
 
-    def _init_track_conv_indices(
-        self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
-    ):
-        """
-        Compute indices for extracting conv states from the input sequence during extend.
-
-        In Mamba models, the conv layer maintains a sliding window of recent inputs.
-        After processing a prefill chunk, we need to save the last `conv_state_len` tokens
-        of the processed region for prefix caching.
-
-        The key insight is that FLA (Flash Linear Attention) processes sequences in chunks
-        of FLA_CHUNK_SIZE. We only track the conv state up to the last complete chunk boundary
-        (aligned_len).
-
-        start_indices is the starting token index of the conv state to track in this extend batch.
-        indices include all pos to track in this extend batch, conv_state_len for each req that
-        needs to be tracked (i.e. mamba_track_mask is True)
-
-        Returns:
-            indices: Tensor of shape [num_tracked_requests, conv_state_len] containing
-                     flattened positions into the packed input tensor.
-        """
-        conv_state_len = self.kernel_size[0] - 1
-
-        # Calculate the end position of the last aligned chunk
-        lens_to_track = (
-            forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
-        )
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-        chunk_aligned_lens_to_track = (
-            lens_to_track // mamba_cache_chunk_size
-        ) * mamba_cache_chunk_size
-        start_indices = (
-            query_start_loc[:-1] + chunk_aligned_lens_to_track - conv_state_len
-        )
-
-        # Create indices: [batch_size, conv_state_len] or padded batch_size in prefill cudagraph
-        indices = start_indices.unsqueeze(-1) + torch.arange(
-            conv_state_len,
-            device=forward_batch.req_pool_indices.device,
-            dtype=start_indices.dtype,
-        )
-
-        # Use slice [-1:] instead of [-1] to avoid 0-d tensor -> scalar conversion during graph capture
-        return torch.clamp(
-            indices,
-            min=torch.zeros(
-                (1,),
-                dtype=start_indices.dtype,
-                device=forward_batch.req_pool_indices.device,
-            ),
-            max=query_start_loc[-1:] - 1,
-        )
-
-    def _prepare_extend_track_conv_indices(
-        self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        if self.layer_id == 0:
-            track_conv_indices = self._init_track_conv_indices(
-                query_start_loc, forward_batch
-            )
-            _metadata_cache["track_conv_indices_extend"] = track_conv_indices
-        return _metadata_cache["track_conv_indices_extend"]
-
-    def _prepare_cache_indices(
-        self, req_to_token_pool, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        """Resolve the per-request mamba slot indices ONCE per forward step.
-
-        ``get_mamba_indices`` is a GPU gather
-        (``req_index_to_mamba_index_mapping[req_pool_indices]``) that depends
-        only on ``forward_batch.req_pool_indices``, which is invariant across
-        every sconv layer within a step. Computing it in each layer's
-        ``forward`` launched one redundant gather kernel per k_sconv/v_sconv
-        (``2 * num_attn_layers`` per step). Cache the layer-0 result in the
-        shared per-step metadata cache and hand it back to subsequent layers,
-        so all layers reuse the same resolved indices.
-
-        Cuda-graph-safe: on capture only layer 0's gather is recorded and
-        subsequent layers read that captured tensor; on replay layer 0's gather
-        re-runs into the same address, keeping it current -- the same mechanism
-        the other ``_metadata_cache`` entries already rely on.
-
-        Under de-tied DRAFT_EXTEND_V2 each per-step forward runs with
-        layer_id != 0 against its own draft pool, so every step must own its
-        gather instead of reusing another forward's cached tensor (same rule
-        as ``_owns_extend_metadata``).
-        """
-        if self._owns_extend_metadata(forward_batch):
-            _metadata_cache["cache_indices"] = (
-                req_to_token_pool.translate_mamba_indices(
-                    req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
-                )
-            )
-        return _metadata_cache["cache_indices"]
-
     def _prepare_extend_sconv_cache(
         self,
         forward_batch: ForwardBatch,
         sconv_cache: torch.Tensor,
         hidden_states: torch.Tensor,
-        query_start_loc: torch.Tensor,
+        track_conv_indices: torch.Tensor | None,
     ):
-        if forward_batch.mamba_track_mask is not None:
-            # Track conv state for prefix caching. Fused gather→scatter writes
-            # directly into sconv_cache without an intermediate [B, W-1, D] buffer.
-            conv_dst = forward_batch.mamba_track_indices
-            # [B, W - 1]
-            track_conv_indices = self._prepare_extend_track_conv_indices(
-                query_start_loc, forward_batch
-            )
+        if track_conv_indices is not None:
+            # Fused gather->scatter straight into sconv_cache, with no intermediate
+            # [B, W-1, D] buffer.
             fused_gather_scatter_to_sconv_cache(
                 hidden_states=hidden_states,
                 sconv_cache=sconv_cache,
                 track_conv_indices=track_conv_indices,
                 mask=forward_batch.mamba_track_mask,
-                dst_indices=conv_dst,
+                dst_indices=forward_batch.mamba_track_indices,
             )
 
     def _save_intermediate_conv_windows(
         self,
         forward_batch: ForwardBatch,
-        cache: MambaPool.SpeculativeState,
         sconv_cache: torch.Tensor,
         cache_indices: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -436,14 +199,14 @@ class ShortConvolution(nn.Module):
         Builds a padded sequence [initial_conv_state | draft_tokens] and extracts
         sliding windows of size (kernel_size - 1) after each draft token position.
         These intermediate states are consumed by
-        InklingForConditionalGeneration.update_conv_state_after_mtp_verify
-        to restore the correct conv state for the number of accepted tokens.
+        InklingShortConvAttnBackend.commit_conv_state_after_mtp_verify to restore
+        the correct conv state for the number of accepted tokens.
         """
         save_intermediate_conv_windows(
             sconv_cache=sconv_cache,
             hidden_states=hidden_states,
             cache_indices=cache_indices,
-            intermediate_out=cache.intermediate_conv_window[self.sconv_type.value],
+            intermediate_out=self._intermediate_window(),
             batch_size=forward_batch.batch_size,
             draft_token_num=forward_batch.spec_info.draft_token_num,
         )
@@ -482,7 +245,7 @@ class ShortConvolution(nn.Module):
 
         crossed = track_step = None
         if do_tracking:
-            mamba_track_interval = get_server_args().mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             pre_seqlen = forward_batch.seq_lens[:batch_size] - draft_token_num
             post_seqlen = pre_seqlen + num_accept_tokens
             crossed = (pre_seqlen // mamba_track_interval) != (
@@ -510,35 +273,30 @@ class ShortConvolution(nn.Module):
     def decode_fused_ar_inputs(self, forward_batch: ForwardBatch):
         """Return inputs for fused decode all-reduce, convolution, and norm.
 
-        These match the fused decode branch of ``forward``, including its
-        per-step metadata cache behavior. Returns
+        These match the fused decode branch of ``forward``. Returns
         ``(sconv_cache, cache_indices, cache_mask, weight_2d)``."""
-        req_to_token_pool = get_req_to_token_pool()
-        cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
-        sconv_cache = cache.conv[self.sconv_type.value]
-        cache_indices = self._prepare_cache_indices(req_to_token_pool, forward_batch)
-        _, _, precomputed = self._prepare_decode_sconv_metadata(
-            forward_batch, cache_indices
+        meta = self._conv_state(forward_batch)
+        return (
+            self._sconv_cache(),
+            meta.cache_indices,
+            meta.precomputed["cache_mask"],
+            self._weight_2d(),
         )
-        weight = rearrange(self.weight, "d 1 w -> d w")
-        return sconv_cache, cache_indices, precomputed["cache_mask"], weight
 
     def verify_fused_ar_inputs(self, forward_batch: ForwardBatch):
         """Return inputs for fused target-verify convolution and norm.
 
         These mirror the target-verify branch of ``forward``. Returns ``(sconv_cache,
         cache_indices[B], has_initial_state[B], weight_2d, inter_out)``."""
-        req_to_token_pool = get_req_to_token_pool()
-        cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
-        sconv_cache = cache.conv[self.sconv_type.value]
-        cache_indices = self._prepare_cache_indices(req_to_token_pool, forward_batch)
-        _, has_initial_state = self._prepare_extend_common_metadata(
-            forward_batch, cache_indices
-        )
-        weight = rearrange(self.weight, "d 1 w -> d w")
-        inter_out = cache.intermediate_conv_window[self.sconv_type.value]
+        meta = self._conv_state(forward_batch)
         b = forward_batch.batch_size
-        return sconv_cache, cache_indices[:b], has_initial_state, weight, inter_out
+        return (
+            self._sconv_cache(),
+            meta.cache_indices[:b],
+            meta.has_initial_state,
+            self._weight_2d(),
+            self._intermediate_window(),
+        )
 
     def extend_fused_ar_inputs(self, forward_batch: ForwardBatch):
         """Return inputs for fused extend all-reduce and scattered convolution.
@@ -551,32 +309,13 @@ class ShortConvolution(nn.Module):
         prep); ``cache_indices``/``has_initial_state`` feed the in-kernel
         cache update, and ``track_rows``/``track_mask``/``track_dst`` feed the
         in-kernel prefix-cache track."""
-        req_to_token_pool = get_req_to_token_pool()
-        cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
-        sconv_cache = cache.conv[self.sconv_type.value]
-        cache_indices = self._prepare_cache_indices(req_to_token_pool, forward_batch)
-        weight = rearrange(self.weight, "d 1 w -> d w")
-        if forward_batch.forward_mode.is_decode():
-            # Decode: every token its own sequence (arange qsl, has_init=ones).
-            query_start_loc, has_initial_state, precomputed = (
-                self._prepare_decode_sconv_metadata(forward_batch, cache_indices)
-            )
-        else:
-            query_start_loc, has_initial_state = self._prepare_extend_common_metadata(
-                forward_batch, cache_indices
-            )
-            precomputed = self._prepare_extend_sconv_metadata(
-                forward_batch, cache_indices
-            )
-        # Prefix-cache track inputs (extend only; the kernel fuses the write).
-        dev = cache_indices.device
-        if (
-            forward_batch.mamba_track_mask is not None
-            and not forward_batch.forward_mode.is_decode()
-        ):
-            track_rows = self._prepare_extend_track_conv_indices(
-                query_start_loc, forward_batch
-            ).long()
+        meta = self._conv_state(forward_batch)
+        precomputed = meta.precomputed
+        # The backend resolves track rows only for the extend modes that snapshot
+        # windows -- never decode or target-verify.
+        dev = meta.cache_indices.device
+        if meta.track_conv_indices is not None:
+            track_rows = meta.track_conv_indices
             track_mask = forward_batch.mamba_track_mask
             track_dst = forward_batch.mamba_track_indices
         else:
@@ -585,15 +324,15 @@ class ShortConvolution(nn.Module):
             track_mask = torch.empty((0,), dtype=torch.bool, device=dev)
             track_dst = torch.empty((0,), dtype=torch.int64, device=dev)
         return (
-            sconv_cache,
+            self._sconv_cache(),
             precomputed["safe_idx"],
             precomputed["cache_mask"].view(-1),
             precomputed["cu"],
             precomputed["si"],
-            weight,
-            query_start_loc,
-            cache_indices,
-            has_initial_state,
+            self._weight_2d(),
+            meta.query_start_loc,
+            meta.cache_indices,
+            meta.has_initial_state,
             track_rows,
             track_mask,
             track_dst,
@@ -607,15 +346,12 @@ class ShortConvolution(nn.Module):
     ) -> None:
         """Target-verify finish for the fused {AR + scattered sconv} path: no
         working-cache update; save the per-position windows (consumed by
-        update_conv_state_after_mtp_verify), exactly as the verify branch of
+        commit_conv_state_after_mtp_verify), exactly as the verify branch of
         ``forward`` does -- on the reduced pre-conv x."""
-        req_to_token_pool = get_req_to_token_pool()
-        cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
-        sconv_cache = cache.conv[self.sconv_type.value]
+        meta = self._conv_state(forward_batch)
         self._save_intermediate_conv_windows(
             forward_batch=forward_batch,
-            cache=cache,
-            sconv_cache=sconv_cache,
+            sconv_cache=self._sconv_cache(),
             cache_indices=cache_indices,
             hidden_states=x_scratch,
         )
@@ -638,20 +374,13 @@ class ShortConvolution(nn.Module):
         """
         del positions
 
-        req_to_token_pool = get_req_to_token_pool()
-        cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
-        sconv_cache = cache.conv[self.sconv_type.value]
-        cache_indices = self._prepare_cache_indices(req_to_token_pool, forward_batch)
-
-        weight = rearrange(self.weight, "d 1 w -> d w")
+        meta = self._conv_state(forward_batch)
+        cache_indices = meta.cache_indices
+        sconv_cache = self._sconv_cache()
+        precomputed = meta.precomputed
+        weight = self._weight_2d()
 
         if forward_batch.forward_mode.is_target_verify():
-            query_start_loc, has_initial_state = self._prepare_extend_common_metadata(
-                forward_batch, cache_indices
-            )
-            precomputed = self._prepare_extend_sconv_metadata(
-                forward_batch, cache_indices
-            )
             y = causal_conv1d(
                 x=hidden_states,
                 weight=weight,
@@ -663,23 +392,16 @@ class ShortConvolution(nn.Module):
             )
             self._save_intermediate_conv_windows(
                 forward_batch=forward_batch,
-                cache=cache,
                 sconv_cache=sconv_cache,
                 cache_indices=cache_indices,
                 hidden_states=hidden_states,
             )
 
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            query_start_loc, has_initial_state = self._prepare_extend_common_metadata(
-                forward_batch, cache_indices
-            )
             self._prepare_extend_sconv_cache(
-                forward_batch, sconv_cache, hidden_states, query_start_loc
+                forward_batch, sconv_cache, hidden_states, meta.track_conv_indices
             )
 
-            precomputed = self._prepare_extend_sconv_metadata(
-                forward_batch, cache_indices
-            )
             if forward_batch.forward_mode.is_draft_extend_v2():
                 y = causal_conv1d(
                     x=hidden_states,
@@ -702,8 +424,8 @@ class ShortConvolution(nn.Module):
                     weight=weight,
                     sconv_cache=sconv_cache,
                     cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    has_initial_state=has_initial_state,
+                    query_start_loc=meta.query_start_loc,
+                    has_initial_state=meta.has_initial_state,
                     precomputed=precomputed,
                     is_decode=False,
                 )
@@ -714,9 +436,6 @@ class ShortConvolution(nn.Module):
             # into the persistent ping-pong slot in-register (no separate
             # copy_if_needed launch). track_mask is None when prefix caching with the
             # mamba extra buffer is disabled, which disables the track-copy path.
-            _query_start_loc, _has_initial_state, precomputed = (
-                self._prepare_decode_sconv_metadata(forward_batch, cache_indices)
-            )
             y = fused_causal_conv1d_update_decode(
                 x=hidden_states,
                 weight=weight,

@@ -18,16 +18,27 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 ## When to use JIT vs AOT (`sgl-kernel`)
 
 - **JIT (`jit_kernel`)**: prefer this first for kernels that do **not** depend on CUTLASS or another large C++ project. It is the default choice for lightweight kernels that benefit from rapid iteration and first-use compilation.
-- **AOT (`sgl-kernel`)**: prefer this when the kernel **does** depend on CUTLASS or another large C++ project, or when it should live in `sgl-kernel/` and participate in the wheel build / torch op registration flow.
+- **AOT (`sgl-kernel`)**: prefer this when the kernel **does** depend on CUTLASS or another large C++ project, or when it should live in `python/sglang/kernels/aot/` and participate in the wheel build / torch op registration flow.
 - **Exception**: kernels that depend on `flashinfer`, or on CUTLASS that is already provided through `flashinfer`, can still be implemented as `jit_kernel`.
+
+---
+
+## Conventions
+
+These hold for every step below.
+
+- **Check where the check is cheapest: `static_assert` > C++ host check > cached Python > per-call Python.** Anything fixed at compile time is a `static_assert`. Anything about the tensors is a `TensorMatcher` / `CHECK_HOST` in the C++ launcher, free next to a kernel launch. A check Python cannot delegate goes inside the `@cache_once` module factory, where it runs once per specialisation. What remains in the per-call entry point costs interpreter time on *every* forward, so it should be nothing but picking the module and allocating `out`.
+- **Fixed-width integer types.** Prefer `int32_t` / `int64_t` / `uint32_t` / `size_t` over `int`, `long`, or `long long`, so an index has the same width on both sides of the FFI boundary. Bare `int` is fine only where the width plainly cannot matter — an unrolled loop counter over a `constexpr` bound, a template `int` parameter. Shapes arrive as `int64_t` (`SymbolicSize::unwrap()`); narrowing to `uint32_t` for in-kernel indexing is a deliberate act, so write the `static_cast` explicitly and only where the range is known.
+- **Doxygen comments in C++.** Document exported entities with `///` or `/** ... */` blocks using `\brief`, `\param`, `\tparam`, `\return`, the way `include/sgl_kernel/` does. `python -m sglang.kernels.jit` writes `CommentFormat: Doxygen` into `.clangd` when clangd is 21 or newer, so these render on hover in the editor. Plain `//` remains fine for implementation notes inside a function body.
+- **ASCII only in C++ and CUDA sources.** Write `--`, `->`, `<=` instead of `—`, `→`, `≤`, including in comments. `grep -nP '[^\x00-\x7F]' <file>` before committing.
+- **`const T* __restrict__` for read-only pointers.** This is what `csrc/` does throughout, and it lets the compiler emit non-coherent (`LDG`) loads.
+- **Watch the register budget.** For memory-bound kernels, keep to roughly 64 registers per thread so occupancy does not become the limit. Build once with `extra_cuda_cflags=["-Xptxas", "-v"]` to see the actual count, and prefer recomputing a value over letting it spill.
 
 ---
 
 ## Common Abstractions in `python/sglang/kernels/jit/include/sgl_kernel/`
 
-**Always prefer these abstractions over raw CUDA primitives.** They provide safety, readability, and consistency with the rest of the codebase.
-
-**Important include rule:** for every `#include <sgl_kernel/...>` line, add a short trailing comment explaining why that header is included (for example `// For TensorMatcher, SymbolicSize, SymbolicDevice`). This matches the current JIT kernel style and keeps include usage self-documenting.
+**Always prefer these abstractions over raw CUDA primitives.** They provide safety, readability, and consistency with the rest of the codebase. The only reason to drop to raw primitives is performance the abstraction cannot reach — a trade you make deliberately, and justify in a comment.
 
 ### `utils.h` — Host-side utilities
 
@@ -57,8 +68,13 @@ Add a new operation that scales each element of a tensor by a scalar factor:
   - Resolves the CUDA stream from a `DLDevice` via TVM-FFI automatically.
   - Checks the CUDA error with file/line info after launch via `operator()(kernel, args...)`.
   - Supports `.enable_pdl(bool)` for PDL (Programmatic Dependent Launch, SM90+).
-- **`host::RuntimeDeviceCheck(cudaError_t)`** — Check a CUDA error; throw on failure.
+- **`device::PDLWaitPrimary<kUsePDL>()`** / **`device::PDLTriggerSecondary<kUsePDL>()`** — The two halves of PDL, on sm_90+ (no-ops on older archs and ROCm). Their guarantees are **not** symmetric:
+  - `PDLTriggerSecondary` (`griddepcontrol.launch_dependents`) only lets the next kernel in the stream *start* early. It carries no memory ordering and publishes nothing — matching that, the header's asm has no `"memory"` clobber.
+  - `PDLWaitPrimary` (`griddepcontrol.wait`) is the ordering point: it waits until the preceding kernel has fully finished and its writes are visible.
+
+  So every read of data the preceding kernel produced must come after `PDLWaitPrimary()`. What overlaps with the primary's tail is whatever you put *before* the wait — loading parameters, computing indices, touching buffers the primary never wrote — so a kernel that waits on its first line gains nothing. Neither call is a barrier: threads may reach or skip them independently. See "Programmatic Dependent Launch and Synchronization" in the CUDA C++ Programming Guide.
 - **`CHECK_CUDA(expr) << "context"`** — Stream-style CUDA error check; evaluates `expr` once and throws `PanicError` with `cudaGetErrorString` + file/line info if it is not `cudaSuccess`. Extra streamed context is optional.
+- **`host::RuntimeDeviceCheck(cudaError_t)`** — Function-style alternative to `CHECK_CUDA`. It takes no context message, so prefer `CHECK_CUDA`, which builds its error object only on the failure path.
 
 ### `tensor.h` — Tensor validation (`TensorMatcher`, Symbolic types)
 
@@ -77,6 +93,7 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
   - `.with_device<kDLCUDA>(device_sym)` — require CUDA and bind the checked device to a `SymbolicDevice`
   - `.with_strides({strides...})` — validate strides (omit to require contiguous)
   - `.verify(tensor_view)` — execute the check; throws `PanicError` with full context on failure; **chainable** (`verify(a).verify(b)` to check multiple tensors with the same shape)
+- **`host::is_type<T>(dtype)`** — whether a `DLDataType` denotes the C++ type `T` (e.g. `fp16_t`).
 
 **Typical pattern:**
 ```cpp
@@ -88,9 +105,27 @@ TensorMatcher({N})  //
     .with_device<kDLCUDA>(device)
     .verify(dst)
     .verify(src);  // same shape, dtype, device as dst
-const size_t n = N.unwrap();
+const int64_t n = N.unwrap();
 const DLDevice dev = device.unwrap();
+const int64_t last_dim = 128;
+TensorMatcher({N, last_dim})  // a fixed dimension can be a plain integer
+    .with_dtype<fp16_t>()
+    .with_device<kDLCUDA>(device)
+    .verify(tensor_2d);
 ```
+
+### `ffi.h` — Tensor allocation and blob wrapping (`host::ffi::`)
+
+```cpp
+#include <sgl_kernel/ffi.h>
+```
+
+The counterpart to `tensor.h`: that one validates what came in, this one produces new `tvm::ffi::Tensor` values. Allocation goes through the environment allocator (`TVMFFIEnvTensorAlloc`), so buffers come from PyTorch's caching allocator rather than a raw `cudaMalloc`.
+
+- **`host::alloc_workspace_tensor(nbytes, device)`** (declared in `utils.cuh`) — **the way to get scratch memory**: a 1-D `uint8` tensor of `nbytes`, or an empty tensor when `nbytes == 0`. Hold the returned `Tensor` in a local across every launch that touches it — it frees on destruction.
+- **`host::ffi::empty(shape, dtype, device)`** — Uninitialized tensor; `shape` accepts a braced list, so `ffi::empty({rows, sizeof(Plan)}, dtype, device)` works for a typed scratch array.
+- **`host::ffi::empty_like(tensor_view)`** — Same shape, dtype, and device as an existing tensor.
+- **`host::ffi::from_blob(data, shape, dtype, device[, deleter, stride, byte_offset])`** / **`from_blob_like(data, tensor_view, ...)`** — View memory you already own as a `Tensor`, no copy. The default deleter does nothing, so ownership stays with the caller; pass one only when the `Tensor` should own the block. Strides default to contiguous.
 
 ### `type.cuh` — `DTypeTrait<T>`, `packed_t<T>`, and reduction traits
 
@@ -117,7 +152,7 @@ const DLDevice dev = device.unwrap();
 - **`device::AlignedVector<T, N>`** — Aligned storage for N elements of type T. N must be a power of two, `sizeof(T)*N <= 32`. Enables vectorized loads/stores for bandwidth efficiency. In terms of API/codegen constraints, the upper bound is 256-bit; in practice, 128-bit is the portable default, while 256-bit vectorization is typically only viable on `SM100+` and should be gated by an architecture check when needed.
   - `.load(ptr, offset)` — vectorized load from `ptr[offset]`
   - `.store(ptr, offset)` — vectorized store to `ptr[offset]`
-  - `.fill(value)` — fill all lanes
+  - `.fill(value)` — fill all N elements with `value`
   - `operator[](i)` — element access
 
 ### `tile.cuh` — `tile::Memory` (strided memory access pattern)
@@ -218,12 +253,17 @@ The implementation fully uses the project abstractions described above:
 
 namespace {
 
-// ----------------------------------------------------------------
-// Kernel: element-wise scale using vectorized 128-bit loads/stores
-// T       = fp16_t | bf16_t | fp32_t
-// kVecN   = number of elements per vector load (e.g. 8 for fp16)
-// factor  = runtime scale factor
-// ----------------------------------------------------------------
+/**
+ * \brief Element-wise scale using vectorized 128-bit loads/stores.
+ *
+ * \tparam T       Element type: fp16_t | bf16_t | fp32_t
+ * \tparam kVecN   Elements per vector load (e.g. 8 for fp16)
+ * \tparam kUsePDL Whether to emit the PDL wait/trigger pair
+ * \param dst      Output buffer, `n_total` elements
+ * \param src      Input buffer, `n_total` elements
+ * \param factor   Runtime scale factor
+ * \param n_total  Number of elements to scale
+ */
 template <typename T, int kVecN, bool kUsePDL>
 __global__ void scale_kernel(T* __restrict__ dst,
                               const T* __restrict__ src,
@@ -264,9 +304,15 @@ __global__ void scale_kernel(T* __restrict__ dst,
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-// ----------------------------------------------------------------
-// Launcher: validates tensors, selects vector width, launches kernel
-// ----------------------------------------------------------------
+/**
+ * \brief Validate the tensors, select the vector width, launch `scale_kernel`.
+ *
+ * \tparam T       Element type: fp16_t | bf16_t | fp32_t
+ * \tparam kUsePDL Whether to launch with PDL enabled
+ * \param dst      Output tensor; same shape / dtype / device as `src`
+ * \param src      Input tensor on CUDA
+ * \param factor   Runtime scale factor
+ */
 template <typename T, bool kUsePDL>
 void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   using namespace host;
@@ -317,7 +363,6 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 **Key points:**
 
 - Include headers from `sgl_kernel/` — **not** raw CUDA headers for anything already covered
-- Add a short trailing `// For ...` explanation to every `#include <sgl_kernel/...>` line
 - Use `TensorMatcher` for all tensor validation; never manually check shape/dtype/device
 - Use `AlignedVector` for vectorised 128-bit loads/stores — significant bandwidth win
 - Use `LaunchKernel` — it resolves the stream and checks errors automatically
@@ -326,13 +371,13 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
 - `device::cast<To, From>` or `DTypeTrait<T>::from(val)` for cross-type conversions
 - `device::math::` functions for device math instead of bare `__` intrinsics if possible.
-- Try to use `PDL` feature. In some cases, this will benefit the performance.
+- Consider PDL — it can help when the kernel has prologue work to overlap. Place `PDLWaitPrimary()` right before the first read of upstream data, not at the top of the kernel
 
 ---
 
-## Step 2: Add the Python wrapper in `kernels/jit/`
+## Step 2: Add the Python wrapper in `kernels/ops/`
 
-Create `python/sglang/kernels/jit/scale.py`:
+The wrapper lives next to its functional group under `python/sglang/kernels/ops/`, not beside the CUDA source — `kernels/jit/` holds only the JIT infrastructure (`csrc/`, `include/`, `utils/`, `benchmark/`). Create `python/sglang/kernels/ops/elementwise/scale.py`:
 
 ```python
 from __future__ import annotations
@@ -355,6 +400,12 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_scale_module(dtype: torch.dtype) -> Module:
     """Compile and cache the JIT scale module for a given dtype."""
+    # Checks on the compile key live here, not in `scale`: `cache_once` keys on
+    # `dtype`, so this runs once per specialisation instead of once per call.
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise RuntimeError(
+            f"Unsupported dtype {dtype}. Supported: float16, bfloat16, float32"
+        )
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "scale",
@@ -380,13 +431,9 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
     -------
     Scaled tensor (dst = src * factor).
     """
-    # DO NOT add too much proactive validation here.
-    # Keep the Python wrapper thin, only enforce the preconditions
-    # that the current JIT/FFI path (C++ side) does not reject on its own.
-    if src.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise RuntimeError(
-            f"Unsupported dtype {src.dtype}. Supported: float16, bfloat16, float32"
-        )
+    # DO NOT add proactive validation here: every check costs interpreter time
+    # on a per-forward path. Tensor invariants belong in the C++ launcher, and
+    # anything about the compile key belongs in `_jit_scale_module`.
     if out is None:
         out = torch.empty_like(src)
 
@@ -403,7 +450,7 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 - `cuda_wrappers`: `(export_name, kernel_symbol)` — `export_name` is called from Python
 - `make_cpp_args(dtype, ...)` converts `torch.dtype` to C++ type alias:
 - `is_arch_support_pdl()` checks if the current architecture supports PDL, which is typically passed as a template argument to the kernel.
-- Keep Python launchers thin, but still validate the basic invariants (`is_cuda`, supported dtype, `out` metadata). In the current JIT/FFI path, invalid tensors are not always rejected safely before launch
+- Keep the entry point thin (see Conventions). What Python must still check goes in the `@cache_once` module factory, not in the entry point: `cache_once` keys on its arguments, so a check there costs one evaluation per specialisation instead of one per call — that is where the supported-dtype guard lives. Tensor invariants belong in the C++ launcher; if something here never reaches a `.verify(...)`, close that gap on the C++ side rather than in Python
 
 | `torch.dtype`      | C++ type   |
 |--------------------|------------|
@@ -427,7 +474,7 @@ return load_jit(
 )
 ```
 
-If your kernel requires SM90+, raise a clear Python error before calling `load_jit`:
+If your kernel requires SM90+, raise a clear Python error before calling `load_jit`. Arch gating is one of the checks that has to live in Python — it decides whether to compile at all, so the C++ launcher never gets to run:
 
 ```python
 if torch.cuda.get_device_capability()[0] < 9:
@@ -438,10 +485,10 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 4: Write tests (required)
 
-JIT kernel correctness tests and benchmarks live under `test/registered/jit/` and `test/registered/jit/benchmark/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
 - **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
-- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/kernels/jit/utils/compile.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
+- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
 
@@ -472,12 +519,12 @@ Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but
 
 For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.
 
-Create `test/registered/jit/test_scale.py`:
+Create `test/registered/kernels/ops/elementwise/test_scale.py`:
 
 ```python
 import pytest
 import torch
-from sglang.kernels.jit.scale import scale
+from sglang.kernels.ops.elementwise.scale import scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -525,7 +572,7 @@ if __name__ == "__main__":
 
 ## Step 5: Add a benchmark (required)
 
-Benchmarks are `bench_*.py` files under `test/registered/jit/benchmark/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
+Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
 
 Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/jit/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
 
@@ -542,14 +589,14 @@ Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/j
 - **`utils.create_random(*shape)` / `utils.create_empty(*shape)`** — shorthand for `torch.randn` / `torch.empty` with `DEFAULT_DTYPE` (`bfloat16`) and `DEFAULT_DEVICE` (`"cuda"`). Override via the `dtype=` / `device=` kwargs.
 - **`utils.get_benchmark_range(full_range, ci_range)`** — returns the smaller `ci_range` under CI (`is_in_ci()`), the `full_range` locally. Still available for the `benchmark(...)` column axis (which has no `ci_vals`); for `parametrize` row axes prefer the built-in `ci_vals` argument.
 
-Create `test/registered/jit/benchmark/bench_scale.py`:
+Create `test/registered/kernels/benchmark/elementwise/bench_scale.py`:
 
 ```python
 import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.jit.scale import scale as jit_scale
+from sglang.kernels.ops.elementwise.scale import scale as jit_scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
@@ -568,7 +615,7 @@ FN_MAP = {
 
 # `parametrize(name, full_vals, ci_vals)`: the 3rd arg is the smaller sweep
 # auto-selected under CI; the full range runs locally.
-@marker.parametrize("size", [2**n for n in range(10, 20)], [4096, 65536])  # 1K … 512K
+@marker.parametrize("size", [2**n for n in range(10, 20)], [4096, 65536])  # 1K .. 512K
 @marker.benchmark("impl", ["jit", "torch"])
 def benchmark(size: int, impl: str):
     src = create_random(size)
@@ -600,7 +647,7 @@ if __name__ == "__main__":
 Run locally:
 
 ```bash
-python test/registered/jit/benchmark/bench_scale.py
+python test/registered/kernels/benchmark/elementwise/bench_scale.py
 ```
 
 Run the benchmark suite the way CI does:
@@ -616,18 +663,20 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time`, `stage`, and `runner_config` (and optional `nightly=True`); starred args and non-literal values break AST collection
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/kernels/jit/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
-- **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. Make sure `graph_clone_args` covers every *read* tensor — reusing a single buffer keeps it L2-hot and skews results
+- **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. `graph_clone_args` defaults to `"all"`; if you narrow it, it must still cover every *read* tensor — reusing a single buffer keeps it L2-hot and skews results. Keep *write* tensors in it too: they are what sets the rotation count, and a shared output buffer stays L2-hot the same way.
 - **Missing GB/s column**: the column is on by default; check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
 
 ---
 
 ## References
 
-- `docs_new/docs/developer_guide/development_jit_kernel_guide.mdx`
+- `docs/docs/developer_guide/development_jit_kernel_guide.mdx`
 - `test/run_suite.py` — suite names, discovery of `test/registered/`, execution entrypoint for CI
 - `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
-- `python/sglang/kernels/jit/utils/compile.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
-- `python/sglang/kernels/jit/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`
+- `python/sglang/kernels/jit/utils/compile.py` — `load_jit`, `make_cpp_args`
+- `python/sglang/kernels/jit/utils/common.py` — `cache_once`, `should_run_full_tests`, `get_ci_test_range`
+- `python/sglang/kernels/jit/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`, `is_type`
+- `python/sglang/kernels/jit/include/sgl_kernel/ffi.h` — `ffi::empty`, `ffi::empty_like`, `ffi::from_blob`
 - `python/sglang/kernels/jit/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/kernels/jit/include/sgl_kernel/vec.cuh` — `AlignedVector`
 - `python/sglang/kernels/jit/include/sgl_kernel/tile.cuh` — `tile::Memory`
@@ -642,14 +691,14 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
 - `python/sglang/kernels/jit/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
 - `python/sglang/kernels/jit/benchmark/utils.py` — `create_random` / `create_empty` / `get_benchmark_range` helpers and `DEFAULT_DTYPE` / `DEFAULT_DEVICE`
-- `test/registered/jit/benchmark/bench_qknorm.py` — real example: multi-axis `parametrize` (with `ci_vals`) + in-place `memory_output`
-- `test/registered/jit/benchmark/bench_store_cache.py` — real example: scoped `memory_args` / `memory_output` + selective `graph_clone_args`
+- `test/registered/kernels/benchmark/layernorm/bench_qknorm.py` — real example: multi-axis `parametrize` (with `ci_vals`) + in-place `memory_output`
+- `test/registered/kernels/benchmark/kvcache/bench_store_cache.py` — real example: scoped `memory_args` / `memory_output` + selective `graph_clone_args`
 
 ## Summary of Files Created
 
 ```
-python/sglang/kernels/jit/csrc/elementwise/scale.cuh   # NEW: CUDA kernel
-python/sglang/kernels/jit/scale.py                     # NEW: Python wrapper
-test/registered/jit/test_scale.py                     # NEW: Tests
-test/registered/jit/benchmark/bench_scale.py          # NEW: Benchmark
+python/sglang/kernels/jit/csrc/elementwise/scale.cuh              # NEW: CUDA kernel
+python/sglang/kernels/ops/elementwise/scale.py                    # NEW: Python wrapper
+test/registered/kernels/ops/elementwise/test_scale.py             # NEW: Tests
+test/registered/kernels/benchmark/elementwise/bench_scale.py      # NEW: Benchmark
 ```

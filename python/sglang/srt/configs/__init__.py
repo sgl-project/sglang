@@ -19,6 +19,7 @@ from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
+from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
@@ -37,7 +38,12 @@ from sglang.srt.configs.nano_nemotron_vl import (
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
-from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+from sglang.srt.configs.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
+)
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
@@ -66,11 +72,14 @@ __all__ = [
     "Step3VisionEncoderConfig",
     "Olmo3Config",
     "KimiLinearConfig",
+    "KimiK3Config",
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
+    "Qwen3_5TextConfig",
+    "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",

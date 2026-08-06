@@ -152,7 +152,8 @@ class KvVmmArena:
         # no_split so the caching allocator hands our bump pointers back verbatim.
         self.pool = torch.cuda.MemPool(self._allocator, no_split=True)
         logger.info(
-            "KvVmmArena[%s] ready: device=%d reserved=%.1f GiB granularity=%d KiB",
+            "KvVmmArena[%s] ready: device=%d reserved_va=%.1f GiB "
+            "granularity=%d KiB",
             self._sfx,
             self.device_id,
             self.reserved / (1024**3),
@@ -178,6 +179,7 @@ class KvVmmArena:
             is_python_module=False,
             verbose=False,
             build_directory=out_dir,
+            no_implicit_headers=True,
         )
         self._so_path = f"{out_dir}/{libname}.so"
         lib = ctypes.CDLL(self._so_path)
