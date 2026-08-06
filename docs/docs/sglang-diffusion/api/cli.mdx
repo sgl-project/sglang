@@ -81,8 +81,9 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
 - `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; `speed` also enables `--enable-torch-compile` unless the model-specific deployment config opts out or you explicitly disable it. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
-- `--tp-size {N}`: tensor parallelism size, mainly for encoders
+- `--tp-size {N}`: tensor parallelism size. Depending on the pipeline, it can shard the DiT, one or more encoders, or both.
 - `--sp-degree {N}`: sequence parallelism size
+- `--dp-size {N}` (alias `--data-parallel-size`): number of data-parallel replicas. Each replica is a full copy of the engine on `num_gpus / N` GPUs with its own ingress; generation requests round-robin across replicas, realtime sessions stick to the replica holding their state, and control operations (weights, LoRA, memory occupation, shutdown) apply to every replica. Combines with the other parallelism axes (`num_gpus = dp × cfg × tp × sp`); monolithic serving only.
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
 - `--encoder-parallel {auto|fold|dp|replicate}`: how the text/image encoders use the GPUs the DiT replica leaves idle during encoding. `auto` (the default for both `generate` and `serve`) TP-folds an encoder wide enough to pay for the per-layer all-reduce, selects DP for a server batch when it can engage, and otherwise replicates; `fold` forces the shard whenever the dims allow it; `dp` splits a batched encode across ranks and needs `--batching-max-size > 1` to engage; `replicate` encodes redundantly on every rank. `fold` and `replicate` are bitwise-identical to single-GPU encoding. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
@@ -182,7 +183,7 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For supported pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../cache_dit).
+For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 

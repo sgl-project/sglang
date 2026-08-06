@@ -161,7 +161,7 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
     other_launch_args = ["--disable-cuda-graph"]
 
 
-class TestDFlashServerSpecV2(TestDFlashServerBase):
+class TestDFlashServerOverlap(TestDFlashServerBase):
     disable_overlap = False
 
     def test_radix_attention(self):
@@ -169,7 +169,7 @@ class TestDFlashServerSpecV2(TestDFlashServerBase):
         assert self.process.poll() is None
 
 
-class TestDFlashServerSpecV2PlanStream(TestDFlashServerSpecV2):
+class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
     overlap_plan_stream = True
 
 
