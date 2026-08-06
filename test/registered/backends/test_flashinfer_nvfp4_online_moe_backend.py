@@ -82,7 +82,6 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4Online(
 ):
     backend = "flashinfer_trtllm"
     model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
-    extra_args = ["--attention-backend", "triton"]
     eval_args = {"api": "completion", "max_tokens": 512}
     extra_env = {
         "FLASHINFER_NVFP4_4OVER6": "1",
