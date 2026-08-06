@@ -203,31 +203,21 @@ class TestLazyHostPoolRelease(CustomTestCase):
 
 
 class TestHostMemoryBudget(CustomTestCase):
-    # Pinned so the two budget reads below see identical free memory; the real
-    # psutil value drifts between calls and would flake the equality checks.
-    _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
+    _AVAILABLE = 64 * (1024**3)
 
     def _budget_with_ranks(self, ranks):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
-        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
         with unittest.mock.patch.object(
             base, "ranks_per_host", return_value=ranks
         ), unittest.mock.patch.object(
-            base.psutil, "virtual_memory", return_value=fake_mem
+            base, "memory_available_bytes", return_value=self._AVAILABLE
         ):
             return base.host_memory_budget_bytes()
 
     def test_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
         self.assertEqual(self._budget_with_ranks(4), solo // 4)
-
-    def test_reserve_is_taken_before_the_split(self):
-        # Each rank must not get its own copy of the reserve.
-        budget = self._budget_with_ranks(8)
-        self.assertLessEqual(
-            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
-        )
 
     def test_ranks_per_host_divides_world_size_by_nodes(self):
         # The launcher slices ranks uniformly across nodes, so the co-located

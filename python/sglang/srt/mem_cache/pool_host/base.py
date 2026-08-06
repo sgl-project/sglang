@@ -6,7 +6,6 @@ import threading
 from functools import wraps
 from typing import Optional
 
-import psutil
 import torch
 
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -15,6 +14,12 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    HICACHE_HOST_MEMORY_RESERVE_BYTES as HICACHE_HOST_MEMORY_RESERVE_BYTES,
+)
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    memory_available_bytes,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -22,9 +27,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-# Host RAM to leave free when sizing HiCache pools (OS, other processes).
-HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -51,12 +53,11 @@ def ranks_per_host() -> int:
 def host_memory_budget_bytes() -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
-    psutil reports the whole machine, so co-located ranks each see the same free
-    memory; without the split every rank sizes its pool against all of it and
-    the host is oversubscribed by the number of ranks it holds.
+    The preflight reports the whole machine, so co-located ranks each see the
+    same free memory; without the split every rank sizes its pool against all
+    of it and the host is oversubscribed by the number of ranks it holds.
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-    return free // ranks_per_host()
+    return memory_available_bytes() // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
