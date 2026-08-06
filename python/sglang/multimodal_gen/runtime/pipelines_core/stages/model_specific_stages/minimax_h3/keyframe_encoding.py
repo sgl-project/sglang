@@ -58,7 +58,12 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
         if device_module.is_available():
             devices = [device]
             device_type = current_platform.device_type
-    with torch.random.fork_rng(devices=devices, device_type=device_type):
+    fork_rng_context = (
+        torch.random.fork_rng(devices=devices)
+        if device_type is None
+        else torch.random.fork_rng(devices=devices, device_type=device_type)
+    )
+    with fork_rng_context:
         torch.default_generator.manual_seed(int(seed))
         for forked_device in devices:
             assert device_module is not None

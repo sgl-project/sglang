@@ -608,11 +608,8 @@ class ComponentResidencyManager:
         return buffer.device.type if buffer is not None else None
 
     def _module_on_supported_accelerator(self, module: nn.Module | None) -> bool:
-        device_type = self._module_device(module)
-        return device_type == current_platform.device_type and (
-            current_platform.is_cuda()
-            or current_platform.is_rocm()
-            or current_platform.is_npu()
+        return current_platform.is_accelerator_device_type(
+            self._module_device(module)
         )
 
     def _empty_cache_after_large_release(

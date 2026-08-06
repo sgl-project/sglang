@@ -171,11 +171,10 @@ For Ascend NPU, follow the
 [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
 before starting the server.
 
-For an eight-NPU host, use TP2 + SP4 with Laser Attention. This is the
-validated topology; replace `laser_attn` with `fa` to use Ascend Flash
-Attention:
+On an 8-NPU server, the validated topology is TP2 + SP4 with Laser Attention.
+Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
 
-```bash 8×Ascend NPU
+```bash 8-NPU
 HCCL_BUFFSIZE=256 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-type diffusion \

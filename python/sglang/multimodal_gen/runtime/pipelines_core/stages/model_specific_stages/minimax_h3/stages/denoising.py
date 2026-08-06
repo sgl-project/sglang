@@ -522,10 +522,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             required_backend = "Ascend NPU"
         elif current_platform.is_cuda() or current_platform.is_rocm():
             device = torch.device(current_platform.device_type)
-            required_backend = "CUDA"
+            required_backend = "ROCm" if current_platform.is_rocm() else "CUDA"
         else:
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CUDA or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CUDA, ROCm, or Ascend NPU"
             )
         if not torch.get_device_module(device).is_available():
             raise RuntimeError(
