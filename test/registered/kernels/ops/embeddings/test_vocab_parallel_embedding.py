@@ -1,4 +1,5 @@
 import types
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -134,6 +135,37 @@ def test_use_triton_embedding_gate():
     )
     for weight in unsupported_weights:
         assert not gate(_stub_layer(weight=weight), input_ids)
+
+
+@pytest.mark.parametrize("use_attn_tp_group", [False, True])
+def test_empty_embedding_skips_all_reduce(use_attn_tp_group):
+    input_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
+    output = torch.empty((0, 32), dtype=torch.bfloat16, device="cuda")
+    layer = types.SimpleNamespace(
+        tp_size=2,
+        use_attn_tp_group=use_attn_tp_group,
+        num_embeddings=128,
+        _embed_local_shard=lambda _: output,
+    )
+
+    with (
+        patch(
+            "sglang.srt.layers.vocab_parallel_embedding.get_attn_tp_context",
+            return_value=types.SimpleNamespace(input_scattered=False),
+        ),
+        patch(
+            "sglang.srt.layers.vocab_parallel_embedding."
+            "tensor_model_parallel_all_reduce"
+        ) as tensor_parallel_all_reduce,
+        patch(
+            "sglang.srt.layers.vocab_parallel_embedding.attn_tp_all_reduce"
+        ) as attn_tp_all_reduce,
+    ):
+        actual = VocabParallelEmbedding.forward(layer, input_ids)
+
+    assert actual is output
+    tensor_parallel_all_reduce.assert_not_called()
+    attn_tp_all_reduce.assert_not_called()
 
 
 if __name__ == "__main__":

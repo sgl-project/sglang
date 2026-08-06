@@ -1,5 +1,7 @@
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -7,12 +9,29 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    require_mlp_tp_gather,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+
+
+class TestRequireMlpTpGather(CustomTestCase):
+    def test_elastic_joiner_uses_expanded_world_before_local_dp_validation(self):
+        parallel = SimpleNamespace(enable_dp_attention=True, dp_size=1)
+        execution = SimpleNamespace(moe=SimpleNamespace(elastic_ep_backend="mooncake"))
+
+        with (
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch("sglang.srt.runtime_context.get_exec", return_value=execution),
+            patch(
+                "sglang.srt.elastic_ep.elastic_ep.elastic_expanded_world_enabled",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(require_mlp_tp_gather(SimpleNamespace()))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

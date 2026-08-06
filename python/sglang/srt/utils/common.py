@@ -3554,7 +3554,6 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3562,6 +3561,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 
             if elastic_expanded_world_enabled():
                 return True
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
         if (
             get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers

@@ -6905,6 +6905,29 @@ class ServerArgs:
             )
         if scaling_active:
             resolved = self._resolved()
+            from sglang.srt.elastic_ep.topology import (
+                derive_attn_tp_size,
+                physical_ep_size_to_dp_size,
+            )
+
+            try:
+                attn_tp_size = derive_attn_tp_size(
+                    tp_size=self.tp_size,
+                    dp_size=self.dp_size,
+                    attn_cp_size=resolved.attn_cp_size,
+                )
+                attn_replica_size = attn_tp_size * resolved.attn_cp_size
+                physical_ep_size_to_dp_size(self.max_ep_size, attn_replica_size)
+                physical_ep_size_to_dp_size(
+                    self.elastic_ep_initial_size or self.tp_size, attn_replica_size
+                )
+                if self.ep_join_mode == "scale":
+                    physical_ep_size_to_dp_size(
+                        self.ep_join_rank_offset, attn_replica_size
+                    )
+            except ValueError as exc:
+                raise AssertionError(str(exc)) from exc
+
             assert (
                 self.elastic_ep_scale_timeout > 0
             ), "--elastic-ep-scale-timeout must be greater than zero."
@@ -6962,17 +6985,12 @@ class ServerArgs:
                 "Elastic EP scale-up requires --pp-size 1 "
                 f"(got pp_size={self.pp_size}); WORLD must not span PP stages."
             )
+            assert attn_tp_size % self.dcp_size == 0, (
+                "Elastic EP scale-up requires --dcp-size to divide the fixed "
+                "attention TP width "
+                f"(got dcp_size={self.dcp_size}, attn_tp_size={attn_tp_size})."
+            )
 
-            decode_cuda_graph_disabled = (
-                self.cuda_graph_config.decode.backend == Backend.DISABLED
-            )
-            prefill_cuda_graph_disabled = (
-                self.cuda_graph_config.prefill.backend == Backend.DISABLED
-            )
-            assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-                "Elastic EP runtime scale-up requires decode and prefill CUDA "
-                "graphs to be disabled."
-            )
             assert resolved.enable_dp_attention, (
                 "Elastic EP scale-up requires --enable-dp-attention; without it "
                 "the TP group is not equivalent to WORLD and the post-scale "
@@ -6992,17 +7010,50 @@ class ServerArgs:
             )
             assert resolved.ep_size == self.tp_size, (
                 "Elastic EP scale-up requires ep_size == tp_size "
-                f"(got ep_size={resolved.ep_size}, tp_size={self.tp_size}); EP, TP "
-                "and the attention DP group must all coincide with WORLD."
-            )
-            assert self.dp_size == self.tp_size, (
-                "Elastic EP scale-up requires dp_size == tp_size "
-                f"(got dp_size={self.dp_size}, tp_size={self.tp_size})."
+                f"(got ep_size={resolved.ep_size}, tp_size={self.tp_size}); "
+                "physical EP membership must coincide with the launch-time TP span."
             )
             assert resolved.moe_a2a_backend == "nixl", (
                 "Elastic EP scale-up requires --moe-a2a-backend nixl "
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
+
+            decode_backend = self.cuda_graph_config.decode.backend
+            assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+                "Elastic EP runtime scale-up supports decode CUDA graph backend "
+                f"'full' or 'disabled' (got {decode_backend!r})."
+            )
+            assert self.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+                "Elastic EP runtime scale-up requires prefill CUDA graph to be "
+                "disabled."
+            )
+            if decode_backend == Backend.FULL:
+                assert self.device == "cuda", (
+                    "Elastic EP CUDA graph recapture requires CUDA "
+                    f"(got device={self.device!r})."
+                )
+                assert self.speculative_algorithm is None, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "speculative decoding."
+                )
+                assert not self.is_embedding, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "embedding models."
+                )
+                assert self.dllm_algorithm is None, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "diffusion models."
+                )
+                assert not self.encoder_only, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "encoder-only models."
+                )
+                assert not self.forward_hooks, (
+                    "Elastic EP CUDA graph recapture does not support forward hooks."
+                )
+                assert not self.enable_pdmux, (
+                    "Elastic EP CUDA graph recapture does not support PDMux."
+                )
 
     def _validate_experimental_sgl_marlin(self):
         view = self._resolved()

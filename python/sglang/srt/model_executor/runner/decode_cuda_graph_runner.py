@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    world_dp_gather_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -1237,6 +1238,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if (
+            self.model_runner.enable_elastic_ep
+            and world_dp_gather_enabled()
+            and forward_batch.forward_mode.is_decode()
+            and self.model_runner.spec_algorithm.is_none()
+        ):
+            buffers.num_token_non_padded.fill_(raw_num_token)
 
         if (
             not is_ragged

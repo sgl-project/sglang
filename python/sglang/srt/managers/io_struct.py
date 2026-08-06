@@ -1921,10 +1921,12 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report asynchronous Elastic EP scale completion or failure."""
+    """Report scale completion in physical EP and logical DP-slot units."""
 
     success: bool
+    # Public Elastic EP state remains physical.
     effective_ep_size: int
+    # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None

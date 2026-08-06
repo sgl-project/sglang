@@ -3759,13 +3759,17 @@ class Scheduler(
         ):
             return
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.elastic_ep.topology import collapse_physical_rank_status
 
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
+            parallel = get_parallel()
+            dp_status = collapse_physical_rank_status(
+                inst.active_ranks_cpu.tolist(),
+                parallel.attn_tp_size * parallel.attn_cp_size,
+            )
             self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
-                )
+                ActiveRanksOutput(status=dp_status)
             )
         else:
             logger.debug("[Elastic EP] active rank state is unavailable")
@@ -4623,6 +4627,18 @@ class Scheduler(
                 message=(
                     f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
                     f"({max_ep_size}). Restart with a larger --max-ep-size."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        parallel = get_parallel()
+        attn_replica_size = parallel.attn_tp_size * parallel.attn_cp_size
+        if new_ep_size % attn_replica_size != 0:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) would admit an incomplete "
+                    f"attention replica with size {attn_replica_size}."
                 ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,

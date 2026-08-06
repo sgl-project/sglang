@@ -867,9 +867,7 @@ class TokenizerControlMixin:
             List of LoadSnapshot, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        if dp_rank is not None and (
-            dp_rank < 0 or dp_rank >= self.elastic_worker_count
-        ):
+        if dp_rank is not None and (dp_rank < 0 or dp_rank >= self.elastic_dp_size):
             return []
 
         reader = self.load_snapshot_reader

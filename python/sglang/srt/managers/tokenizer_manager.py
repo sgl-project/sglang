@@ -49,6 +49,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.elastic_ep.topology import (
+    derive_attn_tp_size,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -400,7 +404,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         self.startup_time: Optional[Dict[str, Any]] = None
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
-        self.elastic_worker_count = server_args.dp_size
+        self.elastic_dp_size = server_args.dp_size
+        self.attn_tp_size = derive_attn_tp_size(
+            tp_size=server_args.tp_size,
+            dp_size=server_args.dp_size if server_args.enable_dp_attention else 1,
+            attn_cp_size=server_args.attn_cp_size,
+        )
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -609,7 +618,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
-        self.model_update_expected_workers = self.elastic_worker_count
+        self.model_update_expected_workers = self.elastic_dp_size
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
@@ -762,7 +771,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
+            dp_size = self.elastic_dp_size
             if dp_size <= 1 and obj.routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -2080,7 +2089,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        expected_workers = self.elastic_worker_count
+        expected_workers = self.elastic_dp_size
         self.model_update_expected_workers = expected_workers
         self.model_update_tmp = []
         self.model_update_result = asyncio.Future()
@@ -3203,16 +3212,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
 
         self._dispatch_to_scheduler(msg)
-        self.elastic_worker_count = msg.effective_ep_size
+        self.elastic_dp_size = physical_ep_size_to_dp_size(
+            msg.effective_ep_size,
+            self.attn_tp_size * self.server_args.attn_cp_size,
+        )
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "serving_expanded"
         self.elastic_last_error = None
-        self.update_control_communicator_fan_out(msg.effective_ep_size)
+        self.update_control_communicator_fan_out(self.elastic_dp_size)
 
     def get_elastic_ep_state(self):
         return {
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
-            "effective_ep_size": self.elastic_worker_count,
+            "effective_ep_size": (
+                self.elastic_dp_size * self.attn_tp_size * self.server_args.attn_cp_size
+            ),
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
@@ -3229,7 +3243,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
-                old_ep_size=self.elastic_worker_count,
+                old_ep_size=(
+                    self.elastic_dp_size
+                    * self.attn_tp_size
+                    * self.server_args.attn_cp_size
+                ),
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,

@@ -105,7 +105,10 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def capture_cuda_graphs(
-    *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
+    *,
+    model_runner: ModelRunner,
+    capture_decode_cuda_graph: bool = True,
+    finalize: bool = True,
 ) -> CudaGraphsCapture:
     """Capture cuda graphs. Requires init_attention_backends() to have run.
 
@@ -207,10 +210,14 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
-    # Register forward hooks AFTER cuda-graph capture so their tensor ops are
-    # not traced into any captured graph — capture stays hook-free and hooks
-    # fire only on the eager forward path (capture replay never runs Python
-    # hooks anyway).
+    if finalize:
+        finalize_cuda_graph_capture(model_runner)
+
+    return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
+
+
+def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
+    """Run setup that must happen after the final graph capture."""
     if model_runner.server_args.forward_hooks:
         register_forward_hooks(
             model_runner.model, model_runner.server_args.forward_hooks
@@ -225,8 +232,6 @@ def capture_cuda_graphs(
 
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()
-
-    return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
 
 
 def capture_prefill_graph(
