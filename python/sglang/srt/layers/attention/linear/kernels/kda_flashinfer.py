@@ -2,6 +2,8 @@
 
 Wraps ``flashinfer.kda_decode.recurrent_kda`` for decode/verify and the public
 ``flashinfer.kda.recurrent_kda`` facade for CAKE prefill (SM100 / Blackwell).
+CAKE decode uses ``flashinfer.packed_kda_decode`` for the exact Kimi-K3 TP8
+serving contract.
 
 Contract with the Triton KDA reference:
   - raw per-K gate ``a`` is activated in-kernel as
@@ -10,11 +12,11 @@ Contract with the Triton KDA reference:
   - q/k are L2-normalized in-kernel;
   - state layout is ``[N, HV, V, K]`` for committed and speculative state.
 
-The optional ``cake`` mode adapts SGLang's raw-gate/indexed-state calls to the
-exported CAKE contracts. Decode accepts precomputed BF16 gate/beta tensors and
-updates 32-bit-addressable state pools directly by index; larger or otherwise
-unsupported pools use a dense gather/scatter fallback. Prefill consumes raw
-gate/beta logits and retains its gather/scatter adapter.
+The optional ``cake`` mode forwards SGLang's post-convolution packed Q/K/V,
+raw gate/beta, and indexed state pool directly to the exported CAKE decode
+contract. Unsupported shapes and ReplaySSM use the existing Triton packed
+path. Prefill consumes raw gate/beta logits and retains its gather/scatter
+adapter.
 """
 
 import inspect
@@ -39,6 +41,16 @@ _flashinfer_kda_available: Optional[bool] = None
 _flashinfer_recurrent_kda = None
 _flashinfer_kda_prefill_available: Optional[bool] = None
 _flashinfer_recurrent_kda_facade = None
+_flashinfer_packed_kda_available: Optional[bool] = None
+_flashinfer_packed_kda_decode = None
+_cake_packed_decode_route_logged = False
+
+_CAKE_PACKED_NUM_HEADS = 12
+_CAKE_PACKED_HEAD_DIM = 128
+_CAKE_PACKED_QKV_WIDTH = 3 * _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM
+_CAKE_PACKED_GATE_WIDTH = _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM
+_CAKE_PACKED_SCALE = _CAKE_PACKED_HEAD_DIM**-0.5
+_CAKE_PACKED_LOWER_BOUND = -5.0
 
 
 def _get_flashinfer_kda_kernel():
@@ -90,6 +102,28 @@ def _get_flashinfer_kda_prefill_kernel():
             _flashinfer_kda_prefill_available = False
             _flashinfer_recurrent_kda_facade = None
     return _flashinfer_kda_prefill_available, _flashinfer_recurrent_kda_facade
+
+
+def _get_flashinfer_packed_kda_kernel():
+    """Lazy import for the exported CAKE packed-decode facade."""
+    global _flashinfer_packed_kda_available, _flashinfer_packed_kda_decode
+    if _flashinfer_packed_kda_available is None:
+        try:
+            os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+
+            from flashinfer import packed_kda_decode
+
+            _flashinfer_packed_kda_decode = packed_kda_decode
+            _flashinfer_packed_kda_available = (
+                is_cuda() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+            )
+            if _flashinfer_packed_kda_available:
+                logger.info("FlashInfer CAKE packed KDA decode loaded successfully")
+        except (ImportError, RuntimeError) as e:
+            logger.warning("FlashInfer CAKE packed KDA decode is not available: %s", e)
+            _flashinfer_packed_kda_available = False
+            _flashinfer_packed_kda_decode = None
+    return _flashinfer_packed_kda_available, _flashinfer_packed_kda_decode
 
 
 class FlashInferKDAKernel(LinearAttnKernelBase):
@@ -779,6 +813,221 @@ class CakeKDAKernel(FlashInferKDAKernel):
     """Named SGLang backend for FlashInfer's exported CAKE KDA kernels."""
 
     supports_k3_fused_decode = False
+    supports_packed_decode = True
 
     def __init__(self):
         super().__init__(backend="cake")
+        available, packed_kda_decode = _get_flashinfer_packed_kda_kernel()
+        self._packed_kda_decode = packed_kda_decode if available else None
+
+    @staticmethod
+    def _cake_packed_decode_is_supported(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        lower_bound: Optional[float],
+    ) -> bool:
+        """Check the frozen Kimi-K3 TP8 packed ABI without a device sync."""
+        batch_size = mixed_qkv.shape[0] if mixed_qkv.ndim == 2 else -1
+        state_inner_size = (
+            _CAKE_PACKED_NUM_HEADS * _CAKE_PACKED_HEAD_DIM * _CAKE_PACKED_HEAD_DIM
+        )
+        if not isinstance(scale, (int, float)) or not isinstance(
+            lower_bound, (int, float)
+        ):
+            return False
+        scale_matches = math.isclose(
+            scale, _CAKE_PACKED_SCALE, rel_tol=0.0, abs_tol=1e-12
+        )
+        lower_bound_matches = math.isclose(
+            lower_bound,
+            _CAKE_PACKED_LOWER_BOUND,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+
+        if (
+            batch_size <= 0
+            or tuple(mixed_qkv.shape) != (batch_size, _CAKE_PACKED_QKV_WIDTH)
+            or mixed_qkv.dtype != torch.bfloat16
+            or not mixed_qkv.is_cuda
+            or mixed_qkv.stride(1) != 1
+            or mixed_qkv.stride(0) < _CAKE_PACKED_QKV_WIDTH
+            or mixed_qkv.stride(0) <= 0
+            or a.dtype != torch.bfloat16
+            or b.dtype != torch.bfloat16
+            or not a.is_cuda
+            or not b.is_cuda
+            or not a.is_contiguous()
+            or not b.is_contiguous()
+            or a.numel() != batch_size * _CAKE_PACKED_GATE_WIDTH
+            or b.numel() != batch_size * _CAKE_PACKED_NUM_HEADS
+            or A_log.dtype != torch.float32
+            or dt_bias.dtype != torch.float32
+            or not A_log.is_cuda
+            or not dt_bias.is_cuda
+            or not A_log.is_contiguous()
+            or not dt_bias.is_contiguous()
+            or A_log.numel() != _CAKE_PACKED_NUM_HEADS
+            or dt_bias.numel() != _CAKE_PACKED_GATE_WIDTH
+            or ssm_states.dtype != torch.bfloat16
+            or not ssm_states.is_cuda
+            or ssm_states.ndim != 4
+            or tuple(ssm_states.shape[1:])
+            != (
+                _CAKE_PACKED_NUM_HEADS,
+                _CAKE_PACKED_HEAD_DIM,
+                _CAKE_PACKED_HEAD_DIM,
+            )
+            or ssm_states.shape[0] <= 0
+            or ssm_states.stride()[1:]
+            != (
+                _CAKE_PACKED_HEAD_DIM * _CAKE_PACKED_HEAD_DIM,
+                _CAKE_PACKED_HEAD_DIM,
+                1,
+            )
+            or ssm_states.stride(0) < state_inner_size
+            or ssm_states.stride(0) <= 0
+            or cache_indices.dtype != torch.int32
+            or not cache_indices.is_cuda
+            or not cache_indices.is_contiguous()
+            or tuple(cache_indices.shape) != (batch_size,)
+            or num_v_heads != _CAKE_PACKED_NUM_HEADS
+            or head_v_dim != _CAKE_PACKED_HEAD_DIM
+            or not scale_matches
+            or not lower_bound_matches
+        ):
+            return False
+
+        device = mixed_qkv.device
+        return all(
+            tensor.device == device
+            for tensor in (a, b, A_log, dt_bias, ssm_states, cache_indices)
+        )
+
+    @staticmethod
+    def _packed_decode_triton(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        lower_bound: Optional[float],
+        **kwargs,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+            TritonKDAKernel,
+        )
+
+        return TritonKDAKernel().packed_decode(
+            mixed_qkv,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            lower_bound=lower_bound,
+            **kwargs,
+        )
+
+    def packed_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        lower_bound: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run CAKE's exact packed decode or explicitly retain Triton semantics."""
+        global _cake_packed_decode_route_logged
+        replay_requested = any(
+            kwargs.get(name) is not None
+            for name in (
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+                "replayssm_write_pos",
+                "replayssm_force_flush",
+            )
+        )
+        covered = (
+            self._packed_kda_decode is not None
+            and self._cake_packed_decode_is_supported(
+                mixed_qkv,
+                a,
+                b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=num_v_heads,
+                head_v_dim=head_v_dim,
+                lower_bound=lower_bound,
+            )
+        )
+        if replay_requested or not covered:
+            return self._packed_decode_triton(
+                mixed_qkv,
+                a,
+                b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=num_v_heads,
+                head_v_dim=head_v_dim,
+                lower_bound=lower_bound,
+                **kwargs,
+            )
+
+        batch_size = mixed_qkv.shape[0]
+        raw_gate = a.view(batch_size, _CAKE_PACKED_GATE_WIDTH)
+        raw_beta = b.view(batch_size, _CAKE_PACKED_NUM_HEADS)
+        output = mixed_qkv.new_empty(
+            batch_size, 1, _CAKE_PACKED_NUM_HEADS, _CAKE_PACKED_HEAD_DIM
+        )
+        if not _cake_packed_decode_route_logged:
+            logger.info(
+                "FlashInfer CAKE packed KDA decode route active: "
+                "H=12, D=128, direct indexed BF16 state"
+            )
+            _cake_packed_decode_route_logged = True
+        self._packed_kda_decode(
+            mixed_qkv=mixed_qkv,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log.view(_CAKE_PACKED_NUM_HEADS),
+            dt_bias=dt_bias.view(_CAKE_PACKED_GATE_WIDTH),
+            state=ssm_states,
+            state_indices=cache_indices,
+            output=output,
+        )
+        return output.transpose(0, 1)
