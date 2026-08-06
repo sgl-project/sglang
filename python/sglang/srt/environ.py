@@ -690,7 +690,7 @@ class Envs:
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
-    # FlashInfer TRT-LLM or CuTe DSL MoE.
+    # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.

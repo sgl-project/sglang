@@ -211,12 +211,8 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             if layer_match is not None
             else layer_prefix
         )
-        if (
-            quant_config.use_per_token_activation
-            and not (
-                self.enable_flashinfer_trtllm_moe
-                or self._is_cutedsl_v2_standard
-            )
+        if quant_config.use_per_token_activation and not (
+            self.enable_flashinfer_trtllm_moe or self._is_cutedsl_v2_standard
         ):
             raise ValueError(
                 "--quantization nvfp4_online requires online per-token FP32 "
