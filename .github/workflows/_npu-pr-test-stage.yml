@@ -36,9 +36,13 @@ on:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: ''
+      skip_pr_test_health_check:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        type: string
+        default: 'false'
 
 env:
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
   SGLANG_USE_MODELSCOPE: true
   SGLANG_IS_IN_CI: true
   HF_ENDPOINT: https://hf-mirror.com
