@@ -118,6 +118,84 @@ class InputMessageConstructionTestCase(unittest.TestCase):
             ],
         )
 
+    def test_function_call_output_parts_normalized_for_chat_templates(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "call f"}],
+                },
+                {
+                    "type": "function_call",
+                    "name": "f",
+                    "call_id": "call_abc",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [{"type": "input_text", "text": "ok"}],
+                },
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request)
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "call f"}],
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_abc",
+                    "content": [{"type": "text", "text": "ok"}],
+                },
+            ],
+        )
+
+    def test_function_call_output_parts_normalized_for_harmony(self):
+        serving = make_serving()
+        serving.use_harmony = True
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "function_call",
+                    "name": "f",
+                    "call_id": "call_abc",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [{"type": "input_text", "text": "ok"}],
+                },
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages_with_harmony(request, None)
+
+        self.assertEqual(messages[-1].author.role.value, "tool")
+        self.assertEqual(messages[-1].author.name, "functions.f")
+        self.assertEqual([part.text for part in messages[-1].content], ["ok"])
+
     def test_previous_response_id_input_list_does_not_call_copy_module(self):
         serving = make_serving()
         serving.use_harmony = True

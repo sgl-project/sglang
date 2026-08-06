@@ -174,10 +174,17 @@ def parse_response_input(
                 break
         if call_response is None:
             raise ValueError(f"No call message found for {call_id}")
-        msg = Message.from_author_and_content(
-            Author.new(Role.TOOL, f"functions.{call_response.name}"),
-            response_msg["output"],
-        )
+        author = Author.new(Role.TOOL, f"functions.{call_response.name}")
+        output = response_msg["output"]
+        if isinstance(output, list):
+            contents = [
+                TextContent(text=part.get("text", ""))
+                for part in output
+                if part.get("type") in ("text", "input_text")
+            ]
+            msg = Message(author=author, content=contents)
+        else:
+            msg = Message.from_author_and_content(author, output)
     elif response_msg["type"] == "reasoning":
         content = response_msg["content"]
         assert len(content) == 1
