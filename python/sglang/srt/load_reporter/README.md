@@ -2,230 +2,228 @@
 
 ## Overview
 
-The per-worker load reporter runs inside the SGLang Python HTTP/TokenizerManager
-process and continuously streams scheduler load snapshots to multiple Routers by
-using gRPC client streaming.
+The load reporter is a **Worker-process-internal gRPC service** that listens on
+its own fixed port (`--load-reporter-port`) and streams scheduler load snapshots
+to an external Router. It is not a separate deployment, a discovery service, or
+a reuse of the HTTP / inference port — it is one more service owned by the
+Worker process.
 
-**Runtime constraints:**
+Transport direction: the **external Router dials INTO** the Worker's reporter
+port and drives a single bidirectional gRPC stream
+(`LoadMonitorService.Monitor`). The Router sends a `RegisterRequest` first; the
+Worker replies with an ack immediately, waits up to one second for the initial
+sampling attempt, and then sends the first `LoadReport`. A successful attempt
+therefore makes the first report a completed current snapshot; a hung attempt
+produces an explicit `UNREACHABLE` report after the bound. Periodic reports are
+then streamed on the negotiated interval, anchored from that first report. This removes the old
+FastAPI-only `POST /v1/start_reporting` control plane, so **every** serving mode
+— including the ones that never start FastAPI — is reachable.
 
-- In single-tokenizer mode, snapshots come from
-  `TokenizerManager.get_loads(include=["core"])`.
-- In multi-tokenizer mode, the single `MultiTokenizerRouter` owns the runtime;
-  HTTP workers register through IPC and coalesce refresh notifications.
-- The reporter uses `grpc.aio.insecure_channel` (h2c, without TLS or gRPC
-  authentication).
-- `POST /v1/start_reporting` is a strictly internal Router-to-Engine control
-  endpoint and does not require `--admin-api-key`.
+The reporter is **opt-in and disabled by default**. When `--load-reporter-port`
+is unset there is zero overhead: no socket, no task, no binding, and the
+optional `grpc`/`protobuf` stack is never imported.
 
-### Runtime dependencies
+> **Router scope.** This component only delivers the Worker-side reporter and
+> its wire contract (canonical proto + fixed-port config). The external Router
+> client — its addressing/discovery, retries, registry reconciliation, and any
+> load-aware routing policy — is delivered separately by the Router owner and is
+> **not part of this PR**. Tests here validate the Worker wire contract with a
+> real `grpc.aio` fake Router; that is not a claim that the production Router is
+> implemented. Keep the reporter disabled in production until that client ships.
 
-Load-reporting dependencies are provided by the shared `load-reporter` optional
-extra in each platform pyproject. They do not increase the default dependency
-set of a regular SGLang wheel. Install the extra in environments that use this
-feature:
+## Serving-mode matrix
 
-```bash
-pip install "sglang[load-reporter]"
-```
+Every mode shares one reporter service / runtime / proto / sampler and one
+`enable_load_monitor("request_lifecycle")` decorator. Only the startup site and
+the snapshot source differ.
 
-The extra requires `grpcio>=1.78.0` and `protobuf>=6.31.1,<7`. The `test` and
-`dev` extras also install these dependencies so that community CI can run the
-load-reporter tests. A normal server can still start when the dependencies are
-missing or incompatible, but the registration endpoint returns HTTP 501.
+| Serving mode | Reporter start site | Snapshot source | Request-end hint | Sampling |
+|---|---|---|---|---|
+| HTTP | FastAPI lifespan (`http_load_reporter_lifespan`) | `TokenizerManager` | static `@enable_load_monitor` on `generate_request` | initial + periodic + request-end wake |
+| native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | same static decorator | initial + periodic + request-end wake |
+| embedded Engine | `Engine.__init__` (`start_load_reporter_in_background`) | `TokenizerManager` snapshot reader | same static decorator | initial + periodic + request-end wake |
+| multi-tokenizer HTTP (`--tokenizer-worker-num > 1`) | sole `MultiTokenizerRouter` owns the port; HTTP workers bind an IPC notifier | Router shared-memory snapshot reader | HTTP workers coalesce refresh over IPC to the sole owner | initial + periodic + request-end wake |
+| standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | same decorator applied at runtime to the current instance's bound `generate_request` | initial + periodic + request-end wake |
 
-## Architecture
+> **Multi-tokenizer native gRPC is not supported.** `ServerArgs` rejects
+> `--grpc-port` together with `--tokenizer-worker-num > 1`, so the reporter does
+> not claim that combination. Multi-tokenizer applies to HTTP only.
+
+**HTTP and standalone SMG RPC are symmetric**: both do register-time initial
+sampling, periodic interval sampling, and request-end active wake-up.
+
+Standalone SMG RPC does **not** require a separately deployed SMG process:
+`smg-grpc-servicer` is a Python package that SGLang imports in-process under
+`--smg-grpc-mode`. SGLang attaches the reporter through the existing
+`on_request_manager_ready(request_manager, server_args, scheduler_info)`
+callback before the gRPC server accepts requests. Capability is detected with
+`inspect.signature(_serve_grpc)` (no version sniffing): if the reporter is
+enabled but that hook is missing, startup fails loudly; if the reporter is
+disabled, the existing compatibility path is preserved.
+
+## Request-end semantics
+
+A request-end (`COMPLETION`) is a **synchronous, non-blocking hint**, not an
+accurate per-request counter:
 
 ```text
-FastAPI lifespan
- ├─ Single tokenizer: LoadReporterRuntime (composition root)
- └─ Multiple tokenizers: HTTP worker proxy/notifier ─IPC→ MultiTokenizerRouter
-                                                └─ LoadReporterRuntime (sole owner)
-     ├─ LatestSnapshotStore (atomic latest-wins view)
-     ├─ ReportBuilder (SnapshotView → protobuf)
-     ├─ LoadSampler (single-flight get_loads loop)
-     └─ MonitorManager (MonitorKey → MonitorTask map)
-         └─ MonitorTask × N (one independent gRPC stream per Router target)
+request end ── decorator finally ──▶ notify (sync) ──▶ sampler coalesce ──▶ snapshot ──▶ same bidi stream
 ```
 
-**Timing boundaries:**
+The decorator never samples, awaits, or writes the gRPC stream on the request
+path. It only wakes the single-flight sampler. Concurrent completions coalesce
+into at most one follow-up refresh, so **high-throughput completion does not
+imply one report per request**. Load values always come from the snapshot
+source; reports converge, they are not one-to-one with hints.
 
-- A request-end notification only refreshes the store; it is synchronous and
-  non-blocking.
-- A gRPC write occurs only when a stream first connects or when that Monitor's
-  `report_interval_ms` deadline expires.
-- Timer and request-end refreshes share one sampler state machine, so at most
-  one `get_loads()` call is in flight at any time.
+The same rule holds across modes:
 
-## Module layout
+- HTTP / native gRPC / embedded Engine: `TokenizerManager.generate_request`
+  carries the static `@enable_load_monitor("request_lifecycle")`; multi-worker
+  HTTP forwards a coalesced IPC hint to the sole router-owned sampler.
+- standalone SMG RPC: SGLang wraps the *current* `GrpcRequestManager`
+  instance's bound `generate_request` with the same decorator at runtime and
+  restores it on shutdown. The class, other instances, and
+  `shutdown`/dispatch/abort methods are never modified.
 
-| File | Responsibility |
-|------|----------------|
-| `config.py` | Freezes `LoadReporterConfig` and `WorkerMetadata` from `ServerArgs`; defines internal transport constants. |
-| `store.py` | `LatestSnapshotStore`: validates `LoadSnapshot`, applies timestamp fallback and latest-wins merging, and publishes immutable `SnapshotView` values. |
-| `report_builder.py` | `ReportBuilder`: converts `SnapshotView` to `pb.LoadReport` and adds status and a process-global sequence number. |
-| `sampler.py` | `LoadSampler`: the only task that calls `get_loads()`; coalesces refresh notifications in a single-flight background loop. |
-| `registration.py` | Strict Pydantic schemas, `MonitorKey` and `MonitorRegistration` value objects, origin normalization, and the `POST /v1/start_reporting` route. |
-| `monitor.py` | `MonitorManager` owns the target map and performs identity-safe upserts; each `MonitorTask` owns one gRPC stream and its fixed-rate lease/reconnect state machine. |
-| `runtime.py` | `LoadReporterRuntime`: top-level composition, the `start_reporting` control plane, the synchronous `notify_request_finished` hook, and bounded shutdown. |
-| `ipc.py` | Correlates multi-tokenizer control requests and responses, coalesces refresh events, and maps stable errors. |
-| `proto/load_monitor.proto` | Embedded `router.loadmonitor.v1` IDL shared with the Router load-monitor service. |
+## Composition root
 
-### Regenerating the Python protobuf code
+`start_load_reporter(server_args, snapshot_source, *, event_owner=None,
+request_lifecycle_method=None) -> Optional[LoadReporterHandle]` is the single
+serving-mode-agnostic entry point. Serving entrypoints only ever see the
+returned handle's `close()`; no reporter-internal type leaks into them.
 
-Run the pinned toolchain from the repository root so the generated files remain
-compatible with the project's minimum supported runtime versions:
+- `load_reporter_port is None` → returns `None` before importing grpc/protobuf.
+- `snapshot_source is None` (multi-tokenizer HTTP worker) → installs a coalescing
+  refresh notifier bound to `event_owner` that forwards hints to the sole owner
+  over IPC. No gRPC server, no port bound.
+- otherwise → owns a `LoadReporterRuntime` + a `grpc.aio` server on
+  `host:load_reporter_port`, binds `event_owner` (if any) so decorator events
+  wake the sampler, and — when `request_lifecycle_method` is set — installs the
+  bound-method decorator on that one instance.
 
-```bash
-codegen_dir=$(mktemp -d /tmp/sglang-load-reporter-codegen.XXXXXX)
-python3 -m venv "$codegen_dir/venv"
-"$codegen_dir/venv/bin/python" -m pip install \
-  grpcio==1.78.0 grpcio-tools==1.78.0 protobuf==6.31.1
-cd python/sglang/srt/load_reporter/proto
-"$codegen_dir/venv/bin/python" -m grpc_tools.protoc \
-  -I. --python_out=. --grpc_python_out=. load_monitor.proto
+`LoadReporterHandle.close()` is idempotent and tears down in order: stop the
+gRPC server, close the runtime, close the IPC notifier, unbind the registry
+callback, restore any shadowed bound method (identity-safe: it only removes its
+own shadow, never a later replacement).
+
+## Network and deployment model
+
+- The reporter's network boundary is `--load-reporter-port` on
+  `server_args.host`. The Router derives the Worker host from the Worker URL it
+  already knows and connects to a **paired fixed reporter port** it is
+  configured with — it does not discover the port via `/server_info`, gRPC info,
+  or port scanning.
+- **Non-host networking assumption:** in the common case each Pod/container has
+  its own IP, so many Workers can reuse the same reporter port number.
+- **host-network is out of scope:** multiple Workers sharing a host's network
+  namespace must be given distinct ports by deployment config; this PR does not
+  implement dynamic allocation or discovery.
+- **h2c only:** the reporter uses `grpc.aio` insecure (h2c) — no TLS, mTLS, or
+  gRPC authentication.
+- A bind failure on the fixed port fails explicitly; there is no silent
+  fallback to a random port.
+
+## Protocol
+
+Canonical IDL: `proto/sglang/router/loadmonitor/v1/load_monitor.proto` (package
+`sglang.router.loadmonitor.v1`). Regenerate the Python bindings with `protoc`
+(grpcio-tools) into `python/sglang/srt/load_reporter/proto/`. It is the single
+wire-contract input for the external Router; do not copy it or its generated
+artifacts into Router-side test fixtures.
+
+```protobuf
+service LoadMonitorService {
+  rpc Monitor(stream RouterFrame) returns (stream WorkerFrame);
+}
 ```
 
-`grpc_tools.protoc` generates an absolute import for the sibling module. Before
-committing, replace `import load_monitor_pb2 as load__monitor__pb2` with the
-package-relative import
-`from . import load_monitor_pb2 as load__monitor__pb2`. Do not remove or modify
-the protobuf or gRPC runtime-version checks emitted by the generator.
+- `RouterFrame` = `register | update_config | keep_alive | stop`. The first
+  frame MUST be `register`; any other first frame yields
+  `WorkerFrame(error=StreamError(code="INVALID_FIRST_FRAME"))`.
+- Registration timing must be positive and `router_id` must be non-empty.
+  `update_config` distinguishes absent fields from explicit values; every
+  present timing field must be positive and starts a new deadline when the
+  Worker accepts the frame. Invalid input terminates the stream with
+  `StreamError(code="INVALID_ARGUMENT")`.
+- `WorkerFrame` = `registered | report | error`. On valid register the Worker
+  sends the ack immediately, then a bounded sampled-first report, followed by
+  periodic `LoadReport`s.
+- Same `router_id` re-registering on a new stream replaces the old session;
+  different `router_id`s coexist. Each session's response queue is capacity-1,
+  latest-wins, so a slow Router never accumulates historical reports.
+- EOF, cancel, `stop`, lease timeout, and server shutdown all run the same
+  idempotent cleanup.
+- `LoadReport.worker` remains compatibility metadata; the Router should
+  associate a report with the Worker identity of the outbound task, not trust
+  `worker_addr`.
 
-## Control flow
-
-### Startup
-
-1. **Lifespan setup**
-   - Single tokenizer: construct
-     `LoadReporterRuntime(snapshot_source, server_args)` and install the
-     request-finished hook.
-   - Multiple tokenizers: each HTTP worker constructs a control proxy and
-     refresh notifier; the Router lazily constructs the single runtime on the
-     first registration.
-   - Store the runtime or unsupported reason in
-     `app.state.load_reporter_runtime` and
-     `app.state.load_reporter_unsupported_reason`.
-
-### Registration and reporting
-
-2. **Router registration**
-   - `POST /v1/start_reporting` calls
-     `runtime.start_reporting(payload, worker_addr)`, then
-     `MonitorManager.upsert`.
-   - The first registration creates a `MonitorTask`, starts its `run()` task,
-     and calls `sampler.activate()`.
-   - Re-registering from the same origin updates `MonitorRegistration`
-     (`revision++`), the lease, and the interval, then wakes the task so it can
-     recompute its deadline.
-   - Re-registering from a different origin returns HTTP 409.
-
-3. **Sampling loop (`LoadSampler`)**
-   - Refresh immediately after activation, then wait for either the wake event
-     or a `min_interval_ms` timeout.
-   - The request-end hook calls `notify_refresh()` to set the wake event.
-   - `MonitorManager` calls `notify_schedule_changed()` when an interval
-     changes.
-   - After each `get_loads()` call, `LatestSnapshotStore.apply_full_snapshot`
-     atomically publishes a new view; failures call `record_error` instead.
-   - Notifications received while sampling cause at most one additional
-     refresh.
-
-4. **Stream writes (`MonitorTask`)**
-   - Each target owns a `grpc.aio` channel and client stream
-     (`LoadMonitorServiceStub.Report`).
-   - Send the current snapshot immediately after each connection, then use a
-     fixed `report_interval_ms` cadence.
-   - Concurrent waits cover the stop event, registration updates, lease
-     expiry, call completion, and the report deadline.
-   - An update re-anchors the deadline at `updated_at + interval`.
-   - After write backpressure clears, skip missed periods instead of replaying
-     historical reports.
-
-5. **Reconnect and error classification**
-   - **Retryable** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, or
-     `RESOURCE_EXHAUSTED`): exponential backoff from 0.25 to 5 seconds with
-     20 percent jitter.
-   - **Wait for renewal** (`INVALID_ARGUMENT`, `UNAUTHENTICATED`,
-     `PERMISSION_DENIED`, or `UNIMPLEMENTED`): record the error and wait for a
-     registration update with a larger revision.
-   - A successful epoch, defined as sending at least one report, resets the
-     backoff to its initial value.
-   - On lease expiry the task exits and `on_stopped` removes it from the
-     manager map.
-
-### Shutdown
-
-6. **Shutdown**
-   - During the HTTP worker lifespan, detach hooks and IPC components before
-     closing the proxy and notifier.
-   - In the parent-process `finally` block, close the sole runtime on the
-     Router event loop before removing the Router socket.
-   - `close()` orders shutdown as `sampler.close()`, then `manager.close()` to
-     stop every task and await convergence.
-   - After the timeout, `cancel_remaining()` force-cancels tasks that have not
-     converged.
+**Report status:** `HEALTHY` when every rank satisfies
+`report_time - snapshot_time <= load_reporter_snapshot_stale_after_ms`; `STALE`
+when at least one rank exceeds it (ranks still included); `UNREACHABLE` when the
+store has never completed a full snapshot.
 
 ## Configuration
 
 | `ServerArgs` field | Default | Description |
-|--------------------|---------|-------------|
-| `load_reporter_snapshot_stale_after_ms` | `3000` | Reports `REPORT_STATUS_STALE` after this threshold. |
-| `load_reporter_zone` | `None` | Optional zone metadata; an empty string is normalized to `None`. |
+|---|---|---|
+| `load_reporter_port` | `None` | Fixed port for the Worker reporter gRPC service. `None` fully disables the reporter (no socket/task/binding). Valid range `1..65535`. |
+| `load_reporter_snapshot_stale_after_ms` | `3000` | Emit `REPORT_STATUS_STALE` past this age. |
+| `load_reporter_zone` | `None` | Optional zone metadata; empty string normalized to `None`. |
 
-**Internal constants** (`config.py`; they do not create CLI arguments):
+The external Router's paired reporter-port configuration is a delivery contract
+only; its parameter name is chosen by the Router owner and is not defined here.
 
-- `GRPC_CONNECT_TIMEOUT_SECONDS = 3.0`
-- `RECONNECT_INITIAL_SECONDS = 0.25`
-- `RECONNECT_MAX_SECONDS = 5.0`
-- `SHUTDOWN_TIMEOUT_SECONDS = 5.0`
+Reporter-internal lifecycle constants live in `config.py` and are intentionally
+not CLI arguments.
 
-## Protocol constraints
+## Module layout
 
-- **Wire contract:** fields 1 through 13 and all enum values in
-  `proto/load_monitor.proto` match the canonical Router IDL.
-- **`Worker.worker_addr`:** normalize the registration HTTP request origin to
-  `scheme://host:port`; never read `Forwarded` or `X-Forwarded-*`.
-- **`RankLoad.snapshot_time_unix_ms`:** prefer
-  `LoadSnapshot.timestamp * 1000`; fall back to `collected_at_unix_ms` when the
-  source timestamp is invalid.
-- **Latest-wins merging:** for repeated snapshots of the same DP rank, keep the
-  newer timestamp. When timestamps are equal, use the complete raw metrics
-  from the current sample.
-- **Status logic:**
-  - `HEALTHY`: every rank satisfies
-    `report_time - snapshot_time <= snapshot_stale_after_ms`.
-  - `STALE`: at least one rank exceeds the threshold; the report still includes
-    its ranks.
-  - `UNREACHABLE`: there is no authoritative rank snapshot because the store
-    has never completed `apply_full_snapshot` successfully.
+| File | Responsibility |
+|---|---|
+| `lifecycle.py` | Composition root plus HTTP-lifespan and background-loop ownership helpers. |
+| `decorator.py` | `enable_load_monitor(kind)` / `bind_load_monitor(owner, notify)`; one shared async-generator finalization helper for both the static and bound-method `request_lifecycle` paths. |
+| `service.py` | `LoadMonitorService.Monitor` bidi handler (depends only on runtime + proto). |
+| `runtime.py` | `LoadReporterRuntime`: inbound Router session table, sampler wiring, bounded shutdown. |
+| `sampler.py` | `LoadSampler` single-flight loop; `ManagerLoadSnapshotSource` / `RouterLoadSnapshotSource`. |
+| `store.py` | `LatestSnapshotStore` latest-wins view. |
+| `report_builder.py` | `SnapshotView` → `pb.LoadReport` with status + sequence id. |
+| `ipc.py` | `LoadReporterRefreshNotifier`: multi-tokenizer worker refresh coalescer. |
+| `config.py` | `LoadReporterConfig` / `WorkerMetadata` from `ServerArgs`; internal constants. |
+| `proto/` | Generated `sglang.router.loadmonitor.v1` bindings. |
 
-## Threading and asynchronous model
+## Threading and async model
 
-- **Single event loop:** every reporter component shares the FastAPI and
-  TokenizerManager asyncio event loop.
-- **Single-flight sampler:** at most one `get_loads()` call is in flight;
-  notifications set a wake event instead of creating tasks.
-- **Per-target task:** every Monitor owns one independent `asyncio.Task`; the
-  manager has no coordinator, reconcile loop, or session generation.
-- **Request-end hook:** synchronously call `sampler.notify_refresh()`; do not
-  await, create a task, or call `get_loads()` there.
-- **Error isolation:** sampling, validation, connection, write, background-task,
-  and shutdown failures never propagate into inference requests or the main
-  FastAPI lifespan.
+- Reporter components share one owned asyncio loop: the serving loop for HTTP,
+  router, and standalone modes, or a dedicated background loop for Engine.
+- Single-flight sampler: at most one `get_loads()` in flight; hints only set a
+  wake event.
+- Request-end hooks are synchronous and non-throwing; a callback exception is
+  logged and never alters the wrapped function's result or exception.
+- Sampling, connection, write, and shutdown failures never propagate into
+  inference requests.
 
 ## Tests and validation
 
-Unit tests cover the store, builder, sampler, monitor deadlines, internal
-control behavior, optional-dependency boundary, IPC correlation and coalescing,
-single ownership across multiple workers, shutdown cleanup, and msgpack
-round-trips. GPU end-to-end validation checks that two tokenizer/HTTP workers
-establish only one Router gRPC stream.
+- Unit / integration (CPU, real in-process `grpc.aio`): decorator contract
+  (static + bound method; normal exhaustion, business exception, `aclose()`,
+  cancellation, callback isolation, identity-safe restore), proto contract,
+  runtime sessions, service handshake/reporting, composition-root lifecycle, and
+  standalone SMG wiring (capability guard, `_serve_grpc` failure/exit/cancel
+  cleanup) via a faked `_serve_grpc` import boundary (no smg install required).
+- E2E (GPU + model, CUDA CI) under `test/registered/tokenizer/`: a real
+  `grpc.aio` fake Router dials in for single-owner, multi-owner, and standalone
+  SMG modes. These require a GPU/model (and `smg-grpc-servicer` for standalone),
+  so they do not run on CPU-only hosts. The standalone test uses the SMG
+  inference stub to perform a real generation and verifies that its request-end
+  wake supplies the snapshot used at the next report deadline.
 
 ## Known limitations
 
-- No TLS, mTLS, gRPC authentication, acknowledgements, replay, exactly-once
-  delivery, or persistence.
-- No custom gRPC keepalive or message-size configuration; grpcio defaults are
-  used.
-- The Router protocol has no SDK metadata, normalized load, `worker_id`, or
-  similar extensions.
+- No TLS/mTLS/gRPC auth, acknowledgements, replay, exactly-once delivery, or
+  persistence.
+- No custom gRPC keepalive/message-size tuning; grpcio defaults are used.
+- Reports are convergent hints, not per-request events.
+- The external Router client (discovery, retry, registry reconciliation,
+  load-aware policy) is a separate prerequisite; until it ships, keep the
+  reporter disabled and do not claim end-to-end load-aware routing.
