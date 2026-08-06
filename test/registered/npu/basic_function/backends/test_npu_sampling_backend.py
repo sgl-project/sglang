@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -13,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
+register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a3", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
@@ -41,6 +42,9 @@ class TestAscendSamplingBackend(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_mmlu(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,

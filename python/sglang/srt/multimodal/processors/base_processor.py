@@ -181,6 +181,9 @@ class BaseMultimodalProcessor(ABC):
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
+    # Set by processors that already build input_ids from the request's own
+    # tokens, so the retokenize-avoidance rebuild below has nothing to add.
+    preserve_processor_input_ids = False
     auto_mm_processor_worker_num = 1
     auto_mm_io_worker_num = 4
     supports_mm_processor_concurrency = False
@@ -1510,6 +1513,7 @@ class BaseMultimodalProcessor(ABC):
             # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
             if (
                 envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and not self.preserve_processor_input_ids
                 and base_output.input_ids is not None
                 and input_ids is not None
                 and raw_images

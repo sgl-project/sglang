@@ -411,8 +411,7 @@ def launch_pool_disagg_server(
                 "pool_work_endpoint": work_eps[inst_idx],
                 "pool_result_endpoint": result_ep,
                 "num_gpus": num_role_gpus,
-                "warmup": role_type == RoleType.ENCODER,
-                "server_warmup": False,
+                "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
                 # Per-role parallelism (None = auto-derive from num_gpus)
@@ -692,8 +691,7 @@ def launch_disagg_role(server_args: ServerArgs):
         "disagg_mode": True,
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
-        "warmup": role_type == RoleType.ENCODER,
-        "server_warmup": False,
+        "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
         "tp_size": role_par["tp_size"],

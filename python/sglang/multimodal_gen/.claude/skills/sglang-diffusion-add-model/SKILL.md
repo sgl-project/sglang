@@ -86,7 +86,7 @@ points cannot silently diverge.
 | Model/VAE/DiT configs | `python/sglang/multimodal_gen/configs/models/dits/`, `vaes/`, `encoders/` |
 | Central registry | `python/sglang/multimodal_gen/registry.py` |
 | Model component registry | `python/sglang/multimodal_gen/runtime/models/registry.py` |
-| Current support list | `docs_new/docs/sglang-diffusion/compatibility_matrix.mdx` |
+| Current support list | `docs/docs/sglang-diffusion/compatibility_matrix.mdx` |
 
 ---
 

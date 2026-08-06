@@ -127,6 +127,9 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_target_verify_war_read_done(self) -> bool:
+        return self.is_dflash_family()
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
@@ -182,6 +185,14 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            return build_dspark_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
         return None

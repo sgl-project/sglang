@@ -220,14 +220,14 @@ class TestRebuildCompactDraftReqToToken(CustomTestCase):
 
 
 class TestHybridNeedsCpuSeqLens(CustomTestCase):
-    def _make(self, prefill_flag, decode_flag):
+    def _make(self, prefill_flag, decode_flag, spec_mode="decode"):
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
         def backend(flag):
             return SimpleNamespace(needs_cpu_seq_lens=flag)
 
         runner = SimpleNamespace(
-            server_args=SimpleNamespace(speculative_attention_mode="decode"),
+            server_args=SimpleNamespace(speculative_attention_mode=spec_mode),
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
@@ -236,9 +236,15 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         return HybridAttnBackend(runner, backend(prefill_flag), backend(decode_flag))
 
     def test_delegation(self):
+        # Only backends serving the spec decode loop count: decode always,
+        # prefill only when speculative_attention_mode routes verify to it.
         self.assertFalse(self._make(False, False).needs_cpu_seq_lens)
-        self.assertTrue(self._make(True, False).needs_cpu_seq_lens)
+        self.assertFalse(self._make(True, False).needs_cpu_seq_lens)
         self.assertTrue(self._make(False, True).needs_cpu_seq_lens)
+        self.assertTrue(self._make(True, False, spec_mode="prefill").needs_cpu_seq_lens)
+        self.assertFalse(
+            self._make(False, False, spec_mode="prefill").needs_cpu_seq_lens
+        )
 
 
 class TestFilterBatchHostIndices(CustomTestCase):

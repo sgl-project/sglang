@@ -108,7 +108,14 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if dst_device_kv_indices is not None:
+            raise NotImplementedError(
+                "Ascend PD transfer does not support HiSparse "
+                "destination device KV indices"
+            )
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices

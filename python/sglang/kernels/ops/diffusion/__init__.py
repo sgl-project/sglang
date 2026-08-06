@@ -44,6 +44,18 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="diffusion.fused_linear_gelu_tanh",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.diffusion.fused_linear_gelu:fused_linear_gelu_tanh",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            description="linear + tanh-GELU via the cublasLt GELU epilogue"
+        ),
+        description="Fused up-proj GEMM + tanh-GELU (torch._addmm_activation).",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="diffusion.fused_inplace_qknorm_rope",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.diffusion.qknorm_rope:fused_inplace_qknorm_rope",

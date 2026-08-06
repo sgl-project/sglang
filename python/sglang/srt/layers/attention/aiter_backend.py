@@ -2339,8 +2339,7 @@ class AiterAttnBackend(AttentionBackend):
                 window_size = (layer.sliding_window_size, -1)
 
             if (
-                get_bool_env_var("SGLANG_AITER_FMHA_FP8_ASM", "False")
-                and is_gfx95_supported()
+                is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
                 and forward_batch.extend_prefix_lens_cpu is not None
                 and not any(forward_batch.extend_prefix_lens_cpu)
@@ -2361,9 +2360,9 @@ class AiterAttnBackend(AttentionBackend):
                     q_c.to(fp8_dtype),
                     k_c.to(fp8_dtype),
                     v_c.to(fp8_dtype),
-                    fp8_q_descale,
-                    k_descale,
-                    v_descale,
+                    fp8_q_descale.reshape(1),
+                    k_descale.reshape(1),
+                    v_descale.reshape(1),
                     self.qo_indptr[:bs0],
                     self.qo_indptr[:bs0],
                     self.forward_metadata.max_q_len,

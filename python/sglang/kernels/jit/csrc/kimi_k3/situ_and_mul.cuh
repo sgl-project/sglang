@@ -18,9 +18,11 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_fp8.h>
 #include <limits>
 #include <type_traits>
+#ifndef USE_ROCM
+#include <cuda_fp8.h>
+#endif
 
 namespace sglang {
 

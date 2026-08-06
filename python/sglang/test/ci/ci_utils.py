@@ -36,6 +36,14 @@ RETRIABLE_PATTERNS = [
     r"timeout",
 ]
 
+# XPU/B580 device-resource flakes. Matched BEFORE the non-retriable list so
+# transient GPU OOMs / slow cold-cache server starts get one clean re-run.
+INFRA_RETRIABLE_PATTERNS = [
+    r"UR_RESULT_ERROR_OUT_OF_RESOURCES",
+    r"XPU out of memory",
+    r"Server failed to start within the timeout",
+]
+
 # Patterns that indicate non-retriable failures (real code errors)
 NON_RETRIABLE_PATTERNS = [
     r"SyntaxError",
@@ -61,6 +69,11 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     Returns:
         tuple: (is_retriable, reason)
     """
+    # XPU infra flakes take precedence over the non-retriable list.
+    for pattern in INFRA_RETRIABLE_PATTERNS:
+        if re.search(pattern, output, re.IGNORECASE):
+            return True, f"retriable XPU infra flake: {pattern}"
+
     # Check for non-retriable patterns first
     for pattern in NON_RETRIABLE_PATTERNS:
         if re.search(pattern, output, re.IGNORECASE):
@@ -269,6 +282,17 @@ def run_unittest_files(
                 # record the timeout cap as an upper bound so the file still
                 # appears in the TIMINGS block below.
                 file_elapsed[filename] = float(timeout_per_file)
+                # Retry once on timeout: usually a stuck server / hung device.
+                # A real hang times out again and is reported.
+                if enable_retry and attempt < max_attempts:
+                    logger.info(
+                        f"\n[CI Retry] {filename} timed out after "
+                        f"{timeout_per_file}s; waiting {retry_wait_seconds}s "
+                        f"before retry (attempt {attempt + 1}/{max_attempts})\n"
+                    )
+                    time.sleep(retry_wait_seconds)
+                    attempt += 1
+                    continue
                 logger.info(
                     f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
                 )

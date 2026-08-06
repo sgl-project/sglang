@@ -22,11 +22,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     _compute_pad_value,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMmHashesContract(CustomTestCase):
@@ -76,6 +75,15 @@ class TestMmHashesContract(CustomTestCase):
         a.set_pad_value()
         b.set_pad_value()
         self.assertNotEqual(a.pad_value, b.pad_value)
+
+    def test_set_hash_updates_an_existing_pad_value(self):
+        item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xAAAA)
+        item.set_pad_value()
+
+        item.set_hash(0xBBBB)
+
+        self.assertEqual(item.hash, 0xBBBB)
+        self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
 
 
 if __name__ == "__main__":

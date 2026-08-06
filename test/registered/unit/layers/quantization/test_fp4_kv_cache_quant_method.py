@@ -75,6 +75,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         runner = object.__new__(ModelRunner)
         runner.server_args = SimpleNamespace(kv_cache_dtype="fp4_e2m1")
+        runner.draft_attention_backend = None
         with self.assertRaisesRegex(ValueError, "fp4_mx_block16"):
             runner.configure_kv_cache_dtype()
 
