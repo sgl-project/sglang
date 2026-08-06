@@ -58,7 +58,7 @@ class TestLongCatFlashLiteFp8(unittest.TestCase):
                 num_examples=200,
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_longcat_flash_lite_fp8",
+                result_dir="performance_results_longcat_flash_lite_fp8",
             ),
         )
 
