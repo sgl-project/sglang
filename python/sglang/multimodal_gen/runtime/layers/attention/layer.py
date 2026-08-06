@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import os
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -10,12 +11,15 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
     build_inv_indices,
     fused_pack_qkv,
     fused_scatter_to_padded,
 )
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
@@ -40,7 +44,9 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _ipc_input_a2a_qkv,
     _usp_input_all_to_all,
+    _usp_input_all_to_all_qkv,
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
@@ -52,6 +58,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
@@ -171,6 +181,38 @@ def build_varlen_mask_meta_from_ranges(
     }
 
 
+class DynamicVarlenMaskMeta:
+    """Replay-local builder for varlen attention metadata.
+
+    BCG attention break points capture Python kwargs once. Passing a plain
+    ``attn_mask_meta`` dict would replay stale cu_seqlens/indices when the same
+    graph bucket is reused for a different prompt length. This helper keeps only
+    replay-local metadata and rebuilds it from the current ``attn_mask`` tensor
+    on the first attention block of each graph replay.
+    """
+
+    def __init__(self) -> None:
+        self._cache_key = None
+        self._meta = None
+
+    def resolve(self, attn_mask: torch.Tensor | None) -> dict | None:
+        if attn_mask is None:
+            self._cache_key = None
+            self._meta = None
+            return None
+
+        replay_token = get_current_replay_token()
+        if replay_token is None:
+            cache_key = ("capture", id(attn_mask), tuple(attn_mask.shape))
+        else:
+            cache_key = ("replay", replay_token, tuple(attn_mask.shape))
+
+        if cache_key != self._cache_key:
+            self._meta = build_varlen_mask_meta(attn_mask)
+            self._cache_key = cache_key
+        return self._meta
+
+
 class UlyssesAttention(nn.Module):
     """Ulysses-style SequenceParallelism attention layer."""
 
@@ -186,6 +228,14 @@ class UlyssesAttention(nn.Module):
         **extra_impl_args,
     ) -> None:
         super().__init__()
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "UlyssesAttention's all-to-all spans the combined sequence "
+                "parallel group and is not ring-aware; it would silently "
+                "shuffle across ring ranks instead of rotating KV within "
+                "them. Ring parallelism is not supported for models still "
+                "using UlyssesAttention -- use USPAttention instead."
+            )
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -380,6 +430,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -390,7 +441,7 @@ class LocalAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        dtype = get_compute_dtype()
+        dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
@@ -578,6 +629,7 @@ class USPAttention(nn.Module):
         num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
+        qkv_pre_all_to_all: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -612,6 +664,9 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+            attn_mask_meta = attn_mask_meta.resolve(attn_mask)
+
         # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
         # pad span) also opts into the masked SP branch. gap_* = legacy alias.
         meta_pad_start = meta_pad_end = None
@@ -725,10 +780,12 @@ class USPAttention(nn.Module):
                 )
 
             sp_size = get_ulysses_parallel_world_size()
-            if sp_size > 1:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+            if sp_size > 1 and not qkv_pre_all_to_all:
+                qkv_fast = _ipc_input_a2a_qkv(q, k, v)
+                if qkv_fast is not None:
+                    q, k, v = qkv_fast
+                else:
+                    q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
             if (
                 _VARLEN_FA_ENABLED
@@ -909,7 +966,7 @@ class USPAttention(nn.Module):
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
-        if sp_size > 1:
+        if sp_size > 1 and not qkv_pre_all_to_all:
             # -> [B, S, H_local, D]
             if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
                 q, k, v = async_a2a_communicate(
@@ -923,9 +980,7 @@ class USPAttention(nn.Module):
                 k = k.contiguous()
                 v = v.contiguous()
             else:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -967,6 +1022,11 @@ class USPAttention(nn.Module):
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
         """
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-prefix/suffix path does not support "
+                "ring parallelism yet."
+            )
         sp_size = get_ulysses_parallel_world_size()
         sp_rank = get_sp_parallel_rank()
 
@@ -1074,6 +1134,11 @@ class USPAttention(nn.Module):
         ctx_attn_metadata,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-kv-prefix path does not support "
+                "ring parallelism yet."
+            )
         sp_rank = get_sp_parallel_rank()
 
         if q.device.type == "cuda":
@@ -1134,3 +1199,62 @@ class USPAttention(nn.Module):
         )
         out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
         return torch.cat([out_shard, out_rep], dim=1)
+
+
+class _BCGBoxedTupleOutput:
+    """Box a tuple-returning break-point output as tensor attributes.
+
+    ``_copy_output`` copies tensors and objects-with-tensor-attributes in
+    place across replays but ignores tuples, so tuple-returning attention
+    forwards (``UlyssesAttention``) are boxed for the break point and
+    unboxed after.
+    """
+
+    def __init__(self, values: tuple) -> None:
+        self.num_values = len(values)
+        for i, value in enumerate(values):
+            setattr(self, f"value_{i}", value)
+
+    def astuple(self) -> tuple:
+        return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
+
+
+def _make_breakable_attention_forward(forward_method):
+    """Wrap a DiT attention module's ``forward`` so it becomes a breakable
+    CUDA graph (BCG) break point.
+
+    During BCG capture the whole attention forward runs eagerly between
+    captured graph segments -- the sequence-parallel all-to-all collectives,
+    varlen packing, and dynamic/sparse attention kernels that live here
+    cannot (or should not) be captured into a static CUDA graph. When BCG is
+    disabled this is a transparent pass-through to the original method.
+    """
+
+    def _forward_boxing_tuples(*args, **kwargs):
+        out = forward_method(*args, **kwargs)
+        return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
+
+    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
+
+    @functools.wraps(forward_method)
+    def forward(self, *args, **kwargs):
+        if is_in_breakable_cuda_graph():
+            out = bcg_forward(self, *args, **kwargs)
+            return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
+        return forward_method(self, *args, **kwargs)
+
+    return forward
+
+
+# Install the break points on every DiT attention entry point. All diffusion
+# models route attention through one of these modules (e.g. FLUX -> USPAttention),
+# so wrapping here gives universal, model-agnostic BCG break points without
+# touching individual model files.
+for _attn_cls in (
+    UlyssesAttention,
+    UlyssesAttention_VSA,
+    LocalAttention,
+    USPAttention,
+):
+    _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
+del _attn_cls

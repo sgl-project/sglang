@@ -33,11 +33,17 @@ def _disable_remote_official_gt_case_map(monkeypatch):
 
 
 def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
-    revision_path = f"/ci-data/{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
-
-    assert "/ci-data/main/" not in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_ROOT
-    assert revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
-    assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+    # GT must be pinned to an immutable commit (not a moving branch) so results are
+    # reproducible and the per-URL download cache invalidates on regeneration.
+    assert test_utils.SGL_TEST_FILES_CI_DATA_REVISION != "main"
+    pinned_revision_path = (
+        f"/{test_utils.SGL_TEST_FILES_CI_DATA_REPO}/"
+        f"{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
+    )
+    assert (
+        pinned_revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
+    )
+    assert pinned_revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
 def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
@@ -410,6 +416,37 @@ def test_consistency_gt_case_alias_reuses_canonical_filename(monkeypatch):
         "h100/zimage_image_t2i_2_gpus_2gpu.jpg",
         "h100/zimage_image_t2i_2_gpus_2gpu.png",
         "h100/zimage_image_t2i_2_gpus_2gpu.webp",
+    ]
+
+
+def test_action_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_action_consistency_gt_candidates("unit_action", 1) == [
+        "h100/unit_action_1gpu.json",
+        "unit_action_1gpu.json",
+    ]
+
+
+def test_remote_action_gt_uses_sglang_generated(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_action_consistency_gt_files("unit_action", 1)
+
+    assert files == [
+        (
+            "h100/unit_action_1gpu.json",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/h100/unit_action_1gpu.json"
+            ),
+        )
     ]
 
 

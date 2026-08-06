@@ -34,8 +34,6 @@ _PINNED_GLOBALS = {
             # DP-attention topology (parallel vertical scope).
             "_ATTN_DP_RANK",
             "_ATTN_DP_SIZE",
-            "_LOCAL_ATTN_DP_SIZE",
-            "_LOCAL_ATTN_DP_RANK",
         }
     ),
 }

@@ -131,6 +131,10 @@ class TransformerQuantLoadSpec:
             return self.quant_config
         return self.nunchaku_config
 
+    @property
+    def is_modelopt_fp4(self) -> bool:
+        return _get_quant_config_name(self.quant_config) == "modelopt_fp4"
+
 
 class _TransformerQuantAdapter:
     def prepare(self) -> None:
@@ -601,7 +605,12 @@ def _resolve_quant_config(
         # in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
-        return quant_cls()
+        quant_kwargs = {}
+        if server_args.quantization in {"fp8", "mxfp4"}:
+            quant_kwargs["ignored_layers"] = getattr(
+                server_args, "quantization_ignored_layers", None
+            )
+        return quant_cls(**quant_kwargs)
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
@@ -615,10 +624,12 @@ def _resolve_quant_config(
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None
     )
+    quant_ignore_remap_dict = getattr(arch_config, "quant_ignore_remap", None)
     quant_config = get_quant_config(
         hf_config,
         component_model_path,
         reverse_param_names_mapping=reverse_param_names_mapping_dict,
+        quant_ignore_remap=quant_ignore_remap_dict,
     )
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None

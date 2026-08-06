@@ -20,9 +20,11 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import (
+    Annotated,
     Any,
     Dict,
     List,
+    Literal,
     NamedTuple,
     Optional,
     Protocol,
@@ -42,7 +44,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -212,7 +213,7 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = False
+    strict: Optional[bool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -337,10 +338,11 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
-    return_hidden_states: bool = False
+    return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -425,12 +427,18 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
         return data
 
 
@@ -459,12 +467,18 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
         return data
 
 
@@ -488,6 +502,20 @@ class CompletionStreamResponse(BaseModel):
 class ChatCompletionMessageContentTextPart(BaseModel):
     type: Literal["text"]
     text: str
+
+
+class ChatCompletionMessageContentThinkingPart(BaseModel):
+    type: Literal["thinking", "reasoning"]
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (self.thinking is None) == (self.text is None):
+            raise ValueError(
+                "thinking parts require exactly one of 'thinking' or 'text'"
+            )
+        return self
 
 
 class ChatCompletionMessageContentImageURL(BaseModel):
@@ -536,6 +564,7 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -596,10 +625,30 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if self.role != "assistant" and isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -638,6 +687,11 @@ class Tool(BaseModel):
         return self
 
 
+# Tool is defined after the message params that reference it, so the forward
+# reference has to be resolved explicitly.
+ChatCompletionMessageGenericParam.model_rebuild()
+
+
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
@@ -649,6 +703,35 @@ class ToolChoice(BaseModel):
 
     function: ToolChoiceFuncName
     type: Literal["function"] = Field(default="function", examples=["function"])
+
+
+# OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
+# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+ReasoningEffortTier = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
+# Chat Completions and /v1/tokenize additionally accept a fine-grained float in
+# [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
+# /v1/responses surface deliberately keeps the string tiers only). Single-sourced
+# so these surfaces cannot drift apart.
+ReasoningEffortType = Optional[
+    Union[
+        ReasoningEffortTier,
+        Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
+    ]
+]
+
+
+def _has_message_level_tools(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and isinstance(message.get("role"), str)
+        and message["role"].lower() in ("system", "developer")
+        and bool(message.get("tools"))
+        for message in messages
+    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -688,15 +771,18 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     parallel_tool_calls: bool = True
-    return_hidden_states: bool = False
+    return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
+    return_token_ids: bool = False
     return_meta_info: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
+    reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
@@ -790,21 +876,52 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+            if values.get("tools") is None and not _has_message_level_tools(
+                values.get("messages")
+            ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
         return values
 
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def validate_reasoning_effort_type(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("reasoning_effort must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
+        thinking = None
 
         if r is not None and isinstance(r, dict):
-            effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            effort = r.get("effort")
+            if effort is None:
+                effort = r.get("reasoning_effort")
+            if isinstance(effort, str) and effort in {
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }:
                 values["reasoning_effort"] = effort
+            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
+                values["reasoning_effort"] = float(effort)
+            elif isinstance(effort, str):
+                # Keep parity with the top-level reasoning_effort field, whose
+                # lax union coerces numeric strings; range checks then apply.
+                try:
+                    values["reasoning_effort"] = float(effort)
+                except ValueError as exc:
+                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
+            elif effort is not None:
+                raise ValueError(f"invalid reasoning effort: {effort!r}")
 
             enabled = (
                 r.get("enabled")
@@ -814,25 +931,21 @@ class ChatCompletionRequest(BaseModel):
             if isinstance(enabled, str):
                 enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
             if enabled:
-                ctk = values.get("chat_template_kwargs")
-                if not isinstance(ctk, dict):
-                    ctk = {}
-                # different models check different keys:
-                # - "thinking" for deepseek-v3, kimi_k2
-                # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1, mimo
-                ctk.setdefault("thinking", True)
-                ctk.setdefault("enable_thinking", True)
-                values["chat_template_kwargs"] = ctk
+                thinking = True
 
-        if values.get("reasoning_effort") == "none":
+        effort = values.get("reasoning_effort")
+        if effort is not None:
+            thinking = effort != "none"
+
+        if thinking is not None:
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
             # different models check different keys:
             # - "thinking" for deepseek-v3, kimi_k2
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", False)
-            ctk.setdefault("enable_thinking", False)
+            ctk.setdefault("thinking", thinking)
+            ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
         return values
@@ -855,11 +968,10 @@ class ChatCompletionRequest(BaseModel):
 
         if schema:
             name_ = schema.get("title", "Schema")
-            strict_ = False
+            strict_ = None
             if "properties" in schema and "strict" in schema["properties"]:
                 item = schema["properties"].pop("strict", None)
-                if item and item.get("default", False):
-                    strict_ = True
+                strict_ = bool(item and item.get("default", False))
 
             response_format["json_schema"] = {
                 "name": name_,
@@ -874,6 +986,7 @@ class ChatCompletionRequest(BaseModel):
         stop: List[str],
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        renderer_handles_response_format: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -921,9 +1034,15 @@ class ChatCompletionRequest(BaseModel):
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
-            )
+            # strict=false may only go unconstrained when the renderer forwards
+            # response_format to the model; plain chat templates never see it.
+            if (
+                self.response_format.json_schema.strict is not False
+                or not renderer_handles_response_format
+            ):
+                sampling_params["json_schema"] = convert_json_schema_to_str(
+                    self.response_format.json_schema.schema_
+                )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
@@ -976,6 +1095,7 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     prompt_token_ids: Optional[List[int]] = None
+    token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
@@ -985,6 +1105,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
         return data
@@ -1086,7 +1208,7 @@ class EmbeddingRequest(BaseModel):
 
 
 class EmbeddingObject(BaseModel):
-    embedding: List[float]
+    embedding: Union[List[float], str]
     index: int
     object: str = "embedding"
 
@@ -1234,7 +1356,7 @@ class TokenizeRequest(BaseModel):
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
         Field(default=None, examples=["auto"])
     )
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = None
+    reasoning_effort: ReasoningEffortType = None
     continue_final_message: bool = False
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
@@ -1300,9 +1422,11 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[ReasoningEffortTier] = Field(
         default="medium",
-        description="Constrains effort on reasoning for reasoning models.",
+        description="Constrains effort on reasoning for reasoning models. "
+        "Accepts the OpenAI string tiers "
+        "('none','minimal','low','medium','high','xhigh','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1682,22 +1806,6 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
-    """Result of processing chat messages and applying templates.
-
-    This dataclass encapsulates all the outputs from message processing including
-    prompt generation, multimodal data extraction, and constraint preparation.
-    Used internally by OpenAIServingChat to pass processed data between methods.
-
-    Args:
-        prompt: The final text prompt after applying chat template
-        prompt_ids: Either the text prompt (str) or tokenized IDs (List[int])
-        image_data: Extracted image data from messages, if any
-        audio_data: Extracted audio data from messages, if any
-        modalities: List of modality types present in the messages
-        stop: Combined stop strings from template and request
-        tool_call_constraint: Optional constraint for structured tool calls
-    """
-
     prompt: str
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
@@ -1706,6 +1814,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    require_reasoning: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
