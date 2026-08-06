@@ -465,11 +465,11 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             raise ValueError(
                 "Cannot find 'quant_algo' in the model's quantization config. "
             )
-        if "FP8" not in quant_method:
+        if quant_method != "FP8":
             raise ValueError(
-                "ModelOptFp8Config only supports static FP8 quantization in SGLang. "
-                "For FP4 quantization, use ModelOptFp4Config. "
-                "Check the quantization config for your model's configuration."
+                "ModelOptFp8Config only supports regular FP8 quantization, "
+                f"but found {quant_method!r}. Use the native 'mxfp8' "
+                "quantization method for MXFP8 or ModelOptFp4Config for FP4."
             )
 
         return cls(

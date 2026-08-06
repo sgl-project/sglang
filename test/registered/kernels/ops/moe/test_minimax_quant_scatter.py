@@ -14,6 +14,7 @@ from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
     per_token_quant_fp8_ue8m0,
     per_token_quant_fp8_ue8m0_scatter,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmMoeQuantInfo,
@@ -158,6 +159,37 @@ def test_compact_all_tokens_uses_tight_routing_independent_bound(
     )
 
 
+def test_standard_layout_auto_memory_policy(monkeypatch):
+    config = MoeRunnerConfig(
+        num_experts=512,
+        num_local_experts=512,
+        hidden_size=4096,
+        intermediate_size_per_partition=256,
+        top_k=8,
+    )
+    quant_info = DeepGemmMoeQuantInfo(
+        w13_weight=torch.empty((1, 512, 1), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((1, 4096, 1), dtype=torch.float8_e4m3fn),
+        use_fp8=True,
+        block_shape=[128, 128],
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner,
+        "_masked_standard_layout_memory_budget_bytes",
+        int(42.5 * (1 << 30)),
+    )
+
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
+        for num_tokens, expected in ((8192, True), (16384, False)):
+            hidden_states = torch.empty((num_tokens, 4096), device="meta")
+            assert (
+                deep_gemm_runner._should_use_masked_standard_layout(
+                    config, quant_info, hidden_states
+                )
+                is expected
+            )
+
+
 @pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])
 def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_dtype):
     """Exercise both production grouped GEMMs through the standard path."""
@@ -252,9 +284,9 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
         topk_output=(topk_weights, topk_ids, None),
     )
 
-    def run_with_num_experts(num_experts):
+    def run_with_layout(layout):
         config = MoeRunnerConfig(
-            num_experts=num_experts,
+            num_experts=8,
             num_local_experts=num_local_experts,
             hidden_size=hidden,
             intermediate_size_per_partition=intermediate,
@@ -264,12 +296,13 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
             inplace=False,
         )
         running_state = {}
-        runner_input = pre_permute_standard_to_deep_gemm(
-            dispatch_output,
-            quant_info,
-            config,
-            running_state,
-        )
+        with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override(layout):
+            runner_input = pre_permute_standard_to_deep_gemm(
+                dispatch_output,
+                quant_info,
+                config,
+                running_state,
+            )
         runner_output = DeepGemmRunnerCore(config).run(
             runner_input,
             quant_info,
@@ -288,10 +321,10 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
         )
 
     compact_is_masked, compact_all_tokens, compact_m_indices, compact_output = (
-        run_with_num_experts(num_local_experts)
+        run_with_layout("compact")
     )
     masked_is_masked, masked_all_tokens, masked_m_indices, masked_output = (
-        run_with_num_experts(8)
+        run_with_layout("masked")
     )
     torch.cuda.synchronize()
 
