@@ -118,6 +118,7 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -2911,10 +2912,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast
-                # kernel per MoE layer per step.
+                # kernel per MoE layer per step. If aiter, the router takes the
+                # gate-logit dtype instead, so match that one to the same end.
                 bias = layer.mlp.gate.e_score_correction_bias
-                if bias.dtype != torch.float32:
-                    bias.data = bias.data.to(torch.float32)
+                _bias_dtype = (
+                    layer.mlp.gate.weight.dtype if _use_aiter else torch.float32
+                )
+                if bias.dtype != _bias_dtype:
+                    bias.data = bias.data.to(_bias_dtype)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
