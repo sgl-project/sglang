@@ -791,7 +791,10 @@ class ServerArgs:
     ] = None
     chunked_prefill_size: A[
         Optional[int],
-        "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        Arg(
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+            resolvable=True,
+        ),
         NS("schedule"),
     ] = None
     enable_dynamic_chunking: A[

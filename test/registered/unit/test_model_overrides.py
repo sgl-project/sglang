@@ -63,6 +63,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "chunked_prefill_size",
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
@@ -403,6 +404,58 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     None,
                 ),
                 [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
+            )
+
+    def test_lfm2_vl_sm100_declarations(self):
+        """LFM2-VL was missing from the LFM2 registration, so SM100 default
+        backend selection picked FA4, which forces page_size 1 -> 128 and
+        trips the hybrid conv cache's page_size=1 startup assert; chunked
+        multimodal prefill also misassembles one encoder item per request.
+        Pin the VL-specific declaration against both regressions."""
+        from sglang.srt.arg_groups.overrides import _lfm2_overrides
+
+        vl_config = SimpleNamespace(architectures=["Lfm2VlForConditionalGeneration"])
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _lfm2_overrides(SimpleNamespace(attention_backend=None), vl_config),
+                {"attention_backend": "flashinfer", "chunked_prefill_size": -1},
+            )
+            # A user-chosen language backend survives; the prefill force stays.
+            self.assertEqual(
+                _lfm2_overrides(SimpleNamespace(attention_backend="triton"), vl_config),
+                {"chunked_prefill_size": -1},
+            )
+            # Text-only LFM2 keeps the backend-only declaration.
+            self.assertEqual(
+                _lfm2_overrides(
+                    SimpleNamespace(attention_backend=None),
+                    SimpleNamespace(architectures=["Lfm2ForCausalLM"]),
+                ),
+                {"attention_backend": "flashinfer"},
+            )
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            self.assertEqual(
+                _lfm2_overrides(SimpleNamespace(attention_backend=None), vl_config),
+                {},
+            )
+
+    def test_lfm2_vl_is_registered(self):
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "Lfm2VlForConditionalGeneration",
+                    SimpleNamespace(attention_backend=None),
+                    SimpleNamespace(architectures=["Lfm2VlForConditionalGeneration"]),
+                ),
+                [
+                    (
+                        "_lfm2_overrides",
+                        {
+                            "attention_backend": "flashinfer",
+                            "chunked_prefill_size": -1,
+                        },
+                    )
+                ],
             )
 
     def test_step3p_hierarchical_cache_golden(self):
@@ -1892,7 +1945,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
             self.assertEqual(
-                _lfm2_overrides(_args(), None), {"attention_backend": "flashinfer"}
+                _lfm2_overrides(
+                    _args(), SimpleNamespace(architectures=["Lfm2ForCausalLM"])
+                ),
+                {"attention_backend": "flashinfer"},
             )
         with patch.object(overrides_module, "is_sm100_supported", return_value=False):
             self.assertEqual(_minicpm_v4_6_overrides(_args(), None), {})
