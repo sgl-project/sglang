@@ -31,10 +31,10 @@ from sglang.srt.disaggregation.encode_server import (
     MMError,
 )
 from sglang.srt.disaggregation.encoder_runtime import (
-    _BATCHABLE_MODALITIES,
     DPDispatcher,
     EncoderRuntime,
     EncoderScheduler,
+    execute_encode_pipeline,
     launch_dp_runtime,
     launch_local_runtime,
 )
@@ -45,7 +45,6 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -263,7 +262,6 @@ async def handle_encode_request(request: dict):
     req_id = request["req_id"]
     start_time = time.monotonic()
     time_stats_json = request.pop("time_stats_json", None)
-    time_stats = EncoderReqTimeStats()
     if dp_dispatcher is not None:
         if time_stats_json:
             request = dict(request)
@@ -320,7 +318,6 @@ async def handle_encode_request(request: dict):
             )
         return ORJSONResponse(content=content)
 
-    modality_str = str(request.get("modality", "image")).lower()
     try:
         # A pre-pull receiver sends the same req_id once per TP rank; only the
         # claimer runs the forward and the rest echo its metadata.
@@ -357,161 +354,39 @@ async def handle_encode_request(request: dict):
             )
             return ORJSONResponse(content=resp)
 
-        def start_background_send(req_id):
-            task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
-            encoder.background_tasks.add(task)
-            task.add_done_callback(encoder.background_tasks.discard)
-
-        request.update({"enter_time": time.time()})
-        modality = Modality.from_str(request["modality"])
-        if time_stats_json:
-            time_stats.decode_json(time_stats_json)
-
-        modality_str = modality.name.lower()
-        time_stats.modality = modality_str
-        time_stats.set_metrics_collector(encode_server_module.encoder_metrics_collector)
-        time_stats.set_mm_encode_start_time()
-        if encode_server_module.encoder_metrics_collector is not None:
-            encode_server_module.encoder_metrics_collector.inc_requests_received(
-                modality=modality_str
+        try:
+            if time_stats_json:
+                request["time_stats_json"] = time_stats_json
+            content = await execute_encode_pipeline(
+                encoder,
+                encoder_scheduler,
+                request,
+                send_sockets=send_sockets,
             )
-        if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
-            try:
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder_scheduler.submit(request)
-                )
-            except asyncio.TimeoutError:
-                if encoder.server_args.encoder_transfer_backend == "mooncake":
-                    await encode_server_module.meta_registry.publish(
-                        req_id, 0, 0, 0, error="encoder batch timed out"
-                    )
-                    encoder.discard_embedding(req_id)
-                time_stats.trace_ctx.abort(
-                    abort_info={"reason": "encoder batch timed out"}
-                )
-                return ORJSONResponse(
-                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
-                    content={
-                        "status": "error",
-                        "message": "encoder batch timed out",
-                        "req_id": req_id,
-                    },
-                )
-        else:
-            # Lock direct dispatch together with rank0 await so its NCCL launch
-            # order matches the ZMQ dispatch order rank>0 sees.
-            async with encoder.encode_dispatch_lock:
-                for socket in send_sockets:
-                    sock_send(socket, wrap_as_pickle(request))
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode_request(request, modality)
-                )
-
-        if error_msg:
-            time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        else:
-            time_stats.set_mm_encode_end_time()
-
-        if error_msg:
-            if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
-                if request["embedding_port"] is None:
-                    start_background_send(req_id)
-                else:
-                    for port in request["embedding_port"]:
-                        await encoder.send(
-                            req_id=req_id,
-                            prefill_host=request["prefill_host"],
-                            embedding_port=port,
-                        )
-            # Drop only the embedding: discarding the metadata here would
-            # strand a waiter that has been notified but not yet resumed.
-            if encoder.server_args.encoder_transfer_backend == "mooncake":
-                await encode_server_module.meta_registry.publish(
-                    req_id, 0, 0, 0, error=error_msg
-                )
-                encoder.discard_embedding(req_id)
-            if encode_server_module.encoder_metrics_collector is not None:
-                encode_server_module.encoder_metrics_collector.inc_requests_total(
-                    modality=modality_str, status="error"
-                )
+        except asyncio.TimeoutError:
             return ORJSONResponse(
-                status_code=error_code,
-                content={"status": "error", "message": error_msg, "req_id": req_id},
+                status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                content={
+                    "status": "error",
+                    "message": "encoder batch timed out",
+                    "req_id": req_id,
+                },
             )
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
-            # Dual-write: pulling decoders read the registry, pre-pull ones read
-            # this response. Same values, so either generation of prefill works.
-            await encode_server_module.meta_registry.publish(
-                req_id, nbytes, embedding_len, embedding_dim
+        except MMError as e:
+            return ORJSONResponse(
+                status_code=int(e.code),
+                content={"status": "error", "message": str(e), "req_id": req_id},
             )
-            del request["mm_items"]
-            request.update(
-                {
-                    "embedding_size": nbytes,
-                    "embedding_len": embedding_len,
-                    "embedding_dim": embedding_dim,
-                }
-            )
-            if encode_server_module.encoder_metrics_collector is not None:
-                encode_server_module.encoder_metrics_collector.inc_requests_total(
-                    modality=modality_str, status="success"
-                )
-            return ORJSONResponse(content=request)
-        elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
-            logger.info(f"{request['embedding_port'] = }")
-            if request["embedding_port"] is None:
-                await encoder.send_with_url(
-                    req_id=request["req_id"],
-                )
-            else:
-                assert type(request["embedding_port"]) == list
-                tasks = []
-                for embedding_port in request["embedding_port"]:
-                    tasks.append(
-                        encoder.send(
-                            req_id=request["req_id"],
-                            prefill_host=request["prefill_host"],
-                            embedding_port=embedding_port,
-                        )
-                    )
-                await asyncio.gather(*tasks)
-                encoder.discard_embedding(request["req_id"])
-            if encode_server_module.encoder_metrics_collector is not None:
-                encode_server_module.encoder_metrics_collector.inc_requests_total(
-                    modality=modality_str, status="success"
-                )
-            return ORJSONResponse(content=None)
-        elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
-            await encoder.send(
-                req_id=request["req_id"],
-                prefill_host=request["prefill_host"],
-                embedding_port=request["embedding_port"],
-            )
-            encoder.discard_embedding(request["req_id"])
-            elapsed = time.monotonic() - start_time
-            logger.info(
-                f"[{req_id}] /encode completed in {elapsed:.3f}s, "
-                f"modality={request['modality']}, tokens={embedding_len}"
-            )
-            if encode_server_module.encoder_metrics_collector is not None:
-                encode_server_module.encoder_metrics_collector.inc_requests_total(
-                    modality=modality_str, status="success"
-                )
-            return ORJSONResponse(content=None)
+
+        elapsed = time.monotonic() - start_time
+        logger.info(
+            f"[{req_id}] /encode completed in {elapsed:.3f}s, "
+            f"modality={request.get('modality', 'image')}"
+        )
+        return ORJSONResponse(content=content)
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
-        # Ensure metadata waiters are unblocked on unexpected errors
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
-            await encode_server_module.meta_registry.publish(
-                req_id, 0, 0, 0, error=error_msg
-            )
-        # All backends: drop any staged embedding, or it pins /health as busy.
-        encoder.discard_embedding(req_id)
-        if encode_server_module.encoder_metrics_collector is not None:
-            encode_server_module.encoder_metrics_collector.inc_requests_total(
-                modality=modality_str, status="error"
-            )
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
@@ -615,11 +490,44 @@ async def handle_scheduler_receive_meta_data(request: dict):
 
 @app.post("/scheduler_receive_url")
 async def handle_scheduler_receive_url_request(request: dict):
+    if dp_dispatcher is not None:
+        try:
+            result = await dp_dispatcher.dispatch_register_destinations(request)
+        except MMError as e:
+            return ORJSONResponse(
+                status_code=int(e.code),
+                content={
+                    "status": "error",
+                    "message": str(e),
+                    "req_id": request["req_id"],
+                },
+            )
+        if result.get("_error"):
+            return ORJSONResponse(
+                status_code=result.get("_error_code")
+                or int(HTTPStatus.INTERNAL_SERVER_ERROR),
+                content={
+                    "status": "error",
+                    "message": result["_error"],
+                    "req_id": request["req_id"],
+                },
+            )
+        return ORJSONResponse(content=None)
+    if encoder is None:
+        return ORJSONResponse(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            content={
+                "status": "error",
+                "message": "encoder not ready",
+                "req_id": request["req_id"],
+            },
+        )
     await encoder.register_embedding_destinations(
         request["req_id"],
         request["receive_count"],
         [request["receive_url"]],
     )
+    return ORJSONResponse(content=None)
 
 
 @app.get("/health")
@@ -697,7 +605,7 @@ async def health_generate():
         )
 
         # Clean up stored embedding
-        encoder.discard_embedding(req_id)
+        await encoder.release_request(req_id)
 
         if error_msg:
             logger.error(f"Encoder health check failed: {error_msg}")
