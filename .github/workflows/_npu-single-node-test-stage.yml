@@ -18,14 +18,14 @@ on:
         default: ''
         description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
       image:
-        required: false
+        required: true
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3"
       install_sglang_deps:
         required: false
         type: boolean
-        default: false
+        default: 'false'
         description: install sglang dependencies (e.g. PyTorch, CANN packages) when using source installation
       device_type_for_deps:
         required: false
@@ -37,6 +37,17 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
+      skip_pr_test_health_check:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        type: string
+        default: 'false'
+      github-token:
+        description: 'GitHub token for API calls'
+        type: string
+        default: ${{ github.token }}
+
+env:
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
 
 concurrency:
   group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}

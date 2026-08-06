@@ -40,6 +40,10 @@ on:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: 'false'
+      github-token:
+        description: 'GitHub token for API calls'
+        type: string
+        default: ${{ github.token }}
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
