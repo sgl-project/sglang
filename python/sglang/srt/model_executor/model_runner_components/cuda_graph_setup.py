@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -124,6 +126,57 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner)
+
+    if model_runner.is_draft_worker:
+        moe_runner_backend = (
+            model_runner.server_args.speculative_moe_runner_backend
+            or model_runner.server_args.moe_runner_backend
+        )
+        moe_a2a_backend = (
+            model_runner.server_args.speculative_moe_a2a_backend
+            or model_runner.server_args.moe_a2a_backend
+        )
+    else:
+        moe_runner_backend = model_runner.server_args.moe_runner_backend
+        moe_a2a_backend = model_runner.server_args.moe_a2a_backend
+
+    uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
+    if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
+        "fp8",
+        "mxfp8",
+    ):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        uses_deep_gemm_moe_runner = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
+            MoeRunnerBackend(moe_runner_backend),
+            MoeA2ABackend(moe_a2a_backend),
+        )
+
+    if (
+        model_runner.device == "cuda"
+        and envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() == "auto"
+        and uses_deep_gemm_moe_runner
+    ):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            set_masked_standard_layout_memory_budget,
+        )
+
+        world_group = get_world_group()
+        available_memory_gb = get_available_gpu_memory(
+            model_runner.device,
+            model_runner.gpu_id,
+            distributed=world_group.world_size > 1,
+            cpu_group=world_group.cpu_group,
+        )
+        budget_bytes = set_masked_standard_layout_memory_budget(
+            int(available_memory_gb * (1 << 30))
+        )
+        logger.info(
+            "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
+            budget_bytes / (1 << 30),
+            available_memory_gb,
+        )
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill

@@ -88,13 +88,14 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         model_runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 chunked_prefill_size=16,
-                context_length=None,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(
                         full_prefill_prefix_chunk_tokens=None, max_bs=8
                     )
                 ),
             ),
+            # Wider than the token table, so the table is the binding limit.
+            model_config=SimpleNamespace(context_len=4096),
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.empty((1, 32), dtype=torch.int32)
             ),
@@ -136,6 +137,17 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(
             PrefillCudaGraphRunner._resolve_prefix_chunk_shape(model_runner, 4),
             (1, 4),
+        )
+
+        # A context shorter than the token table binds instead: a draft runner
+        # capped at the target's context, or a short --context-length.
+        model_runner.model_config.context_len = 8
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_prefix_chunk_tokens = (
+            256
+        )
+        self.assertEqual(
+            PrefillCudaGraphRunner._resolve_prefix_chunk_shape(model_runner, 4),
+            (8, 32),
         )
 
         model_runner.server_args.cuda_graph_config.prefill.full_prefill_prefix_chunk_tokens = (

@@ -175,10 +175,12 @@ def init_tokenizer_manager(
             "tool-call parser",
         ),
     ):
-        if getattr(server_args, attr) != "auto":
+        if tokenizer_manager.config_value(attr) != "auto":
             continue
         if suggested is not None:
-            server_args.override(source="template-detection", **{attr: suggested})
+            tokenizer_manager.record_config_updates(
+                "template-detection", **{attr: suggested}
+            )
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
@@ -187,7 +189,9 @@ def init_tokenizer_manager(
                 f"--{attr.replace('_', '-')}=auto specified but could not detect "
                 f"{label} from chat template. Disabling {label}."
             )
-            server_args.override(source="template-detection", **{attr: None})
+            tokenizer_manager.record_config_updates(
+                "template-detection", **{attr: None}
+            )
 
     return tokenizer_manager, template_manager
 
@@ -212,6 +216,10 @@ class Engine(EngineScoreMixin, EngineBase):
     init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
     run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
     run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
+
+    # Backend-specific launch handle: the Ray engine schedules its actors onto a
+    # placement group. Not config — a live cluster object.
+    _placement_group = None
 
     def __init__(self, **kwargs):
         """
@@ -264,6 +272,7 @@ class Engine(EngineScoreMixin, EngineBase):
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
             run_detokenizer_process_func=self.run_detokenizer_process_func,
+            placement_group=self._placement_group,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -825,6 +834,8 @@ class Engine(EngineScoreMixin, EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        *,
+        placement_group=None,
     ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
@@ -1029,6 +1040,7 @@ class Engine(EngineScoreMixin, EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
+        placement_group=None,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1089,8 +1101,13 @@ class Engine(EngineScoreMixin, EngineBase):
             weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
 
         # Launch scheduler processes
+        # Passed only when there is one: this hook is an override point, and a
+        # subclass written against the three-argument signature must keep working.
+        launch_kwargs = (
+            {"placement_group": placement_group} if placement_group is not None else {}
+        )
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
+            server_args, port_args, run_scheduler_process_func, **launch_kwargs
         )
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server
@@ -1672,6 +1689,34 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set gc threshold
     if gc_threshold := server_args.gc_threshold:
         gc.set_threshold(*gc_threshold)
+
+    _log_legacy_kernel_cache_dirs()
+
+
+def _log_legacy_kernel_cache_dirs():
+    """Note the pre-SGLANG_CACHE_DIR cache dirs without touching them: other
+    frameworks on the box may still be using them."""
+    # TODO(shuwang21): drop once SGLANG_CACHE_DIR has been the default for a
+    # few releases.
+    legacy_dirs = [
+        d
+        for d in (
+            os.path.expanduser("~/.triton"),
+            os.path.expanduser("~/.cache/flashinfer"),
+            os.path.expanduser("~/.cache/deep_gemm"),
+        )
+        if os.path.isdir(d)
+    ]
+    if not legacy_dirs:
+        return
+    logger.info(
+        "Compiled-kernel caches now live under SGLANG_CACHE_DIR (%s). These "
+        "older directories are no longer used by sglang, but may still be "
+        "used by other frameworks on this machine, so they were left alone: "
+        "%s. Remove them yourself if nothing else needs them.",
+        envs.SGLANG_CACHE_DIR.get(),
+        ", ".join(legacy_dirs),
+    )
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
