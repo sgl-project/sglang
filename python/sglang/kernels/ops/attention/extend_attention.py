@@ -16,6 +16,8 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -25,7 +27,15 @@ from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_xpu
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _support_tensor_descriptor = True
+except Exception:
+    _support_tensor_descriptor = False
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -33,6 +43,28 @@ if _is_cuda:
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
+_is_xpu = is_xpu()
+
+
+def support_tensor_descriptor():
+    return _support_tensor_descriptor
+
+
+# Host-side tensor descriptors need a global scratch allocator (unlike the
+# device-side ``tl.make_tensor_descriptor`` path). Set it once per process.
+_TMA_ALLOCATOR_SET = False
+
+
+def _set_triton_tma_allocator(device: str):
+    global _TMA_ALLOCATOR_SET
+    if _TMA_ALLOCATOR_SET:
+        return
+
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+    _TMA_ALLOCATOR_SET = True
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -301,6 +333,14 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    # Host-side tensor descriptors for the contiguous extend tiles (Intel XPU).
+    # ``None`` selects the tensor-of-pointer path; a descriptor selects 2D block
+    # I/O. The rope sub-tiles (``*pe``) are only non-None when BLOCK_DPE > 0.
+    Q_desc=None,
+    Qpe_desc=None,
+    K_desc=None,
+    Kpe_desc=None,
+    V_desc=None,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -342,25 +382,42 @@ def _fwd_kernel(
             1.0,
         )
 
-    offs_q = (
-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_qbs
-        + cur_head * stride_qh
-        + offs_d[None, :]
-    )
-    q = tl.load(
-        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
-
-    if BLOCK_DPE > 0:
-        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        offs_qpe = (
+    # Tensor-descriptor load offsets must be 32-bit ints; indptr-derived indices
+    # are int64, so cast here (the values fit comfortably in int32).
+    q_row_off = (cur_seq_extend_start_idx + cur_block_m * BLOCK_M).to(tl.int32)
+    if Q_desc is not None:
+        # Host-side descriptor over the tensor flattened to 2D
+        # (token, head * head_dim); the head is selected by a runtime column
+        # offset so the descriptor stays 2D (matching the fast device-side
+        # shape) rather than a 3D descriptor + reshape. The per-head column
+        # width is the head dim (Lq), which holds whether or not the host-side
+        # reshape copied. Rows past this sequence are discarded by mask_m.
+        q = Q_desc.load([q_row_off, cur_head * Lq])
+    else:
+        offs_q = (
             (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
             * stride_qbs
             + cur_head * stride_qh
-            + offs_dpe[None, :]
+            + offs_d[None, :]
         )
-        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+        q = tl.load(
+            Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+        )
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        if Qpe_desc is not None:
+            # Rope sub-tile: same 2D flattened buffer, head_dim columns
+            # [BLOCK_DMODEL, Lq) within this head.
+            qpe = Qpe_desc.load([q_row_off, cur_head * Lq + BLOCK_DMODEL])
+        else:
+            offs_qpe = (
+                (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+                * stride_qbs
+                + cur_head * stride_qh
+                + offs_dpe[None, :]
+            )
+            qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
     # stage 1: compute scores with prefix
     offs_n = tl.arange(0, BLOCK_N)
@@ -559,28 +616,49 @@ def _fwd_kernel(
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
-            # load k in transposed way
-            offs_k = (
-                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                + cur_kv_head * stride_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-            )
+            if K_desc is not None:
+                # 2D flattened descriptor; cur_kv_head selects the KV head via a
+                # runtime column offset. Load the (BLOCK_N, BLOCK_DMODEL) block
+                # and transpose to the (BLOCK_DMODEL, BLOCK_N) the dot wants (a
+                # last-stride != 1 descriptor would leave the fast path).
+                # Out-of-range rows are discarded by final_mask.
+                k = K_desc.load(
+                    [(cur_seq_extend_start_idx + start_n).to(tl.int32), cur_kv_head * Lq]
+                ).T
+            else:
+                # load k in transposed way
+                offs_k = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                    + cur_kv_head * stride_kh
+                    + offs_d[:, None]
+                )
+                k = tl.load(
+                    K_Extend + offs_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
 
             qk = tl.dot(q, k, out_dtype=tl.float32)
             if BLOCK_DPE > 0:
-                offs_kpe = (
-                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                    + cur_kv_head * stride_kh
-                    + offs_dpe[:, None]
-                )
-                kpe = tl.load(
-                    K_Extend + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
+                if Kpe_desc is not None:
+                    kpe = Kpe_desc.load(
+                        [
+                            (cur_seq_extend_start_idx + start_n).to(tl.int32),
+                            cur_kv_head * Lq + BLOCK_DMODEL,
+                        ]
+                    ).T
+                else:
+                    offs_kpe = (
+                        (cur_seq_extend_start_idx + start_n + offs_n[None, :])
+                        * stride_kbs
+                        + cur_kv_head * stride_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Extend + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
                 qk += tl.dot(qpe, kpe)
 
             qk *= sm_scale
@@ -617,14 +695,21 @@ def _fwd_kernel(
             p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
-            offs_v = (
-                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-                + cur_kv_head * stride_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-            )
+            if V_desc is not None:
+                # 2D flattened descriptor; cur_kv_head selects the KV head via a
+                # runtime column offset.
+                v = V_desc.load(
+                    [(cur_seq_extend_start_idx + start_n).to(tl.int32), cur_kv_head * Lv]
+                )
+            else:
+                offs_v = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -641,6 +726,11 @@ def _fwd_kernel(
         lse = tl.log(deno) + e_max
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
+    # The output store stays on the masked tensor-of-pointer path even when the
+    # loads use host-side descriptors (matching fused_moe, which never issues a
+    # descriptor store): a descriptor built over the full tensor would write the
+    # padded tail rows into the next sequence's rows and race that sequence's own
+    # block-0 store. mask_m bounds the store to this sequence's valid rows.
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_obs
@@ -745,6 +835,63 @@ def extend_attention_fwd(
         score_mod, aux_tensors
     )
 
+    # Intel XPU: build host-side tensor descriptors for the contiguous extend
+    # tiles (Q, extend-K, extend-V) so the kernel issues 2D block I/O instead of
+    # tensor-of-pointer loads. The (token, head, head_dim) tensors are flattened
+    # to 2D (token, head * head_dim); the kernel picks the head via a runtime
+    # column offset (head * stride_h). This keeps the descriptor 2D -- matching
+    # the fast device-side shape -- instead of a 3D descriptor + reshape, which
+    # does not lower to 2D block I/O on the Intel backend. On other backends (or
+    # without the API) we pass None, keeping the existing pointer path unchanged.
+    q_desc = qpe_desc = k_desc = kpe_desc = v_desc = None
+    # Descriptor-path enablement (tri-state). Unset -> auto (on for XPU, off
+    # elsewhere); True/False force on/off for A/B-testing on the same device.
+    _td_override = envs.SGLANG_TRITON_ATTN_USE_TENSOR_DESC.get()
+    _use_desc = _is_xpu if _td_override is None else _td_override
+    # The 2D-flatten below is a TEMPORARY XPU-ONLY workaround
+    # (intel/intel-xpu-backend-for-triton#7306): the natural (token, head,
+    # head_dim) descriptor is rank-3, but a 3D descriptor + reshape does not
+    # lower to 2D block I/O on the Intel backend, so we flatten to 2D
+    # (token, head * head_dim) and pick the head via a runtime column offset in
+    # the kernel. The kernel body only implements this flattened indexing, so
+    # the descriptor path is gated on _is_xpu until the Intel backend lowers the
+    # 3D form (at which point this reshape + the _is_xpu gate can be removed).
+    # The flattened 2D view makes heads contiguous, so an over-wide tile would
+    # read the neighbouring head instead of zero-padding. Only take the
+    # descriptor path when the tiling exactly covers the head dim (no padding).
+    _desc_no_pad = (BLOCK_DMODEL + BLOCK_DPE == Lq) and (BLOCK_DV == Lv)
+    if _use_desc and _is_xpu and support_tensor_descriptor() and _desc_no_pad:
+        # The flattened-2D head offset in the kernel is head_idx * head_dim, with
+        # head_dim taken as Lq for Q/K and Lv for V. Fail loudly if a layout
+        # breaks those assumptions (analogous to vLLM's TD stride asserts) rather
+        # than silently reading the wrong head:
+        #   - K/V head_dim must match the values the kernel offsets by;
+        #   - the extend K offset reuses Lq, so it requires Lk == Lq.
+        assert k_extend.shape[-1] == Lq, (
+            f"descriptor path requires Lk == Lq, got Lk={k_extend.shape[-1]}, Lq={Lq}"
+        )
+        assert v_extend.shape[-1] == Lv, (
+            f"descriptor path requires v head_dim == Lv, got {v_extend.shape[-1]} vs {Lv}"
+        )
+        # device *type* (not index) so scratch follows the current device.
+        _set_triton_tma_allocator(q_extend.device.type)
+        # reshape (not view): zero-copy for contiguous tensors, and copies
+        # rather than raising for the rare non-contiguous input. The descriptor
+        # reads from the reshaped tensor, so a copy is still correct.
+        q2d = q_extend.reshape(q_extend.shape[0], q_extend.shape[1] * q_extend.shape[2])
+        k2d = k_extend.reshape(k_extend.shape[0], k_extend.shape[1] * k_extend.shape[2])
+        v2d = v_extend.reshape(v_extend.shape[0], v_extend.shape[1] * v_extend.shape[2])
+        q_desc = TensorDescriptor(q2d, q2d.shape, q2d.stride(), [BLOCK_M, BLOCK_DMODEL])
+        k_desc = TensorDescriptor(k2d, k2d.shape, k2d.stride(), [BLOCK_N, BLOCK_DMODEL])
+        v_desc = TensorDescriptor(v2d, v2d.shape, v2d.stride(), [BLOCK_N, BLOCK_DV])
+        if BLOCK_DPE > 0:
+            qpe_desc = TensorDescriptor(
+                q2d, q2d.shape, q2d.stride(), [BLOCK_M, BLOCK_DPE]
+            )
+            kpe_desc = TensorDescriptor(
+                k2d, k2d.shape, k2d.stride(), [BLOCK_N, BLOCK_DPE]
+            )
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -806,6 +953,11 @@ def extend_attention_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        Q_desc=q_desc,
+        Qpe_desc=qpe_desc,
+        K_desc=k_desc,
+        Kpe_desc=kpe_desc,
+        V_desc=v_desc,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
