@@ -552,7 +552,7 @@ jobs:
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3 ]
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/_npu_single_node_test_stage.yml
     with:
@@ -565,7 +565,7 @@ jobs:
 
   base-c-test-perf-4-npu-a3:
     name: base-c-test-perf-4-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-4-npu-a3 ]
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/_npu_single_node_test_stage.yml
     with:
@@ -578,7 +578,7 @@ jobs:
 
   base-c-test-perf-8-npu-a3:
     name: base-c-test-perf-8-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-8-npu-a3 ]
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/_npu_single_node_test_stage.yml
     with:
@@ -591,7 +591,7 @@ jobs:
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-16-npu-a3 ]
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/_npu_single_node_test_stage.yml
     with:
