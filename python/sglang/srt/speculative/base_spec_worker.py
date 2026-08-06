@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.model_executor.graph_memory_usage import (
+    merge_graph_memory_usage,
+    merge_graph_time_usage,
+)
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 if TYPE_CHECKING:
@@ -14,12 +20,48 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+class HiCacheDraftMode(str, Enum):
+    NONE = "none"
+    PACKED = "packed"
+    SIDECAR = "sidecar"
+
+
+@dataclass(frozen=True, slots=True)
+class HiCacheDraftPlan:
+    mode: HiCacheDraftMode = HiCacheDraftMode.NONE
+    device_pools: tuple[object, ...] = ()
+
+
+def _can_pack_hicache_mtp(
+    spec_algorithm: SpeculativeAlgorithm,
+    draft_runners: tuple[ModelRunner, ...],
+) -> bool:
+    is_nextn_mtp = (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and all(
+            runner.model_config.num_nextn_predict_layers for runner in draft_runners
+        )
+    )
+    is_dspark_dsv4 = (
+        spec_algorithm.is_dspark()
+        and draft_runners[0].model_config.hf_config.architectures[0]
+        == "DeepseekV4ForCausalLMDSpark"
+    )
+    return is_nextn_mtp or is_dspark_dsv4
 
 
 class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+
+    def __init__(self) -> None:
+        self._specialized_graph_memory_usage: dict[str, float] = {}
+        self._specialized_graph_time_usage: dict[str, float] = {}
 
     @abstractmethod
     def draft():
@@ -34,6 +76,24 @@ class EagleDraftWorkerBase(ABC):
         """All draft model runners; multi-layer eagle overrides with its
         per-step runner list."""
         return [self.draft_runner]
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        return merge_graph_memory_usage(
+            *(runner.graph_memory_usage for runner in self.draft_runners),
+            self._specialized_graph_memory_usage,
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        return merge_graph_time_usage(
+            *(runner.graph_time_usage for runner in self.draft_runners),
+            self._specialized_graph_time_usage,
+        )
+
+    @property
+    def weight_load_time(self) -> float:
+        return sum(runner.weight_load_time for runner in self.draft_runners)
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -85,6 +145,34 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    _hicache_draft_plan = HiCacheDraftPlan()
+
+    def __init__(self) -> None:
+        self._additional_graph_memory_usage: dict[str, float] = {}
+        self._additional_graph_time_usage: dict[str, float] = {}
+
+    @property
+    def hicache_draft_plan(self) -> HiCacheDraftPlan:
+        return self._hicache_draft_plan
+
+    def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
+        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        draft_worker = self.draft_worker
+        if (
+            draft_worker is None
+            or spec_algorithm.is_ngram()
+            or spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return ()
+        if spec_algorithm.is_dflash_family():
+            return (draft_worker.model_runner,)
+        return tuple(draft_worker.draft_runners)
+
+    @property
+    def primary_draft_kv_pool(self) -> Optional[object]:
+        draft_runners = self._draft_model_runners()
+        return draft_runners[0].token_to_kv_pool if draft_runners else None
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -94,6 +182,34 @@ class BaseSpecWorker(ABC):
         # dflash / dspark drive the draft model through a plain TpModelWorker;
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        if self.draft_worker is None:
+            draft_memory_usage = None
+        else:
+            draft_memory_usage = self.draft_worker.graph_memory_usage
+        return merge_graph_memory_usage(
+            draft_memory_usage,
+            self._additional_graph_memory_usage,
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        if self.draft_worker is None:
+            draft_time_usage = None
+        else:
+            draft_time_usage = self.draft_worker.graph_time_usage
+        return merge_graph_time_usage(
+            draft_time_usage,
+            self._additional_graph_time_usage,
+        )
+
+    @property
+    def weight_load_time(self) -> float:
+        if self.draft_worker is None:
+            return 0.0
+        return self.draft_worker.weight_load_time
 
     @property
     def war_fastpath_runner(self):
@@ -114,6 +230,42 @@ class BaseSpecWorker(ABC):
         target worker and cleared by the scheduler."""
         # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        target_model_runner = self.target_worker.model_runner
+        target_model_runner.mtp_draft_device_pools = ()
+        spec_algorithm = target_model_runner.spec_algorithm
+        if not self.server_args.enable_hierarchical_cache:
+            return HiCacheDraftPlan()
+
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return HiCacheDraftPlan()
+        draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        if (
+            "InklingForConditionalGenerationMTP"
+            in draft_runners[0].model_config.hf_config.architectures
+        ):
+            raise NotImplementedError(
+                "HiCache does not support Inkling MTP draft state yet."
+            )
+
+        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            target_model_runner.mtp_draft_device_pools = draft_pools
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.PACKED,
+                device_pools=draft_pools,
+            )
+
+        return HiCacheDraftPlan(
+            mode=HiCacheDraftMode.SIDECAR,
+            # Preserve the legacy non-packed HiCache behavior: multi-layer
+            # EAGLE registers only the first draft runner as the sidecar.
+            device_pools=draft_pools[:1],
+        )
+
+    def init_hicache_draft_plan(self) -> None:
+        self._hicache_draft_plan = self._build_hicache_draft_plan()
 
     def alloc_memory_pool(
         self,
