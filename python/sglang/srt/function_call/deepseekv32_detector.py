@@ -179,7 +179,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, ValueError):
+                        # partial_json_parser raises its own MalformedJSON
+                        # (a ValueError, but NOT a stdlib json.JSONDecodeError)
+                        # on a not-yet-valid partial value, e.g. code-exec
+                        # arguments whose streamed prefix is bare text like
+                        # `python3 -c "...`. Fall back to the raw string,
+                        # matching the complete-value branch above, instead of
+                        # letting the exception tear down the stream.
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -359,6 +366,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
+            # Fail-safe: never surface raw DSML markup as user-visible content.
+            # While the buffer still holds tool-call markup, returning it as
+            # normal_text would both leak the markers AND -- because _buffer is
+            # retained across increments -- re-emit the whole buffer on every
+            # subsequent chunk, ballooning the response to the output-token cap.
+            # Emit nothing and keep buffering so a still-arriving invoke can
+            # complete on a later chunk.
+            if self.has_tool_call(current_text) or any(
+                marker in current_text for marker in dsml_markers
+            ):
+                return StreamingParseResult(normal_text="")
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
