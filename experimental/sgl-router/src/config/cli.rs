@@ -114,8 +114,9 @@ pub struct Cli {
     pub balance_rel_threshold: Option<f32>,
     /// Queued-request count at or above which a worker stops winning
     /// selections on cache affinity: the request is sent to another worker
-    /// holding the same prefix, or to the least-loaded worker if there is
-    /// none. Counts `num_waiting_reqs` only, so it measures whether the
+    /// holding the same prefix, or to the least-loaded of a
+    /// `--min-load-choices` sample if there is none. Counts
+    /// `num_waiting_reqs` only, so it measures whether the
     /// request would wait rather than how busy the worker is.
     ///
     /// Start at 4 on a single-rank worker — low enough to catch a real
@@ -132,6 +133,25 @@ pub struct Cli {
     /// `--balance-rel-threshold`.
     #[arg(long)]
     pub worker_queue_limit: Option<NonZeroUsize>,
+    /// Candidates sampled for each min-load fallback pick: the fallback
+    /// ranks this many uniformly random workers and takes the least-loaded
+    /// of them. Default 2 (power-of-two choices).
+    ///
+    /// A fleet-wide exact minimum converges across router replicas: every
+    /// replica reads the same engine load snapshots, none sees the others'
+    /// dispatches made since the snapshot, so they all hand the request to
+    /// the same current minimum and overshoot it. Ranking a small random
+    /// sample keeps the pick near-loaded-minimal while making concurrent
+    /// replicas diverge.
+    ///
+    /// Sampling applies within each gating tier, so the tier order is
+    /// unchanged: with `--worker-queue-limit` set, the sample is drawn from
+    /// unqueued workers first and only from queueing ones when nothing is
+    /// unqueued. A value of 1 is uniform-random routing among the eligible
+    /// tier, not the exact minimum — set this at or above the fleet size for
+    /// the deterministic exact fleet-wide minimum.
+    #[arg(long)]
+    pub min_load_choices: Option<NonZeroUsize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -313,12 +333,13 @@ impl Cli {
             || self.balance_rel_threshold.is_some()
             || self.kv_bootstrap_timeout_ms.is_some()
             || self.kv_peer_selector.is_some()
-            || self.worker_queue_limit.is_some();
+            || self.worker_queue_limit.is_some()
+            || self.min_load_choices.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
                  --balance-rel-threshold / --kv-bootstrap-timeout-ms / --kv-peer-selector / \
-                 --worker-queue-limit) requires --policy cache_aware_zmq"
+                 --worker-queue-limit / --min-load-choices) requires --policy cache_aware_zmq"
             ));
         }
         // The queue gate replaces the fleet-spread check rather than layering on
@@ -460,6 +481,10 @@ impl Cli {
                 bootstrap_timeout_ms: self
                     .kv_bootstrap_timeout_ms
                     .unwrap_or(d.bootstrap_timeout_ms),
+                min_load_choices: self
+                    .min_load_choices
+                    .map(NonZeroUsize::get)
+                    .unwrap_or(d.min_load_choices),
             })
         } else {
             None
@@ -1265,6 +1290,72 @@ mod tests {
             err.contains("requires --policy cache_aware_zmq"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn min_load_choices_reaches_the_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--min-load-choices",
+            "3",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.min_load_choices, 3);
+    }
+
+    #[test]
+    fn min_load_choices_defaults_to_two() {
+        // The default IS the herd damping this knob exists for: a silent
+        // edit from 2 to 1 turns every fallback into uniform-random routing
+        // and a large value disables sampling — neither fails any other test.
+        assert_eq!(CacheAwareConfig::default().min_load_choices, 2);
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--cache-threshold",
+            "0.7",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        // Tuning any other knob must not disturb the shipped default.
+        assert_eq!(ca.min_load_choices, 2);
+    }
+
+    #[test]
+    fn rejects_min_load_choices_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--min-load-choices",
+            "2",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires --policy cache_aware_zmq"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_min_load_choices() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--min-load-choices",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("min-load-choices"), "got: {err}");
     }
 
     /// The queue gate replaces the fleet-spread check rather than layering

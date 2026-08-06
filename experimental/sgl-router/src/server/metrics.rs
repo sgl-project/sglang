@@ -339,11 +339,12 @@ pub enum CacheAwareDecision {
     MatchedNodeUnowned,
     MatchedWorkersIneligible,
     /// Every worker holding the prefix already had at least
-    /// `--worker-queue-limit` requests waiting, AND the min-load fallback
-    /// landed on a non-owner, so affinity was genuinely given up to avoid
-    /// queueing. A fallback that lands back on a queueing owner is recorded as
-    /// [`Self::CacheHit`] instead — routing is identical to affinity there, and
-    /// counting it here would overstate the gate's effect.
+    /// `--worker-queue-limit` requests waiting, an UNQUEUED alternative
+    /// existed, and the min-load fallback landed on a non-owner — affinity
+    /// was genuinely given up to avoid queueing. A fallback under fleet-wide
+    /// queueing is recorded as [`Self::CacheHitAllQueued`] instead: with no
+    /// unqueued worker anywhere the gate vetoed nothing, and counting that
+    /// here would overstate the gate's effect.
     ///
     /// [`Self::MatchedWorkersIneligible`] is the neighbouring case: the prefix
     /// owners were not in the candidate set at all. Note that bucket is not
@@ -353,14 +354,19 @@ pub enum CacheAwareDecision {
     /// two together when attributing locality loss to load.
     CacheWorkerQueued,
     /// Every prefix owner was over the queue limit AND so was every other
-    /// candidate, so the min-load fallback landed back on the cache home.
-    /// Routing is identical to a cache hit — which is why this is not
-    /// [`Self::CacheWorkerQueued`] — but it is reachable only when NO worker in
-    /// the fleet is unqueued, so it carries its own label: folded into
-    /// `cache_hit` it would make a fully saturated fleet read as a healthy one,
-    /// which is the opposite of what an operator sizing the limit needs.
+    /// candidate — NO worker in the fleet was unqueued — so the min-load
+    /// fallback picked among queueing workers. It carries its own label
+    /// because of that reachability condition, not because of where the pick
+    /// lands: under sampled min-load picks (the default) the fallback usually
+    /// lands OFF the cache home, so routing is NOT necessarily identical to a
+    /// cache hit. Folded into `cache_hit` it would make a fully saturated
+    /// fleet read as a healthy one, which is the opposite of what an operator
+    /// sizing the limit needs.
     ///
-    /// Count it with `cache_hit` for locality; alert on it for saturation.
+    /// Alert on it for saturation. Do NOT count it with `cache_hit` for
+    /// locality unless the fleet pins `--min-load-choices` at or above the
+    /// fleet size — with sampled picks the chosen worker usually does not
+    /// hold the prefix.
     CacheHitAllQueued,
 }
 
@@ -698,8 +704,12 @@ impl MetricsRegistry {
     /// large cached prefixes to dodge a queue — the signal to weigh forgone
     /// prefill against expected wait instead of thresholding on the queue alone.
     ///
-    /// Only recorded for a real diversion. A fallback that lands back on the
-    /// cache home gave up nothing and is deliberately absent.
+    /// Only recorded for a real diversion. A fallback with no unqueued
+    /// alternative anywhere (fleet-wide queueing) gave nothing up by
+    /// decision — the gate vetoed nothing — and is deliberately absent, so
+    /// the curve collapses toward zero during saturation exactly when raw
+    /// prefix-loss volume peaks; read it alongside `cache_hit_all_queued`,
+    /// not alone.
     pub fn observe_diverted_overlap_blocks(&self, model_id: &str, blocks: u64) {
         let mut guard = self.diverted_overlap_blocks.lock();
         let hist = guard
@@ -1290,7 +1300,7 @@ impl MetricsRegistry {
         // diverted_overlap_blocks histogram — the subset of the above that the
         // queue gate sent away from its cache home.
         out.push_str(
-            "# HELP sgl_router_diverted_overlap_blocks Overlap-block count of requests the per-worker queue gate diverted off their cache home.\n",
+            "# HELP sgl_router_diverted_overlap_blocks Overlap-block count of requests the per-worker queue gate diverted off their cache home while an unqueued alternative existed (excludes fleet-wide-queueing picks, where the gate vetoed nothing).\n",
         );
         out.push_str("# TYPE sgl_router_diverted_overlap_blocks histogram\n");
         let guard = self.diverted_overlap_blocks.lock();

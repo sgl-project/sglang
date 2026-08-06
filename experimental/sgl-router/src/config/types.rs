@@ -387,7 +387,7 @@ pub fn default_tokenizer_shards() -> usize {
 pub enum LoadGate {
     /// Skip the cache lookup entirely when `max_load - min_load >
     /// abs_threshold` AND `max_load > min_load * rel_threshold`, and route to
-    /// the least-loaded worker instead.
+    /// the least-loaded of a `min_load_choices` sample instead.
     ///
     /// `max - min` over the candidate set is an order statistic of the fleet,
     /// so in a large fleet it is dominated by the tail and says little about
@@ -404,15 +404,15 @@ pub enum LoadGate {
     /// Number of already-queued requests at or above which a worker stops being
     /// eligible to win a selection on cache affinity — the request goes to
     /// another worker holding the same prefix, or failing that to the
-    /// least-loaded worker.
+    /// least-loaded of a `min_load_choices` sample.
     ///
     /// The cache lookup itself is unchanged, but every min-load fallback in the
     /// policy additionally *prefers* a non-queueing worker, so this reorders
     /// more than the matched-set pick — including the ordinary below-threshold
     /// tree-miss path, which is the highest-volume one. The fallback is never
-    /// queue-*bounded*, though: when no unqueued worker exists it takes the
-    /// least-loaded worker regardless, so a fleet where everything is queueing
-    /// still routes.
+    /// queue-*bounded*, though: when no unqueued worker exists it samples the
+    /// whole fleet and takes the least-loaded of the sample regardless, so a
+    /// fleet where everything is queueing still routes.
     ///
     /// Gating on the queue rather than on total depth is what makes this
     /// targeted. `num_waiting_reqs` IS the question the request cares about —
@@ -502,6 +502,14 @@ pub struct CacheAwareConfig {
     /// serves anyway with whatever it has — a cold fleet has no warm sibling to
     /// ask, so a gate without a deadline would never open.
     pub bootstrap_timeout_ms: u64,
+    /// Candidates sampled for each min-load fallback pick: the pick is the
+    /// least-loaded of this many uniformly random eligible workers, not the
+    /// fleet-wide minimum. Default 2 (power-of-two choices), which damps the
+    /// cross-replica herd on the shared current minimum while losing almost
+    /// no load quality. Applies within each gating tier (unqueued first),
+    /// so a busy fleet never becomes a selection error. A value at or above
+    /// the fleet size recovers the exact-minimum behavior.
+    pub min_load_choices: usize,
 }
 
 impl Default for CacheAwareConfig {
@@ -510,6 +518,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             load_gate: LoadGate::default(),
             bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
+            min_load_choices: default_min_load_choices(),
         }
     }
 }
@@ -532,6 +541,10 @@ fn default_balance_rel() -> f32 {
 /// that the default was the one budget the derivation mishandled.
 pub(crate) fn default_bootstrap_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_min_load_choices() -> usize {
+    2
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix

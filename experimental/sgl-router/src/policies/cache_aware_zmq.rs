@@ -42,7 +42,8 @@
 //!    which is the highest-volume one.
 //!
 //!    `FleetSpread` — the default — decides here: when the spread is wide it
-//!    skips the cache lookup entirely and picks the lowest-load worker,
+//!    skips the cache lookup entirely and picks the lowest-load of a
+//!    `min_load_choices` sample,
 //!    abandoning locality for every request on the strength of one busy one.
 //! 2. **Routing tokens.** Prefer the ingress-precomputed ids
 //!    (`ctx.request_tokens()`); fall back to tokenizing the body here
@@ -55,13 +56,18 @@
 //!    pick the lowest-load worker whose `url` appears in the match result and
 //!    whose engine queue is under `PerWorkerQueue`'s limit, if one is
 //!    configured. Otherwise, fall through.
-//! 4. **Min-load fallback.** Least-loaded worker that is not known to be
-//!    queueing; if every worker is queueing, least-loaded overall. The second
-//!    tier is what makes this unable to fail — the gate is never allowed to
-//!    turn a busy fleet into a selection error. Reaching it means no worker is
-//!    unqueued, so if it lands back on a prefix owner the routing equals a
-//!    cache hit and is recorded as `cache_hit_all_queued`: a hit for locality
-//!    accounting, and the fleet-saturation signal for everything else.
+//! 4. **Min-load fallback.** Least-loaded among `min_load_choices` uniformly
+//!    sampled workers that are not known to be queueing; if every worker is
+//!    queueing, least-loaded among a sample of the whole fleet. Sampling is
+//!    the power-of-X defence against cross-replica herds: an exact fleet
+//!    minimum makes every replica with the same load snapshots pick the same
+//!    worker. The second tier is what makes this unable to fail — the gate is
+//!    never allowed to turn a busy fleet into a selection error. Reaching it
+//!    means no worker is unqueued, and with prefix owners present that
+//!    saturation is recorded as `cache_hit_all_queued` — the fleet-saturation
+//!    signal. The label keys on saturation, not on where the sampled draw
+//!    lands, which usually is NOT a prefix owner; treat it as locality only
+//!    on fleets pinned to unsampled picks (`min_load_choices >= fleet`).
 //!
 //! The implementation never returns `None` for a non-empty `workers` slice;
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
@@ -304,14 +310,29 @@ impl CacheAwareZmqPolicy {
         }
     }
 
-    /// Lowest-load worker by the per-selection load lookup — ties broken by
-    /// stable iteration order (the order the registry returned, i.e.
-    /// dashmap-undefined). For production traffic the ties are rare; tests
-    /// pin the load skew.
+    /// Lowest-load worker among `choices` uniformly sampled candidates, by
+    /// the per-selection load lookup — power-of-X choices, not a fleet-wide
+    /// minimum.
     ///
-    /// Under [`LoadGate::PerWorkerQueue`] this is a two-tier pick: the
-    /// least-loaded worker that is not already queueing, and only if every
-    /// worker is queueing, the least-loaded worker overall.
+    /// Ranking the whole fleet and taking the single minimum converges
+    /// across router replicas: every replica reads the same engine load
+    /// snapshots, none sees the others' dispatches made since the snapshot
+    /// ([`WorkerLoads::load_of`] corrects only its own), so they all hand
+    /// the request to the same current minimum and overshoot it. Sampling
+    /// `choices` workers per pick keeps the selection near-minimal while
+    /// making concurrent replicas diverge to different near-minima.
+    /// `choices == 1` is uniform-random within the tier; `choices >=
+    /// eligible pool` degenerates to the deterministic exact minimum
+    /// (unsampled — equal-load ties resolve in pool order, so pinning
+    /// `usize::MAX` keeps tests deterministic). A programmatic
+    /// `choices == 0` (impossible from the CLI, which is `NonZeroUsize`)
+    /// is treated as 1.
+    ///
+    /// Under [`LoadGate::PerWorkerQueue`] this stays a two-tier pick, and
+    /// the sampling happens WITHIN each tier: the sample is drawn from the
+    /// workers that are not already queueing, and only when none exists
+    /// from the queueing ones — a sample never lands on a queueing worker
+    /// while an unqueued one exists.
     ///
     /// The two tiers are not optional. Load is ranked by total depth while the
     /// gate reads queue length, and those disagree exactly where this gate
@@ -319,20 +340,52 @@ impl CacheAwareZmqPolicy {
     /// depth, so a single-tier min-load fallback hands the request straight
     /// back to the cache home the gate just rejected. Preferring unqueued
     /// workers first is what makes the diversion actually happen; falling back
-    /// to the global minimum is what keeps an all-queueing fleet routable
+    /// to the whole fleet is what keeps an all-queueing fleet routable
     /// instead of returning `None` and failing every request.
     fn pick_min_load(
         workers: &[Arc<Worker>],
         loads: &WorkerLoads,
         gate: &LoadGate,
+        choices: usize,
     ) -> Option<Arc<Worker>> {
-        let unqueued = workers
+        // Tier order is decided by the gate, never by sampling: rank the
+        // unqueued workers if any exist, else the whole fleet.
+        let mut pool: Vec<usize> = workers
             .iter()
-            .filter(|w| gate.admits_affinity(loads.waiting_of(w)))
-            .min_by_key(|w| loads.load_of(w));
-        unqueued
-            .or_else(|| workers.iter().min_by_key(|w| loads.load_of(w)))
-            .map(Arc::clone)
+            .enumerate()
+            .filter(|(_, w)| gate.admits_affinity(loads.waiting_of(w)))
+            .map(|(i, _)| i)
+            .collect();
+        if pool.is_empty() {
+            pool.extend(0..workers.len());
+        }
+        // Guard against a programmatically constructed 0 (the CLI is
+        // NonZeroUsize; the field is a bare usize for full-fleet pinning).
+        let k = choices.max(1).min(pool.len());
+        if k == 0 {
+            // workers is empty.
+            return None;
+        }
+        let min_of = |candidates: &[usize]| {
+            candidates
+                .iter()
+                .min_by_key(|&&i| loads.load_of(&workers[i]))
+                .map(|&i| Arc::clone(&workers[i]))
+        };
+        if k == pool.len() {
+            // The unsampled exact minimum: no shuffle, so ties resolve in
+            // pool order exactly as the pre-sampling implementation did.
+            return min_of(&pool);
+        }
+        // partial_shuffle leaves `amount` uniformly sampled DISTINCT
+        // elements in the TAIL of the slice (rand 0.8: it randomizes
+        // positions len-1 down to len-amount) and returns them as the
+        // first tuple element. Reading the front is the classic misuse:
+        // the remainder is only disturbed by swaps and is biased toward
+        // low indices.
+        use rand::seq::SliceRandom;
+        let (sample, _) = pool.partial_shuffle(&mut rand::thread_rng(), k);
+        min_of(sample)
     }
 
     /// Detect load imbalance. Returns the min/max load snapshot together
@@ -516,7 +569,12 @@ impl Policy for CacheAwareZmqPolicy {
                 );
                 if balance.imbalanced {
                     self.record_decision(model_id, CacheAwareDecision::LoadImbalance);
-                    let chosen = Self::pick_min_load(workers, &loads, &self.config.load_gate);
+                    let chosen = Self::pick_min_load(
+                        workers,
+                        &loads,
+                        &self.config.load_gate,
+                        self.config.min_load_choices,
+                    );
                     if let Some(w) = &chosen {
                         tracing::info!(
                             model = %ctx.model(),
@@ -529,7 +587,7 @@ impl Policy for CacheAwareZmqPolicy {
                             balance_rel_threshold = rel_threshold,
                             engine_load_workers = loads.engine_worker_count(),
                             engine_load_expected = self.engine_load.expected_count(),
-                            "cache-aware-zmq: load imbalance detected — bypassing cache, routing to min-load worker",
+                            "cache-aware-zmq: load imbalance detected — bypassing cache, routing to sampled min-load worker",
                         );
                     }
                     return chosen;
@@ -553,7 +611,12 @@ impl Policy for CacheAwareZmqPolicy {
                             model = %ctx.model(),
                             "cache-aware-zmq: policy reached without request tokens or a request body; ingress validation invariant broken",
                         );
-                        return Self::pick_min_load(workers, &loads, &self.config.load_gate);
+                        return Self::pick_min_load(
+                            workers,
+                            &loads,
+                            &self.config.load_gate,
+                            self.config.min_load_choices,
+                        );
                     }
                 };
                 let value = match serde_json::from_slice::<serde_json::Value>(body) {
@@ -565,7 +628,12 @@ impl Policy for CacheAwareZmqPolicy {
                             error = %error,
                             "cache-aware-zmq: policy received invalid JSON after ingress validation; invariant broken",
                         );
-                        return Self::pick_min_load(workers, &loads, &self.config.load_gate);
+                        return Self::pick_min_load(
+                            workers,
+                            &loads,
+                            &self.config.load_gate,
+                            self.config.min_load_choices,
+                        );
                     }
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
@@ -573,10 +641,15 @@ impl Policy for CacheAwareZmqPolicy {
                     if should_log(&TOKENIZATION_LOG_COUNTER) {
                         tracing::warn!(
                             model = %ctx.model(),
-                            "cache-aware-zmq: routing tokens unavailable, routing by min-load; check tokenizer and chat encoder configuration. Also expected for requests whose messages carry no text",
+                            "cache-aware-zmq: routing tokens unavailable, routing by sampled min-load; check tokenizer and chat encoder configuration. Also expected for requests whose messages carry no text",
                         );
                     }
-                    return Self::pick_min_load(workers, &loads, &self.config.load_gate);
+                    return Self::pick_min_load(
+                        workers,
+                        &loads,
+                        &self.config.load_gate,
+                        self.config.min_load_choices,
+                    );
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -598,10 +671,15 @@ impl Policy for CacheAwareZmqPolicy {
             if should_log(&HASH_CONFIG_LOG_COUNTER) {
                 tracing::warn!(
                     model = %ctx.model(),
-                    "cache-aware-zmq: no worker has published a complete block-hashing config, routing by min-load. Transient while workers register; if it persists, no engine is publishing KV events",
+                    "cache-aware-zmq: no worker has published a complete block-hashing config, routing by sampled min-load. Transient while workers register; if it persists, no engine is publishing KV events",
                 );
             }
-            return Self::pick_min_load(workers, &loads, &self.config.load_gate);
+            return Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
+            );
         };
         // Uniform fleet: hash once with the established mode. Bimodal fleet
         // (EAGLE-family + non-EAGLE behind one base model): hash both ways and
@@ -609,7 +687,12 @@ impl Policy for CacheAwareZmqPolicy {
         let outcome = self.match_request(tokens, block_size as usize, is_bigram);
         if !outcome.had_blocks {
             self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
-            return Self::pick_min_load(workers, &loads, &self.config.load_gate);
+            return Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
+            );
         }
         tracing::debug!(
             model = %ctx.model(),
@@ -644,9 +727,14 @@ impl Policy for CacheAwareZmqPolicy {
                 matched_blocks = outcome.matched_blocks,
                 match_rate = outcome.match_rate,
                 cache_threshold = self.config.cache_threshold,
-                "cache-aware-zmq: no eligible cache owner, falling back to min-load",
+                "cache-aware-zmq: no eligible cache owner, falling back to sampled min-load",
             );
-            return Self::pick_min_load(workers, &loads, &self.config.load_gate);
+            return Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
+            );
         }
         // Among the matched owners (either family, in a bimodal fleet), pick the
         // lowest-load one that is not already queueing. The gate and the tiebreak
@@ -666,10 +754,16 @@ impl Policy for CacheAwareZmqPolicy {
                 .iter()
                 .any(|w| matched_urls.contains(w.url.as_str()));
             // The fallback prefers an unqueued worker but is never queue-
-            // *bounded*: with no unqueued worker it takes the least-loaded one
-            // regardless, so a fleet where everything is queueing still routes
+            // *bounded*: with no unqueued worker it samples the whole fleet
+            // and takes the least-loaded of the sample regardless, so a fleet
+            // where everything is queueing still routes
             // instead of failing every request.
-            let fallback = Self::pick_min_load(workers, &loads, &self.config.load_gate);
+            let fallback = Self::pick_min_load(
+                workers,
+                &loads,
+                &self.config.load_gate,
+                self.config.min_load_choices,
+            );
             // That second tier is the only way the fallback can land back on a
             // prefix owner: every owner failed the gate, so the preference tier
             // excluded them too, so reaching one means NO worker in the fleet is
@@ -678,17 +772,34 @@ impl Policy for CacheAwareZmqPolicy {
             // worker is queueing" is the single most important thing an operator
             // sizing the limit needs to see, and burying it in `cache_hit` would
             // make a fully saturated fleet read as a healthy one.
+            //
+            // Classify the SATURATION, not the draw. Landing on an owner
+            // implies the all-queued tier (every owner failed the gate, so no
+            // tier-1 pool contains one), but under sampling the converse is
+            // random: an all-queued pick usually lands on a non-owner, and
+            // booking that as `CacheWorkerQueued` would both under-report the
+            // saturation signal this label exists for and poison the diverted-
+            // overlap histogram with requests where NO unqueued alternative —
+            // hence no diversion — existed.
+            let all_queued = !workers
+                .iter()
+                .any(|w| self.config.load_gate.admits_affinity(loads.waiting_of(w)));
             let landed_on_owner = fallback
                 .as_ref()
                 .is_some_and(|w| matched_urls.contains(w.url.as_str()));
-            let decision = match (owners_present, landed_on_owner) {
-                (_, true) => CacheAwareDecision::CacheHitAllQueued,
-                (true, false) => CacheAwareDecision::CacheWorkerQueued,
+            // `landed_on_owner` is intentionally not a disjunct here: it is
+            // implied by `all_queued` (see above), so it carries no
+            // classification information. It stays for the log line below.
+            let decision = if owners_present && all_queued {
+                CacheAwareDecision::CacheHitAllQueued
+            } else if owners_present {
+                CacheAwareDecision::CacheWorkerQueued
+            } else {
                 // Separate from the queue case: the prefix owners were not
                 // candidates at all. Note this bucket ALSO absorbs load-driven
                 // exclusion when admission is enabled, since `try_claim` filters
                 // candidates by `active_load()` before the policy runs.
-                (false, false) => CacheAwareDecision::MatchedWorkersIneligible,
+                CacheAwareDecision::MatchedWorkersIneligible
             };
             self.record_decision(model_id, decision);
             // Record what the diversion cost, but only when one happened: the
@@ -722,7 +833,7 @@ impl Policy for CacheAwareZmqPolicy {
                     landed_on_owner,
                     engine_load_workers = loads.engine_worker_count(),
                     engine_load_expected = self.engine_load.expected_count(),
-                    "cache-aware-zmq: cache affinity given up, falling back to min-load",
+                    "cache-aware-zmq: cache affinity given up, falling back to sampled min-load",
                 );
             }
             return fallback;
@@ -758,9 +869,18 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
+    /// Helpers pin `min_load_choices: usize::MAX` so every fallback is the
+    /// deterministic fleet-wide minimum — these tests assert *which* worker
+    /// other policy mechanics route to, and per-pick sampling would make
+    /// that nondeterministic. The sampling behaviour itself has dedicated
+    /// tests below (`min_load_sampled_*`). Inline `..Default::default()`
+    /// literals that skip the helpers stay deterministic only because their
+    /// 2-worker fleets make k == pool; do NOT copy such a literal onto a 3+
+    /// worker test — route through a helper or pin the field explicitly.
     fn cfg_default() -> CacheAwareConfig {
         CacheAwareConfig {
             cache_threshold: 0.5,
+            min_load_choices: usize::MAX,
             ..Default::default()
         }
     }
@@ -2219,6 +2339,335 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
+    /// The whole point of sampling: with `min_load_choices = 1` every pick is
+    /// one uniform draw, so two replicas (or one over time) stop converging
+    /// on the same current minimum and the load diffuses. Over 200 selects a
+    /// deterministic pick would land on one URL exclusively; sampling must
+    /// visit both — the failing alternative is fixed, not statistical
+    /// (single-draw visits either side with p ≥ 1/2 each select).
+    #[test]
+    fn min_load_sampled_pick_diffuses_across_near_min_workers() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(
+                policy
+                    .select(&workers, &ctx)
+                    .expect("must pick")
+                    .url
+                    .clone(),
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "single-draw picks must diffuse; got {seen:?}"
+        );
+    }
+
+    /// Sampling relaxes the exact MINIMUM, never the tier: with the queue
+    /// gate active and one worker queueing, a single-draw pick still cannot
+    /// land on it while an unqueued worker exists.
+    #[test]
+    fn min_load_sampled_pick_respects_the_queue_tier() {
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(4, 4), now); // queueing
+        engine_load.set("http://w1:30000", 0, load_stat(15, 0), now); // deep, unqueued
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..queue_cfg(2)
+            },
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        for _ in 0..50 {
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w1:30000",
+                "a queueing worker must never win while an unqueued one exists",
+            );
+        }
+    }
+
+    /// `choices >= pool` is the old exact minimum, kept as the escape hatch
+    /// the deployment can set without a rebuild.
+    #[test]
+    fn min_load_full_sample_is_the_exact_minimum() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 2,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _g = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        for _ in 0..50 {
+            assert_eq!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w1:30000",
+                "a full sample must rank the whole pool and take the minimum",
+            );
+        }
+    }
+
+    /// Reach, not shape: with five workers every one must be a possible
+    /// single-draw pick (P(any worker missed) ≤ 5·(4/5)⁵⁰⁰ ≈ 10⁻⁴⁸). This is
+    /// the test the 2-worker diffusion test CANNOT be: on n=2 a biased
+    /// sampler that only ever reaches two of the candidates still passes
+    /// "both workers visited", so only a ≥4-worker fleet detects a sampler
+    /// reading the wrong end of a partial shuffle.
+    #[test]
+    fn min_load_sampled_pick_reaches_every_worker_on_five_workers() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let workers: Vec<_> = (0..5)
+            .map(|i| worker(&format!("http://w{i}:30000"), "tiny"))
+            .collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            seen.insert(
+                policy
+                    .select(&workers, &ctx)
+                    .expect("must pick")
+                    .url
+                    .clone(),
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "every worker must be reachable by the sampler; got {seen:?}"
+        );
+    }
+
+    /// The shipped default path: 1 < k < pool. Deterministic to assert
+    /// against because the deepest worker can only win a sampled pick when
+    /// it shares the sample with no one lighter — impossible with three
+    /// lighter workers and two draws, so "deepest never picked" has no
+    /// statistical tail at all.
+    #[test]
+    fn min_load_power_of_two_never_picks_the_deepest_of_four() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 2,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let workers: Vec<_> = (0..4)
+            .map(|i| worker(&format!("http://w{i}:30000"), "tiny"))
+            .collect();
+        let _heavy = workers[3].load_guard();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        for _ in 0..100 {
+            assert_ne!(
+                policy.select(&workers, &ctx).expect("must pick").url,
+                "http://w3:30000",
+                "a 2-sample can always dodge the single deepest worker",
+            );
+        }
+    }
+
+    /// A full-tie fleet (all loads equal) is where "choices >= pool
+    /// recovers the deterministic exact minimum" pays the helpers back:
+    /// the pick is stable across selects under the usize::MAX pin, which a
+    /// shuffled full-sample implementation would break without failing any
+    /// assertion that pins load skew.
+    #[test]
+    fn min_load_full_sample_is_deterministic_under_ties() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            cfg_default(),
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        // Pool order, not just "some fixed worker": the no-shuffle full
+        // sample preserves the pre-sampling tiebreak, and pinning the URL
+        // (not just cross-select stability) guards that contract.
+        let first = policy
+            .select(&workers, &ctx)
+            .expect("must pick")
+            .url
+            .clone();
+        assert_eq!(first, "http://w0:30000");
+        for _ in 0..50 {
+            assert_eq!(policy.select(&workers, &ctx).expect("must pick").url, first);
+        }
+    }
+
+    /// Where `min_load_sampled_pick_respects_the_queue_tier` degenerates
+    /// (its tier-1 pool is a singleton, so no sampler runs), this one
+    /// exercises the actual draw: two unqueued workers + one queueing, a
+    /// single-draw pick must stay inside the tier over 100 selects.
+    /// P(queueing worker surviving under a whole-fleet-sampling regression)
+    /// = (2/3)¹⁰⁰ ≈ 10⁻¹⁸.
+    #[test]
+    fn min_load_sampled_draw_stays_inside_the_unqueued_tier() {
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(4, 4), now); // queueing
+        engine_load.set("http://w1:30000", 0, load_stat(9, 0), now); // unqueued
+        engine_load.set("http://w2:30000", 0, load_stat(15, 0), now); // unqueued
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..queue_cfg(2)
+            },
+            Arc::new(HashTree::new()),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers: Vec<_> = (0..3)
+            .map(|i| worker(&format!("http://w{i}:30000"), "tiny"))
+            .collect();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let picked = policy.select(&workers, &ctx).expect("must pick");
+            assert_ne!(
+                picked.url, "http://w0:30000",
+                "a queueing worker must never win while an unqueued one exists",
+            );
+            seen.insert(picked.url.clone());
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "both unqueued workers are reachable draws; got {seen:?}"
+        );
+    }
+
+    /// The CLI is NonZeroUsize, but a programmatically constructed 0 is
+    /// clamped to a single draw rather than passed to `partial_shuffle` as
+    /// an empty sample. Pins the documented clamp.
+    #[test]
+    fn min_load_zero_choices_clamps_to_a_single_draw() {
+        let tree = Arc::new(HashTree::new());
+        let policy = new_policy(
+            CacheAwareConfig {
+                min_load_choices: 0,
+                ..cfg_default()
+            },
+            tree,
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let workers = vec![Arc::clone(&w0)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+        );
+    }
+
+    /// Sampling relaxes the exact minimum, never the saturation signal: at
+    /// choices=1 with every worker queueing, a pick landing on a NON-owner
+    /// is now the common case — but the routing could not have used locality
+    /// anyway (no unqueued worker existed), so the decision must still be
+    /// `cache_hit_all_queued`, not `cache_worker_queued`, or the fleet-
+    /// saturation label goes silent exactly when it should climb.
+    #[test]
+    fn queue_gate_all_queued_classification_keys_on_saturation_not_the_draw() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(8, 5), now); // owner, queueing
+        engine_load.set("http://w1:30000", 0, load_stat(1, 5), now); // non-owner, queueing, shallower
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                min_load_choices: 1,
+                ..queue_cfg(4)
+            },
+            Arc::clone(&tree),
+            Arc::clone(&registry),
+            oracle_for_tests(4),
+            Arc::clone(&engine_load),
+        )
+        .with_metrics(Arc::clone(&metrics));
+        // Tier 2 must stay routable: every pick is Some, and it may land on
+        // either worker — that draw is the saturation this label captures.
+        for _ in 0..50 {
+            policy
+                .select(&workers, &ctx)
+                .expect("tier 2 must keep routing");
+        }
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 50"
+            ),
+            "every all-queued pick is saturation regardless of where the draw lands; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("decision=\"cache_worker_queued\""),
+            "nothing was diverted — no unqueued worker existed; got:\n{rendered}"
+        );
+    }
+
     /// Byte-slice helper over the shared `extract_prompt_text_from_value` free
     /// function, so the extraction-shape tests below stay terse.
     fn extract_prompt_text(body: &[u8]) -> Option<String> {
@@ -2470,6 +2919,7 @@ mod tests {
         CacheAwareConfig {
             cache_threshold: 0.0, // any match counts; the gate is what's under test
             load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(limit).expect("limit > 0")),
+            min_load_choices: usize::MAX,
             ..Default::default()
         }
     }
@@ -2479,6 +2929,7 @@ mod tests {
     fn spread_cfg() -> CacheAwareConfig {
         CacheAwareConfig {
             cache_threshold: 0.0,
+            min_load_choices: usize::MAX,
             ..Default::default()
         }
     }
@@ -2704,9 +3155,12 @@ mod tests {
         );
         assert!(
             metrics.render().contains(
-                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 1"
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 1"
             ),
-            "diverting off the cache home is a real sacrifice here",
+            "every worker queueing is saturation, whatever the draw picks: with NO unqueued \
+             alternative the gate vetoed nothing, so this is the saturation label, not a \
+             diversion — and under sampled picks it lands off-owner almost always, which is \
+             why the classification keys on saturation rather than where the draw landed",
         );
     }
 
