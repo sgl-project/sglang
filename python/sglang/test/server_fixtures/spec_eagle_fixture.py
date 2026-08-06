@@ -58,9 +58,8 @@ class SpecEagleServerBase(CustomTestCase):
     attention_backend = "flashinfer"
     # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
-    # 0.85 fit a cap of 8; at 64 the verify logits and activations need the room
-    # back (CI OOM'd with 1.9GB free, 0.80 leaves 3.3GB). Below 0.80 the KV pool
-    # caps the batch instead, with no further speedup.
+    # Leaves ~3.3GB on a 32GB card for the verify logits and activations at a
+    # cap of 64; higher OOMs, lower starves the KV pool into capping the batch.
     mem_fraction_static = 0.80
     # The eval kits drive 128 client threads, so a small cap just serializes them.
     # Capture follows: capture_bs is clipped to req_to_token_pool.size (cap + 1).
