@@ -122,6 +122,7 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FP4_IGNORED_LAYERS": "model.layers.0,model.layers.87",
     }
 
 
