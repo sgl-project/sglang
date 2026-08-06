@@ -67,7 +67,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
+    prepare_mxfp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -84,6 +87,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -296,6 +300,8 @@ class Fp8Config(QuantizationConfig):
             return 95
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
             return 94
+        if self.use_mxfp8 and _is_cuda:
+            return 80
 
         return 100 if self.use_mxfp8 else 80
 
@@ -457,6 +463,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
+        force_marlin = False
         if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
@@ -467,18 +474,40 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        self.use_mxfp8_marlin = (
+            self.use_mxfp8
+            and _is_cuda
+            and not self.convert_mxfp8_to_block
+            and (force_marlin or self._can_auto_enable_mxfp8_marlin())
+        )
+        self.use_marlin = self.use_marlin or self.use_mxfp8_marlin
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        if (
+            self.use_mxfp8
+            and not self.convert_mxfp8_to_block
+            and not self.use_mxfp8_marlin
+        ):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
-        else:
+        elif not self.use_mxfp8_marlin:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+
+    @staticmethod
+    def _can_auto_enable_mxfp8_marlin() -> bool:
+        try:
+            major, minor = get_device_capability()
+            if major is None or minor is None:
+                return False
+            sm = major * 10 + minor
+            return 80 <= sm < 100
+        except Exception:
+            return False
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -669,12 +698,17 @@ class Fp8LinearMethod(LinearMethodBase):
             # MXFP8 (e4m3fn + UE8M0) must NOT be fnuz-normalized; check before
             # the fnuz branch since is_fp8_fnuz() is also True on gfx942.
             if not self.is_checkpoint_fp8_serialized:
-                self._quantize_mxfp8_weights(layer)
+                self._quantize_mxfp8_weights(
+                    layer, process_scale=not self.use_mxfp8_marlin
+                )
                 return
             # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
             # Keep parameter object to preserve weight_loader attrs for hot reload.
+            layer.weight.requires_grad_(False)
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
+            if self.use_mxfp8_marlin:
+                return
             self._process_mxfp8_linear_weight_scale(layer)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -811,7 +845,9 @@ class Fp8LinearMethod(LinearMethodBase):
             # Triton path consumes canonical 2D UE8M0 uint8 scales directly.
             return
 
-    def _quantize_mxfp8_weights(self, layer: Module) -> None:
+    def _quantize_mxfp8_weights(
+        self, layer: Module, process_scale: bool = True
+    ) -> None:
         weight = layer.weight.data
         qweight, weight_scale = mxfp8_group_quantize(weight)
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
@@ -826,7 +862,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
             )
         layer.weight_scale_inv.format_ue8m0 = True
-        self._process_mxfp8_linear_weight_scale(layer)
+        if process_scale:
+            self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
@@ -937,7 +974,10 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
-            prepare_fp8_layer_for_marlin(layer, not self.block_quant)
+            if self.use_mxfp8_marlin:
+                prepare_mxfp8_layer_for_marlin(layer)
+            else:
+                prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
 
@@ -947,6 +987,17 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_mxfp8_marlin:
+            return torch.ops.sglang.apply_mxfp8_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

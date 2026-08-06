@@ -607,6 +607,14 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def _mxfp8_config(self):
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[1, 32],
+            use_mxfp8=True,
+        )
+
     def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {
@@ -814,6 +822,52 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertEqual(
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
+        )
+
+    @patch("sglang.srt.layers.quantization.fp8.is_npu", return_value=False)
+    @patch("sglang.srt.layers.quantization.fp8._is_musa", False)
+    @patch("sglang.srt.layers.quantization.fp8._is_hip", False)
+    @patch("sglang.srt.layers.quantization.fp8._is_cuda", True)
+    @patch("sglang.srt.layers.quantization.fp8._mxfp8_to_block_fp8_required", False)
+    def test_mxfp8_min_capability_allows_cuda_sm80_marlin(self, _):
+        self.assertEqual(self._mxfp8_config().get_min_capability(), 80)
+
+    @patch("sglang.srt.layers.quantization.fp8.cutlass_fp8_supported")
+    @patch("sglang.srt.layers.quantization.fp8.can_auto_enable_marlin_fp8")
+    @patch("sglang.srt.layers.quantization.fp8.get_bool_env_var")
+    @patch("sglang.srt.layers.quantization.fp8.get_device_capability")
+    @patch("sglang.srt.layers.quantization.fp8._is_cuda", True)
+    @patch("sglang.srt.layers.quantization.fp8._mxfp8_to_block_fp8_required", False)
+    def test_mxfp8_cuda_sm80_dense_auto_uses_marlin_w8a16(
+        self,
+        mock_get_device_capability,
+        mock_get_bool_env_var,
+        mock_can_auto_enable_marlin_fp8,
+        mock_cutlass_fp8_supported,
+    ):
+        mock_get_device_capability.return_value = (8, 0)
+        mock_get_bool_env_var.return_value = False
+        mock_can_auto_enable_marlin_fp8.return_value = False
+        mock_cutlass_fp8_supported.return_value = False
+
+        method = Fp8LinearMethod(self._mxfp8_config())
+
+        self.assertTrue(method.use_marlin)
+        self.assertTrue(method.use_mxfp8_marlin)
+        self.assertIsNone(method.w8a8_mxfp8_linear)
+        self.assertIsNone(method.w8a8_block_fp8_linear)
+
+    def test_mxfp8_marlin_reinterprets_ue8m0_scale_bytes(self):
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            _mxfp8_scale_to_dtype,
+        )
+
+        scale_u8 = torch.tensor([127, 128, 126, 0], dtype=torch.uint8)
+        scale_fp32 = _mxfp8_scale_to_dtype(scale_u8, torch.float32)
+
+        torch.testing.assert_close(
+            scale_fp32,
+            torch.tensor([1.0, 2.0, 0.5, 0.0], dtype=torch.float32),
         )
 
 
