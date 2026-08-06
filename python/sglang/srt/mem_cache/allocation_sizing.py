@@ -6,10 +6,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 
 
-def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
-    if server_args is None:
-        server_args = get_server_args()
-
+def get_alloc_len_per_decode(server_args: ServerArgs) -> int:
     if server_args.speculative_algorithm is None:
         return 1
 
@@ -39,7 +36,13 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
     mode; see eagle_utils.eagle_prepare_for_decode.
+
+    Callers on a request path have no config in hand, so this is the module's
+    single "which config" decision point: everything below it takes the
+    instance explicitly.
     """
+    if server_args is None:
+        server_args = get_server_args()
     return 2 * get_alloc_len_per_decode(server_args)
 
 
