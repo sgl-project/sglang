@@ -31,6 +31,7 @@ from transformers import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -257,7 +258,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
-        self.capture_aux_hidden_states = False
 
         self.post_init()
 
@@ -306,8 +306,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
+        # DFlash uses the fused sink + stash handoff.
         self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.language_model.enable_aux_capture(len(layer_ids))
 
     def prepare_attn_masks(
         self,
@@ -663,10 +664,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             # stage; logits processing happens on the last rank only.
             return hidden_states
 
-        # Unpack aux_hidden_states if Eagle3 capture is active
+        # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+        # language model; None for plain generation.
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.language_model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.language_model.pop_aux_hidden_states()
 
         # PP=1 keeps the original tied-weight behavior of using embed_tokens
         # directly; under PP we route through the dedicated lm_head module.
@@ -1099,7 +1103,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return embed, embed
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        self.capture_aux_hidden_states = True
         text_config = self.config.text_config
         if layer_ids is None:
             num_layers = text_config.num_hidden_layers
@@ -1112,6 +1115,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.language_model.enable_aux_capture(
+            len(self.language_model.layers_to_capture)
+        )
 
 
 EntryClass = Gemma4ForConditionalGeneration

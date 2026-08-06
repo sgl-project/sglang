@@ -412,7 +412,6 @@ class OPTForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.capture_aux_hidden_states = False
         self.pp_group = get_pp_group()
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -438,8 +437,6 @@ class OPTForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             if not get_embedding:

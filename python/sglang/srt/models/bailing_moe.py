@@ -36,6 +36,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -683,7 +684,7 @@ class BailingMoEBlock(nn.Module):
         return hidden_states, residual
 
 
-class BailingMoEModel(nn.Module):
+class BailingMoEModel(AuxCaptureMixin, nn.Module):
 
     def __init__(
         self,
@@ -749,13 +750,11 @@ class BailingMoEModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states if residual is None else hidden_states + residual
-                    )
+                if aux_sink is not None and i in self.layers_to_capture:
+                    aux_sink.append_add(hidden_states, residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -763,7 +762,7 @@ class BailingMoEModel(nn.Module):
                     forward_batch,
                     residual,
                     captured_last_layer_outputs=(
-                        aux_hidden_states
+                        aux_sink
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
@@ -782,9 +781,9 @@ class BailingMoEModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class BailingMoEForCausalLM(nn.Module):
@@ -820,8 +819,6 @@ class BailingMoEForCausalLM(nn.Module):
                 use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
-
-        self.capture_aux_hidden_states = False
 
     @property
     def start_layer(self):
@@ -862,8 +859,10 @@ class BailingMoEForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1020,7 +1019,6 @@ class BailingMoEForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
@@ -1028,6 +1026,9 @@ class BailingMoEForCausalLM(nn.Module):
             # Add +1 because in SGLang, for the i-th layer, the auxiliary hidden state
             # corresponds to the output of layer (i - 1).
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

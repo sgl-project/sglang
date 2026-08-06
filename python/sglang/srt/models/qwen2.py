@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -306,7 +307,7 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen2Model(nn.Module):
+class Qwen2Model(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
@@ -378,6 +379,13 @@ class Qwen2Model(nn.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+        # DFlash routes the pre-layer capture into the fused sink + stash; the
+        # loop gates on ``layers_to_capture`` (Pattern A). ``layers_to_capture``
+        # is already offset by the caller (+1 for HF "after layer k").
+        self.layers_to_capture = layers_to_capture
+        self.enable_aux_capture(len(layers_to_capture))
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.get_input_embeddings()(input_ids) * self.config.scale_emb
@@ -407,12 +415,10 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            if aux_sink is not None and i in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -434,10 +440,9 @@ class Qwen2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -514,8 +519,6 @@ class Qwen2ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
@@ -541,8 +544,10 @@ class Qwen2ForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
@@ -748,7 +753,6 @@ class Qwen2ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [
@@ -758,6 +762,9 @@ class Qwen2ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
 
 EntryClass = Qwen2ForCausalLM

@@ -318,9 +318,6 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):

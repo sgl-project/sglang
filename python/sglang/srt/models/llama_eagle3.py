@@ -28,6 +28,7 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -111,7 +112,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class LlamaModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -237,9 +238,18 @@ class LlamaModel(nn.Module):
                 )
             hidden_states = self.fc(hidden_states)
 
+        # The draft captures a single hidden state and stashes it for the outer
+        # wrapper to pop, mirroring the target AuxCaptureMixin handoff so a
+        # body-captured prefill graph routes it through the runner-armed static
+        # buffer (num_aux_capture_layers == 1).
+        aux_sink = self.make_aux_sink()
+
         # idle batch
         if hidden_states.shape[0] == 0:
-            return hidden_states, [hidden_states]
+            if aux_sink is not None:
+                aux_sink.append(hidden_states)
+                self.stash_aux_hidden_states(aux_sink.finalize())
+            return hidden_states
 
         residual = None
         for layer in self.layers:
@@ -257,7 +267,10 @@ class LlamaModel(nn.Module):
 
         # Draft decode captures pre-norm hidden by default; `norm_output` opts for normed.
         aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
-        return hidden_states_to_logits, [aux]
+        if aux_sink is not None:
+            aux_sink.append(aux)
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states_to_logits
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -308,7 +321,10 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )  # draft logits processor has it's own vocab size
         self.logits_processor = LogitsProcessor(config_)
 
-        self.capture_aux_hidden_states = True
+        # The draft stashes its single aux hidden on the inner model; the
+        # inherited LlamaForCausalLM.forward pops it via the AuxCaptureMixin
+        # branch (no legacy tuple return).
+        self.model.enable_aux_capture(1)
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:

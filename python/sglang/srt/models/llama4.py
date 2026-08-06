@@ -28,6 +28,7 @@ from transformers import Llama4TextConfig
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -491,7 +492,7 @@ class Llama4DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Llama4Model(nn.Module):
+class Llama4Model(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -533,10 +534,10 @@ class Llama4Model(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(len(self.layers)):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+            if aux_sink is not None and i in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -547,10 +548,9 @@ class Llama4Model(nn.Module):
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Llama4ForCausalLM(LlamaForCausalLM):

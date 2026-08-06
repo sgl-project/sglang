@@ -35,7 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.aux_capture import AuxCaptureSink
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -507,7 +507,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        captured_last_layer_outputs: Optional[AuxCaptureSink] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
     ):

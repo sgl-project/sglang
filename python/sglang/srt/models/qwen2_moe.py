@@ -40,6 +40,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -831,7 +832,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen2MoeModel(nn.Module):
+class Qwen2MoeModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -892,6 +893,7 @@ class Qwen2MoeModel(nn.Module):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        self.enable_aux_capture(len(layers_to_capture))
 
     def forward(
         self,
@@ -922,7 +924,7 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         if forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
@@ -948,7 +950,7 @@ class Qwen2MoeModel(nn.Module):
                         forward_batch,
                         residual,
                         captured_last_layer_outputs=(
-                            aux_hidden_states
+                            aux_sink
                             if getattr(layer, "_is_layer_to_capture", False)
                             else None
                         ),
@@ -992,10 +994,9 @@ class Qwen2MoeModel(nn.Module):
                 torch.cuda.current_stream(),
             )
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Qwen2MoeForCausalLM(nn.Module):
@@ -1026,8 +1027,6 @@ class Qwen2MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -1046,8 +1045,10 @@ class Qwen2MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
@@ -1204,7 +1205,9 @@ class Qwen2MoeForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
+        # EAGLE3 target capture uses the fused sink + stash handoff; the inner
+        # Model.set_eagle3_layers_to_capture enables the sink and
+        # the outer forward pops the stashed aux buffer.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.set_eagle3_layers_to_capture(

@@ -87,8 +87,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
         self.is_mrope_enabled = bool(rope_config) and "mrope_section" in rope_config
 
-        self.capture_aux_hidden_states = False
-
     @property
     def start_layer(self) -> int:
         return self.model.start_layer
@@ -99,6 +97,9 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
+        self.model.set_dflash_layers_to_capture(layers_to_capture)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -135,9 +136,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
-        aux_hidden_states = None
-        if isinstance(hidden_states, tuple):
-            hidden_states, aux_hidden_states = hidden_states
+        # DFlash stashes the fused aux buffer on the body for the wrapper to
+        # pop; None for plain generation.
+        aux_hidden_states = self.model.pop_aux_hidden_states()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states

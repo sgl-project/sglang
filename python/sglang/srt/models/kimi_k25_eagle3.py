@@ -18,7 +18,7 @@ config flags on top of the same layout:
 import copy
 import logging
 import re
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -26,6 +26,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
@@ -186,7 +187,7 @@ class Eagle3MLADecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Eagle3MLAModel(nn.Module):
+class Eagle3MLAModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -260,7 +261,7 @@ class Eagle3MLAModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> torch.Tensor:
         if input_embeds is None:
             # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels (far above
             # vocab_size). Use target-produced mm_input_embeds for these positions and
@@ -292,8 +293,17 @@ class Eagle3MLAModel(nn.Module):
             hidden_states, _ = self.fc(hidden_states)
             hidden_states = self._fc_gatherer(hidden_states)
 
+        # The draft captures a single hidden state and stashes it for the outer
+        # wrapper to pop, mirroring the target AuxCaptureMixin handoff so a
+        # body-captured prefill graph routes it through the runner-armed static
+        # buffer (num_aux_capture_layers == 1).
+        aux_sink = self.make_aux_sink()
+
         if hidden_states.shape[0] == 0:
-            return hidden_states, [hidden_states]
+            if aux_sink is not None:
+                aux_sink.append(hidden_states)
+                self.stash_aux_hidden_states(aux_sink.finalize())
+            return hidden_states
 
         zero_allocator = BumpAllocator(
             buffer_size=2,
@@ -308,7 +318,10 @@ class Eagle3MLAModel(nn.Module):
             hidden_states, residual
         )
         aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
-        return hidden_states_to_logits, [aux]
+        if aux_sink is not None:
+            aux_sink.append(aux)
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states_to_logits
 
 
 class Eagle3DeepseekV2ForCausalLM(nn.Module):
@@ -365,7 +378,9 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         config_for_logits.vocab_size = draft_vocab_size or config.vocab_size
         self.logits_processor = LogitsProcessor(config_for_logits)
 
-        self.capture_aux_hidden_states = True
+        # The draft stashes its single aux hidden on the inner model; the outer
+        # forward pops it via the AuxCaptureMixin branch (no legacy tuple return).
+        self.model.enable_aux_capture(1)
         self.hot_token_id = None
 
     @torch.no_grad()
@@ -381,9 +396,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
-        aux_hidden_states = None
-        if isinstance(hidden_states, tuple):
-            hidden_states, aux_hidden_states = hidden_states
+        aux_hidden_states = self.model.pop_aux_hidden_states()
         return self.logits_processor(
             input_ids,
             hidden_states,

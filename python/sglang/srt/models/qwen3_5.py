@@ -41,6 +41,7 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -1239,7 +1240,7 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(AuxCaptureMixin, nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
     packed_modules_mapping = {
@@ -1395,6 +1396,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        self.enable_aux_capture(len(layers_to_capture))
 
     @property
     def start_layer(self) -> int:
@@ -1426,7 +1428,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1439,7 +1441,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                     captured_last_layer_outputs=(
-                        aux_hidden_states
+                        aux_sink
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
@@ -1472,10 +1474,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)

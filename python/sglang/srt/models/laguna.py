@@ -23,6 +23,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -521,7 +522,7 @@ class LagunaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LagunaModel(nn.Module):
+class LagunaModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: LagunaConfig,
@@ -611,12 +612,10 @@ class LagunaModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            if aux_sink is not None and i in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -628,17 +627,15 @@ class LagunaModel(nn.Module):
             )
 
         if hidden_states.shape[0] != 0:
-            if self.end_layer in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            if aux_sink is not None and self.end_layer in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class LagunaForCausalLM(nn.Module):
@@ -671,7 +668,6 @@ class LagunaForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
 
         # Only walk this rank's local layers — out-of-range entries can be PPMissingLayer.
         self._routed_experts_weights_of_layer = LazyValue(
@@ -711,8 +707,10 @@ class LagunaForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
@@ -867,10 +865,11 @@ class LagunaForCausalLM(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
         # SGLang captures "before layer i". To capture the hidden state after
-        # target layer `k` (HF-style), capture before layer `k + 1`.
+        # target layer `k` (HF-style), capture before layer `k + 1`. DFlash uses
+        # the fused sink + stash handoff.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.enable_aux_capture(len(layer_ids))
 
 
 EntryClass = LagunaForCausalLM

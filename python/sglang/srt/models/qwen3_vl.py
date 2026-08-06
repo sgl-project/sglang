@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -1156,15 +1157,13 @@ class Qwen3LLMModel(Qwen3Model):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            if aux_sink is not None and layer_idx in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
 
             # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
             # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
@@ -1203,10 +1202,9 @@ class Qwen3LLMModel(Qwen3Model):
                         hidden_states, residual, post_residual_addition=last_deepstack
                     )
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
@@ -1293,7 +1291,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.capture_aux_hidden_states = False
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
@@ -1301,9 +1298,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
-
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -1424,8 +1418,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
@@ -1448,7 +1444,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
+        # Delegate to the inner text model's DFlash setter, which marks its own
+        # capture layers (Pattern A layers_to_capture or Pattern C per-layer
+        # flag) and enables the fused sink + stash; the outer forward pops the
+        # stashed aux buffer.
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -1540,8 +1539,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        self.capture_aux_hidden_states = True
-        self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [
@@ -1551,6 +1548,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
 
 EntryClass = Qwen3VLForConditionalGeneration
