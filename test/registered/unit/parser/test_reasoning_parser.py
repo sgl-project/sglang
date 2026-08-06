@@ -1363,5 +1363,82 @@ class TestCohereCommand4DetectorFinish(CustomTestCase):
         self.assertEqual(end.reasoning_text, "")
 
 
+class TestCohereCommand4DetectorStreamingParity(CustomTestCase):
+    """Streaming must agree with detect_and_parse on the same text.
+
+    Cohere's streaming path is a custom state machine rather than the base
+    class one, so the two implementations have to be kept in step by hand."""
+
+    ECHOED = (
+        "<|START_THINKING|>thinking<|END_THINKING|><|START_TEXT|>answer<|END_TEXT|>"
+    )
+    ACTION = 'thinking<|END_THINKING|><|START_ACTION|>[{"name": "f"}]<|END_ACTION|>'
+
+    @staticmethod
+    def _stream(text, chunks, **kwargs):
+        """Feed ``chunks`` through a fresh detector, then flush with finish()."""
+        detector = CohereCommand4Detector(**kwargs)
+        reasoning, normal = [], []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk)
+            reasoning.append(result.reasoning_text or "")
+            normal.append(result.normal_text or "")
+        end = detector.finish()
+        reasoning.append(end.reasoning_text or "")
+        normal.append(end.normal_text or "")
+        return "".join(reasoning), "".join(normal)
+
+    def _assert_matches_one_shot(self, text, **kwargs):
+        expected = CohereCommand4Detector(**kwargs).detect_and_parse(text)
+        for label, chunks in (
+            ("single increment", [text]),
+            ("character chunked", list(text)),
+        ):
+            with self.subTest(chunking=label):
+                reasoning, normal = self._stream(text, chunks, **kwargs)
+                self.assertEqual(reasoning, expected.reasoning_text)
+                self.assertEqual(normal, expected.normal_text)
+
+    def test_streaming_strips_echoed_think_start(self):
+        """Checkpoints that echo <|START_THINKING|> must not have the raw token
+        surface in streamed reasoning_content. detect_and_parse already drops
+        it; the streaming state machine used to pass it straight through."""
+        for chunks in ([self.ECHOED], list(self.ECHOED)):
+            reasoning, _ = self._stream(self.ECHOED, chunks)
+            self.assertNotIn("<|START_THINKING|>", reasoning)
+            self.assertEqual(reasoning, "thinking")
+
+    def test_streaming_matches_one_shot_with_echoed_think_start(self):
+        self._assert_matches_one_shot(self.ECHOED)
+        self._assert_matches_one_shot(self.ECHOED, stream_reasoning=False)
+
+    def test_finish_flushes_text_block_closed_in_final_increment(self):
+        """When <|END_THINKING|> and the whole text block land in the same
+        increment, the increment returns early after emitting the trace and the
+        answer is left in the buffer. finish() has to drain it."""
+        text = "thinking<|END_THINKING|><|START_TEXT|>answer<|END_TEXT|>"
+        reasoning, normal = self._stream(text, [text])
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "answer")
+
+    def test_finish_flushes_action_block_closed_in_final_increment(self):
+        """Same path as above, but the model emitted a tool call instead of a
+        text answer -- the action block must reach the tool-call parser."""
+        reasoning, normal = self._stream(self.ACTION, [self.ACTION])
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, '<|START_ACTION|>[{"name": "f"}]<|END_ACTION|>')
+
+    def test_streaming_matches_one_shot_without_echo(self):
+        """Formats that never echo the start token must be unaffected."""
+        for text in (
+            "thinking<|END_THINKING|><|START_TEXT|>answer<|END_TEXT|>",
+            "<|START_TEXT|>answer<|END_TEXT|>",
+            self.ACTION,
+            "thinking<|END_THINKING|><|START_TEXT|>truncated",
+        ):
+            with self.subTest(text=text):
+                self._assert_matches_one_shot(text)
+
+
 if __name__ == "__main__":
     unittest.main()
