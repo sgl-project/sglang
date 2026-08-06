@@ -38,21 +38,21 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
-    # canonical-grid key scheme: when set, backends MUST use this topology-free
-    # cell coordinate ("{ns_digest}_L{s}-{e}[_H{j}]") verbatim as the key
+    # unified key scheme: when set, backends MUST use this topology-free
+    # chunk coordinate ("{ns_digest}_L{s}-{e}[_H{j}]") verbatim as the key
     # suffix instead of their hand-rolled rank/pp/cp suffixes. A list means
-    # head fan-out (this rank owns several head-group cells per page, in
+    # head fan-out (this rank owns several head-group chunks per page, in
     # ascending head order — mirrors the split-heads mha_suffix list); only
     # multi-key backends (mooncake) accept the list form. Built and validated
     # in HiCacheController._generate_storage_config via hicache_key_scheme.py;
     # None under the legacy rank-suffix scheme.
-    canonical_suffix: Optional[Union[str, List[str]]] = None
-    # Cell adapter (set iff any partition knob is set): the LOCAL half-open
-    # layer / kv-head ranges of this rank's cells, layer-major and in the
-    # canonical_suffix order. Objects then use the layout-neutral canonical
-    # byte order. head ranges stay None for rank-replicated pools.
-    canonical_layer_ranges: Optional[List[Tuple[int, int]]] = None
-    canonical_head_ranges: Optional[List[Tuple[int, int]]] = None
+    unified_suffix: Optional[Union[str, List[str]]] = None
+    # Layout adapter (set iff any partition knob is set): the LOCAL
+    # half-open layer / kv-head ranges of this rank's chunks, layer-major
+    # and in the unified_suffix order. Objects then use the unified byte
+    # order. Head ranges stay None for rank-replicated pools.
+    unified_layer_ranges: Optional[List[Tuple[int, int]]] = None
+    unified_head_ranges: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass
@@ -401,18 +401,18 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        if storage_config.canonical_suffix is not None:
-            # canonical-grid scheme: the topology-free cell coordinate (model
+        if storage_config.unified_suffix is not None:
+            # unified scheme: the topology-free chunk coordinate (model
             # identity lives inside the namespace digest) replaces the whole
             # rank/pp/cp suffix family. CP is rejected upstream at attach.
-            if not isinstance(storage_config.canonical_suffix, str):
+            if not isinstance(storage_config.unified_suffix, str):
                 # Head fan-out produces several keys per page; this backend
                 # stores one object per page. Guarded at attach too.
                 raise NotImplementedError(
-                    "the file backend does not support canonical-grid head "
-                    "fan-out (multiple cells per page); use mooncake."
+                    "the file backend does not support unified head "
+                    "fan-out (multiple chunks per page); use mooncake."
                 )
-            self.config_suffix = f"_{storage_config.canonical_suffix}"
+            self.config_suffix = f"_{storage_config.unified_suffix}"
         else:
             self.config_suffix = f"_{model_name}"
             if not is_mla_model:

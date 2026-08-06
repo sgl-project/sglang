@@ -555,7 +555,7 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            # Inside the rollback try-block: canonical-grid attach validation
+            # Inside the rollback try-block: unified attach validation
             # raises here, and a failed runtime re-attach must leave the
             # controller consistent (storage_backend_type reset in except).
             self.storage_config = self._generate_storage_config(
@@ -728,9 +728,9 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
-        canonical_suffix = None
-        canonical_layer_ranges = None
-        canonical_head_ranges = None
+        unified_suffix = None
+        unified_layer_ranges = None
+        unified_head_ranges = None
         layer_partition = storage_backend_extra_config.pop("layer_partition", None)
         head_group_knob = storage_backend_extra_config.pop("head_group", None)
 
@@ -747,22 +747,23 @@ class HiCacheController:
         ):
             raise ValueError(
                 f"layer_partition must be a positive integer (the layer "
-                f"unit: layers per cell; the model's trailing remainder "
-                f"forms a short final cell), got {layer_partition!r}."
+                f"unit: layers per chunk; the model's trailing remainder "
+                f"forms a short final chunk), got {layer_partition!r}."
             )
-        if get_memory().hicache_storage_key_scheme == "canonical-grid":
+        if get_memory().hicache_storage_key_scheme == "unified":
             if tp_lcm_size:
                 raise ValueError(
                     "tp_lcm_size is the legacy rank-suffix split-heads knob; "
-                    "canonical-grid uses head_group in the extra config "
-                    "(heads per cell, e.g. head_group = total_kv_heads / "
+                    "the unified key scheme uses head_group in the extra "
+                    "config "
+                    "(heads per chunk, e.g. head_group = total_kv_heads / "
                     "lcm of the fleet's TP sizes)."
                 )
             (
-                canonical_suffix,
-                canonical_layer_ranges,
-                canonical_head_ranges,
-            ) = self._build_canonical_suffix(
+                unified_suffix,
+                unified_layer_ranges,
+                unified_head_ranges,
+            ) = self._build_unified_suffix(
                 model_name=model_name,
                 is_rank_replicated=is_rank_replicated,
                 attn_cp_size=attn_cp_size,
@@ -773,7 +774,7 @@ class HiCacheController:
             raise ValueError(
                 "layer_partition / head_group in "
                 "--hicache-storage-backend-extra-config require "
-                "--hicache-storage-key-scheme canonical-grid."
+                "--hicache-storage-key-scheme unified."
             )
 
         return HiCacheStorageConfig(
@@ -791,12 +792,12 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
-            canonical_suffix=canonical_suffix,
-            canonical_layer_ranges=canonical_layer_ranges,
-            canonical_head_ranges=canonical_head_ranges,
+            unified_suffix=unified_suffix,
+            unified_layer_ranges=unified_layer_ranges,
+            unified_head_ranges=unified_head_ranges,
         )
 
-    def _build_canonical_suffix(
+    def _build_unified_suffix(
         self,
         model_name: Optional[str],
         is_rank_replicated: bool,
@@ -804,42 +805,42 @@ class HiCacheController:
         head_group_knob: Optional[int] = None,
         layer_partition: Optional[int] = None,
     ):
-        """Attach-time canonical-grid planning.
+        """Attach-time unified planning.
 
         Controller-only guards live here; the namespace/grid derivation is
-        hicache_key_scheme.plan_canonical_cells. Everything unsupported
+        hicache_key_scheme.plan_unified_kv. Everything unsupported
         raises with the remedy in the message — nothing degrades silently
         to rank-suffix keys. Returns (suffix, layer_ranges, head_ranges):
-        a single suffix string without partition knobs, else the owned-cell
-        suffix list plus the LOCAL cell grid for the adapter.
+        a single suffix string without partition knobs, else the
+        owned-chunk suffix list plus the LOCAL grid for the adapter.
         """
         from sglang.srt.mem_cache.hicache_key_scheme import (
             namespace_digest,
             normalize_dtype,
-            plan_canonical_cells,
+            plan_unified_kv,
         )
 
         if type(self) is not HiCacheController:
             raise NotImplementedError(
-                "canonical-grid is not supported for hybrid/side-pool cache "
+                "the unified key scheme is not supported for hybrid/side-pool cache "
                 "controllers yet (per-component grids are the follow-up); use "
                 "--hicache-storage-key-scheme rank-suffix."
             )
         if self.storage_backend_type not in ("file", "mooncake"):
             raise NotImplementedError(
-                f"canonical-grid v1 supports the file and mooncake backends; "
+                f"the unified key scheme v1 supports the file and mooncake backends; "
                 f"got {self.storage_backend_type!r}."
             )
         if (
             head_group_knob is not None or layer_partition is not None
         ) and self.storage_backend_type != "mooncake":
             raise NotImplementedError(
-                "canonical-grid partition knobs (head_group / layer_partition) "
+                "unified-scheme partition knobs (head_group / layer_partition) "
                 "need a multi-key-per-page backend; only mooncake supports "
                 "them (the file backend stores one object per page)."
             )
 
-        plan = plan_canonical_cells(
+        plan = plan_unified_kv(
             model_id=model_name or "",
             # Logical KV dtype, not the storage view: fp8 variants all store
             # as uint8 but must land in distinct keyspaces.
@@ -861,12 +862,12 @@ class HiCacheController:
             # Fail at attach, not on the first backup — a raise on the
             # storage threads would silently wedge write-back.
             raise NotImplementedError(
-                "the cell adapter does not support split K/V host pools "
+                "the KV layout adapter does not support split K/V host pools "
                 "(asymmetric MHA)."
             )
 
         logger.info(
-            "HiCache canonical-grid L3 keys: namespace=%s cells=%s",
+            "HiCache unified L3 keys: namespace=%s chunks=%s",
             namespace_digest(plan.namespace),
             plan.suffixes,
         )

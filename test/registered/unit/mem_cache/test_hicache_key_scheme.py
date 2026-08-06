@@ -1,4 +1,4 @@
-"""Unit tests for srt/mem_cache/hicache_key_scheme (canonical-grid L3 keys)."""
+"""Unit tests for srt/mem_cache/hicache_key_scheme (unified L3 keys)."""
 
 import json
 import tempfile
@@ -7,14 +7,14 @@ import unittest
 import msgspec
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
-    CellAdapter,
+    KVCacheLayoutAdapter,
     KVCacheNamespace,
-    build_canonical_cell_suffixes,
+    build_unified_suffixes,
     derive_namespace,
     load_namespace_descriptor,
     namespace_digest,
     normalize_dtype,
-    plan_canonical_cells,
+    plan_unified_kv,
 )
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +25,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 def _gqa_namespace(**overrides) -> KVCacheNamespace:
     """The design doc's worked example: GQA 70B-like, 80 layers, 8 kv heads,
-    fleet head grid at lcm(TP 2,4) -> head_group=2. Layer cells are absolute
+    fleet head grid at lcm(TP 2,4) -> head_group=2. Layer chunks are absolute
     per-stage ranges (layer_group stays 0)."""
     fields = dict(
         model_id="meta-llama/Llama-3-70B",
@@ -76,13 +76,13 @@ def _gqa_suffixes(
         object_layout="page_head",
     )
     kwargs.update(overrides)
-    return build_canonical_cell_suffixes(_gqa_namespace(), **kwargs)
+    return build_unified_suffixes(_gqa_namespace(), **kwargs)
 
 
 def _mla_suffixes(
     *, tp_rank: int, tp_size: int, start_layer: int, end_layer: int
 ) -> list:
-    return build_canonical_cell_suffixes(
+    return build_unified_suffixes(
         _mla_namespace(),
         attn_tp_rank=tp_rank,
         attn_tp_size=tp_size,
@@ -214,7 +214,7 @@ class TestNamespaceDigest(CustomTestCase):
                 object_layout="page_first",
             )
         with self.assertRaisesRegex(ValueError, "divide"):
-            build_canonical_cell_suffixes(
+            build_unified_suffixes(
                 _gqa_namespace(total_kv_heads=8, head_group=3),
                 attn_tp_rank=0,
                 attn_tp_size=4,
@@ -230,7 +230,7 @@ class TestNamespaceDigest(CustomTestCase):
             )
 
 
-class TestCellSuffixes(CustomTestCase):
+class TestUnifiedSuffixes(CustomTestCase):
     """The design doc's worked example with absolute layer-range coordinates
     and head fan-out at head_group=2 (fleet lcm(TP 2,4) = 4)."""
 
@@ -244,7 +244,7 @@ class TestCellSuffixes(CustomTestCase):
             [f"{digest}_L40-80_H1"],
         )
 
-    def test_head_fan_out_cells(self):
+    def test_head_fan_out_chunks(self):
         # TP2 ranks own two head groups each: the fan-out case.
         digest = namespace_digest(_gqa_namespace())
         self.assertEqual(
@@ -256,9 +256,9 @@ class TestCellSuffixes(CustomTestCase):
             [f"{digest}_L0-40_H2", f"{digest}_L0-40_H3"],
         )
 
-    def test_cross_tp_cells_cover_each_other(self):
-        # The cross-topology read: a TP2 rank's cells are exactly the union
-        # of the two corresponding TP4 ranks' cells — a TP2 reader fetches
+    def test_cross_tp_chunks_cover_each_other(self):
+        # The cross-topology read: a TP2 rank's chunks are exactly the union
+        # of the two corresponding TP4 ranks' chunks — a TP2 reader fetches
         # TP4-written objects (and vice versa) by name alone.
         tp2_rank0 = _gqa_suffixes(tp_rank=0, tp_size=2)
         tp4_rank0 = _gqa_suffixes(tp_rank=0, tp_size=4)
@@ -276,7 +276,7 @@ class TestCellSuffixes(CustomTestCase):
 
     def test_uneven_pp_stages_attach(self):
         # DeepSeek-V3 has 61 layers; the default PP2 split is [0,30)/[30,61).
-        # Both stages must derive valid, distinct cell names.
+        # Both stages must derive valid, distinct chunk names.
         digest = namespace_digest(_mla_namespace())
         s0 = _mla_suffixes(tp_rank=0, tp_size=2, start_layer=0, end_layer=30)
         s1 = _mla_suffixes(tp_rank=0, tp_size=2, start_layer=30, end_layer=61)
@@ -285,7 +285,7 @@ class TestCellSuffixes(CustomTestCase):
 
     def test_mla_cross_tp_size_shares_keys(self):
         # Rank-replicated pools have no head axis: TP2 and TP4 deployments
-        # derive identical (single) cell names.
+        # derive identical (single) chunk names.
         digest = namespace_digest(_mla_namespace())
         s_tp2 = _mla_suffixes(tp_rank=1, tp_size=2, start_layer=0, end_layer=61)
         s_tp4 = _mla_suffixes(tp_rank=3, tp_size=4, start_layer=0, end_layer=61)
@@ -315,10 +315,10 @@ class TestCellSuffixes(CustomTestCase):
     def test_local_heads_must_tile_head_group(self):
         # 12 heads at TP4 -> 3 heads/rank: 12 % 2 == 0 passes the product
         # check, but 3 % 2 != 0 must hit the tiling branch, not silently
-        # floor the cell count.
+        # floor the chunk count.
         namespace = _gqa_namespace(total_kv_heads=12, head_group=2)
         with self.assertRaisesRegex(ValueError, "tile"):
-            build_canonical_cell_suffixes(
+            build_unified_suffixes(
                 namespace,
                 attn_tp_rank=0,
                 attn_tp_size=4,
@@ -351,7 +351,7 @@ class TestDeriveNamespace(CustomTestCase):
             head_group=4,
             object_layout="page_head",
         )
-        suffixes = build_canonical_cell_suffixes(
+        suffixes = build_unified_suffixes(
             namespace,
             attn_tp_rank=1,
             attn_tp_size=2,
@@ -408,9 +408,9 @@ class TestDeriveNamespace(CustomTestCase):
         self.assertEqual(normalize_dtype(torch.float8_e5m2), "float8_e5m2")
 
 
-class TestCanonicalCellPlan(CustomTestCase):
-    """plan_canonical_cells: any partition knob selects the adapter, whose
-    canonical byte order makes the namespace layout-neutral (cell-v1)."""
+class TestUnifiedKVPlan(CustomTestCase):
+    """plan_unified_kv: any partition knob selects the adapter, whose
+    unified byte order makes the namespace layout-neutral (unified-v1)."""
 
     def _plan(self, **overrides):
         kwargs = dict(
@@ -428,7 +428,7 @@ class TestCanonicalCellPlan(CustomTestCase):
             pool_layout="page_first",
         )
         kwargs.update(overrides)
-        return plan_canonical_cells(**kwargs)
+        return plan_unified_kv(**kwargs)
 
     def test_no_knobs_keeps_raw_layout(self):
         plan = self._plan()
@@ -439,14 +439,14 @@ class TestCanonicalCellPlan(CustomTestCase):
         self.assertIsNone(plan.head_ranges)
 
     def test_any_knob_selects_adapter(self):
-        # head knob alone: adapter, single layer window, head cells.
+        # head knob alone: adapter, single layer window, head chunks.
         plan = self._plan(head_group_knob=2)
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "cell-v1")
+        self.assertEqual(plan.namespace.object_layout, "unified-v1")
         self.assertEqual(plan.layer_ranges, [(0, 61)])
         self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
         self.assertEqual(len(plan.suffixes), 2)
-        # layer knob alone: adapter with the rank's full head span as one cell.
+        # layer knob alone: adapter, the rank's full head span as one chunk.
         plan = self._plan(layer_partition=30)
         self.assertTrue(plan.adapter)
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
@@ -466,7 +466,7 @@ class TestCanonicalCellPlan(CustomTestCase):
             layer_partition=30,
         )
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "cell-v1")
+        self.assertEqual(plan.namespace.object_layout, "unified-v1")
         self.assertIsNone(plan.head_ranges)
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
         # head_group alone is a no-op for replicated pools (no head axis).
@@ -487,7 +487,7 @@ class TestCanonicalCellPlan(CustomTestCase):
         self.assertEqual(len(raw), 2)
 
     def test_plan_validation(self):
-        with self.assertRaisesRegex(ValueError, "cell adapter"):
+        with self.assertRaisesRegex(ValueError, "layout adapter"):
             self._plan(pool_layout="page_first_kv_split", layer_partition=30)
         with self.assertRaisesRegex(ValueError, "divide"):
             self._plan(head_group_knob=3)
@@ -502,7 +502,7 @@ class TestCanonicalCellPlan(CustomTestCase):
 
 
 class TestControllerGuards(CustomTestCase):
-    """Attach-time guards of HiCacheController._build_canonical_suffix."""
+    """Attach-time guards of HiCacheController._build_unified_suffix."""
 
     class _StubHostPool:
         def __init__(self, layout: str):
@@ -541,7 +541,7 @@ class TestControllerGuards(CustomTestCase):
             layer_partition=None,
         )
         kwargs.update(overrides)
-        return HiCacheController._build_canonical_suffix(controller, **kwargs)
+        return HiCacheController._build_unified_suffix(controller, **kwargs)
 
     def test_backend_allowlist_guard(self):
         from sglang.srt.managers.cache_controller import HiCacheController
@@ -571,7 +571,7 @@ class TestControllerGuards(CustomTestCase):
 
     def test_adapter_plan_from_any_layout(self):
         # No host-layout requirement: head_group on a page_first pool
-        # attaches through the adapter (list suffix + local cell grid).
+        # attaches through the adapter (list suffix + local chunk grid).
         from sglang.srt.managers.cache_controller import HiCacheController
 
         stub = self._stub_controller(HiCacheController, "mooncake")
@@ -588,7 +588,7 @@ class TestControllerGuards(CustomTestCase):
 
         stub = self._stub_controller(HiCacheController, "mooncake")
         stub.mem_pool_host = self._StubHostPool("page_first_kv_split")
-        with self.assertRaisesRegex(ValueError, "cell adapter"):
+        with self.assertRaisesRegex(ValueError, "layout adapter"):
             self._build(
                 stub,
                 is_rank_replicated=False,
@@ -613,7 +613,7 @@ class TestControllerGuards(CustomTestCase):
 
 
 class TestFileBackendSuffix(CustomTestCase):
-    def _config(self, canonical_suffix):
+    def _config(self, unified_suffix):
         return HiCacheStorageConfig(
             tp_rank=1,
             tp_size=4,
@@ -625,30 +625,30 @@ class TestFileBackendSuffix(CustomTestCase):
             enable_storage_metrics=False,
             is_page_first_layout=True,
             model_name="meta-llama/Llama-3-70B",
-            canonical_suffix=canonical_suffix,
+            unified_suffix=unified_suffix,
         )
 
-    def test_file_backend_uses_canonical_suffix_verbatim(self):
+    def test_file_backend_uses_unified_suffix_verbatim(self):
         from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
         with tempfile.TemporaryDirectory() as tmp:
-            canonical = "ukv1-0123456789abcdef_L40-80_H1"
-            backend = HiCacheFile(self._config(canonical), file_path=tmp)
-            self.assertEqual(backend.config_suffix, f"_{canonical}")
+            unified_key = "ukv1-0123456789abcdef_L40-80_H1"
+            backend = HiCacheFile(self._config(unified_key), file_path=tmp)
+            self.assertEqual(backend.config_suffix, f"_{unified_key}")
             self.assertEqual(
-                backend._get_suffixed_key("deadbeef"), f"deadbeef_{canonical}"
+                backend._get_suffixed_key("deadbeef"), f"deadbeef_{unified_key}"
             )
 
     def test_file_backend_rejects_fan_out_list(self):
         from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
         with tempfile.TemporaryDirectory() as tmp:
-            cells = [
+            chunks = [
                 "ukv1-0123456789abcdef_L0-40_H0",
                 "ukv1-0123456789abcdef_L0-40_H1",
             ]
             with self.assertRaisesRegex(NotImplementedError, "fan-out"):
-                HiCacheFile(self._config(cells), file_path=tmp)
+                HiCacheFile(self._config(chunks), file_path=tmp)
 
     def test_file_backend_rank_suffix_unchanged(self):
         from sglang.srt.mem_cache.hicache_storage import HiCacheFile
@@ -659,15 +659,15 @@ class TestFileBackendSuffix(CustomTestCase):
 
 
 class TestLayerPartition(CustomTestCase):
-    """Canonical layer partition (PP read-back): a stage spanning several
-    canonical ranges owns one cell per range, so readers consume cells
+    """Shared layer partition (PP read-back): a stage spanning several
+    layer windows owns one chunk per window, so readers consume chunks
     written under a different pipeline split by name alone."""
 
     def _mla_partition_namespace(self):
         return _mla_namespace(layer_group=30)
 
     def _suffixes(self, start_layer, end_layer, namespace=None, final=True):
-        return build_canonical_cell_suffixes(
+        return build_unified_suffixes(
             namespace or self._mla_partition_namespace(),
             attn_tp_rank=0,
             attn_tp_size=2,
@@ -685,7 +685,7 @@ class TestLayerPartition(CustomTestCase):
 
     def test_pp_read_back_coverage(self):
         # DeepSeek-V3 (61 layers), layer unit 30, default uneven PP2 split
-        # [0,30)/[30,61): the trailing remainder forms a short final cell
+        # [0,30)/[30,61): the trailing remainder forms a short final chunk
         # (L60-61). PP1 fans out to exactly the stages' union.
         digest = namespace_digest(self._mla_partition_namespace())
         stage0 = self._suffixes(0, 30, final=False)
@@ -708,7 +708,7 @@ class TestLayerPartition(CustomTestCase):
         self, *, tp_rank, tp_size, start_layer, end_layer, final=True
     ):
         namespace = _gqa_namespace(layer_group=30, object_layout="page_first_direct")
-        return build_canonical_cell_suffixes(
+        return build_unified_suffixes(
             namespace,
             attn_tp_rank=tp_rank,
             attn_tp_size=tp_size,
@@ -726,7 +726,7 @@ class TestLayerPartition(CustomTestCase):
 
     def test_mha_pp_read_back_coverage(self):
         # GQA layer fan-out: TP4 rank 2 (head_group == local, no head
-        # fan-out) — PP1's cells are the union of the PP2 stages', with the
+        # fan-out) — PP1's chunks are the union of the PP2 stages', with the
         # H coordinate constant and the short final chunk included.
         stage0 = self._gqa_partition_suffixes(
             tp_rank=2, tp_size=4, start_layer=0, end_layer=30, final=False
@@ -741,10 +741,10 @@ class TestLayerPartition(CustomTestCase):
         self.assertEqual(pp1, stage0 + stage1)
         self.assertTrue(all(sfx.endswith("_H2") for sfx in pp1))
 
-    def test_cross_product_cells_cover_both_axes(self):
-        # The cell adapter: TP2/PP1 owns the full H x L cross product
+    def test_cross_product_chunks_cover_both_axes(self):
+        # The layout adapter: TP2/PP1 owns the full H x L cross product
         # (layer-major, head-minor; short final window included), exactly
-        # the union of the four TP4/PP2 members' cells.
+        # the union of the four TP4/PP2 members' chunks.
         cross = self._gqa_partition_suffixes(
             tp_rank=0, tp_size=2, start_layer=0, end_layer=61
         )
@@ -800,10 +800,10 @@ class TestLayerPartition(CustomTestCase):
             )
 
 
-class TestMlaCellAdapter(CustomTestCase):
-    """MLA cell adapter: page_first_direct is already canonical order, so its
-    slabs skip the staging copy (pointer math == the pool address); other
-    layouts stage byte-identical canonical cells through the arena."""
+class TestMlaLayoutAdapter(CustomTestCase):
+    """MLA layout adapter: page_first_direct is already the unified order,
+    so its slabs skip the staging copy (pointer math == the pool address);
+    other layouts stage byte-identical unified chunks."""
 
     _PS, _LAYERS, _DIM, _PAGES = 4, 6, 8, 3
 
@@ -811,7 +811,7 @@ class TestMlaCellAdapter(CustomTestCase):
         import torch
 
         torch.manual_seed(0)
-        # L[layer, token, 1, dim] per page — the canonical MLA cell order.
+        # L[layer, token, 1, dim] per page — the unified MLA order.
         return [
             torch.randn(self._LAYERS, self._PS, 1, self._DIM, dtype=torch.bfloat16)
             for _ in range(self._PAGES)
@@ -857,14 +857,14 @@ class TestMlaCellAdapter(CustomTestCase):
         import torch
 
         pool = self._pool("page_first_direct", self._logical())
-        self.assertTrue(pool.cells_all_direct(self._RANGES))
+        self.assertTrue(pool.unified_zero_copy(self._RANGES))
         itemsize = pool.dtype.itemsize
         layer_stride = pool.page_size * pool.kv_cache_dim * itemsize
         page_stride = pool.layer_num * layer_stride
         base = pool.kv_buffer.data_ptr()
-        # Pages 2 and 0; no arena needed for direct slabs.
+        # Pages 2 and 0; no staging needed for direct slabs.
         indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
-        for meta in (pool.gather_cells_canonical, pool.cell_read_metas):
+        for meta in (pool.gather_unified_chunks, pool.get_unified_chunk_meta):
             ptrs, sizes = meta(indices, self._RANGES, None, None)
             self.assertEqual(
                 ptrs,
@@ -877,7 +877,7 @@ class TestMlaCellAdapter(CustomTestCase):
             )
             self.assertEqual(sizes, [2 * layer_stride, 4 * layer_stride] * 2)
 
-    def test_all_layouts_gather_identical_canonical_bytes(self):
+    def test_all_layouts_gather_identical_unified_bytes(self):
         import ctypes
 
         import torch
@@ -891,11 +891,12 @@ class TestMlaCellAdapter(CustomTestCase):
         )
         for layout in ("layer_first", "page_first", "page_first_direct"):
             pool = self._pool(layout, logical)
-            arena = torch.zeros(
-                self._PAGES * pool.cell_bytes(self._RANGES), dtype=torch.uint8
+            staging = torch.zeros(
+                self._PAGES * pool.unified_bytes_per_page(self._RANGES),
+                dtype=torch.uint8,
             )
-            ptrs, sizes = pool.gather_cells_canonical(
-                indices, self._RANGES, None, arena
+            ptrs, sizes = pool.gather_unified_chunks(
+                indices, self._RANGES, None, staging
             )
             got = b"".join(
                 ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
@@ -910,23 +911,25 @@ class TestMlaCellAdapter(CustomTestCase):
         logical = self._logical()
         indices = torch.arange(self._PAGES * self._PS)
         writer = self._pool("page_first_direct", logical)
-        src_ptrs, src_sizes = writer.gather_cells_canonical(
+        src_ptrs, src_sizes = writer.gather_unified_chunks(
             indices, self._RANGES, None, None
         )
         reader = self._pool("layer_first", [torch.zeros_like(l) for l in logical])
-        self.assertFalse(reader.cells_all_direct(self._RANGES))
-        arena = torch.zeros(
-            self._PAGES * reader.cell_bytes(self._RANGES), dtype=torch.uint8
+        self.assertFalse(reader.unified_zero_copy(self._RANGES))
+        staging = torch.zeros(
+            self._PAGES * reader.unified_bytes_per_page(self._RANGES), dtype=torch.uint8
         )
-        dst_ptrs, dst_sizes = reader.cell_read_metas(indices, self._RANGES, None, arena)
+        dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
+            indices, self._RANGES, None, staging
+        )
         self.assertEqual(src_sizes, dst_sizes)
         # Emulate the store fetch, then scatter; page 1 "failed".
         for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
             ctypes.memmove(dst, src, size)
         page_ok = [True, False, True]
-        reader.scatter_cells_canonical(indices, self._RANGES, None, arena, page_ok)
+        reader.scatter_unified_chunks(indices, self._RANGES, None, staging, page_ok)
         for p, L in enumerate(logical):
-            got = reader._page_view_canonical(p * self._PS)
+            got = reader._page_view_unified(p * self._PS)
             for l0, l1 in self._RANGES:
                 if page_ok[p]:
                     self.assertTrue(torch.equal(got[l0:l1], L[l0:l1]))
@@ -934,9 +937,9 @@ class TestMlaCellAdapter(CustomTestCase):
                     self.assertEqual(got[l0:l1].abs().sum().item(), 0)
 
 
-class TestMhaDirectCells(CustomTestCase):
-    """MHA skip-convert: canonical order is (head, layer, token, dim), so a
-    multi-head pool always stages — but a single-kv-head page_first_direct
+class TestMhaDirectChunks(CustomTestCase):
+    """MHA skip-convert: the unified order is (head, layer, token, dim), so
+    a multi-head pool always stages — but a single-kv-head page_first_direct
     pool is degenerate-contiguous and goes zero-copy."""
 
     def _pool(self, head_num):
@@ -964,18 +967,18 @@ class TestMhaDirectCells(CustomTestCase):
         )
         return pool
 
-    def test_single_head_layer_cells_are_direct(self):
+    def test_single_head_layer_chunks_are_direct(self):
         import torch
 
         pool = self._pool(head_num=1)
         ranges, heads = [(0, 2), (2, 6)], [(0, 1)]
-        self.assertTrue(pool.cells_all_direct(ranges, heads))
+        self.assertTrue(pool.unified_zero_copy(ranges, heads))
         itemsize = pool.dtype.itemsize
         layer_stride = pool.page_size * pool.head_dim * itemsize
         page_stride = pool.layer_num * layer_stride
         v_offset = pool.layer_num * pool.size * pool.head_dim * itemsize
         base = pool.kv_buffer.data_ptr()
-        ptrs, sizes = pool.cell_read_metas(
+        ptrs, sizes = pool.get_unified_chunk_meta(
             torch.tensor([8, 9, 10, 11]), ranges, heads, None
         )
         k0 = base + 2 * page_stride
@@ -993,9 +996,9 @@ class TestMhaDirectCells(CustomTestCase):
             [2 * layer_stride, 2 * layer_stride, 4 * layer_stride, 4 * layer_stride],
         )
 
-    def test_multi_head_cells_stage(self):
+    def test_multi_head_chunks_stage(self):
         pool = self._pool(head_num=2)
-        self.assertFalse(pool.cells_all_direct([(0, 2)], [(0, 2)]))
+        self.assertFalse(pool.unified_zero_copy([(0, 2)], [(0, 2)]))
 
     def test_rejects_split_kv_pools(self):
         import torch
@@ -1003,14 +1006,14 @@ class TestMhaDirectCells(CustomTestCase):
         pool = self._pool(head_num=2)
         pool.kv_buffer = (pool.kv_buffer, pool.kv_buffer)
         with self.assertRaisesRegex(NotImplementedError, "split K/V"):
-            pool.gather_cells_canonical(
+            pool.gather_unified_chunks(
                 torch.tensor([0, 1, 2, 3]), [(0, 2)], [(0, 2)], None
             )
 
 
-class TestCellAdapterGatherScatter(CustomTestCase):
-    """The layout-neutrality property the cell adapter exists for: every
-    supported layout gathers byte-identical canonical cells ((head, layer,
+class TestLayoutAdapterGatherScatter(CustomTestCase):
+    """The layout-neutrality property the adapter exists for: every
+    supported layout gathers byte-identical unified chunks ((head, layer,
     token, dim) per K/V half), and the fetch + scatter path inverts them."""
 
     _PS, _HEADS, _LAYERS, _DIM, _PAGES = 4, 4, 6, 8, 2
@@ -1102,7 +1105,7 @@ class TestCellAdapterGatherScatter(CustomTestCase):
     def _grid(self):
         return [(0, 2), (2, 6)], [(0, 2), (2, 4)]  # layer ranges, head ranges
 
-    def test_all_layouts_gather_identical_canonical_bytes(self):
+    def test_all_layouts_gather_identical_unified_bytes(self):
         import ctypes
 
         import torch
@@ -1110,7 +1113,7 @@ class TestCellAdapterGatherScatter(CustomTestCase):
         logical = self._logical()
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
-        # Canonical bytes computed straight from the logical tensor:
+        # Unified-order bytes computed straight from the logical tensor:
         # page-major, layer-range, head-range, K then V.
         expected = b"".join(
             bytes(L[kv, h0:h1, l0:l1].contiguous().view(torch.uint8).flatten().tolist())
@@ -1121,12 +1124,12 @@ class TestCellAdapterGatherScatter(CustomTestCase):
         )
         for layout in self._LAYOUTS:
             pool = self._pool(layout, logical)
-            arena = torch.zeros(
-                self._PAGES * pool.cell_bytes(layer_ranges, head_ranges),
+            staging = torch.zeros(
+                self._PAGES * pool.unified_bytes_per_page(layer_ranges, head_ranges),
                 dtype=torch.uint8,
             )
-            ptrs, sizes = pool.gather_cells_canonical(
-                indices, layer_ranges, head_ranges, arena
+            ptrs, sizes = pool.gather_unified_chunks(
+                indices, layer_ranges, head_ranges, staging
             )
             got = b"".join(
                 ctypes.string_at(ptr, size) for ptr, size in zip(ptrs, sizes)
@@ -1142,30 +1145,30 @@ class TestCellAdapterGatherScatter(CustomTestCase):
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
         writer = self._pool("page_head", logical)
-        arena_w = torch.zeros(
-            self._PAGES * writer.cell_bytes(layer_ranges, head_ranges),
+        staging_w = torch.zeros(
+            self._PAGES * writer.unified_bytes_per_page(layer_ranges, head_ranges),
             dtype=torch.uint8,
         )
-        src_ptrs, src_sizes = writer.gather_cells_canonical(
-            indices, layer_ranges, head_ranges, arena_w
+        src_ptrs, src_sizes = writer.gather_unified_chunks(
+            indices, layer_ranges, head_ranges, staging_w
         )
 
         # Emulate a fetch into an EMPTY pool of a different layout, then
         # scatter; the covered rectangles must reproduce the writer's values.
         for layout in ("layer_first", "page_first_direct"):
             reader = self._pool(layout, [torch.zeros_like(l) for l in logical])
-            arena_r = torch.zeros_like(arena_w)
-            dst_ptrs, dst_sizes = reader.cell_read_metas(
-                indices, layer_ranges, head_ranges, arena_r
+            staging_r = torch.zeros_like(staging_w)
+            dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
+                indices, layer_ranges, head_ranges, staging_r
             )
             self.assertEqual(src_sizes, dst_sizes)
             for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
                 ctypes.memmove(dst, src, size)
-            reader.scatter_cells_canonical(
-                indices, layer_ranges, head_ranges, arena_r, [True] * self._PAGES
+            reader.scatter_unified_chunks(
+                indices, layer_ranges, head_ranges, staging_r, [True] * self._PAGES
             )
             for p, L in enumerate(logical):
-                got = reader._page_kv_view_canonical(p * self._PS)
+                got = reader._page_kv_view_unified(p * self._PS)
                 for l0, l1 in layer_ranges:
                     for h0, h1 in head_ranges:
                         self.assertTrue(
@@ -1173,13 +1176,14 @@ class TestCellAdapterGatherScatter(CustomTestCase):
                         )
 
 
-class TestCellAdapterStaging(CustomTestCase):
-    """Backend-neutral CellAdapter: key fan-out, arena-sized sub-batching,
-    and the pointer round trip a backend performs — no store involved."""
+class TestLayoutAdapterStaging(CustomTestCase):
+    """Backend-neutral KVCacheLayoutAdapter: key fan-out, staging-sized
+    sub-batching, and the pointer round trip a backend performs — no store
+    involved."""
 
-    class _UnpinnedCellAdapter(CellAdapter):
+    class _UnpinnedLayoutAdapter(KVCacheLayoutAdapter):
         # CPU-only test hosts cannot pin memory.
-        def _alloc_arena(self, numel):
+        def _alloc_staging(self, numel):
             import torch
 
             return torch.empty(numel, dtype=torch.uint8)
@@ -1197,27 +1201,27 @@ class TestCellAdapterStaging(CustomTestCase):
             is_page_first_layout=False,
             model_name="m",
             extra_config=extra,
-            canonical_suffix=suffixes,
-            canonical_layer_ranges=layer_ranges,
-            canonical_head_ranges=head_ranges,
+            unified_suffix=suffixes,
+            unified_layer_ranges=layer_ranges,
+            unified_head_ranges=head_ranges,
         )
 
-    def test_all_direct_pool_allocates_no_arenas(self):
+    def test_all_direct_pool_allocates_no_staging(self):
         # MLA on page_first_direct: every slab pool-contiguous.
-        mla = TestMlaCellAdapter()
+        mla = TestMlaLayoutAdapter()
         pool = mla._pool("page_first_direct", mla._logical())
         registered = []
-        adapter = CellAdapter(
+        adapter = KVCacheLayoutAdapter(
             pool,
             self._config(["ns_L0-2", "ns_L2-6"], [(0, 2), (2, 6)], None),
             register_buffer=registered.append,
         )
-        self.assertIsNone(adapter.arena_set)
-        self.assertIsNone(adapter.arena_get)
+        self.assertIsNone(adapter.staging_set)
+        self.assertIsNone(adapter.staging_get)
         self.assertEqual(registered, [])
         self.assertEqual(adapter.keys_per_page, 2)
         self.assertEqual(
-            adapter.cell_keys(["h1", "h2"]),
+            adapter.chunk_keys(["h1", "h2"]),
             ["h1_ns_L0-2_k", "h1_ns_L2-6_k", "h2_ns_L0-2_k", "h2_ns_L2-6_k"],
         )
 
@@ -1226,7 +1230,7 @@ class TestCellAdapterStaging(CustomTestCase):
 
         import torch
 
-        gs = TestCellAdapterGatherScatter()
+        gs = TestLayoutAdapterGatherScatter()
         logical = gs._logical()
         layer_ranges, head_ranges = gs._grid()
         suffixes = [
@@ -1234,13 +1238,13 @@ class TestCellAdapterStaging(CustomTestCase):
             for l0, l1 in layer_ranges
             for j in range(len(head_ranges))
         ]
-        # cell_arena_mb=0 floors the arenas at ONE page's cells, forcing a
-        # sub-batch per page and arena reuse across sub-batches.
+        # staging_buffer_mb=0 floors the staging at ONE page's chunks,
+        # forcing a sub-batch per page and buffer reuse across sub-batches.
         config = self._config(
-            suffixes, layer_ranges, head_ranges, extra={"cell_arena_mb": 0}
+            suffixes, layer_ranges, head_ranges, extra={"staging_buffer_mb": 0}
         )
-        writer = self._UnpinnedCellAdapter(gs._pool("page_head", logical), config)
-        self.assertEqual(writer.arena_pages, 1)
+        writer = self._UnpinnedLayoutAdapter(gs._pool("page_head", logical), config)
+        self.assertEqual(writer.staging_pages, 1)
         self.assertEqual(writer.keys_per_page, 8)
 
         page_keys = [f"h{p}" for p in range(gs._PAGES)]
@@ -1249,12 +1253,12 @@ class TestCellAdapterStaging(CustomTestCase):
         for sub_keys, sub_indices in writer.sub_batches(page_keys, indices):
             self.assertEqual(len(sub_keys), 1)
             ptrs, sizes = writer.gather(sub_indices)
-            for key, ptr, size in zip(writer.cell_keys(sub_keys), ptrs, sizes):
+            for key, ptr, size in zip(writer.chunk_keys(sub_keys), ptrs, sizes):
                 store[key] = ctypes.string_at(ptr, size)
         self.assertEqual(len(store), gs._PAGES * 8)
 
         registered = []
-        reader = self._UnpinnedCellAdapter(
+        reader = self._UnpinnedLayoutAdapter(
             gs._pool("page_first", [torch.zeros_like(l) for l in logical]),
             config,
             register_buffer=registered.append,
@@ -1262,11 +1266,11 @@ class TestCellAdapterStaging(CustomTestCase):
         self.assertEqual(len(registered), 2)
         for sub_keys, sub_indices in reader.sub_batches(page_keys, indices):
             ptrs, sizes = reader.read_metas(sub_indices)
-            for key, ptr, size in zip(reader.cell_keys(sub_keys), ptrs, sizes):
+            for key, ptr, size in zip(reader.chunk_keys(sub_keys), ptrs, sizes):
                 ctypes.memmove(ptr, store[key], size)
             reader.scatter(sub_indices, [True] * len(sub_keys))
         for p, L in enumerate(logical):
-            got = reader.pool._page_kv_view_canonical(p * gs._PS)
+            got = reader.pool._page_kv_view_unified(p * gs._PS)
             for l0, l1 in layer_ranges:
                 for h0, h1 in head_ranges:
                     self.assertTrue(

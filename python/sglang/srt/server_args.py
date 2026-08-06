@@ -2823,12 +2823,12 @@ class ServerArgs:
             help="How L3 storage object keys encode what an object holds. "
             "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
             "so only bit-identical topologies can share cache. "
-            "'canonical-grid': keys carry topology-free canonical cell "
+            "'unified': keys carry topology-free canonical cell "
             "coordinates (namespace digest + layer/head group indices), so "
             "any topology whose shards tile the same grid shares cache. "
             "v1 supports the file and mooncake backends with plain KV pools "
             "only.",
-            choices=["rank-suffix", "canonical-grid"],
+            choices=["rank-suffix", "unified"],
         ),
         NS("memory"),
     ] = "rank-suffix"

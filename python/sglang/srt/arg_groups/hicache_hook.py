@@ -25,7 +25,7 @@ def handle_hicache(server_args: Any):
     """
     cfg = resolving_view(server_args)
     # Step 0: L3 key-scheme validation. Runs before the early return so
-    # canonical-grid flags are never silently inert.
+    # unified flags are never silently inert.
     resolve_hicache_key_scheme(server_args)
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
@@ -82,33 +82,33 @@ def resolve_hicache_key_scheme(server_args: Any):
         or cfg.disaggregation_decode_enable_offload_kvcache
     ):
         raise ValueError(
-            "--hicache-storage-key-scheme canonical-grid has no effect "
+            "--hicache-storage-key-scheme unified has no effect "
             "without --enable-hierarchical-cache (or decode KV offload); "
             "refusing a silently inert flag."
         )
     if cfg.hicache_storage_backend is None:
         raise ValueError(
-            "--hicache-storage-key-scheme canonical-grid requires an L3 "
+            "--hicache-storage-key-scheme unified requires an L3 "
             "backend (--hicache-storage-backend)."
         )
     if cfg.hicache_storage_backend not in ("file", "mooncake"):
         raise NotImplementedError(
-            "canonical-grid v1 supports --hicache-storage-backend file "
+            "the unified key scheme v1 supports --hicache-storage-backend file "
             f"or mooncake; got {cfg.hicache_storage_backend!r}. Other "
-            "backends need cell-granular key support first."
+            "backends need chunk-granular key support first."
         )
     if cfg.speculative_algorithm is not None:
         raise NotImplementedError(
-            "canonical-grid does not cover speculative-decoding draft "
+            "the unified key scheme does not cover speculative-decoding draft "
             "pools yet; use --hicache-storage-key-scheme rank-suffix."
         )
     # Topologies whose at-rest KV is not a dense per-rank rectangle of
-    # whole pages cannot be named by canonical cells yet. Checked here
+    # whole pages cannot be named by unified chunks yet. Checked here
     # (not only at attach) because the decode-offload attach path has no
     # CP/DCP group wired into its controller.
     if cfg.dcp_size > 1:
         raise NotImplementedError(
-            "canonical-grid with --dcp-size > 1 is not supported: each "
+            "the unified key scheme with --dcp-size > 1 is not supported: each "
             "DCP rank holds an interleaved token shard (needs the "
             "token-granule extension)."
         )
@@ -116,15 +116,15 @@ def resolve_hicache_key_scheme(server_args: Any):
     # mutating the raw field), so read it through the resolved view.
     if cfg.attn_cp_size > 1:
         raise NotImplementedError(
-            "canonical-grid with --attn-cp-size > 1 is not supported: "
+            "the unified key scheme with --attn-cp-size > 1 is not supported: "
             "CP ranks hold sub-page slices or replicated pages (needs "
-            "token-granule cells / writer election)."
+            "token-granule chunks / writer election)."
         )
     # Best-effort early check of the partition knobs when the extra
     # config is inline JSON (the '@file' form is re-validated at attach).
-    # Any knob selects the cell adapter: objects use the layout-neutral
-    # canonical byte order, so there is no host-layout requirement, but
-    # the per-cell key fan-out needs a multi-key backend.
+    # Any knob selects the KV layout adapter: objects use the unified
+    # byte order, so there is no host-layout requirement, but the
+    # per-chunk key fan-out needs a multi-key backend.
     extra = cfg.hicache_storage_backend_extra_config
     if extra and not extra.startswith("@"):
         try:
@@ -139,8 +139,8 @@ def resolve_hicache_key_scheme(server_args: Any):
         if tp_lcm_size:
             raise ValueError(
                 "tp_lcm_size is the legacy rank-suffix split-heads knob; "
-                "canonical-grid uses head_group in the extra config "
-                "(heads per cell)."
+                "the unified key scheme uses head_group in the extra "
+                "config (heads per chunk)."
             )
         # head_group is ignored on rank-replicated (MLA-family) pools, so
         # a shared fleet extra-config must not be rejected for them here.
@@ -149,7 +149,7 @@ def resolve_hicache_key_scheme(server_args: Any):
         )
         if adapter and cfg.hicache_storage_backend != "mooncake":
             raise NotImplementedError(
-                "canonical-grid partition knobs (head_group / "
+                "unified-scheme partition knobs (head_group / "
                 "layer_partition) need a multi-key-per-page backend; "
                 "only mooncake supports them."
             )

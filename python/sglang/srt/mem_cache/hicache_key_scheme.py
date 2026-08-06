@@ -12,11 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Canonical-grid L3 key scheme (``--hicache-storage-key-scheme canonical-grid``).
+"""Unified L3 key scheme (``--hicache-storage-key-scheme unified``).
 
 Replaces the per-backend rank/topology key suffixes (``_{tp_rank}_{tp_size}``,
-``_{pp_size}_{pp_rank}``, ``_cp{r}_{s}``, ...) with a topology-free canonical
-cell coordinate::
+``_{pp_size}_{pp_rank}``, ``_cp{r}_{s}``, ...) with one topology-free
+coordinate::
 
     {page_hash}_{namespace_digest}_L{start_layer}-{end_layer}[_H{head_group_index}]
 
@@ -25,16 +25,17 @@ kv-head-range rectangle of one page), never *who wrote it*. Any deployment
 whose shard tiles the namespace grid derives identical keys for identical
 data, which makes cross-topology reuse a pure key-selection problem.
 
-Without partition knobs, a rank owns one cell per page (its absolute layer
+Without partition knobs, a rank owns one chunk per page (its absolute layer
 range, its head shard) and objects keep the raw pool-layout bytes. Setting
-``head_group`` (heads per cell) and/or ``layer_partition`` (layers per cell)
-in the extra config switches the namespace to the **cell adapter**
-(:func:`plan_canonical_cells`): a rank owns the (layer window x head group)
-cross product of cells, and every object carries a layout-neutral canonical
-byte order — (head, layer, token, dim) per K/V half — regardless of the host
-pool layout (``object_layout`` becomes the constant ``cell-v1``). The pool
-adapters convert on the fly and skip the copy for slabs that are already
-canonical-contiguous (e.g. MLA on page_first_direct stays zero-copy).
+``head_group`` (heads per chunk) and/or ``layer_partition`` (layers per
+chunk) in the extra config switches the namespace to the **layout adapter**
+(:func:`plan_unified_kv`): a rank owns the (layer window x head group)
+cross product of chunks, and every object carries the same unified byte
+order — (head, layer, token, dim) per K/V half — regardless of the host
+pool layout (``object_layout`` becomes the constant ``unified-v1``). The
+pool adapters convert on the fly and skip the copy for slabs that already
+sit in that order contiguously (e.g. MLA on page_first_direct stays
+zero-copy).
 
 The namespace digest prefixes every key: deployments share objects iff every
 identity field matches, so configuration differences partition into disjoint
@@ -53,7 +54,7 @@ import msgspec
 
 logger = logging.getLogger(__name__)
 
-# Bump when the struct schema or its canonical encoding changes: the digest is
+# Bump when the struct schema or its encoding changes: the digest is
 # computed over the encoded struct, so any schema change must change every key.
 _SCHEMA_VERSION = 1
 
@@ -64,8 +65,8 @@ class KVCacheNamespace(
     """Immutable identity of one shared L3 KV keyspace.
 
     Everything that must be equal for two deployments' KV bytes to be
-    interchangeable, plus the canonical grid that fixes cell boundaries.
-    Field order is part of the canonical encoding — append new fields only,
+    interchangeable, plus the shared grid that fixes chunk boundaries.
+    Field order is part of the encoding — append new fields only,
     and bump ``schema_version`` when doing so. ``forbid_unknown_fields``
     makes descriptor-file typos a decode error instead of a silently
     different keyspace.
@@ -82,11 +83,12 @@ class KVCacheNamespace(
     # such namespaces have no head axis (total_kv_heads/head_group are 0).
     rank_replicated: bool
     total_kv_heads: int
-    # Head grid: kv heads per cell. Layer grid: layer_group > 0 = layers per
-    # cell (the fleet's layer unit). Every stage must START on a multiple of
-    # layer_group; the model's trailing remainder simply forms a short final
-    # cell (allowed only on the last PP stage, where the stage end is the
-    # model total). 0 = per-stage ranges (same-partition sharing only).
+    # Head grid: kv heads per chunk. Layer grid: layer_group > 0 = layers
+    # per chunk (the fleet's layer unit). Every stage must START on a
+    # multiple of layer_group; the model's trailing remainder simply forms a
+    # short final chunk (allowed only on the last PP stage, where the stage
+    # end is the model total). 0 = per-stage ranges (same-partition sharing
+    # only).
     layer_group: int = 0
     head_group: int
     # Optional kernel/build ABI digest; deployments whose numerics must not
@@ -101,7 +103,7 @@ class KVCacheNamespace(
 
 
 def namespace_digest(namespace: KVCacheNamespace) -> str:
-    """Digest of the canonical descriptor encoding, used as the key prefix.
+    """Digest of the namespace encoding, used as the key prefix.
 
     msgspec's msgpack encoding of a Struct is deterministic given the class
     definition (fields in declaration order), which is why the schema itself
@@ -149,9 +151,9 @@ def derive_namespace(
     knob): deployments passing the same value land in one keyspace; without
     it, ``head_group`` = the rank's local head count and only same-TP
     deployments share. ``layer_group`` is the layer-unit agreement
-    (``layer_partition`` in the extra config, layers per cell) that enables
+    (``layer_partition`` in the extra config, layers per chunk) that enables
     PP read-back across different pipeline splits — the model's trailing
-    remainder forms a short final cell; without it, layer cells are
+    remainder forms a short final chunk; without it, layer chunks are
     per-stage ranges and only same-partition deployments share.
     All other mismatches (model, logical dtype, page size) partition into
     disjoint keyspaces — safe, never a geometry collision.
@@ -177,7 +179,7 @@ def _validate_grid(namespace: KVCacheNamespace) -> None:
         raise ValueError(f"page_size must be positive: {namespace}")
     if not namespace.model_id:
         raise ValueError(
-            "canonical-grid requires a non-empty model_id: an empty id would "
+            "the unified key scheme requires a non-empty model_id: an empty id would "
             "merge different models into one keyspace."
         )
     if namespace.rank_replicated:
@@ -199,7 +201,7 @@ def _validate_grid(namespace: KVCacheNamespace) -> None:
         )
 
 
-def build_canonical_cell_suffixes(
+def build_unified_suffixes(
     namespace: KVCacheNamespace,
     *,
     attn_tp_rank: int,
@@ -215,18 +217,18 @@ def build_canonical_cell_suffixes(
     object_layout: str,
     is_final_stage: bool = True,
 ) -> list[str]:
-    """Validate this rank against the namespace; return its owned cell suffixes.
+    """Validate this rank against the namespace; return its owned key suffixes.
 
     The attach-time compatibility check of the design's section 2.2: the
     rank's shard must tile the grid, and every identity field must match.
     Raises with the remedy in the message; never degrades silently.
 
-    Returns one suffix per owned cell, in ascending head-group order. A rank
-    whose kv-head shard is coarser than ``head_group`` owns
-    ``local_kv_heads // head_group`` cells (head fan-out): rank ``r`` owns
+    Returns one suffix per owned chunk, in ascending head-group order. A
+    rank whose kv-head shard is coarser than ``head_group`` owns
+    ``local_kv_heads // head_group`` chunks (head fan-out): rank ``r`` owns
     head groups ``[r * n, (r + 1) * n)`` — the same arithmetic as the
-    mooncake split-heads virtual ranks, re-keyed canonically. Rank-replicated
-    namespaces always return exactly one suffix.
+    mooncake split-heads virtual ranks, re-keyed topology-free.
+    Rank-replicated namespaces return one suffix per layer window.
     """
     _validate_grid(namespace)
     _check_identity(
@@ -239,7 +241,7 @@ def build_canonical_cell_suffixes(
     )
     if attn_cp_size > 1:
         raise NotImplementedError(
-            "canonical-grid does not support attention context parallelism "
+            "the unified key scheme does not support attention context parallelism "
             "yet: NSA-CP ranks hold sub-page slices (needs the token-granule "
             "extension) and replicated-CP needs writer election. Use "
             "--hicache-storage-key-scheme rank-suffix with the file backend."
@@ -250,10 +252,10 @@ def build_canonical_cell_suffixes(
     # Layer coordinates are absolute ranges: any PP partition (uneven stages
     # included) yields valid, collision-free names; differing partitions miss
     # instead of colliding. With a layer unit declared, the stage must start
-    # on the grid and owns one cell per contained window; the model's
-    # trailing remainder forms a short final cell (legal only on the last
+    # on the grid and owns one chunk per contained window; the model's
+    # trailing remainder forms a short final chunk (legal only on the last
     # pipeline stage, whose end IS the model total) — this is what lets a
-    # reader consume cells written under a different pipeline split.
+    # reader consume chunks written under a different pipeline split.
     if namespace.layer_group:
         lg = namespace.layer_group
         if start_layer % lg != 0:
@@ -269,7 +271,7 @@ def build_canonical_cell_suffixes(
                 f"this rank's layer range [{start_layer}, {end_layer}) ends "
                 f"off the layer_partition={lg} grid; only the FINAL pipeline "
                 f"stage may end short (the model's trailing remainder forms "
-                f"the short last cell)."
+                f"the short last chunk)."
             )
         layer_coords = [
             f"L{a}-{min(a + lg, end_layer)}" for a in range(start_layer, end_layer, lg)
@@ -295,15 +297,15 @@ def build_canonical_cell_suffixes(
             f"this rank's {local_kv_heads} kv heads do not tile "
             f"head_group={namespace.head_group}."
         )
-    cells_per_rank = local_kv_heads // namespace.head_group
-    first_head_index = attn_tp_rank * cells_per_rank
+    chunks_per_rank = local_kv_heads // namespace.head_group
+    first_head_index = attn_tp_rank * chunks_per_rank
     # The general case is the cross product, layer-major / head-minor — the
-    # same order the cell-adapter arena packs bytes in. Single-axis fan-outs
+    # same order the layout adapter packs bytes in. Single-axis fan-outs
     # are the degenerate cases (one coordinate list has length 1).
     return [
         f"{digest}_{coord}_H{first_head_index + i}"
         for coord in layer_coords
-        for i in range(cells_per_rank)
+        for i in range(chunks_per_rank)
     ]
 
 
@@ -349,26 +351,26 @@ def normalize_dtype(dtype: object) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-class CanonicalCellPlan(msgspec.Struct, frozen=True, kw_only=True):
-    """Everything the storage layer needs for one rank's canonical cells."""
+class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """Everything the storage layer needs for one rank's unified-key objects."""
 
     namespace: KVCacheNamespace
-    # One suffix per owned cell (layer-major, head-minor).
+    # One suffix per owned chunk (layer-major, head-minor).
     suffixes: list[str]
-    # True when any partition knob is set: objects then use the canonical
+    # True when any partition knob is set: objects then use the unified
     # byte order via the gather/scatter adapter (which skips the copy when
     # the pool view already matches).
     adapter: bool
-    # LOCAL half-open cell ranges for the adapter, or None without it.
+    # LOCAL half-open chunk ranges for the adapter, or None without it.
     layer_ranges: Optional[list[tuple[int, int]]] = None
     head_ranges: Optional[list[tuple[int, int]]] = None
 
 
-# Host layouts the adapter can view canonically.
+# Host layouts the adapter can present in the unified byte order.
 ADAPTER_LAYOUTS = ("layer_first", "page_first", "page_first_direct", "page_head")
 
 
-def plan_canonical_cells(
+def plan_unified_kv(
     *,
     model_id: str,
     dtype: str,
@@ -384,19 +386,19 @@ def plan_canonical_cells(
     pool_layout: str,
     head_group_knob: Optional[int] = None,
     layer_partition: Optional[int] = None,
-) -> CanonicalCellPlan:
-    """Derive the namespace and this rank's cell plan from deployment facts.
+) -> UnifiedKVPlan:
+    """Derive the namespace and this rank's chunk plan from deployment facts.
 
     Any partition knob switches the namespace to adapter mode: objects carry
-    the layout-neutral canonical byte order (object_layout "cell-v1"), so
-    the pool layout never constrains which fleets can share.
+    the unified byte order (object_layout "unified-v1"), so the pool layout
+    never constrains which fleets can share.
     """
     adapter = layer_partition is not None or (
         head_group_knob is not None and not rank_replicated
     )
     if adapter and pool_layout not in ADAPTER_LAYOUTS:
         raise ValueError(
-            f"the cell adapter does not support the {pool_layout!r} host "
+            f"the KV layout adapter does not support the {pool_layout!r} host "
             f"layout; use one of {ADAPTER_LAYOUTS}."
         )
 
@@ -419,12 +421,12 @@ def plan_canonical_cells(
         # 1 head/rank is ambiguous (could be kv-head replication); an
         # explicit head_group is the operator's attestation of sharding.
         raise NotImplementedError(
-            "canonical-grid cannot derive a namespace at 1 kv head per rank; "
+            "the unified key scheme cannot derive a namespace at 1 kv head per rank; "
             "set head_group in the extra config, or use "
             "--hicache-storage-key-scheme rank-suffix."
         )
 
-    object_layout = "cell-v1" if adapter else pool_layout
+    object_layout = "unified-v1" if adapter else pool_layout
     namespace = derive_namespace(
         model_id=model_id,
         dtype=dtype,
@@ -435,7 +437,7 @@ def plan_canonical_cells(
         object_layout=object_layout,
         layer_group=layer_partition or 0,
     )
-    suffixes = build_canonical_cell_suffixes(
+    suffixes = build_unified_suffixes(
         namespace,
         attn_tp_rank=attn_tp_rank,
         attn_tp_size=attn_tp_size,
@@ -460,13 +462,15 @@ def plan_canonical_cells(
             for a in range(start_layer, end_layer, lg)
         ]
         if not rank_replicated:
-            cells = local_kv_heads // head_group
-            head_ranges = [(i * head_group, (i + 1) * head_group) for i in range(cells)]
+            chunks = local_kv_heads // head_group
+            head_ranges = [
+                (i * head_group, (i + 1) * head_group) for i in range(chunks)
+            ]
             assert len(suffixes) == len(layer_ranges) * len(head_ranges)
         else:
             assert len(suffixes) == len(layer_ranges)
 
-    return CanonicalCellPlan(
+    return UnifiedKVPlan(
         namespace=namespace,
         suffixes=list(suffixes),
         adapter=adapter,
@@ -475,69 +479,71 @@ def plan_canonical_cells(
     )
 
 
-class CellAdapter:
-    """Backend-neutral staging machinery for canonical cell IO.
+class KVCacheLayoutAdapter:
+    """Backend-neutral staging machinery for unified-layout IO.
 
-    The host pools expose the canonical gather/scatter primitives; this
+    The host pools expose the unified gather/scatter primitives; this
     class owns everything else a backend needs to serve a partitioned
-    (cell-v1) namespace: the per-cell key fan-out, the sub-batch geometry,
-    and one pinned staging arena per IO direction (backup and prefetch run
-    on concurrent controller threads). A backend brings only its own
-    pointer-based batch put/get and, for RDMA transports, a
-    ``register_buffer`` hook for the arenas.
+    (unified-v1) namespace: the per-chunk key fan-out, the sub-batch
+    geometry, and one pinned staging buffer per IO direction (backup and
+    prefetch run on concurrent controller threads). A backend brings only
+    its own pointer-based batch put/get and, for RDMA transports, a
+    ``register_buffer`` hook for the staging buffers.
 
-    When every slab is already pool-contiguous no arena is allocated and
+    When every slab is already pool-contiguous no staging is allocated and
     all transfers resolve to pool addresses (pure zero-copy).
     """
 
     def __init__(self, mem_pool_host, storage_config, register_buffer=None):
         self.pool = mem_pool_host
         self.page_size = mem_pool_host.page_size
-        self.layer_ranges = storage_config.canonical_layer_ranges
-        self.head_ranges = storage_config.canonical_head_ranges
-        suffixes = storage_config.canonical_suffix
+        self.layer_ranges = storage_config.unified_layer_ranges
+        self.head_ranges = storage_config.unified_head_ranges
+        suffixes = storage_config.unified_suffix
         assert isinstance(suffixes, list) and self.layer_ranges is not None
         self.suffixes = suffixes
-        # Rank-replicated (MLA-family) cells are single objects; sharded
-        # pools store one K and one V object per cell.
+        # Rank-replicated (MLA-family) chunks are single objects; sharded
+        # pools store one K and one V object per chunk.
         self.split_kv = self.head_ranges is not None
         self.keys_per_page = len(suffixes) * (2 if self.split_kv else 1)
-        self.arena_set = None
-        self.arena_get = None
-        self.arena_pages = 0
-        if self.pool.cells_all_direct(self.layer_ranges, self.head_ranges):
+        self.staging_set = None
+        self.staging_get = None
+        self.staging_pages = 0
+        if self.pool.unified_zero_copy(self.layer_ranges, self.head_ranges):
             logger.info(
-                "HiCache cell adapter: all cells pool-contiguous, zero-copy "
-                "(no staging arenas)."
+                "HiCache KV layout adapter: everything pool-contiguous, "
+                "zero-copy (no staging buffers)."
             )
             return
         extra = storage_config.extra_config or {}
-        arena_mb = extra.get("cell_arena_mb", 256)
-        page_cell_bytes = self.pool.cell_bytes(self.layer_ranges, self.head_ranges)
-        arena_bytes = max(int(arena_mb) << 20, page_cell_bytes)
-        self.arena_pages = arena_bytes // page_cell_bytes
-        arena_numel = self.arena_pages * page_cell_bytes
-        self.arena_set = self._alloc_arena(arena_numel)
-        self.arena_get = self._alloc_arena(arena_numel)
+        staging_mb = extra.get("staging_buffer_mb", 256)
+        page_bytes = self.pool.unified_bytes_per_page(
+            self.layer_ranges, self.head_ranges
+        )
+        staging_bytes = max(int(staging_mb) << 20, page_bytes)
+        self.staging_pages = staging_bytes // page_bytes
+        staging_numel = self.staging_pages * page_bytes
+        self.staging_set = self._alloc_staging(staging_numel)
+        self.staging_get = self._alloc_staging(staging_numel)
         if register_buffer is not None:
-            register_buffer(self.arena_set)
-            register_buffer(self.arena_get)
+            register_buffer(self.staging_set)
+            register_buffer(self.staging_get)
         logger.info(
-            "HiCache cell adapter: 2 x %d-page staging arenas (%.1f MB each) "
-            "for the backup and prefetch threads.",
-            self.arena_pages,
-            arena_numel / (1 << 20),
+            "HiCache KV layout adapter: 2 x %d-page staging buffers "
+            "(%.1f MB each) for the backup and prefetch threads.",
+            self.staging_pages,
+            staging_numel / (1 << 20),
         )
 
-    def _alloc_arena(self, numel):
+    def _alloc_staging(self, numel):
         # Pinned so RDMA transports can register and DMA it directly.
         # (Overridable seam: CPU-only tests allocate unpinned.)
         import torch
 
         return torch.empty(numel, dtype=torch.uint8, pin_memory=True)
 
-    def cell_keys(self, page_keys: list) -> list:
-        """Fan page keys out to cell keys, in the pools' slab order:
+    def chunk_keys(self, page_keys: list) -> list:
+        """Fan page keys out to chunk keys, in the pools' slab order:
         page-major, suffix (layer-major, head-minor), K then V."""
         key_list = []
         if not self.split_kv:
@@ -552,11 +558,11 @@ class CellAdapter:
         return key_list
 
     def sub_batches(self, keys: list, host_indices):
-        """Split a batch into arena-sized (page_keys, indices) chunks; each
-        chunk reuses the arenas from offset 0."""
+        """Split a batch into staging-sized (page_keys, indices) pieces;
+        each piece reuses the staging buffers from offset 0."""
         if not keys:
             return
-        pages_per_batch = self.arena_pages or len(keys)
+        pages_per_batch = self.staging_pages or len(keys)
         for start in range(0, len(keys), pages_per_batch):
             page_keys = keys[start : start + pages_per_batch]
             indices = host_indices[
@@ -565,24 +571,25 @@ class CellAdapter:
             yield page_keys, indices
 
     def gather(self, indices):
-        """Write path: (ptrs, sizes) per slab — canonical bytes, staged into
-        arena_set only where the pool view is not already contiguous."""
-        return self.pool.gather_cells_canonical(
-            indices, self.layer_ranges, self.head_ranges, self.arena_set
+        """Write path: (ptrs, sizes) per slab — unified-order bytes, staged
+        into staging_set only where the pool view is not already
+        contiguous."""
+        return self.pool.gather_unified_chunks(
+            indices, self.layer_ranges, self.head_ranges, self.staging_set
         )
 
     def read_metas(self, indices):
         """Read path targets: direct slabs fetch straight into the pool,
-        staged slabs into arena_get."""
-        return self.pool.cell_read_metas(
-            indices, self.layer_ranges, self.head_ranges, self.arena_get
+        staged slabs into staging_get."""
+        return self.pool.get_unified_chunk_meta(
+            indices, self.layer_ranges, self.head_ranges, self.staging_get
         )
 
     def scatter(self, indices, page_ok):
         """Read path finalize: copy staged slabs of successful pages from
-        arena_get into the pool (direct slabs already landed in place)."""
-        if self.arena_get is None or not any(page_ok):
+        staging_get into the pool (direct slabs already landed in place)."""
+        if self.staging_get is None or not any(page_ok):
             return
-        self.pool.scatter_cells_canonical(
-            indices, self.layer_ranges, self.head_ranges, self.arena_get, page_ok
+        self.pool.scatter_unified_chunks(
+            indices, self.layer_ranges, self.head_ranges, self.staging_get, page_ok
         )

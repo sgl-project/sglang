@@ -595,21 +595,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
-            if (
-                storage_config is not None
-                and storage_config.canonical_suffix is not None
-            ):
-                # canonical-grid key scheme: topology-free cell coordinates
-                # replace the rank/pp suffixes. A list means the cell adapter
-                # is active (one suffix per owned cell).
-                self.mha_suffix = storage_config.canonical_suffix
-                self.mla_suffix = storage_config.canonical_suffix
+            if storage_config is not None and storage_config.unified_suffix is not None:
+                # unified key scheme: topology-free chunk coordinates
+                # replace the rank/pp suffixes. A list means the layout
+                # adapter is active (one suffix per owned chunk).
+                self.mha_suffix = storage_config.unified_suffix
+                self.mla_suffix = storage_config.unified_suffix
 
             self.registered_pools = {}
-            # Backend-neutral canonical-cell staging (hicache_key_scheme.
-            # CellAdapter); constructed in register_mem_pool_host for
+            # Backend-neutral unified-layout staging (hicache_key_scheme.
+            # KVCacheLayoutAdapter); constructed in register_mem_pool_host for
             # partitioned namespaces.
-            self.cell_adapter = None
+            self.layout_adapter = None
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -712,11 +709,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if (
             self.storage_config is not None
-            and self.storage_config.canonical_layer_ranges is not None
+            and self.storage_config.unified_layer_ranges is not None
         ):
-            from sglang.srt.mem_cache.hicache_key_scheme import CellAdapter
+            from sglang.srt.mem_cache.hicache_key_scheme import KVCacheLayoutAdapter
 
-            self.cell_adapter = CellAdapter(
+            self.layout_adapter = KVCacheLayoutAdapter(
                 self.mem_pool_host,
                 self.storage_config,
                 register_buffer=super().register_buffer,
@@ -971,7 +968,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
-        # One cell per entry of the mha_suffix list (legacy split-heads
+        # One shard per entry of the mha_suffix list (legacy split-heads
         # virtual ranks).
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
@@ -1039,7 +1036,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         if isinstance(self.mha_suffix, list):
-            # Legacy split-heads (rank-suffix tp_lcm_size); canonical cell
+            # Legacy split-heads (rank-suffix tp_lcm_size); unified chunk
             # fan-out goes through the adapter path instead.
             return self._get_mha_split_heads_buffer_meta(keys, host_indices)
         return self._get_mha_buffer_meta(keys, host_indices)
@@ -1078,14 +1075,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
 
     def _batch_set_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Cell-adapter write: canonical (ptr, size) slabs per sub-batch
-        (zero-copy where pool-contiguous, staged otherwise), then put."""
+        """Layout-adapter write: unified-order (ptr, size) slabs per
+        sub-batch (zero-copy where pool-contiguous, staged otherwise),
+        then put."""
         start_time = time.perf_counter()
-        adapter = self.cell_adapter
+        adapter = self.layout_adapter
         results: List[bool] = []
         for page_keys, indices in adapter.sub_batches(keys, host_indices):
             ptrs, sizes = adapter.gather(indices)
-            key_strs = adapter.cell_keys(page_keys)
+            key_strs = adapter.chunk_keys(page_keys)
             assert len(key_strs) == len(ptrs)
             exist_result = self._batch_exist(key_strs)
             put_keys, put_ptrs, put_sizes, put_slots = [], [], [], []
@@ -1126,13 +1124,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return results
 
     def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Cell-adapter read: fetch each slab to its target (pool if
-        contiguous there, else the arena), then scatter successful pages."""
+        """Layout-adapter read: fetch each slab to its target (pool if
+        contiguous there, else staging), then scatter successful pages."""
         start_time = time.perf_counter()
-        adapter = self.cell_adapter
+        adapter = self.layout_adapter
         results: List[bool] = []
         for page_keys, indices in adapter.sub_batches(keys, host_indices):
-            key_strs = adapter.cell_keys(page_keys)
+            key_strs = adapter.chunk_keys(page_keys)
             ptrs, sizes = adapter.read_metas(indices)
             assert len(key_strs) == len(ptrs)
             get_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
@@ -1163,7 +1161,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.cell_adapter is not None:
+        if self.layout_adapter is not None:
             return self._batch_get_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -1195,7 +1193,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.cell_adapter is not None:
+        if self.layout_adapter is not None:
             return self._batch_set_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
