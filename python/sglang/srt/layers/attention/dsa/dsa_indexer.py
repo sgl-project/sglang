@@ -57,6 +57,9 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -680,13 +683,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
     @staticmethod
+    def _deep_gemm_supported_head_counts() -> Tuple[int, ...]:
+        """Head counts the pinned DeepGEMM MQA-logits kernels natively accept
+        on the current architecture, sorted ascending. SM90 only implements
+        32/64 heads; SM100/SM120 (Blackwell) also accept 8/16 natively."""
+        if is_sm100_supported() or is_sm120_supported():
+            return (8, 16, 32, 64)
+        elif is_sm90_supported():
+            return (32, 64)
+        else:
+            return ()
+
+    @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
-        """Pad q and weights to 32 heads when num_heads < 32,
-        so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
+        """Pad q and weights to the smallest DeepGEMM-supported head count
+        for the current architecture."""
         num_heads = q_fp8.shape[1]
-        if num_heads >= 32:
+        target_heads = num_heads
+        for supported in Indexer._deep_gemm_supported_head_counts():
+            if num_heads <= supported:
+                target_heads = supported
+                break
+        assert num_heads <= target_heads
+        if num_heads == target_heads:
             return q_fp8, weights, num_heads
-        target_heads = 32
         q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, target_heads - num_heads))
         weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
         return q_fp8, weights, num_heads
