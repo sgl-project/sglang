@@ -18,6 +18,13 @@ CASES = [
     ((1, 512, 4096), (1, 512, 4096)),
     ((1, 17, 65), (1, 1, 65)),
     ((1, 17, 65), (1, 17, 65)),
+    # FLUX.1 / FLUX.2-klein 1024^2 shapes (D=3072): dual-stream image/text
+    # and single-stream/joint concat; gates are [1, 1, D] modulation rows.
+    ((1, 4096, 3072), (1, 1, 3072)),
+    ((1, 512, 3072), (1, 1, 3072)),
+    ((1, 4608, 3072), (1, 1, 3072)),
+    # FLUX.2-dev (D=6144) joint sequence.
+    ((1, 4608, 6144), (1, 1, 6144)),
 ]
 
 

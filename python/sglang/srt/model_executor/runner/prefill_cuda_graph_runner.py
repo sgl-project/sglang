@@ -109,6 +109,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -776,7 +777,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     @staticmethod
     def _max_addressable_prefix_len(model_runner) -> int:
         table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
-        configured_context = model_runner.server_args.context_length
+        # This runner's own resolved context (a draft runs at the target's
+        # positions), not the launcher's flag, which may be unset.
+        configured_context = model_runner.model_config.context_len
         return (
             min(table_width, configured_context)
             if configured_context is not None and configured_context > 0
@@ -1737,6 +1740,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
+            # Replay prep, including the optional chunked-prefix gather above,
+            # has finished every scheduler-shared read.
+            maybe_publish_prefill_war_read_done(
+                self.model_runner, forward_batch, self.device_module
+            )
 
             if self.enable_cp_v2_bcg_capture:
                 output = execute_prefill_cp_bcg(

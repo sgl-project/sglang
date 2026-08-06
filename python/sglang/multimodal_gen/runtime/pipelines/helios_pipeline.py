@@ -20,9 +20,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HeliosChunkedDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 class HeliosPipeline(LoRAPipeline, ComposedPipelineBase):
