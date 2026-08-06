@@ -37,8 +37,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
-    get_server_args,
     mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -1137,7 +1137,6 @@ class SchedulerBatchResultProcessor:
             keep_written_by_this_step = (
                 crossed and planned_pos == req.mamba_next_track_idx
             )
-            server_args = get_server_args()
             other_idx = 1 - req.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
@@ -1146,7 +1145,7 @@ class SchedulerBatchResultProcessor:
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
                 get_exec().mamba.mamba_track_interval,
-                server_args.max_speculative_num_draft_tokens,
+                max_speculative_num_draft_tokens(),
             )
             if (
                 planned_pos is None

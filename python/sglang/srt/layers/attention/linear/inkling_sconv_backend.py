@@ -62,7 +62,11 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     fused_extend_sconv_metadata,
     precompute_helion_extend_metadata,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+    mamba_cache_chunk_size,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
 if TYPE_CHECKING:
@@ -99,7 +103,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # [n_layers, n_slots, conv_kernel - 1, conv_dim].
         self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # A plain table lookup is recordable; the unified pool's translate is an
         # allocator lookup and must stay in the out-of-graph replay prep.
         self._slot_gather_recordable = (

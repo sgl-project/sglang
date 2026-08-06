@@ -80,7 +80,6 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
-    get_server_args,
     mamba_extra_buffer_enabled,
 )
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
@@ -1018,7 +1017,6 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        server_args = get_server_args()
         assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
         if get_disagg().disaggregation_mode != "decode":
             assert not get_memory().disable_radix_cache
