@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    IPC_A2A,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
@@ -79,6 +82,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     trace_slice,
 )
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -104,6 +108,21 @@ class _ExpandedOutputParts:
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
+def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
+    """CPU intra-op thread budget for one of `num_gpus` co-located workers.
+
+    torch defaults the intra-op pool to every host core in every worker, so
+    co-located workers oversubscribe the host num_gpus-fold and any CPU op
+    past the ~32k-element parallel grain pays pool wakeup contention instead
+    of microseconds (measured 500x on request-static packed layouts). An
+    explicit OMP_NUM_THREADS keeps deployer intent (returns None).
+    """
+    if "OMP_NUM_THREADS" in os.environ:
+        return None
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(16, cpu_count // max(1, num_gpus)))
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -118,6 +137,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ):
         self.local_rank = local_rank
         self.rank = rank
+        # the rank that materializes output and replies to the client: the
+        # first rank of this DP replica, which is global rank 0 only at dp=1
+        gpus_per_replica = max(1, server_args.num_gpus // (server_args.dp_size or 1))
+        self.is_output_rank = rank % gpus_per_replica == 0
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
@@ -157,12 +180,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
         tmp_root = tempfile.gettempdir()
+        sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (
             ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
             ("TRITON_CACHE_DIR", "triton"),
         ):
             current = os.environ.get(env_name)
-            if current and not current.startswith(tmp_root):
+            if (
+                current
+                and current != sglang_defaults.get(env_name)
+                and not current.startswith(tmp_root)
+            ):
                 # Respect an explicit, non-ephemeral user-provided cache dir.
                 continue
             cache_path = os.path.join(compile_cache_root, sub)
@@ -195,6 +223,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         torch.get_device_module().set_device(self.local_rank)
+        intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
+        if intra_op_threads is not None:
+            torch.set_num_threads(intra_op_threads)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -326,6 +357,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
+        # request boundary: the IPC watchdog flag is a device read, illegal
+        # inside a graph capture and too costly per exchange
+        IPC_A2A.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -346,6 +380,54 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             error_context=f"request {req.request_id}",
         )
+
+    def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+        """Yield grouped results after each request finishes its terminal stage."""
+        assert self.pipeline is not None
+        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        group_start_time = time.monotonic()
+
+        try:
+            for req in batch:
+                output_count = (
+                    max(1, int(req.num_outputs_per_prompt or 1))
+                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                    else 1
+                )
+                output_batch = self._execute_forward_common(
+                    req,
+                    forward_fn=lambda results=results, output_count=output_count: (
+                        self._collect_sequential_outputs(results, output_count)
+                    ),
+                    log_reqs=[req],
+                    return_req=False,
+                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                        req, output_batch
+                    ),
+                    error_context=f"grouped request {req.request_id}",
+                    execution_start_time=group_start_time,
+                    propagate_forward_errors=True,
+                )
+                assert isinstance(output_batch, OutputBatch)
+                yield output_batch
+                del output_batch
+        finally:
+            close = getattr(results, "close", None)
+            if close is not None:
+                close()
+
+    def _collect_sequential_outputs(
+        self,
+        results: Iterator[OutputBatch | Req],
+        output_count: int,
+    ) -> OutputBatch | Req:
+        if output_count == 1:
+            return next(results)
+
+        output_batches = [
+            self._to_output_batch(next(results)) for _ in range(output_count)
+        ]
+        return self._merge_expanded_output_batches(output_batches)
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
@@ -372,24 +454,35 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return_req: bool,
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
+        execution_start_time: float | None = None,
+        propagate_forward_errors: bool = False,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        forward_failed = False
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            if self.is_output_rank and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
-            start_time = time.monotonic()
+            start_time = (
+                execution_start_time
+                if execution_start_time is not None
+                else time.monotonic()
+            )
             self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
-            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
+            if (
+                self.is_output_rank
+                and request_metrics
+                and not current_platform.is_cpu()
+            ):
                 baseline_snapshot = capture_memory_snapshot()
                 for metrics in request_metrics:
                     metrics.record_memory_snapshot("before_forward", baseline_snapshot)
@@ -401,7 +494,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
-                result = forward_fn()
+                try:
+                    result = forward_fn()
+                except Exception:
+                    forward_failed = True
+                    raise
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -412,13 +509,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
-            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
+            if self.is_output_rank and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
                 for metrics in output_metrics:
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
 
             if (
-                self.rank == 0
+                self.is_output_rank
                 and not req.suppress_logs
                 and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
@@ -432,11 +529,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_output_transport(output_batch, req, save_output_paths)
 
             if (
-                torch.cuda.is_initialized()
+                not current_platform.is_cpu()
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.cuda.empty_cache()
+                torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -455,6 +552,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     tag="server_perf_dump",
                 )
         except Exception as e:
+            if propagate_forward_errors and forward_failed:
+                if isinstance(e, StopIteration):
+                    raise RuntimeError(
+                        "Grouped pipeline returned fewer outputs than requests."
+                    ) from e
+                raise
             logger.error(
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
@@ -466,8 +569,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if not current_platform.is_cpu():
+                torch.get_device_module().empty_cache()
         return output_batch
 
     def _materialize_output_transport(
@@ -486,7 +589,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
-        if self.rank != 0:
+        if not self.is_output_rank:
             return
         if output_batch.output is not None:
             output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
@@ -508,7 +611,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch: OutputBatch,
         save_output_paths: Callable[[OutputBatch], None],
     ) -> None:
-        if self.rank == 0:
+        if self.is_output_rank:
             save_output_paths(output_batch)
         output_batch.output = None
         output_batch.audio = None
@@ -519,7 +622,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
         if (
-            self.rank != 0
+            not self.is_output_rank
             or output_batch.output is None
             or not getattr(req, "return_frames", False)
         ):
@@ -583,7 +686,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return np.asarray(materialized.frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+        if not self.is_output_rank or current_platform.is_cpu():
             return
         peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
@@ -596,7 +699,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
         """save outputs to files"""
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
 
         dynamic_output_paths = None
@@ -647,7 +750,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         reqs: list[Req],
         output_batch: OutputBatch,
     ) -> None:
-        if self.rank != 0 or output_batch.output is None:
+        if not self.is_output_rank or output_batch.output is None:
             return
         if len(output_batch.output) != len(reqs):
             raise RuntimeError(
@@ -728,6 +831,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
             metrics=result.metrics,
+            usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
             trajectory_latents=getattr(result, "trajectory_latents", None),
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
@@ -762,6 +866,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        if output_batch.usage is not None:
+            if merged.usage is None:
+                merged.usage = {}
+            for key, value in output_batch.usage.items():
+                if isinstance(value, int):
+                    merged.usage[key] = int(merged.usage.get(key, 0)) + value
+                else:
+                    merged.usage[key] = value
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None

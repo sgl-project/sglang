@@ -74,12 +74,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.runtime_context import (
-    get_forward,
-    get_parallel,
-    get_server_args,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -191,7 +186,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
             0
-            if get_server_args().disable_shared_experts_fusion
+            if get_exec().moe.disable_shared_experts_fusion
             else config.n_shared_experts
         )
         self.config = config
@@ -218,7 +213,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -287,7 +282,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -910,7 +905,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -931,7 +926,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self, architecture: str = "Glm4MoeLiteForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None

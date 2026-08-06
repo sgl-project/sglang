@@ -157,6 +157,7 @@ class TestPDDecodeRetractionCPUCopy(CustomTestCase):
             "does not support synchronous CPU save and restore",
             aborted[0].to_finish.message,
         )
+        self.assertEqual(aborted[0].to_finish.err_type, "InternalServerError")
         batch.release_req.assert_called_once_with(1, 1, args, offload_kv=False)
 
     @patch(
@@ -199,6 +200,7 @@ class TestPDDecodeRetractionCPUCopy(CustomTestCase):
 
         self.assertEqual(retracted, [])
         self.assertEqual([req.rid for req in aborted], ["0"])
+        self.assertEqual(aborted[0].to_finish.err_type, "InternalServerError")
         batch.release_req.assert_called_once_with(0, 0, args, offload_kv=False)
 
 

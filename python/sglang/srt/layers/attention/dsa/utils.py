@@ -64,21 +64,42 @@ INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
+def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
+    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    return (
+        is_cuda()
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and server_args.disaggregation_mode == "decode"
+        and not server_args.enable_hisparse
+        and server_args.dcp_size == 1
+    )
+
+
 def should_use_dsa_fused_topk(
-    server_args, seed_dsa_topk_from_draft_extend: bool
+    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
+    """Select fused TopK for PD IndexShare.
+
+    PD Prefill worker:
+    - Target prefill: fused TopK enabled.
+    - Draft extend: fused TopK disabled.
+
+    PD Decode worker:
+    - Draft decode / target verify / draft extend: fused TopK enabled.
+    """
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
-    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
-    # to decode-local KV slots so fused top-k can remain enabled under PD.
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+    )
 
 
 def is_dsa_enable_prefill_cp():
@@ -98,14 +119,14 @@ def is_dsa_enable_prefill_cp():
 def is_dsa_prefill_cp_in_seq_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "in-seq-split"
+        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
-        and get_server_args().dsa_prefill_cp_mode == "round-robin-split"
+        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
@@ -170,6 +191,13 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    # CP-v2 already pads each rank-local shard to its physical size
+    if is_cp_v2_active(forward_batch):
+        return forward_batch.attn_cp_metadata.per_rank_actual_token[
+            get_parallel().attn_cp_rank
+        ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
