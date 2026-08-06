@@ -125,6 +125,7 @@ def _make_model_runner(
     sa.enable_hisparse = False
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
+    sa.dcp_size = 1
     mr.server_args = sa
 
     spec = MagicMock()
@@ -132,6 +133,7 @@ def _make_model_runner(
     spec.is_standalone.return_value = False
     spec.is_dflash.return_value = False
     spec.is_dflash_family.return_value = False
+    spec.is_dspark.return_value = False
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
@@ -141,7 +143,11 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        dflash_draft_num_layers=None,
+        dflash_draft_total_num_kv_heads=None,
+        dflash_draft_head_dim=None,
+        dflash_draft_v_head_dim=None,
     )
 
     return mr
@@ -587,6 +593,45 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDsparkConfigurator(unittest.TestCase):
+    def test_uses_draft_model_kv_geometry(self):
+        num_target_layers = 24
+        num_draft_layers = 5
+        dcp_size = 8
+        page_size = 64
+
+        mr = _make_model_runner(
+            num_layers=num_target_layers,
+            use_mla_backend=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=page_size,
+        )
+        mr.server_args.dcp_size = dcp_size
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_dspark.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = num_draft_layers
+        mr.spec_aux_config.dflash_draft_total_num_kv_heads = 16
+        mr.spec_aux_config.dflash_draft_head_dim = 64
+        mr.spec_aux_config.dflash_draft_v_head_dim = 64
+
+        target_cell_size = (512 + 64) * num_target_layers * KV_SIZE
+        draft_cell_size = num_draft_layers * 2 * (64 + 64) * KV_SIZE * dcp_size
+        available = (target_cell_size + draft_cell_size) * 1024
+
+        with mock_cpu_env(tp_size=8):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size)
+
+        self.assertEqual(cfg._cell_size, target_cell_size + draft_cell_size)
+        self.assertEqual(config.max_total_num_tokens, 1024)
 
 
 class TestFactory(unittest.TestCase):
