@@ -175,10 +175,12 @@ def init_tokenizer_manager(
             "tool-call parser",
         ),
     ):
-        if getattr(server_args, attr) != "auto":
+        if tokenizer_manager.config_value(attr) != "auto":
             continue
         if suggested is not None:
-            server_args.override(source="template-detection", **{attr: suggested})
+            tokenizer_manager.record_config_updates(
+                "template-detection", **{attr: suggested}
+            )
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
@@ -187,7 +189,9 @@ def init_tokenizer_manager(
                 f"--{attr.replace('_', '-')}=auto specified but could not detect "
                 f"{label} from chat template. Disabling {label}."
             )
-            server_args.override(source="template-detection", **{attr: None})
+            tokenizer_manager.record_config_updates(
+                "template-detection", **{attr: None}
+            )
 
     return tokenizer_manager, template_manager
 
