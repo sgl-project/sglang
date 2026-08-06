@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_emb,
@@ -78,7 +79,7 @@ if _is_xpu:
     from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 
-class RotaryEmbedding(MultiPlatformOp):
+class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
 
     def __init__(
