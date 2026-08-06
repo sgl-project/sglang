@@ -134,6 +134,9 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             token_to_kv_pool=None,
             req_to_token_pool=None,
             needs_cpu_seq_lens=False,
+            # HybridLinearAttnBackend.__init__ mirrors the sidecar's RecoverSSM
+            # mode off this attribute; False is the non-GDN sidecar default.
+            _recover_ssm=False,
             init_forward_metadata_in_graph=lambda fb: calls.append(name),
         )
 

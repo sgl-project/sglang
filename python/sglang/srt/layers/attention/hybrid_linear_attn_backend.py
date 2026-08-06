@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # RecoverSSM (--gdn-mtp-cache-mode=none) is a GDN-only verify protocol;
+    # GDNAttnBackend overrides this from the resolved mode. Declared at class
+    # scope (not just in __init__) so the hybrid wrapper can read it off any
+    # linear sidecar, including a MagicMock(spec=MambaAttnBackendBase) — spec
+    # introspects the class, so an __init__-only attribute is invisible to it.
+    _recover_ssm: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -58,10 +65,6 @@ class MambaAttnBackendBase(AttentionBackend):
             is HybridReqToTokenPool.translate_mamba_indices
         )
         self.forward_metadata: ForwardMetadata = None
-        # RecoverSSM (--gdn-mtp-cache-mode=none) is a GDN-only verify protocol;
-        # GDNAttnBackend overrides this from the resolved mode. Declared on the
-        # base so the hybrid wrapper can read it off any linear sidecar.
-        self._recover_ssm = False
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
