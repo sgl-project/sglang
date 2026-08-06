@@ -1133,22 +1133,27 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
-    def forward(
+    def _forward_attention_prepare(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant=None,
-    ) -> torch.Tensor:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            return x
-
+    ):
+        """Prepare Q/KV, compressor, and the C4 indexer/HiSparse swap-in."""
         attn_backend = get_attn_backend()
-        if TYPE_CHECKING:
-            assert isinstance(
-                attn_backend,
-                (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+        tp_slice, q_padded, q_out = slice(None), None, None
+        if self.attn_tp_size > 1:
+            # FlashMLA's sparse decode kernel specializes h_q for {64, 128}.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            q_padded = (
+                x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                if _is_gfx942_supported
+                else x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             )
+            tp_slice = slice(0, self.n_local_heads)
+            q_out = q_padded[:, tp_slice, :]
+        attn_sink = self._local_attn_sink()
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -1158,29 +1163,9 @@ class MQALayer(MqaAttentionBase):
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
         )
-
-        tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
-            else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
-            tp_slice = slice(0, self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink()
-
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
+            # Cache writes are fused into the K kernel, so there is no bf16 KV
+            # intermediate to carry across the operation boundary.
             if _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
                     x,
@@ -1210,17 +1195,39 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
-        attn_k = kv if kv is not None else q
+        return {
+            "q": q,
+            "kv": kv,
+            "attn_k": kv if kv is not None else q,
+            "tp_slice": tp_slice,
+            "q_padded": q_padded,
+            "q_out": q_out,
+            "attn_sink": attn_sink,
+        }
+
+    def _forward_attention_core(
+        self,
+        prepared,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run only the compressed-attention backend on prepared Q/KV."""
+        q = prepared["q"]
+        kv = prepared["kv"]
+        attn_k = prepared["attn_k"]
+        tp_slice = prepared["tp_slice"]
+        q_padded = prepared["q_padded"]
+        q_out = prepared["q_out"]
+        attn_sink = prepared["attn_sink"]
+        attn_backend = get_attn_backend()
+
+        # Cache writes already completed in prepare. With no DSA-CP KV tensor,
+        # attn_k is only a sentinel for backends that require k is v.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
         if is_unified_kv_triton():
-            o = attn_backend.forward(
+            return attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
                 v=attn_k,
@@ -1230,34 +1237,41 @@ class MQALayer(MqaAttentionBase):
                 attn_sink=self.attn_sink,
                 save_kv_cache=kv is not None,
             )
+
+        attn_q = q_padded if q_padded is not None else q
+        save_kv_cache = False
+        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            o = attn_q.new_empty(
+                (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+            )
+            bcg_deepseek_v4_attention_with_output(
+                attn_q,
+                attn_k,
+                o,
+                self.attn_mqa.layer_id,
+                self.compress_ratio,
+                attn_sink,
+                save_kv_cache,
+            )
         else:
-            attn_q = q_padded if q_padded is not None else q
-            save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-                o = attn_q.new_empty(
-                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
-                )
-                bcg_deepseek_v4_attention_with_output(
-                    attn_q,
-                    attn_k,
-                    o,
-                    self.attn_mqa.layer_id,
-                    self.compress_ratio,
-                    attn_sink,
-                    save_kv_cache,
-                )
-            else:
-                o = attn_backend.forward(
-                    q=attn_q,
-                    k=attn_k,
-                    v=attn_k,
-                    layer=self.attn_mqa,
-                    forward_batch=forward_batch,
-                    compress_ratio=self.compress_ratio,
-                    attn_sink=attn_sink,
-                    save_kv_cache=save_kv_cache,
-                )
-            o = o[:, tp_slice, :]
+            o = attn_backend.forward(
+                q=attn_q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=attn_sink,
+                save_kv_cache=save_kv_cache,
+            )
+        return o[:, tp_slice, :]
+
+    def _forward_attention_output(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run inverse RoPE and the WO projection on an attention result."""
         if _is_npu:
             v4_rope_inplace_npu(
                 o[..., -self.qk_rope_head_dim :],
@@ -1276,7 +1290,6 @@ class MQALayer(MqaAttentionBase):
             )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
-
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
@@ -1314,8 +1327,32 @@ class MQALayer(MqaAttentionBase):
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
-
         return o
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant=None,
+    ) -> torch.Tensor:
+        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+            return x
+
+        if TYPE_CHECKING:
+            attn_backend = get_attn_backend()
+            assert isinstance(
+                attn_backend,
+                (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
+        prepared = self._forward_attention_prepare(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            x_quant=x_quant,
+        )
+        o = self._forward_attention_core(prepared, forward_batch)
+        return self._forward_attention_output(o, positions)
 
     # ---- TBO op decomposition ----
     def op_attn(self, state):
@@ -1330,6 +1367,26 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_prepare(self, state):
+        state.attn_prepared = self._forward_attention_prepare(
+            x=state.pop("hidden_states_after_input_norm"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+            x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_core(self, state):
+        state.attn_core_output = self._forward_attention_core(
+            prepared=state.pop("attn_prepared"),
+            forward_batch=state.forward_batch,
+        )
+
+    def op_attn_output(self, state):
+        state.hidden_states_after_attn = self._forward_attention_output(
+            o=state.pop("attn_core_output"),
+            positions=state.positions,
         )
 
 
