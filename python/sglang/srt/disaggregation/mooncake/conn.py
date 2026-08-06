@@ -27,7 +27,6 @@ from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
-    StagingRegisterInfo,
     StagingTransferInfo,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -144,8 +143,8 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
-    staging: Optional[StagingRegisterInfo] = None
+    staging_base_ptr: int = 0
+    staging_total_size: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -176,15 +175,20 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
-            # msg[14:16] belong to the staging field below; DCP trails it.
+            staging_base_ptr=(
+                struct.unpack("Q", msg[14])[0]
+                if len(msg) > 14 and len(msg[14]) == 8
+                else 0
+            ),
+            staging_total_size=(
+                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+            ),
             dst_dcp_size=(
                 int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
-            # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -467,8 +471,8 @@ class MooncakeKVManager(CommonKVManager):
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
-            target_info.staging.base_ptr + c_offset,
-            target_info.staging.total_size - c_offset,
+            target_info.staging_base_ptr + c_offset,
+            target_info.staging_total_size - c_offset,
             target_info,
         )
         if ret == -1:
@@ -1693,7 +1697,10 @@ class MooncakeKVManager(CommonKVManager):
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
-                            and target_rank_registration_info.staging is not None
+                            and (
+                                target_rank_registration_info.staging_base_ptr != 0
+                                or target_rank_registration_info.staging_total_size != 0
+                            )
                         ):
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,
