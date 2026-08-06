@@ -55,9 +55,45 @@ elif is_hip():
     )
     tree_speculative_sampling_target_only = None
 else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
+    # sgl_kernel ships these sampling ops for CUDA/MUSA only, but
+    # build_dflash_verify_target_probs() calls the top-k/top-p renorm helpers
+    # unconditionally. Leaving them as None crashes DSPARK/DFLASH on ROCm as soon
+    # as a request sets top_p < 1 or top_k > 1 (issue #32569). Both ops are plain
+    # probability renormalisation, so provide portable torch fallbacks.
+    # tree_speculative_sampling_target_only has no cheap equivalent and stays
+    # None; _DFLASH_SAMPLING_VERIFY_AVAILABLE therefore remains False, so no
+    # additional code path is enabled by this fallback.
     tree_speculative_sampling_target_only = None
+
+    def top_k_renorm_prob(probs: torch.Tensor, top_k) -> torch.Tensor:
+        """Keep the top_k largest probabilities per row and renormalise."""
+        if not torch.is_tensor(top_k):
+            top_k = torch.full(
+                (probs.shape[0],), int(top_k), device=probs.device, dtype=torch.long
+            )
+        top_k = top_k.to(probs.device).long().clamp_(min=1, max=probs.shape[-1])
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+        ranks = torch.arange(probs.shape[-1], device=probs.device).expand_as(probs)
+        keep = ranks < top_k.unsqueeze(-1)
+        out = torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs * keep)
+        return out / out.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    def top_p_renorm_prob(probs: torch.Tensor, top_p) -> torch.Tensor:
+        """Nucleus: keep the smallest prefix whose mass reaches top_p, renormalise."""
+        if not torch.is_tensor(top_p):
+            top_p = torch.full(
+                (probs.shape[0],), float(top_p), device=probs.device, dtype=probs.dtype
+            )
+        top_p = top_p.to(device=probs.device, dtype=probs.dtype)
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+        # Exclusive cumsum: a token survives when the mass *before* it is < top_p.
+        exclusive = sorted_probs.cumsum(dim=-1) - sorted_probs
+        keep = exclusive < top_p.unsqueeze(-1)
+        # top_p <= 0 would mask everything and yield an all-zero row; always keep
+        # the most likely token.
+        keep[..., 0] = True
+        out = torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs * keep)
+        return out / out.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def is_dflash_sampling_verify_available() -> bool:
