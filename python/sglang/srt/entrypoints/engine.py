@@ -29,7 +29,6 @@ import os
 import random
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -684,6 +683,7 @@ class Engine(EngineScoreMixin, EngineBase):
             compute_local_gpu_id,
             get_ready_path,
         )
+        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -700,61 +700,13 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=server_args.base_gpu_id,
                     gpu_id_step=server_args.gpu_id_step,
                 )
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "sglang.srt.weight_cache.daemon",
-                    "--model-path",
-                    server_args.model_path,
-                    "--gpu-id",
-                    str(gpu_id),
-                    "--tp-size",
-                    str(tp_size),
-                    "--tp-rank",
-                    str(tp_rank),
-                    "--pp-size",
-                    str(server_args.pp_size),
-                    "--pp-rank",
-                    str(pp_rank),
-                    "--dp-size",
-                    str(server_args.dp_size),
-                    "--ep-size",
-                    str(server_args.ep_size),
-                    "--moe-dp-size",
-                    str(server_args.moe_dp_size),
-                    "--attn-cp-size",
-                    str(server_args.attn_cp_size),
-                    "--load-format",
-                    server_args.load_format,
-                    "--dtype",
-                    server_args.dtype,
-                    "--dist-init-method",
-                    dist_init_method,
-                ]
-                if server_args.enable_dp_attention:
-                    cmd.append("--enable-dp-attention")
-                if server_args.enable_dp_lm_head:
-                    cmd.append("--enable-dp-lm-head")
-                if server_args.moe_dense_tp_size is not None:
-                    cmd += ["--moe-dense-tp-size", str(server_args.moe_dense_tp_size)]
-                if server_args.moe_a2a_backend != "none":
-                    cmd += ["--moe-a2a-backend", server_args.moe_a2a_backend]
-                if server_args.deepep_mode != "auto":
-                    cmd += ["--deepep-mode", server_args.deepep_mode]
-                if server_args.quantization:
-                    cmd += ["--quantization", server_args.quantization]
-                if (
-                    server_args.model_loader_extra_config
-                    and server_args.model_loader_extra_config != "{}"
-                ):
-                    cmd += [
-                        "--model-loader-extra-config",
-                        server_args.model_loader_extra_config,
-                    ]
-                if server_args.trust_remote_code:
-                    cmd += ["--trust-remote-code"]
-                if server_args.revision:
-                    cmd += ["--revision", server_args.revision]
+                cmd = build_weight_cache_daemon_command(
+                    server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    dist_init_method=dist_init_method,
+                )
 
                 proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)
