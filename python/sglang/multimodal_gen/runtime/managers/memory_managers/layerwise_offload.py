@@ -287,6 +287,19 @@ class LayerwiseOffloadManager:
         """Leading layers currently held across denoise steps; 0 until armed."""
         return self.resident_layers if self._residency_active else 0
 
+    @property
+    def resident_bytes(self) -> int:
+        """Total bytes held in this manager's CPU buffers.
+
+        The cost of materialising this manager's layers onto the device.
+        """
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for storage in (self._consolidated_cpu_weights, self._strided_cpu_weights)
+            for per_layer in storage.values()
+            for tensor in per_layer.values()
+        )
+
     @torch.compiler.disable
     def _activate_residency(self) -> None:
         """Arm the resident set on the first denoise forward. The pinning itself is

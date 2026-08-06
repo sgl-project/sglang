@@ -48,6 +48,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
+    BYTES_PER_GB,
     _list_safetensors_files,
     get_param_names_mapping,
 )
@@ -57,8 +58,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -70,6 +73,11 @@ logger = init_logger(__name__)
 _DEFAULT_TENSOR_TARGET_MODULE = "transformer"
 LORA_MERGE_WEIGHT_UPDATE_MODE = "lora_merge"
 _LORA_IPC_TARGET_MODULES = frozenset({"transformer", "transformer_2"})
+# Materialising an offloaded module for a weight update makes its full weights
+# resident. Require headroom beyond the raw size: free memory is not necessarily
+# allocatable as one contiguous block. Both values are heuristics.
+_MATERIALIZE_VRAM_MARGIN = 1.2
+_MATERIALIZE_VRAM_FLOOR_GB = 1.0
 
 
 def _get_lora_layer_dict(
@@ -164,11 +172,47 @@ def _validate_weight_files(
     return weights_map, missing
 
 
-def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
-    """Load weights into a module, handling offload-managed parameters.
+def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> set[str]:
+    """
+    Load weights into a module in place, dispatching on how that module stores them.
 
-    For offloaded modules, updates CPU buffers directly via
-    update_cpu_weights(); non-offloaded parameters use in-place copy.
+    Three paths, and the order of the checks matters: an offloaded text encoder satisfies
+    more than one condition, so the offload test must come first.
+
+    1. Offloaded modules -> write into the offload manager's consolidated CPU buffers via
+       update_cpu_weights(); anything the manager does not claim falls back to in-place copy.
+    2. TextEncoder (not offloaded, no DTensor parameters) -> delegate to the module's own
+       load_weights().
+    3. Everything else -> name mapping followed by in-place copy.
+
+    Buffers are included alongside parameters because module state such as BatchNorm running
+    statistics is stored on disk but absent from named_parameters(). For the FLUX.2 VAE the
+    BatchNorm is affine=False, so those buffers are the layer's entire state, and they set the
+    scale/shift applied to every decode.
+
+    Why TextEncoder delegates: each encoder owns quirks the generic path knows nothing about --
+    stripping a "model." prefix, per-model renames, and stacked_params_mapping fusion.  Those
+    differ per model and cannot be centralised.
+
+    Why that branch receives the RAW iterator: _iter_module_weight_updates is deliberately NOT
+    hoisted above the dispatch, even though it appears in two branches. load_weights needs the
+    original checkpoint names -- the fusion mapping is many-to-one (q_proj/k_proj/v_proj ->
+    qkv_proj), so shard_id is derived from which original name matched. Rename first and that
+    information is unrecoverable.
+
+    Why an offloaded text encoder is materialised instead: under offload the parameters are
+    torch.empty((1,)) placeholders, so load_weights has nothing real to write into, and the
+    offload path cannot fuse (it copies flattened tensors into fixed byte ranges).
+    disable_offload() restores real parameters, and enable_offload() syncs them back to the CPU
+    buffers. Same mechanism the LoRA IPC path already uses via LoRAPipeline._temporarily_disable_offload.
+
+    Why DTensor parameters are excluded: load_weights predates sharding. At startup it runs
+    before shard_model(), so it never meets a DTensor and has no branch for one; calling it on
+    an FSDP-wrapped module raises "got mixed torch.Tensor and DTensor". Those modules fall to
+    the generic path, which handles DTensor explicitly.
+
+    Note that _rollback() calls this function too, so a failure here raises again during
+    rollback -- and rollback failures propagate by design, turning a recoverable 400 into a 500.
 
     The in-place copies below (param.data.copy_, DTensor _local_tensor.copy_,
     and the offload manager's CPU-buffer copies) mutate tensors that were
@@ -181,26 +225,99 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     and returns an HTTP error.
     """
     with torch.inference_mode():
-        model_params = dict(module.named_parameters())
-        weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
-
-        offload_managers: list = []
-        if is_layerwise_offloaded_module(module):
-            offload_managers = [
-                m for m in module.layerwise_offload_managers if m.enabled
-            ]
-
-        if offload_managers:
-            weight_dict = dict(weights_iter)
-            offloaded_names: set[str] = set()
-            for manager in offload_managers:
-                offloaded_names.update(manager.update_cpu_weights(weight_dict))
-            remaining = (
-                (n, w) for n, w in weight_dict.items() if n not in offloaded_names
+        should_disable_offload = (
+            is_layerwise_offloaded_module(module)
+            and isinstance(module, TextEncoder)
+            and _can_materialize_module(module)
+        )
+        updated_weights: set[str] = set()
+        if should_disable_offload:
+            module.disable_offload()
+        try:
+            model_params = dict(module.named_parameters())
+            named_buffers = dict(module.named_buffers())
+            target_tensors = model_params | named_buffers
+            offload_managers: list = []
+            has_distributed_params = any(
+                isinstance(p, DTensor) for p in model_params.values()
             )
-            load_weights_into_model(remaining, model_params)
-        else:
-            load_weights_into_model(weights_iter, model_params)
+            if is_layerwise_offloaded_module(module):
+                offload_managers = [
+                    m for m in module.layerwise_offload_managers if m.enabled
+                ]
+            if offload_managers:
+                # Not hoisted above the dispatch on purpose: the TextEncoder branch
+                # below needs the unmapped checkpoint names.
+                weights_iter = _iter_module_weight_updates(
+                    module, weights_iter, target_tensors
+                )
+                weight_dict = dict(weights_iter)
+                offloaded_names: set[str] = set()
+                for manager in offload_managers:
+                    offloaded_names.update(manager.update_cpu_weights(weight_dict))
+                remaining = (
+                    (n, w) for n, w in weight_dict.items() if n not in offloaded_names
+                )
+                updated_weights.update(offloaded_names)
+                updated_weights.update(
+                    load_weights_into_model(remaining, target_tensors)
+                )
+            # TODO(firefly-silvers): FSDP-wrapped text encoders are excluded here and fall
+            # through to the generic path, which cannot strip the "model." prefix or fuse
+            # q/k/v. So their weights are NOT updated (silently, until the completeness
+            # check lands). load_weights() runs before shard_model() at startup, so it has
+            # no DTensor branch and raises "got mixed torch.Tensor and DTensor" if called.
+            # A fix needs either DTensor handling inside the per-model load_weights(), or
+            # the fsdp_load.py pattern: run the weight loader into a plain temp tensor,
+            # then distribute_tensor() the result. An offloaded and sharded encoder is
+            # materialised above and then lands here too, doing no useful work. See #31924.
+            elif isinstance(module, TextEncoder) and not has_distributed_params:
+                updated_weights.update(module.load_weights(weights_iter))
+            else:
+                # See the note above: kept per-branch so the TextEncoder path stays raw.
+                weights_iter = _iter_module_weight_updates(
+                    module, weights_iter, target_tensors
+                )
+                updated_weights.update(
+                    load_weights_into_model(weights_iter, target_tensors)
+                )
+        finally:
+            # enable_offload() syncs GPU state back into the CPU buffers before
+            # re-placeholdering. Without it the update above is silently discarded.
+            if should_disable_offload:
+                module.enable_offload()
+        return updated_weights
+
+
+def _offloaded_weight_bytes(module: torch.nn.Module) -> int:
+    return sum(
+        manager.resident_bytes
+        for manager in module.layerwise_offload_managers
+        if manager.enabled
+    )
+
+
+def _can_materialize_module(module: torch.nn.Module) -> bool:
+    """Whether this module's offloaded weights fit in free VRAM with headroom."""
+    required_gb = _offloaded_weight_bytes(module) / BYTES_PER_GB
+    needed_gb = max(
+        required_gb * _MATERIALIZE_VRAM_MARGIN,
+        required_gb + _MATERIALIZE_VRAM_FLOOR_GB,
+    )
+    available_gb = current_platform.get_available_gpu_memory()
+    if available_gb < needed_gb:
+        logger.warning(
+            "Not materialising %s for weight update: needs %.2f GB (%.2f GB weights "
+            "plus headroom), only %.2f GB free. Falling back to the offload path, "
+            "which cannot strip prefixes or fuse names -- this module's weights will "
+            "be skipped.",
+            type(module).__name__,
+            needed_gb,
+            required_gb,
+            available_gb,
+        )
+        return False
+    return True
 
 
 def _build_module_weight_name_mapper(module: torch.nn.Module):
@@ -258,18 +375,18 @@ def _resolve_lora_ipc_layer_dict_key(
 def _iter_module_weight_updates(
     module: torch.nn.Module,
     weights_iter,
-    model_params: dict,
+    target_tensors: dict,
 ):
     map_name = _build_module_weight_name_mapper(module)
     module_name = type(module).__name__
 
     for name, loaded_weight in weights_iter:
-        if name in model_params:
+        if name in target_tensors:
             yield name, loaded_weight
             continue
 
         mapped_name = map_name(name) if map_name is not None else name
-        if mapped_name in model_params:
+        if mapped_name in target_tensors:
             yield mapped_name, loaded_weight
             continue
 
@@ -282,17 +399,19 @@ def _iter_module_weight_updates(
 
 
 def load_weights_into_model(
-    weights_iter, model_params: dict, module_name: str | None = None
-) -> None:
-    """Copy weights from weights_iter into model_params in-place."""
+    weights_iter, target_tensors: dict, module_name: str | None = None
+) -> set[str]:
+    """Copy weights from weights_iter into target_tensors in-place."""
+    updated_weights: set[str] = set()
     for name, loaded_weight in weights_iter:
-        if name not in model_params:
+        if name not in target_tensors:
             logger.warning("Skipping weight update: parameter %r not found", name)
             continue
-        param = model_params[name]
+        param = target_tensors[name]
         weight_loader = getattr(param, "weight_loader", None)
         if callable(weight_loader):
             weight_loader(param, loaded_weight.to(param.dtype))
+            updated_weights.add(name)
         else:
             dtensor_param = param if isinstance(param, DTensor) else None
             if dtensor_param is None and isinstance(
@@ -315,6 +434,8 @@ def load_weights_into_model(
                         f"model={param.shape}, loaded={loaded_weight.shape}"
                     )
                 param.data.copy_(loaded_weight.to(param.dtype))
+            updated_weights.add(name)
+    return updated_weights
 
 
 class WeightsUpdater:
@@ -426,15 +547,17 @@ class WeightsUpdater:
         weights_map: dict[str, str],
     ) -> tuple[bool, str]:
         """Load weights into each module; rollback on first failure."""
-        updated_modules: list[str] = []
+        updated_modules: dict[str, int] = {}
 
         for module_name, module in modules_to_update:
             try:
                 weights_iter = _get_weights_iter(weights_map[module_name])
-                _load_weights_into_module(module, weights_iter)
-                updated_modules.append(module_name)
+                loaded_weights = _load_weights_into_module(module, weights_iter)
+                if len(loaded_weights) == 0:
+                    logger.warning(f"0 weights loaded for module {module_name}")
+                updated_modules[module_name] = len(loaded_weights)
             except Exception as e:
-                rollback_list = updated_modules + [module_name]
+                rollback_list = list(updated_modules) + [module_name]
                 logger.error(
                     f"Weight update failed for module '{module_name}': {e}. "
                     f"Rolling back {len(rollback_list)} module(s) "
@@ -448,8 +571,10 @@ class WeightsUpdater:
                     f"All modules rolled back to original weights."
                 )
 
-        names = ", ".join(updated_modules)
-        return True, f"Updated {len(updated_modules)} modules ({names})."
+        updated_module_name = ", ".join(
+            f"{key}: {value}" for key, value in updated_modules.items()
+        )
+        return True, f"Updated {len(updated_modules)} modules ({updated_module_name})."
 
     def _rollback(self, updated_modules: list[str]) -> None:
         """Restore updated_modules to original weights.
