@@ -19,8 +19,13 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
+from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -170,6 +175,7 @@ def _build_image_response_kwargs(
     fallback_url: str | None = None,
     fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
+    resize: str | None = None,
 ) -> dict:
     """Build ImageResponse data list.
 
@@ -186,6 +192,7 @@ def _build_image_response_kwargs(
                 b64_json=b64,
                 revised_prompt=prompt,
                 file_path=os.path.abspath(path) if is_persistent else None,
+                resize=resize,
             )
             for b64, path in zip(b64_list, save_file_path_list)
         ]
@@ -210,6 +217,7 @@ def _build_image_response_kwargs(
                     url=url,
                     revised_prompt=prompt,
                     file_path=os.path.abspath(path) if is_persistent else None,
+                    resize=resize,
                 )
             )
 
@@ -229,6 +237,28 @@ def _build_image_response_kwargs(
         ret["usage"]["image_count"] = len(save_file_path_list)
 
     return ret
+
+
+def _get_response_resize(
+    sampling_params: SamplingParams, output_path: str | None = None
+) -> str | None:
+    """Return a generated GLM-Image output's actual size as WIDTHxHEIGHT."""
+    if not isinstance(sampling_params, GlmImageSamplingParams):
+        return None
+
+    if output_path is not None:
+        try:
+            with Image.open(output_path) as output_image:
+                width, height = output_image.size
+            return f"{width}x{height}"
+        except (OSError, ValueError):
+            # Fall back to the aligned sampling canvas if the output cannot be
+            # inspected (for example, for a custom output transport).
+            pass
+
+    if sampling_params.width is None or sampling_params.height is None:
+        return None
+    return sampling_params.output_size_str()
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -308,6 +338,7 @@ async def generations(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
+        response_resize = _get_response_resize(sampling, save_file_path)
         resp_format = (request.response_format or "b64_json").lower()
         if (
             is_cosmos3
@@ -359,6 +390,7 @@ async def generations(
             cloud_urls=cloud_urls,
             fallback_urls=fallback_urls,
             is_persistent=is_persistent,
+            resize=response_resize,
         )
 
     return ImageResponse(**response_kwargs)
@@ -462,6 +494,7 @@ async def edits(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
+        response_resize = _get_response_resize(sampling, save_file_path)
         resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
@@ -510,6 +543,7 @@ async def edits(
             cloud_urls=cloud_urls,
             fallback_urls=fallback_urls,
             is_persistent=is_persistent,
+            resize=response_resize,
         )
 
     return ImageResponse(**response_kwargs)
