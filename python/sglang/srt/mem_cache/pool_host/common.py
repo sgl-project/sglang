@@ -42,9 +42,13 @@ class HostTensorAllocator:
         SGLANG_HUGEPAGE_SIZE). A subclass that overrides allocate() gets its
         memory elsewhere and is credited nothing unless it overrides this too.
         """
-        if type(self).allocate is not HostTensorAllocator.allocate:
+        if not self.supports_hugetlb():
             return 0
         return hugetlb_pool_free_bytes()
+
+    def supports_hugetlb(self) -> bool:
+        """Whether allocate() can honor the SGLANG hugepage policy."""
+        return type(self).allocate is HostTensorAllocator.allocate
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
@@ -336,4 +340,12 @@ def device_uses_allocator(device: Union[str, torch.device]) -> bool:
 
     npu/musa allocate with torch.empty(pin_memory=True) and never see it.
     """
-    return ALLOC_MEMORY_FUNCS[device] is alloc_with_host_register
+    key = (
+        device.type
+        if isinstance(device, torch.device)
+        else str(device).split(":", 1)[0]
+    )
+    return (
+        ALLOC_MEMORY_FUNCS.get(key, alloc_with_host_register)
+        is alloc_with_host_register
+    )

@@ -6,6 +6,7 @@ import unittest.mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -235,8 +236,6 @@ class TestLazyHostPoolRelease(CustomTestCase):
 
 
 class TestHostMemoryBudget(CustomTestCase):
-    # Pinned so the two budget reads below see identical free memory; the real
-    # psutil value drifts between calls and would flake the equality checks.
     _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
 
     def _budget_with_ranks(self, ranks):
@@ -248,19 +247,13 @@ class TestHostMemoryBudget(CustomTestCase):
             unittest.mock.patch.object(
                 base.psutil, "virtual_memory", return_value=fake_mem
             ),
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
         ):
             return base.host_memory_budget_bytes()
 
     def test_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
         self.assertEqual(self._budget_with_ranks(4), solo // 4)
-
-    def test_reserve_is_taken_before_the_split(self):
-        # Each rank must not get its own copy of the reserve.
-        budget = self._budget_with_ranks(8)
-        self.assertLessEqual(
-            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
-        )
 
     def test_ranks_per_host_divides_world_size_by_nodes(self):
         # The launcher slices ranks uniformly across nodes, so the co-located
@@ -277,13 +270,17 @@ class TestHostMemoryBudget(CustomTestCase):
         ):
             self.assertEqual(base.ranks_per_host(), 8)
 
-    def _budget_for(self, allocator, device, available, ranks=8):
+    def _budget_for(
+        self, allocator, device, available, ranks=8, mode="prefer", size="2MB"
+    ):
         fake_mem = unittest.mock.Mock(available=available)
         with (
             unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
             unittest.mock.patch.object(
                 base.psutil, "virtual_memory", return_value=fake_mem
             ),
+            envs.SGLANG_HUGEPAGE_MODE.override(mode),
+            envs.SGLANG_HUGEPAGE_SIZE.override(size),
         ):
             return base.host_memory_budget_bytes(allocator, device)
 
@@ -294,7 +291,8 @@ class TestHostMemoryBudget(CustomTestCase):
         gib = 1024**3
         reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
         allocator = unittest.mock.Mock(
-            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib)
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
         )
         budget = self._budget_for(allocator, "cuda", available=reserve + 64 * gib)
         self.assertEqual(budget, 96 * gib // 8)
@@ -303,10 +301,24 @@ class TestHostMemoryBudget(CustomTestCase):
         gib = 1024**3
         reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
         allocator = unittest.mock.Mock(
-            free_hugetlb_bytes=unittest.mock.Mock(return_value=16 * gib)
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=16 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
         )
         budget = self._budget_for(allocator, "cuda", available=reserve + 64 * gib)
         self.assertEqual(budget, 64 * gib // 8)
+
+    def test_off_mode_does_not_query_or_credit_hugetlb(self):
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
+        )
+        budget = self._budget_for(
+            allocator, "cuda", available=reserve + 64 * gib, mode="off"
+        )
+        self.assertEqual(budget, 64 * gib // 8)
+        allocator.free_hugetlb_bytes.assert_not_called()
 
     def test_no_hugetlb_credit_for_pin_memory_devices(self):
         # npu/musa allocate with torch.empty(pin_memory=True) and never see the
@@ -314,7 +326,8 @@ class TestHostMemoryBudget(CustomTestCase):
         gib = 1024**3
         reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
         allocator = unittest.mock.Mock(
-            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib)
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
         )
         budget = self._budget_for(allocator, "npu", available=reserve + 64 * gib)
         self.assertEqual(budget, 64 * gib // 8)
@@ -325,12 +338,55 @@ class TestHostMemoryBudget(CustomTestCase):
         # message that shows it, when there is no hugetlb pool to credit.
         gib = 1024**3
         allocator = unittest.mock.Mock(
-            free_hugetlb_bytes=unittest.mock.Mock(return_value=0)
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=0),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
         )
         budget = self._budget_for(allocator, "cuda", available=4 * gib)
         self.assertEqual(
             budget, (4 * gib - base.HICACHE_HOST_MEMORY_RESERVE_BYTES) // 8
         )
+
+    def test_required_mode_uses_only_hugetlb(self):
+        gib = 1024**3
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=24 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
+        )
+        budget = self._budget_for(allocator, "cuda", available=1 << 50, mode="required")
+        self.assertEqual(budget, 24 * gib // 8)
+
+    def test_required_mode_is_ignored_by_unsupported_allocation_paths(self):
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=False),
+        )
+        with unittest.mock.patch.object(base, "hugepage_size_requested") as parser:
+            for device in ("cuda", "npu"):
+                with self.subTest(device=device):
+                    budget = self._budget_for(
+                        allocator,
+                        device,
+                        available=reserve + 64 * gib,
+                        mode="required",
+                    )
+                    self.assertEqual(budget, 64 * gib // 8)
+            parser.assert_not_called()
+        allocator.free_hugetlb_bytes.assert_not_called()
+
+    def test_required_mode_requires_a_hugepage_size(self):
+        allocator = unittest.mock.Mock(
+            supports_hugetlb=unittest.mock.Mock(return_value=True)
+        )
+        with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
+            self._budget_for(
+                allocator,
+                "cuda",
+                available=1 << 50,
+                mode="required",
+                size="",
+            )
 
     def test_guard_passes_its_allocator_and_device(self):
         device_pool = MHATokenToKVPool(
@@ -382,6 +438,11 @@ class TestHostTensorAllocatorHugetlb(CustomTestCase):
             self.assertEqual(common.HostTensorAllocator().free_hugetlb_bytes(), 4 * gib)
             self.assertEqual(common.ShmHostTensorAllocator().free_hugetlb_bytes(), 0)
             self.assertEqual(Elsewhere().free_hugetlb_bytes(), 0)
+
+    def test_device_dispatch_check_normalizes_device_keys(self):
+        self.assertTrue(common.device_uses_allocator(torch.device("cpu")))
+        self.assertTrue(common.device_uses_allocator("cuda:0"))
+        self.assertFalse(common.device_uses_allocator("npu:0"))
 
 
 class TestHostPoolGroup(CustomTestCase):

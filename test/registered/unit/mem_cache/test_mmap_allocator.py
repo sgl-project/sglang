@@ -31,6 +31,83 @@ class TestMmapAllocator(unittest.TestCase):
         # Verify it has mapped memory address
         self.assertGreater(tensor.data_ptr(), 0)
 
+    def test_alloc_mmap_hugepage_modes(self):
+        with (
+            self.subTest(mode="off"),
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(mmap_allocator, "_alloc_hugepage") as hugepage,
+        ):
+            self.assertEqual(mmap_allocator.alloc_mmap((4,), torch.float32).shape, (4,))
+            hugepage.assert_not_called()
+
+        with (
+            self.subTest(mode="prefer", result="hugetlb"),
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                return_value=(ctypes.c_uint8 * 16)(),
+            ) as hugepage,
+            unittest.mock.patch.object(mmap_allocator, "_mmap_prefaulted") as plain,
+        ):
+            self.assertEqual(mmap_allocator.alloc_mmap((4,), torch.float32).shape, (4,))
+            hugepage.assert_called_once()
+            plain.assert_not_called()
+
+        with (
+            self.subTest(mode="prefer", result="fallback"),
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(mmap_allocator, "_libc", object()),
+            unittest.mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                side_effect=OSError("no hugepages"),
+            ),
+            unittest.mock.patch.object(
+                mmap_allocator,
+                "_mmap_prefaulted",
+                wraps=mmap_allocator._mmap_prefaulted,
+            ) as plain,
+        ):
+            self.assertEqual(mmap_allocator.alloc_mmap((4,), torch.float32).shape, (4,))
+            plain.assert_called_once()
+
+        with (
+            self.subTest(mode="required", result="failure"),
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(mmap_allocator, "_libc", object()),
+            unittest.mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                side_effect=OSError("no hugepages"),
+            ),
+            unittest.mock.patch.object(mmap_allocator, "_mmap_prefaulted") as plain,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no hugepages"):
+                mmap_allocator.alloc_mmap((4,), torch.float32)
+            plain.assert_not_called()
+
+        with (
+            self.subTest(mode="required", result="missing-size"),
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override(""),
+            self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"),
+        ):
+            mmap_allocator.alloc_mmap((4,), torch.float32)
+
+        with (
+            self.subTest(mode="required", result="libc-unavailable"),
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(mmap_allocator, "_libc", None),
+            self.assertRaisesRegex(RuntimeError, "C library"),
+        ):
+            mmap_allocator.alloc_mmap((4,), torch.float32)
+
     def test_alloc_shm(self):
         dims = (10, 1024)
         dtype = torch.float32
@@ -143,18 +220,19 @@ class TestMmapAllocator(unittest.TestCase):
         os.close(fd)
 
     def test_alloc_shm_hugepage_warning(self):
-        from sglang.srt.environ import envs
-
-        envs.SGLANG_HUGEPAGE_SIZE.override("2MB")
-        try:
-            # Should succeed by falling back to plain page size mapping
-            dims = (2, 2)
-            tensor, fd, mm = alloc_shm(dims, torch.float32)
-            self.assertEqual(tensor.shape, dims)
-            mm.close()
-            os.close(fd)
-        finally:
-            envs.SGLANG_HUGEPAGE_SIZE.override(None)
+        for mode in ("prefer", "required"):
+            with (
+                self.subTest(mode=mode),
+                envs.SGLANG_HUGEPAGE_MODE.override(mode),
+                envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+                self.assertLogs(mmap_allocator.logger, "WARNING"),
+            ):
+                # SHM does not dispatch to alloc_mmap, so the mode is ignored.
+                dims = (2, 2)
+                tensor, fd, mm = alloc_shm(dims, torch.float32)
+                self.assertEqual(tensor.shape, dims)
+                mm.close()
+                os.close(fd)
 
     def test_shm_host_tensor_allocator_invalid_device(self):
         allocator = ShmHostTensorAllocator()
@@ -183,6 +261,28 @@ class TestHugetlbPool(unittest.TestCase):
         for raw, expected in {"": 0, "2MB": 2 * 1024**2, " 1gb ": 1024**3}.items():
             with self.subTest(raw=raw), envs.SGLANG_HUGEPAGE_SIZE.override(raw):
                 self.assertEqual(mmap_allocator.hugepage_size_requested(), expected)
+
+    def test_hugepage_mode_defaults_and_parses_the_env(self):
+        for raw_mode, size, expected in (
+            ("", 0, mmap_allocator.HUGEPAGE_MODE_OFF),
+            ("", 2 * 1024**2, mmap_allocator.HUGEPAGE_MODE_PREFER),
+            (" Required ", 2 * 1024**2, mmap_allocator.HUGEPAGE_MODE_REQUIRED),
+        ):
+            with (
+                self.subTest(raw_mode=raw_mode, size=size),
+                envs.SGLANG_HUGEPAGE_MODE.override(raw_mode),
+            ):
+                self.assertEqual(mmap_allocator.hugepage_mode(size), expected)
+
+    def test_unrecognized_hugepage_mode_uses_the_size_based_default(self):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("invalid"),
+            self.assertLogs(mmap_allocator.logger, "WARNING"),
+        ):
+            self.assertEqual(
+                mmap_allocator.hugepage_mode(2 * 1024**2),
+                mmap_allocator.HUGEPAGE_MODE_PREFER,
+            )
 
     def test_unrecognized_hugepage_size_means_plain_pages(self):
         with (
@@ -232,6 +332,12 @@ class TestHugetlbPool(unittest.TestCase):
                 with (
                     self.subTest(why="not requested"),
                     envs.SGLANG_HUGEPAGE_SIZE.override(""),
+                ):
+                    self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), 0)
+                with (
+                    self.subTest(why="mode off"),
+                    envs.SGLANG_HUGEPAGE_MODE.override("off"),
+                    envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
                 ):
                     self.assertEqual(mmap_allocator.hugetlb_pool_free_bytes(), 0)
                 with (
