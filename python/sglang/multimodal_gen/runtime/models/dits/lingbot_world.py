@@ -60,8 +60,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     RotaryEmbedding,
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
@@ -589,7 +587,12 @@ class LingBotWorldTransformerBlock(nn.Module):
             elementwise_affine=True,
             dtype=torch.float32,
         )
-
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
         cross_attn_backends = {
             b for b in supported_attention_backends if not b.is_sparse
         }
@@ -673,18 +676,7 @@ class LingBotWorldTransformerBlock(nn.Module):
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        elif USE_AITER:
+        if USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
@@ -704,9 +696,12 @@ class LingBotWorldTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query = _apply_rotary_emb(query, cos, sin, is_neox_style=False)
-            key = _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                cos=cos,
+                sin=sin,
+            )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
