@@ -266,12 +266,10 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
     def test_flashmla_selects_natural_log_lse(self):
-        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-            _is_mla_dcp_lse_base_on_e,
-        )
+        from sglang.srt.layers.dcp import is_lse_base_on_e
 
-        self.assertTrue(_is_mla_dcp_lse_base_on_e("flashmla"))
-        self.assertFalse(_is_mla_dcp_lse_base_on_e("flashinfer_mla"))
+        self.assertTrue(is_lse_base_on_e("flashmla"))
+        self.assertFalse(is_lse_base_on_e("flashinfer_mla"))
 
     def test_nan_lse_handled(self):
         from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu

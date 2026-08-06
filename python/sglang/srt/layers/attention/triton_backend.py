@@ -16,15 +16,12 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
-    cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
+    get_dcp_attn_comm,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -179,12 +176,15 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
-        self.num_head = (
+        self.dcp_comm = get_dcp_attn_comm()
+        self.dcp_size = self.dcp_comm.size
+        self.dcp_rank = self.dcp_comm.rank
+        if self.dcp_comm.enabled:
+            self.dcp_comm.check_layout()
+        self.num_head = self.dcp_comm.num_kernel_heads(
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
-        ) * self.dcp_size
+        )
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
@@ -1456,7 +1456,6 @@ class TritonAttnBackend(AttentionBackend):
                 "DCP Triton extend does not support sliding window"
             )
 
-        group = get_parallel().dcp_group
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         total_tokens, local_heads, _ = q_local.shape
 
@@ -1520,7 +1519,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
         # partial attention with all gathered query heads and merge by LSE.
-        q_all = group.all_gather(q_local, dim=1).contiguous()
+        q_all = self.dcp_comm.gather_q_heads(q_local)
         total_heads = q_all.shape[1]
         prefix_out = torch.zeros(
             (total_tokens, total_heads, layer.v_head_dim),
@@ -1558,8 +1557,8 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
-        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
-            prefix_out, prefix_lse, group, return_lse=True
+        prefix_out, prefix_lse = self.dcp_comm.combine_mha_with_lse(
+            prefix_out, prefix_lse
         )
         final_lse = torch.logaddexp(prefix_lse, current_lse)
         prefix_scale = torch.exp(prefix_lse - final_lse).unsqueeze(-1)
@@ -1799,12 +1798,9 @@ class TritonAttnBackend(AttentionBackend):
                 raise NotImplementedError(
                     "DCP Triton decode does not support score_mod"
                 )
-            group = get_parallel().dcp_group
-            with use_symmetric_memory(group):
-                q_for_decode = q.view(
-                    -1, layer.tp_q_head_num, layer.qk_head_dim
-                ).contiguous()
-            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
+            q_for_decode = self.dcp_comm.gather_q_heads(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            )
             o_for_decode = torch.empty(
                 (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
                 dtype=torch.float32,
@@ -1835,7 +1831,7 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            o = self.dcp_comm.combine_mha(o_for_decode, local_lse)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(

@@ -2188,6 +2188,31 @@ def init_distributed_environment(
         ), "world group already initialized with a different world size"
 
 
+def build_dcp_group_ranks(
+    tp_group_ranks: List[List[int]], decode_context_parallel_size: int
+) -> List[List[int]]:
+    """Lay out the decode-context-parallel groups inside each TP group.
+
+    Contiguous, lowest-order slices: TP group ``[g0..g7]`` with dcp_size 2 yields
+    ``[g0,g1], [g2,g3], [g4,g5], [g6,g7]``. That layout is what makes
+    ``dcp_rank == attn_tp_rank % dcp_size`` hold, which in turn is what lets the
+    post-attention merge hand each rank the head shard its ``o_proj`` weights
+    were loaded for -- both reductions (reduce-scatter and all-to-all) are
+    structural and give rank *r* chunk *r*.
+
+    Any other layout must remap ``DcpAttnComm.head_shard_index`` to match, which
+    ``DcpAttnComm.check_layout`` will demand. This is the single place the layout
+    is decided.
+    """
+    dcp_group_ranks = []
+    for tp_group in tp_group_ranks:
+        for start in range(0, len(tp_group), decode_context_parallel_size):
+            dcp_group_ranks.append(
+                tp_group[start : start + decode_context_parallel_size]
+            )
+    return dcp_group_ranks
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -2285,6 +2310,24 @@ def initialize_model_parallel(
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
             f"decode_context_parallel_size ({decode_context_parallel_size})"
         )
+    attn_head_shard_size = (
+        tensor_model_parallel_size
+        // attention_context_model_parallel_size
+        // attention_data_parallel_size
+    )
+    if attn_head_shard_size % decode_context_parallel_size != 0:
+        # DCP replicates one attention head shard across its own dimension, so a
+        # DCP group must sit inside a single attention TP group. Otherwise a
+        # rank's DCP partners span several head shards and the post-attention
+        # merge returns a shard o_proj was not loaded for.
+        raise RuntimeError(
+            f"attn_tp_size ({attn_head_shard_size}) must be divisible by "
+            f"decode_context_parallel_size ({decode_context_parallel_size}); "
+            f"attn_tp_size = tensor_model_parallel_size "
+            f"({tensor_model_parallel_size}) // attention_context_model_parallel_size "
+            f"({attention_context_model_parallel_size}) // "
+            f"attention_data_parallel_size ({attention_data_parallel_size})"
+        )
 
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
@@ -2335,12 +2378,9 @@ def initialize_model_parallel(
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
     if decode_context_parallel_size > 1:
-        dcp_group_ranks = []
-        for tp_group in group_ranks:
-            for start in range(0, len(tp_group), decode_context_parallel_size):
-                dcp_group_ranks.append(
-                    tp_group[start : start + decode_context_parallel_size]
-                )
+        dcp_group_ranks = build_dcp_group_ranks(
+            group_ranks, decode_context_parallel_size
+        )
         _DCP = init_model_parallel_group(
             dcp_group_ranks,
             get_world_group().local_rank,
