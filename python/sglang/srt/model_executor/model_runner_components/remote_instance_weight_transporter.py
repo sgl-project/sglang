@@ -62,10 +62,9 @@ class RemoteInstanceWeightTransporter:
             and get_model().remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.engine is not None
-            and self.weight_info is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
-            self.weight_info = register_memory_region(self.model, self.engine)
+            if self.weight_info is None:
+                self.weight_info = register_memory_region(self.model, self.engine)
             self._register_to_engine_info_bootstrap()
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
