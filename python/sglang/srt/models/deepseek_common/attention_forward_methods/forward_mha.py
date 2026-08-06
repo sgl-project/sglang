@@ -406,20 +406,32 @@ class DeepseekMHAForwardMixin:
             if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
                 get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
+        # Q is shared by the causal suffix and every prefix chunk. Quantize it
+        # once at the layer-forward scope while retaining the dtype expected by
+        # prefix KV fetch/projection.
+        kv_a_dtype = None
+        q_attn = q
+        if has_extend_prefix:
+            backend = _resolve_attn_backend(forward_batch)
+            q_attn = backend.prepare_prefill_query(q)
+            if q_attn.dtype != q.dtype:
+                kv_a_dtype = q.dtype
+
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha(q_attn, k, v, forward_batch, save_kv_cache=False)
 
         # Do mha attention with chunked prefix cache if there are any sequence with prefix
         if has_extend_prefix:
             attn_output, lse = attn_output
             forward_batch.set_attn_attend_prefix_cache(True)
             attn_output = self._chunked_prefix_attn_mha(
-                q=q,
+                q=q_attn,
                 accum_output=attn_output,
                 accum_lse=lse,
                 forward_batch=forward_batch,
+                kv_a_dtype=kv_a_dtype,
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
@@ -462,11 +474,13 @@ class DeepseekMHAForwardMixin:
         accum_output: torch.Tensor,
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_a_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
-        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+        if kv_a_dtype is None:
+            kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
 
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
