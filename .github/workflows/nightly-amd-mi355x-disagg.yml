@@ -84,24 +84,36 @@ jobs:
             FILTER_ARG=(--filter "$CONFIGS_FILTER")
           fi
           MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
-            scripts/ci/slurm/nightly-configs.yaml --runner mi355x "${FILTER_ARG[@]}")
+            scripts/ci/slurm/nightly-configs.yaml --runner mi355x --with-nodes "${FILTER_ARG[@]}")
           MATRIX="$MATRIX" python3 - <<'PY'
           import json
           import os
 
+          # Size of the amd-sglang partition. salloc takes whole nodes, so a leg
+          # can share the cluster only if two of it fit; anything larger needs
+          # all of it. Bump this if the partition grows.
+          CLUSTER_NODES = 4
+
+          # Stage on the allocation size generate_matrix.py reads out of each
+          # recipe, not on the config name. A name pattern cannot distinguish
+          # 1P1D-with-wide-decode (prefill 1 node + decode 2 nodes = 3) from
+          # plain 1P1D, so it would silently under-size that leg and let the
+          # scheduler co-schedule it -- the exact failure this staging prevents.
           matrix = json.loads(os.environ["MATRIX"])
-          groups = {
-              "matrix-2n": [entry for entry in matrix if "-1p1d" in entry["name"]],
-              "matrix-4n": [
-                  entry for entry in matrix if "-2p1d-ep16" in entry["name"]
-              ],
-          }
-          matched = {entry["name"] for entries in groups.values() for entry in entries}
-          unmatched = [entry["name"] for entry in matrix if entry["name"] not in matched]
-          if unmatched:
+          unsized = [e["name"] for e in matrix if not e.get("nodes")]
+          if unsized:
               raise SystemExit(
-                  "Unrecognized MI355X topology for config(s): " + ", ".join(unmatched)
+                  "Cannot size MI355X allocation for config(s): " + ", ".join(unsized)
               )
+
+          groups = {
+              "matrix-2n": [e for e in matrix if e["nodes"] * 2 <= CLUSTER_NODES],
+              "matrix-4n": [e for e in matrix if e["nodes"] * 2 > CLUSTER_NODES],
+          }
+          for name, entries in groups.items():
+              print(f"{name}: {len(entries)} leg(s)")
+              for entry in entries:
+                  print(f"  - {entry['name']} ({entry['nodes']} nodes)")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               for name, entries in groups.items():
@@ -131,6 +143,10 @@ jobs:
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: mi355x-${{ matrix.config.name }}
       MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
+      # Allocation size this leg was staged for. The launcher derives its own
+      # TOTAL_NODES from the recipe and fails if the two disagree, so the
+      # staging split cannot silently drift from what actually gets allocated.
+      EXPECTED_NODES: ${{ matrix.config.nodes }}
       # NOTE: RUNNER_NAME is a built-in default env var on every runner, so the
       # launch + cleanup steps read it directly. Do NOT set it here from
       # ${{ runner.name }} -- the `runner` context is not available in job-level
