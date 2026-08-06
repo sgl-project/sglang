@@ -19,6 +19,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -301,6 +302,10 @@ class TritonAttnBackend(AttentionBackend):
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
+        # dLLM (diffusion) config; None for non-diffusion models. Used to size
+        # the fixed per-request query block for DLLM_EXTEND cuda-graph capture.
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -527,6 +532,34 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
         )
+
+    def _update_dllm_buffers(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ):
+        """Fill QO + KV cuda-graph buffers for DLLM_EXTEND mode.
+
+        The dLLM block is a fixed-size (block_size) span of query tokens that
+        attends bidirectionally over the cached prefix. The block's own K/V are
+        supplied to the extend kernel as the extend part, so the KV buffer
+        covers only the prefix (``seq_lens - block_size``) — matching the eager
+        DLLM_EXTEND path.
+        """
+        block_size = self.dllm_config.block_size
+        qo_indptr = self.qo_indptr[: bs + 1]
+        qo_indptr[: bs + 1] = torch.arange(
+            0,
+            (1 + bs) * block_size,
+            step=block_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        kv_indptr = self._fill_kv_indptr_and_indices(
+            bs, seq_lens - block_size, req_pool_indices, self.cuda_graph_kv_indices
+        )
+        return qo_indptr, kv_indptr
 
     def _update_draft_extend_buffers(
         self,
@@ -1134,6 +1167,27 @@ class TritonAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
+        elif forward_mode.is_dllm_extend():
+            # dLLM block: fixed block_size query tokens, bidirectional over the
+            # cached prefix (causal=False set in forward_extend for ENCODER_ONLY
+            # layers), no custom mask.
+            return ForwardMetadata(
+                attn_logits=None,
+                attn_lse=None,
+                max_extend_len=self.dllm_config.block_size,
+                num_kv_splits=None,
+                kv_indptr=self.kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                qo_indptr=self.qo_indptr[: bs + 1],
+                custom_mask=None,
+                mask_indptr=None,
+                window_kv_indptr=self.window_kv_indptr,
+                window_kv_indices=None,
+                window_num_kv_splits=None,
+                window_kv_offsets=None,
+                swa_out_cache_loc=swa_out_cache_loc,
+                out_cache_loc_full_physical=out_cache_loc_full_physical,
+            )
         elif forward_mode.is_draft_extend_v2():
             return ForwardMetadata(
                 attn_logits=None,
@@ -1193,6 +1247,8 @@ class TritonAttnBackend(AttentionBackend):
             self._update_target_verify_buffers(
                 bs, seq_lens, req_pool_indices, spec_info
             )
+        elif forward_mode.is_dllm_extend():
+            self._update_dllm_buffers(bs, seq_lens, req_pool_indices)
         elif forward_mode.is_draft_extend_v2():
             self._update_draft_extend_buffers(
                 bs, seq_lens, req_pool_indices, forward_mode, spec_info
