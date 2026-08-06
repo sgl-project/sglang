@@ -1486,9 +1486,16 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 "Only Bailing MoE V3 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        # Check W4AFP8 quantization
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Bailing MoE V3 W4AFP8 model uses different quant method for routed experts and shared experts."
+        # Check mixed routed-expert quantization. Shared experts remain in their
+        # original format and therefore cannot share a fused MoE weight tensor.
+        elif self.quant_config and (
+            self.quant_config.get_name() == "w4afp8"
+            or getattr(self.quant_config, "is_fp4_experts", False)
+        ):
+            disable_reason = (
+                "Bailing MoE V3 uses different quant methods for routed experts "
+                "and shared experts."
+            )
         # Check shared_experts intermediate_size compatibility
         # Fusion requires shared_experts and routed experts to have the same intermediate_size
         # Note: The default value for moe_shared_expert_intermediate_size is

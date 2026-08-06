@@ -358,11 +358,21 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
+        # Mixed FP8/MXFP4 checkpoints can explicitly mark routed experts as
+        # MXFP4 while keeping dense and shared-expert tensors in their original
+        # FP8/BF16 formats.
+        quantization_config = getattr(self.hf_config, "quantization_config", None) or {}
+        routed_experts_quant_method = quantization_config.get(
+            "routed_experts_quant_method"
+        )
+        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
+        if self.is_fp4_experts:
+            logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+
         # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
-        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
-        # FP8 expert tensor layout.
-        self.is_fp4_experts: bool = False
-        if is_deepseek_v4(self.hf_config):
+        # Other FP8 MoE models keep the normal FP8 expert tensor layout unless
+        # they opt in through routed_experts_quant_method above.
+        if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
