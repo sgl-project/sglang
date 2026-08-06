@@ -125,11 +125,6 @@ _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
 _k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -204,9 +199,6 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
-# ---------------------------------------------------------------------------
-# DP attention helpers
-#
 # K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
 # input_layernorm / post_attention_layernorm, which the communicator expects
 # to own. Instead the MLP/MoE modules gather/scatter around their own body:
@@ -215,9 +207,6 @@ def _merge_weights_as_views(
 # semantics (its internal all-reduces are unchanged and required — the latent
 # reduce must happen in latent space before the norm), and the delayed
 # prefix_sum add stays local, applied after the scatter back.
-# ---------------------------------------------------------------------------
-
-
 def _dp_local_buffer_group():
     """Symmetric-memory group for the local DP buffer (mirrors
     CommunicateSummableTensorPairFn._scatter_hidden_states)."""
@@ -247,11 +236,6 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     group = get_parallel().attn_tp_group
     lo = group.rank_in_group * hidden_states.shape[0]
     return slice(lo, lo + hidden_states.shape[0])
-
-
-# ---------------------------------------------------------------------------
-# KimiK3MLP — supports both SiLU and SiTU
-# ---------------------------------------------------------------------------
 
 
 class KimiK3MLP(nn.Module):
@@ -343,11 +327,6 @@ class KimiK3MLP(nn.Module):
         if prefix_sum is not None:
             hidden_states = hidden_states + prefix_sum
         return hidden_states
-
-
-# ---------------------------------------------------------------------------
-# KimiK3MoE — with Latent MoE support
-# ---------------------------------------------------------------------------
 
 
 def _add3(
@@ -1321,11 +1300,6 @@ class KimiK3MoE(nn.Module):
         return out.view(num_tokens, hidden_size)
 
 
-# ---------------------------------------------------------------------------
-# KimiK3DeltaAttention — KDA with full-rank gate option
-# ---------------------------------------------------------------------------
-
-
 class KimiK3DeltaAttention(nn.Module):
     def __init__(
         self,
@@ -1826,11 +1800,6 @@ class KimiK3DeltaAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
-# ---------------------------------------------------------------------------
-# KimiK3MLAAttention — MLA with optional output gate
-# ---------------------------------------------------------------------------
-
-
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
@@ -2005,11 +1974,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
-
-
-# ---------------------------------------------------------------------------
-# KimiK3DecoderLayer — with Attention Residual
-# ---------------------------------------------------------------------------
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2481,11 +2445,6 @@ class KimiK3DecoderLayer(nn.Module):
         return out, None, False
 
 
-# ---------------------------------------------------------------------------
-# KimiK3LinearModel — language model backbone
-# ---------------------------------------------------------------------------
-
-
 class KimiK3LinearModel(nn.Module):
     def __init__(
         self,
@@ -2728,11 +2687,6 @@ class KimiK3LinearModel(nn.Module):
         )
 
 
-# ---------------------------------------------------------------------------
-# KimiK3LinearForCausalLM — text-only causal LM
-# ---------------------------------------------------------------------------
-
-
 class KimiK3LinearForCausalLM(nn.Module):
     def __init__(
         self,
@@ -2796,14 +2750,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
-            logits_output = self.logits_processor(
+            return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
                 aux_hidden_states,
             )
-            return logits_output
         return hidden_states
 
     def prepare_context_parallel_metadata_for_dcp(
@@ -3078,11 +3031,6 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
-
-
-# ---------------------------------------------------------------------------
-# KimiK3ForConditionalGeneration — multimodal wrapper
-# ---------------------------------------------------------------------------
 
 
 class KimiK3ForConditionalGeneration(nn.Module):

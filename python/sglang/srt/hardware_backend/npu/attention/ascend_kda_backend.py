@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -31,6 +32,9 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+_LOG2_E = math.log2(math.e)
+
+
 class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
@@ -57,7 +61,7 @@ class _AscendKDAExtendKernel:
         g = chunk_local_cumsum(
             g.contiguous(),
             chunk_size=chunk_size,
-            scale=1.4426950408889634,
+            scale=_LOG2_E,
             cu_seqlens=query_start_loc,
             chunk_indices=chunk_indices,
         )

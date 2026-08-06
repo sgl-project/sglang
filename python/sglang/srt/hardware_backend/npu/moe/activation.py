@@ -3,7 +3,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel_npu.activation.situ import situ_deepep
+from sgl_kernel_npu.activation.situ import situ
 
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
@@ -86,8 +86,8 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         return hidden_states, None
 
 
-class NPUSituDeepEPKernel(BaseActivation):
-    """SiTU activation and optional INT8 requantization for DeepEP."""
+class NPUSitu(BaseActivation):
+    """SiTU activation and optional INT8 requantization for grouped rows."""
 
     def __init__(
         self,
@@ -106,7 +106,7 @@ class NPUSituDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        return situ_deepep(
+        return situ(
             hidden_states,
             group_list,
             group_list_type,
