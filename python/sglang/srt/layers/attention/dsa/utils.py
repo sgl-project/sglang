@@ -449,7 +449,6 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     Step 2, synchronized allgather communication.
     Step 3, removing the padding and reassembling the data according to the actual tokens.
     """
-    # step1
     # The metadata is the source of truth for the per-rank physical extent.
     # ceil(total_len / cp_size) can be smaller for multi-request batches whose
     # per-sequence remainders accumulate on the same rank.
@@ -474,9 +473,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
             device=input_.device,
             dtype=input_.dtype,
         )
-    # step2
     attn_cp_all_gather_into_tensor(input_tensor_all, input_)
-    # step3
     outputs_list_max = list(
         torch.split(
             input_tensor_all, forward_batch.attn_cp_metadata.max_rank_len, dim=0
@@ -559,7 +556,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     return output_tensor
 
 
-# ----------------------------------------------------------------------------
 # "Plain" CP layout: rank i holds the contiguous token slice
 # [i*S/cp, (i+1)*S/cp). This is the natural layout produced by a vanilla
 # all_gather on rank-major buffers, so KDA layers (which need natural-sequential
@@ -572,7 +568,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 # conversion -- they are re-derived from hidden_states at each layer entry by
 # `mhc.attn_split`, so they inherit hidden_states' layer-input layout, which
 # under the plain cross-layer contract is always plain.
-# ----------------------------------------------------------------------------
 
 
 def cp_plain_split(input_tensor: torch.Tensor) -> torch.Tensor:

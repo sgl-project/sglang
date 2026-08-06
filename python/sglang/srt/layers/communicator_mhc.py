@@ -13,11 +13,10 @@
 # ==============================================================================
 """MHC (Manifold-Constrained Hyper-Connections) communicator for attention preparation.
 
-Ported from the GLM reference (``sglang-glm/sglang``). Adapted to this tree:
-- NSA naming -> DSA (``dsa_use_prefill_cp``, ``ctx.is_dsa``).
-- ``get_local_dp_buffer`` here keeps the explicit-group signature, so the
-  hc_mult-width variant is ``get_local_dp_buffer_mhc(get_tp_group(), n)``.
-- ``hc_expand`` / ``hc_contract`` live in ``layers/mhc.py`` in this tree.
+Adapted from the GLM reference: NSA naming -> DSA (``dsa_use_prefill_cp``,
+``ctx.is_dsa``). ``hc_expand`` / ``hc_contract`` live in ``layers/mhc.py``;
+the hc_mult-width local DP buffer is exposed via
+``get_local_dp_buffer_mhc(get_tp_group(), n)``.
 """
 
 from dataclasses import dataclass
@@ -102,8 +101,6 @@ class MHCState:
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
-        # If the backend didn't fuse the out-norm into the kernel, apply the
-        # caller's norm module here.
         if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
@@ -343,7 +340,6 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             hidden_states,
         )
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -493,11 +489,9 @@ class MHCLayerCommunicator(LayerCommunicator):
             context=self._context,
         )
 
-        # Pre-gather hidden_states to avoid duplicate all_gather(hidden_states/qkv_latent) in DSA.
-        # If qkv_latent_func is None, the attention impl has no qkv_latent
-        # abstraction to hide a gather inside (e.g. KDA's causal_conv1d /
-        # chunk_kda are called directly by the model on full-sequence
-        # mixed_qkv), so we must materialize the full hidden_states here.
+        # Pre-gather to avoid duplicate all_gather in DSA; without a
+        # qkv_latent hook the attention impl reads mixed_qkv directly, so the
+        # full hidden_states must be materialized here.
         ctx = get_attn_tp_context()
         dsa_pre_gather = ctx.input_scattered and ctx.is_dsa
         no_qkv_latent_pre_gather = ctx.input_scattered and self.qkv_latent_func is None

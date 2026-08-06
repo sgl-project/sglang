@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
 @triton.jit
 def exp_e(x):
+    # exp(x) == 2 ** (x * log2(e)); must match fused_sigmoid_gating_recurrent numerics.
     return exp2(x * 1.4426950408889634)
 
 

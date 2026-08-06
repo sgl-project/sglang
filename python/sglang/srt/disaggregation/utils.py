@@ -177,16 +177,8 @@ def unified_memory_disagg_move_gate(scheduler):
 
 
 def should_bypass_dsa_cp_prefix_cache(server_args) -> bool:
-    """Whether PD Prefill must avoid unsafe DSA-CP radix prefix reuse.
-
-    A normal radix entry stores one process-local view of each KV page. DSA
-    Prefill CP partitions those pages across CP ranks, so reusing the entry
-    requires CP-aware cache resharding. Until that feature is enabled, a cache
-    hit can make an attention backend read non-local page rows. This is a
-    correctness fallback only: CP compute, MTP, and P-to-D transfer stay on.
-    The cache builder selects a request-scoped chunk cache, and scheduler-side
-    matching follows that cache's disabled-prefix contract.
-    """
+    """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
+    exists; without it, cache hits let attention read non-local page rows."""
     return (
         server_args.disaggregation_mode == DisaggregationMode.PREFILL.value
         and server_args.attn_cp_size > 1
@@ -940,16 +932,10 @@ def resolve_linear_state_shards(
     decode_attn_tp_size: int,
     decode_tp_rank: int,
 ) -> Optional[Tuple[int, int, int, int]]:
-    """Resolve an overlapping source/destination shard pair for linear state.
-
-    GLM-5 Next shards its Mamba/GDN state by attention CP during DSA Prefill CP,
-    and by attention TP otherwise. Decode does not use CP, so its state shard is
-    selected by the decode attention-TP rank. ``None`` means the two ranks own
-    disjoint head ranges and this source must not write that destination.
-
-    The returned tuple is ``(src_shard_size, src_shard_rank,
-    dst_shard_size, dst_shard_rank)``.
-    """
+    """Select the linear-state source shard for one destination rank. Prefill
+    shards by attention CP (DSA Prefill CP) or attention TP; decode by
+    attention TP only. Returns ``None`` when the two ranks own disjoint head
+    ranges."""
     values = {
         "prefill_attn_tp_size": prefill_attn_tp_size,
         "prefill_attn_cp_size": prefill_attn_cp_size,
@@ -1130,7 +1116,6 @@ def append_state_component(
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
-    """Encode the live DSA kpool-compress tail as up to two ring segments."""
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
     if not getattr(pool, "_kpool_use_compress", False):

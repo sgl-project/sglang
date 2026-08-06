@@ -166,7 +166,6 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        # TODO: support fusion with quant
         self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -327,7 +326,6 @@ class Glm5NextLinearAttention(nn.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # Compute beta, forget_gate, and g_proj_states
         beta = self.b_proj(hidden_states)[0]
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
@@ -350,7 +348,6 @@ class Glm5NextLinearAttention(nn.Module):
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
-        # use batch matmul to calculate forget_gate and g_proj_states
         forget_gate, g_proj_states = self.fused_fg_b_proj(
             fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         )
@@ -435,7 +432,6 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
 
         if self.is_linear_attn:
             self.self_attn = Glm5NextLinearAttention(
@@ -458,7 +454,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 qk_nope_head_dim=config.qk_nope_head_dim,
                 qk_rope_head_dim=config.qk_rope_head_dim,
                 v_head_dim=config.v_head_dim,
-                q_lora_rank=getattr(config, "q_lora_rank", None),
+                q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
@@ -474,7 +470,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 mla_enable_prefill_cp=mla_enable_prefill_cp,
             )
 
-        if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
+        if config.q_lora_rank is None and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
                 "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
             )

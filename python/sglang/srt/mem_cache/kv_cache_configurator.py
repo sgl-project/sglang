@@ -313,8 +313,7 @@ class KVCacheConfigurator:
 
     def _dsa_pool_geometry(self, max_total_num_tokens: int) -> tuple[int, int]:
         physical_page_size = get_schedule().page_size
-        # CUDA DSA kernels require physical 64-slot pages, while replicated draft
-        # pools must still back the wider DCP allocator's final virtual page.
+        # Physical page stays 64 for CUDA DSA kernels; only the token pool is grown.
         pool_size = max_total_num_tokens + self.pool_page_size - physical_page_size
         return pool_size, physical_page_size
 
@@ -1513,9 +1512,8 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
-            # GLM5-Next style hybrid: linear (KDA) layers + DSA sparse
-            # full-attention layers. Route the DSA indexer KV pool in as
-            # the hybrid pool's full_kv_pool instead of a dense MLA pool.
+            # Route DSATokenToKVPool in as the hybrid pool's full_kv_pool
+            # instead of a dense MLA pool.
             if is_deepseek_dsa(self.model_config.hf_config):
                 from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
@@ -2199,7 +2197,6 @@ def calculate_mla_kv_cache_dim(
     elif disaggregation_mode == "prefill":
         uses_trtllm_kv_layout = server_args.dsa_prefill_backend == "trtllm"
     else:
-        # In colocated serving the same pool is consumed by both phases.
         uses_trtllm_kv_layout = (
             server_args.dsa_prefill_backend == "trtllm"
             or server_args.dsa_decode_backend == "trtllm"

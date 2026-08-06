@@ -69,9 +69,6 @@ _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "index_skip_topk_offset",
     "index_share_for_mtp_iteration",
     "indexer_rope_interleave",
-    "indexer_types",
-    "index_dsa_use_layernorm",
-    "mla_nope",
     "layer_types",
     "mlp_layer_types",
     "quantization_config",
@@ -168,8 +165,6 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-
-        # moe config
         self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
@@ -182,21 +177,17 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.moe_layer_freq = moe_layer_freq
 
-        # mla config
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.swiglu_limit = swiglu_limit
-
-        # mhc config
         self.mhc = mhc
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
 
-        # linear attention config
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.linear_head_dim = linear_head_dim
         self.linear_num_heads = linear_num_heads
@@ -233,8 +224,6 @@ class Glm5NextTextConfig(PretrainedConfig):
                 "gate_lower_bound": self.gate_lower_bound,
             }
         self.linear_attn_config = linear_attn_config
-
-        # dsa index config
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads

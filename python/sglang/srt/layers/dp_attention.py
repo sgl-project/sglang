@@ -211,10 +211,6 @@ class _DpGatheredBufferWrapper:
         from sglang.srt.runtime_context import get_flags
 
         dp = get_flags().dp
-        # MHC hyper-connections keep ``n = hc_mult`` streams concatenated along
-        # the hidden dim between layers, so the local DP buffer width is
-        # ``hidden_size * n`` (n collapses back to 1 on the last layer after
-        # hc_contract).
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, dp.buffer_hidden_size * n),

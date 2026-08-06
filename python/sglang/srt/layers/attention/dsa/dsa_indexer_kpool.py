@@ -621,7 +621,6 @@ class IndexerKPool(MultiPlatformOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
                 key, _ = self.wk(x)
                 key = self.k_norm(key)
 
@@ -663,7 +662,6 @@ class IndexerKPool(MultiPlatformOp):
         x: torch.Tensor,
         positions: torch.Tensor,
     ):
-        # Compute only key, skip query
         key, _ = self.wk(x)
         key = self.k_norm(key)
         k_rope, _ = torch.split(
@@ -1460,7 +1458,6 @@ class IndexerKPool(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        # Fast path: only compute and store index K cache, skip all Q/weight/logit ops.
         key = self._get_k_bf16(x, positions)
         self._compress_write(
             x=x,
@@ -1471,7 +1468,6 @@ class IndexerKPool(MultiPlatformOp):
             metadata=metadata,
         )
 
-        # MHA doesn't need topk_indices.
         if not return_indices:
             return None
 
@@ -1611,15 +1607,13 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices=return_indices,
             )
 
-        # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
+        # CUDA graph capture keeps the full topk path; the skip branch is extend-only.
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
-        # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
             return self._forward_cuda_skip_logits(
                 x,

@@ -3616,8 +3616,6 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
-        # DSA (sparse full-attention) args, used when the full_kv_pool is a
-        # DSATokenToKVPool (e.g. GLM5-Next: KDA linear layers + DSA layers).
         use_dsa: bool = False,
         index_head_dim: Optional[int] = None,
         kv_cache_dim: Optional[int] = None,
@@ -3701,10 +3699,9 @@ class HybridLinearKVPool(KVCache):
                 **post_capture_kwargs,
             )
         elif use_dsa:
-            # GLM5-Next hybrid: DSA sparse full-attention layers share the same
-            # MLA latent layout but additionally keep a paged index_k cache. We
-            # only allocate the full-attention layer count here; the wrapper
-            # translates global layer_id -> dense full-attention index.
+            # DSA sparse full-attention layers share the MLA latent layout and
+            # additionally keep a paged index_k cache. Only full-attn layer count
+            # is allocated here; the wrapper translates global layer_id to dense.
             assert (
                 index_head_dim is not None and kv_cache_dim is not None
             ), "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
@@ -4064,8 +4061,6 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
-    # ---- DSA index-cache accessors (forward to full_kv_pool with global ->
-    # dense full-attention layer_id translation, mirroring get_key_buffer). ----
     def set_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -4746,13 +4741,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         device: str,
         max_running_requests: Optional[int],
     ) -> None:
-        """Allocate per-layer kpool-compress tail buffers.
-
-        These hold the raw bf16 key / score of the in-progress pool
-        that hasn't been compressed + flushed to the fp8 index cache yet.
-        Conceptually part of the index cache state, so they live on the KV
-        pool rather than on the per-layer Indexer module.
-        """
+        """In-flight per-request bf16 key/score tail buffers; kept on the pool, not the Indexer, because they are part of the index cache state."""
         self._kpool_use_compress = index_kpool > 1 and index_kpool_compress
 
         if not self._kpool_use_compress:
@@ -4841,11 +4830,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         out_cache_loc: torch.Tensor,
         round_scale: bool = False,
     ) -> None:
-        """Decode-step kpool update: append the current raw key/score to each
-        request's tail buffer and, whenever a pool fills, compress+flush it
-        to the fp8 index cache. Hides the per-layer tail buffer indexing so
-        callers never touch _compress_tail_* directly.
-        """
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             kpool_decode_update_and_maybe_write_cache,
         )
@@ -4880,11 +4864,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         n_remain: int,
         dst_logical_start: int,
     ) -> None:
-        """Overwrite the in-progress pool tail for a single request after an
-        extend chunk. Raw tokens are stored in the logical ring at
-        ``dst_logical_start + i``. A zero n_remain means the chunk landed on
-        a pool boundary and no tail carries over.
-        """
+        """Overwrite per-request tail ring rows after a chunk. ``n_remain == 0``
+        means the chunk landed on a pool boundary, no tail carries over."""
         assert (
             self._kpool_use_compress
         ), "set_compress_tail_for_request called when kpool compress is disabled"
@@ -4958,8 +4939,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_k_cpu = []
         tail_score_cpu = []
         for tail_k, tail_score in zip(self._compress_tail_k, self._compress_tail_score):
-            # Keep a placeholder for skipped/unowned layers so layer alignment
-            # remains stable without indexing a zero-row tensor.
             if tail_k.shape[0] == 0:
                 tail_k_cpu.append(None)
                 tail_score_cpu.append(None)

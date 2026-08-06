@@ -1517,14 +1517,9 @@ class Scheduler(
         )
 
     def init_dsa_kpool_truncation_align(self):
-        """Fold DSA index_kpool into truncation_align_size.
-
-        The kpool compress-write path asserts every chunked extend starts on a
-        pool boundary, i.e. each request's prior cumulative seq_len must be a
-        pool_size multiple. truncation_align_size enforces that on the
-        per-request truncation point. LCM with any existing align size so
-        deterministic inference and kpool can coexist.
-        """
+        """The kpool compress-write path asserts each chunked extend starts on a
+        pool boundary; truncation_align_size enforces that per request. LCM with
+        any existing align size so deterministic inference and kpool coexist."""
         from sglang.srt.configs.model_config import (
             get_dsa_index_kpool,
             is_deepseek_dsa,

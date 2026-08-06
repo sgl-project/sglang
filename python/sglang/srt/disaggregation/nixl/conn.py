@@ -2069,7 +2069,6 @@ class NixlKVManager(CommonKVManager):
         dst_gpu_id: int,
         notif: str,
     ):
-        """Transfer the live slots of a request-scoped DSA tail ring."""
         dst_data_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
             src_data_ptrs,
             dst_data_ptrs,

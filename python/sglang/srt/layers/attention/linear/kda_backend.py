@@ -124,7 +124,7 @@ class KDAKernelDispatcher:
             )
 
             cutedsl_kernel = CuteDSLKDAKernel()
-            if getattr(cutedsl_kernel, "supports_prefill", False):
+            if cutedsl_kernel.supports_prefill:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:

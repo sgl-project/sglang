@@ -13,10 +13,7 @@
 # ==============================================================================
 """MHC + DSA prefill-CP hybrid communicator.
 
-Used for DSA (full-attention) layers in GLM5-Next that run hyper-connections
-(MHC) AND context-parallel long-sequence prefill at the same time. Ported from
-the GLM reference (``communicator_mhc_hybrid_cp.py``), with the hc_mult-width
-DP buffer routed through ``get_local_dp_buffer_mhc``.
+hc_mult-width local DP buffer is routed through ``get_local_dp_buffer_mhc``.
 """
 
 from functools import partial
@@ -140,8 +137,6 @@ class MHCHybridDSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual, out_norm=layernorm
         )
 
-        # for prefill: attn tp scattered -> full
-        # for decode: attn tp full -> full
         if dsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
@@ -211,8 +206,6 @@ class MHCHybridDSACPCommunicateSummableTensorPairFn(
         is_last_layer: bool,
         **kwargs,
     ):
-        # for prefill: full -> attn tp scattered
-        # for decode: full -> attn tp full
         if dsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             input_hidden_states = hidden_states

@@ -1490,7 +1490,6 @@ class MooncakeKVManager(CommonKVManager):
         dst_indices: list[int],
         label: str,
     ) -> int:
-        """Transfer the live slots of a request-scoped ring-row component."""
         try:
             dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
                 src_ptrs,
@@ -1935,7 +1934,6 @@ class MooncakeKVManager(CommonKVManager):
                                     )
                                     break
 
-                            # Only the last chunk we need to send the aux data.
                             if should_send_aux_metadata(
                                 attn_cp_rank=self.attn_cp_rank,
                                 prefill_attn_tp_size=self.attn_tp_size,
