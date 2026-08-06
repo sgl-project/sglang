@@ -940,7 +940,6 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-        self._validate_elastic_cuda_graph_recapture()
         is_scale_joiner = (
             self.server_args.is_ep_scale_joiner and not self.is_draft_worker
         )
@@ -949,6 +948,8 @@ class ModelRunner:
             and capture_decode_cuda_graph
             and self._elastic_cuda_graph_enabled()
         )
+        if is_scale_joiner:
+            self._validate_elastic_cuda_graph_recapture()
         capture = capture_cuda_graphs(
             model_runner=self,
             capture_decode_cuda_graph=(
@@ -2049,6 +2050,16 @@ class ModelRunner:
                     "Primary and joining cohort must use the same CUDA graph "
                     "configuration for Elastic EP scale-up"
                 )
+                ElasticEPStateManager.fail_scale(error)
+                self._reset_eplb_after_elastic_scale_failure()
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            try:
+                self._validate_elastic_cuda_graph_recapture()
+            except ValueError as exc:
+                error = str(exc)
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
                 self._report_elastic_scale_failure(error, effective_size)
