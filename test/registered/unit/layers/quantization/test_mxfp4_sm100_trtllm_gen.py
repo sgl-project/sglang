@@ -110,6 +110,7 @@ def _build_method(num_experts, hidden, inter, precision):
     method._fi_kernel = "trtllm_sm100"
     method.use_flashinfer = True
     method.use_marlin = False
+    method.use_deep_gemm = False
     method.num_experts = num_experts
     method.hidden_size = hidden
     method.intermediate_size_per_partition = inter
