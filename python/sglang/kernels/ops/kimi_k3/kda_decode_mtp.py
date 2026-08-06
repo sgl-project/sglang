@@ -13,6 +13,8 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
 
+from sglang.kernels.jit.cute_aot_cache import get_jit_cache
+
 WARP_SIZE = 32
 TILE_K = 128
 KERNEL_WIDTH = 4
@@ -890,11 +892,21 @@ def _block_threads(*, H: int, N: int) -> int:
     return BLOCK_THREADS_WIDE if H * N <= num_sms else BLOCK_THREADS_NARROW
 
 
-_DSPARK_COMPILED = {}
+_DSPARK_COMPILED = get_jit_cache(
+    "kimi_k3_kda_mtp_verify",
+    source_paths=(__file__,),
+    enable_tvm_ffi=False,
+)
 
 
 def _tensor_layout_key(tensor):
-    return (tensor.device, tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()))
+    return (
+        tensor.device,
+        tensor.dtype,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        _fits_32bit_stride(tensor),
+    )
 
 
 def _fits_32bit_stride(tensor):
@@ -1098,6 +1110,7 @@ def fused_kda_decode_mtp_dspark(
         onorm_weight if apply_onorm else dt_bias,
     )
     key = (
+        torch.cuda.get_device_capability(),
         H,
         N,
         num_spec,
