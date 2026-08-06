@@ -33,7 +33,7 @@ dependencies = [
   "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "helion==0.2.6",
+  "helion==1.4",
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
@@ -67,7 +67,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-deep-gemm==0.1.5",
+  "sgl-deep-gemm==0.1.5.post1",
   "sglang-kernel==0.4.5",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",

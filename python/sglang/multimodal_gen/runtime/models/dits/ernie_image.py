@@ -19,6 +19,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from sglang.kernels.ops.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
+)
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
 )
@@ -40,6 +44,40 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+_ERNIE_RESIDUAL_GATE_CUDA_DISABLED = False
+
+
+def _ernie_residual_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
+
+    Restricted to half dtypes: there the kernel reproduces the eager pair's
+    two-step rounding exactly (verified by ``torch.equal``), while for fp32 it
+    would contract to an fma (one rounding) and stop being bit-exact.
+    """
+    global _ERNIE_RESIDUAL_GATE_CUDA_DISABLED
+
+    if (
+        not _ERNIE_RESIDUAL_GATE_CUDA_DISABLED
+        and residual.dtype in (torch.float16, torch.bfloat16)
+        and can_use_residual_gate_add_cuda(residual, update, gate)
+    ):
+        try:
+            return residual_gate_add_cuda(residual, update, gate)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling ERNIE residual-gate CUDA fast path: {exc}")
+            _ERNIE_RESIDUAL_GATE_CUDA_DISABLED = True
+
+    return residual + gate * update
 
 
 def _rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
@@ -256,13 +294,13 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
     ) -> torch.Tensor:
         residual = x
         x = self.adaLN_sa_ln(x) * (1 + scale_msa) + shift_msa
-        x = residual + gate_msa * self.self_attention(
+        attn_out = self.self_attention(
             x, rotary_pos_emb, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
         )
+        residual = _ernie_residual_gate_add(residual, attn_out, gate_msa)
 
-        residual = x
-        x = self.adaLN_mlp_ln(x) * (1 + scale_mlp) + shift_mlp
-        x = residual + gate_mlp * self.mlp(x)
+        x = self.adaLN_mlp_ln(residual) * (1 + scale_mlp) + shift_mlp
+        x = _ernie_residual_gate_add(residual, self.mlp(x), gate_mlp)
 
         return x
 
@@ -473,8 +511,10 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         c = self.time_embedding(t_emb.to(dtype=dtype))
 
         mod_params = self.adaLN_modulation(c)
+        # .contiguous() is a bit-exact copy of the tiny (B, 1, D) modulation
+        # params; the fused residual-gate kernel requires dense inputs.
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            t.unsqueeze(1) for t in mod_params.chunk(6, dim=-1)
+            t.unsqueeze(1).contiguous() for t in mod_params.chunk(6, dim=-1)
         )
 
         for layer in self.layers:

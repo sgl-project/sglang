@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=540, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=810, suite="nightly-4-gpu-b200", nightly=True)
 
 NEMOTRON_3_SUPER_NVFP4_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
@@ -27,6 +27,31 @@ NEMOTRON_3_SUPER_NVFP4_ARGS = [
     "--disable-radix-cache",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true, "num_threads": 17}',
+]
+
+DP_ATTENTION_EP_ARGS = [
+    "--dp-size",
+    "4",
+    "--enable-dp-attention",
+    "--enable-dp-lm-head",
+    "--ep-size",
+    "4",
+    "--moe-a2a-backend",
+    "flashinfer",
+    "--moe-runner-backend",
+    "flashinfer_cutedsl",
+    "--mamba-full-memory-ratio",
+    "5.0",
+    "--mamba-radix-cache-strategy",
+    "extra_buffer",
+    "--attention-backend",
+    "trtllm_mha",
+    "--max-running-requests",
+    "1024",
+    "--mem-fraction-static",
+    "0.93",
+    "--max-prefill-tokens",
+    "8192",
 ]
 
 MTP_ARGS = [
@@ -97,6 +122,33 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + MTP_ARGS,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _run_gsm8k(self)
+
+
+class TestNvidiaNemotron3SuperNVFP4DPAttentionEP(CustomTestCase):
+    """DP attention + EP with the FlashInfer one-sided A2A and CuteDSL MoE runner."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with (
+            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0),
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4096),
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(1024 * 1024 * 1024),
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + DP_ATTENTION_EP_ARGS,
             )
 
     @classmethod

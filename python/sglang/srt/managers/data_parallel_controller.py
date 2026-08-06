@@ -47,6 +47,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
+from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.runtime_context import get_exec, publish
 from sglang.srt.server_args import (
@@ -731,6 +732,9 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.startup_time = aggregate_scheduler_startup_times(
+            info.get("startup_time") for info in scheduler_info
+        )
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -844,6 +848,7 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
