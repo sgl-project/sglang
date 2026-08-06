@@ -930,7 +930,6 @@ def popen_launch_server(
     device: str = "auto",
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
-    bounded_cuda_graph: bool = True,
 ):
     """Launch a server process with automatic device detection and offline/online retry.
 
@@ -945,7 +944,6 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu")
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
-        bounded_cuda_graph: Cap the CUDA graph bucket lists (see below)
 
     Returns:
         Started subprocess.Popen object
@@ -957,32 +955,6 @@ def popen_launch_server(
         device = auto_config_device()
         other_args = list(other_args)
         other_args += ["--device", str(device)]
-
-    # The CUDA graph defaults are sized for a server that lives for days, so the
-    # capture is amortized; a test server lives for one file and captures buckets
-    # it never replays. Measured across a full CI run: 97% of prefill batches are
-    # <= 1024 tokens (the bucket list runs to chunked_prefill_size -- 8192 on
-    # H100-class GPUs -- and its top buckets cost 2s+ each), and 97% of decode
-    # steps are at bs <= 32 (the list runs to 256). Benchmarks opt out: they must
-    # measure the graph coverage a deployment would actually have.
-    if bounded_cuda_graph:
-        for flag, value, conflicts in (
-            (
-                "--cuda-graph-max-bs-prefill",
-                "1024",
-                ("--cuda-graph-bs-prefill", "--disable-prefill-cuda-graph"),
-            ),
-            (
-                "--cuda-graph-max-bs-decode",
-                "64",
-                ("--cuda-graph-bs-decode", "--disable-decode-cuda-graph"),
-            ),
-        ):
-            if not any(
-                arg.startswith((flag, "--disable-cuda-graph") + conflicts)
-                for arg in other_args
-            ):
-                other_args = list(other_args) + [flag, value]
 
     # CI-specific: Validate cache and enable offline mode if complete
     if env is None:
@@ -1283,13 +1255,15 @@ def run_bench_serving(
         device = auto_config_device()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_server_args,
-        bounded_cuda_graph=False,
-    )
+    # A benchmark must run the graph coverage a deployment would have, not the
+    # bounded CI range; the child inherits the override at spawn time.
+    with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_server_args,
+        )
 
     # Resolve tokenizer to local snapshot path when available, so the benchmark
     # client's AutoTokenizer.from_pretrained uses the local path directly instead
@@ -1628,14 +1602,15 @@ def run_bench_serving_multi(
     pd_separated=False,
 ):
     # Launch the server
-    process = popen_launch_server(
-        model,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_server_args,
-        pd_separated=pd_separated,
-        bounded_cuda_graph=False,
-    )
+    # See run_bench_serving: benchmarks keep the deployed graph coverage.
+    with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_server_args,
+            pd_separated=pd_separated,
+        )
 
     # run benchmark for all
     res_l = []
@@ -1737,7 +1712,11 @@ def run_bench_offline_throughput(model, other_args):
     ]
 
     print(f"command={' '.join(command)}")
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # See run_bench_serving: benchmarks keep the deployed graph coverage.
+    with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
 
     try:
         stdout, stderr = process.communicate()

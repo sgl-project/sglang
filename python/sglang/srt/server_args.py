@@ -4686,6 +4686,27 @@ class ServerArgs:
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
 
+        # The defaults above assume a long-lived server that amortizes capture
+        # over days. A CI server serves one test file, so its largest buckets are
+        # captured and never replayed -- measured over a full run, 97% of decode
+        # steps sit at bs <= 32 and 97% of prefill batches at <= 1024 tokens.
+        # Only ever shrink, and only when the user did not ask for a range.
+        if is_in_ci() and envs.SGLANG_TEST_BOUND_CUDA_GRAPH.get():
+            if (
+                self.cuda_graph_max_bs_decode is None
+                and decode_cuda_graph_config.max_bs
+            ):
+                decode_cuda_graph_config.max_bs = min(
+                    decode_cuda_graph_config.max_bs, 64
+                )
+            if (
+                self.cuda_graph_max_bs_prefill is None
+                and prefill_cuda_graph_config.max_bs
+            ):
+                prefill_cuda_graph_config.max_bs = min(
+                    prefill_cuda_graph_config.max_bs, 1024
+                )
+
         # Set cuda graph batch sizes
         if self.device != "cpu":
             if decode_cuda_graph_config.bs is None:

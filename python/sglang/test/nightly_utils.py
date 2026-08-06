@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
@@ -262,19 +263,20 @@ class NightlyBenchmarkRunner:
         process = None
         try:
             # Launch server
-            process = popen_launch_server(
-                model=model_path,
-                base_url=self.base_url,
-                other_args=other_args or [],
-                timeout=(
-                    timeout
-                    if timeout is not None
-                    else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-                ),
-                env=env,
-                # Benchmarks measure the prefill path the deployed default takes.
-                bounded_cuda_graph=False,
-            )
+            # A benchmark must run the graph coverage a deployment would have,
+            # not the bounded CI range; the child inherits it at spawn time.
+            with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
+                process = popen_launch_server(
+                    model=model_path,
+                    base_url=self.base_url,
+                    other_args=other_args or [],
+                    timeout=(
+                        timeout
+                        if timeout is not None
+                        else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                    ),
+                    env=env,
+                )
 
             # Generate filenames
             profile_path_prefix, json_output_file = self.generate_profile_filename(
