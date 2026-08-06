@@ -35,10 +35,10 @@
  * ``DeepseekV3MoE.forward``, and gives the downstream allreduce+rmsnorm
  * a clean PDL handoff.
  *
- * Expert-weight dtype is templated on ``TypeExpW`` so we support both the
- * bf16 and fp32 topk-weight paths (DSv3/K2.5 trtllm backends use fp32
- * because their ``_routing_logits_dtype = torch.float32``; other backends
- * use bf16).
+ * Expert-weight dtype is templated on ``TypeExpW`` so we accept both bf16
+ * and fp32 topk weights. The trtllm deferred-finalize path always feeds bf16
+ * (the trtllm-gen routing kernel emits bf16 for every routing method); fp32
+ * is kept for callers that produce topk weights in fp32.
  *
  * Expert-weight scale convention: in our target backends
  * (flashinfer trtllm nvfp4 + unquantized), ``apply_routed_scaling_factor_on_output``
