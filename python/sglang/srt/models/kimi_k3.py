@@ -482,8 +482,15 @@ class KimiK3MoE(nn.Module):
         # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
         # so the fused-front split view can be consumed as is; other runners
         # (e.g. marlin) require a dense buffer.
-        self._moe_front_needs_contiguous = (
-            not get_moe_runner_backend().is_flashinfer_mxfp4()
+        # aiter takes the view on K3's mxfp8-activation route, whose moe-sort
+        # quant indexes rows by input.stride(-2). Its other quant_types
+        # (generic per-token / per-1x128, prequant bypass) were not checked
+        # for strided input. `--moe-runner-backend` defaults to `auto` and only
+        # create_moe_runner resolves that to aiter, so ask the runner.
+        _runner = getattr(self.experts, "runner", None)
+        self._moe_front_needs_contiguous = not (
+            get_moe_runner_backend().is_flashinfer_mxfp4()
+            or (_runner is not None and _runner.runner_backend.is_aiter())
         )
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
