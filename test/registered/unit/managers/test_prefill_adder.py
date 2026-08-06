@@ -58,11 +58,13 @@ class TestPrefillAdder(CustomTestCase):
         full_available_size: int = 0,
         swa_available_size: int = 0,
         available_size: int = 0,
+        size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
+        allocator.size_swa = size_swa
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
