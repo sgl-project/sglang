@@ -5,6 +5,9 @@
 // re-measured cache-cold (--flush-cache), P50, standardized to isl 2048 / osl 256
 // at conc 24 & 64. b200 required PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 // (shipped --mem-fraction-static 0.65 OOMs at cuda-graph capture on 0.5.16).
+// The re-bench runs served with --reasoning-parser auto / --tool-call-parser auto
+// present (they are now Playground-only in the cells per the DSv4 convention);
+// parsers affect only output parsing, not throughput, so the speed rows are unaffected.
 // STILL PENDING a 0.5.16 re-bench (numbers below are the original "PR #27944"
 // measurement): h200 (no 8x-h200 whole-node currently placeable), gb200 (no box),
 // and the AMD cells mi300x/mi325x/mi350x/mi355x (no AMD devbox in the fleet).
