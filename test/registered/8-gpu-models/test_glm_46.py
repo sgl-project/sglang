@@ -43,7 +43,7 @@ class TestGLM46(unittest.TestCase):
             test_name="GLM-4.6",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_glm_4_6",
+                result_dir="performance_results_glm_4_6",
             ),
         )
 
