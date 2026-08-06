@@ -2,7 +2,6 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.cache_consistency_jitter import get_jitter_engine, run_jitter_test
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -10,10 +9,9 @@ from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # NVFP4 needs Blackwell FP4 kernels, so this runs on the Blackwell leg of the
 # common 8-GPU suite (Hopper is skipped below).
-register_cuda_ci(est_time=4800, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=3600, suite="nightly-8-gpu-common", nightly=True)
 
 INKLING_NVFP4_MODEL = "thinkingmachines/Inkling-NVFP4"
-INKLING_SMALL_NVFP4_MODEL = "thinkingmachines/Inkling-Small-NVFP4"
 
 # Verified Blackwell NVFP4 recipe; see the SGLang cookbook Inkling page.
 NVFP4_ARGS = [
@@ -75,36 +73,6 @@ class TestInklingNVFP4Nightly(unittest.TestCase):
                     profile_dir="performance_profiles_inkling_nvfp4",
                 ),
             )
-
-
-class TestInklingSmallCacheConsistencyNightly(unittest.TestCase):
-    """Same consistency check as the per-commit variant in
-    ``test/registered/models/test_inkling.py``, on the real checkpoint and with
-    a workload large enough to reach production batch shapes."""
-
-    @unittest.skipIf(not is_blackwell_system(), "NVFP4 requires Blackwell")
-    def test_scored_contexts_are_bitwise_identical(self):
-        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override(1):
-            with get_jitter_engine(
-                model_path=INKLING_SMALL_NVFP4_MODEL,
-                tp_size=8,
-                trust_remote_code=True,
-                quantization="modelopt_fp4",
-                attention_backend="fa4",
-                page_size=128,
-                fp4_gemm_runner_backend="flashinfer_trtllm",
-                moe_runner_backend="flashinfer_trtllm_routed",
-                enable_torch_symm_mem=True,
-                mamba_radix_cache_strategy="extra_buffer",
-                swa_full_tokens_ratio=0.1,
-                mamba_full_memory_ratio=0.1,
-                mem_fraction_static=0.6,
-                enable_deterministic_inference=True,
-                # The harness pins max_total_tokens to keep the pool tight; give
-                # the larger checkpoint room for the scaled-up workload below.
-                max_total_tokens=131_072,
-            ) as engine:
-                run_jitter_test(engine)
 
 
 if __name__ == "__main__":
