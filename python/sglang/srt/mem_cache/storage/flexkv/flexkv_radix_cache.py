@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+from flexkv.integration.sglang.connector import (
     FlexKVConnector,
     FlexKVHostReleaseShim,
 )

@@ -27,6 +27,20 @@ def _flexkv_factory(ctx):
     needs them to fan out lookup/store decisions across the full TP × CP
     × PP topology.
     """
+    try:
+        from flexkv.integration.sglang.connector import FlexKVConnector  # noqa: F401
+    except ImportError as exc:
+        try:
+            import flexkv  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "FlexKV is not installed. Please install the FlexKV package "
+                "to use --enable-flexkv."
+            ) from exc
+        raise RuntimeError(
+            f"FlexKV is installed but incompatible version: {exc}."
+        ) from exc
+
     from sglang.srt.distributed.parallel_state import (
         get_attn_cp_group,
         get_attn_tp_group,
