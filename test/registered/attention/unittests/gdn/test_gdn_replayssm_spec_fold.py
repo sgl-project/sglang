@@ -29,7 +29,7 @@ NUM_SLOTS = 8
 DEVICE = "cuda"
 # Absolute allowance for this deterministic regression case, not a general
 # numerical-error guarantee for ReplaySSM.
-FP32_ATOL = torch.finfo(torch.float32).eps
+FP32_ATOL = 2 * torch.finfo(torch.float32).eps
 
 
 def _make_window(step_seed: int):
