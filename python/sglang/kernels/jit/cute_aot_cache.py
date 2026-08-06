@@ -1,85 +1,122 @@
-# Manage Ahead-of-Time (AOT) compiled kernels
+"""In-memory and persistent caches for CuTe DSL JIT functions.
+
+Set ``SGLANG_CUTE_AOT_CACHE_DIR`` to a trusted persistent directory to share
+exported objects across process restarts.
+"""
+
 import ctypes
 import fcntl
 import hashlib
+import logging
 import os
 import pickle
 import sys
-import tempfile
 import time
+from collections.abc import Sequence
 from functools import lru_cache
-from getpass import getuser
 from pathlib import Path
-from typing import Hashable, TypeAlias
+from typing import Any, Hashable, TypeAlias
 
-import cutlass
-import cutlass.cute as cute
-import tvm_ffi
-from cutlass.cutlass_dsl import JitCompiledFunction
+logger = logging.getLogger(__name__)
 
-from sglang.kernels.ops.attention.flash_attn.cute.fa_logging import fa_log
-
-# Pre-load cute DSL runtime libraries with RTLD_GLOBAL so that their symbols
-# (e.g. _cudaLibraryLoadData) are visible to .so modules loaded later via dlopen.
-# Upstream cute.runtime.load_module loads these without RTLD_GLOBAL, which causes
-# "undefined symbol" errors when loading cached kernels from disk.
-for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
-    if Path(_lib_path).exists():
-        ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
+_runtime_library_handles: list[Any] = []
+_loaded_modules: list[Any] = []
 
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
-CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
+CallableFunction: TypeAlias = Any
 
-# Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
-CUTE_DSL_CACHE_ENABLED: bool = (
-    os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
-)
+CUTE_AOT_CACHE_DIR = os.getenv("SGLANG_CUTE_AOT_CACHE_DIR") or None
 
 
-# Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
-# `/tmp/${USER}/flash_attention_cute_dsl_cache``
-CUTE_DSL_CACHE_DIR: str | None = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", None)
+def _normalize_disk_key(value: Any) -> Any:
+    value_type = type(value)
+    if value_type.__module__ == "torch" and value_type.__name__ == "device":
+        return ("torch.device", value.type)
+    if isinstance(value, tuple):
+        return tuple(_normalize_disk_key(item) for item in value)
+    if isinstance(value, list):
+        return [_normalize_disk_key(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _normalize_disk_key(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    return value
 
 
-def get_cache_path() -> Path:
-    if CUTE_DSL_CACHE_DIR is not None:
-        cache_dir = Path(CUTE_DSL_CACHE_DIR)
-    else:
-        cache_dir = (
-            Path(tempfile.gettempdir()) / getuser() / "flash_attention_cute_dsl_cache"
-        )
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-@lru_cache(maxsize=1)
-def _compute_source_fingerprint() -> str:
+@lru_cache(maxsize=None)
+def _compute_source_fingerprint(
+    source_paths: tuple[str, ...], enable_tvm_ffi: bool
+) -> str:
     """
     Hash all CuTe Python sources plus runtime ABI stamps into a short fingerprint.
 
-    The fingerprint changes whenever:
-    - Any .py file under flash_attn/cute is added, removed, renamed, or modified.
-    - The Python minor version changes (e.g. 3.13 -> 3.14).
-    - The cutlass or tvm_ffi package version changes.
+    The fingerprint changes with the supplied sources, Python/CuTe versions,
+    selected ABI, CUDA version, or target architecture.
 
     Computed once per process and cached.
     """
-    cute_root = Path(__file__).resolve().parent
+    import cutlass
+
     h = hashlib.sha256()
 
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
-    h.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
+    h.update(f"cuda={getattr(cutlass, 'CUDA_VERSION', 'unknown')}".encode())
+    h.update(f"tvm_ffi={enable_tvm_ffi}".encode())
+    h.update(f"arch={os.getenv('CUTE_DSL_ARCH')}".encode())
+    if enable_tvm_ffi:
+        import tvm_ffi
 
-    for src in sorted(cute_root.rglob("*.py")):
-        if not src.is_file():
-            continue
-        h.update(src.relative_to(cute_root).as_posix().encode())
-        content = src.read_bytes()
-        h.update(len(content).to_bytes(8, "little"))
-        h.update(content)
+        h.update(f"tvm_ffi_version={tvm_ffi.__version__}".encode())
+
+    for index, raw_path in enumerate(source_paths):
+        source_path = Path(raw_path).resolve()
+        if source_path.is_dir():
+            sources = sorted(source_path.rglob("*.py"))
+            root = source_path
+        elif source_path.is_file():
+            sources = [source_path]
+            root = source_path.parent
+        else:
+            raise FileNotFoundError(source_path)
+        for src in sources:
+            if not src.is_file():
+                continue
+            h.update(f"{index}:{src.relative_to(root).as_posix()}".encode())
+            content = src.read_bytes()
+            h.update(len(content).to_bytes(8, "little"))
+            h.update(content)
 
     return h.hexdigest()
+
+
+@lru_cache(maxsize=2)
+def _preload_runtime_libraries(enable_tvm_ffi: bool) -> None:
+    """Make CuTe runtime symbols visible to cached objects loaded by dlopen."""
+    import cutlass.cute as cute
+
+    for raw_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=enable_tvm_ffi):
+        path = Path(raw_path)
+        if path.is_file():
+            _runtime_library_handles.append(
+                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+            )
+
+
+def _load_object(
+    object_path: Path, function_prefix: str, *, enable_tvm_ffi: bool
+) -> CallableFunction:
+    import cutlass.cute as cute
+
+    _preload_runtime_libraries(enable_tvm_ffi)
+    module = cute.runtime.load_module(str(object_path), enable_tvm_ffi=enable_tvm_ffi)
+    try:
+        function = module[function_prefix]
+    except (KeyError, TypeError):
+        function = getattr(module, function_prefix)
+    _loaded_modules.append(module)
+    return function
 
 
 class FileLock:
@@ -160,7 +197,7 @@ class JITCache:
     def __init__(self):
         self.cache: dict[CompileKeyType, CallableFunction] = {}
 
-    def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
+    def __setitem__(self, key: CompileKeyType, fn: CallableFunction) -> None:
         self.cache[key] = fn
 
     def __getitem__(self, key: CompileKeyType) -> CallableFunction:
@@ -168,6 +205,11 @@ class JITCache:
 
     def __contains__(self, key: CompileKeyType) -> bool:
         return key in self.cache
+
+    def get(
+        self, key: CompileKeyType, default: CallableFunction | None = None
+    ) -> CallableFunction | None:
+        return self[key] if key in self else default
 
     def clear(self) -> None:
         """
@@ -178,19 +220,18 @@ class JITCache:
 
 class JITPersistentCache(JITCache):
     """
-    In-memory cache for compiled functions, which is also backed by persistent storage.
-    Use cutedsl ahead-of-time (AOT) compilation, only supporting enable_tvm_ffi=True
+    In-memory cache for compiled functions backed by persistent storage.
     """
 
-    EXPORT_FUNCTION_PREFIX = "func"
     LOCK_TIMEOUT_SECONDS = 15
 
-    def __init__(self, cache_path: Path):
+    def __init__(self, cache_path: Path, *, enable_tvm_ffi: bool = True):
         super().__init__()
         cache_path.mkdir(parents=True, exist_ok=True)
         self.cache_path: Path = cache_path
+        self.enable_tvm_ffi = enable_tvm_ffi
 
-    def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
+    def __setitem__(self, key: CompileKeyType, fn: CallableFunction) -> None:
         JITCache.__setitem__(self, key, fn)
         self._try_export_to_storage(key, fn)
 
@@ -221,18 +262,16 @@ class JITPersistentCache(JITCache):
             label=sha256_hex,
         ):
             if obj_path.exists():
-                fa_log(1, f"Loading compiled function from disk: {obj_path}")
-                m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
-                fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
+                logger.info("Loading compiled function from disk: %s", obj_path)
+                prefix = self._function_prefix(sha256_hex)
+                fn = _load_object(obj_path, prefix, enable_tvm_ffi=self.enable_tvm_ffi)
                 JITCache.__setitem__(self, key, fn)
                 return True
             else:
-                fa_log(1, f"Cache miss on disk for key hash {sha256_hex}")
+                logger.info("Cache miss on disk for key hash %s", sha256_hex)
         return False
 
-    def _try_export_to_storage(
-        self, key: CompileKeyType, fn: JitCompiledFunction
-    ) -> None:
+    def _try_export_to_storage(self, key: CompileKeyType, fn: CallableFunction) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""
         sha256_hex = self._key_to_hash(key)
         with FileLock(
@@ -244,32 +283,51 @@ class JITPersistentCache(JITCache):
             obj_path = self.cache_path / f"{sha256_hex}.o"
             if obj_path.exists():
                 # Another process already exported.
-                fa_log(1, f"Skipping export, already on disk: {obj_path}")
+                logger.info("Skipping export, already on disk: %s", obj_path)
                 return
-            fa_log(1, f"Exporting compiled function to disk: {obj_path}")
-            fn.export_to_c(
-                object_file_path=str(obj_path),
-                function_name=self.EXPORT_FUNCTION_PREFIX,
-            )
-            fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
+            logger.info("Exporting compiled function to disk: %s", obj_path)
+            prefix = self._function_prefix(sha256_hex)
+            if self.enable_tvm_ffi:
+                fn.export_to_c(
+                    object_file_path=str(obj_path),
+                    function_name=prefix,
+                )
+            else:
+                fn.export_to_c(
+                    str(self.cache_path),
+                    sha256_hex,
+                    function_prefix=prefix,
+                )
+            logger.info("Successfully exported compiled function to disk: %s", obj_path)
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
-        return hashlib.sha256(pickle.dumps(key)).hexdigest()
+        disk_key = (self.enable_tvm_ffi, _normalize_disk_key(key))
+        return hashlib.sha256(pickle.dumps(disk_key)).hexdigest()
 
     def _lock_path(self, sha256_hex: str) -> Path:
         return self.cache_path / f"{sha256_hex}.lock"
+
+    @staticmethod
+    def _function_prefix(sha256_hex: str) -> str:
+        return f"sglang_cute_{sha256_hex[:20]}"
 
     def clear(self) -> None:
         """
         Not only clear the in-memory cache. Also purge persistent compilation cache.
         """
-        fa_log(1, f"Clearing persistent cache at {self.cache_path}")
+        logger.info("Clearing persistent cache at %s", self.cache_path)
         super().clear()
         for child in self.cache_path.iterdir():
             child.unlink()
 
 
-def get_jit_cache(name: str | None = None) -> JITCache:
+def get_jit_cache(
+    name: str | None = None,
+    *,
+    cache_dir: str | os.PathLike[str] | None = CUTE_AOT_CACHE_DIR,
+    source_paths: Sequence[str | os.PathLike[str]] = (),
+    enable_tvm_ffi: bool = True,
+) -> JITCache:
     """
     JIT cache factory.
     `name` is an optional identifier to create subdirectories to manage cache.
@@ -278,12 +336,17 @@ def get_jit_cache(name: str | None = None) -> JITCache:
     source fingerprint directory so that code or dependency changes
     automatically invalidate stale entries.
     """
-    if CUTE_DSL_CACHE_ENABLED:
-        path = get_cache_path() / _compute_source_fingerprint()
+    if cache_dir is not None:
+        paths = (str(Path(__file__).resolve()),) + tuple(
+            str(Path(path).resolve()) for path in source_paths
+        )
+        path = Path(cache_dir).expanduser() / _compute_source_fingerprint(
+            paths, enable_tvm_ffi
+        )
         if name:
             path = path / name
-        fa_log(1, f"Creating persistent JIT cache at {path}")
-        return JITPersistentCache(path)
+        logger.info("Creating persistent JIT cache at %s", path)
+        return JITPersistentCache(path, enable_tvm_ffi=enable_tvm_ffi)
     else:
-        fa_log(1, "Persistent cache disabled, using in-memory JIT cache")
+        logger.info("Persistent cache disabled, using in-memory JIT cache")
         return JITCache()
