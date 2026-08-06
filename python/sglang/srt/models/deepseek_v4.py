@@ -2162,17 +2162,14 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
-    def forward(
+    def _forward_attention_prepare(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant: Optional[torch.Tensor] = None,
-        defer_all_reduce: bool = False,
-    ) -> Union[torch.Tensor, mhc.AttnOutput]:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            return x
-
+    ):
+        """Prepare Q/KV, compressor, and the C4 indexer/HiSparse swap-in."""
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
             assert isinstance(
@@ -2408,6 +2405,39 @@ class MQALayer(MqaAttentionBase):
             if _is_hip
             else None
         )
+        return {
+            "q": q,
+            "kv": kv,
+            "attn_k": attn_k,
+            "tp_slice": tp_slice,
+            "q_padded": q_padded,
+            "q_out": q_out,
+            "q_rope": q_rope,
+            "k_rope": k_rope,
+            "attn_sink": attn_sink,
+            "unified": unified,
+            "inv_rope": inv_rope,
+        }
+
+    def _forward_attention_core(
+        self,
+        prepared,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run only the compressed-attention backend on prepared Q/KV."""
+        q = prepared["q"]
+        kv = prepared["kv"]
+        attn_k = prepared["attn_k"]
+        tp_slice = prepared["tp_slice"]
+        q_padded = prepared["q_padded"]
+        q_out = prepared["q_out"]
+        q_rope = prepared["q_rope"]
+        k_rope = prepared["k_rope"]
+        attn_sink = prepared["attn_sink"]
+        unified = prepared["unified"]
+        inv_rope = prepared["inv_rope"]
+        attn_backend = get_attn_backend()
+
         if unified:
             # only the HIP radix backend takes these; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2460,6 +2490,17 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        return o
+
+    def _forward_attention_output(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inv_rope=None,
+        defer_all_reduce: bool = False,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        """Run inverse RoPE and the WO projection on an attention result."""
         if (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
@@ -2638,6 +2679,32 @@ class MQALayer(MqaAttentionBase):
             o = attn_tp_all_reduce(o)
         return o
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant: Optional[torch.Tensor] = None,
+        defer_all_reduce: bool = False,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+            return x
+
+        prepared = self._forward_attention_prepare(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            x_quant=x_quant,
+        )
+        o = self._forward_attention_core(prepared, forward_batch)
+        return self._forward_attention_output(
+            o,
+            positions,
+            forward_batch,
+            inv_rope=prepared["inv_rope"],
+            defer_all_reduce=defer_all_reduce,
+        )
+
     # ---- TBO op decomposition ----
     def op_attn(self, state):
         """Run the attention forward as a single TBO op.
@@ -2651,6 +2718,30 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_prepare(self, state):
+        state.attn_prepared = self._forward_attention_prepare(
+            x=state.pop("hidden_states_after_input_norm"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+            x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_core(self, state):
+        prepared = state.pop("attn_prepared")
+        state.attn_core_output = self._forward_attention_core(
+            prepared=prepared,
+            forward_batch=state.forward_batch,
+        )
+        state.attn_inv_rope = prepared["inv_rope"]
+
+    def op_attn_output(self, state):
+        state.hidden_states_after_attn = self._forward_attention_output(
+            o=state.pop("attn_core_output"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+            inv_rope=state.pop("attn_inv_rope"),
         )
 
 
