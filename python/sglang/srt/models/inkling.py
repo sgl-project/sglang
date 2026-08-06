@@ -947,13 +947,19 @@ class InklingCausalLLM(nn.Module):
 
 
 class InklingAudio(nn.Module):
-    def __init__(self, config: InklingAudioConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: InklingAudioConfig,
+        prefix: str = "",
+        embedding_chunk_size: int | None = None,
+    ):
         del prefix
         super().__init__()
         assert config.audio_mode == "dmel"
         self.n_mel_bins = config.n_mel_bins
         self.mel_vocab_size = config.mel_vocab_size
         self.use_audio_norm = config.use_audio_norm
+        self.embedding_chunk_size = embedding_chunk_size
         self.encoder = nn.Embedding(
             config.n_mel_bins * config.mel_vocab_size, config.decoder_dmodel
         )
@@ -973,11 +979,28 @@ class InklingAudio(nn.Module):
             * self.mel_vocab_size
         ).unsqueeze(0) + audio_features.to(torch.int32)
 
-        hidden_states = (
-            self.encoder(embedding_indices.reshape(-1))
-            .reshape(audio_features.shape[0], audio_features.shape[1], -1)
-            .sum(axis=1)
-        )
+        num_audio_tokens = audio_features.shape[0]
+        chunk_size = self.embedding_chunk_size
+        if chunk_size is None or num_audio_tokens <= chunk_size:
+            hidden_states = (
+                self.encoder(embedding_indices.reshape(-1))
+                .reshape(num_audio_tokens, self.n_mel_bins, self.encoder.embedding_dim)
+                .sum(dim=1)
+            )
+        else:
+            hidden_states = torch.empty(
+                (num_audio_tokens, self.encoder.embedding_dim),
+                dtype=self.encoder.weight.dtype,
+                device=self.encoder.weight.device,
+            )
+            for start in range(0, num_audio_tokens, chunk_size):
+                end = min(start + chunk_size, num_audio_tokens)
+                chunk_hidden_states = (
+                    self.encoder(embedding_indices[start:end].reshape(-1))
+                    .reshape(end - start, self.n_mel_bins, self.encoder.embedding_dim)
+                    .sum(dim=1)
+                )
+                hidden_states[start:end].copy_(chunk_hidden_states)
 
         if self.final_norm is not None:
             hidden_states = self.final_norm(hidden_states)
@@ -1050,7 +1073,10 @@ class InklingForConditionalGeneration(nn.Module):
         # weight loader already skip audio./visual. when these are None.
         build_multimodal = bool(get_mm().enable_multimodal)
         self.audio = (
-            InklingAudio(self.config.audio_config)
+            InklingAudio(
+                self.config.audio_config,
+                embedding_chunk_size=server_args.inkling_audio_embedding_chunk_size,
+            )
             if build_multimodal and self.config.audio_config.decoder_dmodel is not None
             else None
         )

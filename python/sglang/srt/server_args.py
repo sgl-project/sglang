@@ -2755,6 +2755,11 @@ class ServerArgs:
         "multimodal feature transport.",
         NS("mm"),
     ] = False
+    inkling_audio_embedding_chunk_size: A[
+        Optional[int],
+        "The number of audio tokens per Inkling audio embedding chunk. Smaller values reduce peak memory but increase runtime overhead. If unset, process all audio tokens at once.",
+        NS("mm"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # LoRA
@@ -8157,6 +8162,14 @@ class ServerArgs:
                             f"Invalid modality '{modality}' in --limit-mm-data-per-request."
                             f"Allowed modalities are: {list(allowed_modalities)}"
                         )
+
+        if (
+            self.inkling_audio_embedding_chunk_size is not None
+            and self.inkling_audio_embedding_chunk_size <= 0
+        ):
+            raise ValueError(
+                "--inkling-audio-embedding-chunk-size must be a positive integer."
+            )
 
         # Validate preferred_sampling_params
         if self.preferred_sampling_params:
