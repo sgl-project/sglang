@@ -62,6 +62,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -73,6 +77,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            pool_label=pool_label,
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
@@ -226,6 +233,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
+        host_indices = self.dcp_kernel_indices(host_indices)
+        device_indices = self.dcp_kernel_indices(device_indices)
         host_layer = self._host_layer_index(layer_id)
 
         if io_backend == "kernel":
@@ -311,6 +320,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        # Indices arrive already translated by backup_from_device_all_layer.
         host_layer = self._host_layer_index(layer_id)
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -370,6 +380,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        host_indices = self.dcp_kernel_indices(host_indices)
+        device_indices = self.dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
@@ -459,6 +471,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        assert self.dcp_size == 1, (
+            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
+            "need dcp_rank-scoped keys); --hicache-storage-backend with "
+            "--dcp-size > 1 should have been rejected at server start."
+        )
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":

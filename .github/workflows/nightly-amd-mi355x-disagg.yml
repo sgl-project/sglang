@@ -1,8 +1,8 @@
 name: Nightly Test (AMD MI355X 2N 1P1D Disagg)
 
-# A self-hosted runner on the amd-sglang login node salloc's two MI355X nodes
-# and runs the Docker harness (prefill + decode over MORI, a standalone load
-# balancer, then an sglang.bench_serving concurrency sweep) via
+# Self-hosted runners on the amd-sglang login node salloc two or four MI355X
+# nodes and run the Docker harness (prefill + decode over MORI, a standalone
+# load balancer, then an sglang.bench_serving concurrency sweep) via
 # scripts/ci/slurm/launch_mi355x.sh.
 on:
   schedule:
@@ -35,7 +35,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.generate.outputs.matrix }}
+      matrix-2n: ${{ steps.generate.outputs.matrix-2n }}
+      matrix-4n: ${{ steps.generate.outputs.matrix-4n }}
       image: ${{ steps.image.outputs.image }}
     steps:
       - name: Checkout code
@@ -84,19 +85,42 @@ jobs:
           fi
           MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
             scripts/ci/slurm/nightly-configs.yaml --runner mi355x "${FILTER_ARG[@]}")
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          MATRIX="$MATRIX" python3 - <<'PY'
+          import json
+          import os
 
-  nightly-mi355x-benchmark:
+          matrix = json.loads(os.environ["MATRIX"])
+          groups = {
+              "matrix-2n": [entry for entry in matrix if "-1p1d" in entry["name"]],
+              "matrix-4n": [
+                  entry for entry in matrix if "-2p1d-ep16" in entry["name"]
+              ],
+          }
+          matched = {entry["name"] for entries in groups.values() for entry in entries}
+          unmatched = [entry["name"] for entry in matrix if entry["name"] not in matched]
+          if unmatched:
+              raise SystemExit(
+                  "Unrecognized MI355X topology for config(s): " + ", ".join(unmatched)
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for name, entries in groups.items():
+                  value = {"include": [{"config": entry} for entry in entries]}
+                  print(f"{name}={json.dumps(value, separators=(',', ':'))}", file=output)
+          PY
+
+  nightly-mi355x-2n:
     needs: setup
     if: |
       always() && github.repository == 'sgl-project/sglang'
       && needs.setup.result == 'success'
+      && needs.setup.outputs.matrix-2n != '{"include":[]}'
     runs-on: linux-sglang-mi35x-di
     strategy:
       fail-fast: false
-      matrix:
-        config: ${{ fromJson(needs.setup.outputs.matrix) }}
-    env:
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.setup.outputs.matrix-2n) }}
+    env: &mi355x-env
       FRAMEWORK: sglang
       HW: mi355x
       MODEL: ${{ matrix.config.model }}
@@ -115,7 +139,7 @@ jobs:
       # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
       MODEL_PATH: ${{ matrix.config.model_path }}
 
-    steps:
+    steps: &mi355x-steps
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -139,16 +163,12 @@ jobs:
             scancel $STALE_JOBS
           fi
 
-      - name: Launch MI355X 2N 1P1D benchmark
+      - name: Launch MI355X benchmark
         timeout-minutes: 180
         env:
           # Manual dispatch input wins; otherwise use the latest image resolved
           # by the setup job; otherwise the launcher falls back to the recipe default.
           IMAGE_OVERRIDE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
-          # Keep the scheduler off mia1-p01-g20: its ionic RDMA driver ABI
-          # mismatches the container, so MORI reports "no active RDMA device"
-          # and the disagg server dies on init. Remove once the node is fixed.
-          SLURM_EXCLUDE: mia1-p01-g20
         run: bash scripts/ci/slurm/launch_mi355x.sh
 
       - name: Pack logs
@@ -230,8 +250,26 @@ jobs:
             rm -rf "$LOG_DIR"
           fi
 
+  nightly-mi355x-4n:
+    needs:
+      - setup
+      - nightly-mi355x-2n
+    if: |
+      !cancelled() && github.repository == 'sgl-project/sglang'
+      && needs.setup.result == 'success'
+      && needs.setup.outputs.matrix-4n != '{"include":[]}'
+    runs-on: linux-sglang-mi35x-di
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.setup.outputs.matrix-4n) }}
+    env: *mi355x-env
+    steps: *mi355x-steps
+
   collect-results:
-    needs: nightly-mi355x-benchmark
+    needs:
+      - nightly-mi355x-2n
+      - nightly-mi355x-4n
     if: github.repository == 'sgl-project/sglang' && always()
     runs-on: ubuntu-latest
     steps:
