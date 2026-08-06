@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import dataclasses
 import glob
 import importlib
@@ -8609,52 +8608,12 @@ class ServerArgs:
 
         declare_late_resolution(self, source, **fields)
 
-    def derive(self, source: str, **fields) -> ServerArgs:
-        """A copy carrying variant values: a draft worker's context length, an
-        encode worker's device, a launcher's late port pick.
-
-        The receiver is untouched, so a config already published from it -- and
-        the namespace bags projected out of it -- stay true; the variant is a
-        second config, to be published in its own right or handed to whoever
-        owns it. Resolution does not re-run: the values being set are decided
-        *after* it, from inputs resolution never had, and re-resolving a
-        resolved config re-derives conditional decisions from the wrong ones.
-
-        Whitelisted resolvable fields also join the copy's declaration stash so
-        a later re-resolution keeps them; ``source`` is recorded for provenance.
-        """
-        from sglang.srt.arg_groups.arg_utils import resolvable_fields
-
-        variant = copy.deepcopy(self)
-        whitelist = resolvable_fields(type(variant))
-        declared = {k: v for k, v in fields.items() if k in whitelist}
-        rest = {k: v for k, v in fields.items() if k not in whitelist}
-        if declared:
-            stash = getattr(variant, "_resolved_overrides", None)
-            if stash is None:
-                stash = []
-                object.__setattr__(variant, "_resolved_overrides", stash)
-            stash.append((source, dict(declared)))
-        if rest:
-            log = getattr(variant, "_runtime_mutations", None)
-            if log is None:
-                log = []
-                object.__setattr__(variant, "_runtime_mutations", log)
-            log.append((source, dict(rest)))
-        object.__setattr__(variant, "_internal_write", True)
-        try:
-            for field, value in fields.items():
-                setattr(variant, field, value)
-        finally:
-            object.__setattr__(variant, "_internal_write", False)
-        return variant
-
     def __setattr__(self, name, value):
         # After materialization the fields are the resolved startup
         # configuration -- the pristine, READ-ONLY record that the config bags
         # were projected from. Resolved config changes go to the bags via
-        # get_context().override(source, ...); a config that differs per runner
-        # or per worker is a separate object, built with derive().
+        # get_context().override(source, ...); a value one runner or worker
+        # owns travels as a constructor argument to it.
         if (
             not name.startswith("_")
             and getattr(self, "_declarations_materialized", False)
@@ -8663,8 +8622,8 @@ class ServerArgs:
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "
                 "read-only -- use get_context().override(source, ...) to change "
-                "resolved config, or server_args.derive(source, ...) to build a "
-                "variant for one runner."
+                "resolved config; a value one runner owns travels as a "
+                "constructor argument."
             )
         object.__setattr__(self, name, value)
 

@@ -261,9 +261,9 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         # unnamed fields keep their dataclass defaults
         self.assertEqual(published.tp_size, 1)
 
-    def test_fields_carry_provenance(self):
-        published = get_context().override_server_args(tp_size=4).install()
-        self.assertIn(("test-override", {"tp_size": 4}), published._runtime_mutations)
+    def test_unknown_fields_are_rejected(self):
+        with self.assertRaises(ValueError):
+            get_context().override_server_args(not_a_config_field=1).install()
 
     def test_restore_reinstates_previous_publish(self):
         previous = object()
@@ -299,12 +299,10 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
-        # raise, and a differing value lives on a derived variant.
+        # raise.
         published = get_context().override_server_args(tp_size=2).install()
         with self.assertRaises(AttributeError):
             published.tp_size = 4
-        variant = published.derive("test", tp_size=4)
-        self.assertEqual(variant.tp_size, 4)
         self.assertEqual(published.tp_size, 2)
 
     def test_restore_resets_the_capture_seed(self):
