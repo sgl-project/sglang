@@ -92,7 +92,7 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
                     repeat=1,
                 ),
                 performance_params=PerformanceTestParams(
-                    result_dir="performance_results_nemotron_3_super_bf16",
+                    profile_dir="performance_profiles_nemotron_3_super_bf16",
                 ),
             )
 
@@ -129,7 +129,7 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
                     repeat=1,
                 ),
                 performance_params=PerformanceTestParams(
-                    result_dir="performance_results_nemotron_3_super_nvfp4",
+                    profile_dir="performance_profiles_nemotron_3_super_nvfp4",
                 ),
             )
 

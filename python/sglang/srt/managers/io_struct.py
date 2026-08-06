@@ -2260,10 +2260,7 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
         return None
     if _USE_PICKLE_IPC:
         return obj
-    if not isinstance(obj, PickleWrapper):
-        # Already materialized: the embedded Rust server attaches in-process
-        # objects (native-MM `mm_inputs`) without a pickle hop.
-        return obj
+    assert isinstance(obj, PickleWrapper)
     return pickle.loads(obj.data)
 
 

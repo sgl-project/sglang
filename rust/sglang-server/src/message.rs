@@ -11,7 +11,6 @@
 mod egress;
 mod finish_reason;
 mod io_struct;
-pub mod mm_payload;
 mod request;
 mod sampling;
 mod types;
@@ -23,10 +22,7 @@ pub use egress::{
 };
 pub use finish_reason::Matched;
 pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
-pub use request::{GenerateBody, GenerateRequest, MmRequest, MmWorkItem, RequestKind};
-// Constructed directly only by tests: `api_server::prefetch` fills its
-// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
-pub use request::MmData;
+pub use request::{GenerateBody, GenerateRequest, RequestKind};
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 

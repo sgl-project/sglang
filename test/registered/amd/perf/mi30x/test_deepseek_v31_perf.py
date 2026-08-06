@@ -22,7 +22,7 @@ register_amd_ci(est_time=18000, suite="nightly-perf-8-gpu-deepseek-v31", nightly
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without cost columns.
+    """Generate a simplified markdown report without traces and cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -56,7 +56,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 DEEPSEEK_V31_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V31_MODEL_PATH", "deepseek-ai/DeepSeek-V3.1"
 )
-RESULT_DIR = "performance_results_deepseek_v31"
+PROFILE_DIR = "performance_profiles_deepseek_v31"
 
 
 class TestNightlyDeepseekV31Performance(unittest.TestCase):
@@ -109,9 +109,9 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
             },
         ]
 
-        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_result_directory()
-        # Set the report header for this test
+        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_profile_directory()
+        # Override full_report to remove traces help text
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -129,6 +129,7 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                         other_args=variant_config["other_args"],
                         variant=variant_config["name"],
                         extra_bench_args=["--trust-remote-code"],
+                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]
@@ -136,7 +137,7 @@ class TestNightlyDeepseekV31Performance(unittest.TestCase):
                     if not success:
                         failed_variants.append(variant_config["name"])
 
-                    # Use the simplified report format
+                    # Use simplified report format without traces
                     if results:
                         self.runner.full_report += (
                             generate_simple_markdown_report(results) + "\n"

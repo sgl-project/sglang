@@ -13,7 +13,7 @@ class PerformanceTestParams:
     batch_sizes: List[int] = field(default_factory=lambda: [1, 8, 16])
     input_lens: Tuple[int, ...] = (8192,)
     output_lens: Tuple[int, ...] = (512,)
-    result_dir: Optional[str] = None  # None = auto-generate based on is_vlm
+    profile_dir: Optional[str] = None  # None = auto-generate based on is_vlm
     dataset_name: str = "mmmu"  # For VLM perf test
     # MTP/EAGLE speculative decoding: minimum accept length threshold (None = no validation)
     spec_accept_length_threshold: Optional[float] = None
@@ -86,8 +86,9 @@ def run_performance_test(
             perf_runner.add_report(results, variant=model.variant)
             print(f"✓ Performance test succeeded for {model.model_path}")
 
-            # Fall back to the per-run accept lengths captured during benchmarking
-            # when the cumulative /server_info metric is unavailable.
+            # The cumulative /server_info accept length is reset by the cache
+            # flush before the profiling phase, so it can be missing here. Fall
+            # back to the per-run accept lengths captured during benchmarking.
             if avg_spec_accept_length is None:
                 run_accept_lengths = [
                     r.acc_length
@@ -154,7 +155,7 @@ def run_performance_test(
 
 def run_performance_for_models(
     models: List[ModelLaunchSettings],
-    result_dir: str,
+    profile_dir: str,
     test_name: str,
     base_url: Optional[str] = None,
     batch_sizes: List[int] = None,
@@ -167,7 +168,7 @@ def run_performance_for_models(
 
     Args:
         models: List of ModelLaunchSettings to test
-        result_dir: Directory for performance results
+        profile_dir: Directory for performance profiles
         test_name: Name for the test (used in reports)
         base_url: Server base URL (default: DEFAULT_URL_FOR_TEST)
         batch_sizes: Batch sizes for perf test
@@ -187,11 +188,11 @@ def run_performance_for_models(
 
     # Setup performance runner
     perf_runner = NightlyBenchmarkRunner(
-        result_dir=result_dir,
+        profile_dir=profile_dir,
         test_name=test_name,
         base_url=base_url,
     )
-    perf_runner.setup_result_directory()
+    perf_runner.setup_profile_directory()
 
     all_results = []
     all_passed = True

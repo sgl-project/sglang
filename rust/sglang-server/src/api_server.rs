@@ -10,7 +10,6 @@ mod log;
 mod native_api;
 mod openai;
 mod pd_bootstrap;
-mod prefetch;
 mod submit;
 
 use std::sync::Arc;

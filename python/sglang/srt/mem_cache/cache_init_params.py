@@ -53,5 +53,3 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
-
-    mtp_draft_device_pools: tuple[object, ...] = ()

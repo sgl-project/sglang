@@ -68,7 +68,7 @@ class TestDeepseekR1FP4Unified(unittest.TestCase):
                 api="completion",
             ),
             performance_params=PerformanceTestParams(
-                result_dir="performance_results_deepseek_v3_fp4",
+                profile_dir="performance_profiles_deepseek_v3_fp4",
             ),
         )
 

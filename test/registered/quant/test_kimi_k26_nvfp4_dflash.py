@@ -61,7 +61,7 @@ class TestKimiK26Nvfp4Dflash(unittest.TestCase):
             performance_params=PerformanceTestParams(
                 batch_sizes=[1, 8, 16],
                 spec_accept_length_threshold=2.0,
-                result_dir="performance_results_kimi_k26_nvfp4_dflash",
+                profile_dir="performance_profiles_kimi_k26_nvfp4_dflash",
             ),
         )
 

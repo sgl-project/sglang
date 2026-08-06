@@ -54,7 +54,7 @@ class TestKimiK25(unittest.TestCase):
                 dataset="mmmu-pro", baseline_accuracy=0.69, repeat=1, max_tokens=32768
             ),
             performance_params=PerformanceTestParams(
-                result_dir="performance_results_gb300",
+                profile_dir="performance_profiles_gb300",
             ),
         )
 
