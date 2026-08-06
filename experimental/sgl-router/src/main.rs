@@ -91,6 +91,14 @@ async fn main() -> Result<()> {
         cfg.server.host,
         cfg.server.port
     );
+    // Surface the input_ids offload state: a serving-semantics kill switch
+    // must be greppable in logs, so an engaged switch is never mistaken for
+    // a broken offload.
+    if cfg.model.forward_input_ids {
+        tracing::info!("input_ids offload enabled; engine-equivalent prompts forwarded to skip engine-side tokenization");
+    } else {
+        tracing::warn!("input_ids offload DISABLED (--disable-input-ids-offload / SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD); every chat prompt re-tokenizes engine-side");
+    }
 
     let tokenizers = Arc::new(
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)

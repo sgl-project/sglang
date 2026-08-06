@@ -8,10 +8,11 @@
 //!
 //! * A plain text chat request on the engine-equivalent chat-encoder path →
 //!   the forwarded body carries `input_ids` AND retains `messages`.
-//! * A request carrying `tools` → `input_ids` omitted (the router's encoder
-//!   doesn't render tool schemas, so its ids would diverge from the engine).
-//! * A request with multimodal (array) content → `input_ids` omitted (a text
-//!   tokenizer can't represent image content).
+//! * Requests carrying `tools` or a thinking override → also forwarded (the
+//!   dsv4 encoder mirrors the engine's tool rendering and per-request
+//!   thinking resolution, so the ids are engine-equivalent).
+//! * A request with multimodal (non-text parts) content → `input_ids`
+//!   omitted (the engine-side mm-item plumbing is unverified).
 //!
 //! The model id contains `deepseek-v4` so the tokenizer registry auto-attaches
 //! the built-in V4 chat encoder — the engine-equivalent path — without a
@@ -60,6 +61,7 @@ fn config() -> Config {
             cache_aware: Some(CacheAwareConfig::default()),
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -151,7 +153,7 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
 }
 
 #[tokio::test]
-async fn tool_request_omits_input_ids() {
+async fn tool_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
     let status = send(
@@ -166,17 +168,18 @@ async fn tool_request_omits_input_ids() {
     assert_eq!(status, StatusCode::OK);
 
     let body = captured(&mock);
+    let ids = body.get("input_ids").and_then(|v| v.as_array());
     assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids; got {body}"
+        ids.is_some_and(|a| !a.is_empty()),
+        "tool requests on the dsv4 encoder must forward input_ids; got {body}"
     );
 }
 
 #[tokio::test]
-async fn thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode, which the
-    // router's encoder renders in the default mode only — forwarding ids would
-    // silently run the wrong mode, so the handler must omit them.
+async fn thinking_request_forwards_input_ids() {
+    // `chat_template_kwargs.thinking` steers engine-side thinking mode, and
+    // the dsv4 encoder resolves it the same way (`resolve_render_opts`), so
+    // the ids are engine-equivalent and forward.
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
     let status = send(
@@ -184,16 +187,17 @@ async fn thinking_request_omits_input_ids() {
         json!({
             "model": MODEL,
             "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true},
+            "chat_template_kwargs": {"thinking": true},
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
     let body = captured(&mock);
+    let ids = body.get("input_ids").and_then(|v| v.as_array());
     assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids; got {body}"
+        ids.is_some_and(|a| !a.is_empty()),
+        "thinking-mode requests on the dsv4 encoder must forward input_ids; got {body}"
     );
 }
 

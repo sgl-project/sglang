@@ -8,13 +8,22 @@ encoder, fed the SAME preprocessing `serving_chat.py` applies before it
 canonicalization lives in serving_chat, NOT in encoding_dsv4 — running bare
 `encode_messages` on raw tools produces the WRONG field order, so this
 preprocessing MUST be replayed here. Re-run this whenever the engine encoder,
-`TOOLS_TEMPLATE`, `REASONING_EFFORT_MAX`, or the `Function` field order changes:
+`TOOLS_TEMPLATE`, the reasoning-effort profile prompts, or the `Function` field
+order changes:
 
     python3 gen_dsv4_thinking_cases.py <path-to-encoding_dsv4.py>
 
-(defaults to the ENC path below). The Rust consts + these fixtures drift together
-if the oracle changes but this isn't re-run — the test only guards Rust-side
-regressions, not engine-side drift.
+Each case is emitted for BOTH reasoning-effort profiles, with the profile
+recorded in the fixture and replayed by the Rust test — so neither side can
+silently assume one. Pass the encoder path EXPLICITLY when the checkout's own
+`python/` tree is older than the engine you actually deploy: the default ENC
+below points at this checkout, which on a long-lived branch can predate the
+feature under test. A pre-#33140 encoder is rejected outright rather than
+quietly emitting preview-only fixtures.
+
+The Rust consts + these fixtures drift together if the oracle changes but this
+isn't re-run — the test guards Rust-side regressions, and engine-side drift only
+once this is re-run against the deployed engine.
 """
 
 import importlib.util
@@ -23,8 +32,9 @@ import os
 import sys
 
 # Default to the engine encoder shipping in THIS checkout (the router worktree is
-# inside the sglang repo, which also holds the Python engine), so regenerated
-# fixtures track the engine that ships alongside — reproducible for teammates/CI.
+# inside the sglang repo, which also holds the Python engine). On a long-lived
+# branch that copy can lag the deployed engine badly enough that the guard below
+# rejects it — pass the encoder path explicitly when it does.
 # Repo root is five levels up: testdata/tokenizer/src/sgl-router/experimental/<root>.
 _REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), *([os.pardir] * 5))
@@ -89,10 +99,26 @@ def prep(msgs, tools):
     return msgs
 
 
-def render(msgs, tools, thinking, effort):
+PROFILES = getattr(enc, "REASONING_EFFORT_PROFILES", None)
+if PROFILES is None:
+    sys.exit(
+        f"{ENC} has no REASONING_EFFORT_PROFILES (it predates the profile split).\n"
+        "Regenerating against it would silently emit preview-only fixtures and\n"
+        "drop all `official` coverage. Point this at a newer encoder:\n"
+        "    python3 gen_dsv4_thinking_cases.py <newer>/encoding_dsv4.py"
+    )
+
+
+def render(msgs, tools, thinking, effort, profile):
     mode = "thinking" if thinking else "chat"
+    # `reasoning_effort_profile` MUST be passed explicitly: upstream defaults it
+    # to "preview", so omitting it silently yields preview output regardless of
+    # which profile the fixture claims to cover.
     return enc.encode_messages(
-        prep(msgs, tools), thinking_mode=mode, reasoning_effort=effort
+        prep(msgs, tools),
+        thinking_mode=mode,
+        reasoning_effort=effort,
+        reasoning_effort_profile=profile,
     )
 
 
@@ -112,18 +138,25 @@ READ_TOOL = [
 
 cases = []
 
+# Every case is emitted once per profile: the two differ only in the block-0
+# effort preamble, but that is exactly the surface #33140 added, and `official`
+# is what the DeepSeek-V4-Flash-0731 checkpoint resolves to.
+_PROFILES = ("preview", "official")
+
 
 def add(name, msgs, tools, thinking, effort):
-    cases.append(
-        {
-            "name": name,
-            "messages": msgs,
-            "tools": tools,
-            "thinking": thinking,
-            "reasoning_effort": effort,
-            "expected": render(msgs, tools, thinking, effort),
-        }
-    )
+    for profile in _PROFILES:
+        cases.append(
+            {
+                "name": f"{name}[{profile}]",
+                "messages": msgs,
+                "tools": tools,
+                "thinking": thinking,
+                "reasoning_effort": effort,
+                "reasoning_effort_profile": profile,
+                "expected": render(msgs, tools, thinking, effort, profile),
+            }
+        )
 
 
 # --- chat-mode regression guards (must equal the pre-thinking output) ---

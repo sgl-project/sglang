@@ -651,32 +651,35 @@ async fn chat_completions_inner(
     };
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
-    // skips re-tokenizing the same prompt — but only when they are
-    // engine-equivalent (chat-encoder path) AND the request contains nothing
-    // the router's encoder didn't replicate (see `input_ids_safe_to_forward`).
-    // Otherwise omit them and the engine tokenizes from `messages` as usual —
-    // a transparent, always-correct fallback (`messages` are always retained
-    // in the forwarded body). `forward_input_ids` is `Some` only when
-    // `request_value` is `Some` (a model the ingress tokenized for), so the
-    // predicate always has a parsed body to inspect.
-    let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
-    {
-        (Some(t), Some(v)) if t.engine_equivalent && input_ids_safe_to_forward(v) => {
-            Some(t.ids.as_slice())
-        }
-        _ => None,
-    };
+    // skips re-tokenizing the same prompt — but only when the offload is
+    // enabled (`--disable-input-ids-offload` gates it centrally) AND the ids
+    // are engine-equivalent (chat-encoder path) AND the request contains
+    // nothing the router's encoder didn't replicate (the per-encoder
+    // predicate, selected via the ids' stamped parity in
+    // `select_forward_input_ids`). Otherwise omit them and the engine
+    // tokenizes from `messages` as usual — a transparent, always-correct
+    // fallback (`messages` are always retained in the forwarded body).
+    // `input_ids_to_forward` (the selected ids) is named distinct from
+    // `ModelConfig::forward_input_ids` (the gate) — both names are live in
+    // this scope.
+    let input_ids_to_forward: Option<&[u32]> = select_forward_input_ids(
+        ctx.config.model.forward_input_ids,
+        request_tokens.as_ref(),
+        request_value.as_ref(),
+    );
 
     // Surface a broken offload: when the encoder SHOULD have produced
     // engine-equivalent ids but didn't, the chat request silently fell back to
     // engine-side tokenization. Count only that case (see
     // `ingress_tokenize_offload_failed`); successful forwards and expected
-    // omissions are not problems.
+    // omissions are not problems. A dsv4 render error is a CLIENT error the
+    // engine rejects identically — never broken-offload signal.
     if ingress_tokenize_offload_failed(
         ctx.tokenizers.has_chat_encoder(&model_str),
         request_value.as_ref(),
         request_tokens.as_ref(),
-    ) {
+    ) && !dsv4_render_rejects_request(&ctx.tokenizers, &model_str, request_value.as_ref())
+    {
         ctx.metrics.record_ingress_tokenize_error(&metrics_model);
     }
 
@@ -739,7 +742,7 @@ async fn chat_completions_inner(
     let outgoing_body = build_outgoing_body(
         &body,
         request_value,
-        forward_input_ids,
+        input_ids_to_forward,
         bootstrap.as_ref(),
         rid_to_inject,
         inject_max_tokens,
@@ -1467,7 +1470,7 @@ struct BootstrapFields {
 /// its own chat-template tokenization; `messages` are retained in the body so
 /// the engine still derives stop tokens / tool-call constraint and the OpenAI
 /// response shape. The caller sets this only when the tokens are
-/// engine-equivalent and `input_ids_safe_to_forward` held.
+/// engine-equivalent and the per-encoder forwarding predicate held.
 ///
 /// `value` is the already-parsed request body when one is on hand (the
 /// cache-aware path parses once at ingress); it is consumed so the mutation
@@ -1557,7 +1560,170 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Whether the router's `input_ids` may be forwarded for this request.
+/// Select the ids to forward to the engine as `input_ids`, if any.
+///
+/// `Some` only when ALL of:
+///   * `offload_enabled` — the `--disable-input-ids-offload` kill switch is
+///     off. This is the central gate: with the offload disabled the engine
+///     always re-tokenizes from `messages`, while ingress tokenization still
+///     ran (routing and the cache-sim tees don't change).
+///   * the ids exist and are engine-equivalent (chat-encoder path);
+///   * the predicate matching the stamped [`crate::tokenizer::ForwardParity`]
+///     of the ENCODER THAT PRODUCED the ids holds:
+///     [`input_ids_safe_to_forward_dsv4`] for the built-in dsv4 encoder, the
+///     conservative [`input_ids_safe_to_forward`] for everything else. The
+///     stamp travels with the tokens, so ids can never be gated by the wrong
+///     encoder's predicate.
+///
+/// `request_value` is `Some` exactly when the ingress parsed the body for
+/// tokenization (`want_tokens` — regardless of whether that tokenization
+/// succeeded), so the predicate always has a parsed body to inspect inside
+/// the match.
+fn select_forward_input_ids<'a>(
+    offload_enabled: bool,
+    request_tokens: Option<&'a RequestTokens>,
+    request_value: Option<&serde_json::Value>,
+) -> Option<&'a [u32]> {
+    match (offload_enabled, request_tokens, request_value) {
+        (true, Some(t), Some(v)) if t.engine_equivalent => match t.parity {
+            crate::tokenizer::ForwardParity::Dsv4Full if input_ids_safe_to_forward_dsv4(v) => {
+                Some(t.ids.as_slice())
+            }
+            crate::tokenizer::ForwardParity::Conservative if input_ids_safe_to_forward(v) => {
+                Some(t.ids.as_slice())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The dsv4-encoder forwarding predicate. The built-in encoder mirrors the
+/// engine's FULL dsv4 request handling — tools and tool results, per-request
+/// thinking / reasoning-effort resolution, `task` attachment, legacy
+/// `functions` and per-request `chat_template` (both ignored engine-side on
+/// the dsv4 path), and the trailing-assistant surgery behind
+/// `continue_final_message` (see `dsv4::render_request`) — so those are all
+/// forwardable. What remains withheld is exactly what the encoder cannot
+/// mirror faithfully:
+///
+///   * content parts that are not `type: "text"` — the dsv4 engine path
+///     stringifies OpenAI parts-content and silently discards non-text parts,
+///     which the router replicates, but the surrounding mm-item plumbing on
+///     the engine side is unverified, so anything carrying a non-text part
+///     stays engine-tokenized.
+///   * message-level `tools` — the one DECLARED extra that actually renders
+///     (after that message's content, and it flips `drop_thinking` off).
+///     `wo_eos` / `mask` / `content_blocks` / `response_format` are NOT
+///     withheld: undeclared on both message models, which use pydantic's
+///     default `extra="ignore"`, so they never reach the encoder.
+///   * message-level `tools` — a declared protocol field the engine renders
+///     after that message's content, independently of the request-level
+///     tools the (mirrored) system-turn rendering uses.
+///   * any role outside the engine's dsv4 render set (`system`, `user`,
+///     `developer`, `assistant`, `tool`) — `latest_reminder` renders a marker
+///     the encoder does not emit, and unknown roles are engine errors that
+///     forwarding would silently convert into served prompts.
+///   * a `continue_final_message` value that isn't pydantic-coercible — the
+///     engine would 422 the request; the router must not guess false and
+///     forward surgery-mismatched ids for it.
+///   * a history tool call whose `arguments` is not a JSON object (inlined, or
+///     a string that parses to one) — `encode_arguments_to_dsml` raises before
+///     a prompt exists, so forwarding would serve a completion for a request
+///     the engine rejects. BOTH accepted spellings stay forwardable; the
+///     encoder renders them identically, as the engine does.
+///
+/// Every other field either feeds `dsv4::render_request` (mirrored,
+/// including case-normalized roles) or is ignored by the engine's dsv4 path
+/// entirely (identical ids either way).
+///
+/// NOTE (deploy): three router-side settings must match the engine's, because
+/// nothing in the request lets the predicate detect a mismatch — it forwards
+/// wrong-mode ids undetectably:
+///   * `SGLANG_ROUTER_DSV4_DEFAULT_THINKING` /
+///     `SGLANG_ROUTER_DSV4_REASONING_EFFORT` vs the engine's
+///     `SGLANG_DEFAULT_THINKING` / `SGLANG_DSV4_REASONING_EFFORT`
+///     (`--default-chat-template-kwargs`) — a PLAIN request (no mode fields)
+///     carries no field to key on;
+///   * `SGLANG_ROUTER_DSV4_REASONING_EFFORT_PROFILE` vs the profile the engine
+///     resolves from the CHECKPOINT (`chat_encoding.resolve_dsv4_reasoning_
+///     effort_profile`, defaulting to `preview` when detection fails). The
+///     router defaults to `official`; a preview-era checkpoint needs the env
+///     set to `preview`, and a `reasoning_effort` of `high`/`max` carries no
+///     signal distinguishing the two profiles.
+fn input_ids_safe_to_forward_dsv4(value: &serde_json::Value) -> bool {
+    if let Some(v) = value.get("continue_final_message").filter(|v| !v.is_null()) {
+        if crate::tokenizer::openai_bool(v).is_none() {
+            return false;
+        }
+    }
+    let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) else {
+        return true;
+    };
+    for m in msgs {
+        // Only message-level `tools` is a DECLARED protocol field, so only it
+        // can reach the encoder. `wo_eos` / `mask` / `content_blocks` /
+        // `response_format` are undeclared on both message models, which use
+        // pydantic's default `extra="ignore"`, so they are stripped before
+        // `model_dump()` — withholding them bought nothing and cost coverage.
+        if m.get("tools").is_some_and(|v| !v.is_null()) {
+            return false;
+        }
+        // The engine's dsv4 render set. Compared case-insensitively to match
+        // `render_request`'s lowercasing; note only the six GENERIC roles are
+        // case-normalized protocol-side (`user` is a bare Literal), so a
+        // case-varied `user` is a 422 rather than a role this ever sees.
+        let role_ok = m
+            .get("role")
+            .and_then(|r| r.as_str())
+            .map(|r| r.to_ascii_lowercase())
+            .is_none_or(|r| {
+                matches!(
+                    r.as_str(),
+                    "system" | "user" | "developer" | "assistant" | "tool"
+                )
+            });
+        if !role_ok {
+            return false;
+        }
+        if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+            let has_non_text_part = parts
+                .iter()
+                .any(|p| p.get("type").and_then(|t| t.as_str()) != Some("text"));
+            if has_non_text_part {
+                return false;
+            }
+        }
+        // History tool calls: the engine requires `arguments` to BE a JSON
+        // object — inlined, or a string it can `json.loads` into one. Anything
+        // else raises (`JSONDecodeError`, or its `must be a JSON object`
+        // ValueError) before a prompt exists, so forwarding would serve a
+        // completion for a request the engine rejects.
+        if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
+            let all_object_args = calls.iter().all(|c| {
+                match c.get("function").and_then(|f| f.get("arguments")) {
+                    Some(serde_json::Value::String(s)) => {
+                        serde_json::from_str::<serde_json::Value>(s).is_ok_and(|v| v.is_object())
+                    }
+                    Some(serde_json::Value::Object(_)) => true,
+                    // Absent / null / scalar: `arguments` is Optional, so this
+                    // validates, then fails the engine's object check.
+                    _ => false,
+                }
+            });
+            if !all_object_args {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether the router's `input_ids` may be forwarded for this request — the
+/// predicate for NON-dsv4 chat encoders (today: the generic Jinja path). The
+/// dsv4 encoder has its own, far less conservative predicate
+/// [`input_ids_safe_to_forward_dsv4`]; selection between them happens in
+/// [`select_forward_input_ids`] via the ids' stamped parity.
 ///
 /// We forward only when the engine, fed `input_ids`, would have produced the
 /// SAME prompt the router tokenized. When `input_ids` is present the engine
@@ -1571,39 +1737,24 @@ fn build_outgoing_body(
 ///
 /// Replicated-and-safe: plain text `messages` with a string `content`.
 /// Not replicated → omit:
-///   * `tools` / `functions` — the DeepSeek-V4 encoder DOES render tool schemas
-///     for routing, but tool-carrying ids are still withheld from forwarding out
-///     of conservatism: the generic Jinja encoder does not render tools, and even
-///     the dsv4 render has documented per-version edge cases (`py_json` float
-///     formatting, the tool-`arguments` fallback). A safety choice, not "not
-///     rendered".
+///   * `tools` / `functions` — the generic Jinja encoder renders only
+///     `messages`; its ids would omit the tool schemas the engine's template
+///     injects into the prompt.
 ///   * multimodal (array) `content` — a text tokenizer can't represent images.
 ///   * `chat_template` — an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
-///     custom one would diverge. (SGLang ignores it today, but block it so the
-///     offload stays correct across engines / future versions.)
+///     custom one would diverge.
 ///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
 ///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
-///     encoder renders in the engine's default mode only.
+///     Jinja encoder renders in the model's default mode only.
 ///   * `continue_final_message: true`, or a trailing `assistant` message — the
-///     engine rewrites/strips the final assistant turn; the encoder renders it
-///     verbatim.
+///     engine rewrites/strips the final assistant turn; the Jinja encoder
+///     renders it verbatim.
 ///
-/// NOTE: the DeepSeek-V4 encoder renders in the mode
-/// `dsv4::resolve_render_opts` picks — the per-request `chat_template_kwargs`
-/// (thinking/reasoning_effort, which this guard omits from forwarding above) or,
-/// for a plain request, the router's `SGLANG_ROUTER_DSV4_DEFAULT_THINKING` /
-/// `SGLANG_ROUTER_DSV4_REASONING_EFFORT` defaults. So a plain request's forwarded
-/// `input_ids` match the engine ONLY when those router defaults match the engine's
-/// `SGLANG_DEFAULT_THINKING` / `SGLANG_DSV4_REASONING_EFFORT` (i.e.
-/// `--default-chat-template-kwargs`) — keep them in sync at deploy time. A mismatch
-/// forwards wrong-mode ids: the one divergence class this predicate can't detect,
-/// since a plain request carries no mode field to key on (routing itself only
-/// degrades, but a forwarded mismatch reaches the engine — see the deploy runbook).
-/// The same parity assumption covers `add_special_tokens`: the router renders
-/// specials via the chat template, which matches the engine on tokenizers that
-/// auto-add them (the common case); a tokenizer that does not would diverge by a
-/// leading special, again undetectable from the request.
+/// One parity assumption the predicate can't check: the router renders
+/// specials via the template, matching the engine on tokenizers that auto-add
+/// them (the common case); a model whose engine does not would diverge by a
+/// leading special.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value) || request_is_multimodal(value) {
         return false;
@@ -1623,8 +1774,8 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     }
     if value
         .get("continue_final_message")
-        .and_then(|v| v.as_bool())
-        == Some(true)
+        .filter(|v| !v.is_null())
+        .is_some_and(|v| crate::tokenizer::openai_bool(v) != Some(false))
     {
         return false;
     }
@@ -1643,10 +1794,11 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
 ///     tokenization.
 ///
 /// Non-chat-encoder / non-`messages` requests never expected the offload, so
-/// they are not failures. A tools / multimodal / thinking request on a
-/// chat-encoder model still gets engine-equivalent ids (`encode_chat`
-/// succeeded; the safe-predicate withholds forwarding for other reasons), so it
-/// is an expected omission, not a failure.
+/// they are not failures. Requests withheld by the safe-predicates (see
+/// `input_ids_safe_to_forward_dsv4` / `input_ids_safe_to_forward`) still get
+/// engine-equivalent ids (`encode_chat` succeeded; the predicate withholds
+/// forwarding for other reasons), so they too are expected omissions, not
+/// failures.
 fn ingress_tokenize_offload_failed(
     has_chat_encoder: bool,
     request_value: Option<&serde_json::Value>,
@@ -1661,6 +1813,36 @@ fn ingress_tokenize_offload_failed(
         return false;
     }
     !request_tokens.is_some_and(|t| t.engine_equivalent)
+}
+
+/// Whether the dsv4 render pipeline rejects this request outright — the
+/// cases [`crate::tokenizer::dsv4::render_request`] errors on (invalid task,
+/// task without any user/developer message). Such requests are rejected by
+/// the ENGINE identically, so the ingress-encode fallback here is not
+/// offload breakage and must not count in
+/// `sgl_router_ingress_tokenize_errors_total`. Only invoked on the failure
+/// path, where the re-render cost is irrelevant.
+fn dsv4_render_rejects_request(
+    tokenizers: &crate::tokenizer::TokenizerRegistry,
+    model_id: &str,
+    value: Option<&serde_json::Value>,
+) -> bool {
+    if tokenizers.forward_parity(model_id) != crate::tokenizer::ForwardParity::Dsv4Full {
+        return false;
+    }
+    let Some(v) = value else { return false };
+    let Some(messages) = v.get("messages").filter(|m| m.is_array()) else {
+        return false;
+    };
+    let opts = crate::tokenizer::dsv4::resolve_render_opts(v);
+    let parts = crate::tokenizer::dsv4::RequestParts {
+        task: v.get("task").and_then(|t| t.as_str()),
+        continue_final_message: v
+            .get("continue_final_message")
+            .and_then(crate::tokenizer::openai_bool)
+            == Some(true),
+    };
+    crate::tokenizer::dsv4::render_request(messages, v.get("tools"), opts, parts).is_err()
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -2091,6 +2273,222 @@ mod tests {
         );
     }
 
+    /// The central kill switch: with the offload disabled, engine-equivalent
+    /// ids for a perfectly forwardable plain-text chat are still withheld, so
+    /// the engine always re-tokenizes from `messages`.
+    #[test]
+    fn select_forward_input_ids_disabled_gate_withholds_ids() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let tokens = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity: crate::tokenizer::ForwardParity::Conservative,
+        };
+        assert_eq!(
+            select_forward_input_ids(false, Some(&tokens), Some(&value)),
+            None
+        );
+    }
+
+    /// With the offload enabled, plain-text chat with engine-equivalent ids
+    /// forwards them.
+    #[test]
+    fn select_forward_input_ids_enabled_forwards_engine_equivalent_ids() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let tokens = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity: crate::tokenizer::ForwardParity::Conservative,
+        };
+        assert_eq!(
+            select_forward_input_ids(true, Some(&tokens), Some(&value)),
+            Some(&[1, 2, 3][..])
+        );
+    }
+
+    /// Non-engine-equivalent ids (the raw-prompt path — a model with no chat
+    /// encoder, or a chat-encode failure that fell through to raw text) are
+    /// withheld even with the offload enabled and a plain body — the
+    /// `engine_equivalent` conjunct, so this gate can never forward ids the
+    /// engine wouldn't have produced itself.
+    #[test]
+    fn select_forward_input_ids_withholds_non_engine_equivalent_ids() {
+        let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let tokens = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: false,
+            parity: crate::tokenizer::ForwardParity::Conservative,
+        };
+        assert_eq!(
+            select_forward_input_ids(true, Some(&tokens), Some(&value)),
+            None
+        );
+    }
+
+    /// Enabling the offload does NOT bypass the per-request safety predicate:
+    /// unreplicated signals (tools, here) still withhold the ids when the ids
+    /// came from the conservative (Jinja) encoder path.
+    #[test]
+    fn select_forward_input_ids_enabled_still_respects_safe_predicate() {
+        let value = serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]
+        });
+        let tokens = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity: crate::tokenizer::ForwardParity::Conservative,
+        };
+        assert_eq!(
+            select_forward_input_ids(true, Some(&tokens), Some(&value)),
+            None
+        );
+    }
+
+    /// The stamped parity dispatches the predicate: the SAME tool-bearing
+    /// body is withheld for Conservative-stamped ids (Jinja renders no tool
+    /// schemas) but forwarded for Dsv4Full-stamped ids (the dsv4 encoder
+    /// mirrors tool rendering).
+    #[test]
+    fn select_forward_input_ids_dispatches_predicate_by_stamped_parity() {
+        let value = serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]
+        });
+        let conservative = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity: crate::tokenizer::ForwardParity::Conservative,
+        };
+        assert_eq!(
+            select_forward_input_ids(true, Some(&conservative), Some(&value)),
+            None
+        );
+        let dsv4 = RequestTokens {
+            ids: vec![1, 2, 3],
+            engine_equivalent: true,
+            parity: crate::tokenizer::ForwardParity::Dsv4Full,
+        };
+        assert_eq!(
+            select_forward_input_ids(true, Some(&dsv4), Some(&value)),
+            Some(&[1, 2, 3][..])
+        );
+    }
+
+    /// The dsv4 predicate allows exactly the classes the dsv4 encoder mirrors
+    /// (or the engine ignores) — tools, thinking overrides, reasoning_effort,
+    /// task, trailing-assistant/continue-final-message, functions, per-request
+    /// chat_template — so a regression back toward the conservative set would
+    /// silently inert the offload for them.
+    #[test]
+    fn input_ids_safe_to_forward_dsv4_allows_mirrored_classes() {
+        for body in [
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "tools":[{"type":"function","function":{"name":"f"}}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "functions":[{"name":"f"}]}),
+            // BOTH `arguments` spellings the engine accepts and renders
+            // identically (JSON string, and the inlined object its type
+            // permits) stay forwardable.
+            serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+                 {"function":{"name":"f","arguments":"{\"a\": 1}"}}]}]}),
+            serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+                 {"function":{"name":"f","arguments":{"a":1}}}]}]}),
+            // Now mirrored / provably inert, so all of these forward:
+            // the `reasoning` OBJECT (both alias spellings and `enabled`),
+            // and the undeclared message keys pydantic strips.
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "reasoning":{"effort":"high"}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "reasoning":{"enabled":true,"effort":"max"}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "reasoning":{"enabled":false}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning":false}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi","wo_eos":true}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi","mask":true}]}),
+            serde_json::json!({"messages":[{"role":"system","content":"s",
+                               "response_format":{"type":"json_object"}}]}),
+            // Tool-level `defer_loading` is now mirrored, so it stays allowed.
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "tools":[{"type":"function","defer_loading":true,
+                                         "function":{"name":"f"}}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "chat_template_kwargs":{"thinking":true}}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "reasoning_effort":"high"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"query"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"},
+                                           {"role":"assistant","content":"partial"}],
+                               "continue_final_message":true}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"},
+                                           {"role":"assistant","content":"partial"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "chat_template":"custom"}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                               "continue_final_message":"true"}), // pydantic-coercible form
+            // Numeric content and a case-varied role are both 422s at the
+            // protocol boundary (pydantic v2 does not coerce int->str, and
+            // only the six GENERIC roles have a case-normalizer — `user` is a
+            // bare Literal). They are listed as ALLOWED because the predicate
+            // need not withhold what can never reach the engine; the ids are
+            // simply never built for a request the engine rejects.
+            serde_json::json!({"messages":[{"role":"user","content":42}]}),
+            serde_json::json!({"messages":[{"role":"User","content":"hi"}]}),
+        ] {
+            assert!(
+                input_ids_safe_to_forward_dsv4(&body),
+                "dsv4 predicate must allow: {body}"
+            );
+        }
+    }
+
+    /// …and blocks exactly what the encoder cannot mirror: non-text content
+    /// parts (or parts with no type), the engine-internal message keys
+    /// (`wo_eos`, `mask`, `content_blocks`), message-level `tools`, unmirrored
+    /// roles, the `reasoning` object, and an uncoercible
+    /// `continue_final_message`.
+    #[test]
+    fn input_ids_safe_to_forward_dsv4_blocks_unmirrored_classes() {
+        for body in [
+            serde_json::json!({"messages":[{"role":"user",
+                 "content":[{"type":"image_url","image_url":"x"}]}]}),
+            serde_json::json!({"messages":[{"role":"user",
+                 "content":[{"text":"no type key"}]}]}),
+            // `arguments` shapes the engine rejects before a prompt exists:
+            // unparsable, parsing to a non-object, a scalar, and absent.
+            serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+                 {"function":{"name":"f","arguments":"not json"}}]}]}),
+            serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+                 {"function":{"name":"f","arguments":"[1, 2]"}}]}]}),
+            serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+                 {"function":{"name":"f","arguments":5}}]}]}),
+            serde_json::json!({"messages":[{"role":"assistant","tool_calls":[
+                 {"function":{"name":"f"}}]}]}),
+            serde_json::json!({"messages":[{"role":"system","content":"hi",
+                 "tools":[{"type":"function","function":{"name":"f"}}]}]}),
+            serde_json::json!({"messages":[{"role":"latest_reminder","content":"hi"}]}),
+            serde_json::json!({"messages":[{"role":"function","content":"hi"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                 "continue_final_message":"maybe"}),
+        ] {
+            assert!(
+                !input_ids_safe_to_forward_dsv4(&body),
+                "dsv4 predicate must block: {body}"
+            );
+        }
+        // null/absent forms are tolerated (treated as not-present).
+        for body in [
+            serde_json::json!({"messages":[{"role":"user","content":"hi","wo_eos":null}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"hi"}],
+                 "continue_final_message":null}),
+        ] {
+            assert!(
+                input_ids_safe_to_forward_dsv4(&body),
+                "null forms must not block: {body}"
+            );
+        }
+    }
+
     /// `input_ids` are injected and `messages` retained (the engine still
     /// needs them for stop tokens / tool-call constraint / response shape).
     #[test]
@@ -2341,7 +2739,6 @@ mod tests {
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
             serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
@@ -2394,6 +2791,7 @@ mod tests {
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
             engine_equivalent: true,
+            parity: crate::tokenizer::ForwardParity::Conservative,
         };
         assert!(!ingress_tokenize_offload_failed(
             true,
@@ -2420,6 +2818,7 @@ mod tests {
         let tokens = RequestTokens {
             ids: vec![1, 2, 3],
             engine_equivalent: false,
+            parity: crate::tokenizer::ForwardParity::Conservative,
         };
         assert!(ingress_tokenize_offload_failed(
             true,

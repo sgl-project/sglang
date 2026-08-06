@@ -224,6 +224,7 @@ impl AppContext {
                     cache_aware: None,
                     sticky: None,
                     max_output_tokens: None,
+                    forward_input_ids: true,
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {

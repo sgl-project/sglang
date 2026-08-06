@@ -959,6 +959,7 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 max_output_tokens: None,
+                forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -1661,6 +1662,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         let block_size = 4u32;
@@ -1724,6 +1726,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         let raw = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
@@ -1754,6 +1757,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         let block_size = 4u32;
@@ -2781,6 +2785,7 @@ mod tests {
                 &messages,
                 None,
                 crate::tokenizer::dsv4::RenderOpts::chat(),
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
 
@@ -2830,7 +2835,21 @@ mod tests {
             chat_ids, thinking_ids,
             "request_tokens_for must thread chat_template_kwargs.thinking into the render"
         );
-        // The thinking body matches the encoder driven with thinking opts directly.
+        // Pin what the shared resolution produces for that body, THEN drive the
+        // encoder with those pinned values — feeding `resolve_render_opts`'s
+        // output straight in would mirror any resolution regression into the
+        // expectation and the comparison could never fail.
+        let thinking_body = serde_json::json!({
+            "messages": messages.clone(),
+            "chat_template_kwargs": {"thinking": true}
+        });
+        let resolved = crate::tokenizer::dsv4::resolve_render_opts(&thinking_body);
+        assert!(resolved.thinking);
+        assert_eq!(
+            resolved.reasoning_effort,
+            crate::tokenizer::dsv4::ReasoningEffort::Low,
+            "no effort on the request → the `low` env default"
+        );
         let expected_thinking = registry
             .encode_chat(
                 "tiny",
@@ -2838,8 +2857,10 @@ mod tests {
                 None,
                 crate::tokenizer::dsv4::RenderOpts {
                     thinking: true,
-                    reasoning_effort: crate::tokenizer::dsv4::ReasoningEffort::None,
+                    reasoning_effort: crate::tokenizer::dsv4::ReasoningEffort::Low,
+                    reasoning_effort_profile: crate::tokenizer::dsv4::active_effort_profile(),
                 },
+                crate::tokenizer::dsv4::RequestParts::default(),
             )
             .unwrap();
         assert_eq!(thinking_ids, expected_thinking);

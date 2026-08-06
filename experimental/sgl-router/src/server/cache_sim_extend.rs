@@ -93,7 +93,13 @@ pub(crate) struct IngressPrompt {
 /// DSV4-specific — for Jinja-encoder models the renderer ignores thinking
 /// mode, so keep the DSV4-named env defaults unset there or this gate skips
 /// extensions that would have been fine.
+///
+/// Surgery-shaped traffic is additionally disarmed via
+/// [`request_has_extension_unsafe_shape`].
 pub(crate) fn extension_can_match(request: &Value) -> bool {
+    if request_has_extension_unsafe_shape(request) {
+        return false;
+    }
     let opts = crate::tokenizer::dsv4::resolve_render_opts(request);
     if !opts.thinking {
         return true;
@@ -102,6 +108,43 @@ pub(crate) fn extension_can_match(request: &Value) -> bool {
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|a| !a.is_empty())
+}
+
+/// Request/request-message shapes the incremental extension is NOT proven
+/// against, so the tee stays disarmed: `continue_final_message` (pydantic
+/// coerced) or a trailing assistant message (the engine's trailing-assistant
+/// surgery changes where the prompt ends, so prompt-ids ++ reply-suffix no
+/// longer models the next round); request-level `task` or any message-level
+/// `task` (the task transition changes the tail, and the reply's
+/// `prev_has_task` suppression breaks the suffix-vs-full-render comparison);
+/// and the engine-internal message keys the encoder doesn't model (`wo_eos`,
+/// `mask`, `content_blocks`). The next round's full re-encode still measures
+/// these — only the O(output) incremental path is skipped.
+fn request_has_extension_unsafe_shape(request: &Value) -> bool {
+    if request
+        .get("continue_final_message")
+        .filter(|v| !v.is_null())
+        .is_some_and(|v| crate::tokenizer::openai_bool(v) != Some(false))
+    {
+        return true;
+    }
+    if request.get("task").is_some_and(|v| !v.is_null()) {
+        return true;
+    }
+    let Some(msgs) = request.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    if msgs
+        .last()
+        .is_some_and(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+    {
+        return true;
+    }
+    msgs.iter().any(|m| {
+        ["task", "wo_eos", "mask", "content_blocks"]
+            .iter()
+            .any(|k| m.get(k).is_some_and(|v| !v.is_null()))
+    })
 }
 
 /// Spawn the background task that reconstructs the assistant reply(ies) from
@@ -249,11 +292,23 @@ fn full_reencode_extension(
         .get_mut("messages")
         .and_then(Value::as_array_mut)?
         .push(reply);
-    let tokens = request_tokens_for(&ctx.tokenizers, model_id, request);
+    // Reconstruct the ids WITHOUT request-level surgery (`encode_chat_plain`):
+    // the appended reply is the NEXT round's history — an ordinary closed
+    // assistant turn — not this request's trailing continuation. The raw
+    // fallback (`request_tokens_for`) stays for models without a chat encoder.
+    let messages = request.get("messages").unwrap().clone();
+    let opts = crate::tokenizer::dsv4::resolve_render_opts(request);
+    let ids = ctx
+        .tokenizers
+        .encode_chat_plain(&model_id.0, &messages, request.get("tools"), opts);
+    let tokens = match ids {
+        Some(ids) => Some(ids),
+        None => request_tokens_for(&ctx.tokenizers, model_id, request).map(|t| t.ids),
+    };
     if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
         messages.pop();
     }
-    tokens.map(|t| t.ids)
+    tokens
 }
 
 /// `usage.completion_tokens` from a buffered chat response, when present.
@@ -483,6 +538,44 @@ mod tests {
             "messages": [], "chat_template_kwargs": {"thinking": true}, "tools": [],
         });
         assert!(!extension_can_match(&empty_tools));
+    }
+
+    /// Shapes the incremental extension can't model: the prompt tail touches
+    /// engine behaviors (trailing-assistant surgery / task transitions /
+    /// engine-internal message keys) that break the ids ++ reply-suffix
+    /// correspondence. These must disarm even under shapes that would
+    /// otherwise arm (chat mode, or thinking-with-tools).
+    #[test]
+    fn extension_can_match_disarms_surgery_shapes() {
+        let thinking_tools = serde_json::json!({
+            "messages": [{"role":"user","content":"q"}],
+            "chat_template_kwargs": {"thinking": true},
+            "tools": [{"type":"function","function":{"name":"f"}}],
+        });
+        // Baseline arms.
+        assert!(extension_can_match(&thinking_tools));
+
+        for body in [
+            serde_json::json!({"messages":[{"role":"user","content":"q"}],
+                               "continue_final_message":true}),
+            serde_json::json!({"messages":[{"role":"user","content":"q"}],
+                               "continue_final_message":"true"}), // pydantic-coerced too
+            serde_json::json!({"messages":[{"role":"user","content":"q"}],"task":"query"}),
+            serde_json::json!({"messages":[{"role":"user","content":"q","task":"query"}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"q","wo_eos":true}]}),
+            serde_json::json!({"messages":[{"role":"user","content":"q"},
+                                           {"role":"assistant","content":"partial"}],
+                               "continue_final_message":false}),
+        ] {
+            assert!(
+                !extension_can_match(&body),
+                "extension must stay disarmed for: {body}"
+            );
+        }
+        // And null/absent forms stay armed.
+        let cleared = serde_json::json!({"messages":[{"role":"user","content":"q"}],
+                                         "continue_final_message":false, "task":null});
+        assert!(extension_can_match(&cleared));
     }
 
     #[test]
@@ -744,6 +837,7 @@ mod spawn_tests {
                 cache_aware: None,
                 sticky: None,
                 max_output_tokens: None,
+                forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -828,7 +922,13 @@ mod spawn_tests {
         let opts = RenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat(
+                "dsv4",
+                &messages(),
+                None,
+                opts,
+                crate::tokenizer::dsv4::RequestParts::default(),
+            )
             .expect("chat encode");
         let n = prompt_ids.len();
 
@@ -926,7 +1026,13 @@ mod spawn_tests {
         let opts = RenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat(
+                "dsv4",
+                &messages(),
+                None,
+                opts,
+                crate::tokenizer::dsv4::RequestParts::default(),
+            )
             .unwrap();
 
         spawn_extend_tee(
@@ -973,7 +1079,13 @@ mod spawn_tests {
         let opts = RenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat(
+                "dsv4",
+                &messages(),
+                None,
+                opts,
+                crate::tokenizer::dsv4::RequestParts::default(),
+            )
             .unwrap();
         // The request asked for 2; only one choice carries a usable message.
         let req = Bytes::from(
@@ -1026,7 +1138,13 @@ mod spawn_tests {
         let opts = RenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat(
+                "dsv4",
+                &messages(),
+                None,
+                opts,
+                crate::tokenizer::dsv4::RequestParts::default(),
+            )
             .unwrap();
         let req = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -1077,7 +1195,13 @@ mod spawn_tests {
         let opts = RenderOpts::chat();
         let prompt_ids = ctx
             .tokenizers
-            .encode_chat("dsv4", &messages(), None, opts)
+            .encode_chat(
+                "dsv4",
+                &messages(),
+                None,
+                opts,
+                crate::tokenizer::dsv4::RequestParts::default(),
+            )
             .unwrap();
         spawn_extend_tee(
             Arc::clone(&ctx),

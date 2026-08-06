@@ -46,6 +46,7 @@ async fn failover_when_one_worker_dies() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
@@ -188,6 +189,7 @@ async fn retry_recovers_request_that_lands_on_a_dead_worker() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
@@ -335,6 +337,7 @@ async fn retry_skipped_when_the_only_other_worker_is_full() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w_dead.url.clone(), w_live.url.clone()],
@@ -500,6 +503,7 @@ async fn retry_recovers_streaming_request_that_lands_on_a_dead_worker() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
@@ -644,6 +648,7 @@ async fn retry_is_bounded_to_one_when_every_worker_is_dead() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone()],
@@ -795,6 +800,7 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone()],
@@ -911,6 +917,7 @@ async fn retry_skipped_when_only_alternative_is_itl_hot() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w_dead.url.clone(), w_hot.url.clone()],
@@ -1061,6 +1068,7 @@ fn retry_gate_cfg(urls: Vec<String>, attempt_deadline_ms: Option<u64>) -> Config
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig { urls }),
         proxy: ProxyConfig::default(),

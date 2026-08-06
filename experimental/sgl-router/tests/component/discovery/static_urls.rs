@@ -138,6 +138,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             cache_aware: None,
             sticky: None,
             max_output_tokens: None,
+            forward_input_ids: true,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],

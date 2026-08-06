@@ -365,6 +365,12 @@ pub struct ModelConfig {
     /// `NonZeroU64` rules out a `0` cap, which would reject or zero out
     /// every request.
     pub max_output_tokens: Option<NonZeroU64>,
+    /// Whether the chat handler may forward ingress-computed `input_ids` to
+    /// the engine so it skips re-tokenizing (the ingress tokenize offload).
+    /// `false` gates ONLY the engine-facing forward — ingress tokenization
+    /// still runs for routing and the cache-sim tees. Default `true`; the
+    /// `--disable-input-ids-offload` kill switch flips it.
+    pub forward_input_ids: bool,
 }
 
 /// Default [`ModelConfig::tokenizer_shards`]. 8 independent instances is

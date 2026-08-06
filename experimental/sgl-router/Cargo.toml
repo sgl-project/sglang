@@ -71,7 +71,7 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 
 # Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
 # Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so

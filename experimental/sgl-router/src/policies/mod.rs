@@ -34,6 +34,13 @@ pub struct RequestTokens {
     /// template. False for the raw-prompt fallback, where the engine must
     /// tokenize the text itself, so the ids are NOT safe to forward.
     pub engine_equivalent: bool,
+    /// Which forwarding predicate these ids may pass through, stamped at
+    /// production time from the encoder that made them (see
+    /// [`tokenizer::ForwardParity`]). Stamping keeps the encode-time
+    /// provenance attached to the ids — a downstream registry re-lookup could
+    /// pair ids with the wrong encoder's predicate. Meaningful only when
+    /// `engine_equivalent`.
+    pub parity: crate::tokenizer::ForwardParity,
 }
 
 /// Produce the routing tokens — and whether they are engine-equivalent —
@@ -69,12 +76,25 @@ pub fn request_tokens_for(
             // override, else the router's engine-matching default) so the routing
             // tokens still match when the engine runs a non-default thinking mode.
             let opts = crate::tokenizer::dsv4::resolve_render_opts(value);
+            // Request-level dsv4 steering (`task`, `continue_final_message`) —
+            // mirrored by the built-in dsv4 encoder, ignored by Jinja. The
+            // bool is coerced the way pydantic would (`openai_bool`), not
+            // `as_bool` — an engine-true `"true"`/`1` must not render as
+            // router-false while the engine does the surgery.
+            let parts = crate::tokenizer::dsv4::RequestParts {
+                task: value.get("task").and_then(|v| v.as_str()),
+                continue_final_message: value
+                    .get("continue_final_message")
+                    .and_then(crate::tokenizer::openai_bool)
+                    == Some(true),
+            };
             if let Some(ids) =
-                tokenizers.encode_chat(&model_id.0, messages, value.get("tools"), opts)
+                tokenizers.encode_chat(&model_id.0, messages, value.get("tools"), opts, parts)
             {
                 return Some(RequestTokens {
                     ids,
                     engine_equivalent: true,
+                    parity: tokenizers.forward_parity(&model_id.0),
                 });
             }
         }
@@ -84,6 +104,8 @@ pub fn request_tokens_for(
     Some(RequestTokens {
         ids,
         engine_equivalent: false,
+        // Raw fallback ids are never forwarded; the marker is inert.
+        parity: crate::tokenizer::ForwardParity::Conservative,
     })
 }
 

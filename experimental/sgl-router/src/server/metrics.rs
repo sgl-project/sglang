@@ -932,15 +932,26 @@ impl MetricsRegistry {
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
-    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
-    /// router's chat encoder failed: a chat request (`messages`) on a model with
-    /// a chat encoder that did not yield engine-equivalent ids. That request
-    /// silently fell back to engine-side tokenization, defeating the offload —
-    /// the actionable "offload broken" signal. It stays at ~0 in healthy
-    /// operation and climbs only on a real tokenizer problem; successful
-    /// forwards and expected omissions (tools / multimodal / thinking, whose
-    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
-    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    /// Recorded ONLY when the router's chat encoder should have produced
+    /// engine-equivalent ids but didn't: a chat request (`messages`) on a model
+    /// with a chat encoder that yielded NO tokens (chat-encode AND the raw
+    /// fallback failed) or non-engine-equivalent ones (chat-encode failed, raw
+    /// fallback succeeded). In the first case routing/tees get no ids at all;
+    /// in the second they get raw-path ids the cache-aware prefix match no
+    /// longer reflects the engine's tokenization of. Either way the engine
+    /// tokenizes the prompt itself — the actionable "offload broken" signal.
+    /// It stays at ~0 in healthy operation and climbs only on a real tokenizer
+    /// problem; successful forwards and expected omissions (requests whose ids
+    /// are engine-equivalent but withheld by the safe-predicates — dsv4:
+    /// `wo_eos`/`mask`/`content_blocks`/`tools` message keys, non-text content
+    /// parts, unmirrored roles, `reasoning` objects, uncoercible
+    /// `continue_final_message`; other encoders: tools, thinking overrides,
+    /// chat-template overrides, task, multimodal, trailing assistant) are NOT
+    /// counted. Fires even when the
+    /// `--disable-input-ids-offload` kill switch is engaged — it measures
+    /// encoder health, which routing still depends on; deliberate withholding
+    /// by the switch is not a failure and is not counted. Pairs with the
+    /// per-occurrence WARN log in `tokenize_text`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
@@ -1531,7 +1542,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress chat-encode failed; the engine tokenizes the prompt itself, and the ids cache-aware routing/tees consume are raw-path (not engine-equivalent), if any.\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();

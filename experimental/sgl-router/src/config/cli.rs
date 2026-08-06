@@ -79,6 +79,32 @@ pub struct Cli {
     /// the only output bound.
     #[arg(long)]
     pub max_output_tokens: Option<NonZeroU64>,
+    /// Central kill switch for the ingress tokenize offload: when set, the
+    /// router NEVER injects its ingress-computed `input_ids` into the
+    /// forwarded body, so the engine always tokenizes from `messages` itself.
+    /// Ingress tokenization still runs — routing and the cache-sim tees keep
+    /// consuming the ids; only the engine-facing forward is gated. Unset (the
+    /// default) forwards `input_ids` when they are engine-equivalent (chat-
+    /// encoder model) and the request passes `input_ids_safe_to_forward`,
+    /// per `select_forward_input_ids`. Also read from
+    /// `SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD` so the platform can flip it
+    /// via env — an env var an older router (without this flag) simply
+    /// ignores, rather than crash-looping on an unknown CLI flag. Both the
+    /// flag and the env value accept boolish spellings (e.g.
+    /// `true/false/yes/no/on/off/1/0`, case-insensitive — see clap's
+    /// `BoolishValueParser`) — the strict `true`/`false`-only parser would
+    /// crash-loop the rollout on the common `value: "1"` convention this
+    /// env wiring exists to support. An empty or unrecognized env value is
+    /// a startup parse error — unset the var instead of setting it empty.
+    #[arg(
+        long,
+        env = "SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub disable_input_ids_offload: bool,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -544,6 +570,7 @@ impl Cli {
                 cache_aware,
                 sticky,
                 max_output_tokens: self.max_output_tokens,
+                forward_input_ids: !self.disable_input_ids_offload,
             },
             discovery,
             proxy: ProxyConfig {
@@ -670,7 +697,18 @@ mod tests {
             .collect()
     }
 
+    /// Parse under a SHARED env lock, so no sibling test can be mutating
+    /// `SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD` mid-parse. Tests that mutate
+    /// the env hold the lock exclusively and must call [`parse_env_locked`]
+    /// instead — `RwLock` is not reentrant, so re-locking here would deadlock.
     fn into_config_owned(args: Vec<String>) -> Result<Config> {
+        let _shared = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        parse_env_locked(args)
+    }
+
+    /// Parse WITHOUT taking the env lock — for callers already holding it
+    /// exclusively via [`lock_env`].
+    fn parse_env_locked(args: Vec<String>) -> Result<Config> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         into_config(&refs)
     }
@@ -694,6 +732,108 @@ mod tests {
     fn retry_disabled_by_default_in_cli() {
         let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
         assert!(!c.retry.enabled, "retry must be opt-in");
+    }
+
+    /// Serializes env mutation against config parsing. `Cli` declares
+    /// `env = "SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD"`, so EVERY parse reads
+    /// that var — not just the tests that set it. A plain mutex held only by
+    /// the setters is therefore not enough: while one test parks the var at an
+    /// intentionally-invalid value (`"banana"`, to prove startup fails), any
+    /// sibling test parsing in parallel sees it too and fails with a wholly
+    /// unrelated error. Hence a RwLock — mutators take it exclusively, every
+    /// parse takes it shared, so parses still run concurrently with each other.
+    /// Poison-tolerant: a panicking test must neither leak the var nor
+    /// cascade-fail its siblings with a misleading PoisonError.
+    static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Restores SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD on drop, even
+    /// through a panic mid-test.
+    struct EnvReset;
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            std::env::remove_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD");
+        }
+    }
+
+    /// Take the env lock (recovering from poison) and clean slate the var,
+    /// returning a guard pair whose drop removes it again.
+    fn lock_env() -> (std::sync::RwLockWriteGuard<'static, ()>, EnvReset) {
+        let guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD");
+        (guard, EnvReset)
+    }
+
+    #[test]
+    fn input_ids_offload_on_by_default_and_gated_by_flag() {
+        let (_guard, _reset) = lock_env();
+        let on = parse_env_locked(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+        assert!(
+            on.model.forward_input_ids,
+            "the input_ids offload must default to enabled"
+        );
+        let off = parse_env_locked(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--disable-input-ids-offload",
+        ]))
+        .unwrap();
+        assert!(
+            !off.model.forward_input_ids,
+            "--disable-input-ids-offload must gate the forward"
+        );
+    }
+
+    /// The env var is the platform's activation channel: it must gate the
+    /// offload accepting the common Kubernetes `value: "1"` spelling (and
+    /// other boolish forms), and an empty/unrecognized value must be a
+    /// startup parse error — never a silent default.
+    #[test]
+    fn input_ids_offload_gated_by_boolish_env_var() {
+        let (_guard, _reset) = lock_env();
+        for value in ["1", "true", "TRUE", "yes"] {
+            std::env::set_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD", value);
+            let c =
+                parse_env_locked(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+            assert!(
+                !c.model.forward_input_ids,
+                "env value {value:?} must gate the offload"
+            );
+        }
+        for value in ["0", "false", "no"] {
+            std::env::set_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD", value);
+            let c =
+                parse_env_locked(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+            assert!(
+                c.model.forward_input_ids,
+                "env value {value:?} must leave the offload enabled"
+            );
+        }
+        for value in ["", "banana", " 1"] {
+            std::env::set_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD", value);
+            assert!(
+                parse_env_locked(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).is_err(),
+                "env value {value:?} must fail startup parsing, not silently default"
+            );
+        }
+    }
+
+    /// An explicit CLI value is the operator's per-replica escape hatch: it
+    /// overrides the env var (clap's occurrence-beats-env precedence), so a
+    /// single replica can be taken off a platform-wide engaged switch.
+    #[test]
+    fn input_ids_offload_cli_value_overrides_env_var() {
+        let (_guard, _reset) = lock_env();
+        std::env::set_var("SGLANG_ROUTER_DISABLE_INPUT_IDS_OFFLOAD", "1");
+        let c = parse_env_locked(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--disable-input-ids-offload=false",
+        ]))
+        .unwrap();
+        assert!(
+            c.model.forward_input_ids,
+            "--disable-input-ids-offload=false must override the env var"
+        );
     }
 
     #[test]

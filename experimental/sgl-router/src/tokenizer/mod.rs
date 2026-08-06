@@ -26,25 +26,104 @@ pub enum ChatEncoder {
 
 impl ChatEncoder {
     /// Render `messages` (+ the request's top-level `tools`, or `None`) into the
-    /// engine-equivalent prompt text.
+    /// engine-equivalent prompt text. Returns the text plus, when
+    /// `continue_final_message` extracted a trailing assistant turn, its content
+    /// for the caller to encode and append after the prompt ids (the engine's
+    /// `_append_assistant_prefix_to_prompt_ids`).
     ///
     /// The DeepSeek-V4 encoder renders `tools` (see [`dsv4::render_messages`]) so
-    /// cache-aware routing matches the engine's cached blocks for tool traffic.
-    /// The Jinja path does not yet thread `tools` (a tools-carrying request there
-    /// still routes on the no-tools rendering); adding per-model Jinja tool
-    /// rendering is future work.
+    /// cache-aware routing matches the engine's cached blocks for tool traffic,
+    /// and it threads the request-level `parts` (`task`, `continue_final_message`;
+    /// see [`dsv4::render_request`]). The Jinja path does not yet thread
+    /// `tools`/`parts` (a tools-carrying request there still routes on the
+    /// no-tools rendering); adding per-model Jinja tool rendering is future work.
     fn render(
+        &self,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+        opts: dsv4::RenderOpts,
+        parts: dsv4::RequestParts<'_>,
+    ) -> Result<(String, Option<String>)> {
+        match self {
+            // The Jinja path does not thread thinking-mode/tools/parts yet
+            // (future work); it ignores `opts` and `parts` and renders the
+            // model's default template.
+            ChatEncoder::Jinja(t) => t.render(messages).map(|s| (s, None)),
+            ChatEncoder::DeepSeekV4 => {
+                dsv4::render_request(messages, tools, opts, parts).map_err(anyhow::Error::from)
+            }
+        }
+    }
+
+    /// Render WITHOUT request-level surgery (`task` attach, trailing-assistant
+    /// handling). The surgery belongs to ingress REQUEST rendering — where a
+    /// trailing assistant turn is a client continuation; a mid-conversation
+    /// assistant turn must never see it — so the reply-suffix derivation and
+    /// the concat self-check (which model the NEXT round's history, where the
+    /// reply sits mid-conversation) render through this plain path.
+    fn render_plain(
         &self,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
         opts: dsv4::RenderOpts,
     ) -> Result<String> {
         match self {
-            // The Jinja path does not thread thinking-mode/tools yet (future
-            // work); it ignores `opts` and renders the model's default template.
             ChatEncoder::Jinja(t) => t.render(messages),
             ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages, tools, opts)),
         }
+    }
+
+    /// The forwarding-safety contract this encoder's ids satisfy:
+    /// which `input_ids_safe_to_forward`-family predicate may gate them.
+    /// `request_tokens_for` stamps it onto the ids at production time, so the
+    /// provenance travels with the tokens instead of being re-derived
+    /// downstream from another registry lookup.
+    fn forward_parity(&self) -> ForwardParity {
+        match self {
+            // The Jinja encoder needs the conservative predicate (no tool /
+            // thinking / task rendering — see `input_ids_safe_to_forward`).
+            ChatEncoder::Jinja(_) => ForwardParity::Conservative,
+            // The dsv4 encoder mirrors the engine's full dsv4 request
+            // handling (`input_ids_safe_to_forward_dsv4`).
+            ChatEncoder::DeepSeekV4 => ForwardParity::Dsv4Full,
+        }
+    }
+}
+
+/// Which forwarding predicate a chat encoder's ids may pass through (see
+/// [`ChatEncoder::forward_parity`]). Exhaustive by construction: a new
+/// encoder variant forces a decision here, not in scattered call sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardParity {
+    /// `input_ids_safe_to_forward` (tools, thinking overrides, multimodal,
+    /// trailing assistant, … all withheld).
+    Conservative,
+    /// `input_ids_safe_to_forward_dsv4` (only genuinely unmirrored engine
+    /// internals withheld).
+    Dsv4Full,
+}
+
+/// Parse a JSON value the way pydantic v2 (lax mode) coerces an OpenAI
+/// request's boolean field (e.g. `continue_final_message: bool = False`): a
+/// bool as-is; `1`/`0` (numeric) and the strings `true/yes/on/y/t/1` → true,
+/// `false/no/off/n/f/0` → false, case-insensitive. Anything else is `None` —
+/// pydantic would 422 the request, and a caller deciding correctness-sensitive
+/// behavior on such a value must treat it as unknown rather than silently
+/// defaulting it to `false`.
+pub fn openai_bool(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(1.0) => Some(true),
+            Some(0.0) => Some(false),
+            _ => None,
+        },
+        serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "y" | "t" | "1" => Some(true),
+            "false" | "no" | "off" | "n" | "f" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -301,36 +380,114 @@ impl TokenizerRegistry {
         self.encoders.contains_key(model_id)
     }
 
+    /// This model's chat encoder's forwarding parity ([`ForwardParity`]),
+    /// `Conservative` when the model has no encoder at all (whose ids are
+    /// never engine-equivalent anyway).
+    pub fn forward_parity(&self, model_id: &str) -> ForwardParity {
+        self.encoders
+            .get(model_id)
+            .map(|e| e.encoder.forward_parity())
+            .unwrap_or(ForwardParity::Conservative)
+    }
+
     /// Render `messages` through the model's chat encoder, then tokenize the
     /// result the same way the engine does (`add_special_tokens = false`, so the
-    /// encoder's literal `bos_token`/role markers carry the specials). Returns
-    /// `None` — caller falls back to raw routing — when the model has no
-    /// encoder, no tokenizer, or rendering/encoding fails or yields no tokens.
+    /// encoder's literal `bos_token`/role markers carry the specials). `parts`
+    /// carries the request-level dsv4 steering (`task`, `continue_final_message`;
+    /// ignored on the Jinja path). Returns `None` — caller falls back to raw
+    /// routing — when the model has no encoder, no tokenizer, or
+    /// rendering/encoding fails or yields no tokens.
     pub fn encode_chat(
         &self,
         model_id: &str,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
         opts: dsv4::RenderOpts,
+        parts: dsv4::RequestParts<'_>,
     ) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.encoders.get(model_id)?);
         let tokenizer = self.get(model_id)?;
+        let (rendered, assistant_prefix) = entry
+            .encoder
+            .render(messages, tools, opts, parts)
+            .inspect_err(|e| {
+                // A dsv4 RenderErr is a REQUEST error the engine would also
+                // reject (invalid task / task without user), not encoder
+                // breakage — it must not consume the model's one-shot
+                // broken-encoder WARN latch (the engine-facing story continues
+                // at the request level: the engine rejects it identically).
+                if e.downcast_ref::<dsv4::RenderErr>().is_some() {
+                    tracing::debug!(model = %model_id, error = %e,
+                        "dsv4 request-level render error (engine-invalid request)");
+                } else {
+                    // `{e:#}` prints the full anyhow chain, so the underlying
+                    // minijinja cause (e.g. a `raise_exception` message) is
+                    // visible, not just the "render chat template" context.
+                    entry.log_fallback(model_id, &format!("render failed: {e:#}"))
+                }
+            })
+            .ok()?;
+        let mut ids = match adapter::encode(&tokenizer, &rendered) {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => {
+                entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
+                return None;
+            }
+            Err(e) => {
+                entry.log_fallback(model_id, &format!("tokenize failed: {e:#}"));
+                return None;
+            }
+        };
+        // Mirror `_append_assistant_prefix_to_prompt_ids`: the engine encodes
+        // the extracted prefix (stripping a leading BOS its tokenizer may
+        // have added) and appends it after the generation prompt. The router's
+        // encode never adds specials — and the pinned single-user-turn engine
+        // vector (`[0, 128803, …]`, a lone BOS from the literal text) proves
+        // the V4 tokenizer adds none either, making the strip a no-op — so
+        // this plain encode is exactly what the engine appends.
+        if let Some(prefix) = assistant_prefix.filter(|p| !p.is_empty()) {
+            match adapter::encode(&tokenizer, &prefix) {
+                Ok(pids) if !pids.is_empty() => ids.extend(pids),
+                Ok(_) => {
+                    entry.log_fallback(model_id, "assistant prefix tokenized to zero tokens");
+                    return None;
+                }
+                Err(e) => {
+                    entry.log_fallback(model_id, &format!("prefix tokenize failed: {e:#}"));
+                    return None;
+                }
+            }
+        }
+        Some(ids)
+    }
+
+    /// Render WITHOUT request-level surgery and tokenize — the encoding of a
+    /// conversation whose trailing assistant turn is HISTORY (the cache-sim
+    /// extension's full-re-encode fallback reconstructing `messages + [reply]`
+    /// for NEXT-round matching), not an ingress request where that turn is a
+    /// client continuation. `encode_chat`'s surgery (role rewrite / prefix
+    /// extraction) would corrupt exactly that trailing turn; this path keeps
+    /// it an ordinary closed turn. Same fallback semantics as `encode_chat`.
+    pub fn encode_chat_plain(
+        &self,
+        model_id: &str,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+        opts: dsv4::RenderOpts,
+    ) -> Option<Vec<u32>> {
+        let entry = Arc::clone(&*self.encoders.get(model_id)?);
+        let tokenizer = self.get(model_id)?;
         let rendered = entry
             .encoder
-            .render(messages, tools, opts)
-            .inspect_err(|e| {
-                // `{e:#}` prints the full anyhow chain, so the underlying
-                // minijinja cause (e.g. a `raise_exception` message) is
-                // visible, not just the "render chat template" context.
-                entry.log_fallback(model_id, &format!("render failed: {e:#}"))
-            })
+            .render_plain(messages, tools, opts)
+            .inspect_err(|e| entry.log_fallback(model_id, &format!("plain render failed: {e:#}")))
             .ok()?;
         match adapter::encode(&tokenizer, &rendered) {
             Ok(ids) if !ids.is_empty() => Some(ids),
             Ok(_) => {
-                entry.log_fallback(model_id, "rendered prompt tokenized to zero tokens");
+                entry.log_fallback(model_id, "plain render tokenized to zero tokens");
                 None
             }
             Err(e) => {
@@ -449,11 +606,15 @@ fn assistant_turn_suffix(
     reply: &serde_json::Value,
     opts: dsv4::RenderOpts,
 ) -> Option<String> {
+    // Plain render: the reply models a mid-conversation assistant turn in the
+    // NEXT round's history — request-level surgery must not run here (it
+    // would rewrite the trailing turn's role, producing a suffix no next
+    // round ever contains).
     let empty = encoder
-        .render(&serde_json::Value::Array(Vec::new()), None, opts)
+        .render_plain(&serde_json::Value::Array(Vec::new()), None, opts)
         .ok()?;
     let solo = encoder
-        .render(&serde_json::Value::Array(vec![reply.clone()]), None, opts)
+        .render_plain(&serde_json::Value::Array(vec![reply.clone()]), None, opts)
         .ok()?;
     solo.strip_prefix(&empty).map(str::to_owned)
 }
@@ -476,22 +637,27 @@ fn assistant_turn_suffix(
 /// whose prompt render ends in the added tokens `<think>`/`</think>` that
 /// merges cannot cross.
 fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
+    // Probe under the profile this router actually renders with: `high` emits
+    // no preamble under `preview` but the max-preview preamble under
+    // `official`, so a verdict reached under the wrong profile would bless a
+    // render state production never produces.
+    let profile = dsv4::active_effort_profile();
     let opt_variants = [
         dsv4::RenderOpts::chat(),
         dsv4::RenderOpts {
             thinking: true,
             reasoning_effort: dsv4::ReasoningEffort::None,
+            reasoning_effort_profile: profile,
         },
-        // High renders identically to None today, but it is a distinct engine
-        // state — probe it so an engine build that gives `high` its own
-        // rendering can't be silently blessed by a verdict that never saw it.
         dsv4::RenderOpts {
             thinking: true,
             reasoning_effort: dsv4::ReasoningEffort::High,
+            reasoning_effort_profile: profile,
         },
         dsv4::RenderOpts {
             thinking: true,
             reasoning_effort: dsv4::ReasoningEffort::Max,
+            reasoning_effort_profile: profile,
         },
     ];
     let tools_probe = serde_json::json!([{
@@ -523,7 +689,7 @@ fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
     for opts in opt_variants {
         for tools in tool_variants {
             for base in &bases {
-                let Ok(prompt_text) = encoder.render(base, tools, opts) else {
+                let Ok(prompt_text) = encoder.render_plain(base, tools, opts) else {
                     return false;
                 };
                 let Ok(prompt_ids) = adapter::encode(tokenizer, &prompt_text) else {
@@ -533,7 +699,7 @@ fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
                     let mut msgs = base.as_array().expect("probe base is an array").clone();
                     msgs.push(reply.clone());
                     let Ok(full_text) =
-                        encoder.render(&serde_json::Value::Array(msgs), tools, opts)
+                        encoder.render_plain(&serde_json::Value::Array(msgs), tools, opts)
                     else {
                         return false;
                     };
@@ -597,6 +763,7 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 max_output_tokens: None,
+                forward_input_ids: true,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
@@ -811,6 +978,53 @@ mod tests {
             .is_none());
     }
 
+    /// `openai_bool` mirrors pydantic v2 lax bool coercion: bools, 0/1
+    /// numeric, and the string token sets (case-insensitive); everything else
+    /// is unknown, never silently defaulted.
+    #[test]
+    fn openai_bool_matches_pydantic_lax_coercion() {
+        use serde_json::json;
+        for v in [
+            json!(true),
+            json!("true"),
+            json!("TRUE"),
+            json!("yes"),
+            json!("on"),
+            json!("y"),
+            json!("t"),
+            json!("1"),
+            json!(1),
+            json!(1.0),
+        ] {
+            assert_eq!(openai_bool(&v), Some(true), "must be true: {v}");
+        }
+        for v in [
+            json!(false),
+            json!("false"),
+            json!("FALSE"),
+            json!("no"),
+            json!("off"),
+            json!("n"),
+            json!("f"),
+            json!("0"),
+            json!(0),
+            json!(0.0),
+        ] {
+            assert_eq!(openai_bool(&v), Some(false), "must be false: {v}");
+        }
+        for v in [
+            json!(null),
+            json!("maybe"),
+            json!(" 1"),
+            json!(""),
+            json!(2),
+            json!(0.5),
+            json!(-1),
+        ] {
+            assert_eq!(openai_bool(&v), None, "must be unknown: {v}");
+        }
+    }
+
     /// `encode_chat` renders the template then tokenizes the result — and that
     /// token sequence differs from tokenizing the raw message content (the very
     /// reason raw-content hashing missed the engine's chat-templated blocks).
@@ -830,7 +1044,13 @@ mod tests {
 
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         let chat_ids = reg
-            .encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat())
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                dsv4::RenderOpts::chat(),
+                dsv4::RequestParts::default(),
+            )
             .expect("encode_chat");
         assert!(!chat_ids.is_empty());
 
@@ -842,14 +1062,68 @@ mod tests {
         );
 
         // encode_chat is exactly tokenize(render(messages)).
-        let rendered = reg
+        let (rendered, _) = reg
             .encoders
             .get("tiny")
             .unwrap()
             .encoder
-            .render(&messages, None, dsv4::RenderOpts::chat())
+            .render(
+                &messages,
+                None,
+                dsv4::RenderOpts::chat(),
+                dsv4::RequestParts::default(),
+            )
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
+    }
+
+    /// `continue_final_message`: encode_chat's ids are exactly
+    /// `encode(render of messages-minus-trailing-assistant)` followed by
+    /// `encode(extracted prefix)` — the engine's prompt shape for a client
+    /// continuation (prefix appended AFTER the generation prompt, never
+    /// rendered into the assistant turn).
+    #[test]
+    fn encode_chat_appends_extracted_prefix_after_generation_prompt() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+        );
+        reg.attach_chat_encoder_for_test("tiny", ChatEncoder::DeepSeekV4);
+
+        let messages = serde_json::json!([
+            {"role":"user","content":"count: 2 + 2 ="},
+            {"role":"assistant","content":"4, and 3 + 3 ="}
+        ]);
+        let parts = dsv4::RequestParts {
+            task: None,
+            continue_final_message: true,
+        };
+        let got = reg
+            .encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat(), parts)
+            .expect("encode_chat");
+
+        let tok = reg.get("tiny").unwrap();
+        let mut want = adapter::encode(
+            &tok,
+            "<｜begin▁of▁sentence｜><｜User｜>count: 2 + 2 =<｜Assistant｜></think>",
+        )
+        .unwrap();
+        want.extend(adapter::encode(&tok, "4, and 3 + 3 =").unwrap());
+        assert_eq!(got, want);
+
+        // Control: without the flag the SAME messages rewrite the trailing
+        // assistant to a user turn (no prefix, different ids).
+        let without = reg
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                dsv4::RenderOpts::chat(),
+                dsv4::RequestParts::default(),
+            )
+            .expect("encode_chat");
+        assert_ne!(got, without);
     }
 
     /// The incremental extension is byte-identical to a full re-encode of
@@ -882,6 +1156,7 @@ mod tests {
             dsv4::RenderOpts {
                 thinking: true,
                 reasoning_effort: dsv4::ReasoningEffort::Max,
+                reasoning_effort_profile: dsv4::ReasoningEffortProfile::Official,
             },
         ];
         let replies = [
@@ -896,7 +1171,13 @@ mod tests {
         for opts in opt_variants {
             for tools in [None, Some(&tools)] {
                 let prompt_ids = reg
-                    .encode_chat("dsv4", &messages, tools, opts)
+                    .encode_chat(
+                        "dsv4",
+                        &messages,
+                        tools,
+                        opts,
+                        dsv4::RequestParts::default(),
+                    )
                     .expect("encode_chat");
                 for reply in &replies {
                     let inc = reg
@@ -904,8 +1185,11 @@ mod tests {
                         .expect("dsv4 + merge-free fixture must take the incremental path");
                     let mut msgs = messages.as_array().unwrap().clone();
                     msgs.push(reply.clone());
+                    // The comparison target is the PLAIN reconstruction —
+                    // the reply is next-round history, not an ingress
+                    // continuation (request surgery must not run on it).
                     let full = reg
-                        .encode_chat("dsv4", &serde_json::Value::Array(msgs), tools, opts)
+                        .encode_chat_plain("dsv4", &serde_json::Value::Array(msgs), tools, opts)
                         .expect("full re-encode");
                     assert_eq!(
                         inc, full,
@@ -968,7 +1252,13 @@ mod tests {
         assert!(!reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(reg
-            .encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat())
+            .encode_chat(
+                "tiny",
+                &messages,
+                None,
+                dsv4::RenderOpts::chat(),
+                dsv4::RequestParts::default()
+            )
             .is_none());
     }
 
@@ -992,8 +1282,14 @@ mod tests {
         assert!(reg.has_chat_encoder("tiny"));
         let messages = serde_json::json!([{"role":"user","content":"hi"}]);
         assert!(
-            reg.encode_chat("tiny", &messages, None, dsv4::RenderOpts::chat())
-                .is_none(),
+            reg.encode_chat(
+                "tiny",
+                &messages,
+                None,
+                dsv4::RenderOpts::chat(),
+                dsv4::RequestParts::default()
+            )
+            .is_none(),
             "a failing render must yield None so routing falls back to raw text"
         );
     }
