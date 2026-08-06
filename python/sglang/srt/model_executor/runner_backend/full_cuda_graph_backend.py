@@ -93,6 +93,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
+        # Ensure all async JIT compilation and lazy initialization triggered
+        # during warmup completes before entering capture context. Without this,
+        # TVM/DeepGEMM JIT kernels that are still compiling after the 2nd warmup
+        # iteration can issue illegal CUDA driver calls (cuModuleLoadData, etc.)
+        # inside the graph capture region, causing CUDA_ERROR_ILLEGAL_ADDRESS or
+        # cudaErrorStreamCaptureUnsupported. This predominantly affects compact
+        # ragged-verify mode where each new non-uniform verify_lens shape triggers
+        # fresh JIT compilation of compressor/norm_rope kernels.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
         graph = torch.cuda.CUDAGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]
