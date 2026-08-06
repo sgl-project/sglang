@@ -11,6 +11,7 @@ resources:
   - network-policy.yaml
   - autoscaling.yaml
   - gpu-scheduled-scaling.yaml
+  - gpu-capacity-scaler.yaml
   - h100-denoiser.yaml
   - l4-vae.yaml
   - gateway-service.yaml

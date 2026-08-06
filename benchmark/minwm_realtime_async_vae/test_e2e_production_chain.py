@@ -11,7 +11,7 @@ from e2e_production_chain import (
 def _result():
     return {
         "hardware": {
-            "denoiser": {"instance_type": "p5.4xlarge", "gpu": "H100", "count": 1},
+            "denoiser": {"instance_type": "p5.48xlarge", "gpu": "H100", "count": 8},
             "vae": {"instance_type": "g6.2xlarge", "gpu": "L4", "count": 1},
         },
         "runs": [
@@ -64,3 +64,22 @@ def test_chinese_report_contains_hardware_concurrency_and_stage_timings():
     assert "Denoise" in report
     assert "VAE Decode" in report
     assert "Display Lag" in report
+
+
+def test_chinese_report_accepts_runtime_hardware_and_client_action_fields():
+    result = _result()
+    result["hardware"]["denoiser"].pop("count")
+    result["hardware"]["denoiser"]["worker_count"] = 8
+    result["hardware"]["vae"].pop("count")
+    result["hardware"]["vae"]["gpu_count"] = 1
+    result["runs"][0]["action_to_first_frame_ms"] = {}
+    result["runs"][0]["client_observed_action_to_first_frame_ms"] = {
+        "p50": 640.0,
+        "p95": 700.0,
+    }
+
+    report = render_chinese_report(result, run_id="run-runtime")
+
+    assert "| Denoiser | p5.48xlarge | H100 | 8 |" in report
+    assert "| VAE | g6.2xlarge | L4 | 1 |" in report
+    assert "700.0 ms" in report

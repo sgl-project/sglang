@@ -8,6 +8,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from uuid import uuid4
 
 import torch
 import uvicorn
@@ -30,6 +31,11 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_worker import (
     AsyncVAEWorker,
     SessionOpen,
     TAEHVEngine,
+)
+from sglang.multimodal_gen.runtime.realtime.worker_reservation import (
+    WorkerReservationRegistry,
+    install_worker_reservation_routes,
+    resolve_worker_epoch,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
     log_realtime_trace,
@@ -60,13 +66,21 @@ async def _bind_socket_session(
     return opened.session_id, opened.generation_id
 
 
-def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
+def create_app(
+    worker: AsyncVAEWorker,
+    *,
+    max_message_bytes: int,
+    reservation_registry: WorkerReservationRegistry | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
         await worker.close_all()
 
     app = FastAPI(lifespan=lifespan)
+    if reservation_registry is not None:
+        reservation_registry.set_load_provider(worker.runtime_state)
+        install_worker_reservation_routes(app, reservation_registry)
 
     @app.get("/health")
     async def health():
@@ -88,6 +102,9 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
         identity = None
         trace_session = None
         output_client = None
+        reservation_token = None
+        reservation_owner = uuid4().hex
+        reservation_consumed = False
         send_lock = asyncio.Lock()
         finish_tasks: set[asyncio.Task] = set()
 
@@ -114,6 +131,18 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                         output_url=message.get("output_url"),
                         output_token=message.get("output_token"),
                     )
+                    if reservation_registry is not None:
+                        reservation_token = str(
+                            message.get("coordinator_token") or ""
+                        )
+                        await reservation_registry.consume(
+                            reservation_token,
+                            session_id=opened.session_id,
+                            generation_id=opened.generation_id,
+                            worker_epoch=str(message.get("worker_epoch") or ""),
+                            owner_id=reservation_owner,
+                        )
+                        reservation_consumed = True
                     if bool(opened.output_url) != bool(opened.output_token):
                         raise ProtocolViolation(
                             "output_url and output_token must be provided together"
@@ -211,20 +240,23 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                         output_direct=output_client is not None,
                     )
 
+                async def on_decode_started(*, header=header):
+                    await send(
+                        encode_message(
+                            "latent_accepted",
+                            session_id=header.session_id,
+                            generation_id=header.generation_id,
+                            request_id=header.request_id,
+                            chunk_index=header.chunk_index,
+                            next_credit_chunk_index=header.chunk_index + 1,
+                        )
+                    )
+
                 future = await worker.submit(
                     header,
                     latents,
                     on_frame_batch=on_frame_batch,
-                )
-                await send(
-                    encode_message(
-                        "latent_accepted",
-                        session_id=header.session_id,
-                        generation_id=header.generation_id,
-                        request_id=header.request_id,
-                        chunk_index=header.chunk_index,
-                        next_credit_chunk_index=header.chunk_index + 1,
-                    )
+                    on_decode_started=on_decode_started,
                 )
 
                 async def finish_chunk(future=future, header=header):
@@ -255,6 +287,30 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                             duration_ms=round(result.encode_ms, 3),
                             **common_trace,
                         )
+                        if output_client is not None:
+                            completion_started = time.perf_counter()
+                            await output_client.send(
+                                encode_message(
+                                    "media_chunk_complete",
+                                    session_id=header.session_id,
+                                    generation_id=header.generation_id,
+                                    request_id=header.request_id,
+                                    chunk_index=header.chunk_index,
+                                    event_id=header.event_id,
+                                    num_frames=result.num_frames,
+                                )
+                            )
+                            log_realtime_trace(
+                                logger,
+                                trace_session,
+                                "server.vae_media_completion_accepted",
+                                duration_ms=round(
+                                    (time.perf_counter() - completion_started)
+                                    * 1000,
+                                    3,
+                                ),
+                                **common_trace,
+                            )
                         await send(
                             encode_message(
                                 "chunk_complete",
@@ -269,6 +325,14 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                             )
                         )
                     except Exception as exc:
+                        logger.exception(
+                            "VAE chunk completion failed: session_id=%s "
+                            "generation_id=%s request_id=%s chunk_index=%s",
+                            header.session_id,
+                            header.generation_id,
+                            header.request_id,
+                            header.chunk_index,
+                        )
                         await send(
                             encode_message(
                                 "error",
@@ -296,6 +360,15 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
             except Exception:
                 pass
         finally:
+            if (
+                reservation_registry is not None
+                and reservation_token is not None
+                and reservation_consumed
+            ):
+                await reservation_registry.release(
+                    reservation_token,
+                    owner_id=reservation_owner,
+                )
             for task in finish_tasks:
                 task.cancel()
             if finish_tasks:
@@ -320,6 +393,7 @@ def main() -> None:
     parser.add_argument("--queue-depth-per-session", type=int, default=1)
     parser.add_argument("--encoded-frames-per-batch", type=int, default=1)
     parser.add_argument("--max-message-mb", type=int, default=64)
+    parser.add_argument("--worker-epoch")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -336,7 +410,15 @@ def main() -> None:
         queue_depth_per_session=args.queue_depth_per_session,
         encoded_frames_per_batch=args.encoded_frames_per_batch,
     )
-    app = create_app(worker, max_message_bytes=args.max_message_mb * 1024 * 1024)
+    reservations = WorkerReservationRegistry(
+        worker_epoch=resolve_worker_epoch(args.worker_epoch),
+        capacity=args.max_sessions,
+    )
+    app = create_app(
+        worker,
+        max_message_bytes=args.max_message_mb * 1024 * 1024,
+        reservation_registry=reservations,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

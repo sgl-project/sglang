@@ -34,6 +34,11 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.realtime.worker_reservation import (
+    WorkerReservationRegistry,
+    install_worker_reservation_routes,
+    resolve_worker_epoch,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_async_client_warmup,
@@ -390,6 +395,7 @@ def create_app(server_args: ServerArgs):
             warmup_done is not None
             and not warmup_done.is_set()
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
+            and not request.url.path.startswith("/v1/realtime_worker/")
         ):
             await warmup_done.wait()
         return await call_next(request)
@@ -406,6 +412,14 @@ def create_app(server_args: ServerArgs):
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
+
+    install_worker_reservation_routes(
+        app,
+        WorkerReservationRegistry(
+            worker_epoch=resolve_worker_epoch(),
+            capacity=server_args.realtime_max_sessions_per_worker,
+        ),
+    )
 
     app.state.server_args = server_args
     return app

@@ -47,12 +47,36 @@
     let events = [];
     let eventKeys = new Set();
     let chunks = new Map();
+    let aggregate = null;
+    let aggregateMetricSignature = "";
 
     function reset(nextTraceId = "") {
       traceId = String(nextTraceId || "");
       events = [];
       eventKeys = new Set();
       chunks = new Map();
+      aggregate = null;
+      aggregateMetricSignature = "";
+    }
+
+    function setAggregate(nextAggregate) {
+      if (!nextAggregate || !Array.isArray(nextAggregate.stages)) return false;
+      if (traceId && nextAggregate.trace_id && nextAggregate.trace_id !== traceId) {
+        return false;
+      }
+      if (!traceId && nextAggregate.trace_id) traceId = String(nextAggregate.trace_id);
+      const nextSignature = JSON.stringify(nextAggregate.stages.map((stage) => [
+        stage.id,
+        stage.count,
+        stage.avg_ms,
+        stage.p50_ms,
+        stage.p95_ms,
+        stage.max_ms,
+      ]));
+      const changed = nextSignature !== aggregateMetricSignature;
+      aggregate = nextAggregate;
+      aggregateMetricSignature = nextSignature;
+      return changed;
     }
 
     function addEvent(rawEvent, receivedPerfMs = 0) {
@@ -95,8 +119,8 @@
         sortedChunks,
         latestTimedChunk(sortedChunks) || latestObservedChunk,
       );
-      const nodes = buildNodes(latestChunk, events);
-      const edges = buildEdges(latestChunk, events);
+      const nodes = buildNodes(latestChunk, events, aggregate);
+      const edges = buildEdges(latestChunk, events, aggregate);
       return {
         traceId,
         eventCount: events.length,
@@ -106,12 +130,13 @@
         latestChunk,
         nodes,
         edges,
+        aggregate,
         asyncEstimate: estimateAsyncVae(latestChunk, transferBudgetMs),
       };
     }
 
     reset(options.traceId || "");
-    return { addEvent, reset, summary };
+    return { addEvent, reset, setAggregate, summary };
   }
 
   function normalizeTraceEvent(rawEvent, receivedPerfMs = 0) {
@@ -221,27 +246,47 @@
     }
   }
 
-  function buildNodes(latestChunk, events) {
+  function buildNodes(latestChunk, events, aggregate) {
     const latestByStage = latestEventsByStage(events);
+    const aggregateByStage = new Map(
+      (aggregate?.stages || []).map((stage) => [String(stage.id || ""), stage]),
+    );
     return STAGES.map((stage) => {
       const event = latestByStage.get(stage.id);
-      const metric = stageMetric(stage.id, latestChunk, event);
+      const stageAggregate = aggregateByStage.get(stage.id);
+      const metric = aggregateMetric(stageAggregate)
+        || stageMetric(stage.id, latestChunk, event);
       return {
         ...stage,
         metric,
-        status: event ? "active" : "idle",
+        status: Number(stageAggregate?.count || 0) > 0 || event ? "active" : "idle",
       };
     });
   }
 
-  function buildEdges(latestChunk, events) {
+  function buildEdges(latestChunk, events, aggregate) {
+    const aggregateByStage = new Map(
+      (aggregate?.stages || []).map((stage) => [String(stage.id || ""), stage]),
+    );
     const edges = [];
     for (let i = 0; i < STAGES.length - 1; i += 1) {
       const from = STAGES[i].id;
       const to = STAGES[i + 1].id;
-      edges.push({ from, to, label: edgeMetric(from, to, latestChunk, events) });
+      const aggregateLabel = aggregateMetric(aggregateByStage.get(to));
+      edges.push({
+        from,
+        to,
+        label: aggregateLabel || edgeMetric(from, to, latestChunk, events),
+      });
     }
     return edges;
+  }
+
+  function aggregateMetric(stage) {
+    if (!stage || Number(stage.count || 0) <= 0) return "";
+    const p50 = formatTraceDuration(stage.p50_ms);
+    const p95 = formatTraceDuration(stage.p95_ms);
+    return `p50 ${p50} · p95 ${p95}`;
   }
 
   function latestEventsByStage(events) {

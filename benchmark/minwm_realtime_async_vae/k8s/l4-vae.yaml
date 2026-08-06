@@ -80,6 +80,43 @@ spec:
           operator: Equal
           value: "true"
           effect: NoSchedule
+      initContainers:
+        - name: vae-heartbeat
+          image: REPLACE_WITH_VAE_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
+              --coordinator-url=http://minwm-realtime-coordinator:18081
+              --health-url=http://127.0.0.1:18081/health
+              --state-url=http://127.0.0.1:18081/v1/realtime_worker/state
+              --worker-id=$(POD_UID)
+              --worker-epoch-file=/var/run/minwm-worker/epoch
+              --role=vae
+              --endpoint=ws://$(POD_IP):18081/v1/realtime_vae/decode
+              --reservation-endpoint=http://$(POD_IP):18081/v1/realtime_worker
+              --node-name=$(NODE_NAME)
+              --capacity=16
+              --model-revision=all
+              --vae-fingerprint=taew2_2-d053e216
+              --interval-s=5
+          env:
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+          volumeMounts:
+            - {name: worker-epoch, mountPath: /var/run/minwm-worker, readOnly: true}
       containers:
         - name: vae
           image: REPLACE_WITH_VAE_IMAGE_DIGEST
@@ -90,11 +127,14 @@ spec:
             - --dtype=bfloat16
             - --max-sessions=16
             - --queue-depth-per-session=1
-            - --encoded-frames-per-batch=1
+            # One transport message per regular 16-frame chunk avoids
+            # high-RTT per-message backpressure on remote browser links.
+            - --encoded-frames-per-batch=16
             - --max-message-mb=64
             - --host=0.0.0.0
             - --port=18081
           env:
+            - {name: WORKER_EPOCH_FILE, value: /var/run/minwm-worker/epoch}
             - {name: OTEL_SERVICE_NAME, value: minwm-realtime-vae}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://minwm-realtime-adot:4317
@@ -102,6 +142,24 @@ spec:
               value: service.namespace=minwm,deployment.environment=production,worker.role=vae
           ports:
             - {name: vae, containerPort: 18081}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -ec
+                  - |
+                    deadline=$(( $(date +%s) + 50 ))
+                    curl --fail --silent --max-time 3 \
+                      -H 'content-type: application/json' \
+                      --data "{\"deadline\":${deadline}}" \
+                      http://127.0.0.1:18081/v1/realtime_worker/drain
+                    for _ in $(seq 1 23); do
+                      state=$(curl --fail --silent --max-time 2 \
+                        http://127.0.0.1:18081/v1/realtime_worker/state) || break
+                      echo "${state}" | grep -q '"active_sessions":0' && break
+                      sleep 2
+                    done
           startupProbe:
             httpGet: {path: /health, port: vae}
             periodSeconds: 10
@@ -129,33 +187,8 @@ spec:
               memory: 28Gi
               ephemeral-storage: 40Gi
               nvidia.com/gpu: "1"
-        - name: vae-heartbeat
-          image: REPLACE_WITH_VAE_IMAGE_DIGEST
-          imagePullPolicy: IfNotPresent
-          command: [/bin/sh, -ec]
-          args:
-            - >-
-              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
-              --coordinator-url=http://minwm-realtime-coordinator:18081
-              --health-url=http://127.0.0.1:18081/health
-              --worker-id=$(POD_UID)
-              --role=vae
-              --endpoint=ws://$(POD_IP):18081/v1/realtime_vae/decode
-              --node-name=$(NODE_NAME)
-              --capacity=16
-              --model-revision=all
-              --vae-fingerprint=taew2_2-d053e216
-              --interval-s=5
-          env:
-            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
-            - name: POD_UID
-              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
-            - name: POD_IP
-              valueFrom: {fieldRef: {fieldPath: status.podIP}}
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-          resources:
-            requests: {cpu: 25m, memory: 64Mi}
-            limits: {cpu: 200m, memory: 256Mi}
+          volumeMounts:
+            - {name: worker-epoch, mountPath: /var/run/minwm-worker}
+      volumes:
+        - name: worker-epoch
+          emptyDir: {}

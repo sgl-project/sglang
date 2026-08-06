@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import sys
 
 from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints.realtime_coordinator_server import (
+    _parse_args,
     create_app,
 )
 from sglang.multimodal_gen.runtime.realtime.coordinator import (
@@ -25,15 +27,30 @@ def test_coordinator_http_session_lifecycle_and_structured_rejection(caplog):
             "/v1/workers/heartbeat",
             json={
                 "worker_id": f"{role}-a",
+                "worker_epoch": f"{role}-epoch",
                 "role": role,
                 "endpoint": f"ws://{role}-a.cluster.local/generate",
+                "reservation_endpoint": (
+                    f"http://{role}-a.cluster.local/v1/realtime_worker"
+                ),
                 "az": "us-east-2a",
                 "capacity": 1,
                 "model_revision": "minwm-r1",
                 "vae_fingerprint": "taew2_2",
+                "lifecycle": "ready",
+                "active_sessions": 0,
+                "runnable_sessions": 0,
+                "blocked_sessions": 0,
+                "queue_depth": 0,
+                "service_time_ms": 0,
             },
         )
         assert response.status_code == 204
+
+    capacity = client.get("/v1/capacity")
+    assert capacity.status_code == 200
+    assert capacity.json()["roles"]["denoiser"]["free_slots"] == 1
+    assert capacity.json()["roles"]["vae"]["free_slots"] == 1
 
     request = {
         "user_id": "user-a",
@@ -48,6 +65,7 @@ def test_coordinator_http_session_lifecycle_and_structured_rejection(caplog):
     assert response.status_code == 200
     assignment = response.json()
     assert assignment["denoiser"]["worker_id"] == "denoiser-a"
+    assert assignment["denoiser"]["worker_epoch"] == "denoiser-epoch"
     assert assignment["vae"]["worker_id"] == "vae-a"
     assert '"event":"coordinator.admit_complete"' in caplog.text
     assert '"trace_id":"trace-a"' in caplog.text
@@ -64,3 +82,9 @@ def test_coordinator_http_session_lifecycle_and_structured_rejection(caplog):
     released = client.request("DELETE", "/v1/sessions/release", json=renewed.json())
     assert released.status_code == 204
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_coordinator_cli_bounds_worker_reservation_calls(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["realtime_coordinator_server"])
+
+    assert _parse_args().worker_reservation_timeout_s == 2.0

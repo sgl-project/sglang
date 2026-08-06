@@ -22,6 +22,7 @@ Dry run only. The following bounded resources would be deleted:
 - NodePools: ${NODEPOOLS[*]}
 - EC2NodeClass/minwm-model-artifact-publisher
 - PersistentVolume/minwm-async-west-s3-pv
+- PersistentVolume/minwm-async-east-s3-source-pv
 - CloudFormation stack ${STACK_NAME} when DELETE_CONTROL_PLANE=1
 
 Retained intentionally:
@@ -52,6 +53,7 @@ done
 kubectl delete ec2nodeclass.karpenter.k8s.aws/minwm-model-artifact-publisher \
   --ignore-not-found --wait=true
 kubectl delete persistentvolume/minwm-async-west-s3-pv --ignore-not-found --wait=true
+kubectl delete persistentvolume/minwm-async-east-s3-source-pv --ignore-not-found --wait=true
 
 for _ in $(seq 1 60); do
   NODE_COUNT="$(kubectl get nodes -l "${LABEL}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"

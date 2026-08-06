@@ -21,13 +21,31 @@ Coordinator 负责全局准入、Worker 配对、容量槽 Lease 和 Session 生
 持有公网 WebSocket，但不持有 GPU KV。Denoiser 只产生 latent，VAE 直接把编码后帧发送
 到当前 Gateway 实例，媒体数据不绕回 Denoiser。
 
+### 1.1 代码实现状态（2026-08-06）
+
+| 能力 | 当前实现 |
+| --- | --- |
+| 多用户准入 | Gateway 有界等待队列；Coordinator 使用 DynamoDB 用户/Session/slot Lease |
+| 两阶段预留 | Coordinator 先持久化 Lease，再向 Denoiser/VAE 幂等预留；部分失败回滚 |
+| 粘性与 fencing | Session 固定绑定一个 Denoiser 和一个 VAE；token、generation、Worker epoch 同时校验 |
+| Worker 生命周期 | heartbeat 上报 load/lifecycle/epoch；preStop 进入 Drain；失联或 epoch 变化使 renew 失败 |
+| 异步 VAE | 每 Session 有界 latent 队列；进入全局 Decode actor 后才返 credit；VAE 跨 Session 公平排队 |
+| 弹性 | 定时 scale-to-zero/预热与 Coordinator shared-capacity 事件扩容同时存在；缩容前检查 active/queued/draining |
+| Trace | 视频 WS 不承载 Trace；浏览器批量 HTTP 上报，查询页按需读取 CloudWatch 最近 5 分钟聚合 |
+| 发布 | digest、模型 `_READY`、DynamoDB schema/TTL、日志保留期门禁；失败时原地 SSA 滚动恢复发布前 spec |
+| 身份安全 | 按本阶段范围交由上游内部服务；本实现不作为公网认证边界 |
+
+真实 H100 Spot + L4 的最终并发、延迟和故障数据必须写入独立测试报告；在报告产生前，
+本文只描述行为约束，不用单机模拟值替代生产结论。
+
 ## 2. 角色化预打包镜像
 
-使用一个多阶段 BuildKit Dockerfile 生成三个不可变 ECR 镜像：
+使用一个多阶段 BuildKit Dockerfile 生成四个不可变 ECR 镜像：
 
 | 镜像 | 包含内容 | 不包含内容 |
 | --- | --- | --- |
 | Gateway | WebUI、WebSocket Gateway、Trace Query API、Coordinator Client | CUDA、模型权重 |
+| Coordinator | Session/Worker Lease、DynamoDB Client、容量聚合 API | CUDA、模型权重、媒体转发 |
 | Denoiser | CUDA/PyTorch、SGLang Diffusion、MinWM Converter、Denoiser Runtime | TAEHV Session state |
 | VAE | CUDA/PyTorch、TAEHV、校验后的 `taew2_2.pth`、VAE Runtime | MinWM DiT checkpoint |
 
@@ -89,7 +107,7 @@ Session，禁止无界占用内存。
 视频 WebSocket 只允许以下业务消息：
 
 - Generate Init、Action、Prompt、Heartbeat、Close。
-- Session Ready/Error、必要控制 ACK、Chunk Stats。
+- Session Ready/Error 与必要控制 ACK。
 - FrameBatch 媒体数据。
 
 服务端 Trace 不再进入视频 WebSocket。Gateway、Coordinator、Denoiser、VAE 使用 OTLP
@@ -149,7 +167,8 @@ Timeline 模式保持不丢帧。Live 模式允许丢弃已经过时的旧 Actio
    未达标，报告必须分离 server-to-gateway 与 browser queue 两部分证据。
 7. 完成单用户正确性、至少 4 并发 Session、Action/Prompt 更新、异常断开和 Worker
    故障测试。
-8. 测试结束后删除 GPU NodePool、Pod、NLB 和临时 Trace 资源，并确认没有残留计费 GPU。
+8. 本轮测试完成后保留 H100 Spot、L4、控制面和 NLB 供人工验证；只有收到明确清理指令后
+   才执行释放，并在释放后确认计费 GPU 为 0。
 
 ## 9. 基础设施、权限与数据生命周期
 
@@ -177,16 +196,22 @@ flowchart LR
     Artifact --> Apply["Server-side apply 生产拓扑"]
     Apply --> Probe["真实浏览器 + 1/4 并发验收"]
     Probe --> Report["中文结果报告"]
-    Report --> Cleanup["删除 NLB、GPU NodePool 与测试栈"]
+    Report --> Hold["保留服务供人工验证"]
+    Hold --> Cleanup["收到明确指令后再释放"]
 ```
 
 部署脚本在 apply 前执行只读门禁：DynamoDB 必须存在、Trace Log Group 必须是 5 天、模型
 `_READY` 必须存在、所有镜像必须是 SHA-256 digest，且渲染后不能残留 placeholder。
 
-应用回滚只替换角色镜像 digest；模型回滚只替换 `MODEL_ARTIFACT_REVISION`。Coordinator
-Schema 保持向后兼容。GPU Worker 不做状态迁移，回滚或 Spot 中断只影响绑定 Session，用户
-重试后重新准入。清理脚本必须验证测试标签 Node 数量为 0、NLB 已删除且 namespace 无残留；
-ECR 和模型制品保留，以避免下一次重复构建与转换成本。
+应用失败时使用发布前 workload spec 做原地 Server-Side Apply。CPU Deployment
+保持 Kubernetes 滚动恢复；Denoiser StatefulSet 使用 `Parallel + OnDelete`，发布和回滚
+都按 2 个 Pod 一批执行 `2 -> 2 -> 2 -> 2` 替换。每批必须确认旧 Pod 已删除、同名新
+Pod 已创建且全部 Ready，才允许进入下一批，因此正常发布期间至少保留 6 张 H100 服务。
+发布窗口内承载 Denoiser 的节点临时标记 `karpenter.sh/do-not-disrupt`，避免节点因短暂空闲
+被回收。宿主机 `flock` 同样把高内存冷加载并发限制为 2，与滚动批大小保持一致。
+Coordinator Schema 保持向后兼容。GPU Worker 不做状态迁移，回滚或 Spot 中断
+只影响绑定 Session，用户重试后重新准入。清理脚本只能在明确指令后执行，并必须验证计费
+GPU、NLB 与 namespace 残留；ECR 和模型制品默认保留以降低下次部署成本。
 
 ## 11. 运维门禁与扩容路径
 

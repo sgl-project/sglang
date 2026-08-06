@@ -263,6 +263,8 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
             output_url="ws://gateway/v1/internal/realtime_output/s",
             output_token="output-secret",
             trace_id="trace-a",
+            coordinator_token="coordinator-secret",
+            worker_epoch="vae-epoch",
         )
         assert connect_kwargs["compression"] is None
         session_open = decode_message(await socket.sent.get())
@@ -270,6 +272,8 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
         assert session_open["output_url"].startswith("ws://gateway/")
         assert session_open["output_token"] == "output-secret"
         assert session_open["trace_id"] == "trace-a"
+        assert session_open["coordinator_token"] == "coordinator-secret"
+        assert session_open["worker_epoch"] == "vae-epoch"
 
         received_batches = []
         submit_task = asyncio.create_task(
@@ -396,6 +400,26 @@ def test_gateway_output_client_binds_identity_and_sends_frames_directly():
         )
         await client.send(frame)
         assert await socket.sent.get() == frame
+        completion = encode_message(
+            "media_chunk_complete",
+            session_id="s",
+            generation_id="g",
+            request_id="r0",
+            chunk_index=0,
+            num_frames=1,
+        )
+        await socket.received.put(
+            encode_message(
+                "media_chunk_complete_accepted",
+                session_id="s",
+                generation_id="g",
+                request_id="r0",
+                chunk_index=0,
+            )
+        )
+        await client.send(completion)
+        assert await socket.sent.get() == completion
+        assert socket.received.empty()
         await client.close()
         assert socket.closed
 

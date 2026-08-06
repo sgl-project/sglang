@@ -124,6 +124,14 @@ def test_realtime_generate_does_not_start_a_trace_websocket_sender():
     assert "_send_realtime_trace_events" not in source
     assert "trace_task" not in source
     assert '"type": "trace_events"' not in inspect.getsource(realtime_video_api)
+    assert "_send_realtime_chunk_stats" not in inspect.getsource(realtime_video_api)
+
+
+def test_realtime_init_keeps_client_trace_off_the_video_websocket():
+    assert "client_trace" not in RealtimeVideoGenerationsRequest.model_fields
+    session = GenerateSession()
+    assert not hasattr(session, "client_trace")
+    assert "client_trace=session" not in inspect.getsource(realtime_video_api)
 
 
 def test_gateway_managed_session_uses_coordinator_identity_and_routes():
@@ -133,7 +141,9 @@ def test_gateway_managed_session_uses_coordinator_identity_and_routes():
             "session_id": "session-a",
             "generation_id": "generation-a",
             "coordinator_token": "lease-secret",
+            "worker_epoch": "denoiser-epoch",
             "realtime_vae_worker_url": "ws://vae-a/decode",
+            "realtime_vae_worker_epoch": "vae-epoch",
             "gateway_output_url": "ws://gateway-a/output",
             "gateway_output_token": "output-secret",
         }
@@ -141,7 +151,9 @@ def test_gateway_managed_session_uses_coordinator_identity_and_routes():
     config = realtime_video_api._gateway_managed_config(websocket)
     assert config.session_id == "session-a"
     assert config.generation_id == "generation-a"
+    assert config.worker_epoch == "denoiser-epoch"
     assert config.vae_worker_url == "ws://vae-a/decode"
+    assert config.vae_worker_epoch == "vae-epoch"
     assert config.output_url == "ws://gateway-a/output"
 
     session = GenerateSession(
@@ -150,6 +162,14 @@ def test_gateway_managed_session_uses_coordinator_identity_and_routes():
     )
     assert session.id == "session-a"
     assert session.generation_id == "generation-a"
+
+
+def test_gateway_managed_session_can_allocate_reservation_owner():
+    first = realtime_video_api.uuid4().hex
+    second = realtime_video_api.uuid4().hex
+
+    assert len(first) == 32
+    assert first != second
 
 
 def test_realtime_diffusion_stage_declares_long_lived_components():
@@ -1095,7 +1115,7 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     assert events[-1] == "send_end_1"
 
 
-def test_send_output_emits_chunk_stats_message():
+def test_send_output_keeps_chunk_timing_off_the_video_websocket():
     sent_messages = []
 
     class _Ws:
@@ -1141,16 +1161,8 @@ def test_send_output_emits_chunk_stats_message():
         )
     )
 
-    message = msgspec.msgpack.decode(sent_messages[-1])
     assert stats["raw_write_ms"] == 42.0
-    assert message["type"] == "chunk_stats"
-    assert message["chunk_index"] == 7
-    assert message["event_id"] == 11
-    assert message["raw_write_ms"] == 42
-    assert message["ws_write_ms"] == 42
-    assert message["ws_payload_bytes"] == 450
-    assert message["content_type"] == "image/webp"
-    assert bytes([0xCB]) not in sent_messages[-1]
+    assert sent_messages == []
 
 
 def test_scheduler_stage_metrics_emit_dedicated_realtime_trace_events(monkeypatch):

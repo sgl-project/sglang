@@ -4,9 +4,12 @@ import asyncio
 
 from load_test import (
     aggregate_measurement_seconds,
+    chunk_stats_from_trace,
     collect_trace_events,
     derive_trace_http_url,
+    final_frame_batch_chunk,
     init_request,
+    measurement_window_start,
     record_frame_batch,
     record_action_latency,
     server_action_latencies,
@@ -40,6 +43,74 @@ def test_record_frame_batch_counts_all_batches_in_the_same_chunk():
     )
 
     assert frame_counts == {3: 16}
+
+
+def test_final_frame_batch_is_the_media_websocket_completion_signal():
+    assert final_frame_batch_chunk(
+        {
+            "type": "frame_batch",
+            "chunk_index": 3,
+            "frame_batch_index": 15,
+            "is_final_frame_batch": True,
+        }
+    ) == 3
+    assert final_frame_batch_chunk(
+        {
+            "type": "frame_batch",
+            "chunk_index": 3,
+            "frame_batch_index": 14,
+            "is_final_frame_batch": False,
+        }
+    ) is None
+    assert final_frame_batch_chunk(
+        {
+            "type": "media_chunk_complete",
+            "chunk_index": 3,
+            "num_frames": 16,
+        }
+    ) == 3
+
+
+def test_chunk_stats_are_read_from_the_separate_trace_transport():
+    events = [
+        {
+            "event": "server.chunk_complete",
+            "chunk_index": 0,
+            "chunk_total_ms": 712.5,
+            "scheduler_forward_ms": 630.0,
+            "trace_seq": 10,
+        },
+        {
+            "event": "server.vae_decode_complete",
+            "chunk_index": 0,
+            "duration_ms": 52.0,
+            "trace_seq": 11,
+        },
+        {
+            "event": "server.chunk_complete",
+            "chunk_index": 1,
+            "chunk_total_ms": 481.25,
+            "scheduler_forward_ms": 401.0,
+            "trace_seq": 20,
+        },
+    ]
+
+    assert chunk_stats_from_trace(events) == {
+        0: {
+            "event": "server.chunk_complete",
+            "chunk_index": 0,
+            "chunk_total_ms": 712.5,
+            "scheduler_forward_ms": 630.0,
+            "trace_seq": 10,
+        },
+        1: {
+            "event": "server.chunk_complete",
+            "chunk_index": 1,
+            "chunk_total_ms": 481.25,
+            "scheduler_forward_ms": 401.0,
+            "trace_seq": 20,
+        },
+    }
 
 
 def test_stage_values_excludes_warmup_and_records_local_vae():
@@ -76,7 +147,7 @@ def test_trace_http_url_is_derived_from_the_public_websocket_origin():
     ) == "http://127.0.0.1:18080"
 
 
-def test_collect_trace_events_polls_incrementally_and_deduplicates():
+def test_collect_trace_events_polls_full_snapshots_and_deduplicates():
     class Response:
         def __init__(self, payload):
             self.payload = payload
@@ -125,7 +196,93 @@ def test_collect_trace_events_polls_incrementally_and_deduplicates():
         )
         assert [event["trace_seq"] for event in events] == [1, 2, 3]
         assert client.calls[0][1]["after"] == 0
-        assert client.calls[1][1]["after"] == 2
+        assert client.calls[1][1]["after"] == 0
+
+    asyncio.run(run())
+
+
+def test_collect_trace_events_waits_for_all_chunks_and_terminal_event():
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    snapshots = [
+        {
+            "events": [
+                {"event": "gateway.ws_accepted", "trace_seq": 10},
+                {
+                    "event": "server.chunk_complete",
+                    "chunk_index": 0,
+                    "trace_seq": 20,
+                },
+            ],
+            "next_cursor": 20,
+        },
+        {
+            "events": [
+                {"event": "gateway.ws_accepted", "trace_seq": 10},
+                {
+                    "event": "server.chunk_complete",
+                    "chunk_index": 0,
+                    "trace_seq": 20,
+                },
+            ],
+            "next_cursor": 20,
+        },
+        {
+            "events": [
+                {
+                    "event": "server.vae_decode_complete",
+                    "chunk_index": 1,
+                    "trace_seq": 15,
+                },
+                {"event": "gateway.ws_accepted", "trace_seq": 10},
+                {
+                    "event": "server.chunk_complete",
+                    "chunk_index": 0,
+                    "trace_seq": 20,
+                },
+                {
+                    "event": "server.chunk_complete",
+                    "chunk_index": 1,
+                    "trace_seq": 30,
+                },
+                {"event": "gateway.session_closed", "trace_seq": 40},
+            ],
+            "next_cursor": 40,
+        },
+    ]
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def get(self, url, *, params):
+            self.calls.append((url, dict(params)))
+            index = min(len(self.calls) - 1, len(snapshots) - 1)
+            return Response(snapshots[index])
+
+    async def run():
+        client = Client()
+        events = await collect_trace_events(
+            "http://gateway",
+            "trace-eventual",
+            client=client,
+            timeout_s=0.1,
+            poll_interval_s=0,
+            stable_polls=1,
+            expected_chunks=2,
+        )
+
+        assert [event["trace_seq"] for event in events] == [10, 15, 20, 30, 40]
+        assert len(client.calls) == 4
+        assert all(call[1]["after"] == 0 for call in client.calls)
 
     asyncio.run(run())
 
@@ -231,6 +388,27 @@ def test_aggregate_measurement_seconds_uses_real_overlapping_wall_window():
     ]
 
     assert aggregate_measurement_seconds(sessions) == 3.0
+
+
+def test_measurement_window_starts_after_the_last_warmup_chunk():
+    assert measurement_window_start(
+        chunk_index=1,
+        observed_at=10.0,
+        warmup_chunks=2,
+        current=None,
+    ) == 10.0
+    assert measurement_window_start(
+        chunk_index=2,
+        observed_at=10.5,
+        warmup_chunks=2,
+        current=10.0,
+    ) == 10.0
+    assert measurement_window_start(
+        chunk_index=0,
+        observed_at=9.0,
+        warmup_chunks=2,
+        current=None,
+    ) is None
 
 
 def test_server_action_latencies_use_sampled_event_and_first_frame_marker():

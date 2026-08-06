@@ -336,7 +336,7 @@ function lowLatencyModeFollowsMeasuredSourceInsteadOfDrainingAtTargetFps() {
   assert.ok(snapshot.renderFps <= 9, `render fps ${snapshot.renderFps}`);
 }
 
-function lowLatencyModeBoundsSingleChunkBacklogAndCutsOldActionImmediately() {
+function lowLatencyModePreservesNewestChunkAndCutsOldActionImmediately() {
   const controller = new RealtimePlaybackController({
     targetFps: 16,
     lowLatencyPlayback: true,
@@ -349,15 +349,12 @@ function lowLatencyModeBoundsSingleChunkBacklogAndCutsOldActionImmediately() {
   enqueueChunk(controller, {
     chunk: 0,
     eventId: 0,
-    frameCount: 12,
+    frameCount: 16,
     durationMs: 750,
     now: 1000,
   });
-  assert.ok(controller.snapshot().bufferMs <= controller.snapshot().maxLeadMs + 1);
-  assert.ok(
-    controller.snapshot().maxLeadMs <=
-      controller.snapshot().targetLeadMs + 1000 / controller.snapshot().sourceFps + 1,
-  );
+  assert.equal(controller.snapshot().droppedFrames, 0);
+  assert.equal(controller.snapshot().queueFrames, 16);
   controller.noteInputEvent(5, 1010);
   const result = enqueueChunk(controller, {
     chunk: 1,
@@ -367,6 +364,8 @@ function lowLatencyModeBoundsSingleChunkBacklogAndCutsOldActionImmediately() {
     now: 1100,
   });
   assert.ok(result.cutover);
+  assert.equal(result.droppedFrames.length, 16);
+  assert.equal(controller.snapshot().queueFrames, 3);
   assert.equal(controller.queue.some((frame) => frame.eventId < 5), false);
 }
 
@@ -386,4 +385,4 @@ timelineModeNeverDropsBacklog();
 timelineModePreservesFramesAcrossEventCutover();
 switchingBackToLiveTrimsTimelineBacklog();
 lowLatencyModeFollowsMeasuredSourceInsteadOfDrainingAtTargetFps();
-lowLatencyModeBoundsSingleChunkBacklogAndCutsOldActionImmediately();
+lowLatencyModePreservesNewestChunkAndCutsOldActionImmediately();

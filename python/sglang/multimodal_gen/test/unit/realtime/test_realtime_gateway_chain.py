@@ -130,24 +130,49 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                 )
                 accepted = decode_message(await output.recv())
                 assert accepted["type"] == "session_output_accepted"
+                async def send_frame(index: int):
+                    await output.send(
+                        encode_message(
+                            "frame_batch",
+                            session_id=session_id,
+                            generation_id=generation_id,
+                            request_id="request-0",
+                            chunk_index=0,
+                            frame_batch_index=index,
+                            payload_lengths=[4],
+                            payload=b"webp",
+                            content_type="image/webp",
+                            width=8,
+                            height=8,
+                            num_frames=1,
+                            is_final_frame_batch=False,
+                        )
+                    )
+
+                await send_frame(0)
+                denoiser_close_started_at = time.monotonic()
+                await connection.close(code=1000, reason="generation complete")
+                # The VAE media route is independent and can still be flushing
+                # accepted frames after the Denoiser control route closes.
+                await asyncio.sleep(0.05)
+                await send_frame(1)
+                await send_frame(2)
+                await send_frame(3)
                 await output.send(
                     encode_message(
-                        "frame_batch",
+                        "media_chunk_complete",
                         session_id=session_id,
                         generation_id=generation_id,
                         request_id="request-0",
                         chunk_index=0,
-                        frame_batch_index=0,
-                        payload_lengths=[4],
-                        payload=b"webp",
-                        content_type="image/webp",
-                        width=8,
-                        height=8,
-                        num_frames=1,
+                        num_frames=4,
                     )
                 )
-                denoiser_close_started_at = time.monotonic()
-                await connection.close(code=1000, reason="generation complete")
+                completion_accepted = decode_message(await output.recv())
+                assert completion_accepted["type"] == (
+                    "media_chunk_complete_accepted"
+                )
+                assert completion_accepted["chunk_index"] == 0
 
         coordinator = _Coordinator(
             f"ws://127.0.0.1:{denoiser_port}/v1/realtime_video/generate"
@@ -172,20 +197,20 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                 )
                 async with connect(url, max_size=None, compression=None) as browser:
                     async def send_actions_until_closed():
-                        event_id = 1
-                        while True:
-                            try:
-                                await browser.send(
-                                    encode_message(
-                                        "camera_actions",
-                                        event_id=event_id,
-                                        actions=["w"],
-                                    )
-                                )
-                            except ConnectionClosedOK:
-                                return
-                            event_id += 1
-                            await asyncio.sleep(0)
+                        await browser.send(
+                            encode_message(
+                                "init",
+                                max_chunks=1,
+                            )
+                        )
+                        await browser.send(
+                            encode_message(
+                                "camera_actions",
+                                event_id=1,
+                                actions=["w"],
+                            )
+                        )
+                        await browser.wait_closed()
 
                     action_task = asyncio.create_task(send_actions_until_closed())
                     messages = []
@@ -202,7 +227,24 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                 assert {message["type"] for message in messages} == {
                     "session_ready",
                     "frame_batch",
+                    "media_chunk_complete",
                 }
+                frame_batches = [
+                    message for message in messages if message["type"] == "frame_batch"
+                ]
+                assert [message["frame_batch_index"] for message in frame_batches] == [
+                    0,
+                    1,
+                    2,
+                    3,
+                ]
+                assert frame_batches[-1]["is_final_frame_batch"] is False
+                media_complete = next(
+                    message
+                    for message in messages
+                    if message["type"] == "media_chunk_complete"
+                )
+                assert media_complete["chunk_index"] == 0
                 assert all("trace" not in message["type"] for message in messages)
 
                 async with httpx.AsyncClient() as client:
@@ -219,6 +261,7 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                 await server_task
 
         assert len(coordinator.admitted) == 1
+        assert coordinator.admitted[0]["wait_for_capacity"] is True
         assert len(coordinator.released) == 1
         assert denoiser_close_started_at is not None
         assert coordinator.released_at - denoiser_close_started_at >= 0.045

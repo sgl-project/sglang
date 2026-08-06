@@ -469,8 +469,18 @@
       droppedFrames.push(...this.#trimStaleBacklog(now));
       if (this.config.lowLatencyPlayback) {
         const backlogDropStart = droppedFrames.length;
-        while (this.queue.length > 1 && this.bufferDurationMs > this.maxLeadMs) {
-          droppedFrames.push(this.queue.shift());
+        if (this.queue.length > 1 && this.bufferDurationMs > this.maxLeadMs) {
+          const newestChunk = this.queue.at(-1).chunkIndex;
+          let oldFrameCount = 0;
+          while (
+            oldFrameCount < this.queue.length &&
+            this.queue[oldFrameCount].chunkIndex !== newestChunk
+          ) {
+            oldFrameCount += 1;
+          }
+          if (oldFrameCount) {
+            droppedFrames.push(...this.queue.splice(0, oldFrameCount));
+          }
         }
         const backlogDropCount = droppedFrames.length - backlogDropStart;
         if (backlogDropCount) {

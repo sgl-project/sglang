@@ -1,0 +1,10 @@
+ARG CPU_RUNTIME_IMAGE
+
+FROM ${CPU_RUNTIME_IMAGE}
+ARG SOURCE_REVISION
+
+COPY python/sglang /opt/sglang/python/sglang
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION} \
+      seedleap.minwm.image.layer="cpu-code-overlay"
+
+WORKDIR /opt/sglang

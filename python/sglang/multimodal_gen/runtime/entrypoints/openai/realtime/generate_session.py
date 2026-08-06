@@ -10,10 +10,7 @@ from uuid import uuid4
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_trace import (
-    compact_client_trace,
-    normalize_trace_id,
-)
+from sglang.multimodal_gen.runtime.utils.realtime_trace import normalize_trace_id
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSession,
 )
@@ -58,7 +55,6 @@ class GenerateSession:
         self.prompt_version = 0
         self.denoise_intervals: dict[int, tuple[float, float]] = {}
         self.vae_intervals: dict[int, tuple[float, float]] = {}
-        self.client_trace: dict[str, Any] | None = None
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
         self.generate_chunk_cnt = 0
@@ -74,6 +70,8 @@ class GenerateSession:
         self.output_pace_last_event_id: int | None = None
         self.vae_client: Any = None
         self.vae_worker_url: str | None = None
+        self.vae_worker_epoch: str | None = None
+        self.coordinator_token: str | None = None
         self.gateway_output_url: str | None = None
         self.gateway_output_token: str | None = None
         self.pending_control_refresh: tuple[str, int | None] | None = None
@@ -85,7 +83,6 @@ class GenerateSession:
 
     def bind_trace(self, request: RealtimeVideoGenerationsRequest):
         self.trace_id = normalize_trace_id(request.trace_id, fallback=self.trace_id)
-        self.client_trace = compact_client_trace(request.client_trace)
 
     def set_request(self, request: RealtimeVideoGenerationsRequest):
         self.bind_trace(request)
@@ -95,7 +92,6 @@ class GenerateSession:
         if self.adapter is not None:
             self.adapter.dispose(self)
         self.request = None
-        self.client_trace = None
         self.input_temp_dir = None
         self.generate_chunk_cnt = 0
         self.next_chunk_index = 0

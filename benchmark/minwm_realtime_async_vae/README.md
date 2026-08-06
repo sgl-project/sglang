@@ -7,6 +7,10 @@
 AWS 控制面、不可变镜像、版本化模型制品、Kubernetes 拓扑、真实浏览器探针和显式清理
 脚本都在本目录中，详细发布顺序见 `k8s/README.md`。
 
+- 自定义 UI 接入协议：[`BACKEND_API_ZH.md`](BACKEND_API_ZH.md)
+- 8 x H100 + 1 x L4 生产链路最终压测报告：
+  [`results/20260806T1315Z-production-v22/压测报告.md`](results/20260806T1315Z-production-v22/压测报告.md)
+
 ```bash
 python benchmark/minwm_realtime_async_vae/load_test.py \
   --ws-url ws://HOST/v1/realtime_video/generate \

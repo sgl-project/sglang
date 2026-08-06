@@ -73,6 +73,8 @@ spec:
               --worker-ttl-s=15
               --wait-timeout-s=10
               --candidate-limit=64
+              --denoiser-capacity-limit=1
+              --vae-capacity-limit=16
           env:
             - name: COORDINATOR_TABLE
               value: REPLACE_WITH_COORDINATOR_TABLE

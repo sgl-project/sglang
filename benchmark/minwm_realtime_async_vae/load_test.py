@@ -62,6 +62,7 @@ async def collect_trace_events(
     timeout_s: float,
     poll_interval_s: float = 2.0,
     stable_polls: int = 2,
+    expected_chunks: int | None = None,
     client=None,
 ) -> list[dict]:
     """Collect an incrementally published Trace without touching the video WS."""
@@ -72,13 +73,14 @@ async def collect_trace_events(
         raise ValueError("timeout_s must be positive")
     if stable_polls < 1:
         raise ValueError("stable_polls must be positive")
+    if expected_chunks is not None and expected_chunks < 1:
+        raise ValueError("expected_chunks must be positive")
     endpoint = (
         f"{http_origin.rstrip('/')}/v1/realtime_video/traces/{trace_id}"
     )
     owns_client = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=min(10.0, timeout_s))
-    cursor = 0
     unchanged = 0
     by_cursor: dict[int, dict] = {}
     deadline = time.monotonic() + timeout_s
@@ -87,7 +89,10 @@ async def collect_trace_events(
             try:
                 response = await client.get(
                     endpoint,
-                    params={"after": cursor, "limit": 500},
+                    # CloudWatch may publish an older trace_seq after a newer
+                    # event. Re-read the full snapshot so late events cannot
+                    # fall behind an incremental cursor permanently.
+                    params={"after": 0, "limit": 500},
                 )
                 response.raise_for_status()
             except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
@@ -114,13 +119,21 @@ async def collect_trace_events(
                     continue
                 by_cursor[event_cursor] = dict(raw_event)
                 added += 1
-            cursor = max(
-                cursor,
-                int(payload.get("next_cursor") or 0),
-                *by_cursor.keys(),
-            )
             unchanged = 0 if added else unchanged + 1
-            if by_cursor and unchanged >= stable_polls:
+            completed_chunks = {
+                int(event["chunk_index"])
+                for event in by_cursor.values()
+                if event.get("event") == "server.chunk_complete"
+                and event.get("chunk_index") is not None
+            }
+            terminal_seen = any(
+                event.get("event") == "gateway.session_closed"
+                for event in by_cursor.values()
+            )
+            complete = expected_chunks is None or (
+                len(completed_chunks) >= expected_chunks and terminal_seen
+            )
+            if by_cursor and complete and unchanged >= stable_polls:
                 break
             if poll_interval_s > 0:
                 await asyncio.sleep(poll_interval_s)
@@ -277,6 +290,35 @@ def record_frame_batch(
     frame_counts[chunk_index] = frame_counts.get(chunk_index, 0) + num_frames
 
 
+def final_frame_batch_chunk(message: dict) -> int | None:
+    message_type = message.get("type")
+    if message_type == "media_chunk_complete":
+        chunk_index = int(message.get("chunk_index", -1))
+        return chunk_index if chunk_index >= 0 else None
+    if message_type not in {"frame_batch", "frame_batch_header"} or (
+        message.get("is_final_frame_batch") is not True
+    ):
+        return None
+    chunk_index = int(message.get("chunk_index", -1))
+    return chunk_index if chunk_index >= 0 else None
+
+
+def chunk_stats_from_trace(trace_events: list[dict]) -> dict[int, dict]:
+    """Read authoritative chunk timings from the out-of-band Trace API."""
+
+    stats: dict[int, dict] = {}
+    for event in trace_events:
+        if event.get("event") != "server.chunk_complete":
+            continue
+        chunk_value = event.get("chunk_index")
+        if chunk_value is None or event.get("chunk_total_ms") is None:
+            continue
+        chunk_index = int(chunk_value)
+        if chunk_index >= 0:
+            stats[chunk_index] = dict(event)
+    return stats
+
+
 def server_action_latencies(
     trace_events: list[dict], *, min_chunk_index: int = 0
 ) -> dict[str, list[float]]:
@@ -351,6 +393,22 @@ def aggregate_measurement_seconds(sessions: list[dict]) -> float:
     return max(0.0, max(completions) - min(starts))
 
 
+def measurement_window_start(
+    *,
+    chunk_index: int,
+    observed_at: float,
+    warmup_chunks: int,
+    current: float | None,
+) -> float | None:
+    """Start timing after the final warmup chunk has fully completed."""
+
+    if current is not None:
+        return current
+    if warmup_chunks > 0 and chunk_index == warmup_chunks - 1:
+        return observed_at
+    return None
+
+
 async def stream_actions(
     websocket,
     *,
@@ -391,8 +449,25 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     action_sent_at: dict[int, float] = {}
     action_latencies: list[float] = []
     pending_raw_header = None
+    completed_chunk_at: dict[int, float] = {}
     measured_started_at: float | None = None
     measured_completed_at: float | None = None
+    session_started_at = time.perf_counter()
+
+    def mark_chunk_complete(message: dict, observed_at: float) -> None:
+        nonlocal measured_started_at, measured_completed_at
+        chunk = final_frame_batch_chunk(message)
+        if chunk is None or chunk in completed_chunk_at:
+            return
+        completed_chunk_at[chunk] = observed_at
+        measured_started_at = measurement_window_start(
+            chunk_index=chunk,
+            observed_at=observed_at,
+            warmup_chunks=args.warmup_chunks,
+            current=measured_started_at,
+        )
+        if chunk >= args.warmup_chunks:
+            measured_completed_at = observed_at
 
     async with websockets.connect(
         url,
@@ -401,6 +476,8 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
         ping_timeout=20,
         open_timeout=args.timeout_s,
     ) as websocket:
+        if args.warmup_chunks == 0:
+            measured_started_at = time.perf_counter()
         await websocket.send(
             msgspec.msgpack.encode(
                 init_request(args, total_chunks=total_chunks, trace_id=trace_id)
@@ -425,6 +502,7 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                 if not isinstance(packed, bytes):
                     continue
                 if pending_raw_header is not None:
+                    mark_chunk_complete(pending_raw_header, time.perf_counter())
                     pending_raw_header = None
                     continue
                 message = msgspec.msgpack.decode(packed)
@@ -437,6 +515,9 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                     raise RuntimeError(
                         "production video WebSocket carried forbidden Trace data"
                     )
+                if message_type == "media_chunk_complete":
+                    mark_chunk_complete(message, time.perf_counter())
+                    continue
                 if message_type == "frame_batch_header":
                     pending_raw_header = message
                 if message_type in {"frame_batch", "frame_batch_header"}:
@@ -444,8 +525,6 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                     observed_at = time.perf_counter()
                     record_frame_batch(message, frame_counts=frame_counts)
                     first_frame_at.setdefault(chunk, observed_at)
-                    if chunk >= args.warmup_chunks and measured_started_at is None:
-                        measured_started_at = observed_at
                     record_action_latency(
                         message,
                         first_frame_at=first_frame_at,
@@ -453,6 +532,8 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                         action_latencies=action_latencies,
                         min_chunk_index=args.warmup_chunks,
                     )
+                    if message_type == "frame_batch":
+                        mark_chunk_complete(message, observed_at)
                     continue
                 if message_type != "chunk_stats":
                     continue
@@ -460,10 +541,6 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                 chunk = int(message["chunk_index"])
                 observed_at = time.perf_counter()
                 stats[chunk] = dict(message)
-                if chunk >= args.warmup_chunks:
-                    if measured_started_at is None:
-                        measured_started_at = first_frame_at.get(chunk, observed_at)
-                    measured_completed_at = observed_at
                 record_action_latency(
                     message,
                     first_frame_at=first_frame_at,
@@ -480,7 +557,37 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
             args.trace_http_url or derive_trace_http_url(args.ws_url),
             trace_id,
             timeout_s=args.trace_timeout_s,
+            expected_chunks=total_chunks,
         )
+
+    expected_chunks = set(range(total_chunks))
+    completed_chunks = set(completed_chunk_at)
+    if completed_chunks != expected_chunks:
+        missing = sorted(expected_chunks - completed_chunks)
+        raise RuntimeError(
+            "session media stream closed before final frame batches for "
+            f"chunks {missing}"
+        )
+
+    trace_stats = chunk_stats_from_trace(trace_events)
+    stats.update(trace_stats)
+    if trace_stats and len(trace_stats) == total_chunks:
+        timing_source = "trace_http"
+    elif len(stats) == total_chunks:
+        timing_source = "video_ws_chunk_stats"
+    elif args.skip_trace_query:
+        timing_source = "client_frame_completion_interval"
+        previous = session_started_at
+        for chunk in range(total_chunks):
+            completed_at = completed_chunk_at[chunk]
+            stats[chunk] = {
+                "chunk_index": chunk,
+                "chunk_total_ms": max(0.0, (completed_at - previous) * 1000.0),
+            }
+            previous = completed_at
+    else:
+        missing = sorted(expected_chunks - set(stats))
+        raise RuntimeError(f"Trace API omitted chunk timings for chunks {missing}")
 
     if len(stats) != total_chunks:
         raise RuntimeError(
@@ -505,6 +612,7 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     return {
         "session_index": index,
         "trace_id": trace_id,
+        "timing_source": timing_source,
         "chunk_total_ms": chunk_total,
         "action_to_first_frame_ms": server_action[
             "action_to_server_first_frame_ms"
@@ -571,6 +679,9 @@ async def run_level(args: argparse.Namespace, concurrency: int) -> dict:
         "successful_sessions": len(sessions),
         "errors": errors,
         "error_rate": len(errors) / concurrency,
+        "timing_sources": sorted(
+            {session["timing_source"] for session in sessions}
+        ),
         "chunk_total_ms": latency_summary(chunks),
         "action_to_first_frame_ms": latency_summary(action),
         "action_ingress_to_first_frame_ms": latency_summary(action_ingress),

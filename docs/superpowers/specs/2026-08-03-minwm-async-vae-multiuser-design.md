@@ -33,29 +33,26 @@
 
 第一阶段不提供透明 Session 迁移、跨节点 KV 复制或 GPU Worker 故障后的无感续跑。
 
-## 2. 当前实现与核心限制
+## 2. 当前实现与仍保留的限制
 
-当前代码已经具备 T2V/I2V、动态 Action、动态 Prompt、Trace、Recording/Dump 和
-TAEHV 预加载等能力，但执行模型仍然是单体、单用户、同步流水：
+当前分支已经具备 T2V/I2V、动态 Action/Prompt、Trace、Recording/Dump、TAEHV 预加载、
+多用户准入和异步 VAE 流水：
 
-- `realtime_video_api.py` 使用进程内 `_ACTIVE_SESSION_IDS`，第二个活动 Session 会被拒绝。
-- `_generate_loop()` 会等待 `process_generation_batch()` 返回完整结果后，才准备下一个
-  Chunk。目前只允许 WebSocket 发送和部分后续逻辑重叠，Denoising 与 VAE Decode
-  仍然串行。
-- `GenerateSession` 已有 `session_id` 和每个 Chunk 的 `request_id`，但没有独立的
-  `generation_id`，无法可靠拒绝 Session 重置前遗留的延迟消息。
-- `RealtimeSessionCache` 是进程内 LRU。非零 Chunk 如果被路由到没有该 Session 状态的
-  Worker 会直接失败，因此不能按 Chunk 做普通轮询调度。
-- MinWM Adapter 已经通过 event ID 保存并采样 Action、Prompt、Seed；分布式架构必须
-  保持这个语义，并明确记录每个 Chunk 实际采样的 event/version。
-- TAEHV 权重已经做到每个 Worker 启动时预加载，`StreamingTAEHV` 保存在
-  `RealtimeVAEDecodeState` 中。这个边界适合拆分，但多 Session cache 隔离与重入安全
-  仍需压力测试。
-- Wan fallback decoder 会修改模型实例上的 `_feat_map`、`_conv_idx` 等字段，在同一个
-  模型实例中交错多个 Session 不安全。
+- 公网 Gateway 使用有界准入队列；Coordinator 将一个 Session 粘性绑定到一个 Denoiser
+  slot 和一个 VAE slot，每用户默认只允许一个活动 Session。
+- `GenerateSession`、媒体消息、reservation 和输出路由都使用独立的 `session_id`、
+  `generation_id`、`request_id` 与 `chunk_index`，旧 generation/旧 Worker epoch 会被拒绝。
+- Denoiser 完成 Chunk N 后把 latent 放入有界 VAE 队列；VAE 真正进入 Decode actor 后才
+  返还下一张 credit，使 Chunk N+1 Denoising 能与 Chunk N Decode/Encode 重叠。
+- MinWM Adapter 通过 event ID/version 保存并采样 Action、Prompt、Seed；Frame/Trace/Dump
+  记录每个 Chunk 实际采用的控制版本。
+- TAEHV 权重随 VAE 镜像固化并在 Worker 启动时预加载；每个 Session 的因果 decoder state
+  按 `(session_id, generation_id)` 隔离。
 
-因此，改造不能只是在现有循环外层增加线程，而要引入明确的 Session 粘性路由、
-阶段化 Worker、版本化协议和有界 Credit。
+仍保留的边界：GPU KV、latent history 与 TAEHV context 不复制；Worker/Spot 故障时绑定
+Session 失败并由用户重试。Wan fallback decoder 的模型级可变 cache 不允许跨 Session
+交错，生产异步 VAE 路径固定使用通过隔离测试的 TAEHV。Denoiser 侧公平性由 SGLang 原生
+Scheduler/FIFO batching 提供，当前没有另造一套 DRR GPU Scheduler。
 
 ## 3. 设计目标与非目标
 
@@ -115,7 +112,7 @@ flowchart LR
     Coordinator <-->|"容量、预留、释放"| Denoiser
     Coordinator <-->|"容量、预留、释放"| VAE
     Gateway -->|"Action / Prompt 控制流"| Denoiser
-    Denoiser -->|"有界 BF16 latent gRPC 流"| VAE
+    Denoiser -->|"有界 BF16 latent WebSocket 流"| VAE
     VAE -->|"编码后 Frame 流"| Gateway
     Gateway -.->|"时序元数据"| OTel
     Denoiser -.->|"时序元数据"| OTel
@@ -331,7 +328,7 @@ Coordinator 负责准入与粘性路由。每个已接收生成任务形成以�
 - 到绑定 VAE Worker 的有界 latent stream。
 
 Worker 暴露的容量由显存和实测服务时间决定，不按 GPU 数量简单估算。多个独立 Session
-使用带 deadline 的 Deficit Round Robin 公平调度：
+由 SGLang 原生 Scheduler 做 FIFO/batching，并受 Session credit 与 deadline 约束：
 
 - 同一 Session 最多一个 Denoise Chunk 在执行。
 - 一个 Session 不能提前塞入多个未来 Chunk。
@@ -418,9 +415,10 @@ stateDiagram-v2
 
 ## 8. 服务协议设计
 
-第一阶段使用 Protobuf 与双向 Streaming gRPC。Tensor payload 使用连续 `bytes`，禁止
-pickle 和 base64。默认 gRPC 最大消息为 8 MiB，能够覆盖当前 MinWM/LingBot latent，
-同时保留协议校验余量。
+当前实现使用 MessagePack envelope + WebSocket 二进制 payload。Tensor 使用连续 `bytes`，
+禁止 pickle 和 base64；大 payload 由 header 中的 shape/dtype/length 校验。协议逻辑名称沿用
+`SessionOpen`、`LatentChunk`、`LatentAccepted`、`FrameBatch`。未来若吞吐测试证明 HTTP/2
+流控收益明确，可以在不改变这些 envelope 语义的前提下替换为 gRPC。
 
 ### 8.1 Session 与控制消息
 
@@ -612,9 +610,10 @@ Gateway 与 VAE 输出队列同样有界。Gateway 每个 Session 最多保留�
 
 ### 11.1 Denoiser 公平调度
 
-第一阶段采用带 deadline 的 Deficit Round Robin：
+当前 Denoiser 采用 SGLang Scheduler 的 FIFO/batching，并通过每 Session 最多一个可运行
+Chunk、VAE credit 和请求 deadline 避免单用户提前占用未来容量：
 
-- 每个活动 Session 每个输出 Chunk 周期获得一次 work credit。
+- 每个活动 Session 每个输出 Chunk 周期最多获得一次 work credit。
 - 没有 VAE Credit 的 Session 被跳过，不进行 busy wait。
 - Action-to-frame deadline 更早的 Session 在同等条件下优先。
 - 每个用户最多一个活动 Session。
@@ -625,9 +624,10 @@ Gateway 与 VAE 输出队列同样有界。Gateway 每个 Session 最多保留�
 
 ### 11.2 VAE 公平调度
 
-VAE Actor 在驻留的 Session Context 之间 Round Robin 调度 ready Chunk，同时保持每个
-Session 内严格顺序。第一阶段每个 Actor 同时只执行一个 Decode Kernel 序列。只有基准
-测试证明多 Actor/CUDA Stream 能提高吞吐且无 cache 串扰，才提高单 GPU 并发。
+每个 Session runner 最多向全局 FIFO/fair Decode lock 提交一个 ready Chunk，因此等价于
+对活跃 Session 做 job 级轮转，同时保持每个 Session 内严格顺序。当前每个 VAE Worker
+同时只执行一个 Decode Kernel 序列；只有基准测试证明多 CUDA Stream 能提高吞吐且无
+cache 串扰，才提高单 GPU kernel 并发。
 
 ## 12. 容量规划与弹性扩缩容
 
@@ -816,7 +816,7 @@ CloudWatch Log Group 强制设置 5 天保留。全量 Trace 即使没有媒体�
 ### Milestone 2：跨节点低成本 VAE Pool
 
 - Denoiser 部署在 H100/B200/B300，VAE 部署在 L4。
-- 使用同 AZ 直连 Streaming gRPC。
+- 使用同 AZ MessagePack/WebSocket 二进制直连。
 - L4 不满足 30% P99 余量时测试并切换 L40S。
 - 验证 60 秒 Session、网络错误、重连边界和 Spot 回收 Cleanup。
 
@@ -876,7 +876,7 @@ CloudWatch Log Group 强制设置 5 天保留。全量 Trace 即使没有媒体�
 ### 17.4 Chaos 与过载测试
 
 - 在不同阶段 Kill Gateway、Coordinator、Denoiser 和 VAE。
-- 注入 Spot interruption/Drain、gRPC 断开、重复、延迟、损坏、乱序消息。
+- 注入 Spot interruption/Drain、WebSocket 断开、重复、延迟、损坏、乱序消息。
 - 模拟慢浏览器与阻塞 Trace Exporter。
 - 打满准入队列和两个 GPU Pool。
 - 断言只有绑定 Session 失败，所有资源都能回收，每个队列保持有界，错误可重试且清晰。
@@ -907,9 +907,64 @@ CloudWatch Log Group 强制设置 5 天保留。全量 Trace 即使没有媒体�
 1. 每个 L4/L40S Worker 可安全驻留的 Session Context 数和 Decode 并发。
 2. L4 与 L40S 的 P99 及每个持续视频流成本。
 3. 指定模型、分辨率、GPU 下每个 Denoiser 的安全 Session slot 数。
-4. 同 AZ 与跨 AZ gRPC latent transfer P99。
+4. 同 AZ 与跨 AZ WebSocket latent transfer P99。
 5. 满足 1 秒 P95 Action-to-render 时的真实最大准入量。
 6. 各灰度阶段全量 Trace 的 CloudWatch GB/day 与费用。
 
 任一 Gate 不通过时，应降低准入上限或更换 VAE SKU，不能放宽因果顺序、有界队列、
 Trace 完整性或公开交互 SLO。
+
+## 20. 2026-08-06 生产链路实测收敛值
+
+本节记录 `wan22-5b-stage3-dmd-30-gs1800` 在 AWS `us-east-2` 的实测值。它覆盖
+8 x H100 Denoiser、1 x L4 TAEHV、2 x Gateway、2 x Coordinator 的公网完整链路，不能
+外推到其他模型、分辨率或 GPU SKU。
+
+### 20.1 准入容量
+
+- Denoiser Worker 内部仍允许最多 4 个 Session，用于吞吐模式实验和回滚；生产低延迟
+  Coordinator 只广播并准入 `1 Session/H100`。
+- 8 个 H100 Worker 的当前硬准入上限是 8 个并发生成 Session。12 并发边界测试中 8 个
+  成功，另外 4 个收到明确的 `CAPACITY_EXHAUSTED`，没有进入无界等待。
+- L4 VAE Worker 驻留 16 个 Session Context，但当前整体容量先受 8 个 H100 slot 限制。
+- 低延迟模式选择每卡 1 Session，是因为每卡 4 Session 时单会话约 10 FPS，不能满足
+  16 FPS SLO；每卡 1 Session 后 8 并发最慢会话约 34 FPS。
+
+### 20.2 稳态 SLO
+
+正式压测采用 2 个 warmup Chunk、6 个计量 Chunk、1/2/4/8 并发各 3 轮，以下为三轮
+中位数：
+
+| 并发 | 聚合 FPS | 最慢会话 FPS | Chunk P95 | Action 到首帧 P95 | Denoise P95 | VAE Decode P95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 40.85 | 40.85 | 609.73 ms | 686.87 ms | 385.34 ms | 31.57 ms |
+| 2 | 79.67 | 40.32 | 626.10 ms | 696.15 ms | 391.89 ms | 41.15 ms |
+| 4 | 156.17 | 40.81 | 651.82 ms | 726.76 ms | 385.54 ms | 43.86 ms |
+| 8 | 246.16 | 34.00 | 795.26 ms | 865.15 ms | 388.44 ms | 160.72 ms |
+
+8 并发仍满足 Action 到首帧 P95 小于 1 秒、最慢会话大于 16 FPS、错误率为 0 的验收
+门槛。L4 在 8 并发时 VAE Decode 与 credit wait 已明显升高，是下一阶段扩容或切换 L40S
+的观察点，但尚未击穿当前 SLO。
+
+### 20.3 异步 VAE 与浏览器
+
+Trace 观测到的 Pipeline overlap 平均值从 1 并发的 202.01 ms 增长到 8 并发的
+303.93 ms。按 `观测关键路径 + overlap` 估算串行等价值，异步流水隐藏了约
+25.4% 到 28.5% 的串行时间。这个值证明当前请求中存在真实重叠，但不是同一代码 revision
+关闭异步 VAE 后的严格 A/B；后者仍应在不改变模型、Trace 和准入配置时单独执行。
+
+真实 Chrome 探针测得 Display Lag P50 26.1 ms、P95 69.93 ms，持续播放约 24 FPS。
+I2V、T2V、Action、Prompt update、HTTP Trace、录制 WebM/JSON/HTML 和轨迹回放均已通过
+公网链路验证。Trace 保留在 CloudWatch 5 天，不再随媒体 WebSocket 实时返回。
+
+### 20.4 故障与剩余验证项
+
+- 实测杀死活动 Denoiser 后，仅绑定到该 Worker 的 Session 返回 `WORKER_LOST`；Pod 在
+  约 69 秒后以新 UID 恢复，随后 8 并发再次全部成功。
+- 断连后同用户立即重连可能短暂收到 `USER_SESSION_LIMIT`，客户端退避重试约 2.37 秒后
+  成功；慢消费者未造成队列无限增长。
+- 真实 Spot interruption notice 与 Kubernetes Drain 云事件尚未注入。代码、preStop 和
+  单元测试已覆盖 Drain 语义，但该云级 Chaos Gate 在正式放量前仍需补跑。
+
+完整数据和测试口径见
+`benchmark/minwm_realtime_async_vae/results/20260806T1315Z-production-v22/压测报告.md`。

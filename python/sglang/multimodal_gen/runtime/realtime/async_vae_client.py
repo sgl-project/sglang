@@ -124,15 +124,39 @@ class GatewayOutputClient:
         if self._ws is None:
             raise RemoteVAEError("Gateway output client is not open")
         message = decode_message(wire, max_message_bytes=self.max_message_bytes)
-        if message.get("type") != "frame_batch":
-            raise ProtocolViolation("Gateway output accepts frame_batch only")
+        if message.get("type") not in {
+            "frame_batch",
+            "media_chunk_complete",
+        }:
+            raise ProtocolViolation(
+                "Gateway output accepts frame_batch or media_chunk_complete only"
+            )
         if (
             message.get("session_id") != self.session_id
             or message.get("generation_id") != self.generation_id
         ):
-            raise ProtocolViolation("Gateway output frame identity mismatch")
+            raise ProtocolViolation("Gateway output identity mismatch")
         async with self._send_lock:
             await self._ws.send(wire)
+            if message.get("type") == "media_chunk_complete":
+                response = decode_message(
+                    await asyncio.wait_for(self._ws.recv(), self.timeout_s),
+                    max_message_bytes=self.max_message_bytes,
+                )
+                if response.get("type") != "media_chunk_complete_accepted":
+                    raise RemoteVAEError(
+                        "Gateway did not acknowledge media chunk completion"
+                    )
+                if (
+                    response.get("session_id") != self.session_id
+                    or response.get("generation_id") != self.generation_id
+                    or response.get("request_id") != message.get("request_id")
+                    or int(response.get("chunk_index", -1))
+                    != int(message.get("chunk_index", -1))
+                ):
+                    raise ProtocolViolation(
+                        "Gateway media completion acknowledgement mismatch"
+                    )
 
     async def close(self) -> None:
         if self._ws is None:
@@ -204,6 +228,8 @@ class RealtimeVAEClient:
         output_url: str | None = None,
         output_token: str | None = None,
         trace_id: str | None = None,
+        coordinator_token: str | None = None,
+        worker_epoch: str | None = None,
     ) -> None:
         if self._ws is not None:
             return
@@ -227,6 +253,8 @@ class RealtimeVAEClient:
                 output_url=output_url,
                 output_token=output_token,
                 trace_id=trace_id,
+                coordinator_token=coordinator_token,
+                worker_epoch=worker_epoch,
             )
         )
         response = decode_message(

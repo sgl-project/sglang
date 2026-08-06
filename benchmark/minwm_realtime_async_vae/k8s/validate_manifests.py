@@ -59,11 +59,10 @@ def validate(documents: list[dict]) -> None:
     assert requirement_values(denoiser_8x, "karpenter.sh/capacity-type") == ["spot"]
     assert requirement_values(vae, "karpenter.sh/capacity-type") == ["spot"]
     assert requirement_values(denoiser, "node.kubernetes.io/instance-type") == [
-        "p5.4xlarge"
+        "p5.48xlarge"
     ]
     assert requirement_values(denoiser_8x, "node.kubernetes.io/instance-type") == [
-        "p5.48xlarge",
-        "p6-b200.48xlarge",
+        "p5.48xlarge"
     ]
     assert requirement_values(denoiser_8x, "topology.kubernetes.io/zone") == [
         "us-east-2a",
@@ -94,13 +93,17 @@ def validate(documents: list[dict]) -> None:
 
     denoiser = find(documents, "StatefulSet", "minwm-async-denoiser")
     containers = denoiser["spec"]["template"]["spec"]["containers"]
-    assert {container["name"] for container in containers} == {
-        "denoiser",
-        "denoiser-heartbeat",
-    }
+    assert {container["name"] for container in containers} == {"denoiser"}
     command = " ".join(containers[0]["args"])
     assert "--realtime-vae-worker-url" not in command
-    assert "realtime_worker_heartbeat" in " ".join(containers[1]["args"])
+    init_containers = denoiser["spec"]["template"]["spec"]["initContainers"]
+    heartbeat = next(
+        container
+        for container in init_containers
+        if container["name"] == "denoiser-heartbeat"
+    )
+    assert heartbeat["restartPolicy"] == "Always"
+    assert "realtime_worker_heartbeat" in " ".join(heartbeat["args"])
 
     gateway_service = find(documents, "Service", "minwm-realtime-public")
     assert gateway_service["spec"]["selector"] == {

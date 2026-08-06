@@ -225,11 +225,11 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
 
         def get_decode_scale_and_shift(self, device, dtype, vae):
             del device, dtype, vae
-            return 1.0, None
+            raise AssertionError("TAEHV must receive model-space latents directly")
 
         def preprocess_decoding(self, latents, server_args, vae=None):
-            del server_args, vae
-            return latents + 2
+            del latents, server_args, vae
+            raise AssertionError("TAEHV must bypass native VAE preprocessing")
 
     streaming = _StreamingTAEHV()
     monkeypatch.setattr(
@@ -257,8 +257,9 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
         disable_autocast=True,
     )
 
+    model_latents = torch.full((1, 48, 1, 4, 4), 1.5)
     frames = stage.decode_causal(
-        torch.zeros(1, 48, 1, 4, 4),
+        model_latents,
         server_args,
         first_chunk=True,
         decode_state=decode_state,
@@ -267,7 +268,10 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
     assert native_vae.calls == []
     assert streaming.reset_calls == 1
     assert tuple(streaming.inputs[0].shape) == (1, 1, 48, 4, 4)
-    assert torch.equal(streaming.inputs[0], torch.full((1, 1, 48, 4, 4), 2.0))
+    assert torch.equal(
+        streaming.inputs[0],
+        model_latents.permute(0, 2, 1, 3, 4),
+    )
     assert tuple(frames.shape) == (1, 3, 1, 16, 16)
     assert torch.equal(frames, torch.full((1, 3, 1, 16, 16), 0.25))
 

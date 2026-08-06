@@ -36,6 +36,8 @@ from sglang.multimodal_gen.runtime.realtime.coordinator import (
     WorkerSlot,
 )
 from sglang.multimodal_gen.runtime.realtime.gateway import (
+    AdmissionQueueFull,
+    BoundedAdmissionWaiterGate,
     GatewayOutputRegistry,
     OutputBackpressureError,
     OutputProtocolError,
@@ -100,7 +102,7 @@ def _assignment(payload: dict[str, Any]) -> SessionAssignment:
 
 
 class HTTPCoordinatorClient:
-    def __init__(self, base_url: str, *, timeout_s: float = 12.0) -> None:
+    def __init__(self, base_url: str, *, timeout_s: float = 15.0) -> None:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), timeout=timeout_s
         )
@@ -158,8 +160,8 @@ class _BrowserSender:
             else:
                 await self.websocket.send_text(payload)
 
-    async def error(self, content: str) -> None:
-        await self.send(encode_message("error", content=content))
+    async def error(self, content: str, **fields: Any) -> None:
+        await self.send(encode_message("error", content=content, **fields))
 
 
 def _user_id(websocket: WebSocket) -> str:
@@ -200,17 +202,24 @@ def create_app(
     internal_output_url: str,
     output_queue_depth: int = 2,
     output_enqueue_timeout_s: float = 1.0,
+    output_drain_timeout_s: float = 5.0,
     lease_renew_interval_s: float = 10.0,
     release_grace_s: float = 0.5,
+    max_admission_waiters: int = 64,
     connect_factory=connect,
     ui_config: dict[str, Any] | None = None,
     trace_query=None,
 ) -> FastAPI:
     if release_grace_s < 0:
         raise ValueError("release_grace_s must be non-negative")
+    if output_drain_timeout_s <= 0:
+        raise ValueError("output_drain_timeout_s must be positive")
     registry = GatewayOutputRegistry(
         queue_depth=output_queue_depth,
         enqueue_timeout_s=output_enqueue_timeout_s,
+    )
+    admission_gate = BoundedAdmissionWaiterGate(
+        max_waiters=max_admission_waiters
     )
 
     @asynccontextmanager
@@ -222,6 +231,7 @@ def create_app(
 
     app = FastAPI(title="SGLang Realtime Gateway", lifespan=lifespan)
     app.state.output_registry = registry
+    app.state.admission_gate = admission_gate
 
     @app.get("/healthz")
     async def healthz():
@@ -249,8 +259,11 @@ def create_app(
             return await trace_query.query(trace_id, after=after, limit=limit)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (RuntimeError, TimeoutError) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Trace query failed for trace_id=%s", trace_id)
+            raise HTTPException(
+                status_code=503, detail="trace query unavailable"
+            ) from exc
 
     @app.post("/v1/realtime_video/traces/{trace_id}/client-events")
     async def post_client_trace(trace_id: str, payload: dict):
@@ -312,8 +325,20 @@ def create_app(
                 )
             )
             while True:
-                await route.put(await websocket.receive_bytes())
-        except WebSocketDisconnect:
+                wire = await websocket.receive_bytes()
+                message = decode_message(wire)
+                await route.put(wire)
+                if message.get("type") == "media_chunk_complete":
+                    await websocket.send_bytes(
+                        encode_message(
+                            "media_chunk_complete_accepted",
+                            session_id=session_id,
+                            generation_id=generation_id,
+                            request_id=message.get("request_id"),
+                            chunk_index=message.get("chunk_index"),
+                        )
+                    )
+        except (WebSocketDisconnect, OutputRouteClosed):
             pass
         except OutputBackpressureError as exc:
             await websocket.close(code=1013, reason=str(exc))
@@ -339,18 +364,20 @@ def create_app(
         route = None
         upstream = None
         tasks: set[asyncio.Task] = set()
+        expected_last_chunk: int | None = None
         try:
             admitted_at = time.perf_counter()
             _log_gateway_trace(trace_id, "gateway.ws_accepted", session_id=session_id)
-            assignment = await coordinator.admit(
-                user_id=_user_id(websocket),
-                session_id=session_id,
-                generation_id=generation_id,
-                model_revision=model_revision,
-                vae_fingerprint=vae_fingerprint,
-                wait_for_capacity=False,
-                trace_id=trace_id,
-            )
+            async with admission_gate.waiter():
+                assignment = await coordinator.admit(
+                    user_id=_user_id(websocket),
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    model_revision=model_revision,
+                    vae_fingerprint=vae_fingerprint,
+                    wait_for_capacity=True,
+                    trace_id=trace_id,
+                )
             _log_gateway_trace(
                 trace_id,
                 "gateway.coordinator_admit_complete",
@@ -369,7 +396,9 @@ def create_app(
                 session_id=session_id,
                 generation_id=generation_id,
                 coordinator_token=assignment.token,
+                worker_epoch=assignment.denoiser.worker_epoch,
                 vae_url=assignment.vae.endpoint,
+                vae_worker_epoch=assignment.vae.worker_epoch,
                 output_url=internal_output_url,
                 output_token=output_token,
                 trace_id=trace_id,
@@ -390,9 +419,20 @@ def create_app(
             )
 
             async def browser_to_worker():
+                nonlocal expected_last_chunk
                 try:
                     while True:
-                        await upstream.send(await _receive_browser(websocket))
+                        payload = await _receive_browser(websocket)
+                        if isinstance(payload, bytes) and expected_last_chunk is None:
+                            try:
+                                control = decode_message(payload)
+                            except ProtocolViolation:
+                                control = None
+                            if isinstance(control, dict) and control.get("type") == "init":
+                                max_chunks = int(control.get("max_chunks") or 0)
+                                if max_chunks > 0:
+                                    expected_last_chunk = max_chunks - 1
+                        await upstream.send(payload)
                 except ConnectionClosedOK:
                     return
 
@@ -427,25 +467,60 @@ def create_app(
                     await asyncio.sleep(lease_renew_interval_s)
                     assignment = await coordinator.renew(assignment)
 
+            browser_input_task = asyncio.create_task(
+                browser_to_worker(), name="gateway-browser-input"
+            )
+            worker_control_task = asyncio.create_task(
+                worker_to_browser(), name="gateway-worker-control"
+            )
+            output_task = asyncio.create_task(
+                output_to_browser(), name="gateway-vae-output"
+            )
+            lease_task = asyncio.create_task(
+                renew_lease(), name="gateway-lease-renew"
+            )
             tasks = {
-                asyncio.create_task(browser_to_worker(), name="gateway-browser-input"),
-                asyncio.create_task(worker_to_browser(), name="gateway-worker-control"),
-                asyncio.create_task(output_to_browser(), name="gateway-vae-output"),
-                asyncio.create_task(renew_lease(), name="gateway-lease-renew"),
+                browser_input_task,
+                worker_control_task,
+                output_task,
+                lease_task,
             }
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 exception = task.exception()
                 if exception is not None:
                     raise exception
-            if route is not None:
+            if route is not None and worker_control_task in done:
                 try:
-                    await asyncio.wait_for(route.join(), timeout=1.0)
+                    if expected_last_chunk is not None:
+                        await asyncio.wait_for(
+                            route.wait_until_chunk_completed(expected_last_chunk),
+                            timeout=output_drain_timeout_s,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            route.wait_until_output_closed(),
+                            timeout=output_drain_timeout_s,
+                        )
+                    await asyncio.wait_for(
+                        route.join(), timeout=output_drain_timeout_s
+                    )
                 except TimeoutError:
-                    pass
+                    logger.warning(
+                        "Gateway media drain timed out for session_id=%s",
+                        session_id,
+                    )
         except CoordinatorRejected as exc:
+            await sender.error(
+                f"realtime admission rejected: {exc.reason}",
+                reason=exc.reason,
+                retry_after_s=exc.retry_after_s,
+            )
+            close_code = 1013 if exc.reason == "CAPACITY_EXHAUSTED" else 1008
+            await websocket.close(code=close_code, reason=exc.reason)
+        except AdmissionQueueFull as exc:
             await sender.error(f"realtime admission rejected: {exc.reason}")
-            await websocket.close(code=1008, reason=exc.reason)
+            await websocket.close(code=1013, reason=exc.reason)
         except (WebSocketDisconnect, OutputRouteClosed):
             pass
         except Exception as exc:
@@ -468,7 +543,10 @@ def create_app(
                 try:
                     await coordinator.release(assignment)
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Coordinator release failed for session_id=%s",
+                        assignment.session_id,
+                    )
             _log_gateway_trace(trace_id, "gateway.session_closed", session_id=session_id)
             try:
                 await websocket.close(code=1000)
@@ -496,8 +574,10 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-queue-depth", type=int, default=2)
     parser.add_argument("--output-enqueue-timeout-s", type=float, default=1.0)
+    parser.add_argument("--output-drain-timeout-s", type=float, default=5.0)
     parser.add_argument("--lease-renew-interval-s", type=float, default=10.0)
     parser.add_argument("--release-grace-s", type=float, default=0.5)
+    parser.add_argument("--max-admission-waiters", type=int, default=64)
     parser.add_argument("--trace-log-group")
     parser.add_argument(
         "--ui-config-json",
@@ -535,8 +615,10 @@ def main() -> None:
         internal_output_url=args.internal_output_url,
         output_queue_depth=args.output_queue_depth,
         output_enqueue_timeout_s=args.output_enqueue_timeout_s,
+        output_drain_timeout_s=args.output_drain_timeout_s,
         lease_renew_interval_s=args.lease_renew_interval_s,
         release_grace_s=args.release_grace_s,
+        max_admission_waiters=args.max_admission_waiters,
         ui_config=ui_config,
         trace_query=trace_query,
     )

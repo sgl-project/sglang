@@ -48,18 +48,23 @@ assert.doesNotMatch(
 );
 assert.match(
   appJs,
-  /traceHttpClient\?\.startPolling\(5000\)/,
+  /if \(message\.type === "media_chunk_complete"\)[\s\S]+recordTrajectoryEvent\("media_chunk_complete"[\s\S]+return;/,
+  "media completion control messages must not become pending frame headers",
+);
+assert.match(
+  appJs,
+  /traceHttpClient\?\.setActive\(true, 5000\)/,
   "Trace workspace should start bounded HTTP polling only while visible",
 );
 assert.match(
   appJs,
-  /traceHttpClient\?\.stopPolling\(\)/,
+  /traceHttpClient\?\.setActive\(false\)/,
   "leaving the Trace workspace should stop HTTP polling",
 );
 assert.match(
   appJs,
-  /recordTraceTopologyEvent\(\{ event: "server\.chunk_complete", \.\.\.stats \}/,
-  "chunk stats should feed both dump artifacts and live trace topology",
+  /traceTopology\?\.setAggregate\?\.\(aggregate\)/,
+  "Trace REST aggregates should feed the live topology without using the video socket",
 );
 assert.match(
   appJs,

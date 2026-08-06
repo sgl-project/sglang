@@ -295,6 +295,38 @@ function formatsReadableDurations() {
   assert.equal(formatTraceDuration(null), "-");
 }
 
+function keepsAggregateMetricsStableUntilValuesChange() {
+  const topology = createRealtimeTraceTopology({ traceId: "trace-aggregate" });
+  const aggregate = {
+    trace_id: "trace-aggregate",
+    observed_at: "2026-08-06T00:00:00Z",
+    stale: false,
+    window: { seconds: 300 },
+    stages: [
+      { id: "denoise", count: 4, avg_ms: 50, p50_ms: 45, p95_ms: 70, max_ms: 80 },
+    ],
+  };
+
+  assert.equal(topology.setAggregate(aggregate), true);
+  assert.equal(
+    topology.summary().nodes.find((node) => node.id === "denoise").metric,
+    "p50 45ms · p95 70ms",
+  );
+  assert.equal(
+    topology.setAggregate({ ...aggregate, observed_at: "2026-08-06T00:00:15Z" }),
+    false,
+  );
+  assert.equal(topology.summary().aggregate.observed_at, "2026-08-06T00:00:15Z");
+  assert.equal(
+    topology.setAggregate({
+      ...aggregate,
+      observed_at: "2026-08-06T00:00:30Z",
+      stages: [{ ...aggregate.stages[0], p95_ms: 72 }],
+    }),
+    true,
+  );
+}
+
 recordsChunkCriticalPathAndAsyncEstimate();
 keepsOnlyCurrentTraceAndRecentEvents();
 usesLatestCompletedChunkWhenNextChunkIsInFlight();
@@ -303,5 +335,6 @@ mapsGenericPipelineStageEventsToChunkMetrics();
 separatesVaeEncodeAndDecodeInTopologyOrder();
 keepsLatestCompleteRemoteVaeMetricsDuringNextChunk();
 formatsReadableDurations();
+keepsAggregateMetricsStableUntilValuesChange();
 
 console.log("trace topology tests ok");

@@ -51,6 +51,8 @@ function parseArgs(argv) {
     warmupChunks: Number(values["warmup-chunks"] || 2),
     timeoutMs: Number(values["timeout-ms"] || 300000),
     traceTimeoutMs: Number(values["trace-timeout-ms"] || 90000),
+    continuous: values.continuous === "true",
+    sendAction: values["send-action"] !== "false",
   };
 }
 
@@ -61,8 +63,8 @@ async function collectTrace(request, endpoint, timeoutMs) {
   const events = new Map();
   while (Date.now() < deadline) {
     const response = await request.get(endpoint, {
-      params: { after: String(cursor), limit: "500" },
-      timeout: 15000,
+      params: { after: String(cursor), limit: "100" },
+      timeout: 30000,
     });
     if (response.ok()) {
       const payload = await response.json();
@@ -94,33 +96,71 @@ async function run(args) {
   const browser = await chromium.launch(launch);
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
   const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error") pageErrors.push(message.text());
+  });
   try {
     const url = new URL(args.url);
     url.searchParams.set("mode", "t2v");
     await page.goto(url.toString(), { waitUntil: "networkidle", timeout: 60000 });
     await page.selectOption("#generationMode", "t2v");
     await page.fill("#fps", "24");
-    await page.fill("#numFrames", "121");
+    if (args.continuous) {
+      await page.check("#continuous");
+    } else {
+      await page.uncheck("#continuous");
+      await page.fill("#numFrames", "121");
+    }
     await page.fill("#guidance", "0");
     await page.fill("#prompt", "A smooth forward camera move through a mountain valley in daylight");
     await page.click("#connectBtn");
-    await page.waitForFunction(
-      (minFrames) => {
-        const debug = window.__sglangRealtimeDebug?.();
-        return debug && debug.frames >= minFrames && Number.isFinite(debug.lastDisplayLagMs);
-      },
-      args.minFrames,
-      { timeout: args.timeoutMs, polling: 250 },
-    );
-    await page.keyboard.down("w");
-    await page.waitForTimeout(350);
-    await page.keyboard.up("w");
+    try {
+      await page.waitForFunction(
+        (minFrames) => {
+          const debug = window.__sglangRealtimeDebug?.();
+          return debug && debug.frames >= minFrames && Number.isFinite(debug.lastDisplayLagMs);
+        },
+        args.minFrames,
+        { timeout: args.timeoutMs, polling: 250 },
+      );
+    } catch (error) {
+      const diagnostics = await page.evaluate(() => ({
+        debug: window.__sglangRealtimeDebug?.() || null,
+        historyList: (document.querySelector("#historyList")?.textContent || "").slice(-4000),
+        status: document.querySelector("#statusText")?.textContent || "",
+      }));
+      throw new Error(
+        `browser did not reach requested frames: ${JSON.stringify({ ...diagnostics, pageErrors })}`,
+        { cause: error },
+      );
+    }
+    const preActionDebug = await page.evaluate(() => window.__sglangRealtimeDebug());
+    if (args.sendAction) {
+      await page.keyboard.down("w");
+      await page.waitForTimeout(350);
+      await page.keyboard.up("w");
+    }
     await page.waitForTimeout(1500);
     const debug = await page.evaluate(() => window.__sglangRealtimeDebug());
+    if (args.continuous && debug.socketReadyState !== 1) {
+      throw new Error(
+        `continuous T2V socket closed after ${debug.frames || 0} frames: ${JSON.stringify(debug)}`,
+      );
+    }
     const traceId = debug.currentSessionArtifact?.traceId;
     if (!traceId) throw new Error("browser session did not expose a trace id");
     if (args.screenshot) {
       await page.screenshot({ path: args.screenshot, fullPage: true });
+    }
+    if (args.continuous) {
+      await page.click("#stopBtn");
+      await page.waitForFunction(
+        () => window.__sglangRealtimeDebug?.().socketReadyState !== WebSocket.OPEN,
+        null,
+        { timeout: 10000, polling: 100 },
+      );
     }
     const events = await collectTrace(
       context.request,
@@ -136,10 +176,20 @@ async function run(args) {
     if (!displayEvents.length) throw new Error("CloudWatch Trace has no warm display-lag events");
     return {
       trace_id: traceId,
+      continuous: args.continuous,
+      socket_open: debug.socketReadyState === 1,
+      status: debug.status,
       display_lag_ms: summarize(displayEvents.map((event) => Number(event.display_lag_ms))),
       rendered_frames: Number(debug.frames || 0),
       render_fps: Number(debug.renderedFps || 0),
       playback: debug.playback,
+      pre_action: {
+        playback: preActionDebug.playback,
+        received_frames: Number(preActionDebug.frames || 0),
+        rendered_frames: Number(preActionDebug.renderedPreviewFrames || 0),
+        render_fps: Number(preActionDebug.renderedFps || 0),
+      },
+      rendered_preview_frames: Number(debug.renderedPreviewFrames || 0),
       evidence_events: displayEvents.length,
     };
   } finally {

@@ -156,6 +156,7 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Query
                   - dynamodb:TransactWriteItems
+                  - dynamodb:ConditionCheckItem
                   - dynamodb:DescribeTable
                 Resource:
                   - !GetAtt CoordinatorTable.Arn

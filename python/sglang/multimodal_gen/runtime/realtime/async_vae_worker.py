@@ -14,9 +14,6 @@ from typing import Any, Awaitable, Callable
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
-    MinWMWan22VAEArchConfig,
-)
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     AcceptDisposition,
     ChunkSequenceTracker,
@@ -90,6 +87,7 @@ class _DecodeJob:
     submitted_at: float
     future: asyncio.Future[DecodeResult]
     on_frame_batch: FrameBatchCallback | None = None
+    on_decode_started: Callable[[], Any] | None = None
 
 
 @dataclass(slots=True)
@@ -101,6 +99,7 @@ class _WorkerSession:
     runner: asyncio.Task[None] | None = None
     first_t2v_latent: torch.Tensor | None = None
     last_activity_at: float = field(default_factory=time.monotonic)
+    processing: bool = False
 
 
 class AsyncVAEWorker:
@@ -125,6 +124,7 @@ class AsyncVAEWorker:
         self._sessions: dict[tuple[str, str], _WorkerSession] = {}
         self._session_lock = asyncio.Lock()
         self._actor_lock = asyncio.Lock()
+        self._service_time_ms = 0.0
 
     async def open(self, request: SessionOpen) -> None:
         if not request.session_id or not request.generation_id:
@@ -157,6 +157,7 @@ class AsyncVAEWorker:
         latents: torch.Tensor,
         *,
         on_frame_batch: FrameBatchCallback | None = None,
+        on_decode_started: Callable[[], Any] | None = None,
     ) -> asyncio.Future[DecodeResult]:
         identity = (header.session_id, header.generation_id)
         state = self._sessions.get(identity)
@@ -199,6 +200,7 @@ class AsyncVAEWorker:
             submitted_at=time.perf_counter(),
             future=future,
             on_frame_batch=on_frame_batch,
+            on_decode_started=on_decode_started,
         )
         try:
             state.queue.put_nowait(job)
@@ -215,11 +217,13 @@ class AsyncVAEWorker:
         latents: torch.Tensor,
         *,
         on_frame_batch: FrameBatchCallback | None = None,
+        on_decode_started: Callable[[], Any] | None = None,
     ) -> DecodeResult:
         future = await self.submit(
             header,
             latents,
             on_frame_batch=on_frame_batch,
+            on_decode_started=on_decode_started,
         )
         return await future
 
@@ -231,6 +235,8 @@ class AsyncVAEWorker:
         try:
             while True:
                 job = await state.queue.get()
+                service_started = time.perf_counter()
+                state.processing = True
                 try:
                     result = await self._decode_job(state, job)
                 except asyncio.CancelledError:
@@ -244,6 +250,15 @@ class AsyncVAEWorker:
                     if not job.future.done():
                         job.future.set_result(result)
                 finally:
+                    service_time_ms = (
+                        time.perf_counter() - service_started
+                    ) * 1000.0
+                    self._service_time_ms = (
+                        service_time_ms
+                        if self._service_time_ms == 0
+                        else 0.8 * self._service_time_ms + 0.2 * service_time_ms
+                    )
+                    state.processing = False
                     state.queue.task_done()
                     state.last_activity_at = time.monotonic()
                     self._update_capacity_metrics()
@@ -278,8 +293,31 @@ class AsyncVAEWorker:
         callback_tail: asyncio.Task | None = None
         frame_batch_index = 0
         remaining_drop = drop_leading_frames
+        pending_frames: list[torch.Tensor] = []
+        pending_frame_count = 0
+
+        def schedule_encode(frames: torch.Tensor) -> None:
+            nonlocal callback_tail, frame_batch_index
+            task = asyncio.create_task(
+                self._encode_and_emit(
+                    frames,
+                    state.opened,
+                    frame_batch_index=frame_batch_index,
+                    previous_callback=callback_tail,
+                    on_frame_batch=job.on_frame_batch,
+                )
+            )
+            encode_tasks.append(task)
+            callback_tail = task
+            frame_batch_index += (
+                int(frames.shape[2]) + self.encoded_frames_per_batch - 1
+            ) // self.encoded_frames_per_batch
 
         async with self._actor_lock:
+            if job.on_decode_started is not None:
+                started = job.on_decode_started()
+                if inspect.isawaitable(started):
+                    await started
             async for raw_frames in self._iter_decoded_frames(
                 state.decoder,
                 source,
@@ -293,20 +331,30 @@ class AsyncVAEWorker:
                 if frames.shape[2] == 0:
                     continue
 
-                task = asyncio.create_task(
-                    self._encode_and_emit(
-                        frames,
-                        state.opened,
-                        frame_batch_index=frame_batch_index,
-                        previous_callback=callback_tail,
-                        on_frame_batch=job.on_frame_batch,
-                    )
+                pending_frames.append(frames)
+                pending_frame_count += int(frames.shape[2])
+                if pending_frame_count < self.encoded_frames_per_batch:
+                    continue
+
+                merged = (
+                    pending_frames[0]
+                    if len(pending_frames) == 1
+                    else torch.cat(pending_frames, dim=2)
                 )
-                encode_tasks.append(task)
-                callback_tail = task
-                frame_batch_index += (
-                    int(frames.shape[2]) + self.encoded_frames_per_batch - 1
-                ) // self.encoded_frames_per_batch
+                while int(merged.shape[2]) >= self.encoded_frames_per_batch:
+                    schedule_encode(
+                        merged[:, :, : self.encoded_frames_per_batch].contiguous()
+                    )
+                    merged = merged[:, :, self.encoded_frames_per_batch :]
+                pending_frames = [merged.contiguous()] if merged.shape[2] else []
+                pending_frame_count = int(merged.shape[2])
+
+            if pending_frames:
+                schedule_encode(
+                    pending_frames[0]
+                    if len(pending_frames) == 1
+                    else torch.cat(pending_frames, dim=2).contiguous()
+                )
 
         decode_ms = (time.perf_counter() - decode_started) * 1000.0
         encoded_groups = (
@@ -507,6 +555,21 @@ class AsyncVAEWorker:
     def active_sessions(self) -> int:
         return len(self._sessions)
 
+    def runtime_state(self) -> dict[str, int | float]:
+        return {
+            "runnable_sessions": sum(
+                state.processing or not state.queue.empty()
+                for state in self._sessions.values()
+            ),
+            "blocked_sessions": sum(
+                state.queue.full() for state in self._sessions.values()
+            ),
+            "queue_depth": sum(
+                state.queue.qsize() for state in self._sessions.values()
+            ),
+            "service_time_ms": self._service_time_ms,
+        }
+
     def _update_capacity_metrics(self) -> None:
         update_capacity(
             active=len(self._sessions),
@@ -539,13 +602,6 @@ class TAEHVEngine:
             .to(device=self.device, dtype=dtype)
             .requires_grad_(False)
         )
-        config = MinWMWan22VAEArchConfig()
-        self.mean = torch.tensor(config.latents_mean, device=self.device, dtype=dtype)[
-            None, :, None, None, None
-        ]
-        self.std = torch.tensor(config.latents_std, device=self.device, dtype=dtype)[
-            None, :, None, None, None
-        ]
 
     def create_decoder(self, identity):
         del identity
@@ -571,7 +627,7 @@ class TAEHVEngine:
         if first_chunk:
             decoder.reset()
         source = latents.to(device=self.device, dtype=self.dtype, non_blocking=True)
-        source = (source * self.std + self.mean).permute(0, 2, 1, 3, 4).contiguous()
+        source = source.permute(0, 2, 1, 3, 4).contiguous()
         frame = decoder.decode(source)
         while frame is not None:
             yield frame.permute(0, 2, 1, 3, 4).contiguous().clamp(0, 1)

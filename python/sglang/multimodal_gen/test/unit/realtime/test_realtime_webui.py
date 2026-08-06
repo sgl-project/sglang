@@ -50,14 +50,21 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert 'id="referenceSection"' in index_html
     assert 'id="t2vFrameHint"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-production-gateway-v2" in index_html
+    assert "playback_controller.js?v=realtime-playback-v22" in index_html
+    assert "app.js?v=realtime-production-gateway-v4" in index_html
     assert "UI_CONFIG.generationModes" in app_js
     assert "UI_CONFIG.generationMode" in app_js
     assert "CONFIGURED_DEFAULT_GENERATION_MODE" in app_js
     assert "generation_mode: generationMode" in app_js
     assert 'generationMode === "i2v"' in app_js
-    assert "numFrames = readT2VNumFrames()" in app_js
+    assert 'const continuousT2V = generationMode === "t2v"' in app_js
+    assert "numFrames = continuousT2V ? undefined : readT2VNumFrames()" in app_js
+    assert "num_frames: continuousT2V ? undefined : numFrames" in app_js
     assert 'max_chunks: generationMode === "t2v"' in app_js
+    assert '$(' + '"continuous"' + ').disabled = false' in app_js
+    assert "let savedT2VContinuous = true" in app_js
+    assert '$(' + '"continuous"' + ').checked = savedT2VContinuous' in app_js
+    assert '"Continuous T2V session"' in app_js
     assert '$("referenceSection").hidden = isT2V' in app_js
 
 
@@ -107,7 +114,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-production-gateway-v2" in index_html
+    assert "app.js?v=realtime-production-gateway-v4" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
     assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 16);' in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
@@ -160,8 +167,8 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'setStatus("Receiving", "live")' in app_js
     assert "pumpDecodeQueue()" in app_js
     assert "receiveChain" not in app_js
-    assert 'message.type === "chunk_stats"' in app_js
-    assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
+    assert 'message.type === "chunk_stats"' not in app_js
+    assert "function updateServerChunkStats" not in app_js
     assert ".stage-stat" in styles_css
     assert ".workspace" in styles_css
     assert ".preview-frame" in styles_css
@@ -235,11 +242,25 @@ def test_realtime_webui_exposes_live_trace_topology_with_dump_trace_id():
     assert 'id="traceVaeDecodeText"' in index_html
     assert "const traceTopologyApi = window.SGLangRealtimeTraceTopology || {};" in app_js
     assert "function traceWebSocketUrl" in app_js
-    assert 'recordTraceTopologyEvent({ event: "server.chunk_complete", ...stats }' in app_js
+    assert 'message.type === "chunk_stats"' not in app_js
     assert "currentSessionArtifact.trace_id = currentTrace.traceId" in app_js
     assert "traceHttpClient?.enqueueClientEvent(event)" in app_js
-    assert "traceHttpClient?.startPolling(5000)" in app_js
+    assert "traceHttpClient?.setActive(true, 5000)" in app_js
+    assert "traceHttpClient?.setActive(false)" in app_js
+    assert "traceTopology?.setAggregate?.(aggregate)" in app_js
+    assert 'id="traceObservedText"' in index_html
     assert "client_trace:" not in app_js
     assert 'message.type === "trace_event"' not in app_js
     assert "trace-panel" in styles_css
     assert ".trace-node" in styles_css
+
+
+def test_realtime_webui_uses_frame_metadata_for_live_business_status():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+
+    assert "lastSampledEventId = Number(header.event_id || lastSampledEventId)" in app_js
+    assert "formatBytes(payloadBytes)" in app_js
+    assert "playback.sourceFps.toFixed(1)" in app_js

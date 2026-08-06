@@ -67,7 +67,7 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             - name: MODEL_REVISION
-              value: wan22-5b-stage3-dmd-30-gs1800
+              value: REPLACE_WITH_MODEL_ID
             - name: VAE_FINGERPRINT
               value: taew2_2-d053e216
             - name: REALTIME_UI_CONFIG_JSON

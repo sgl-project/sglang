@@ -8,7 +8,7 @@ metadata:
     seedleap.ai/ttl-after-test: required
 spec:
   limits:
-    cpu: "128"
+    cpu: "192"
     nvidia.com/gpu: "8"
   disruption:
     consolidationPolicy: WhenEmpty
@@ -34,7 +34,7 @@ spec:
           values: [amd64]
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: [p5.4xlarge]
+          values: [p5.48xlarge]
       taints:
         - key: nvidia.com/gpu
           value: "true"
@@ -79,7 +79,7 @@ spec:
           values: [us-east-2a, us-east-2b, us-east-2c]
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: [p5.48xlarge, p6-b200.48xlarge]
+          values: [p5.48xlarge]
       taints:
         - key: nvidia.com/gpu
           value: "true"
@@ -115,9 +115,9 @@ spec:
   replicas: REPLACE_WITH_DENOISER_BASE_REPLICAS
   revisionHistoryLimit: 1
   serviceName: minwm-async-denoiser-headless
-  podManagementPolicy: OrderedReady
+  podManagementPolicy: Parallel
   updateStrategy:
-    type: RollingUpdate
+    type: OnDelete
   selector:
     matchLabels:
       app.kubernetes.io/name: minwm-async-denoiser
@@ -149,9 +149,9 @@ spec:
           command: [/bin/bash, -lc]
           env:
             - name: SOURCE_MODEL
-              value: /checkpoint-archive/world-model/minwm/serving-artifacts/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
+              value: /checkpoint-archive/world-model/minwm/serving-artifacts/REPLACE_WITH_MODEL_ID/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
             - name: CACHED_MODEL
-              value: /model-cache/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
+              value: /model-cache/REPLACE_WITH_MODEL_ID/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
           args:
             - |
               set -euo pipefail
@@ -176,6 +176,42 @@ spec:
             - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}
             - {name: model-cache, mountPath: /model-cache}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
+        - name: denoiser-heartbeat
+          image: REPLACE_WITH_DENOISER_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
+              --coordinator-url=http://minwm-realtime-coordinator:18081
+              --health-url=http://127.0.0.1:30000/health
+              --state-url=http://127.0.0.1:30000/v1/realtime_worker/state
+              --worker-id=$(POD_UID)
+              --worker-epoch-file=/var/run/minwm-worker/epoch
+              --role=denoiser
+              --endpoint=ws://$(POD_IP):30000/v1/realtime_video/generate
+              --reservation-endpoint=http://$(POD_IP):30000/v1/realtime_worker
+              --node-name=$(NODE_NAME)
+              --capacity=4
+              --model-revision=REPLACE_WITH_MODEL_ID
+              --vae-fingerprint=taew2_2-d053e216
+              --interval-s=5
+          env:
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+          volumeMounts:
+            - {name: worker-epoch, mountPath: /var/run/minwm-worker, readOnly: true}
       containers:
         - name: denoiser
           image: REPLACE_WITH_DENOISER_IMAGE_DIGEST
@@ -183,12 +219,16 @@ spec:
           workingDir: /opt/sglang
           env:
             - {name: PYTHONUNBUFFERED, value: "1"}
-            - {name: MODEL_REVISION, value: wan22-5b-stage3-dmd-30-gs1800}
+            - {name: WORKER_EPOCH_FILE, value: /var/run/minwm-worker/epoch}
+            - {name: DENOISER_STARTUP_PARALLELISM, value: "2"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: MODEL_REVISION, value: REPLACE_WITH_MODEL_ID}
             - {name: REALTIME_MAX_SESSIONS, value: "4"}
             - name: REALTIME_UI_CONFIG_JSON
               value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
             - name: MINWM_MODEL
-              value: /model-cache/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
+              value: /model-cache/REPLACE_WITH_MODEL_ID/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
             - {name: TAEHV_CHECKPOINT_PATH, value: /opt/taehv/taew2_2.pth}
             - {name: MINWM_ATTENTION_IMPL, value: packed}
             - {name: MINWM_PACKED_ATTENTION_DETERMINISTIC, value: "false"}
@@ -206,7 +246,9 @@ spec:
               test -f "${MINWM_MODEL}/_READY"
               test -f "${MINWM_MODEL}/model_index.json"
               test -d "${MINWM_MODEL}/transformer"
-              exec 9>/var/run/minwm-startup-lock/denoiser.lock
+              ordinal="${POD_NAME##*-}"
+              slot=$((ordinal % DENOISER_STARTUP_PARALLELISM))
+              exec 9>"/var/run/minwm-startup-lock/denoiser-${slot}.lock"
               flock -x 9
               python3 -m sglang.multimodal_gen.runtime.launch_server \
                 --model-path "${MINWM_MODEL}" \
@@ -239,7 +281,8 @@ spec:
                 exit 143
               }
               trap terminate TERM INT
-              until curl --fail --silent --max-time 2 http://127.0.0.1:30000/health >/dev/null; do
+              until curl --fail --silent --max-time 2 \
+                http://127.0.0.1:30000/health >/dev/null; do
                 if ! kill -0 "${child}" 2>/dev/null; then
                   wait "${child}"
                   exit $?
@@ -250,6 +293,24 @@ spec:
               wait "${child}"
           ports:
             - {name: api, containerPort: 30000}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -ec
+                  - |
+                    deadline=$(( $(date +%s) + 80 ))
+                    curl --fail --silent --max-time 3 \
+                      -H 'content-type: application/json' \
+                      --data "{\"deadline\":${deadline}}" \
+                      http://127.0.0.1:30000/v1/realtime_worker/drain
+                    for _ in $(seq 1 38); do
+                      state=$(curl --fail --silent --max-time 2 \
+                        http://127.0.0.1:30000/v1/realtime_worker/state) || break
+                      echo "${state}" | grep -q '"active_sessions":0' && break
+                      sleep 2
+                    done
           startupProbe:
             httpGet: {path: /health, port: api}
             periodSeconds: 20
@@ -280,37 +341,8 @@ spec:
           volumeMounts:
             - {name: model-cache, mountPath: /model-cache, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
+            - {name: worker-epoch, mountPath: /var/run/minwm-worker}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
-        - name: denoiser-heartbeat
-          image: REPLACE_WITH_DENOISER_IMAGE_DIGEST
-          imagePullPolicy: IfNotPresent
-          command: [/bin/sh, -ec]
-          args:
-            - >-
-              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
-              --coordinator-url=http://minwm-realtime-coordinator:18081
-              --health-url=http://127.0.0.1:30000/health
-              --worker-id=$(POD_UID)
-              --role=denoiser
-              --endpoint=ws://$(POD_IP):30000/v1/realtime_video/generate
-              --node-name=$(NODE_NAME)
-              --capacity=4
-              --model-revision=wan22-5b-stage3-dmd-30-gs1800
-              --vae-fingerprint=taew2_2-d053e216
-              --interval-s=5
-          env:
-            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
-            - name: POD_UID
-              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
-            - name: POD_IP
-              valueFrom: {fieldRef: {fieldPath: status.podIP}}
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-          resources:
-            requests: {cpu: 25m, memory: 64Mi}
-            limits: {cpu: 200m, memory: 256Mi}
       volumes:
         - name: checkpoint-archive
           persistentVolumeClaim: {claimName: minwm-async-west-s3, readOnly: true}
@@ -324,3 +356,5 @@ spec:
           hostPath:
             path: /var/lib/minwm-model-cache
             type: DirectoryOrCreate
+        - name: worker-epoch
+          emptyDir: {}

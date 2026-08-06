@@ -327,6 +327,27 @@ class CausalVaeDecodingStage(DecodingStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
+        taehv_checkpoint_path = self._taehv_checkpoint_path(
+            getattr(server_args.pipeline_config, "vae_config", None)
+        )
+        if taehv_checkpoint_path is not None:
+            if not vae_autocast_enabled:
+                latents = latents.to(vae_dtype)
+            if decode_state is None:
+                decode_state = RealtimeVAEDecodeState()
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                return self._decode_with_streaming_taehv(
+                    latents,
+                    decode_state,
+                    taehv_checkpoint_path,
+                    vae_dtype,
+                    first_chunk=first_chunk,
+                )
+
         latents = self.scale_and_shift(latents, server_args)
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
@@ -345,20 +366,6 @@ class CausalVaeDecodingStage(DecodingStage):
 
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-
-            taehv_checkpoint_path = self._taehv_checkpoint_path(
-                getattr(server_args.pipeline_config, "vae_config", None)
-            )
-            if taehv_checkpoint_path is not None:
-                if decode_state is None:
-                    decode_state = RealtimeVAEDecodeState()
-                return self._decode_with_streaming_taehv(
-                    latents,
-                    decode_state,
-                    taehv_checkpoint_path,
-                    vae_dtype,
-                    first_chunk=first_chunk,
-                )
 
             decode_fn = getattr(self.vae, "causal_decode", None)
             if callable(decode_fn):

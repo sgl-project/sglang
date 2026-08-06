@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Response, status
 from sglang.multimodal_gen.runtime.realtime.coordinator import (
     CoordinatorRejected,
     DynamoDBCoordinatorStore,
+    HTTPWorkerReservationClient,
     InMemoryCoordinatorStore,
     RealtimeCoordinator,
     SessionAssignment,
@@ -48,6 +50,7 @@ def _raise_http(exc: CoordinatorRejected) -> None:
         "USER_SESSION_LIMIT": status.HTTP_409_CONFLICT,
         "CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
         "LEASE_LOST": status.HTTP_409_CONFLICT,
+        "WORKER_LOST": status.HTTP_409_CONFLICT,
     }.get(exc.reason, status.HTTP_400_BAD_REQUEST)
     headers = None
     if exc.retry_after_s is not None:
@@ -60,11 +63,20 @@ def _raise_http(exc: CoordinatorRejected) -> None:
 
 
 def create_app(coordinator: RealtimeCoordinator) -> FastAPI:
-    app = FastAPI(title="SGLang Realtime Coordinator")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        await coordinator.close()
+
+    app = FastAPI(title="SGLang Realtime Coordinator", lifespan=lifespan)
 
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
+
+    @app.get("/v1/capacity")
+    async def capacity():
+        return await coordinator.capacity_snapshot()
 
     @app.post("/v1/workers/heartbeat", status_code=status.HTTP_204_NO_CONTENT)
     async def heartbeat(payload: dict):
@@ -151,6 +163,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-ttl-s", type=float, default=15.0)
     parser.add_argument("--wait-timeout-s", type=float, default=10.0)
     parser.add_argument("--candidate-limit", type=int, default=64)
+    parser.add_argument("--denoiser-capacity-limit", type=int)
+    parser.add_argument("--vae-capacity-limit", type=int)
+    parser.add_argument(
+        "--worker-reservation-timeout-s", type=float, default=2.0
+    )
     return parser.parse_args()
 
 
@@ -165,13 +182,27 @@ def main() -> None:
             worker_ttl_s=args.worker_ttl_s,
             region_name=args.region,
             candidate_limit=args.candidate_limit,
+            capacity_limits={
+                role: limit
+                for role, limit in (
+                    ("denoiser", args.denoiser_capacity_limit),
+                    ("vae", args.vae_capacity_limit),
+                )
+                if limit is not None
+            },
         )
     else:
         store = InMemoryCoordinatorStore(
             ttl_s=args.ttl_s,
             worker_ttl_s=args.worker_ttl_s,
         )
-    coordinator = RealtimeCoordinator(store, wait_timeout_s=args.wait_timeout_s)
+    coordinator = RealtimeCoordinator(
+        store,
+        wait_timeout_s=args.wait_timeout_s,
+        reservation_client=HTTPWorkerReservationClient(
+            timeout_s=args.worker_reservation_timeout_s
+        ),
+    )
     uvicorn.run(create_app(coordinator), host=args.host, port=args.port)
 
 

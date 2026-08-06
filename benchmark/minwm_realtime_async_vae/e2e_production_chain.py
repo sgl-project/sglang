@@ -80,6 +80,18 @@ def _metric(summary: dict | None, field: str = "p95") -> str:
     return "-" if value is None else f"{float(value):.1f} ms"
 
 
+def _hardware_count(hardware: dict) -> int | str:
+    return hardware.get(
+        "count", hardware.get("worker_count", hardware.get("gpu_count", "-"))
+    )
+
+
+def _action_latency(run: dict) -> dict:
+    return run.get("action_to_first_frame_ms") or run.get(
+        "client_observed_action_to_first_frame_ms"
+    ) or {}
+
+
 def render_chinese_report(result: dict, *, run_id: str) -> str:
     hardware = result.get("hardware") or {}
     denoiser = hardware.get("denoiser") or {}
@@ -96,8 +108,8 @@ def render_chinese_report(result: dict, *, run_id: str) -> str:
         "",
         "| 模块 | 实例 | GPU | 数量 |",
         "| --- | --- | --- | ---: |",
-        f"| Denoiser | {denoiser.get('instance_type', '-')} | {denoiser.get('gpu', '-')} | {denoiser.get('count', '-')} |",
-        f"| VAE | {vae.get('instance_type', '-')} | {vae.get('gpu', '-')} | {vae.get('count', '-')} |",
+        f"| Denoiser | {denoiser.get('instance_type', '-')} | {denoiser.get('gpu', '-')} | {_hardware_count(denoiser)} |",
+        f"| VAE | {vae.get('instance_type', '-')} | {vae.get('gpu', '-')} | {_hardware_count(vae)} |",
         "",
         "## 并发与耗时",
         "",
@@ -109,7 +121,7 @@ def render_chinese_report(result: dict, *, run_id: str) -> str:
         lines.append(
             f"| {run['concurrency']} 并发 | {run.get('successful_sessions', 0)} | "
             f"{_metric(run.get('chunk_total_ms'))} | "
-            f"{_metric(run.get('action_to_first_frame_ms'))} | "
+            f"{_metric(_action_latency(run))} | "
             f"{_metric(stage.get('denoise_ms'))} | "
             f"{_metric(stage.get('vae_decode_ms'))} |"
         )

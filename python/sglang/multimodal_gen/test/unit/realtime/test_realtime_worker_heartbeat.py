@@ -26,11 +26,22 @@ class _Response:
 
 
 class _Client:
-    def __init__(self, *, health_status=200):
+    def __init__(self, *, health_status=200, state_payload=None):
         self.health_status = health_status
+        self.state_payload = state_payload or {
+            "worker_epoch": "epoch-a",
+            "lifecycle": "ready",
+            "active_sessions": 2,
+            "runnable_sessions": 1,
+            "blocked_sessions": 1,
+            "queue_depth": 3,
+            "service_time_ms": 12.5,
+        }
         self.posts = []
 
     async def get(self, url, **kwargs):
+        if url.endswith("/state"):
+            return _Response(200, self.state_payload)
         return _Response(self.health_status)
 
     async def post(self, url, *, json):
@@ -48,9 +59,12 @@ async def _test_worker_registers_capacity_only_after_local_health_is_ready():
         client,
         coordinator_url="http://coordinator:18081",
         health_url="http://127.0.0.1:30000/health",
+        state_url="http://127.0.0.1:30000/v1/realtime_worker/state",
         worker_id="pod-123",
+        worker_epoch="epoch-a",
         role="denoiser",
         endpoint="ws://10.0.0.7:30000/v1/realtime_video/generate",
+        reservation_endpoint="http://10.0.0.7:30000/v1/realtime_worker",
         az="us-east-2a",
         capacity=4,
         model_revision="model-sha",
@@ -67,12 +81,22 @@ async def _test_worker_registers_capacity_only_after_local_health_is_ready():
             "http://coordinator:18081/v1/workers/heartbeat",
             {
                 "worker_id": "pod-123",
+                "worker_epoch": "epoch-a",
                 "role": "denoiser",
                 "endpoint": "ws://10.0.0.7:30000/v1/realtime_video/generate",
+                "reservation_endpoint": (
+                    "http://10.0.0.7:30000/v1/realtime_worker"
+                ),
                 "az": "us-east-2a",
                 "capacity": 4,
                 "model_revision": "model-sha",
                 "vae_fingerprint": "taew2_2",
+                "lifecycle": "ready",
+                "active_sessions": 2,
+                "runnable_sessions": 1,
+                "blocked_sessions": 1,
+                "queue_depth": 3,
+                "service_time_ms": 12.5,
             },
         )
     ]
@@ -84,9 +108,12 @@ def test_worker_rejects_public_or_malformed_endpoints():
             _Client(),
             coordinator_url="http://coordinator:18081",
             health_url="http://127.0.0.1:30000/health",
+            state_url="http://127.0.0.1:30000/v1/realtime_worker/state",
             worker_id="pod-123",
+            worker_epoch="epoch-a",
             role="denoiser",
             endpoint="https://public.example.com/generate",
+            reservation_endpoint="http://10.0.0.7:30000/v1/realtime_worker",
             az="us-east-2a",
             capacity=1,
             model_revision="model-sha",
@@ -116,3 +143,36 @@ def test_worker_discovers_real_az_from_its_kubernetes_node():
             token="token",
         )
     ) == "us-east-2b"
+
+
+def test_heartbeat_follows_process_epoch_file_across_worker_restart(tmp_path):
+    async def run():
+        epoch_file = tmp_path / "worker-epoch"
+        epoch_file.write_text("epoch-a\n")
+        client = _Client()
+        reporter = WorkerHeartbeatReporter(
+            client,
+            coordinator_url="http://coordinator:18081",
+            health_url="http://127.0.0.1:30000/health",
+            state_url="http://127.0.0.1:30000/v1/realtime_worker/state",
+            worker_id="pod-123",
+            worker_epoch=None,
+            worker_epoch_file=epoch_file,
+            role="denoiser",
+            endpoint="ws://10.0.0.7:30000/v1/realtime_video/generate",
+            reservation_endpoint="http://10.0.0.7:30000/v1/realtime_worker",
+            az="us-east-2a",
+            capacity=4,
+            model_revision="model-sha",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert await reporter.heartbeat_once() is True
+        assert client.posts[-1][1]["worker_epoch"] == "epoch-a"
+
+        epoch_file.write_text("epoch-b\n")
+        client.state_payload["worker_epoch"] = "epoch-b"
+        assert await reporter.heartbeat_once() is True
+        assert client.posts[-1][1]["worker_epoch"] == "epoch-b"
+
+    asyncio.run(run())

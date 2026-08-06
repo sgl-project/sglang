@@ -119,22 +119,25 @@ spec:
           imagePullPolicy: IfNotPresent
           command: [python3, /opt/sglang/benchmark/minwm_realtime_async_vae/publish_model_artifact.py]
           args:
-            - --source-checkpoint=/checkpoint-archive/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
-            - --source-uri=s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
-            - --source-version-id=ghDNCSQtQ2OJ1LnrxtMKLXtqNWDK0CsR
-            - --donor-dir=/checkpoint-archive/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - --source-checkpoint=REPLACE_WITH_SOURCE_CHECKPOINT_PATH
+            - --source-uri=REPLACE_WITH_SOURCE_CHECKPOINT_URI
+            - --source-version-id=REPLACE_WITH_SOURCE_CHECKPOINT_VERSION_ID
+            - --donor-dir=/checkpoint-west/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
             - --converter-script=/opt/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py
             - --converter-git-sha=REPLACE_WITH_CONVERTER_GIT_SHA
             - --revision=REPLACE_WITH_MODEL_ARTIFACT_REVISION
             - --output-bucket=leap-world-us-west-2
             - --output-region=us-west-2
-            - --output-prefix=world-model/minwm/serving-artifacts/wan22-5b-stage3-dmd-30-gs1800
+            - --output-prefix=world-model/minwm/serving-artifacts/REPLACE_WITH_MODEL_ID
             - --upload-concurrency=16
           resources:
             requests: {cpu: "24", memory: 128Gi, ephemeral-storage: 100Gi}
             limits: {cpu: "31", memory: 220Gi, ephemeral-storage: 220Gi}
           volumeMounts:
-            - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}
+            - {name: checkpoint-east, mountPath: /checkpoint-east, readOnly: true}
+            - {name: checkpoint-west, mountPath: /checkpoint-west, readOnly: true}
       volumes:
-        - name: checkpoint-archive
+        - name: checkpoint-east
+          persistentVolumeClaim: {claimName: minwm-async-east-s3-source, readOnly: true}
+        - name: checkpoint-west
           persistentVolumeClaim: {claimName: minwm-async-west-s3, readOnly: true}

@@ -102,6 +102,30 @@ def test_cloudwatch_trace_query_rejects_unsafe_trace_ids_without_a_query():
     asyncio.run(run())
 
 
+def test_cloudwatch_trace_query_escapes_trace_id_regex_metacharacters():
+    class FakeLogs:
+        def __init__(self):
+            self.query_string = ""
+
+        def start_query(self, **kwargs):
+            self.query_string = kwargs["queryString"]
+            return {"queryId": "query-escaped"}
+
+        def get_query_results(self, *, queryId):
+            assert queryId == "query-escaped"
+            return {"status": "Complete", "results": []}
+
+    async def run():
+        logs = FakeLogs()
+        query = CloudWatchTraceQuery(logs, log_group="logs")
+
+        await query.query("trace.with:parts-1")
+
+        assert "filter @message like /trace\\.with:parts-1/" in logs.query_string
+
+    asyncio.run(run())
+
+
 def test_cloudwatch_trace_query_coalesces_identical_requests_and_bounds_concurrency():
     class FakeLogs:
         def __init__(self):
@@ -217,5 +241,213 @@ def test_cloudwatch_trace_query_retries_transient_api_throttling():
 
         assert result["events"] == []
         assert logs.started == 2
+
+    asyncio.run(run())
+
+
+def test_cloudwatch_trace_query_returns_five_minute_stage_aggregates():
+    events = [
+        {
+            "trace_id": "trace-aggregate",
+            "event": "client.generate_clicked",
+            "trace_seq": 1,
+            "client_epoch_ms": 1_000,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "client.ws_open",
+            "trace_seq": 2,
+            "client_epoch_ms": 1_025,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "gateway.coordinator_admit_complete",
+            "trace_seq": 3,
+            "coordinator_admit_ms": 8,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "server.chunk_complete",
+            "trace_seq": 4,
+            "chunk_index": 1,
+            "event_id": 7,
+            "request_prepare_ms": 10,
+            "scheduler_forward_ms": 20,
+            "raw_payload_build_ms": 2,
+            "ws_write_ms": 3,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "server.model_denoise_complete",
+            "trace_seq": 5,
+            "chunk_index": 1,
+            "event_id": 7,
+            "duration_ms": 40,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "server.model_denoise_complete",
+            "trace_seq": 6,
+            "chunk_index": 2,
+            "event_id": 8,
+            "duration_ms": 80,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "server.vae_decode_complete",
+            "trace_seq": 7,
+            "chunk_index": 1,
+            "event_id": 7,
+            "cuda_ms": 12,
+        },
+        {
+            "trace_id": "trace-aggregate",
+            "event": "client.chunk_first_rendered",
+            "trace_seq": 8,
+            "chunk_index": 1,
+            "event_id": 7,
+            "decode_ms": 1,
+            "display_lag_ms": 9,
+        },
+    ]
+
+    class FakeLogs:
+        def start_query(self, **kwargs):
+            assert kwargs["startTime"] == 700
+            assert kwargs["endTime"] == 1_000
+            assert kwargs["limit"] == 10_000
+            return {"queryId": "query-aggregate"}
+
+        def get_query_results(self, *, queryId):
+            assert queryId == "query-aggregate"
+            return {
+                "status": "Complete",
+                "results": [
+                    [{"field": "@message", "value": json.dumps(event)}]
+                    for event in events
+                ],
+            }
+
+    async def run():
+        query = CloudWatchTraceQuery(
+            FakeLogs(),
+            log_group="logs",
+            wall_clock=lambda: 1_000,
+        )
+        result = await query.query("trace-aggregate", window_s=300)
+
+        assert result["stale"] is False
+        assert result["window"]["seconds"] == 300
+        assert result["window"]["start_epoch_ms"] == 700_000
+        assert result["window"]["end_epoch_ms"] == 1_000_000
+        assert result["observed_at"]
+        stages = {stage["id"]: stage for stage in result["stages"]}
+        assert stages["browser"]["avg_ms"] == 25
+        assert stages["gateway"]["avg_ms"] == 8
+        assert stages["api"]["avg_ms"] == 10
+        assert stages["scheduler"]["avg_ms"] == 20
+        assert stages["denoise"] == {
+            "id": "denoise",
+            "title": "Denoising",
+            "count": 2,
+            "avg_ms": 60,
+            "p50_ms": 40,
+            "p95_ms": 80,
+            "max_ms": 80,
+        }
+        assert stages["vae_decode"]["avg_ms"] == 12
+        assert stages["transport"]["avg_ms"] == 5
+        assert stages["frontend"]["avg_ms"] == 10
+
+    asyncio.run(run())
+
+
+def test_cloudwatch_trace_query_retains_last_good_aggregate_on_empty_result():
+    class FakeLogs:
+        def __init__(self):
+            self.started = 0
+
+        def start_query(self, **_kwargs):
+            self.started += 1
+            return {"queryId": f"query-{self.started}"}
+
+        def get_query_results(self, *, queryId):
+            if queryId == "query-1":
+                event = {
+                    "trace_id": "trace-sticky",
+                    "event": "server.model_denoise_complete",
+                    "trace_seq": 1,
+                    "chunk_index": 1,
+                    "duration_ms": 55,
+                }
+                return {
+                    "status": "Complete",
+                    "results": [[{"field": "@message", "value": json.dumps(event)}]],
+                }
+            return {"status": "Complete", "results": []}
+
+    async def run():
+        now = [100.0]
+        query = CloudWatchTraceQuery(
+            FakeLogs(),
+            log_group="logs",
+            cache_ttl_s=1,
+            clock=lambda: now[0],
+            wall_clock=lambda: 1_000,
+        )
+        first = await query.query("trace-sticky")
+        now[0] = 102.0
+        second = await query.query("trace-sticky")
+
+        assert first["stale"] is False
+        assert second["stale"] is True
+        assert second["stale_reason"] == "no_results"
+        assert second["observed_at"] == first["observed_at"]
+        assert second["stages"] == first["stages"]
+
+    asyncio.run(run())
+
+
+def test_cloudwatch_trace_query_retains_last_good_aggregate_on_transient_failure():
+    class FakeLogs:
+        def __init__(self):
+            self.started = 0
+
+        def start_query(self, **_kwargs):
+            self.started += 1
+            if self.started == 2:
+                raise RuntimeError("temporary CloudWatch failure")
+            return {"queryId": "query-good"}
+
+        def get_query_results(self, *, queryId):
+            assert queryId == "query-good"
+            event = {
+                "trace_id": "trace-fallback",
+                "event": "server.vae_decode_complete",
+                "trace_seq": 9,
+                "chunk_index": 3,
+                "duration_ms": 14,
+            }
+            return {
+                "status": "Complete",
+                "results": [[{"field": "@message", "value": json.dumps(event)}]],
+            }
+
+    async def run():
+        now = [100.0]
+        query = CloudWatchTraceQuery(
+            FakeLogs(),
+            log_group="logs",
+            cache_ttl_s=1,
+            clock=lambda: now[0],
+        )
+        first = await query.query("trace-fallback")
+        now[0] = 102.0
+        second = await query.query("trace-fallback")
+
+        assert second["stale"] is True
+        assert second["stale_reason"] == "query_failed"
+        assert second["observed_at"] == first["observed_at"]
+        assert second["stages"] == first["stages"]
 
     asyncio.run(run())

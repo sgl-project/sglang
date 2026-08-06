@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -29,8 +30,35 @@ class OutputRouteClosed(RuntimeError):
     pass
 
 
+class AdmissionQueueFull(RuntimeError):
+    reason = "ADMISSION_QUEUE_FULL"
+
+    def __init__(self) -> None:
+        super().__init__(self.reason)
+
+
+class BoundedAdmissionWaiterGate:
+    def __init__(self, *, max_waiters: int = 64) -> None:
+        if max_waiters < 1:
+            raise ValueError("max_waiters must be positive")
+        self.max_waiters = max_waiters
+        self.waiters = 0
+        self._lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def waiter(self):
+        async with self._lock:
+            if self.waiters >= self.max_waiters:
+                raise AdmissionQueueFull()
+            self.waiters += 1
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self.waiters -= 1
+
+
 _WORKER_CONTROL_MESSAGES = {
-    "chunk_stats",
     "error",
     "session_ready",
     "control_ack",
@@ -70,6 +98,8 @@ def build_denoiser_url(
     output_url: str,
     output_token: str,
     trace_id: str,
+    worker_epoch: str = "",
+    vae_worker_epoch: str = "",
 ) -> str:
     parts = urlsplit(endpoint)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -78,7 +108,9 @@ def build_denoiser_url(
         session_id=session_id,
         generation_id=generation_id,
         coordinator_token=coordinator_token,
+        worker_epoch=worker_epoch,
         realtime_vae_worker_url=vae_url,
+        realtime_vae_worker_epoch=vae_worker_epoch,
         gateway_output_url=output_url,
         gateway_output_token=output_token,
         trace_id=trace_id,
@@ -98,11 +130,35 @@ class GatewayOutputRoute:
     _queue: asyncio.Queue[bytes | None] = field(init=False)
     _last_chunk_index: int = field(default=-1, init=False)
     _last_frame_batch_index: int = field(default=-1, init=False)
+    _seen_chunks: set[int] = field(default_factory=set, init=False)
+    _output_closed: asyncio.Event = field(init=False)
+    _chunk_completed: dict[int, asyncio.Event] = field(
+        default_factory=dict, init=False
+    )
     bound: bool = field(default=False, init=False)
     closed: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self._queue = asyncio.Queue(maxsize=self.queue_depth)
+        self._output_closed = asyncio.Event()
+        self._output_closed.set()
+
+    def bind_output(self) -> None:
+        self.bound = True
+        self._output_closed.clear()
+
+    def unbind_output(self) -> None:
+        self.bound = False
+        self._output_closed.set()
+
+    async def wait_until_output_closed(self) -> None:
+        await self._output_closed.wait()
+
+    async def wait_until_chunk_completed(self, chunk_index: int) -> None:
+        if chunk_index < 0:
+            raise ValueError("chunk_index must be non-negative")
+        event = self._chunk_completed.setdefault(chunk_index, asyncio.Event())
+        await event.wait()
 
     def token_matches(self, token: str) -> bool:
         return hmac.compare_digest(self.token, token)
@@ -111,15 +167,39 @@ class GatewayOutputRoute:
         if self.closed:
             raise OutputRouteClosed("output route is closed")
         message = decode_message(wire)
-        if message.get("type") != "frame_batch":
-            raise OutputProtocolError("Gateway output accepts frame_batch only")
+        message_type = message.get("type")
+        if message_type not in {"frame_batch", "media_chunk_complete"}:
+            raise OutputProtocolError(
+                "Gateway output accepts frame_batch or media_chunk_complete only"
+            )
         if message.get("session_id") != self.session_id:
             raise OutputProtocolError("wrong session")
         if message.get("generation_id") != self.generation_id:
             raise OutputProtocolError("stale generation")
         chunk_index = int(message.get("chunk_index", -1))
+        if chunk_index < 0:
+            raise OutputProtocolError("invalid chunk sequence")
+        if message_type == "media_chunk_complete":
+            if chunk_index not in self._seen_chunks:
+                raise OutputProtocolError("completion before frame batch")
+            completed = self._chunk_completed.setdefault(
+                chunk_index, asyncio.Event()
+            )
+            if completed.is_set():
+                raise OutputProtocolError("duplicate completion")
+            try:
+                await asyncio.wait_for(
+                    self._queue.put(wire), timeout=self.enqueue_timeout_s
+                )
+            except TimeoutError as exc:
+                raise OutputBackpressureError(
+                    "Gateway output queue remained full"
+                ) from exc
+            completed.set()
+            return
+
         frame_batch_index = int(message.get("frame_batch_index", -1))
-        if chunk_index < 0 or frame_batch_index < 0:
+        if frame_batch_index < 0:
             raise OutputProtocolError("invalid frame sequence")
         if chunk_index < self._last_chunk_index:
             raise OutputProtocolError("stale chunk")
@@ -140,6 +220,11 @@ class GatewayOutputRoute:
             ) from exc
         self._last_chunk_index = chunk_index
         self._last_frame_batch_index = frame_batch_index
+        self._seen_chunks.add(chunk_index)
+        if message.get("is_final_frame_batch") is True:
+            self._chunk_completed.setdefault(
+                chunk_index, asyncio.Event()
+            ).set()
 
     async def get(self) -> bytes:
         wire = await self._queue.get()
@@ -157,6 +242,9 @@ class GatewayOutputRoute:
         if self.closed:
             return
         self.closed = True
+        self.unbind_output()
+        for event in self._chunk_completed.values():
+            event.set()
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -222,7 +310,7 @@ class GatewayOutputRegistry:
                 raise OutputProtocolError("invalid output token")
             if route.bound:
                 raise OutputProtocolError("output route is already bound")
-            route.bound = True
+            route.bind_output()
             return route
 
     async def unbind(
@@ -238,7 +326,7 @@ class GatewayOutputRegistry:
                 return
             if route.generation_id != generation_id or not route.token_matches(token):
                 return
-            route.bound = False
+            route.unbind_output()
 
     async def unregister(
         self,

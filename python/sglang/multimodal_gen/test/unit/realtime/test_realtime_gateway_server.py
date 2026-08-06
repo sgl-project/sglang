@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+import sys
 
+import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints import realtime_gateway_server
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
+    _parse_args,
     _parse_ui_config,
     create_app,
 )
+from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import decode_message
+from sglang.multimodal_gen.runtime.realtime.coordinator import CoordinatorRejected
 
 
 class _Coordinator:
@@ -83,6 +89,25 @@ def test_gateway_serves_trace_query_and_accepts_sanitized_client_metrics():
     assert response.json() == {"accepted": 1}
 
 
+def test_gateway_maps_first_cloudwatch_transport_failure_to_503():
+    class FailingTraceQuery:
+        async def query(self, *_args, **_kwargs):
+            raise OSError("CloudWatch connection reset")
+
+    app = create_app(
+        _Coordinator(),
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        internal_output_url="ws://gateway/v1/internal/realtime_output",
+        trace_query=FailingTraceQuery(),
+    )
+
+    response = TestClient(app).get("/v1/realtime_video/traces/trace-a")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace query unavailable"
+
+
 def test_gateway_readiness_depends_on_coordinator():
     ready_client = TestClient(
         create_app(
@@ -105,3 +130,50 @@ def test_gateway_readiness_depends_on_coordinator():
     response = unavailable_client.get("/readyz")
     assert response.status_code == 503
     assert response.json()["detail"] == "coordinator unavailable"
+
+
+def test_gateway_cli_defaults_to_a_bounded_64_waiter_queue(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "realtime_gateway_server",
+            "--coordinator-url=http://coordinator:18081",
+            "--model-revision=minwm-r1",
+        ],
+    )
+
+    assert _parse_args().max_admission_waiters == 64
+
+
+@pytest.mark.parametrize(
+    ("reason", "retry_after_s", "expected_code"),
+    (
+        ("CAPACITY_EXHAUSTED", 0.25, 1013),
+        ("USER_SESSION_LIMIT", None, 1008),
+    ),
+)
+def test_gateway_uses_retryable_close_semantics_for_capacity_only(
+    reason, retry_after_s, expected_code
+):
+    class RejectingCoordinator(_Coordinator):
+        async def admit(self, **_request):
+            raise CoordinatorRejected(reason, retry_after_s=retry_after_s)
+
+    app = create_app(
+        RejectingCoordinator(),
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        internal_output_url="ws://gateway/v1/internal/realtime_output",
+        release_grace_s=0,
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime_video/generate") as websocket:
+            message = decode_message(websocket.receive_bytes())
+            assert message["type"] == "error"
+            assert message["reason"] == reason
+            assert message.get("retry_after_s") == retry_after_s
+            with pytest.raises(WebSocketDisconnect) as closed:
+                websocket.receive_bytes()
+            assert closed.value.code == expected_code
