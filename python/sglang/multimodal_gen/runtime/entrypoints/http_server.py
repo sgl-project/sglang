@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import torch
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -141,7 +141,10 @@ health_router = APIRouter()
 
 
 @health_router.get("/health")
-async def health():
+async def health(request: Request):
+    warmup_done = getattr(request.app.state, "server_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set():
+        return Response(status_code=503)
     return {"status": "ok"}
 
 
@@ -233,8 +236,11 @@ async def model_info_endpoint(request: Request):
 
 
 @health_router.get("/health_generate")
-async def health_generate():
+async def health_generate(request: Request):
     # TODO : health generate endpoint
+    warmup_done = getattr(request.app.state, "server_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set():
+        return Response(status_code=503)
     return {"status": "ok"}
 
 
