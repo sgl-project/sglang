@@ -10,13 +10,16 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# SM100 suite, same slot as the CuteDSL KDA prefill test.
-# Disabled in public CI until the B200 runner image ships recurrent_kda.
+# SM100 suite, same slot as the CuteDSL KDA prefill test. Disabled until the
+# pinned public FlashInfer dependency contains both KDA APIs exercised here.
 register_cuda_ci(
     est_time=60,
     stage="base-b",
     runner_config="4-gpu-b200",
-    disabled="recurrent_kda (SM100 KDA decode) not guaranteed in public CI FlashInfer build",
+    disabled=(
+        "recurrent_kda and packed_kda_decode are not both in the pinned public "
+        "FlashInfer build"
+    ),
 )
 
 if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10):
@@ -77,8 +80,10 @@ def _make_decode_inputs(
         b=(
             torch.randn(B, num_value_heads, device=device, dtype=dtype) * 0.5
         ).contiguous(),
-        A_log=torch.randn(num_heads, device=device, dtype=torch.float32) * 0.2,
-        dt_bias=torch.randn(num_heads * K, device=device, dtype=torch.float32) * 0.1,
+        A_log=torch.randn(num_value_heads, device=device, dtype=torch.float32) * 0.2,
+        dt_bias=(
+            torch.randn(num_value_heads * K, device=device, dtype=torch.float32) * 0.1
+        ),
         ssm=(
             torch.randn(pool, num_value_heads, V, K, device=device, dtype=dtype) * 0.01
         ).contiguous(),
