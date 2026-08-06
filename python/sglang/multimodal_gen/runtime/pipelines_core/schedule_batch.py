@@ -150,6 +150,8 @@ class Req:
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
+    # per-sample reference-image latents threaded through the DiT
+    ref_image_hidden_states: list[list[torch.Tensor]] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
     c2ws_plucker_emb: torch.Tensor | None = None
