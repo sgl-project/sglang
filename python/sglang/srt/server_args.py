@@ -4690,8 +4690,9 @@ class ServerArgs:
         # over days. A CI server serves one test file, so its largest buckets are
         # captured and never replayed -- measured over a full run, 97% of decode
         # steps sit at bs <= 32 and 97% of prefill batches at <= 1024 tokens.
-        # Only ever shrink, and only when the user did not ask for a range.
-        if is_in_ci() and envs.SGLANG_TEST_BOUND_CUDA_GRAPH.get():
+        # Only ever shrink, and only when the test did not ask for a range:
+        # passing --cuda-graph-max-bs-{decode,prefill} opts back out.
+        if is_in_ci():
             if (
                 self.cuda_graph_max_bs_decode is None
                 and decode_cuda_graph_config.max_bs

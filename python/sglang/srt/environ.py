@@ -298,10 +298,6 @@ class Envs:
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
-    # Shrink the cuda graph capture range in CI, where a server serves one test
-    # file and never amortizes it. Benchmarks turn this off to keep the defaults
-    # a deployment would run with.
-    SGLANG_TEST_BOUND_CUDA_GRAPH = EnvBool(True)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.

@@ -1255,15 +1255,12 @@ def run_bench_serving(
         device = auto_config_device()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
-    # A benchmark must run the graph coverage a deployment would have, not the
-    # bounded CI range; the child inherits the override at spawn time.
-    with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
-        process = popen_launch_server(
-            model,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_server_args,
-        )
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
 
     # Resolve tokenizer to local snapshot path when available, so the benchmark
     # client's AutoTokenizer.from_pretrained uses the local path directly instead
@@ -1602,15 +1599,13 @@ def run_bench_serving_multi(
     pd_separated=False,
 ):
     # Launch the server
-    # See run_bench_serving: benchmarks keep the deployed graph coverage.
-    with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
-        process = popen_launch_server(
-            model,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_server_args,
-            pd_separated=pd_separated,
-        )
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+        pd_separated=pd_separated,
+    )
 
     # run benchmark for all
     res_l = []
@@ -1712,11 +1707,7 @@ def run_bench_offline_throughput(model, other_args):
     ]
 
     print(f"command={' '.join(command)}")
-    # See run_bench_serving: benchmarks keep the deployed graph coverage.
-    with envs.SGLANG_TEST_BOUND_CUDA_GRAPH.override(False):
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
         stdout, stderr = process.communicate()
