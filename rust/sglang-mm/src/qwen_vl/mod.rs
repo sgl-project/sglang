@@ -34,12 +34,51 @@ pub struct QwenVlSpec {
     pub max_pixels: usize,
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
+    #[serde(default)]
+    pub resample: Resampler,
+}
+
+/// The HF image processor the pipeline must match bit-exactly. Defaults to the
+/// one a default server runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resampler {
+    /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
+    #[default]
+    AtenU8,
+    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    Pil,
+}
+
+impl From<Resampler> for resize::Resample {
+    fn from(r: Resampler) -> Self {
+        match r {
+            Resampler::AtenU8 => resize::Resample::AtenU8,
+            Resampler::Pil => resize::Resample::Pil(resize::Filter::Bicubic),
+        }
+    }
 }
 
 pub struct QwenVlProcessor {
     spec: QwenVlSpec,
-    /// Per-channel u8 → normalized-f32 lookup: `(v/255 - mean) / std`.
+    /// Per-channel u8 → normalized-f32 lookup; see [`normalize_lut`].
     lut: [[f32; 256]; 3],
+}
+
+/// `1 / rescale_factor`; `resolve_native_spec` rejects any other factor.
+const INV_RESCALE: f32 = 255.0;
+
+/// u8 → normalized f32, rounded as the mirrored processor rounds. The slow one
+/// rescales then normalizes; the fast one folds the rescale into mean/std first
+/// (`_fuse_mean_std_and_rescale_factor`), which differs on 128 of the 256 inputs.
+fn normalize_lut(resample: Resampler, mean: f32, std: f32) -> [f32; 256] {
+    match resample {
+        Resampler::Pil => core::array::from_fn(|v| (v as f32 / INV_RESCALE - mean) / std),
+        Resampler::AtenU8 => {
+            let (mean, std) = (mean * INV_RESCALE, std * INV_RESCALE);
+            core::array::from_fn(|v| (v as f32 - mean) / std)
+        }
+    }
 }
 
 impl QwenVlProcessor {
@@ -48,7 +87,7 @@ impl QwenVlProcessor {
             return Err("qwen_vl spec: sizes must be positive".into());
         }
         let lut = core::array::from_fn(|c| {
-            core::array::from_fn(|v| (v as f32 / 255.0 - spec.image_mean[c]) / spec.image_std[c])
+            normalize_lut(spec.resample, spec.image_mean[c], spec.image_std[c])
         });
         Ok(Self { spec, lut })
     }
@@ -127,7 +166,7 @@ impl MmFamilyProcessor for QwenVlProcessor {
         )?;
         let resized;
         let data = if (th, tw) != (h, w) {
-            resized = resize::resize_rgb_filter(rgb, h, w, th, tw, resize::Filter::Bicubic);
+            resized = resize::resize_rgb(rgb, h, w, th, tw, self.spec.resample.into());
             &resized
         } else {
             rgb.as_slice()
@@ -513,6 +552,22 @@ mod tests {
             max_pixels: 1 << 30,
             image_mean: [0.0; 3],
             image_std: [1.0; 3],
+            resample: Resampler::default(),
+        }
+    }
+
+    /// The fused and unfused normalize forms are not interchangeable: with
+    /// mean = std = 0.5 they disagree on 128 of the 256 u8 inputs, so picking
+    /// the wrong one silently costs bit-exactness with the HF processor.
+    #[test]
+    fn normalize_lut_differs_per_resampler() {
+        let pil = normalize_lut(Resampler::Pil, 0.5, 0.5);
+        let aten = normalize_lut(Resampler::AtenU8, 0.5, 0.5);
+        assert_eq!(pil.iter().zip(aten).filter(|(p, a)| *p != a).count(), 128);
+        // Both still span [-1, 1] — this is rounding, not a scale error.
+        for lut in [pil, aten] {
+            assert_eq!(lut[0], -1.0);
+            assert_eq!(lut[255], 1.0);
         }
     }
 

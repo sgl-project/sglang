@@ -1145,6 +1145,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
         "../single_test_file/test_dp_serving_2_gpu.py",
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
     ],
 }
 
@@ -1181,6 +1182,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
         # zimage server startup dominates; six short requests after warmup
         "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        # one capture plus three replays on a 32K-element exchange
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
     },
 }
 
