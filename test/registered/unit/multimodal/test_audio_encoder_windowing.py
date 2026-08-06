@@ -11,6 +11,7 @@ import torch
 from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.audio_encoder_windowing import (
+    AudioEncoderWindowSpec,
     build_audio_encoder_window_items,
     resolve_audio_encoder_window_config,
 )
@@ -45,9 +46,12 @@ class TestAudioEncoderWindowing(CustomTestCase):
             _get_feat_extract_output_lengths=lambda lengths: lengths,
         )
         cls.config = resolve_audio_encoder_window_config(
-            window_frames=8,
-            alignment_frames=4,
+            AudioEncoderWindowSpec(
+                window_frames=8,
+                alignment_frames=4,
+            ),
             processor=cls.processor,
+            output_length_fn=cls.processor._get_feat_extract_output_lengths,
             model_sample_rate=16,
         )
 
@@ -58,6 +62,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
             placeholder_token_id=99,
             config=self.config,
             processor=self.processor,
+            output_length_fn=self.processor._get_feat_extract_output_lengths,
         )
 
     def test_complete_windows_keep_their_cache_identity_after_append(self):
@@ -105,9 +110,12 @@ class TestAudioEncoderWindowing(CustomTestCase):
             ),
         )
         config = resolve_audio_encoder_window_config(
-            window_frames=8,
-            alignment_frames=4,
+            AudioEncoderWindowSpec(
+                window_frames=8,
+                alignment_frames=4,
+            ),
             processor=processor,
+            output_length_fn=processor._get_feat_extract_output_lengths,
             model_sample_rate=16,
         )
 
@@ -118,6 +126,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
                 placeholder_token_id=99,
                 config=config,
                 processor=processor,
+                output_length_fn=processor._get_feat_extract_output_lengths,
             )[0]
 
         tail = build(30)[1]

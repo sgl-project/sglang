@@ -8,6 +8,7 @@ existing multimodal embedding cache; extraction itself is recomputed cheaply.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import msgspec
@@ -25,6 +26,19 @@ class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
     min_input_samples: int
     window_samples: int
     window_tokens: int
+    feature_output_key: str = "input_features"
+    attention_mask_output_key: str = "attention_mask"
+    item_attention_mask_key: str = "feature_attention_mask"
+
+
+class AudioEncoderWindowSpec(msgspec.Struct, frozen=True):
+    """Model-declared geometry for independently encodable audio windows."""
+
+    window_frames: int
+    alignment_frames: int
+    feature_output_key: str = "input_features"
+    attention_mask_output_key: str = "attention_mask"
+    item_attention_mask_key: str = "feature_attention_mask"
 
 
 class _AudioWindowFeatures(msgspec.Struct, frozen=True):
@@ -34,25 +48,36 @@ class _AudioWindowFeatures(msgspec.Struct, frozen=True):
 
 
 def resolve_audio_encoder_window_config(
-    window_frames: int,
-    alignment_frames: int,
+    spec: AudioEncoderWindowSpec,
     *,
     processor: Any,
+    output_length_fn: Callable[[Any], Any],
     model_sample_rate: int,
 ) -> AudioEncoderWindowConfig:
     """Validate encoder window geometry against the feature extractor."""
-    if window_frames % alignment_frames:
+    if spec.window_frames <= 0 or spec.alignment_frames <= 0:
+        raise ValueError("audio window geometry must be positive")
+    if spec.window_frames % spec.alignment_frames:
         raise ValueError("audio window is not encoder-block aligned")
+    if not all(
+        (
+            spec.feature_output_key,
+            spec.attention_mask_output_key,
+            spec.item_attention_mask_key,
+        )
+    ):
+        raise ValueError("audio window tensor keys must be non-empty")
     feature_extractor = processor.feature_extractor
     if int(feature_extractor.sampling_rate) != model_sample_rate:
         raise ValueError("audio windowing and realtime model sample rates differ")
 
     return AudioEncoderWindowConfig(
         min_input_samples=int(feature_extractor.n_fft),
-        window_samples=window_frames * int(feature_extractor.hop_length),
-        window_tokens=int(
-            processor._get_feat_extract_output_lengths([window_frames])[0]
-        ),
+        window_samples=spec.window_frames * int(feature_extractor.hop_length),
+        window_tokens=int(output_length_fn([spec.window_frames])[0]),
+        feature_output_key=spec.feature_output_key,
+        attention_mask_output_key=spec.attention_mask_output_key,
+        item_attention_mask_key=spec.item_attention_mask_key,
     )
 
 
@@ -61,6 +86,7 @@ def _extract_audio_window_features(
     config: AudioEncoderWindowConfig,
     *,
     processor: Any,
+    output_length_fn: Callable[[Any], Any],
 ) -> tuple[list[_AudioWindowFeatures], int]:
     """Extract one feature row per complete window plus a mutable tail."""
     samples = np.asarray(samples, dtype=np.float32)
@@ -93,13 +119,10 @@ def _extract_audio_window_features(
         truncation=False,
         padding="longest",
     )
-    processed_features = audio_inputs["input_features"]
-    processed_masks = audio_inputs["attention_mask"]
+    processed_features = audio_inputs[config.feature_output_key]
+    processed_masks = audio_inputs[config.attention_mask_output_key]
     token_counts = [
-        int(count)
-        for count in processor._get_feat_extract_output_lengths(
-            processed_masks.sum(dim=-1)
-        )
+        int(count) for count in output_length_fn(processed_masks.sum(dim=-1))
     ]
 
     if token_counts[:complete_count] != [config.window_tokens] * complete_count:
@@ -121,6 +144,7 @@ def _extract_audio_window_features(
 def _build_audio_window_items(
     input_ids: torch.Tensor,
     placeholder_token_id: int,
+    config: AudioEncoderWindowConfig,
     window_features: list[_AudioWindowFeatures],
     complete_window_count: int,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
@@ -170,7 +194,7 @@ def _build_audio_window_items(
                 feature=window.feature,
                 use_embedding_cache=use_embedding_cache,
                 model_specific_data={
-                    "feature_attention_mask": window.attention_mask,
+                    config.item_attention_mask_key: window.attention_mask,
                 },
             )
         )
@@ -186,13 +210,19 @@ def build_audio_encoder_window_items(
     config: AudioEncoderWindowConfig,
     *,
     processor: Any,
+    output_length_fn: Callable[[Any], Any],
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Convert one audio input into reusable complete windows and a mutable tail."""
     window_features, complete_count = _extract_audio_window_features(
         samples,
         config,
         processor=processor,
+        output_length_fn=output_length_fn,
     )
     return _build_audio_window_items(
-        input_ids, placeholder_token_id, window_features, complete_count
+        input_ids,
+        placeholder_token_id,
+        config,
+        window_features,
+        complete_count,
     )

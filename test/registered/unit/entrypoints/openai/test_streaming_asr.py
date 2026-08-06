@@ -75,6 +75,7 @@ class _MockTokenizerManager:
             else ["stop"] * len(self._transcripts)
         )
         self._fail = fail
+        self.served_model_name = "qwen3-asr"
         self.requests = []
         self.processor_kwargs = []
         self.tokenizer = Mock(

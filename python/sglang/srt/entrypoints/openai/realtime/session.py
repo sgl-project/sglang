@@ -138,6 +138,7 @@ class RealtimeConnection:
         self.websocket = websocket
         self.adapter = adapter
         self.server_args = server_args
+        self.served_model_name = tokenizer_manager.served_model_name
 
         self.session_id = f"sess_{random_uuid()}"
         self._current_client_event_id: Optional[str] = None
@@ -286,12 +287,12 @@ class RealtimeConnection:
         if (
             transcription is not None
             and transcription.model
-            and transcription.model != self.tokenizer_manager.served_model_name
+            and transcription.model != self.served_model_name
         ):
             await self._send_error(
                 "not_supported",
                 f"Model {transcription.model!r} is not served by this endpoint "
-                f"(serving {self.tokenizer_manager.served_model_name!r}); set "
+                f"(serving {self.served_model_name!r}); set "
                 f"transcription.model to null or to the server's model name.",
                 param="session.audio.input.transcription.model",
             )

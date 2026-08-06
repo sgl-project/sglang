@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import concurrent
 import concurrent.futures
@@ -6,7 +8,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -38,6 +40,12 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.multimodal.audio_encoder_windowing import (
+        AudioEncoderWindowConfig,
+        AudioEncoderWindowSpec,
+    )
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -371,10 +379,62 @@ class BaseMultimodalProcessor(ABC):
         """
         return None, None
 
+    @property
+    def audio_encoder_window_spec(self) -> Optional[AudioEncoderWindowSpec]:
+        """Return window geometry only when this encoder is block-independent."""
+        return None
+
+    def get_audio_encoder_output_lengths(self, feature_lengths):
+        """Map feature-frame lengths to encoder token counts."""
+        return self._processor._get_feat_extract_output_lengths(feature_lengths)
+
     def resolve_audio_encoder_window_config(self, model_sample_rate: int):
-        # Model-specific processors that support encoder-aligned audio
-        # windowing override this with their own geometry.
-        raise ValueError("model does not support audio encoder windowing")
+        from sglang.srt.multimodal import audio_encoder_windowing
+
+        spec = self.audio_encoder_window_spec
+        if spec is None:
+            raise ValueError("model does not support audio encoder windowing")
+        return audio_encoder_windowing.resolve_audio_encoder_window_config(
+            spec,
+            processor=self._processor,
+            output_length_fn=self.get_audio_encoder_output_lengths,
+            model_sample_rate=model_sample_rate,
+        )
+
+    def build_audio_encoder_window_items(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        config: AudioEncoderWindowConfig,
+    ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
+        """Build cacheable complete windows and one uncached mutable tail."""
+        from sglang.srt.multimodal import audio_encoder_windowing
+
+        audios = base_output.audios or []
+        if len(base_output.organize_results()) != 1 or len(audios) != 1:
+            raise ValueError("audio windowing requires exactly one audio item")
+
+        placeholder_token_id = mm_tokens.get_token_id_by_modality(Modality.AUDIO)
+        if placeholder_token_id is None:
+            raise ValueError("audio windowing requires an audio placeholder")
+
+        input_ids = self._tokenizer(
+            base_output.input_text,
+            return_tensors="pt",
+            padding=False,
+        ).input_ids.flatten()
+        mm_items, input_ids = audio_encoder_windowing.build_audio_encoder_window_items(
+            samples=audios[0],
+            input_ids=input_ids,
+            placeholder_token_id=placeholder_token_id,
+            config=config,
+            processor=self._processor,
+            output_length_fn=self.get_audio_encoder_output_lengths,
+        )
+        if self.use_cuda_ipc:
+            for item in mm_items:
+                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+        return mm_items, input_ids
 
     @property
     def spatial_merge_size(self):
@@ -1463,6 +1523,7 @@ class BaseMultimodalProcessor(ABC):
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
         processor=None,
+        audio_encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
         **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
@@ -1472,6 +1533,20 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (list of mm_items, input_ids)
         """
+        if audio_encoder_window_config is not None:
+            try:
+                mm_items, input_ids = self.build_audio_encoder_window_items(
+                    base_output,
+                    mm_tokens,
+                    audio_encoder_window_config,
+                )
+                return mm_items, input_ids, {}
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Audio encoder windowing failed; using monolithic processing",
+                    exc_info=True,
+                )
+
         processor_override = processor
         processor, tokenizer = self._resolve_processor(processor)
 
