@@ -175,9 +175,9 @@ class Serving(msgspec.Struct):
         "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
     ] = None
     file_storage_path: A[
-        str,
+        Optional[str],
         "The path of the file storage in backend.",
-    ] = "sglang_storage"
+    ] = None
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
