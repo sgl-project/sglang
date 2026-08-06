@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -226,6 +226,24 @@ impl PodInfo {
     }
 }
 
+fn tracked_pods_summary(tracked: &HashMap<String, PodInfo>, port: u16) -> String {
+    let mut pods = tracked
+        .values()
+        .map(|pod| {
+            format!(
+                "name={} ip={} status={} is_ready={} worker_url={}",
+                pod.name,
+                pod.ip,
+                pod.status,
+                pod.is_ready,
+                pod.worker_url(port)
+            )
+        })
+        .collect::<Vec<_>>();
+    pods.sort();
+    format!("count={} pods=[{}]", tracked.len(), pods.join("; "))
+}
+
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
@@ -294,7 +312,7 @@ pub async fn start_service_discovery(
     }
 
     let handle = task::spawn(async move {
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
 
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
             Api::namespaced(client, namespace)
@@ -337,14 +355,44 @@ pub async fn start_service_discovery(
 
             let config_clone = Arc::clone(&config_arc);
             let tracked_pods_clone = Arc::clone(&tracked_pods);
+            let tracked_pods_filter = Arc::clone(&tracked_pods_clone);
 
             let filtered_stream = watcher_stream.filter_map(move |obj_res| {
                 let config_inner = Arc::clone(&config_clone);
+                let tracked_pods_inner = Arc::clone(&tracked_pods_filter);
 
                 async move {
                     match obj_res {
                         Ok(pod) => {
                             if PodInfo::should_include(&pod, &config_inner) {
+                                return Some(Ok(pod));
+                            }
+
+                            // Pod no longer matches selectors. Only let it pass through
+                            // when its name is still tracked, so the downstream handler
+                            // can deregister the stale worker. Avoid the cost of
+                            // PodInfo::from_pod here since we only need the name.
+                            let name = match pod.metadata.name.as_deref() {
+                                Some(name) if !name.is_empty() => name,
+                                _ => return None,
+                            };
+
+                            let is_tracked = match tracked_pods_inner.lock() {
+                                Ok(tracker) => tracker.contains_key(name),
+                                Err(e) => {
+                                    error!(
+                                        "Failed to acquire tracked_pods lock while filtering pod event: {}",
+                                        e
+                                    );
+                                    false
+                                }
+                            };
+
+                            if is_tracked {
+                                debug!(
+                                    "Passing through tracked pod that no longer matches service discovery selectors: name={}",
+                                    name
+                                );
                                 Some(Ok(pod))
                             } else {
                                 None
@@ -377,13 +425,21 @@ pub async fn start_service_discovery(
                                     port,
                                 )
                                 .await;
-                            } else {
+                            } else if PodInfo::should_include(&pod, &config_inner) {
                                 handle_pod_event(
                                     &pod_info,
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
                                     config_inner.pd_mode,
+                                )
+                                .await;
+                            } else {
+                                handle_selector_mismatch(
+                                    &pod_info,
+                                    tracked_pods_inner,
+                                    app_context_inner,
+                                    port,
                                 )
                                 .await;
                             }
@@ -421,7 +477,7 @@ pub async fn start_service_discovery(
 
 async fn handle_pod_event(
     pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: Arc<Mutex<HashMap<String, PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
     pd_mode: bool,
@@ -439,10 +495,10 @@ async fn handle_pod_event(
                 }
             };
 
-            if tracker.contains(pod_info) {
+            if tracker.contains_key(&pod_info.name) {
                 (false, tracker.len())
             } else {
-                tracker.insert(pod_info.clone());
+                tracker.insert(pod_info.name.clone(), pod_info.clone());
                 (true, tracker.len())
             }
         };
@@ -533,7 +589,7 @@ async fn handle_pod_event(
                         );
 
                         if let Ok(mut tracker) = tracked_pods.lock() {
-                            tracker.remove(pod_info);
+                            tracker.remove(&pod_info.name);
                         }
                     }
                 }
@@ -555,14 +611,38 @@ async fn handle_pod_event(
 
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: Arc<Mutex<HashMap<String, PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    handle_pod_removal(
+        pod_info,
+        tracked_pods,
+        app_context,
+        port,
+        metrics_labels::DEREGISTRATION_POD_DELETED,
+    )
+    .await;
+}
 
-    // Remove pod and get remaining count in single lock acquisition
-    let (was_tracked, remaining_count) = {
+async fn handle_pod_removal(
+    pod_info: &PodInfo,
+    tracked_pods: Arc<Mutex<HashMap<String, PodInfo>>>,
+    app_context: Arc<AppContext>,
+    port: u16,
+    deregistration_reason: &'static str,
+) {
+    debug!(
+        "Handling pod removal: name={} ip={}",
+        pod_info.name, pod_info.ip
+    );
+
+    // Only build the (potentially expensive) tracked-pods snapshot when debug
+    // logging is actually enabled, and keep the critical section as short as
+    // possible so we don't block other watcher events on a slow format.
+    let want_summary = tracing::enabled!(tracing::Level::DEBUG);
+
+    let (tracked_pod, remaining_count, tracked_after) = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -570,14 +650,31 @@ async fn handle_pod_deletion(
                 return;
             }
         };
-        let removed = tracked.remove(pod_info);
-        (removed, tracked.len())
+        let removed = tracked.remove(&pod_info.name);
+        let tracked_after = if want_summary {
+            tracked_pods_summary(&tracked, port)
+        } else {
+            String::new()
+        };
+        (removed, tracked.len(), tracked_after)
     };
 
-    if was_tracked {
+    if want_summary {
+        debug!(
+            "Tracked pods update after removal event: was_tracked={} | incoming=name={} ip={} worker_url={} | after={}",
+            tracked_pod.is_some(),
+            pod_info.name,
+            pod_info.ip,
+            pod_info.worker_url(port),
+            tracked_after
+        );
+    }
+
+    if let Some(removed_pod) = tracked_pod {
+        let worker_url = removed_pod.worker_url(port);
         info!(
             "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            removed_pod.name, removed_pod.pod_type, worker_url
         );
 
         let job = Job::RemoveWorker {
@@ -596,7 +693,7 @@ async fn handle_pod_deletion(
                 // Layer 4: Record deregistration from K8s pod deletion
                 Metrics::record_discovery_deregistration(
                     metrics_labels::DISCOVERY_KUBERNETES,
-                    metrics_labels::DEREGISTRATION_POD_DELETED,
+                    deregistration_reason,
                 );
 
                 // Update workers discovered gauge (using count from initial lock)
@@ -612,11 +709,35 @@ async fn handle_pod_deletion(
             );
         }
     } else {
+        let worker_url = pod_info.worker_url(port);
         debug!(
             "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
             pod_info.name, pod_info.pod_type, worker_url
         );
     }
+}
+
+async fn handle_selector_mismatch(
+    pod_info: &PodInfo,
+    tracked_pods: Arc<Mutex<HashMap<String, PodInfo>>>,
+    app_context: Arc<AppContext>,
+    port: u16,
+) {
+    warn!(
+        "Pod no longer matches service discovery selectors, removing tracked worker if present: name={} ip={} worker_url={}",
+        pod_info.name,
+        pod_info.ip,
+        pod_info.worker_url(port)
+    );
+
+    handle_pod_removal(
+        pod_info,
+        tracked_pods,
+        app_context,
+        port,
+        metrics_labels::DEREGISTRATION_SELECTOR_MISMATCH,
+    )
+    .await;
 }
 
 /// Start router node discovery for mesh cluster
@@ -1236,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pod_event_add_unhealthy_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
@@ -1258,13 +1379,13 @@ mod tests {
         )
         .await;
 
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
@@ -1291,7 +1412,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_event_prefill_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
             ip: "1.2.3.4".into(),
@@ -1315,7 +1436,7 @@ mod tests {
 
         // With fully async control plane, pod is tracked and job is queued
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(tracked_pods.lock().unwrap().contains_key(&pod_info.name));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1324,7 +1445,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_event_decode_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
             ip: "1.2.3.5".into(),
@@ -1348,7 +1469,7 @@ mod tests {
 
         // With fully async control plane, pod is tracked and job is queued
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(tracked_pods.lock().unwrap().contains_key(&pod_info.name));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1357,7 +1478,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_tracked_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "test-pod".into(),
             ip: "1.2.3.4".into(),
@@ -1372,7 +1493,7 @@ mod tests {
         // Add pod to tracked set first
         {
             let mut tracked = tracked_pods.lock().unwrap();
-            tracked.insert(pod_info.clone());
+            tracked.insert(pod_info.name.clone(), pod_info.clone());
         }
 
         let port = 8080u16;
@@ -1386,13 +1507,101 @@ mod tests {
         .await;
 
         // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pd_pod_deletion_removes_when_status_changed() {
+        let app_context = create_test_app_context().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let tracked_pod = PodInfo {
+            name: "prefill-pod".into(),
+            ip: "1.2.3.4".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Prefill),
+            bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
+        };
+        let deletion_event_pod = PodInfo {
+            name: tracked_pod.name.clone(),
+            ip: tracked_pod.ip.clone(),
+            status: "Failed".into(),
+            is_ready: false,
+            pod_type: tracked_pod.pod_type.clone(),
+            bootstrap_port: tracked_pod.bootstrap_port,
+            is_router: false,
+            mesh_port: None,
+        };
+
+        {
+            let mut tracked = tracked_pods.lock().unwrap();
+            tracked.insert(tracked_pod.name.clone(), tracked_pod.clone());
+        }
+
+        handle_pod_deletion(
+            &deletion_event_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            8080,
+        )
+        .await;
+
+        assert!(
+            tracked_pods.lock().unwrap().is_empty(),
+            "deletion must remove the tracked pod even if readiness/status changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_selector_mismatch_removes_tracked_pod_by_name() {
+        let app_context = create_test_app_context().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let tracked_pod = PodInfo {
+            name: "prefill-pod".into(),
+            ip: "1.2.3.4".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Prefill),
+            bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
+        };
+        let selector_mismatch_pod = PodInfo {
+            name: tracked_pod.name.clone(),
+            ip: tracked_pod.ip.clone(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Regular),
+            bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
+        };
+
+        {
+            let mut tracked = tracked_pods.lock().unwrap();
+            tracked.insert(tracked_pod.name.clone(), tracked_pod);
+        }
+
+        handle_selector_mismatch(
+            &selector_mismatch_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            8080,
+        )
+        .await;
+
+        assert!(
+            tracked_pods.lock().unwrap().is_empty(),
+            "selector mismatch must remove the previously tracked pod"
+        );
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_untracked_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "untracked-pod".into(),
             ip: "1.2.3.4".into(),
@@ -1422,7 +1631,7 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_regular_mode() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "regular-pod".into(),
             ip: "1.2.3.4".into(),
@@ -1447,7 +1656,7 @@ mod tests {
         // With fully async control plane, pod is tracked and job is queued
         // In regular mode (pd_mode=false), worker_type defaults to Regular
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(tracked_pods.lock().unwrap().contains_key(&pod_info.name));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1456,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_pd_mode_with_prefill() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "prefill-pod".into(),
             ip: "1.2.3.4".into(),
@@ -1480,7 +1689,7 @@ mod tests {
 
         // With fully async control plane, pod is tracked and job is queued
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(tracked_pods.lock().unwrap().contains_key(&pod_info.name));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1489,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_deletion_with_pd_mode() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
             name: "decode-pod".into(),
             ip: "1.2.3.4".into(),
@@ -1504,7 +1713,7 @@ mod tests {
         // Add pod to tracked set first
         {
             let mut tracked = tracked_pods.lock().unwrap();
-            tracked.insert(pod_info.clone());
+            tracked.insert(pod_info.name.clone(), pod_info.clone());
         }
 
         let port = 8080u16;
@@ -1518,7 +1727,7 @@ mod tests {
         .await;
 
         // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!tracked_pods.lock().unwrap().contains_key(&pod_info.name));
     }
 
     #[test]
