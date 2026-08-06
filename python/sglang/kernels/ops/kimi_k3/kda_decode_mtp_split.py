@@ -24,7 +24,6 @@ P1_NUM_JOBS = 3
 P1_V_WARP_DIVISOR = 4
 # Width-16 split-V warp allocation. Six warps per interleaved Q/K/G job
 # balance the precise-math path while leaving one warp for V convolution.
-# RESIDENT_V instead assigns one 1024-thread CTA the full 128-wide V state
 P1_SPLIT_QK_WARPS = 6
 P1_SPLIT_G_WARPS = 6
 P1_SPLIT_V_WARPS = 1
@@ -50,8 +49,6 @@ BLOCK_THREADS_MID_W8 = 896
 # z64 owns 64 recurrent rows per CTA; a lean 512-thread CTA (16 P2 warps, 4
 # rows each) beats 1024 threads at every multi-request cell measured.
 BLOCK_THREADS_Z64 = 512
-# Full-V resident CTA: 32 warps, every recurrent row in registers.
-BLOCK_THREADS_RESIDENT = 1024
 STATE_COPY_THREADS_SPLIT = 512
 
 # K spans one recurrence lane group. The serial topology prefers eight lanes,
@@ -186,7 +183,6 @@ def kda_decode_mtp_kernel(
     NUM_SPEC: cutlass.Constexpr[int],
     BLOCK_THREADS: cutlass.Constexpr[int],
     SPLIT_V: cutlass.Constexpr[bool],
-    RESIDENT_V: cutlass.Constexpr[bool],
     SPLIT_TILE: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
@@ -202,10 +198,7 @@ def kda_decode_mtp_kernel(
     i_hv, i_n, i_z = cute.arch.block_idx()
     head_off = i_hv * HEAD_DIM
     T_LOOP = 1 + NUM_SPEC
-    # RESIDENT_V is the single-CTA (z=1) full-width specialization of the
-    # split-V family: split recurrence lanes and the q.k trick, serial-style
-    # phase-1 warps and in-CTA onorm over the whole V dimension.
-    SPLIT_NARROW = SPLIT_V and not RESIDENT_V
+    SPLIT_NARROW = SPLIT_V
     # Wide split tiles (>16 rows/CTA) need a dedicated onorm smem scratch: the
     # shared sConvW region only fits the z16 row count without clobbering the
     # q.k scratch, and there are no spare warps to do post-P2 staging.
@@ -217,9 +210,7 @@ def kda_decode_mtp_kernel(
     # at N=2..3, all strict gates unchanged; a global flip cost 1.8% e2e
     # accept length at conc-1 and was rejected).
     P1_FASTMATH = SPLIT_TILE != SPLIT_TILE_V
-    if cutlass.const_expr(RESIDENT_V):
-        CTA_V_ROWS = HEAD_DIM
-    elif cutlass.const_expr(SPLIT_V):
+    if cutlass.const_expr(SPLIT_V):
         CTA_V_ROWS = SPLIT_TILE
     else:
         CTA_V_ROWS = TILE_V
@@ -229,7 +220,7 @@ def kda_decode_mtp_kernel(
     # Conv-precompute warp budget.
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     # Split-family P2 warps: two V rows per 16-lane group, as many warps as
-    # the CTA's V slice needs (z16: 8, z64: 32, resident: clamps at 32).
+    # the CTA's V slice needs (z16: 8, z64: 32).
     P2_NUM_WARPS = (
         min(CTA_V_ROWS // (WARP_SIZE // P2_LANES_K_SPLIT), NUM_WARPS)
         if cutlass.const_expr(SPLIT_V)
@@ -237,13 +228,7 @@ def kda_decode_mtp_kernel(
     )
     P1_SERIAL_V_WARPS = max(1, NUM_WARPS // P1_V_WARP_DIVISOR)
     P1_SERIAL_JOB_WARPS = (NUM_WARPS - P1_SERIAL_V_WARPS) // P1_NUM_JOBS
-    # Resident dedicates exactly one lane per V channel to v-conv (4 warps);
-    # the Q/K/G jobs split the rest, one warp idles (27 + 4 < 32).
-    if cutlass.const_expr(RESIDENT_V):
-        P1_QK_WARPS = 9
-        P1_G_WARPS = 9
-        P1_V_WARPS = 4
-    elif cutlass.const_expr(SPLIT_NARROW):
+    if cutlass.const_expr(SPLIT_NARROW):
         P1_V_WARPS = max(1, SPLIT_TILE // SPLIT_TILE_V)
         if cutlass.const_expr(SPLIT_TILE == SPLIT_TILE_V):
             # z16 conv jobs scale with any surplus warp budget: width-8 is
@@ -330,6 +315,26 @@ def kda_decode_mtp_kernel(
     )
     r_wq = cute.make_rmem_tensor(
         cute.make_layout((KERNEL_WIDTH * VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    # g-job load double-buffer ([split-gbuf]): the serial kernel's measured
+    # [ser-gdb] fix, enabled only where each g warp owns >= 3 full token
+    # rounds (z64: 4). z16 (<2 rounds) and z32-2s w16 (2-3 rounds) both
+    # measured worse with this buffer ([split-gdb] z16, [split-gbuf] z32
+    # probe), so the guard keeps it off both.
+    r_gcur = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    r_gnxt = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    # k newest-row double-buffer ([split-kbuf]): the serial kernel's [ser-kbuf]
+    # fix transplanted to the narrow-mode k conv; same >= 3-round guard as
+    # [split-gbuf] (z64 only).
+    r_kbcur = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    r_kbnxt = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
     )
     # One channel's KERNEL_WIDTH conv taps are contiguous in the [dim, W]
     # weights, so they load as a single 16-byte vector instead of W strided
@@ -436,11 +441,26 @@ def kda_decode_mtp_kernel(
         )
     if warp_idx < P1_QKG_WARPS and p1_job == 2:
         r_exp_A = sExpA[0]
+        if cutlass.const_expr(T_LOOP >= 3 * P1_G_WARPS):
+            # Prime this warp's first gate row.
+            for i in range(VEC_SIZE):
+                r_gcur[i] = cutlass.Float32(
+                    g[0, bos + cutlass.min(p1_par, n_tok - 1), i_hv, i * 32 + in_warp_tid]
+                )
         for i_t in cutlass.range(p1_par, T_LOOP, P1_G_WARPS):
             token = bos + cutlass.min(i_t, n_tok - 1)
+            if cutlass.const_expr(T_LOOP >= 3 * P1_G_WARPS):
+                # Prefetch the next owned gate row; the clamped duplicate at
+                # the loop tail is never consumed.
+                _tn = bos + cutlass.min(i_t + P1_G_WARPS, n_tok - 1)
+                for i in range(VEC_SIZE):
+                    r_gnxt[i] = cutlass.Float32(g[0, _tn, i_hv, i * 32 + in_warp_tid])
             for i in range(VEC_SIZE):
                 k_idx = i * 32 + in_warp_tid
-                r_g_raw = cutlass.Float32(g[0, token, i_hv, k_idx])
+                if cutlass.const_expr(T_LOOP >= 3 * P1_G_WARPS):
+                    r_g_raw = r_gcur[i]
+                else:
+                    r_g_raw = cutlass.Float32(g[0, token, i_hv, k_idx])
                 r_g_raw = r_g_raw + cutlass.Float32(dt_bias[i_hv * HEAD_DIM + k_idx])
                 exp_A_x = r_exp_A * r_g_raw
                 sigmoid_val = cute.arch.rcp_approx(
@@ -451,6 +471,8 @@ def kda_decode_mtp_kernel(
                 if cutlass.const_expr(CACHE_RING):
                     if cutlass.const_expr(not SPLIT_V) or i_z == 0:
                         ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                if cutlass.const_expr(T_LOOP >= 3 * P1_G_WARPS):
+                    r_gcur[i] = r_gnxt[i]
     elif warp_idx < P1_QKG_WARPS:
         # Warp starting at token p1_par needs its window advanced that
         # many steps.
@@ -477,6 +499,40 @@ def kda_decode_mtp_kernel(
                             r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i]
                         )
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = _xn
+        if cutlass.const_expr(T_LOOP >= 3 * P1_QK_WARPS):
+            if p1_job == 1:
+                # Prime k's current-row buffer and the window taps with this
+                # warp's first token.
+                for i in range(VEC_SIZE):
+                    r_kbcur[i] = cutlass.Float32(
+                        x_k[
+                            0,
+                            bos + cutlass.min(p1_par, n_tok - 1),
+                            i_hv,
+                            i * 32 + in_warp_tid,
+                        ]
+                    )
+                for i in range(VEC_SIZE):
+                    k_idx = i * 32 + in_warp_tid
+                    for w in range(KERNEL_WIDTH - 1):
+                        history_index = p1_par + w
+                        history_value = cutlass.Float32(0.0)
+                        if history_index < KERNEL_WIDTH - 1:
+                            history_value = cutlass.Float32(
+                                cs_k[slot, head_off + k_idx, history_index]
+                            )
+                        else:
+                            history_value = cutlass.Float32(
+                                x_k[
+                                    0,
+                                    bos + history_index - (KERNEL_WIDTH - 1),
+                                    i_hv,
+                                    k_idx,
+                                ]
+                            )
+                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i] = (
+                            history_value
+                        )
         for i_t in cutlass.range(p1_par, T_LOOP, P1_QK_WARPS):
             token = bos + cutlass.min(i_t, n_tok - 1)
             if cutlass.const_expr(SPLIT_NARROW):
@@ -505,31 +561,35 @@ def kda_decode_mtp_kernel(
                                 )
                             r_state[w * VEC_SIZE + i] = history_value
                 elif p1_job == 1:
-                    for i in range(VEC_SIZE):
-                        k_idx = i * 32 + in_warp_tid
-                        for w in range(KERNEL_WIDTH - 1):
-                            history_index = i_t + w
-                            history_value = cutlass.Float32(0.0)
-                            if history_index < KERNEL_WIDTH - 1:
-                                history_value = cutlass.Float32(
-                                    cs_k[
-                                        slot,
-                                        head_off + k_idx,
-                                        history_index,
-                                    ]
-                                )
-                            else:
-                                history_value = cutlass.Float32(
-                                    x_k[
-                                        0,
-                                        bos + history_index - (KERNEL_WIDTH - 1),
-                                        i_hv,
-                                        k_idx,
-                                    ]
-                                )
-                            r_state[
-                                (KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i
-                            ] = history_value
+                    # Under the >= 3-round k buffer the taps arrive prefetched
+                    # into r_state (prologue prime + iteration-end reload), so
+                    # this per-token rebuild is redundant there.
+                    if cutlass.const_expr(T_LOOP < 3 * P1_QK_WARPS):
+                        for i in range(VEC_SIZE):
+                            k_idx = i * 32 + in_warp_tid
+                            for w in range(KERNEL_WIDTH - 1):
+                                history_index = i_t + w
+                                history_value = cutlass.Float32(0.0)
+                                if history_index < KERNEL_WIDTH - 1:
+                                    history_value = cutlass.Float32(
+                                        cs_k[
+                                            slot,
+                                            head_off + k_idx,
+                                            history_index,
+                                        ]
+                                    )
+                                else:
+                                    history_value = cutlass.Float32(
+                                        x_k[
+                                            0,
+                                            bos + history_index - (KERNEL_WIDTH - 1),
+                                            i_hv,
+                                            k_idx,
+                                        ]
+                                    )
+                                r_state[
+                                    (KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i
+                                ] = history_value
             if p1_job == 0:
                 for i_pair in range(VEC_SIZE // 2):
                     i0 = i_pair * 2
@@ -603,6 +663,14 @@ def kda_decode_mtp_kernel(
                     k_idx = i * 32 + in_warp_tid
                     sQ[i_t, k_idx] = r_q[i]
             elif p1_job == 1:
+                if cutlass.const_expr(T_LOOP >= 3 * P1_QK_WARPS):
+                    # Prefetch the next owned token's k row before computing
+                    # this one; the clamped tail duplicate is never consumed.
+                    _tkn = bos + cutlass.min(i_t + P1_QK_WARPS, n_tok - 1)
+                    for i in range(VEC_SIZE):
+                        r_kbnxt[i] = cutlass.Float32(
+                            x_k[0, _tkn, i_hv, i * 32 + in_warp_tid]
+                        )
                 r_b_raw = cutlass.Float32(0.0)
                 if in_warp_tid == 0:
                     r_b_raw = cutlass.Float32(beta[0, token, i_hv])
@@ -620,7 +688,10 @@ def kda_decode_mtp_kernel(
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i]
                         * sConvW[2 * HEAD_DIM + i * 32 + in_warp_tid]
                     )
-                    r_xk = cutlass.Float32(x_k[0, token, i_hv, k_idx])
+                    if cutlass.const_expr(T_LOOP >= 3 * P1_QK_WARPS):
+                        r_xk = r_kbcur[i]
+                    else:
+                        r_xk = cutlass.Float32(x_k[0, token, i_hv, k_idx])
                     r_conv += (
                         r_xk
                         * sConvW[(KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid]
@@ -639,13 +710,42 @@ def kda_decode_mtp_kernel(
                     if cutlass.const_expr(CACHE_RING):
                         if cutlass.const_expr(not SPLIT_V) or i_z == 0:
                             ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_conv)
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = r_state[
-                        (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
-                    ]
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i] = r_state[
-                        (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
-                    ]
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = r_xk
+                    if cutlass.const_expr(T_LOOP >= 3 * P1_QK_WARPS):
+                        # Narrow per-token rebuild makes the sliding shift dead
+                        # at this geometry; stage the next owned token's window
+                        # taps into the freed slots (register-neutral) so the
+                        # next iteration's conv finds its operands resident.
+                        _tkw = cutlass.min(i_t + P1_QK_WARPS, T_LOOP - 1)
+                        for w in range(KERNEL_WIDTH - 1):
+                            history_index = _tkw + w
+                            history_value = cutlass.Float32(0.0)
+                            if history_index < KERNEL_WIDTH - 1:
+                                history_value = cutlass.Float32(
+                                    cs_k[slot, head_off + k_idx, history_index]
+                                )
+                            else:
+                                history_value = cutlass.Float32(
+                                    x_k[
+                                        0,
+                                        bos + history_index - (KERNEL_WIDTH - 1),
+                                        i_hv,
+                                        k_idx,
+                                    ]
+                                )
+                            r_state[
+                                (KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i
+                            ] = history_value
+                        r_kbcur[i] = r_kbnxt[i]
+                    else:
+                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = (
+                            r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i]
+                        )
+                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i] = (
+                            r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i]
+                        )
+                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = (
+                            r_xk
+                        )
                 sum_k = 0.0
                 for i in range(VEC_SIZE):
                     sum_k += r_k[i] * r_k[i]
@@ -1314,7 +1414,6 @@ def _run_kda_decode_mtp_dspark(
     NUM_SPEC: cutlass.Constexpr[int],
     BLOCK_THREADS: cutlass.Constexpr[int],
     SPLIT_V: cutlass.Constexpr[bool],
-    RESIDENT_V: cutlass.Constexpr[bool],
     SPLIT_TILE: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
@@ -1324,7 +1423,7 @@ def _run_kda_decode_mtp_dspark(
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
-    SPLIT_NARROW = SPLIT_V and not RESIDENT_V
+    SPLIT_NARROW = SPLIT_V
     SPLIT_WIDE = SPLIT_NARROW and SPLIT_TILE > SPLIT_TILE_V
     qk_span = TILE_K
     smem_qk_layout = cute.make_layout((1 + NUM_SPEC, TILE_K), stride=(TILE_K, 1))
@@ -1333,9 +1432,7 @@ def _run_kda_decode_mtp_dspark(
     # its naturally aligned stride is already bank-conflict free.  Padding is
     # useful only for the serial eight-lane recurrence topology.
     smem_state_stride = TILE_K if cutlass.const_expr(SPLIT_V) else TILE_K + p2_lanes_k
-    if cutlass.const_expr(RESIDENT_V):
-        state_tile_v = HEAD_DIM
-    elif cutlass.const_expr(SPLIT_V):
+    if cutlass.const_expr(SPLIT_V):
         state_tile_v = SPLIT_TILE
     else:
         state_tile_v = TILE_V
@@ -1416,7 +1513,6 @@ def _run_kda_decode_mtp_dspark(
         NUM_SPEC,
         BLOCK_THREADS,
         SPLIT_V,
-        RESIDENT_V,
         SPLIT_TILE,
         lower_bound,
         CACHE_RING,
@@ -1524,7 +1620,6 @@ def fused_kda_decode_mtp_dspark(
     lower_bound,
     scale=None,
     split_v=False,
-    resident_v=False,
     split_tile_v=SPLIT_TILE_V,
     block_threads=None,
     pdl_late=False,
@@ -1553,11 +1648,6 @@ def fused_kda_decode_mtp_dspark(
     split_v selects the width-16 eight-CTA split-V specialization (any N>=1;
     each request gets its own eight V-slice CTAs).
 
-    resident_v selects the single-CTA full-width specialization: one
-    1024-thread CTA per (head, request) keeps the whole 128-wide recurrent
-    state register-resident and runs the split-family recurrence with no
-    cluster. Width-agnostic; wins where split-V's CTA fan-out cannot.
-
     Passing all three onorm_* arguments fuses gated RMSNorm into the recurrence
     kernel.
     """
@@ -1583,14 +1673,12 @@ def fused_kda_decode_mtp_dspark(
         raise ValueError(
             f"split_v requires 8 or 16 verify tokens per request, got {1 + num_spec}"
         )
-    if resident_v and split_v:
-        raise ValueError("resident_v and split_v are mutually exclusive")
-    if split_tile_v != SPLIT_TILE_V and (not split_v or resident_v):
-        raise ValueError("split_tile_v requires split_v and not resident_v")
+    if split_tile_v != SPLIT_TILE_V and not split_v:
+        raise ValueError("split_tile_v requires split_v")
     if split_tile_v not in (16, 32, 64) or HEAD_DIM % split_tile_v != 0:
         raise ValueError(f"split_tile_v must be 16, 32, or 64, got {split_tile_v}")
     if block_threads is not None:
-        if not split_v or resident_v:
+        if not split_v:
             raise ValueError("block_threads override requires split_v")
         if (
             block_threads % WARP_SIZE != 0
@@ -1674,9 +1762,7 @@ def fused_kda_decode_mtp_dspark(
             raise ValueError(f"expected output-norm weight shape {(TILE_K,)}")
         if onorm_gate.dtype != torch.bfloat16 or onorm_weight.dtype != torch.float32:
             raise ValueError("expected output-norm gate=bf16 and weight=fp32")
-    if resident_v:
-        block_threads = BLOCK_THREADS_RESIDENT
-    elif split_v:
+    if split_v:
         block_threads = (
             block_threads
             or {
@@ -1694,7 +1780,7 @@ def fused_kda_decode_mtp_dspark(
             dtype=torch.float32,
             device=x_v.device,
         )
-        if apply_onorm and split_v and not resident_v
+        if apply_onorm and split_v
         else A_log.reshape(1, 1, -1)
     )
     args = (
@@ -1735,7 +1821,6 @@ def fused_kda_decode_mtp_dspark(
         num_spec,
         block_threads,
         split_v,
-        resident_v,
         split_tile_v,
         pdl_late,
         cache_ring,
@@ -1757,8 +1842,7 @@ def fused_kda_decode_mtp_dspark(
             N=N,
             NUM_SPEC=num_spec,
             BLOCK_THREADS=block_threads,
-            SPLIT_V=split_v or resident_v,
-            RESIDENT_V=resident_v,
+            SPLIT_V=split_v,
             SPLIT_TILE=split_tile_v,
             lower_bound=float(lower_bound),
             PDL_LATE=pdl_late,

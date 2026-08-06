@@ -249,6 +249,24 @@ def kda_decode_mtp_kernel(
     r_wq = cute.make_rmem_tensor(
         cute.make_layout((KERNEL_WIDTH * VEC_SIZE,), stride=(1,)), cutlass.Float32
     )
+    # g-job double-buffer: q/k hide their per-token global load latency behind
+    # the sliding conv windows; g has no window, so prefetch the next token's
+    # gate values while the current token computes (measured P1-pole fix).
+    r_gcur = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    r_gnxt = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    # Same double-buffer for the k conv's newest row: its per-i global load
+    # sits mid-chain with only the three window FMAs of cover, so prefetch
+    # the next token's row one warp-step ahead (post-gdb P1 pole, ser-attrib-3).
+    r_kcur = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
+    r_knxt = cute.make_rmem_tensor(
+        cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+    )
     # One channel's KERNEL_WIDTH conv taps are contiguous in the [dim, W]
     # weights, so they load as a single 16-byte vector instead of W strided
     # scalars. These run once per block, i.e. entirely in the fixed cost.
@@ -338,6 +356,23 @@ def kda_decode_mtp_kernel(
     if warp_idx < P1_QKG_WARPS:
         if p1_job == 2:
             r_exp_A = cute.math.exp(cutlass.Float32(A_log[i_hv]), fastmath=True)
+            # Prime the g double-buffer with this warp's first token.
+            for i in range(VEC_SIZE):
+                r_gcur[i] = cutlass.Float32(
+                    g[0, bos + cutlass.min(p1_par, n_tok - 1), i_hv, i * 32 + in_warp_tid]
+                )
+        if p1_job == 1:
+            # Prime the k double-buffer with this warp's first token row; the
+            # window advance below only walks rows < p1_par.
+            for i in range(VEC_SIZE):
+                r_kcur[i] = cutlass.Float32(
+                    x_k[
+                        0,
+                        bos + cutlass.min(p1_par, n_tok - 1),
+                        i_hv,
+                        i * 32 + in_warp_tid,
+                    ]
+                )
         # Warp starting at token p1_par needs its window advanced that
         # many steps; the g path is pointwise and needs none.
         if p1_job == 0:
@@ -413,6 +448,13 @@ def kda_decode_mtp_kernel(
                 r_b_raw = cutlass.Float32(0.0)
                 if in_warp_tid == 0:
                     r_b_raw = cutlass.Float32(beta[0, token, i_hv])
+                # Prefetch the next token's k row before computing this one;
+                # the clamped duplicate at the loop tail is never consumed.
+                _tkn = bos + cutlass.min(i_t + P1_JOB_WARPS, n_tok - 1)
+                for i in range(VEC_SIZE):
+                    r_knxt[i] = cutlass.Float32(
+                        x_k[0, _tkn, i_hv, i * 32 + in_warp_tid]
+                    )
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
                     r_conv = (
@@ -427,7 +469,7 @@ def kda_decode_mtp_kernel(
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i]
                         * sConvW[2 * HEAD_DIM + i * 32 + in_warp_tid]
                     )
-                    r_xk = cutlass.Float32(x_k[0, token, i_hv, k_idx])
+                    r_xk = r_kcur[i]
                     r_conv += (
                         r_xk
                         * sConvW[(KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid]
@@ -445,6 +487,7 @@ def kda_decode_mtp_kernel(
                         (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
                     ]
                     r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = r_xk
+                    r_kcur[i] = r_knxt[i]
                 sum_k = 0.0
                 for i in range(VEC_SIZE):
                     sum_k += r_k[i] * r_k[i]
@@ -472,10 +515,14 @@ def kda_decode_mtp_kernel(
                     if cutlass.const_expr(CACHE_RING):
                         ring_beta[slot, i_hv, i_t] = sBeta[i_t]
             else:
+                # Prefetch the next token's gate values before computing this
+                # one; the clamped duplicate at the loop tail is never consumed.
+                _tn = bos + cutlass.min(i_t + P1_JOB_WARPS, n_tok - 1)
+                for i in range(VEC_SIZE):
+                    r_gnxt[i] = cutlass.Float32(g[0, _tn, i_hv, i * 32 + in_warp_tid])
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
-                    r_g_raw = cutlass.Float32(g[0, token, i_hv, k_idx])
-                    r_g_raw = r_g_raw + cutlass.Float32(
+                    r_g_raw = r_gcur[i] + cutlass.Float32(
                         dt_bias[i_hv * HEAD_DIM + k_idx]
                     )
                     exp_A_x = r_exp_A * r_g_raw
@@ -493,6 +540,7 @@ def kda_decode_mtp_kernel(
                     ] = cute.math.exp(r_gk, fastmath=True)
                     if cutlass.const_expr(CACHE_RING):
                         ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                    r_gcur[i] = r_gnxt[i]
             if p1_job == 0:
                 for i in range(VEC_SIZE):
                     k_idx = i * 32 + in_warp_tid
@@ -705,7 +753,22 @@ def kda_decode_mtp_kernel(
 
     if cutlass.const_expr(APPLY_ONORM):
         cute.arch.barrier()
+        # The gate load sits one global round-trip away from its sigmoid with
+        # nothing overlapping it; hoist this token's gate+weight loads above
+        # the sumsq reduction so the latency hides behind the butterfly
+        # (ser-attrib-4: this phase is ~2.2us at every shape).
+        r_ogate = cute.make_rmem_tensor(
+            cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+        )
+        r_ow = cute.make_rmem_tensor(
+            cute.make_layout((VEC_SIZE,), stride=(1,)), cutlass.Float32
+        )
         for i_t in cutlass.range(warp_idx, T_LOOP, NUM_WARPS):
+            _tok = bos + cutlass.min(i_t, n_tok - 1)
+            for i in range(VEC_SIZE):
+                v_idx = i * 32 + in_warp_tid
+                r_ogate[i] = cutlass.Float32(onorm_g[0, _tok, i_hv, v_idx])
+                r_ow[i] = cutlass.Float32(onorm_weight[v_idx])
             sumsq = cutlass.Float32(0.0)
             for i in range(VEC_SIZE):
                 _o = sOall[i_t * HEAD_DIM + i * 32 + in_warp_tid]
@@ -720,14 +783,12 @@ def kda_decode_mtp_kernel(
             for i in range(VEC_SIZE):
                 v_idx = i * 32 + in_warp_tid
                 raw_o = sOall[i_t * HEAD_DIM + v_idx]
-                _tok = bos + cutlass.min(i_t, n_tok - 1)
-                gate_raw = cutlass.Float32(onorm_g[0, _tok, i_hv, v_idx])
                 gate = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
+                    cutlass.Float32(1.0) + cute.math.exp(-r_ogate[i], fastmath=True)
                 )
                 if i_t < n_tok:
                     o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
-                        raw_o * rms * cutlass.Float32(onorm_weight[v_idx]) * gate
+                        raw_o * rms * r_ow[i] * gate
                     )
 
 

@@ -985,11 +985,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         #                sum, which measurably drops dflash accept length
         #                (humaneval b16: 7.75 -> 7.63 aggregate). At N==1 the
         #                cluster has no scheduling cliff, so fidelity wins.
-        #   N==2..3   -> z32 two-stage (w16: 14.4/15.0, w8: 10.5/11.0;
+        #   N==2..3   -> z32 two-stage (w16: 13.96/14.19, w8: 9.56/9.74;
         #                serial 21.3; bs=3 was a 28.8us cluster cliff)
         #   N==4..6, w16 -> z64 cluster with a 512-thread CTA and the fused
-        #                fp32 onorm (20.0/20.4/20.8; paired vs the two-stage
-        #                0.974-0.989x; 96..144 CTAs stay one-wave, N>=7 needs
+        #                fp32 onorm (17.1/17.2/17.6 after the
+        #                [split-gbuf]/[split-kbuf]/[split-kwin] load-hiding
+        #                fixes; paired vs the two-stage 0.974-0.989x
+        #                pre-fix, wider now; 96..144 CTAs stay one-wave,
+        #                N>=7 needs
         #                a second wave and serial wins back). w8 N>=4 -> serial
         #                (z64 cluster paired 1.035-1.050x slower than serial).
         if draft_num in (8, 16) and 2 <= num_req <= 3:
