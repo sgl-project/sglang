@@ -14,7 +14,7 @@ export const benchmarks = [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 1414.39, tpot_ms: 7.35, tokens_per_sec_per_gpu: 8030.5 },
     ],
-    accuracy: { gsm8k_pct: 96.66 },
+    accuracy: { gsm8k_pct: 96.66, gpqa_pct: 79.23 },
   },
 
   // ==== H200, high-throughput (spec off) ====

@@ -54,18 +54,28 @@ export const config = {
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
+      gpqa_pct:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gpqa \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --num-threads 16`,
     },
     numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512 },
   },
 
   // Per-variant accuracy applied to every cell; per-cell `accuracy` overrides.
-  // Measured on H200 with the low-latency (EAGLE 3-1-4) recipe, full 1319 split,
-  // default sampling from generation_config (temp 0.8, top_p 1.0, top_k 50).
+  // Measured on 2xH200 with the low-latency (EAGLE NEXTN 3-1-4) recipe,
+  // no --temperature override — the model's own generation_config
+  // (temp=0.8, top_p=1.0, top_k=50) applies throughout.
+  // gsm8k : full 1319-example test split.
+  // gpqa  : Diamond, 198 problems × 8 repeats, pass@1 avg-of-8 = 79.23% ± 1.49,
+  //         pass@8 = 88.38 %, majority@8 = 80.56 %, stop_rate = 100 %.
   defaultAccuracy: {
-    default: { gsm8k_pct: 96.7 },
+    default: { gsm8k_pct: 96.66, gpqa_pct: 79.23 },
   },
 
   accuracyLabels: [
+    ["gpqa_pct",  "GPQA Diamond",   "%"],
     ["gsm8k_pct", "GSM8K (1-shot)", "%"],
   ],
 
