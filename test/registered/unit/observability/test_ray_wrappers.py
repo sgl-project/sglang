@@ -13,7 +13,7 @@ import sys
 import unittest
 from functools import partial
 
-from prometheus_client import CollectorRegistry, Counter, Histogram
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -316,6 +316,7 @@ class TestInterTokenLatencyEquivalence(unittest.TestCase):
 
         class _Collector(TokenizerMetricsCollector):
             _counter_cls = partial(Counter, registry=registry)
+            _gauge_cls = partial(Gauge, registry=registry)
             _histogram_cls = partial(Histogram, registry=registry)
 
         collector = _Collector(
