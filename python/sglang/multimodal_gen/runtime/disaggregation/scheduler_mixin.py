@@ -1562,6 +1562,8 @@ class SchedulerDisaggMixin:
             scalar_fields["output_file_paths"] = output_batch.output_file_paths
         if output_batch.error is not None:
             scalar_fields["error"] = output_batch.error
+        if output_batch.usage is not None:
+            scalar_fields["usage"] = output_batch.usage
         scalar_fields["peak_memory_mb"] = output_batch.peak_memory_mb
         send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 

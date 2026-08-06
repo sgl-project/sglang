@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-from copy import deepcopy
 from enum import Enum
 from typing import Any
-
-import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
@@ -83,55 +80,3 @@ def can_dynamic_batch(base_req: Req, candidate_req: Req) -> bool:
     base_signature = get_dynamic_batch_signature(base_req)
     candidate_signature = get_dynamic_batch_signature(candidate_req)
     return base_signature is not None and base_signature == candidate_signature
-
-
-def merge_generation_reqs(reqs: list[Req]) -> Req | None:
-    if not reqs:
-        return None
-    if len(reqs) == 1:
-        return deepcopy(reqs[0])
-
-    base_req = reqs[0]
-    if any(not can_dynamic_batch(base_req, req) for req in reqs[1:]):
-        return None
-
-    merged_req = deepcopy(base_req)
-    merged_req.prompt = [req.prompt for req in reqs]
-    merged_req.extra = deepcopy(merged_req.extra)
-    merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
-    if merged_req.return_file_paths_only:
-        merged_req.extra["dynamic_batch_output_paths"] = [
-            req.output_file_path(req.num_outputs_per_prompt, output_index)
-            for req in reqs
-            for output_index in range(req.num_outputs_per_prompt)
-        ]
-    merged_req.request_id = f"dynamic_batch::{base_req.request_id}"
-    return merged_req
-
-
-def slice_generation_req(req: Req, start: int, end: int, total: int) -> Req:
-    shard = deepcopy(req)
-    prompt = req.prompt
-    if isinstance(prompt, list) and len(prompt) == total:
-        shard.prompt = deepcopy(prompt[start:end])
-
-    for field in dataclasses.fields(Req):
-        value = getattr(req, field.name, None)
-        if isinstance(value, list) and len(value) == total:
-            setattr(shard, field.name, deepcopy(value[start:end]))
-        elif isinstance(value, tuple) and len(value) == total:
-            setattr(shard, field.name, deepcopy(value[start:end]))
-        elif (
-            isinstance(value, torch.Tensor)
-            and value.ndim > 0
-            and value.shape[0] == total
-        ):
-            setattr(shard, field.name, value[start:end])
-
-    shard.extra = deepcopy(req.extra)
-    for key in ("dynamic_batch_seeds", "dynamic_batch_output_paths"):
-        value = shard.extra.get(key)
-        if isinstance(value, list) and len(value) == total:
-            shard.extra[key] = value[start:end]
-    shard.request_id = f"{req.request_id}::shard::{start}:{end}"
-    return shard

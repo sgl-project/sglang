@@ -552,6 +552,10 @@ class DiffusionServer:
         )
 
     def _poll_glm_ar_result(self) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+            _merge_srt_usages,
+        )
+
         future = self._glm_ar_future
         if future is None or not future.done():
             return
@@ -559,7 +563,7 @@ class DiffusionServer:
         self._glm_ar_future = None
         self._glm_ar_clients = []
         try:
-            prior_token_ids = future.result()
+            prior_token_ids, output_usages = future.result()
         except Exception as error:
             for client in clients:
                 self._complete_with_error(client.request_id, f"GLM AR error: {error}")
@@ -574,6 +578,14 @@ class DiffusionServer:
                     client.request_id,
                     "GLM AR output count mismatch: "
                     f"got {len(prior_token_ids)}, expected {expected_outputs}",
+                )
+            return
+        if len(output_usages) != expected_outputs:
+            for client in clients:
+                self._complete_with_error(
+                    client.request_id,
+                    "GLM AR usage count mismatch: "
+                    f"got {len(output_usages)}, expected {expected_outputs}",
                 )
             return
 
@@ -601,6 +613,9 @@ class DiffusionServer:
                 prior_token_ids[output_start:output_end], dim=0
             )
             shard_req.prior_token_image_ids = None
+            shard_usages = output_usages[output_start:output_end]
+            shard_req.extra["usage_by_output"] = shard_usages
+            shard_req.usage = _merge_srt_usages(shard_usages)
             shard_id = shard_req.request_id
             shard_clients = [client]
             shard_req.extra["fanout_child_request_ids"] = [
@@ -737,6 +752,7 @@ class DiffusionServer:
                 audio_sample_rate=scalar_fields.get("audio_sample_rate"),
                 error=error,
                 peak_memory_mb=scalar_fields.get("peak_memory_mb", 0.0),
+                usage=scalar_fields.get("usage"),
             )
             with self._lock:
                 identity = self._pending.pop(client.request_id, None)

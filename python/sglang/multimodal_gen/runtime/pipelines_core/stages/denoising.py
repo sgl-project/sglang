@@ -20,6 +20,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    mount_fused_gate_rmsnorm,
+    unmount_fused_gate_rmsnorm,
+)
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    mount_fused_linear_gelu,
+    unmount_fused_linear_gelu,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -222,6 +230,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        # quality="high" fusion state: whether the cublasLt linear+GELU and
+        # fused gate-RMSNorm sites are currently mounted on the transformers.
+        self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
         self._bcg_runners: dict[int, Any] = {}
@@ -443,9 +454,47 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
+
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        """Mount/unmount the ``quality="high"`` fusions for this batch.
+
+        The cublasLt linear+GELU epilogue and the fused gate-RMSNorm Triton
+        kernels are numerically equivalent only at half-precision rounding
+        level (not bit-exact), so they are mounted for ``quality="high"``
+        requests and unmounted otherwise -- the ``"lossless"`` default runs
+        the unmodified reference path bit-for-bit. ``quality`` participates
+        in the dynamic-batch signature, so a worker batch is uniform in
+        ``quality`` and this process-wide transition is safe at the batch
+        boundary. Mounting is all-or-nothing per transformer and per fusion
+        family (any ineligible marked site keeps the whole transformer on
+        that family's reference path); models without marked sites are
+        no-ops.
+        """
+        want = getattr(batch.sampling_params, "quality", "lossless") == "high"
+        if want == self._quality_fusions_mounted:
+            return
+        mounted_gelu = False
+        mounted_gate_norm = False
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if want:
+                mounted_gelu |= mount_fused_linear_gelu(transformer)
+                mounted_gate_norm |= mount_fused_gate_rmsnorm(transformer)
+            else:
+                unmount_fused_linear_gelu(transformer)
+                unmount_fused_gate_rmsnorm(transformer)
+        self._quality_fusions_mounted = want
+        if want and mounted_gelu:
+            logger.info(
+                "Mounted fused linear+GELU (cublasLt epilogue) for quality=high"
+            )
+        if want and mounted_gate_norm:
+            logger.info(
+                "Mounted fused gate RMSNorm (Z-Image Triton suite) for quality=high"
+            )
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
