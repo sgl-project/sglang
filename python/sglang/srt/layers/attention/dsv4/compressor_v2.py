@@ -413,12 +413,19 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
+    num_draft_tokens: int = 0,
     online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
     """Build the paged compress metadata (= the plan).
 
     State-pool slot translation is done inside the C++ planner; the
     Python side just hands the relevant tensors over.
+
+    `num_draft_tokens` is the upper bound on how many trailing tokens of this
+    batch may be rolled back after the forward (`speculative_num_draft_tokens`
+    on a verify batch, 0 on a plain prefill). The planner uses it to keep every
+    committed token resident in the compress-state ring whatever the accept
+    length turns out to be.
     """
     if _use_online_compress(compress_ratio):
         return _create_online_paged_compressor_data(
@@ -464,6 +471,7 @@ def create_paged_compressor_data(
             swa_page_size=swa_page_size,
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
+            num_draft_tokens=num_draft_tokens,
             use_cuda_graph=use_prefill_cuda_graph,
         )
     else:

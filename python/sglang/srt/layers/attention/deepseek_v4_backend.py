@@ -538,6 +538,12 @@ class DeepseekV4AttnBackend(
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
+        # How many trailing tokens a verify batch may roll back, as an always-int
+        # value the compress planner can consume (0 when not speculating). The
+        # planner keeps this many tokens resident in the compress-state ring so a
+        # future compression window sees every committed token whatever the accept
+        # length turns out to be.
+        self.compress_verify_write_pad: int = self.speculative_num_draft_tokens or 0
         if self.speculative_num_draft_tokens is not None:
             # Persistent target-verify metadata buffers. Allocated here (not
             # lazily) so they are ordinary tensors: the first touch of a lazy
@@ -640,6 +646,7 @@ class DeepseekV4AttnBackend(
             extend_lens=extend_seq_lens,
             extend_lens_cpu=extend_lens_cpu,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            num_draft_tokens=num_draft_tokens,
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
@@ -721,6 +728,7 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
+        num_draft_tokens: int = 0,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -774,6 +782,7 @@ class DeepseekV4AttnBackend(
                         extend_lens_cpu=None,
                         use_prefill_cuda_graph=True,
                         num_q_tokens=out_cache_loc.shape[0],
+                        num_draft_tokens=num_draft_tokens,
                         online_state_slot_offset=online_c128_state_slot_offset,
                     )
                 return create_paged_compressor_data(
@@ -787,6 +796,7 @@ class DeepseekV4AttnBackend(
                     extend_lens=extend_seq_lens,
                     extend_lens_cpu=extend_seq_lens_cpu,
                     use_prefill_cuda_graph=use_graph_plan,
+                    num_draft_tokens=num_draft_tokens,
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
@@ -912,6 +922,7 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             online_c128_state_slot_offset=online_c128_state_slot_offset,
+            num_draft_tokens=self.compress_verify_write_pad,
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -1008,6 +1019,7 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
             num_q_tokens=num_q_tokens,
+            num_draft_tokens=self.compress_verify_write_pad,
             online_state_slot_offset=online_c128_state_slot_offset,
         )
         c128_compress_metadata = raw_metadata.c128_compress_metadata
