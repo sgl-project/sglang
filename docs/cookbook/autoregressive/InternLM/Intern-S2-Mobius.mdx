@@ -162,6 +162,8 @@ So, 15% of 240 is **36**.
 
 Enable the **`qwen3_coder` tool-call parser** (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Intern-S2-Mobius emits `<tool_call>…<function=name>…<parameter=key>…value…</parameter>…` — this is exactly the format `qwen3_coder` parses; without the parser the call is left as raw text in `content`. On this thinking-mode model the turn also fills `reasoning_content`, so print both fields.
 
+**Auto-resolution works out of the box.** Intern-S2-Mobius's chat template contains the `<function=` / `<parameter=` markers the auto-detector keys on, so `--reasoning-parser auto --tool-call-parser auto` resolves to `qwen3` / `qwen3_coder` without any extra config (verified on this build by tailing the server log's "Auto-detected …" lines + a live `tools` request). You can pass the literal `qwen3_coder` slug, but you don't have to.
+
 <Accordion title="Tool Calling Example (Python)">
 
 ```python Example
@@ -197,17 +199,21 @@ print("Tool calls:", msg.tool_calls)
 <Accordion title="Example Output">
 
 ```text Output
-Reasoning: The user is asking for the weather in Beijing. I have access
-to a get_weather function that takes a location parameter. The user
-specified "Beijing" as the location, so I should use that exactly as provided.
+Reasoning: The user is asking for the weather in Beijing. I have a
+get_weather function available that takes a location parameter (city
+name). The user specified "Beijing" as the location, so I have all the
+required parameters to make this function call.
 
 Tool calls: [
   {
-    "id": "call_792f2864bc7143529f71d9a8d5816fdc",
+    "id": "call_a39f018ee5ae4a07abdbf9ad",
+    "index": 0,
     "type": "function",
     "function": {"name": "get_weather", "arguments": "{\"location\": \"Beijing\"}"}
   }
 ]
+
+finish_reason: tool_calls
 ```
 
 </Accordion>
