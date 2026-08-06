@@ -75,42 +75,29 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
 
-def _get_sp_attention_mode() -> str:
-    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
-    return get_global_server_args().sp_attention_mode
-
-
 def _resolve_sp_attention_mode(
     *, causal: bool, sparse_backend: bool
 ) -> tuple[str, bool]:
     """Resolve one layer's SP exchange; returns (mode, is_auto).
 
-    ``auto`` picks kv_gather only in the measured-win zone — 2-way SP, ring
-    disabled, non-causal, dense backend — and ulysses everywhere else. An
-    explicit ``kv_gather`` raises instead of degrading.
+    ``kv_gather_degree > 1`` selects the gather exchange for the SP rows. When
+    the degree was auto-assigned, layers the gather path cannot serve fall
+    back to Ulysses; an explicit degree fails closed instead of degrading.
     """
-    configured = _get_sp_attention_mode()
-    if configured == "ulysses":
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    args = get_global_server_args()
+    if args.kv_gather_degree <= 1:
         return "ulysses", False
-    if configured == "kv_gather":
+    if causal or sparse_backend:
+        if args.sp_split_auto:
+            return "ulysses", True
         if causal:
             raise ValueError("K/V-gather SP does not support causal attention.")
-        if get_ring_parallel_world_size() != 1:
-            raise ValueError("K/V-gather SP requires ring_degree=1.")
-        if sparse_backend:
-            raise NotImplementedError(
-                "K/V-gather SP does not support sparse attention backends."
-            )
-        return "kv_gather", False
-    if (
-        not causal
-        and not sparse_backend
-        and get_sequence_parallel_world_size() == 2
-        and get_ring_parallel_world_size() == 1
-    ):
-        return "kv_gather", True
-    return "ulysses", True
+        raise NotImplementedError(
+            "K/V-gather SP does not support sparse attention backends."
+        )
+    return "kv_gather", args.sp_split_auto
 
 
 def _kv_gather_unsupported_reason(

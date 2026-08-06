@@ -71,7 +71,6 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
-SP_ATTENTION_MODES = ("auto", "ulysses", "kv_gather")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -219,7 +218,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
-    sp_attention_mode: Literal["auto", "ulysses", "kv_gather"] = "auto"
+    # rows split inside attention, exchanged with one K/V all-gather instead
+    # of Ulysses a2a or ring rotation; auto-assigned at sp_degree=2 when no SP
+    # degree is set explicitly
+    kv_gather_degree: Optional[int] = None
+    # whether the SP split was auto-assigned (lets layers fall back per call)
+    sp_split_auto: bool = False
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -1099,14 +1103,35 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.ulysses_degree is None
             and self.ring_degree is None
+            and self.kv_gather_degree is None
             and self.sp_degree != 1
         ):
-            self.ulysses_degree = self.sp_degree
-            logger.info(
-                "Automatically set ulysses_degree=sp_degree=%d for the "
-                "sequence-parallel process-group layout",
-                self.ulysses_degree,
-            )
+            if self.sp_degree == 2:
+                # measured-win zone for the K/V-gather exchange; layers whose
+                # calls the gather path cannot take fall back to Ulysses
+                self.kv_gather_degree = 2
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=2; set "
+                    "--ulysses-degree explicitly to keep the Ulysses exchange"
+                )
+            else:
+                self.ulysses_degree = self.sp_degree
+                logger.info(
+                    "Automatically set ulysses_degree=sp_degree=%d for the "
+                    "sequence-parallel process-group layout",
+                    self.ulysses_degree,
+                )
+
+        if self.kv_gather_degree is None:
+            self.kv_gather_degree = 1
+
+        if self.kv_gather_degree > 1:
+            if (self.ulysses_degree or 1) != 1 or (self.ring_degree or 1) != 1:
+                raise ValueError(
+                    "kv_gather_degree does not compose with ulysses_degree or "
+                    "ring_degree yet; set exactly one of them above 1"
+                )
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
@@ -1117,6 +1142,13 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+        if self.kv_gather_degree > 1:
+            # K/V-gather rows occupy the contiguous inner SP dimension; the
+            # process groups are built from ulysses_degree, so alias it until
+            # gather gets a first-class dimension (needed only once it
+            # composes with Ulysses).
+            self.ulysses_degree = self.kv_gather_degree
 
     def _model_default_uses_cfg(self) -> bool:
         """
@@ -1505,18 +1537,17 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
-            "--sp-attention-mode",
-            type=str,
-            choices=SP_ATTENTION_MODES,
-            default=ServerArgs.sp_attention_mode,
+            "--kv-gather-degree",
+            type=int,
+            default=ServerArgs.kv_gather_degree,
             help=(
-                "Sequence-parallel attention exchange: 'ulysses' redistributes "
-                "sequence shards over attention heads with all-to-all; "
-                "'kv_gather' keeps local queries and all-gathers keys/values "
-                "(non-causal attention with ring_degree=1). The default 'auto' "
-                "picks kv_gather per attention layer in its measured-win zone "
-                "(2-way SP, ring disabled, non-causal, dense backend) and "
-                "ulysses everywhere else."
+                "Sequence-parallel degree that splits rows inside attention "
+                "and exchanges with one K/V all-gather (queries stay local) "
+                "instead of Ulysses all-to-all. Non-causal attention only; "
+                "does not compose with --ulysses-degree/--ring-degree yet. "
+                "When no SP degree is set explicitly, sp_degree=2 defaults to "
+                "kv_gather_degree=2 (its measured-win zone) and higher "
+                "degrees default to Ulysses."
             ),
         )
         parser.add_argument(
@@ -2472,12 +2503,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_parallelism(self):
-        if self.sp_attention_mode not in SP_ATTENTION_MODES:
-            raise ValueError(
-                f"sp_attention_mode must be one of: {', '.join(SP_ATTENTION_MODES)}"
-            )
-        if self.sp_attention_mode == "kv_gather" and self.ring_degree != 1:
-            raise ValueError("--sp-attention-mode kv_gather requires --ring-degree 1")
+        if self.kv_gather_degree < 1:
+            raise ValueError("kv_gather_degree must be >= 1")
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(

@@ -273,34 +273,31 @@ class TestUlyssesAttentionKVGather(unittest.TestCase):
 
 
 class TestSpAttentionModeResolution(unittest.TestCase):
-    def _resolve(self, configured, *, sp=2, ring=1, causal=False, sparse=False):
-        with (
-            patch(f"{_LAYER}._get_sp_attention_mode", return_value=configured),
-            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=sp),
-            patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=ring),
+    def _resolve(self, *, degree=2, auto=True, causal=False, sparse=False):
+        stub = SimpleNamespace(kv_gather_degree=degree, sp_split_auto=auto)
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.get_global_server_args",
+            return_value=stub,
         ):
             return _resolve_sp_attention_mode(causal=causal, sparse_backend=sparse)
 
-    def test_auto_picks_kv_gather_at_two_way_sp(self):
-        self.assertEqual(self._resolve("auto"), ("kv_gather", True))
+    def test_gather_degree_selects_the_gather_exchange(self):
+        self.assertEqual(self._resolve(), ("kv_gather", True))
+        self.assertEqual(self._resolve(auto=False), ("kv_gather", False))
 
-    def test_auto_stays_ulysses_outside_the_win_zone(self):
-        self.assertEqual(self._resolve("auto", sp=4), ("ulysses", True))
-        self.assertEqual(self._resolve("auto", ring=2), ("ulysses", True))
-        self.assertEqual(self._resolve("auto", causal=True), ("ulysses", True))
-        self.assertEqual(self._resolve("auto", sparse=True), ("ulysses", True))
+    def test_degree_one_is_plain_ulysses(self):
+        self.assertEqual(self._resolve(degree=1), ("ulysses", False))
+        self.assertEqual(self._resolve(degree=1, causal=True), ("ulysses", False))
 
-    def test_explicit_kv_gather_fails_closed(self):
-        self.assertEqual(self._resolve("kv_gather"), ("kv_gather", False))
+    def test_auto_degree_falls_back_for_unsupported_layers(self):
+        self.assertEqual(self._resolve(causal=True), ("ulysses", True))
+        self.assertEqual(self._resolve(sparse=True), ("ulysses", True))
+
+    def test_explicit_degree_fails_closed(self):
         with self.assertRaises(ValueError):
-            self._resolve("kv_gather", ring=2)
-        with self.assertRaises(ValueError):
-            self._resolve("kv_gather", causal=True)
+            self._resolve(auto=False, causal=True)
         with self.assertRaises(NotImplementedError):
-            self._resolve("kv_gather", sparse=True)
-
-    def test_explicit_ulysses_never_gathers(self):
-        self.assertEqual(self._resolve("ulysses"), ("ulysses", False))
+            self._resolve(auto=False, sparse=True)
 
 
 class TestKVGatherCallSupport(unittest.TestCase):
