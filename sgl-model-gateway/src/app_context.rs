@@ -378,7 +378,7 @@ impl AppContextBuilder {
             n => {
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
+                    .filter(|&t| t >= 0)
                     .unwrap_or(n);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
