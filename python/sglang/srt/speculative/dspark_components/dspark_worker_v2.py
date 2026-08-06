@@ -162,16 +162,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.gamma), device=self.device
         )
 
-        target_model = self.target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
-            raise RuntimeError(
-                "DSpark requires the target model to expose `lm_head` with `weight`."
-            )
-        self.draft_model.attach_shared_modules(
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
-            lm_head=lm_head,
-        )
+        self._attach_shared_modules()
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -277,6 +268,21 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _attach_shared_modules(self) -> None:
+        if self._is_pd_prefill:
+            return
+
+        target_model = self.target_worker.model_runner.model
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise RuntimeError(
+                "DSpark requires the target model to expose `lm_head` with `weight`."
+            )
+        self.draft_model.attach_shared_modules(
+            embed_tokens=self._resolve_target_embed_tokens(target_model),
+            lm_head=lm_head,
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
