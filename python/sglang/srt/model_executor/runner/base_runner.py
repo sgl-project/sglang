@@ -621,7 +621,9 @@ class BaseRunner(ABC):
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
-            with torch.inference_mode(), run_ctx or empty_context():
+            # Match the serving forward's default no-grad context so buffers
+            # lazily created by warmup remain safe for later in-place updates.
+            with torch.no_grad(), run_ctx or empty_context():
                 run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
