@@ -12,6 +12,21 @@
 > ABI's "chunks", so the full artifact protocol can be layered on later without
 > rewriting data.
 
+> **Implementation update (rev 15).** The implemented design has evolved past
+> this document in two ways. (1) `layer_partition` is a single integer — the
+> layer unit — with the model's trailing remainder forming a short final
+> cell (only the last PP stage may end off-unit; boundary lists no longer
+> exist). (2) There are no separate layout-pinned zero-copy schemes: ANY
+> partition knob (`head_group` and/or `layer_partition`, rank-replicated
+> included) selects the cell adapter, whose objects always carry the
+> layout-neutral canonical byte order (`object_layout = "cell-v1"`). The
+> adapter skips conversion per slab when the pool view is already
+> canonical-contiguous — MLA on `page_first_direct` stays fully zero-copy
+> (no staging arena allocated). Where sections below pin `page_head` or
+> `page_first_direct` as *requirements*, read them as the zero-copy fast
+> cases of the one adapter path. Current source of truth:
+> `PR_unified_kv_l3.md` and `hicache_key_scheme.plan_canonical_cells`.
+
 ## 0. Direct answers to the two framing questions
 
 **Q1 — "single key across parallel configs + metadata to distinguish"?**
