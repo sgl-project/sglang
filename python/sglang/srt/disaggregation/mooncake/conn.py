@@ -276,35 +276,73 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
+    def _batch_register_checked(self, ptrs, lens, what: str) -> None:
+        """Register memory regions, aborting if the transport reports failure.
+
+        ``MooncakeTransferEngine.batch_register`` returns an int status
+        (0 = success, -1 when the underlying binding raised) and only logs at
+        DEBUG level. An unregistered region is not addressable by RDMA, so
+        continuing past a failure defers the symptom to a later transfer error
+        or a silently wrong payload. The NIXL connector already raises from its
+        registration path; this makes Mooncake behave the same.
+        """
+        ret = self.engine.batch_register(ptrs, lens)
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake memory registration failed for {what}: "
+                f"{len(ptrs)} regions, {sum(lens)} bytes, batch_register "
+                f"returned {ret}"
+            )
+
+    def _batch_deregister_logged(self, ptrs, what: str) -> None:
+        """Deregister on the teardown path, where a failure only leaks a
+        registration and must not mask whatever caused the teardown."""
+        ret = self.engine.batch_deregister(ptrs)
+        if ret != 0:
+            logger.warning(
+                "Mooncake memory deregistration failed for %s: %d regions, "
+                "batch_deregister returned %s",
+                what,
+                len(ptrs),
+                ret,
+            )
+
+    def _register_staging_memory(self, ptr: int, size: int, what: str) -> None:
+        self._batch_register_checked([ptr], [size], what)
+
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            self._batch_register_checked(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens, "KV data buffers"
             )
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            self._batch_register_checked(
+                self.kv_args.aux_data_ptrs,
+                self.kv_args.aux_data_lens,
+                "auxiliary data buffers",
             )
 
-        for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+        for i, (ptrs, lens) in enumerate(
+            zip(self.kv_args.state_data_ptrs, self.kv_args.state_data_lens)
         ):
             if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+                self._batch_register_checked(ptrs, lens, f"state data buffers {i}")
 
     def deregister_buffer_to_engine(self):
         if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+            self._batch_deregister_logged(self.kv_args.kv_data_ptrs, "KV data buffers")
 
         if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+            self._batch_deregister_logged(
+                self.kv_args.aux_data_ptrs, "auxiliary data buffers"
+            )
 
-        for ptrs in self.kv_args.state_data_ptrs or []:
+        for i, ptrs in enumerate(self.kv_args.state_data_ptrs or []):
             if ptrs:
-                self.engine.batch_deregister(ptrs)
+                self._batch_deregister_logged(ptrs, f"state data buffers {i}")
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -331,7 +369,9 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            lambda ptr, size: self._register_staging_memory(
+                ptr, size, "prefill staging buffer"
+            ),
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
@@ -344,7 +384,9 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            lambda ptr, size: self._register_staging_memory(
+                ptr, size, "decode staging allocator pool"
+            ),
             self.kv_args,
         )
         self.kv_buffer_tensors = None
