@@ -777,7 +777,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     @staticmethod
     def _max_addressable_prefix_len(model_runner) -> int:
         table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
-        configured_context = model_runner.server_args.context_length
+        # This runner's own resolved context (a draft runs at the target's
+        # positions), not the launcher's flag, which may be unset.
+        configured_context = model_runner.model_config.context_len
         return (
             min(table_width, configured_context)
             if configured_context is not None and configured_context > 0

@@ -6,7 +6,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 register_cuda_ci(est_time=600, suite="nightly-4-gpu-b200", nightly=True)
 
-PROFILE_DIR = "performance_profiles_gpt_oss_4gpu"
+RESULT_DIR = "performance_results_gpt_oss_4gpu"
 
 
 class TestNightlyGptOss4GpuPerformance(unittest.TestCase):
@@ -29,8 +29,8 @@ class TestNightlyGptOss4GpuPerformance(unittest.TestCase):
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = (4096,)
         cls.output_lens = (512,)
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
 
     def test_bench_one_batch(self):
         all_model_succeed = True

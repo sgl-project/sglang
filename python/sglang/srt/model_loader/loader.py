@@ -835,6 +835,15 @@ class DefaultModelLoader(BaseModelLoader):
 
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
+        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
+        if is_mxfp8:
+            weights = (
+                (
+                    f"{name}_inv" if name.endswith(".weight_scale") else name,
+                    loaded_weight,
+                )
+                for name, loaded_weight in weights
+            )
 
         if is_nvfp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
