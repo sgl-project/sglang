@@ -395,32 +395,16 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
         prefill_backend, decode_backend = attention_backends_of(server_args)
         if decode_backend == "aiter":
-            # aiter DCP decode uses the gluon MLA kernel (tiles query heads, so it
-            # serves K3's non-pow2 gathered head count) and merges partials across
-            # ranks. The default merge is the AllGather+ReduceScatter reduction
-            # (cp_lse_ag_out_rs_mla, dcp_comm_backend='ag_rs'), which needs the
-            # head-dim Q all-gather so replicated Q projection stays off.
+            # DCP decode runs aiter's gluon MLA kernel over each rank's KV shard
+            # and merges the partials, by default with ag_rs
+            # (cp_lse_ag_out_rs_mla). --dcp-comm-backend a2a switches the merge to
+            # dcp_a2a_lse_reduce, which avoids the ag_rs reduce_scatter's grouped
+            # self-P2P RCCL path (sgl-project/sglang#32831).
             #
-            # dcp_comm_backend may be set to 'a2a' via --dcp-comm-backend a2a: the
-            # MLA decode path then merges via dcp_a2a_lse_reduce (all_to_all_single)
-            # instead of ag_rs. This avoids the ag_rs reduce_scatter's grouped
-            # self-send/self-recv RCCL path, which deadlocks under high-concurrency
-            # CUDA-graph replay on ROCm (see sgl-project/sglang#32831); the a2a
-            # exchange is the workaround for that wedge at dcp_size 8.
-            #
-            # Prefill defaults to aiter (gluon absorb-prefill); it now pages the
-            # staging KV, so it is ~25% faster than triton at long input instead
-            # of the ~28x slower it was while gluon's tile was stuck at one
-            # token. --prefill-attention-backend triton remains available and is
-            # correct: triton dispatches extend two ways: a zero-prefix
-            # batch takes the MHA path (per-head K/V up-projected in hand, plain
-            # local causal attention -- DCP contributes nothing there), while ANY
-            # non-zero prefix (chunked prefill, or a radix hit) sends the whole
-            # batch down the absorbed MLA path into _forward_extend_dcp, which
-            # attends this rank's KV shard over the gathered query heads and
-            # merges the partials with cp_lse_ag_out_rs_mha. Both paths write the
-            # same latent KV that the aiter gluon DCP decode reads (K3 MLA is
-            # NoPE, so no rope mismatch), so the mixed backend is KV-compatible.
+            # Prefill defaults to aiter's paged absorb-prefill;
+            # --prefill-attention-backend triton stays available and is
+            # KV-compatible, since both write the same latent KV the gluon DCP
+            # decode reads.
             prefill_ab = "triton" if prefill_backend == "triton" else "aiter"
             dcp_comm = (
                 server_args.dcp_comm_backend
@@ -437,25 +421,17 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="aiter",
                 dcp_comm_backend=dcp_comm,
             )
-            # ag_rs needs the head-dim Q all-gather, so replicated Q stays off.
-            # a2a/fi_a2a instead project the full-head Q locally (replicated Q on):
-            # this removes the decode-path Q all-gather entirely, leaving only the
-            # a2a output exchange — another grouped-collective site that can wedge
-            # under high-concurrency CUDA-graph replay on ROCm.
+            # ag_rs needs the head-dim Q all-gather, so replicated Q stays off;
+            # a2a/fi_a2a project the full-head Q locally instead.
             if server_args.dcp_replicate_q_proj is None:
                 overrides["dcp_replicate_q_proj"] = dcp_comm in ("a2a", "fi_a2a")
             if server_args.page_size is None:
                 # gluon's MLA decode takes its KV tile straight from the paged
-                # block size (TILE_SIZE == block_size, and the kernel asserts
-                # NUM_BLOCKS_GATHER_PER_TILE == 1), so page_size 1 shrinks every
-                # tile to a single token and cost 12x on the decode step at 128k
-                # context (median ITL 1073 -> 87 ms). Under DCP the allocator's
-                # page is page_size * dcp_size, so this leaves each rank
-                # page_size contiguous physical slots per virtual page -- exactly
-                # the tile gluon wants. 32 measured fastest across shapes
-                # (ms/layer at 128k/bs=55: 42.7 at 1, 1.80 at 16, 1.41 at 32,
-                # 4.40 at 64); the extend path stages its own copy and picks its
-                # own page size (_GLUON_PREFILL_PAGE_SIZE, where 64 wins).
+                # block size, and under DCP the allocator's page is
+                # page_size * dcp_size, so this gives each rank 32 contiguous
+                # physical slots per virtual page. 32 measured fastest across
+                # shapes; the extend path stages its own copy with its own page
+                # size (_GLUON_PREFILL_PAGE_SIZE).
                 overrides["page_size"] = 32
             return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:
