@@ -311,14 +311,15 @@ class Fp8GemmRunnerBackend(Enum):
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
-if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer import SfLayout
-    from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
-    from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
-    from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
-    from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+@lru_cache(maxsize=1)
+def flashinfer_per_tensor_fp8_supported() -> bool:
+    return is_flashinfer_available() and (
+        is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+    )
 
-    from sglang.srt.utils.custom_op import register_custom_op
+
+if flashinfer_per_tensor_fp8_supported():
+    from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
 
     @register_custom_op(
         op_name="flashinfer_bmm_fp8",
@@ -343,6 +344,13 @@ if is_blackwell_supported() and is_flashinfer_available():
             out_dtype,
             backend="cublas",
         ).view(m, n)
+
+
+if is_blackwell_supported() and is_flashinfer_available():
+    from flashinfer import SfLayout
+    from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
+    from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
+    from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
@@ -1820,7 +1828,7 @@ def apply_fp8_linear_bmm_flashinfer(
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM100/SM120 Blackwell)."""
+    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
     qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)

@@ -223,7 +223,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         self.backend = backend
-        self.scaling = config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size

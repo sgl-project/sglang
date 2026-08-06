@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import glob
 import importlib
@@ -31,7 +32,6 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
@@ -68,7 +68,6 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
-    get_int_env_var,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -6626,8 +6625,8 @@ class ServerArgs:
         ):
             return
         required_tokens = self.cutedsl_moe_max_num_tokens()
-        max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+        max_dispatch_tokens_per_rank = (
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
         )
         max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
         if max_cutedsl_tokens < required_tokens:
@@ -8549,56 +8548,73 @@ class ServerArgs:
 
         return resolved_view(self)
 
-    def override(self, source: str, **fields) -> None:
-        """The single post-resolution mutation point.
+    def _late_resolution(self, source: str, **fields) -> None:
+        """Resolve fields at the launcher's validation stage (pre-publish).
 
-        After ``__post_init__`` the configuration is resolved; the audited
-        runtime adjustments (load-resolved values, control-plane
-        reconfiguration, deployment wiring) go through here instead of
-        assigning fields. Whitelisted resolvable fields also join the
-        declaration stash, so a republish resolves the same values;
-        everything is recorded with its ``source`` for provenance.
+        See ``arg_groups.overrides.declare_late_resolution``: in place, because
+        every holder of this instance must see the resolved value, and refused
+        outright once the config is published.
+        """
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+        declare_late_resolution(self, source, **fields)
+
+    def derive(self, source: str, **fields) -> ServerArgs:
+        """A copy carrying variant values: a draft worker's context length, an
+        encode worker's device, a launcher's late port pick.
+
+        The receiver is untouched, so a config already published from it -- and
+        the namespace bags projected out of it -- stay true; the variant is a
+        second config, to be published in its own right or handed to whoever
+        owns it. Resolution does not re-run: the values being set are decided
+        *after* it, from inputs resolution never had, and re-resolving a
+        resolved config re-derives conditional decisions from the wrong ones.
+
+        Whitelisted resolvable fields also join the copy's declaration stash so
+        a later re-resolution keeps them; ``source`` is recorded for provenance.
         """
         from sglang.srt.arg_groups.arg_utils import resolvable_fields
 
-        whitelist = resolvable_fields(type(self))
+        variant = copy.deepcopy(self)
+        whitelist = resolvable_fields(type(variant))
         declared = {k: v for k, v in fields.items() if k in whitelist}
         rest = {k: v for k, v in fields.items() if k not in whitelist}
         if declared:
-            stash = getattr(self, "_resolved_overrides", None)
+            stash = getattr(variant, "_resolved_overrides", None)
             if stash is None:
                 stash = []
-                object.__setattr__(self, "_resolved_overrides", stash)
+                object.__setattr__(variant, "_resolved_overrides", stash)
             stash.append((source, dict(declared)))
         if rest:
-            log = getattr(self, "_runtime_mutations", None)
+            log = getattr(variant, "_runtime_mutations", None)
             if log is None:
                 log = []
-                object.__setattr__(self, "_runtime_mutations", log)
+                object.__setattr__(variant, "_runtime_mutations", log)
             log.append((source, dict(rest)))
-        object.__setattr__(self, "_in_override", True)
+        object.__setattr__(variant, "_internal_write", True)
         try:
             for field, value in fields.items():
-                setattr(self, field, value)
+                setattr(variant, field, value)
         finally:
-            object.__setattr__(self, "_in_override", False)
+            object.__setattr__(variant, "_internal_write", False)
+        return variant
 
     def __setattr__(self, name, value):
-        # after materialization the fields are the resolved startup
-        # configuration -- the pristine, READ-ONLY record. A bare assignment
-        # outside ServerArgs.override() (and the resolution pipeline, which runs
-        # before materialization) always raises; resolved config is mutated on
-        # the context bags via get_context().override(...), not here. (Formerly
-        # gated on SGLANG_STRICT_CONFIG_MUTATION; now unconditional.)
+        # After materialization the fields are the resolved startup
+        # configuration -- the pristine, READ-ONLY record that the config bags
+        # were projected from. Resolved config changes go to the bags via
+        # get_context().override(source, ...); a config that differs per runner
+        # or per worker is a separate object, built with derive().
         if (
             not name.startswith("_")
             and getattr(self, "_declarations_materialized", False)
-            and not getattr(self, "_in_override", False)
+            and not getattr(self, "_internal_write", False)
         ):
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "
                 "read-only -- use get_context().override(source, ...) to change "
-                "resolved config."
+                "resolved config, or server_args.derive(source, ...) to build a "
+                "variant for one runner."
             )
         object.__setattr__(self, name, value)
 
@@ -8674,6 +8690,14 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
+
+            try:
+                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+                    CHUNK_SIZE as FLA_CHUNK_SIZE,
+                )
+            except ImportError:
+                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
+                FLA_CHUNK_SIZE = 64
 
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
@@ -8908,7 +8932,7 @@ class ServerArgs:
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
-                self.override("check_lora_server_args", enable_lora=True)
+                self._late_resolution("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
@@ -8919,7 +8943,7 @@ class ServerArgs:
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args", enable_lora_overlap_loading=False
                 )
 
@@ -8978,9 +9002,11 @@ class ServerArgs:
                             "Expected a string or a dictionary."
                         )
                     parsed_lora_paths.append(lora_ref)
-                self.override("check_lora_server_args", lora_paths=parsed_lora_paths)
+                self._late_resolution(
+                    "check_lora_server_args", lora_paths=parsed_lora_paths
+                )
             elif isinstance(self.lora_paths, dict):
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args",
                     lora_paths=[
                         LoRARef(
@@ -8993,7 +9019,7 @@ class ServerArgs:
                     ],
                 )
             elif self.lora_paths is None:
-                self.override("check_lora_server_args", lora_paths=[])
+                self._late_resolution("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -9003,7 +9029,7 @@ class ServerArgs:
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args",
                     lora_target_modules=set(self.lora_target_modules),
                 )
@@ -9168,12 +9194,14 @@ class ServerArgs:
         """Transport backend for modelexpress."""
         return self._parsed_modelexpress_config.get("transport", "nixl")
 
-    def remote_instance_weight_loader_use_transfer_engine(self):
+    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
+        """``load_format`` overrides the seed's: a draft runner loading under
+        ``--speculative-draft-load-format`` needs its own transfer engine."""
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # Use TransferEngine as client backend.
-        if self.load_format == "remote_instance" and (
+        if (load_format or self.load_format) == "remote_instance" and (
             self.remote_instance_weight_loader_backend == "transfer_engine"
             or (
                 self.remote_instance_weight_loader_backend == "modelexpress"

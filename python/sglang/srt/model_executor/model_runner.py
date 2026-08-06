@@ -112,6 +112,7 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
     build_attention_backends,
     configure_aux_hidden_state_capture,
     get_attention_backend,
+    resolve_attention_backend_strs,
 )
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
@@ -166,6 +167,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils import make_war_read_done_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -175,6 +177,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    get_spec,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -259,6 +262,24 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
+def resolve_draft_attention_backend(
+    *,
+    draft_attention_backend: Optional[str],
+    server_args: ServerArgs,
+    is_draft_worker: bool,
+) -> Optional[str]:
+    """The attention backend a runner uses because it is a draft runner.
+
+    ``None`` for a target runner. For a draft: the backend the algorithm that
+    built it resolved (the supported-backend fallback in
+    ``build_draft_tp_worker``), else ``--speculative-draft-attention-backend``.
+    It belongs to the runner, not the process: target and draft coexist.
+    """
+    if not is_draft_worker:
+        return None
+    return draft_attention_backend or server_args.speculative_draft_attention_backend
+
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
@@ -275,6 +296,7 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -291,6 +313,15 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.draft_attention_backend = resolve_draft_attention_backend(
+            draft_attention_backend=draft_attention_backend,
+            server_args=server_args,
+            is_draft_worker=is_draft_worker,
+        )
+        # This runner's own load format, resolved before anything keys off it:
+        # the remote-instance transfer engine is initialized at the top of
+        # initialize(), long before the weights are loaded.
+        self.draft_load_format = self._resolve_draft_load_format()
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -374,6 +405,10 @@ class ModelRunner:
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+        # Graph runners record this persistent event after shared-state reads.
+        self.war_read_done_event = make_war_read_done_event(
+            torch.get_device_module(self.device)
+        )
 
         # CPU offload
         set_offloader(
@@ -634,7 +669,9 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine(
+            load_format=self.draft_load_format
+        ):
             self.remote_instance_weight_transporter.init_engine()
 
     def maybe_init_expert_location_metadata(self):
@@ -890,12 +927,15 @@ class ModelRunner:
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
             is_dspark=self.spec_algorithm.is_dspark(),
         )
+        # Resolve before building: backends read the pair off the runner while
+        # they construct (the FlashInfer KV-access check).
+        resolved = resolve_attention_backend_strs(model_runner=self)
+        self.prefill_attention_backend_str = resolved.prefill
+        self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.prefill_attention_backend_str = backends.prefill_attention_backend_str
-        self.decode_attention_backend_str = backends.decode_attention_backend_str
 
         if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
@@ -1022,8 +1062,10 @@ class ModelRunner:
 
         set_cuda_arch()
 
+        draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
             server_args=self.server_args,
+            load_format=draft_load_format,
             tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
@@ -1047,18 +1089,21 @@ class ModelRunner:
             )
 
         maybe_trigger_remote_instance_nccl_send_group(
-            server_args=self.server_args, tp_rank=self.ps.tp_rank
+            server_args=self.server_args,
+            tp_rank=self.ps.tp_rank,
+            load_format=draft_load_format,
         )
 
-        loaded = load_model_with_memory_saver(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            load_config=self.load_config,
-            device=self.device,
-            gpu_id=self.gpu_id,
-            memory_saver_adapter=self.memory_saver_adapter,
-            is_draft_worker=self.is_draft_worker,
-        )
+        with self._load_format_scope(draft_load_format):
+            loaded = load_model_with_memory_saver(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                load_config=self.load_config,
+                device=self.device,
+                gpu_id=self.gpu_id,
+                memory_saver_adapter=self.memory_saver_adapter,
+                is_draft_worker=self.is_draft_worker,
+            )
         self.loader = loaded.loader
         self.model = loaded.model
         if loaded.remote_instance_weight_info is not None:
@@ -1195,6 +1240,31 @@ class ModelRunner:
         else:
             return self.max_total_num_tokens
 
+    def _load_format_scope(self, load_format: Optional[str]):
+        """Make this runner's load format the published one while it loads.
+
+        Model code reads it off the bag during construction (Inkling replaces
+        per-element noise in its shared-expert scales under dummy loading), so a
+        draft loading a different way than the target needs its own value live
+        for the load, and the target's back afterwards.
+        """
+        if load_format is None:
+            return contextlib.nullcontext()
+        return get_model().override(load_format=load_format)
+
+    def _resolve_draft_load_format(self) -> Optional[str]:
+        """``--speculative-draft-load-format``, for a draft runner only.
+
+        The draft loads its own checkpoint, so its load format is this runner's
+        own resolved value; the target keeps ``--load-format``.
+        """
+        if not self.is_draft_worker:
+            return None
+        load_format = get_spec().speculative_draft_load_format
+        if load_format is not None:
+            logger.info(f"Using draft model load_format: '{load_format}'")
+        return load_format
+
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
@@ -1208,9 +1278,7 @@ class ModelRunner:
                     if spec_algorithm is not None
                     else False
                 ),
-                speculative_draft_attention_backend=getattr(
-                    self.server_args, "speculative_draft_attention_backend", None
-                ),
+                speculative_draft_attention_backend=self.draft_attention_backend,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention

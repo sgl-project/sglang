@@ -47,6 +47,17 @@ class _FakeResponse:
         return data
 
 
+class _FakeBatchResponse:
+    def __init__(self, outputs):
+        self._outputs = outputs
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._outputs
+
+
 class TestGlmImageARSrtBackend(unittest.TestCase):
     def _server_args(self):
         return SimpleNamespace(
@@ -135,16 +146,18 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
     )
     def test_srt_ar_forward_aggregates_usage(self, mock_post, _mock_device):
         set_global_server_args(self._server_args())
-        mock_post.side_effect = [
-            _FakeResponse(
-                list(range(1025)),
-                meta_info={"prompt_tokens": 13, "completion_tokens": 25},
-            ),
-            _FakeResponse(
-                list(range(1025)),
-                meta_info={"prompt_tokens": 13, "completion_tokens": 25},
-            ),
-        ]
+        mock_post.return_value = _FakeBatchResponse(
+            [
+                {
+                    "output_ids": list(range(1025)),
+                    "meta_info": {"prompt_tokens": 13, "completion_tokens": 25},
+                },
+                {
+                    "output_ids": list(range(1025)),
+                    "meta_info": {"prompt_tokens": 13, "completion_tokens": 25},
+                },
+            ]
+        )
         stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
         batch = SimpleNamespace(
             prompt="A simple product sketch",
@@ -153,6 +166,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
             image_path=None,
             num_outputs_per_prompt=2,
             seed=None,
+            extra={},
         )
 
         batch = stage.forward(batch, self._server_args())

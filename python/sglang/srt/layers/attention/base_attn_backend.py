@@ -108,6 +108,9 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Whether prefill metadata initialization finishes all scheduler-shared reads.
+    prefill_shared_reads_end_at_metadata_init: bool = False
+
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
     # assume that generic ForwardBatch metadata is sufficient for every

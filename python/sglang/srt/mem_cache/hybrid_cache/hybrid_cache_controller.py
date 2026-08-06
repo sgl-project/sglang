@@ -419,10 +419,11 @@ class HybridCacheController(BaseHiCacheController):
             )
         self.write_queue.clear()
         start_event = device_module.Event()
-        finish_event = device_module.Event()
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            ack_start_event.record()
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_indices,
@@ -437,14 +438,60 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     self.io_backend,
                 )
-            finish_event.record()
+            ack_finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
                 host_indices,
                 device_indices,
                 resolved_pool_transfers,
             )
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
+            )
+        )
+
+    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+        """Per-pool token counts for a merged transfer op (anchor + extra
+        pools), shared by D->H write and H->D load acks; sidecar transfers
+        reusing another pool's indices are excluded."""
+        counts = {self.mem_pool_host.anchor_entry.name.value: len(op.device_indices)}
+        for transfer in op.pool_transfers or []:
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            name = transfer.name.value
+            counts[name] = counts.get(name, 0) + len(transfer.host_indices)
+        return counts
+
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        """Total bytes moved by a merged transfer op across all pools,
+        including draft piggyback and sidecar transfers riding another
+        pool's indices (both excluded from the per-pool token counts)."""
+        kv_tokens = len(op.device_indices)
+        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        if self.has_draft:
+            num_bytes += kv_tokens * self.mem_pool_host_draft.size_per_token
+        # Slot counts of the pools sidecars can ride on.
+        source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
+        for t in op.pool_transfers or []:
+            if t.indices_from_pool is None and t.host_indices is not None:
+                source_len[t.name] = len(t.host_indices)
+        for t in op.pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(t.name)
+            if entry is None:
+                continue
+            if t.indices_from_pool is not None:
+                num_slots = source_len.get(t.indices_from_pool, 0)
+            else:
+                num_slots = len(t.host_indices) if t.host_indices is not None else 0
+            num_bytes += num_slots * entry.host_pool.size_per_token
+        return num_bytes
 
     def load(
         self,
@@ -542,6 +589,8 @@ class HybridCacheController(BaseHiCacheController):
                 op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id

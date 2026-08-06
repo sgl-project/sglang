@@ -5,7 +5,7 @@ import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -23,6 +23,15 @@ def _default_hip() -> bool:
         return torch.version.hip is not None
     except Exception:
         return False
+
+
+def _default_cache_subdir(name: str) -> str:
+    """A directory under SGLANG_CACHE_DIR, for env defaults that track it.
+
+    Pass as a callable default: SGLANG_CACHE_DIR is declared further down the
+    Envs body, and resolving late also lets tests override it.
+    """
+    return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
 class EnvField:
@@ -238,10 +247,6 @@ class DsparkFoldedSampling(IntEnum):
 
 class Envs:
 
-    # Raise on bare server_args field assignments after resolution; mutation
-    # must go through ServerArgs.override() (enabled by the test harness).
-    SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
-
     # Per-role config-namespace bookkeeping: off / record / enforce (value is
     # validated fail-loud in runtime_context, which resolves it once at import
     # so the read stays dynamo-prunable).
@@ -433,6 +438,8 @@ class Envs:
     # Force the WAR barrier to wait for the whole forward instead of the
     # read-done fastpath event.
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
+    # Enable prefill read-done publication after compliant metadata initialization.
+    SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -675,6 +682,9 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
+    # means each call site keeps its own default.
+    SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
@@ -719,6 +729,8 @@ class Envs:
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
+    SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
     # round_up(max(masked_m), 256) instead of round_up(rank_tokens, 256):
     # shrinks the [num_local_experts, m, *] MoE intermediates ~4x under
@@ -735,7 +747,8 @@ class Envs:
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
-    SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
+    # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
+    SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
@@ -1028,6 +1041,12 @@ class Envs:
     SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
+    # Raise if Triton loads a kernel after the engine starts serving. This
+    # verifies that startup warmup covers every kernel specialization used at
+    # serving time.
+    SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
+    SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
+    SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
 
     # Encoder gRPC
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
@@ -1309,7 +1328,7 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
-    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
@@ -1363,6 +1382,33 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
     """
     if env_name in os.environ:
         warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
+def third_party_cache_defaults() -> Dict[str, str]:
+    base = os.path.expanduser(envs.SGLANG_CACHE_DIR.get())
+    return {
+        "TRITON_CACHE_DIR": os.path.join(base, "triton"),
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(base, "inductor"),
+        "CUDA_CACHE_PATH": os.path.join(base, "nv"),
+        # FlashInfer appends ".cache/flashinfer" to this base itself, so this
+        # is the base dir rather than the final cache dir.
+        "FLASHINFER_WORKSPACE_BASE": base,
+    }
+
+
+def redirect_third_party_caches():
+    """Point third-party JIT caches at SGLANG_CACHE_DIR, so a run's compiled
+    kernels can be cleaned, warmed or volume-mounted as one directory.
+
+    Must be called early. The redirect silently does nothing if either of
+    these has already happened:
+
+    - FlashInfer was imported. It resolves its workspace at import time.
+    - Inductor made its first ``cache_dir()`` call. That call setdefaults
+      TORCHINDUCTOR_CACHE_DIR itself.
+    """
+    for key, value in third_party_cache_defaults().items():
+        os.environ.setdefault(key, value)
 
 
 def _convert_SGL_to_SGLANG():

@@ -17,14 +17,15 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
-from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
@@ -462,6 +463,7 @@ class TestParseQuantHfConfig(CustomTestCase):
         ({"quant_algo": "NVFP4_AWQ"}, "modelopt_fp4"),
         ({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}, "w4afp8"),
         ({"quant_algo": "FP8"}, "modelopt_fp8"),
+        ({"quant_algo": "MXFP8"}, "mxfp8"),
         ({"quant_algo": "FP4"}, "modelopt_fp4"),
         ({"quant_algo": "MIXED_PRECISION"}, "w4afp8"),
         ({"quant_method": "modelopt"}, "modelopt"),
@@ -508,6 +510,90 @@ class TestParseQuantHfConfig(CustomTestCase):
         )
         self.assertEqual(cfg.group_size, 16)
         self.assertTrue(cfg.is_awq)
+
+    def test_modelopt_mxfp8_config(self):
+        """ModelOpt MXFP8 metadata must select block scales and retain FP8 KV policy."""
+        model_config = ModelConfig.__new__(ModelConfig)
+        for kv_cache_config in (
+            {"kv_cache_quant_algo": "FP8"},
+            {"kv_cache_scheme": {"type": "float", "num_bits": 8}},
+        ):
+            with self.subTest(kv_cache_config=kv_cache_config):
+                result = model_config._parse_modelopt_quant_config(
+                    {
+                        "quantization": {
+                            "quant_algo": "MXFP8",
+                            "group_size": 32,
+                            "exclude_modules": ["lm_head"],
+                            **kv_cache_config,
+                        }
+                    }
+                )
+                self.assertEqual(result["quant_method"], "mxfp8")
+                self.assertEqual(result["scale_fmt"], "ue8m0")
+
+                quant_config = Fp8Config.from_config(result)
+                self.assertEqual(quant_config.get_name(), "mxfp8")
+                self.assertEqual(quant_config.activation_scheme, "dynamic")
+                self.assertEqual(quant_config.weight_block_size, [1, 32])
+                self.assertIn("lm_head", quant_config.ignored_layers)
+                self.assertEqual(quant_config.kv_cache_quant_algo, "FP8")
+
+    def test_modelopt_mxfp8_override(self):
+        """Generic ModelOpt selection must not route MXFP8 to scalar FP8."""
+        self.assertEqual(
+            ModelOptFp8Config.override_quantization_method(
+                {"quant_algo": "MXFP8"}, "modelopt"
+            ),
+            "mxfp8",
+        )
+
+    def test_modelopt_mxfp8_weight_loading(self):
+        """ModelOpt MXFP8 block scales must reach native scale parameters."""
+        weight = torch.empty(1)
+        weights = [
+            ("model.q_proj.weight_scale", weight),
+            ("model.q_proj.input_weight_scale", weight),
+            ("model.q_proj.weight_scale_inv", weight),
+        ]
+
+        def load_names(quant_config):
+            model = nn.Module()
+            model.quant_config = quant_config
+            loaded_names = []
+            model.load_weights = lambda weights: loaded_names.extend(
+                name for name, _ in weights
+            )
+            with patch(
+                "sglang.srt.model_loader.loader.is_cuda_alike", return_value=False
+            ):
+                DefaultModelLoader.load_weights_and_postprocess(
+                    model, iter(weights), torch.device("cpu")
+                )
+            return loaded_names
+
+        mxfp8_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[1, 32],
+            use_mxfp8=True,
+        )
+        self.assertEqual(
+            load_names(mxfp8_config),
+            [
+                "model.q_proj.weight_scale_inv",
+                "model.q_proj.input_weight_scale",
+                "model.q_proj.weight_scale_inv",
+            ],
+        )
+        self.assertEqual(
+            load_names(Fp8Config(is_checkpoint_fp8_serialized=True)),
+            [
+                "model.q_proj.weight_scale",
+                "model.q_proj.input_weight_scale",
+                "model.q_proj.weight_scale_inv",
+            ],
+        )
 
     def test_non_modelopt_quant_method_unchanged(self):
         """Non-modelopt quant_method (e.g. 'gptq') must NOT enter the modelopt path."""

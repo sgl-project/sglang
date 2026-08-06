@@ -97,8 +97,8 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> None:
         super().__init__(tokenizer_manager, template_manager)
 
-        # template_manager is already set by parent class
-        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        # template_manager is already set by parent class; reasoning_parser comes
+        # from the parent, which reads the manager's control-plane overlay.
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
 
         # Parent OpenAIServingChat.__init__ already populated default_sampling_params.

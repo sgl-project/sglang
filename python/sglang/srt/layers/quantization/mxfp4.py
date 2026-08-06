@@ -59,7 +59,6 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
-    mxfp_supported,
     next_power_of_2,
     round_up,
     set_weight_attrs,
@@ -256,7 +255,7 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
         if _is_hip:
-            if mxfp_supported():
+            if is_gfx95_supported():
                 return cls(
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )

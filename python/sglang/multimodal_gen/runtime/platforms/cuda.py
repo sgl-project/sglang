@@ -519,6 +519,17 @@ class CudaPlatformBase(Platform):
     ) -> str:
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
+            if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+                # cuDNN SDPA is 1.25-1.5x faster than the FA4 CuTe kernels on
+                # sm_100 for dense diffusion attention; DYNAMIC_CUDNN_SDPA
+                # keeps FA as the fallback for causal/unsupported shapes and
+                # cuDNN runtime errors.
+                fa_cls_str = cls._resolve_flash_attention_backend_cls_str(
+                    target_backend, head_size, dtype
+                )
+                if fa_cls_str == _SDPA_BACKEND_CLS_STR:
+                    return fa_cls_str
+                return _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
         else:
             resolver = _CUDA_ATTENTION_BACKEND_RESOLVERS.get(selected_backend)
             if resolver is None:

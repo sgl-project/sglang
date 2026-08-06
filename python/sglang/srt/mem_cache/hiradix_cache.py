@@ -1028,6 +1028,7 @@ class HiRadixCache(RadixCache):
                     ack.finish_event.synchronize()
                     for ack_id in ack.node_ids:
                         self._finish_write_through_ack(ack_id, release_lock=False)
+                    self._log_write_ack_metrics(ack)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1055,7 +1056,23 @@ class HiRadixCache(RadixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
+            self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _log_write_ack_metrics(self, ack) -> None:
+        """Record D->H backup volume and duration for a completed write ack."""
+        if self.metrics_collector is None:
+            return
+        for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+            if num_tokens > 0:
+                self.metrics_collector.increment_backup_num_tokens(
+                    num_tokens=num_tokens, pool=pool
+                )
+        if ack.num_bytes > 0:
+            self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
+        if ack.timing_enabled:
+            duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
     def loading_check(self, finish_count: Optional[int] = None):
         if finish_count is None:
@@ -1080,7 +1097,13 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(end_node)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
@@ -1300,6 +1323,12 @@ class HiRadixCache(RadixCache):
         root.parent.children.pop(key, None)
         self._update_leaf_status(root.parent)
         self._update_host_leaf_status(root.parent)
+        if freed_device > 0 and self.metrics_collector is not None:
+            self.metrics_collector.increment_dropped_tokens(
+                num_tokens=freed_device,
+                reason="host_pressure",
+                pool=PoolName.KV.value,
+            )
         return freed_device
 
     def evict_host(self, num_tokens: int):

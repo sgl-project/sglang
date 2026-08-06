@@ -134,29 +134,51 @@ cleanup_stale_shm() {
 }
 
 install_apt_packages() {
-    apt-get update || true
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
-    apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-        echo "Warning: apt-get install failed, checking if required packages are available..."
-        for pkg in "${CI_APT_PACKAGES[@]}"; do
-            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-                echo "ERROR: Required package $pkg is not installed and apt-get failed"
-                exit 1
-            fi
-        done
-        echo "All required packages are already installed, continuing..."
-    }
+
+    # The images bake these in, so the usual run pays apt-get update's round
+    # trips to install nothing. Skipping it costs no currency either: apt-get
+    # install only ever considers the packages named above, and a passing run
+    # leaves 100+ others un-upgraded - the image is what pins these versions.
+    local pkg
+    local -a MISSING_APT_PACKAGES=()
+    for pkg in "${CI_APT_PACKAGES[@]}"; do
+        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+    done
+
+    if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
+        echo "All required apt packages are already installed, skipping apt-get"
+    else
+        echo "Installing missing apt packages: ${MISSING_APT_PACKAGES[*]}"
+        apt-get update || true
+        apt-get install -y --no-install-recommends "${MISSING_APT_PACKAGES[@]}" || {
+            echo "ERROR: apt-get failed to install: ${MISSING_APT_PACKAGES[*]}"
+            exit 1
+        }
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache
-    python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+    # Clear torch compilation cache from every location it can be in; sglang
+    # is not installed yet, so it cannot be asked which one is in use.
+    python3 -c '
+import getpass, os, shutil, tempfile
+
+sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
+for cache_dir in (
+    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
+    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
+):
+    if cache_dir:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+'
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")

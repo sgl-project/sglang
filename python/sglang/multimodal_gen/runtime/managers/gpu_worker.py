@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     trace_slice,
 )
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
+from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -175,12 +176,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
         )
         tmp_root = tempfile.gettempdir()
+        sglang_defaults = third_party_cache_defaults()
         for env_name, sub in (
             ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
             ("TRITON_CACHE_DIR", "triton"),
         ):
             current = os.environ.get(env_name)
-            if current and not current.startswith(tmp_root):
+            if (
+                current
+                and current != sglang_defaults.get(env_name)
+                and not current.startswith(tmp_root)
+            ):
                 # Respect an explicit, non-ephemeral user-provided cache dir.
                 continue
             cache_path = os.path.join(compile_cache_root, sub)

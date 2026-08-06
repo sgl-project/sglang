@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -28,7 +29,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -297,7 +298,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return output
 
 
-class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
     def __init__(
@@ -609,6 +610,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer=layer,
             dispatch_output=dispatch_output,
         )
+
+    # forward_native is aliased to forward_cpu at the end of the class body
+    # (pre-existing behavior); under torch.compile the dedicated
+    # fused_moe_forward_native is installed instead via this hook.
+    def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
+        # torch.compile on this layer only pays off at bs=1; keep the
+        # optimized dispatch otherwise.
+        if num_tokens == 1:
+            from sglang.srt.layers.moe.fused_moe_native import (
+                fused_moe_forward_native,
+            )
+
+            return fused_moe_forward_native
+        return None
 
     def forward_cuda(
         self,
