@@ -1000,7 +1000,7 @@ class MQALayer(MqaAttentionBase):
         # projections and be collected inside forward_core_compressor below --
         # the projections are what hides it. No-op unless the CP+TBO path armed
         # _cp_prefetch_comm_stream.
-        if self.compressor is not None:
+        if _is_hip and self.compressor is not None:
             self.compressor.prelaunch_kv_score(x, forward_batch)
             if self.indexer is not None:
                 self.indexer.compressor.prelaunch_kv_score(x, forward_batch)
@@ -2333,7 +2333,15 @@ class DeepseekV4Model(nn.Module):
         return True
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
-        """DSV4 prefill-only two-batch-overlap gate."""
+        """DSV4 prefill-only two-batch-overlap gate.
+
+        TBO batch prep (tbo_split_seq_index / tbo_children) is populated
+        model-agnostically when --enable-two-batch-overlap is set and the
+        DP-attention preparer allows it (mori `normal` mode permits prefill
+        TBO). We additionally restrict to: prefill (EXTEND), single PP, and a
+        path the DSV4 op strategy implements -- the non-CP path everywhere, plus
+        the round-robin DSA prefill CP path on HIP.
+        """
         from sglang.srt.layers.moe import is_tbo_enabled
 
         if not _is_hip:
@@ -2353,6 +2361,8 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
             and forward_batch.global_forward_mode is not None
+            # MTP target-verify also reports is_extend(); only real prefill
+            # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
             and path_ok
             and self.pp_group.world_size == 1

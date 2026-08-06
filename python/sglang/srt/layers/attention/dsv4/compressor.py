@@ -449,10 +449,11 @@ class Compressor(MultiPlatformOp):
         )
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        pending = getattr(forward_batch, "_cp_pending_gathers", None)
-        handle = pending.pop(self._pending_key(), None) if pending else None
-        if handle is not None:
-            return cp_all_gather_rerange_finish(handle)
+        if _is_hip:
+            pending = getattr(forward_batch, "_cp_pending_gathers", None)
+            handle = pending.pop(self._pending_key(), None) if pending else None
+            if handle is not None:
+                return cp_all_gather_rerange_finish(handle)
 
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 

@@ -672,14 +672,15 @@ class TboForwardBatchPreparer:
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         attention_tp_size = get_parallel().attn_tp_size
-        cp_align = 1
+        _tbo_padded_len = (
+            (end_token_index - start_token_index - 1) // attention_tp_size + 1
+        ) * attention_tp_size
         if _is_hip:
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
-            cp_align = get_cp_padding_align_size()
-        align = math.lcm(attention_tp_size, cp_align)
-        n_tokens = end_token_index - start_token_index
-        _tbo_padded_len = ((n_tokens + align - 1) // align) * align
+            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
+            n_tokens = end_token_index - start_token_index
+            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
