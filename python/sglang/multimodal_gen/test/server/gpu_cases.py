@@ -659,6 +659,61 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
+        "minimax_h3_t2va_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder,vae",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp, brick storefronts, muted teal "
+                "and amber colors, subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "flux2_modelopt_fp8_tp2_t2i",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
@@ -1009,13 +1064,39 @@ ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 
 
+# Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
+# Enabled incrementally and AMD-only: the CUDA `multimodal-gen-unit-test`
+# lane keeps the flat glob below. Files that still need fixes/skips are added
+# in follow-up PRs. Paths are relative to the unit/ dir.
+_AMD_READY_NESTED_UNIT_TESTS = (
+    "realtime/test_causal_denoising.py",
+    "realtime/test_output_materialization.py",
+    "realtime/test_realtime_consistency_harness.py",
+    "realtime/test_realtime_control_signals.py",
+    "realtime/test_realtime_output_transport.py",
+    "realtime/test_realtime_vae.py",
+    "sana_wm/test_streaming_cached.py",
+    "sana_wm/test_streaming_stage.py",
+    "sana_wm/test_streaming_vae.py",
+)
+
+
 def _discover_unit_tests() -> list[str]:
     unit_dir = Path(__file__).resolve().parent.parent / "unit"
     if not unit_dir.is_dir():
         return []
-    return sorted(
-        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
-    )
+    # Flat unit/ tests run on every lane (unchanged). This keeps the CUDA
+    # `multimodal-gen-unit-test` job byte-identical.
+    flat = [f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()]
+    if not current_platform.is_hip():
+        return sorted(flat)
+    # AMD/ROCm additionally runs the vetted nested-subdir tests.
+    nested = [
+        f"../unit/{rel}"
+        for rel in _AMD_READY_NESTED_UNIT_TESTS
+        if (unit_dir / rel).is_file()
+    ]
+    return sorted(flat + nested)
 
 
 FILE_SUITES = {
@@ -1063,6 +1144,8 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_dp_serving_2_gpu.py",
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
     ],
 }
 
@@ -1097,6 +1180,10 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        # zimage server startup dominates; six short requests after warmup
+        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        # one capture plus three replays on a 32K-element exchange
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
     },
 }
 
