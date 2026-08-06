@@ -71,7 +71,7 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
-SP_ATTENTION_MODES = ("ulysses", "kv_gather")
+SP_ATTENTION_MODES = ("auto", "ulysses", "kv_gather")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -219,7 +219,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
-    sp_attention_mode: Literal["ulysses", "kv_gather"] = "ulysses"
+    sp_attention_mode: Literal["auto", "ulysses", "kv_gather"] = "auto"
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -1512,8 +1512,11 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Sequence-parallel attention exchange: 'ulysses' redistributes "
                 "sequence shards over attention heads with all-to-all; "
-                "'kv_gather' keeps local queries and all-gathers keys/values. "
-                "kv_gather supports non-causal attention with ring_degree=1."
+                "'kv_gather' keeps local queries and all-gathers keys/values "
+                "(non-causal attention with ring_degree=1). The default 'auto' "
+                "picks kv_gather per attention layer in its measured-win zone "
+                "(2-way SP, ring disabled, non-causal, dense backend) and "
+                "ulysses everywhere else."
             ),
         )
         parser.add_argument(

@@ -81,6 +81,64 @@ def _get_sp_attention_mode() -> str:
     return get_global_server_args().sp_attention_mode
 
 
+def _resolve_sp_attention_mode(
+    *, causal: bool, sparse_backend: bool
+) -> tuple[str, bool]:
+    """Resolve one layer's SP exchange; returns (mode, is_auto).
+
+    ``auto`` picks kv_gather only in the measured-win zone — 2-way SP, ring
+    disabled, non-causal, dense backend — and ulysses everywhere else. An
+    explicit ``kv_gather`` raises instead of degrading.
+    """
+    configured = _get_sp_attention_mode()
+    if configured == "ulysses":
+        return "ulysses", False
+    if configured == "kv_gather":
+        if causal:
+            raise ValueError("K/V-gather SP does not support causal attention.")
+        if get_ring_parallel_world_size() != 1:
+            raise ValueError("K/V-gather SP requires ring_degree=1.")
+        if sparse_backend:
+            raise NotImplementedError(
+                "K/V-gather SP does not support sparse attention backends."
+            )
+        return "kv_gather", False
+    if (
+        not causal
+        and not sparse_backend
+        and get_sequence_parallel_world_size() == 2
+        and get_ring_parallel_world_size() == 1
+    ):
+        return "kv_gather", True
+    return "ulysses", True
+
+
+def _kv_gather_unsupported_reason(
+    *,
+    qkv_pre_all_to_all: bool,
+    replicated_mode_count: int,
+    attn_mask: torch.Tensor | None,
+    num_replicated_kv_prefix: int,
+) -> str | None:
+    """Call shapes the gather path does not take; explicit mode fails closed
+    on these, auto falls back to the Ulysses exchange for the call."""
+    if qkv_pre_all_to_all:
+        return (
+            "K/V-gather SP expects sequence-sharded Q/K/V; "
+            "caller-side pre-all-to-all is Ulysses-only."
+        )
+    if replicated_mode_count > 1:
+        return "K/V-gather SP supports at most one replicated-token mode per call."
+    if attn_mask is not None:
+        if num_replicated_kv_prefix:
+            return "K/V-gather SP masked attention does not support a KV-only prefix."
+        if attn_mask.dim() != 2:
+            return "K/V-gather SP masked attention expects a [B, S_local] mask."
+        if torch.is_floating_point(attn_mask):
+            return "K/V-gather SP supports boolean or integer padding masks."
+    return None
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -272,16 +330,11 @@ class UlyssesAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
         self.causal = causal
-        self.sp_attention_mode = _get_sp_attention_mode()
-        if self.sp_attention_mode == "kv_gather":
-            if causal:
-                raise ValueError("K/V-gather SP does not support causal attention.")
-            if get_ring_parallel_world_size() != 1:
-                raise ValueError("K/V-gather SP requires ring_degree=1.")
-            if self.backend.is_sparse:
-                raise NotImplementedError(
-                    "K/V-gather SP does not support sparse UlyssesAttention backends."
-                )
+        self.sp_attention_mode, self.sp_attention_mode_is_auto = (
+            _resolve_sp_attention_mode(
+                causal=causal, sparse_backend=self.backend.is_sparse
+            )
+        )
 
     def _forward_with_kv_gather(
         self,
@@ -348,7 +401,9 @@ class UlyssesAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
-        if self.sp_attention_mode == "kv_gather":
+        if self.sp_attention_mode == "kv_gather" and not (
+            self.sp_attention_mode_is_auto and seq_lens is not None
+        ):
             return self._forward_with_kv_gather(
                 q,
                 k,
@@ -679,12 +734,11 @@ class USPAttention(nn.Module):
 
         self.skip_sequence_parallel = skip_sequence_parallel
         self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
-        self.sp_attention_mode = _get_sp_attention_mode()
-        if self.sp_attention_mode == "kv_gather":
-            if causal:
-                raise ValueError("K/V-gather SP does not support causal attention.")
-            if get_ring_parallel_world_size() != 1:
-                raise ValueError("K/V-gather SP requires ring_degree=1.")
+        self.sp_attention_mode, self.sp_attention_mode_is_auto = (
+            _resolve_sp_attention_mode(
+                causal=causal, sparse_backend=self.backend.is_sparse
+            )
+        )
 
     def _get_usp_a2a_stream(self):
         if USPAttention._usp_a2a_stream is None:
@@ -767,26 +821,26 @@ class USPAttention(nn.Module):
             and not effective_skip_sp
             and get_sequence_parallel_world_size() > 1
         ):
-            if qkv_pre_all_to_all:
-                raise NotImplementedError(
-                    "K/V-gather SP expects sequence-sharded Q/K/V; "
-                    "caller-side pre-all-to-all is Ulysses-only."
-                )
-            if replicated_mode_count > 1:
-                raise ValueError(
-                    "K/V-gather SP supports at most one replicated-token mode per call."
-                )
-            return self._forward_with_kv_gather(
-                q,
-                k,
-                v,
-                ctx_attn_metadata,
-                attn_mask,
-                attn_mask_meta,
-                num_replicated_prefix,
-                num_replicated_suffix,
-                num_replicated_kv_prefix,
+            unsupported = _kv_gather_unsupported_reason(
+                qkv_pre_all_to_all=qkv_pre_all_to_all,
+                replicated_mode_count=replicated_mode_count,
+                attn_mask=attn_mask,
+                num_replicated_kv_prefix=num_replicated_kv_prefix,
             )
+            if unsupported is None:
+                return self._forward_with_kv_gather(
+                    q,
+                    k,
+                    v,
+                    ctx_attn_metadata,
+                    attn_mask,
+                    attn_mask_meta,
+                    num_replicated_prefix,
+                    num_replicated_suffix,
+                    num_replicated_kv_prefix,
+                )
+            if not self.sp_attention_mode_is_auto:
+                raise NotImplementedError(unsupported)
 
         if attn_mask is not None or meta_only_pad:
 

@@ -9,6 +9,8 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     UlyssesAttention,
     UlyssesAttention_VSA,
     USPAttention,
+    _kv_gather_unsupported_reason,
+    _resolve_sp_attention_mode,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -39,6 +41,7 @@ def _make_attention(head_dim: int) -> USPAttention:
     obj.allow_cudnn_sdp = False
     obj.skip_sequence_parallel = False
     obj.sp_attention_mode = "kv_gather"
+    obj.sp_attention_mode_is_auto = False
     return obj
 
 
@@ -117,18 +120,6 @@ class TestUSPAttentionKVGather(unittest.TestCase):
 
         torch.testing.assert_close(out, expected)
 
-    def test_pre_all_to_all_convention_is_rejected(self):
-        q = torch.randn(1, 4, self.heads, self.head_dim)
-        with (
-            patch(
-                f"{_LAYER}.get_forward_context",
-                return_value=SimpleNamespace(attn_metadata=None),
-            ),
-            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=2),
-        ):
-            with self.assertRaises(NotImplementedError):
-                self.attn.forward(q, q, q, qkv_pre_all_to_all=True)
-
     def test_padding_mask_uses_local_queries_and_global_keys(self):
         q = torch.randn(2, 3, self.heads, self.head_dim)
         k = torch.randn(2, 3, self.heads, self.head_dim)
@@ -204,6 +195,7 @@ class TestUlyssesAttentionKVGather(unittest.TestCase):
         self.attn.softmax_scale = self.head_dim**-0.5
         self.attn.attn_impl = _SdpaAttention(self.attn.softmax_scale)
         self.attn.sp_attention_mode = "kv_gather"
+        self.attn.sp_attention_mode_is_auto = False
 
     def _run(self, q, k, v, gathered, **kwargs):
         with (
@@ -278,6 +270,81 @@ class TestUlyssesAttentionKVGather(unittest.TestCase):
         q = torch.randn(1, 3, self.heads, self.head_dim)
         with self.assertRaisesRegex(NotImplementedError, "video sparse"):
             attn.forward(q, q, q, gate_compress=q)
+
+
+class TestSpAttentionModeResolution(unittest.TestCase):
+    def _resolve(self, configured, *, sp=2, ring=1, causal=False, sparse=False):
+        with (
+            patch(f"{_LAYER}._get_sp_attention_mode", return_value=configured),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=sp),
+            patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=ring),
+        ):
+            return _resolve_sp_attention_mode(causal=causal, sparse_backend=sparse)
+
+    def test_auto_picks_kv_gather_at_two_way_sp(self):
+        self.assertEqual(self._resolve("auto"), ("kv_gather", True))
+
+    def test_auto_stays_ulysses_outside_the_win_zone(self):
+        self.assertEqual(self._resolve("auto", sp=4), ("ulysses", True))
+        self.assertEqual(self._resolve("auto", ring=2), ("ulysses", True))
+        self.assertEqual(self._resolve("auto", causal=True), ("ulysses", True))
+        self.assertEqual(self._resolve("auto", sparse=True), ("ulysses", True))
+
+    def test_explicit_kv_gather_fails_closed(self):
+        self.assertEqual(self._resolve("kv_gather"), ("kv_gather", False))
+        with self.assertRaises(ValueError):
+            self._resolve("kv_gather", ring=2)
+        with self.assertRaises(ValueError):
+            self._resolve("kv_gather", causal=True)
+        with self.assertRaises(NotImplementedError):
+            self._resolve("kv_gather", sparse=True)
+
+    def test_explicit_ulysses_never_gathers(self):
+        self.assertEqual(self._resolve("ulysses"), ("ulysses", False))
+
+
+class TestKVGatherCallSupport(unittest.TestCase):
+    def _reason(self, **overrides):
+        kwargs = dict(
+            qkv_pre_all_to_all=False,
+            replicated_mode_count=0,
+            attn_mask=None,
+            num_replicated_kv_prefix=0,
+        )
+        kwargs.update(overrides)
+        return _kv_gather_unsupported_reason(**kwargs)
+
+    def test_plain_and_masked_calls_are_supported(self):
+        self.assertIsNone(self._reason())
+        self.assertIsNone(self._reason(attn_mask=torch.ones(1, 4, dtype=torch.bool)))
+
+    def test_unsupported_shapes_are_reported(self):
+        self.assertIn("pre-all-to-all", self._reason(qkv_pre_all_to_all=True))
+        self.assertIn("replicated-token", self._reason(replicated_mode_count=2))
+        self.assertIn(
+            "KV-only prefix",
+            self._reason(
+                attn_mask=torch.ones(1, 4, dtype=torch.bool),
+                num_replicated_kv_prefix=2,
+            ),
+        )
+        self.assertIn("[B, S_local]", self._reason(attn_mask=torch.ones(1, 1, 4)))
+        self.assertIn("integer padding", self._reason(attn_mask=torch.ones(1, 4)))
+
+    def test_explicit_mode_raises_and_auto_falls_back_at_dispatch(self):
+        attn = _make_attention(4)
+        attn.skip_sequence_parallel = False
+        q = torch.randn(1, 4, 3, 4)
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=SimpleNamespace(attn_metadata=None),
+            ),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=2),
+        ):
+            attn.sp_attention_mode_is_auto = False
+            with self.assertRaisesRegex(NotImplementedError, "pre-all-to-all"):
+                attn.forward(q, q, q, qkv_pre_all_to_all=True)
 
 
 if __name__ == "__main__":

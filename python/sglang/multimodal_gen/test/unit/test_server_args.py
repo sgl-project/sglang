@@ -1834,7 +1834,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
 
 class TestSPAttentionMode(unittest.TestCase):
-    def test_ulysses_is_the_default(self):
+    def test_auto_is_the_default(self):
         args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
@@ -1842,7 +1842,21 @@ class TestSPAttentionMode(unittest.TestCase):
             }
         )
 
-        self.assertEqual(args.sp_attention_mode, "ulysses")
+        self.assertEqual(args.sp_attention_mode, "auto")
+
+    def test_auto_accepts_ring_parallelism(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "sp_degree": 4,
+                "ulysses_degree": 2,
+                "ring_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.sp_attention_mode, "auto")
 
     def test_kv_gather_supports_tp_and_sp(self):
         args = _from_dict_without_model_resolution(
