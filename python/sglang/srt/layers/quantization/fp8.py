@@ -235,6 +235,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        kv_cache_quant_algo: Optional[str] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -258,10 +259,11 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        self.kv_cache_quant_algo = kv_cache_quant_algo
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -322,6 +324,9 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        kv_cache_quant_algo = cls.get_from_keys_or(
+            config, ["kv_cache_quant_algo"], None
+        )
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -337,6 +342,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            kv_cache_quant_algo=kv_cache_quant_algo,
         )
 
     def get_quant_method(
@@ -484,7 +490,6 @@ class Fp8LinearMethod(LinearMethodBase):
         output_partition_sizes: List[int],
         skip_block_quant_check: bool = False,
     ):
-        tp_size = get_parallel().tp_size
         block_n, block_k = (
             quant_config.weight_block_size[0],
             quant_config.weight_block_size[1],
@@ -495,6 +500,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
+            tp_size = get_parallel().tp_size
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
@@ -1073,20 +1079,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
-    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+    def is_deepgemm_moe_runner_backend_enabled(
+        moe_runner_backend=None, moe_a2a_backend=None
+    ) -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend is None:
+            moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_deep_gemm():
             return True
         if moe_runner_backend.is_auto():
-            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or get_moe_a2a_backend().is_nixl()
-            )
+            if moe_a2a_backend is None:
+                moe_a2a_backend = get_moe_a2a_backend()
+            if not (
+                moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_mooncake()
+                or moe_a2a_backend.is_nixl()
+            ):
+                return False
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         return False
 
     @staticmethod
@@ -1774,11 +1788,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from triton_kernels.tensor import convert_layout, wrap_torch_tensor
             from triton_kernels.tensor_details import layout
 
-            scale_layout, scale_layout_opts = (
-                layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=1, num_warps=num_warps
-                )
+            scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=-2, num_warps=num_warps
             )
+            scale_layout_opts = {}
             scale = scale.transpose(-2, -1)
             scale = convert_layout(
                 wrap_torch_tensor(scale), scale_layout, **scale_layout_opts

@@ -267,12 +267,14 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
+        is_draft_quantization_explicit: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -565,6 +567,10 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            is_draft_quantization_explicit=(
+                is_draft_model
+                and server_args._speculative_draft_quantization_explicitly_set
+            ),
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             speculative_algorithm=server_args.speculative_algorithm,
@@ -629,6 +635,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTP"
         if is_draft_model and self.hf_config.architectures[0] in MIMO_V2_MODEL_ARCHS:
             self.hf_config.architectures[0] = "MiMoV2MTP"
+            self.hf_config.num_nextn_predict_layers = 1
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
@@ -852,21 +859,8 @@ class ModelConfig:
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
-            # Handle rope scaling
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
-            rope_scaling = self.hf_text_config.rope_scaling
-            if rope_scaling:
-                # v5 uses "rope_type", v4 uses "type"
-                rope_type = (
-                    rope_scaling.get("rope_type")
-                    or rope_scaling.get("type")
-                    or "default"
-                )
-                if rope_type != "default":
-                    self.scaling = compute_mla_mscale_scaling(
-                        rope_scaling, self.scaling
-                    )
+            # In transformers v5, rope_scaling is just rope_parameters.
+            self._init_mla_scaling(self.hf_text_config.rope_scaling)
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
@@ -880,11 +874,7 @@ class ModelConfig:
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
             self.attention_arch = AttentionArch.MHA
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
             if self.head_dim is None:
                 self.head_dim = (
@@ -927,9 +917,7 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if getattr(tc, "rope_scaling", None):
-                self.scaling = compute_mla_mscale_scaling(tc.rope_scaling, self.scaling)
+            self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
@@ -940,12 +928,7 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
-            # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
@@ -955,11 +938,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1035,6 +1014,12 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+
+    def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
+        """Base MLA attention scale from the head dims, then the rope mscale."""
+        self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+        if rope_scaling:
+            self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -1268,8 +1253,34 @@ class ModelConfig:
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
-        elif quant_algo and "FP8" in quant_algo:
+        elif quant_algo == "FP8":
             return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
+        elif quant_algo == "MXFP8":
+            group_size = json_quant_configs.get("group_size", 32)
+            ignored_layers = json_quant_configs.get(
+                "exclude_modules", json_quant_configs.get("ignore")
+            )
+            kv_cache_quant_algo = json_quant_configs.get("kv_cache_quant_algo")
+            if kv_cache_quant_algo is None:
+                kv_cache_scheme = json_quant_configs.get("kv_cache_scheme")
+                if (
+                    isinstance(kv_cache_scheme, dict)
+                    and kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
+            parsed = {
+                "quant_method": "mxfp8",
+                "quant_algo": quant_algo,
+                "activation_scheme": "dynamic",
+                "weight_block_size": [1, group_size],
+                "scale_fmt": "ue8m0",
+            }
+            if ignored_layers is not None:
+                parsed["modules_to_not_convert"] = ignored_layers
+            if kv_cache_quant_algo is not None:
+                parsed["kv_cache_quant_algo"] = kv_cache_quant_algo
+            return parsed
         else:
             return None
 
@@ -1417,7 +1428,9 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            # Keep explicit or inherited modelopt_fp4 for literal FP8 checkpoints
+            # so eligible MoE experts are requantized online.
+            "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
@@ -1459,7 +1472,6 @@ class ModelConfig:
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
-
             # Detect which checkpoint is it
             if not preserve_online_draft_quantization:
                 for _, method in QUANTIZATION_METHODS.items():
@@ -1944,7 +1956,9 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
     Transformers v5 also exposes the default RoPE parameters through
     ``rope_scaling``. Those parameters do not request any scaling.
+    Warns if 'factor' is missing from a scaling request (common in v5 configs).
     """
+    # v5 uses "rope_type", v4 uses "type"
     rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
     if rope_type == "default":
         return base_scaling

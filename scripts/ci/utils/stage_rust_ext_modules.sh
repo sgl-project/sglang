@@ -12,15 +12,25 @@ shopt -s nullglob
 # module would silently shift the archive layout.
 rm -rf rust-ext-staging
 built=()
+# Same suffix set across pkgs, or one ABI's Rust-server tests silently skip.
+expected_suffixes=""
 for pkg in server grpc multimodal; do
     found=(python/sglang/srt/"${pkg}"/_core*.so)
-    if [ ${#found[@]} -ne 1 ]; then
-        echo "::error::expected exactly one extension module for ${pkg}, found ${#found[@]}"
+    if [ ${#found[@]} -eq 0 ]; then
+        echo "::error::no extension module found for ${pkg}"
+        exit 1
+    fi
+    suffixes=$(printf '%s\n' "${found[@]##*/_core}" | sort)
+    if [ -z "${expected_suffixes}" ]; then
+        expected_suffixes="${suffixes}"
+    elif [ "${suffixes}" != "${expected_suffixes}" ]; then
+        echo "::error::extension modules for ${pkg} do not match server's interpreter set"
+        printf 'have:\n%s\nwant:\n%s\n' "${suffixes}" "${expected_suffixes}"
         exit 1
     fi
     mkdir -p "rust-ext-staging/${pkg}"
-    cp "${found[0]}" "rust-ext-staging/${pkg}/"
-    built+=("${found[0]}")
+    cp "${found[@]}" "rust-ext-staging/${pkg}/"
+    built+=("${found[@]}")
 done
 max_allowed="${MAX_GLIBC:-}"
 [ -n "${max_allowed}" ] || exit 0

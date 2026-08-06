@@ -70,7 +70,7 @@ class TestInklingNVFP4Nightly(unittest.TestCase):
                     repeat=1,
                 ),
                 performance_params=PerformanceTestParams(
-                    profile_dir="performance_profiles_inkling_nvfp4",
+                    result_dir="performance_results_inkling_nvfp4",
                 ),
             )
 
