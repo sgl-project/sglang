@@ -285,7 +285,6 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.observability.startup_phase_registry import (
     freeze_startup_phases,
-    startup_phase,
     startup_phase_prefix,
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
@@ -935,34 +934,33 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        with startup_phase("spec_decode_setup"):
-            # Launch a draft worker for speculative decoding. It builds its draft
-            # from this process's own config: what differs for the draft — the
-            # target's context length, the draft load format, its attention backend
-            # — is resolved per runner, not on a config copy.
-            draft_worker_kwargs = dict(
-                server_args=self.server_args,
-                gpu_id=self.ps.gpu_id,
-                ps=self.ps,
-                nccl_port=self.nccl_port,
-                target_worker=self.tp_worker,
+        # Launch a draft worker for speculative decoding. It builds its draft
+        # from this process's own config: what differs for the draft — the
+        # target's context length, the draft load format, its attention backend
+        # — is resolved per runner, not on a config copy.
+        draft_worker_kwargs = dict(
+            server_args=self.server_args,
+            gpu_id=self.ps.gpu_id,
+            ps=self.ps,
+            nccl_port=self.nccl_port,
+            target_worker=self.tp_worker,
+        )
+
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        with startup_phase_prefix("draft_"):
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.external_corpus_manager import (
+                ExternalCorpusManager,
             )
 
-            DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-            with startup_phase_prefix("draft_"):
-                self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
-
-            if self.spec_algorithm.is_ngram():
-                from sglang.srt.speculative.external_corpus_manager import (
-                    ExternalCorpusManager,
-                )
-
-                self.external_corpus_manager = ExternalCorpusManager(
-                    self.draft_worker,
-                    self.ipc_channels.send_to_tokenizer.send_output,
-                )
-            else:
-                self.external_corpus_manager = None
+            self.external_corpus_manager = ExternalCorpusManager(
+                self.draft_worker,
+                self.ipc_channels.send_to_tokenizer.send_output,
+            )
+        else:
+            self.external_corpus_manager = None
 
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
