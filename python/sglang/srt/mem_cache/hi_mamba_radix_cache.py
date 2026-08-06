@@ -455,7 +455,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.dec_lock_ref(end_node)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
@@ -465,9 +471,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
-
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()
