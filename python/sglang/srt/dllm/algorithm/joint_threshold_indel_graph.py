@@ -1,10 +1,8 @@
 import torch
 
 try:
-    from sglang.srt.hardware_backend.npu.norm.argmax_softmax_prob import (
-        argmax_softmax_prob_fused,
-        scrub_argmax_fused,
-    )
+    from sgl_kernel_npu.sample.argmax_softmax_prob import argmax_softmax_prob_fused
+    from sgl_kernel_npu.sample.scrub_argmax import scrub_argmax_fused
 except (ImportError, OSError):
     argmax_softmax_prob_fused = None
     scrub_argmax_fused = None

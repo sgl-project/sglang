@@ -91,8 +91,12 @@ LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+block_topk_cann_hybrid = None
 if _is_npu:
-    import torch_npu
+    try:
+        from sgl_kernel_npu.moe.block_topk import block_topk_cann_hybrid
+    except (ImportError, OSError):
+        pass
 
 import triton
 import triton.language as tl
@@ -311,80 +315,6 @@ def block_topk_triton(
     )
 
     return topk_weights, topk_ids
-
-
-def block_topk_cann_hybrid(
-    router_logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    block_size: int,
-    expert_capacity: int,
-    top_k: int,
-    expert_tie_break: Optional[torch.Tensor] = None,
-):
-    """Run two-stage block routing with torch/CANN operations."""
-    num_tokens, num_experts = router_logits.shape
-    device = router_logits.device
-    if num_tokens == 0:
-        return (
-            torch.empty((0, top_k), dtype=router_logits.dtype, device=device),
-            torch.empty((0, top_k), dtype=torch.int32, device=device),
-        )
-    base_scores = torch.sigmoid(router_logits.float())
-    routing_scores = base_scores + correction_bias.float()
-    # Keep routing in fixed-size groups when a partially filled graph bucket
-    # supplies fewer rows. Padded rows cannot win the block maximum and are
-    # removed from the returned tensors.
-    num_blocks = (num_tokens + block_size - 1) // block_size
-    padded_num_tokens = num_blocks * block_size
-    pad_tokens = padded_num_tokens - num_tokens
-    if pad_tokens:
-        base_scores = F.pad(base_scores, (0, 0, 0, pad_tokens), value=0.0)
-        routing_scores = F.pad(
-            routing_scores,
-            (0, 0, 0, pad_tokens),
-            value=float("-inf"),
-        )
-    routing_scores_blocked = routing_scores.view(num_blocks, block_size, num_experts)
-    block_expert_scores = routing_scores_blocked.max(dim=1).values
-
-    if expert_tie_break is None:
-        expert_idx = torch.arange(num_experts, device=device, dtype=torch.float32)
-        expert_tie_break = -expert_idx * 3e-7
-    combined = block_expert_scores + expert_tie_break
-    _, cap_ids = combined.topk(expert_capacity, dim=-1)
-    # Only capacity-selected experts can win the per-token route.
-    cap_ids_per_token = cap_ids.unsqueeze(1).expand(-1, block_size, -1)
-    capacity_scores = routing_scores_blocked.gather(2, cap_ids_per_token)
-    capacity_scores = capacity_scores - cap_ids_per_token.to(torch.float32) * 3e-7
-    if router_logits.device.type == "npu":
-        _, local_ids, _ = torch_npu.npu_moe_gating_top_k(
-            capacity_scores.view(padded_num_tokens, expert_capacity),
-            top_k,
-            norm_type=0,
-        )
-        local_ids = local_ids.to(torch.int64).view(num_blocks, block_size, top_k)
-    else:
-        _, local_ids = capacity_scores.topk(top_k, dim=-1)
-    ids = cap_ids_per_token.gather(2, local_ids).view(padded_num_tokens, top_k)
-
-    # Correction bias affects expert selection, not the returned weights.
-    selected_base_scores = base_scores.gather(1, ids)
-    row_max = selected_base_scores.max(dim=-1, keepdim=True).values
-    has_nonzero_score = row_max > 1e-30
-    scaled = selected_base_scores / torch.where(
-        has_nonzero_score, row_max, torch.ones_like(row_max)
-    )
-    normalized = scaled / scaled.sum(dim=-1, keepdim=True).clamp_min(1e-30)
-    weights = torch.where(
-        has_nonzero_score,
-        normalized,
-        torch.full_like(selected_base_scores, 1.0 / top_k),
-    )
-
-    return (
-        weights[:num_tokens].to(router_logits.dtype),
-        ids[:num_tokens].to(torch.int32),
-    )
 
 
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
@@ -653,6 +583,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
     def _block_topk(self, router_logits: torch.Tensor):
         if _is_npu:
+            if block_topk_cann_hybrid is None:
+                raise RuntimeError(
+                    "LLaDA2 NPU block routing requires sgl_kernel_npu.moe.block_topk"
+                )
             topk_weights, topk_ids = block_topk_cann_hybrid(
                 router_logits,
                 self.correction_bias,

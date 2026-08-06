@@ -10,66 +10,7 @@ import torch
 import sglang.srt.models.llada2 as llada2
 
 
-def block_topk_reference(
-    router_logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    block_size: int,
-    expert_capacity: int,
-    top_k: int,
-):
-    num_tokens, num_experts = router_logits.shape
-    base_scores = torch.sigmoid(router_logits.float())
-    routing_scores = base_scores + correction_bias.float()
-    tie_break = -torch.arange(num_experts, dtype=torch.float32) * 3e-7
-    result_ids = []
-    result_weights = []
-
-    for start in range(0, num_tokens, block_size):
-        block_scores = routing_scores[start : start + block_size]
-        capacity_ids = (
-            (block_scores.max(dim=0).values + tie_break).topk(expert_capacity).indices
-        )
-        token_scores = block_scores[:, capacity_ids] + tie_break[capacity_ids]
-        local_ids = token_scores.topk(top_k, dim=-1).indices
-        selected_ids = capacity_ids[local_ids]
-        selected_scores = base_scores[start : start + block_size].gather(
-            1, selected_ids
-        )
-        selected_weights = selected_scores / selected_scores.sum(dim=-1, keepdim=True)
-        result_ids.append(selected_ids)
-        result_weights.append(selected_weights)
-
-    return torch.cat(result_weights), torch.cat(result_ids).to(torch.int32)
-
-
 class TestLLaDA2BlockRouting(unittest.TestCase):
-    def test_cann_hybrid_matches_reference(self):
-        for num_tokens, num_experts, block_size, capacity, top_k in (
-            (32, 16, 8, 8, 2),
-            (63, 256, 32, 48, 8),
-        ):
-            torch.manual_seed(num_tokens)
-            logits = torch.randn(num_tokens, num_experts)
-            bias = torch.randn(num_experts) * 0.1
-
-            weights, ids = llada2.block_topk_cann_hybrid(
-                logits,
-                bias,
-                block_size,
-                capacity,
-                top_k,
-            )
-            expected_weights, expected_ids = block_topk_reference(
-                logits,
-                bias,
-                block_size,
-                capacity,
-                top_k,
-            )
-
-            torch.testing.assert_close(ids, expected_ids)
-            torch.testing.assert_close(weights, expected_weights)
-
     def test_npu_folds_routed_scaling_factor_into_block_topk_weights(self):
         block = llada2.LLaDA2MoeSparseMoeBlock.__new__(llada2.LLaDA2MoeSparseMoeBlock)
         torch.nn.Module.__init__(block)
