@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
     linear_bf16_fp32,
@@ -348,7 +349,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(MultiPlatformOp):
+class Compressor(BaseFusedOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
