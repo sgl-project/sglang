@@ -492,6 +492,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         per_token_scale=per_token_scale,
     )
+
     return StandardCombineInput(hidden_states=output)
 
 
@@ -578,6 +579,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         per_token_scale=per_token_scale,
     )
+
     # Note: output contains routed expert results; shared_expert is handled separately
 
     # Write into pre-allocated workspace buffer if available
