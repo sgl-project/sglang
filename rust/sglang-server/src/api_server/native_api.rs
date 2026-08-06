@@ -24,14 +24,14 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::{
-    OutputAccumulator, cumulative_frame_string, error_value, frame_value, stream_frame_string,
-    tag_value,
+    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
-use super::submit::{pre_submit_error, submit};
+use super::submit::submit;
 use crate::environ::env_bool;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
+use crate::utils::response::{error_response, error_value};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -148,7 +148,11 @@ async fn generate(
         // can only answer unary — as Python's does (FastAPI rejects before its
         // handler runs).
         Err(rejection) => {
-            return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error_value(400, &rejection.body_text()),
+                false,
+            );
         }
     };
     let stream = body.stream;
@@ -159,13 +163,13 @@ async fn generate(
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
             let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
-            return pre_submit_error(code, &e.to_string(), stream);
+            return error_response(code, error_value(code.as_u16(), &e.to_string()), stream);
         }
     };
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
-        return pre_submit_error(StatusCode::BAD_REQUEST, &e, stream);
+        return error_response(StatusCode::BAD_REQUEST, error_value(400, &e), stream);
     }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.

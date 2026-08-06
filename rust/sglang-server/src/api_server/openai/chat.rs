@@ -33,11 +33,12 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, indexed_egress_stream, openai_error,
-    streaming_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
+    submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
+use crate::utils::response::error_response;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -49,32 +50,58 @@ async fn chat_completions(
 ) -> Response {
     let request = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => return openai_error(StatusCode::BAD_REQUEST, rejection.body_text()),
+        Err(rejection) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
+                false,
+            );
+        }
     };
     if request.model != state.server_args.served_model_name {
-        return openai_error(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            format!("The model `{}` does not exist", request.model),
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                format!("The model `{}` does not exist", request.model),
+            ),
+            false,
         );
     }
     if request.messages.is_empty() {
-        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            error_payload(StatusCode::BAD_REQUEST, "messages cannot be empty"),
+            false,
+        );
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return openai_error(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "image, audio, video, and file message content is not supported",
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                "image, audio, video, and file message content is not supported",
+            ),
+            false,
         );
     }
     if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            error_payload(StatusCode::BAD_REQUEST, "n must be at least 1"),
+            false,
+        );
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
     if max_tokens == Some(0) {
-        return openai_error(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "max_completion_tokens must be positive",
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                "max_completion_tokens must be positive",
+            ),
+            false,
         );
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
@@ -84,16 +111,24 @@ async fn chat_completions(
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
     {
-        return openai_error(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "audio, prediction, web search, and multimodal inputs are not supported",
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                "audio, prediction, web search, and multimodal inputs are not supported",
+            ),
+            false,
         );
     }
     #[allow(deprecated)]
     if request.function_call.is_some() || request.functions.is_some() {
-        return openai_error(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "deprecated function_call/functions are not supported; use tools and tool_choice",
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                "deprecated function_call/functions are not supported; use tools and tool_choice",
+            ),
+            false,
         );
     }
 
@@ -107,9 +142,13 @@ async fn chat_completions(
         .then(|| state.server_args.tool_call_parser.clone())
         .flatten();
     if tools_enabled && parser.is_none() {
-        return openai_error(
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "tool calls require --tool-call-parser",
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                "tool calls require --tool-call-parser",
+            ),
+            false,
         );
     }
     // Python gates the split on `request.separate_reasoning` (default true);
@@ -143,7 +182,13 @@ async fn chat_completions(
         &state.server_args,
     ) {
         Ok(sampling) => sampling,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error_payload(StatusCode::BAD_REQUEST, message),
+                false,
+            );
+        }
     };
 
     let stream = request.stream.unwrap_or(false);
@@ -241,9 +286,13 @@ pub(super) async fn prepare_chat_request(
     mut request: CreateChatCompletionRequest,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
-        return Err(openai_error(
+        return Err(error_response(
             StatusCode::BAD_REQUEST,
-            "this model has no usable chat template",
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                "this model has no usable chat template",
+            ),
+            false,
         ));
     };
     // Template stops first, then the request's own — Python
@@ -252,9 +301,13 @@ pub(super) async fn prepare_chat_request(
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
     let prompt = formatter.render(&request).map_err(|error| {
-        openai_error(
+        error_response(
             StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
+            error_payload(
+                StatusCode::BAD_REQUEST,
+                format!("chat template render failed: {error}"),
+            ),
+            false,
         )
     })?;
     Ok((request, prompt))
@@ -428,7 +481,9 @@ pub(super) async fn unary_chat(
     for (index, rid, rx) in submitted {
         let output = match collect_output(rx, &mut guard, &rid).await {
             Ok(output) => output,
-            Err((status, message)) => return openai_error(status, message),
+            Err((status, message)) => {
+                return error_response(status, error_payload(status, message), false);
+            }
         };
 
         if prompt_tokens == 0 {
@@ -559,7 +614,7 @@ pub(super) fn chat_event_stream(
                     id: None,
                     event: None,
                     comment: None,
-                    error: Some(streaming_error(500, "response truncated before completion")),
+                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
                 };
                 continue;
             };
@@ -576,7 +631,7 @@ pub(super) fn chat_event_stream(
                         id: None,
                         event: None,
                         comment: None,
-                        error: Some(streaming_error(error.http_status(), error.to_string())),
+                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
                     };
                     continue;
                 }
@@ -592,7 +647,7 @@ pub(super) fn chat_event_stream(
                     id: None,
                     event: None,
                     comment: None,
-                    error: Some(streaming_error(code, message)),
+                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
                 };
                 continue;
             }
