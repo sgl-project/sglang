@@ -230,7 +230,9 @@ class RayEngine(Engine):
     """Engine using Ray actors for scheduler processes."""
 
     def __init__(self, **kwargs):
-        placement_group = kwargs.pop("placement_group", None)
+        # Set before super().__init__(): it launches the subprocesses, which need
+        # the group to schedule the scheduler actors onto.
+        self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
         # Schedulers are separate Ray actors; default to the Ray-backed
@@ -239,9 +241,7 @@ class RayEngine(Engine):
             from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
 
             kwargs["stat_loggers"] = build_ray_stat_loggers()
-        server_args = ServerArgs(**kwargs)
-        server_args.override("ray.placement_group", placement_group=placement_group)
-        super().__init__(server_args=server_args)
+        super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -258,6 +258,8 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        *,
+        placement_group=None,
     ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 
@@ -265,7 +267,7 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        pg = server_args.placement_group or ray.util.get_current_placement_group()
+        pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
                 placement_group as create_placement_group,
@@ -294,7 +296,7 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
-        is_custom_pg = server_args.placement_group is not None
+        is_custom_pg = placement_group is not None
         nnodes = server_args.nnodes
         world_size = _compute_world_size(server_args)
 
@@ -430,6 +432,7 @@ class RayEngine(Engine):
                     pg,
                     bundle_for_node,
                     rank0_node_ip,
+                    is_custom_pg,
                 ),
                 None,
             )
@@ -442,6 +445,7 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
@@ -467,16 +471,10 @@ class RayEngine(Engine):
             server_args,
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
-        # dataclasses.replace only copies declared fields; placement_group is
-        # a dynamic attribute that must be manually appended after the rebuild.
-        dp_server_args.override(
-            "ray.placement_group", placement_group=server_args.placement_group
-        )
-
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(
-            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip
+            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip, is_custom_pg
         )
 
         # Start the DP controller's event loop in a daemon thread.
