@@ -49,7 +49,7 @@ _EXCLUDED = (
     "multimodal_gen",
 )
 
-_BASELINE = 18
+_BASELINE = 15
 
 
 class TestServerArgsWriterRatchet(CustomTestCase):
