@@ -1157,6 +1157,7 @@ class EmbeddingReqInput:
                 text=[self.text[i]] if self.text is not None else None,
                 sampling_params=self.sampling_params[i],
                 is_cross_encoder_request=True,
+                priority=self.priority,
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
@@ -1184,6 +1185,7 @@ class EmbeddingReqInput:
                     else None
                 ),
                 sampling_params=self.sampling_params[i],
+                priority=self.priority,
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
