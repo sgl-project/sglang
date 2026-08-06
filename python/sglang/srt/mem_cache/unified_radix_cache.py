@@ -448,6 +448,11 @@ class UnifiedRadixCache(BasePrefixCache):
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 get_memory().hicache_storage_backend_extra_config
             )
+            if server_args.file_storage_path:
+                storage_extra_config = dict(storage_extra_config or {})
+                storage_extra_config.setdefault(
+                    "file_storage_path", server_args.file_storage_path
+                )
         storage_prefetch_threshold = (
             self._storage_attachment.resolve_prefetch_threshold(
                 storage_prefetch_threshold
