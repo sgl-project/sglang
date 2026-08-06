@@ -339,12 +339,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler()
-                    if self._draft_sampler is not None:
-                        self.draft_model_runner.capture_tail_hooks.append(
-                            make_draft_sampler_capture_hook(self._draft_sampler)
-                        )
+                self._draft_sampler = self._maybe_build_draft_sampler()
+                if self._draft_sampler is not None:
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._draft_sampler)
+                    )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph

@@ -31,7 +31,6 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-
 _LOG2_E = math.log2(math.e)
 
 
@@ -357,7 +356,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        """Restore the 0728 Ascend prefill gate contract.
+        """Apply the Ascend prefill gate contract.
 
         The checkpoint was validated with FP32 gate activation before
         ``chunk_kda``. Keeping this platform override here leaves the shared
@@ -436,8 +435,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        # Match the proven 0728 target-verify contract exactly: activate the
-        # forget gate and beta in FP32 before entering the recurrent kernel.
+        # Activate the forget gate and beta in FP32 before entering the
+        # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
         preactivated_a = fused_kda_gate_npu(
             dense_a.flatten(-2),

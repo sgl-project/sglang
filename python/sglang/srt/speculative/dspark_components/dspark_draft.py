@@ -212,8 +212,7 @@ class DraftBlockProposer:
         confidence_tap = None
         folded = False
         if (
-            envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
-            and draft_sampler is not None
+            draft_sampler is not None
             and fwd.can_run_graph
             and (all_greedy or draft_sampler.folded_sampling)
         ):

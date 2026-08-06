@@ -218,9 +218,8 @@ def forward_mla_prepare_npu(
                         eps=m.q_a_layernorm.variance_epsilon,
                     )
                 else:
-                    # Kimi-K3 precision baseline (0728): the fused split+RMSNorm
-                    # kernel is not numerically equivalent on Ascend. Keep the
-                    # proven unfused path for models that explicitly opt out.
+                    # The fused split+RMSNorm kernel is not numerically equivalent
+                    # on Ascend. Keep the unfused path for models that opt out.
                     q, latent_cache = qkv_latent.split(
                         [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
                         dim=-1,
@@ -303,15 +302,9 @@ def forward_mla_core_npu(
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-        dtype=attn_output.dtype,
-        device=attn_output.device,
-    )
-
     attn_output = attn_output.contiguous()
     # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
-    # Kimi-K3.  Match the validated 0728 Ascend path.
+    # Kimi-K3, so use the numerically validated torch_npu implementation.
     attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
         attn_output,
         m.w_vc,

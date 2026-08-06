@@ -249,6 +249,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
+
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
@@ -1146,6 +1147,7 @@ class OpenAIServingChat(OpenAIServingBase):
         modalities = []
 
         template_content_format = self.template_manager.jinja_template_content_format
+
         # Try custom encoding first (override in subclass for custom renderers)
         thinking_requested = (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()

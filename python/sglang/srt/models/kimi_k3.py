@@ -125,6 +125,7 @@ _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -239,6 +240,8 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
 
 
 class KimiK3MLP(nn.Module):
+    """K3 MLP; SiLU or SiTU activation."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -253,7 +256,7 @@ class KimiK3MLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
-        # The 0728 Ascend path shards the dense MLP inside each attention-TP
+        # The Ascend path shards the dense MLP inside each attention-TP
         # replica.  The GPU K3 refactor instead gathers all DP rows and shards
         # this one dense layer over the full TP group.  Keep the GPU default,
         # but allow the NPU launcher to retain the proven attention-TP layout
@@ -369,6 +372,8 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
 
 
 class KimiK3MoE(nn.Module):
+    """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -388,7 +393,6 @@ class KimiK3MoE(nn.Module):
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
 
-        # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
@@ -577,7 +581,6 @@ class KimiK3MoE(nn.Module):
             and self.alt_stream is not None
         )
 
-        # Latent MoE projections
         if self.use_latent_moe:
             latent_quant_config = (
                 quant_config
@@ -680,7 +683,7 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
-        # NOTE: invalidate the cached properties
+        # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
             "_routing_contract_ok",
@@ -1296,6 +1299,8 @@ class KimiK3MoE(nn.Module):
 
 
 class KimiK3DeltaAttention(nn.Module):
+    """KDA attention; optional full-rank gate."""
+
     def __init__(
         self,
         layer_idx: int,
@@ -1346,7 +1351,6 @@ class KimiK3DeltaAttention(nn.Module):
             "use_full_rank_gate", False
         )
 
-        # Decide fusion strategy
         # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
@@ -1972,6 +1976,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
 
 
 class KimiK3DecoderLayer(nn.Module):
+    """Decoder layer carrying the K3 attention-residual stream."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2441,6 +2447,8 @@ class KimiK3DecoderLayer(nn.Module):
 
 
 class KimiK3LinearModel(nn.Module):
+    """K3 language-model backbone."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2524,7 +2532,6 @@ class KimiK3LinearModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-            # NOTE: assert to bypass the annoying typing errors
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
@@ -2683,6 +2690,8 @@ class KimiK3LinearModel(nn.Module):
 
 
 class KimiK3LinearForCausalLM(nn.Module):
+    """Text-only K3 causal LM."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3029,6 +3038,8 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
+    """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
     encoder_only_safetensors_weight_prefixes = (
         "vision_tower.",
