@@ -309,20 +309,37 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
+
+    batch.sampling_params.quality = "ultra"
+    server_args.attention_backend = None
+    with pytest.raises(ValueError, match="quality must be one of"):
+        stage.forward(batch, server_args)
+
+
+def test_validate_server_args_requires_packed_varlen_backend():
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
+        dit_config=SimpleNamespace(
+            arch_config=SimpleNamespace(attention_head_dim=128)
+        ),
+        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+    )
+    server_args = SimpleNamespace(
+        component_attention_backends={}, attention_backend="sage_attn"
+    )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
-        side_effect=ValueError("does not implement packed varlen attention"),
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
     ) as get_attn_backend:
-        with pytest.raises(ValueError, match="does not implement packed varlen"):
-            stage.forward(batch, server_args)
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
         128,
         torch.bfloat16,
         selected_attention_backend=AttentionBackendEnum.SAGE_ATTN,
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
-
-    batch.sampling_params.quality = "ultra"
-    server_args.attention_backend = None
-    with pytest.raises(ValueError, match="quality must be one of"):
-        stage.forward(batch, server_args)
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        side_effect=ValueError("does not implement packed varlen attention"),
+    ):
+        with pytest.raises(ValueError, match="does not implement packed varlen"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
