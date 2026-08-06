@@ -62,7 +62,7 @@ class RedisConnector(BaseKVConnector):
             if cursor == 0:
                 break
 
-        return [key.decode("utf-8") for key in all_keys]
+        return [key.decode("utf-8") for key in dict.fromkeys(all_keys)]
 
     def weight_iterator(
         self, rank: int = 0
