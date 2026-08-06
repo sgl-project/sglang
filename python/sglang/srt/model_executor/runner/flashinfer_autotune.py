@@ -190,7 +190,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
 
             maybe_skip_logits = autotune_dummy_run_mode()
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with torch.inference_mode(), autotune(
+        with autotune(
             True,
             cache=str(autotune_cache),
             skip_ops=skip_ops,
