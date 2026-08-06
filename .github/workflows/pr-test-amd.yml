@@ -810,7 +810,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
+        part: [0, 1, 2, 3, 4, 5, 6]  # 7 partitions: 2 parametrized + 5 standalone tests
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -907,7 +907,7 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 3 \
+              --total-partitions 7 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
