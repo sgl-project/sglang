@@ -21,12 +21,15 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_split_before_forward,
     enable_cp_v2,
     prepare_cp_forward,
 )
+from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
@@ -105,6 +108,31 @@ class PrefillCPBCGInput:
                     dtype=torch.int64,
                 ),
             )
+
+    def can_replay(
+        self,
+        *,
+        static_num_tokens: int,
+        extend_seq_lens: Any,
+    ) -> bool:
+        """Return whether a live zigzag layout fits the captured local rows."""
+        captured_local_tokens = self.bucket_local_tokens.get(static_num_tokens)
+        strategy = get_cp_strategy()
+        if (
+            captured_local_tokens is None
+            or not isinstance(strategy, ZigzagCPStrategy)
+            or extend_seq_lens is None
+        ):
+            return False
+
+        _, _, per_rank_logical_tokens = strategy.build_token_layout(
+            [int(length) for length in extend_seq_lens]
+        )
+        align_size = get_cp_padding_align_size()
+        live_local_tokens = (
+            (max(per_rank_logical_tokens) + align_size - 1) // align_size * align_size
+        )
+        return live_local_tokens <= captured_local_tokens
 
     def prepare(
         self,

@@ -1040,6 +1040,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return_logprob: bool,
         lora_ineligible: bool = False,
         chunked_prefix_uncapturable: bool = False,
+        extend_seq_lens=None,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1097,6 +1098,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
+        if getattr(self, "enable_cp_v2_bcg_capture", False):
+            assert self.prefill_cp_bcg_input is not None
+            if not self.prefill_cp_bcg_input.can_replay(
+                static_num_tokens=padded_num_tokens,
+                extend_seq_lens=extend_seq_lens,
+            ):
+                return False
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -1135,6 +1143,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self._has_prefix_hit(forward_batch)
                 and self._select_prefix_capture_chunks(forward_batch) is None
             ),
+            extend_seq_lens=getattr(forward_batch, "extend_seq_lens_cpu", None),
         ):
             return False
         # Multi-req replay is supported by body-capture backends via the

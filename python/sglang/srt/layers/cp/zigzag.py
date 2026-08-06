@@ -118,6 +118,33 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             return True
         return all(int(length) >= self.cp_size * 2 for length in extend_lens)
 
+    def build_token_layout(
+        self, extend_seqs_len: List[int]
+    ) -> tuple[List[List[int]], List[int], List[int]]:
+        """Build the CPU-only token layout shared by planning and BCG checks."""
+        cp_segment_num = self.cp_size * 2
+        per_seq_block_sizes: List[List[int]] = []
+        split_list: List[int] = []
+        for length in extend_seqs_len:
+            base = int(length) // cp_segment_num
+            rem = int(length) % cp_segment_num
+            block_sizes = [
+                base + 1 if block_id < rem else base
+                for block_id in range(cp_segment_num)
+            ]
+            per_seq_block_sizes.append(block_sizes)
+            split_list.extend(block_sizes)
+
+        per_rank_actual_token = []
+        for rank in range(self.cp_size):
+            per_rank_actual_token.append(
+                sum(
+                    block_sizes[rank] + block_sizes[cp_segment_num - 1 - rank]
+                    for block_sizes in per_seq_block_sizes
+                )
+            )
+        return per_seq_block_sizes, split_list, per_rank_actual_token
+
     def build_metadata(
         self,
         num_tokens: int,
@@ -146,26 +173,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         # TODO: move these per-request layout/index computations to a Triton
         # kernel if Python-side metadata construction becomes a bottleneck.
-        per_seq_block_sizes: List[List[int]] = []
-        split_list: List[int] = []
-        for length in extend_seqs_len:
-            base = length // cp_segment_num
-            rem = length % cp_segment_num
-            block_sizes = [
-                base + 1 if block_id < rem else base
-                for block_id in range(cp_segment_num)
-            ]
-            per_seq_block_sizes.append(block_sizes)
-            split_list.extend(block_sizes)
-
-        per_rank_actual_token = []
-        for rank in range(self.cp_size):
-            per_rank_actual_token.append(
-                sum(
-                    block_sizes[rank] + block_sizes[cp_segment_num - 1 - rank]
-                    for block_sizes in per_seq_block_sizes
-                )
-            )
+        per_seq_block_sizes, split_list, per_rank_actual_token = (
+            self.build_token_layout(extend_seqs_len)
+        )
         max_rank_len = [max(per_rank_actual_token)] * self.cp_size
 
         cp_rank = self.cp_rank
