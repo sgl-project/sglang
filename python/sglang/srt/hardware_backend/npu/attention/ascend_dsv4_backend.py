@@ -1152,9 +1152,13 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_unique_compress_ratios = list(
             dict.fromkeys(self._dsv4_compress_ratios)
         )
+        self._is_dspark_algorithm = bool(
+            model_runner.spec_algorithm is not None
+            and model_runner.spec_algorithm.is_dspark()
+        )
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
-            and model_runner.spec_algorithm.is_dspark()
+            and self._is_dspark_algorithm
         )
         self._dsv4_graph_tokens_per_req = int(
             model_runner.decode_num_tokens_per_req()
@@ -1441,7 +1445,7 @@ class DeepseekV4AscendAttnBackend(
             else 1
         )
 
-        final_seq_lens_cpu = seq_lens_cpu[:bs]
+        raw_seq_lens_cpu = seq_lens_cpu[:bs]
         is_idle_replay = runtime_mode.is_idle()
         if graph_mode.is_target_verify():
             explicit_live_cpu = getattr(
@@ -1450,23 +1454,35 @@ class DeepseekV4AscendAttnBackend(
                 None,
             )
             if is_idle_replay:
-                live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-            elif explicit_live_cpu is not None:
-                explicit_live_cpu = torch.as_tensor(
-                    explicit_live_cpu,
-                    dtype=final_seq_lens_cpu.dtype,
-                    device=final_seq_lens_cpu.device,
-                ).flatten()
-                live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-                num_live_rows = min(bs, explicit_live_cpu.numel())
-                if num_live_rows > 0:
-                    live_seq_lens_cpu[:num_live_rows].copy_(
-                        explicit_live_cpu[:num_live_rows]
+                live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
+                final_seq_lens_cpu = live_seq_lens_cpu
+            elif self._is_dspark_algorithm or explicit_live_cpu is not None:
+                # DSpark/DFLASH temporarily expand seq_lens_cpu to the final
+                # target-verify length and carry the committed/live prefix
+                # separately. Graph replay batches are lightweight namespace
+                # views and do not necessarily retain spec_algorithm.
+                final_seq_lens_cpu = raw_seq_lens_cpu
+                if explicit_live_cpu is None:
+                    live_seq_lens_cpu = torch.clamp(
+                        final_seq_lens_cpu - int(tokens_per_bs), min=0
                     )
+                else:
+                    explicit_live_cpu = torch.as_tensor(
+                        explicit_live_cpu,
+                        dtype=final_seq_lens_cpu.dtype,
+                        device=final_seq_lens_cpu.device,
+                    ).flatten()
+                    live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
+                    num_live_rows = min(bs, explicit_live_cpu.numel())
+                    if num_live_rows > 0:
+                        live_seq_lens_cpu[:num_live_rows].copy_(
+                            explicit_live_cpu[:num_live_rows]
+                        )
             else:
-                live_seq_lens_cpu = torch.clamp(
-                    final_seq_lens_cpu - int(tokens_per_bs), min=0
-                )
+                # EAGLE and the other uniform verify callers keep
+                # seq_lens_cpu at the committed/live prefix length.
+                live_seq_lens_cpu = raw_seq_lens_cpu
+                final_seq_lens_cpu = live_seq_lens_cpu + int(tokens_per_bs)
             live_seq_lens = live_seq_lens_cpu.to(
                 device=device, dtype=torch.int32
             )
@@ -1475,9 +1491,11 @@ class DeepseekV4AscendAttnBackend(
             and forward_batch.seq_lens.device.type != "cpu"
         ):
             live_seq_lens_cpu = seq_lens_cpu[:bs]
+            final_seq_lens_cpu = live_seq_lens_cpu
             live_seq_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
         else:
             live_seq_lens_cpu = seq_lens_cpu[:bs]
+            final_seq_lens_cpu = live_seq_lens_cpu
             live_seq_lens = live_seq_lens_cpu.to(
                 device=device, dtype=torch.int32
             )
@@ -1486,7 +1504,9 @@ class DeepseekV4AscendAttnBackend(
             graph_mode.is_target_verify() and not is_idle_replay and has_compress
         )
         compress_seq_lens = live_seq_lens
-        compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
+        compress_seq_lens_max = (
+            int(final_seq_lens_cpu.max()) if bs > 0 else 0
+        )
         if active_target_verify:
             compress_seq_lens = final_seq_lens_cpu.to(
                 device=device, dtype=torch.int32
@@ -2130,11 +2150,10 @@ class DeepseekV4AscendAttnBackend(
                 self.speculative_num_draft_tokens,
             )
         )
-        # The verify caller has already expanded seq_lens_cpu from the live
-        # prefix length to the final target-attention KV length.  Adding
-        # n_draft again shifts compressor boundaries to the next reserved
-        # verify block and pairs current positions with future c4/c128 slots.
-        verify_seq_lens_cpu = forward_batch.seq_lens_cpu[:bs]
+        # The parent backend normalizes this to final KV lengths for every
+        # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
+        # already pass expanded lengths and are not incremented again.
+        verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
