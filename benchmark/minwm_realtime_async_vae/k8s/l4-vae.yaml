@@ -37,7 +37,7 @@ spec:
           values: [us-east-2a, us-east-2b, us-east-2c]
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: [g6.2xlarge, g6.4xlarge]
+          values: [g6.2xlarge, g6.4xlarge, g6.8xlarge]
       taints:
         - key: nvidia.com/gpu
           value: "true"

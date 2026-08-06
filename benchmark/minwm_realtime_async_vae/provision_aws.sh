@@ -10,7 +10,7 @@ COORDINATOR_TABLE="${COORDINATOR_TABLE:-minwm-realtime-benchmark}"
 TRACE_LOG_GROUP="${TRACE_LOG_GROUP:-/aws/eks/minwm/realtime-traces-benchmark}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-leap-world/minwm-realtime}"
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-leap-world-us-west-2}"
-ARTIFACT_PREFIX="${ARTIFACT_PREFIX:-world-model/minwm/serving-artifacts/wan22-5b-stage3-dmd-30-gs1800}"
+ARTIFACT_PREFIX="${ARTIFACT_PREFIX:-world-model/minwm/serving-artifacts}"
 
 ROOT="$(git rev-parse --show-toplevel)"
 TEMPLATE="${ROOT}/benchmark/minwm_realtime_async_vae/aws/stack.yaml"
