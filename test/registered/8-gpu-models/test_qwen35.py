@@ -30,7 +30,7 @@ class TestQwen35(unittest.TestCase):
             "--tool-call-parser=qwen3_coder",
             "--mem-fraction-static=0.8",
         ]
-        dp_args = ["--dp=8", "--enable-dp-attention"]
+        dp_args = ["--dp=8", "--enable-dp-attention", "--disable-prefill-cuda-graph"]
         mtp_args = [
             "--speculative-algorithm=EAGLE",
             "--speculative-num-steps=3",
@@ -71,7 +71,7 @@ class TestQwen35(unittest.TestCase):
                 num_examples=200,
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_qwen35",
+                result_dir="performance_results_qwen35",
             ),
         )
 

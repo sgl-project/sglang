@@ -1,7 +1,8 @@
 import inspect
 import re
 import time
-from typing import List, Optional, Tuple, Union
+from copy import copy, deepcopy
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -10,6 +11,10 @@ import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.sample.glmimage import (
+    GLM_IMAGE_RESOLUTION_ALIGNMENT,
+    align_glm_image_resolution,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -117,6 +122,26 @@ def image_path_to_list(image_path: Union[str, List[str]]) -> List[str]:
     return image_path if isinstance(image_path, list) else [image_path]
 
 
+def resize_glm_image_to_alignment(image: PIL.Image.Image) -> PIL.Image.Image:
+    """Resize an image up so both dimensions use GLM-Image's D32 grid."""
+    width, height = image.size
+    aligned_width, aligned_height = align_glm_image_resolution(width, height)
+    if (aligned_width, aligned_height) == (width, height):
+        return image
+    return image.resize((aligned_width, aligned_height), PIL.Image.Resampling.LANCZOS)
+
+
+def _validate_glm_image_resolution_alignment(width: int, height: int) -> None:
+    if (
+        height % GLM_IMAGE_RESOLUTION_ALIGNMENT != 0
+        or width % GLM_IMAGE_RESOLUTION_ALIGNMENT != 0
+    ):
+        raise ValueError(
+            "GLM-Image dimensions must be aligned before AR token generation, "
+            f"got {width}x{height}"
+        )
+
+
 def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
     pooler_output = getattr(image_features, "pooler_output", None)
     if pooler_output is not None:
@@ -151,6 +176,41 @@ def _repeat_to_batch(tensor: Optional[torch.Tensor], batch_size: int):
         )
     repeat_shape = [batch_size] + [1] * (tensor.dim() - 1)
     return tensor.repeat(*repeat_shape)
+
+
+def _extract_srt_usage(meta_info: dict[str, Any] | None) -> dict[str, int] | None:
+    if not isinstance(meta_info, dict):
+        return None
+
+    usage = {
+        "prompt_tokens": int(meta_info.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(meta_info.get("completion_tokens", 0) or 0),
+        "reasoning_tokens": int(meta_info.get("reasoning_tokens", 0) or 0),
+        "cached_tokens": int(meta_info.get("cached_tokens", 0) or 0),
+    }
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    return usage
+
+
+def _merge_srt_usage(
+    total_usage: dict[str, Any] | None, usage: dict[str, int] | None
+) -> dict[str, Any] | None:
+    if usage is None:
+        return total_usage
+    if total_usage is None:
+        total_usage = {}
+    for key, value in usage.items():
+        total_usage[key] = int(total_usage.get(key, 0)) + int(value)
+    return total_usage
+
+
+def _merge_srt_usages(
+    usages: list[dict[str, int] | None],
+) -> dict[str, Any] | None:
+    total_usage = None
+    for usage in usages:
+        total_usage = _merge_srt_usage(total_usage, usage)
+    return total_usage
 
 
 class GlmImageAR(PipelineStage):
@@ -214,6 +274,86 @@ class GlmImageAR(PipelineStage):
         token_ids = token_ids.reshape(1, -1)
         return token_ids
 
+    @staticmethod
+    def _external_ar_sampling_params(max_new_tokens: int, seed: Optional[int]):
+        sampling_params = {
+            "temperature": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        }
+        if seed is not None:
+            sampling_params["sampling_seed"] = seed
+        return sampling_params
+
+    @staticmethod
+    def _request_external_ar(payload: dict, server_args: ServerArgs):
+        try:
+            response = requests.post(
+                server_args.srt_encoder_url + "/generate",
+                json=payload,
+                timeout=(
+                    server_args.srt_encoder_connect_timeout,
+                    server_args.srt_encoder_timeout,
+                ),
+            )
+            response.raise_for_status()
+        except requests.ConnectTimeout as e:
+            logger.error(
+                "Connection timeout to SGLang encoder (%s). Try to increase "
+                "--srt-encoder-connection-timeout (current: %s sec). Details: %s",
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_connect_timeout,
+                e,
+            )
+            raise
+        except requests.ReadTimeout as e:
+            logger.error(
+                "Read timeout from SGLang encoder (%s). Try to increase "
+                "--srt-encoder-timeout (current: %s sec). Details: %s",
+                server_args.srt_encoder_url,
+                server_args.srt_encoder_timeout,
+                e,
+            )
+            raise
+        except requests.ConnectionError as e:
+            logger.error(
+                "Failed to connect to SGLang encoder at %s: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+        except requests.RequestException as e:
+            logger.error(
+                "SGLang encoder request to %s failed: %s",
+                server_args.srt_encoder_url,
+                e,
+            )
+            raise
+        return response.json()
+
+    def _extract_prior_token_ids(
+        self,
+        generated_ids: Any,
+        generation_shape: tuple[int, int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        large_image_offset, token_h, token_w = generation_shape
+        expected_output_len = large_image_offset + token_h * token_w
+        actual_output_len = 0 if generated_ids is None else len(generated_ids)
+        if actual_output_len < expected_output_len:
+            raise RuntimeError(
+                "GLM-Image AR returned too few output_ids: "
+                f"got {actual_output_len}, need at least {expected_output_len} "
+                f"(large_image_offset={large_image_offset}, "
+                f"token_h={token_h}, token_w={token_w})."
+            )
+
+        prior_token_ids_d32 = torch.tensor(
+            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
+            device=device,
+        )
+        return self._upsample_token_ids(prior_token_ids_d32, token_h, token_w)
+
     def generate_prior_tokens(
         self,
         prompt: str,
@@ -221,8 +361,8 @@ class GlmImageAR(PipelineStage):
         width: int,
         server_args: ServerArgs,
         image: Optional[List[PIL.Image.Image]] = None,
-        factor: int = 32,
-    ) -> Tuple[torch.Tensor, int, int]:
+        seed: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[dict[str, int]]]:
         """
         Generate prior tokens using the AR (vision_language_encoder) model.
 
@@ -231,14 +371,11 @@ class GlmImageAR(PipelineStage):
             condition_images: Optional list of condition images for i2i
 
         Returns:
-            Tuple of (prior_token_ids, pixel_height, pixel_width)
-            - prior_token_ids: Upsampled to d16 format, shape [1, token_h*token_w*4]
-            - pixel_height: Image height in pixels
-            - pixel_width: Image width in pixels
+            Tuple of the D16 prior token IDs, optional source-image token IDs,
+            and optional usage statistics returned by an external AR server.
         """
         device = get_local_torch_device()
-        height = (height // factor) * factor
-        width = (width // factor) * factor
+        _validate_glm_image_resolution_alignment(width, height)
 
         is_text_to_image = image is None or len(image) == 0
         # Build messages for processor
@@ -281,57 +418,13 @@ class GlmImageAR(PipelineStage):
             payload = {
                 "input_ids": inputs["input_ids"][0].tolist(),
                 "image_data": [{"image_grid_thw": image_grid_thw.tolist()}],
-                "sampling_params": {
-                    "temperature": 1.0,
-                    "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
-                },
+                "sampling_params": self._external_ar_sampling_params(
+                    max_new_tokens, seed
+                ),
             }
-            try:
-                response = requests.post(
-                    server_args.srt_encoder_url + "/generate",
-                    json=payload,
-                    timeout=(
-                        server_args.srt_encoder_connect_timeout,
-                        server_args.srt_encoder_timeout,
-                    ),
-                )
-            except requests.ConnectionError as e:
-                logger.error(
-                    "Failed to establish a connection to SGLang encoder server at %s. "
-                    "Verify that the AR model server is running and accessible. Error details: %s",
-                    server_args.srt_encoder_url,
-                    e,
-                )
-                raise
-            except requests.ConnectTimeout as e:
-                logger.error(
-                    "Connection timeout to SGLang encoder (%s). Try to increase --srt-encoder-connection-timeout (current: %s sec). Details: %s",
-                    server_args.srt_encoder_url,
-                    server_args.srt_encoder_connect_timeout,
-                    e,
-                )
-                raise
-            except requests.ReadTimeout as e:
-                logger.error(
-                    "Read timeout from SGLang encoder (%s). Try to increase --srt-encoder-timeout (current: %s sec). Details: %s",
-                    server_args.srt_encoder_url,
-                    server_args.srt_encoder_timeout,
-                    e,
-                )
-                raise
-            except requests.RequestException as e:
-                logger.error(
-                    "An error occurred during communication with SGLang encoder server at %s. "
-                    "The server is reachable, but the request failed. Error type: %s, Details: %s",
-                    server_args.srt_encoder_url,
-                    type(e).__name__,
-                    e,
-                )
-                raise
-
-            data = response.json()
+            data = self._request_external_ar(payload, server_args)
             generated_ids = data.get("output_ids")
+            usage = _extract_srt_usage(data.get("meta_info"))
         else:
             if image is not None:
                 source_grids = image_grid_thw[:-1]
@@ -366,27 +459,202 @@ class GlmImageAR(PipelineStage):
             )
             input_len = inputs["input_ids"].shape[-1]
             generated_ids = outputs[0][input_len:]
+            usage = None
 
-        expected_output_len = large_image_offset + token_h * token_w
-        actual_output_len = 0 if generated_ids is None else len(generated_ids)
-        if actual_output_len < expected_output_len:
+        prior_token_ids = self._extract_prior_token_ids(
+            generated_ids,
+            (large_image_offset, token_h, token_w),
+            device,
+        )
+
+        return prior_token_ids, prior_token_image_ids, usage
+
+    def generate_prior_tokens_batch(
+        self,
+        prompts: list[str],
+        seeds: list[Optional[int]],
+        height: int,
+        width: int,
+        server_args: ServerArgs,
+    ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
+        device = get_local_torch_device()
+        _validate_glm_image_resolution_alignment(width, height)
+
+        input_ids = []
+        image_data = []
+        sampling_params = []
+        generation_shapes = []
+        for prompt, seed in zip(prompts, seeds, strict=True):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }
+            ]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                target_h=height,
+                target_w=width,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            image_grid_thw = inputs.get("image_grid_thw")
+            max_new_tokens, large_image_offset, token_h, token_w = (
+                self._compute_generation_params(
+                    image_grid_thw=image_grid_thw,
+                    is_text_to_image=True,
+                )
+            )
+            input_ids.append(inputs["input_ids"][0].tolist())
+            image_data.append([{"image_grid_thw": image_grid_thw.tolist()}])
+            sampling_params.append(
+                self._external_ar_sampling_params(max_new_tokens, seed)
+            )
+            generation_shapes.append((large_image_offset, token_h, token_w))
+
+        payload = {
+            "input_ids": input_ids,
+            "image_data": image_data,
+            "sampling_params": sampling_params,
+        }
+        data = self._request_external_ar(payload, server_args)
+        if not isinstance(data, list) or len(data) != len(prompts):
             raise RuntimeError(
-                "GLM-Image AR returned too few output_ids: "
-                f"got {actual_output_len}, need at least {expected_output_len} "
-                f"(large_image_offset={large_image_offset}, "
-                f"token_h={token_h}, token_w={token_w})."
+                "GLM-Image AR batch returned an unexpected response: "
+                f"expected {len(prompts)} outputs, got "
+                f"{len(data) if isinstance(data, list) else type(data).__name__}."
             )
 
-        # Extract large image tokens + upsample D32→D16
-        prior_token_ids_d32 = torch.tensor(
-            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
-            device=device,
+        prior_token_ids = []
+        usages = []
+        for item, generation_shape in zip(data, generation_shapes, strict=True):
+            prior_token_ids.append(
+                self._extract_prior_token_ids(
+                    item.get("output_ids"), generation_shape, device
+                )
+            )
+            usages.append(_extract_srt_usage(item.get("meta_info")))
+        return prior_token_ids, usages
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        can_batch_ar = (
+            len(batches) > 1
+            and server_args.srt_encoder_url is not None
+            and all(
+                isinstance(batch.prompt, str) and batch.image_path is None
+                for batch in batches
+            )
         )
-        prior_token_ids = self._upsample_token_ids(
-            prior_token_ids_d32, token_h, token_w
+        if not can_batch_ar:
+            return super().run_grouped_requests(batches, server_args)
+
+        height = batches[0].height
+        width = batches[0].width
+        if any(batch.height != height or batch.width != width for batch in batches[1:]):
+            return super().run_grouped_requests(batches, server_args)
+
+        start_time = time.time()
+        output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
+        prompts = [
+            batch.prompt
+            for batch, output_count in zip(batches, output_counts, strict=True)
+            for _ in range(output_count)
+        ]
+        seeds = [
+            _seed_for_output(batch.seed, output_idx)
+            for batch, output_count in zip(batches, output_counts, strict=True)
+            for output_idx in range(output_count)
+        ]
+        prior_token_ids, usages = self.generate_prior_tokens_batch(
+            prompts=prompts,
+            seeds=seeds,
+            height=height,
+            width=width,
+            server_args=server_args,
+        )
+        duration = time.time() - start_time
+        logger.info(
+            "generate_prior_tokens_batch time: %.3fs for %d requests (%d outputs)",
+            duration,
+            len(batches),
+            len(prior_token_ids),
         )
 
-        return prior_token_ids, prior_token_image_ids
+        stage_name = self._active_profile_stage_name()
+        output_offset = 0
+        for batch, output_count in zip(batches, output_counts, strict=True):
+            batch.prior_token_id = torch.cat(
+                prior_token_ids[output_offset : output_offset + output_count], dim=0
+            )
+            batch.prior_token_image_ids = None
+            output_usages = usages[output_offset : output_offset + output_count]
+            batch.extra["usage_by_output"] = output_usages
+            usage = _merge_srt_usages(output_usages)
+            if usage is not None:
+                batch.usage = usage
+            if batch.metrics is not None:
+                batch.metrics.record_stage(stage_name, duration)
+            output_offset += output_count
+        return batches
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        output_count = _num_outputs_per_prompt(batch)
+        if output_count == 1:
+            return iter((batch,))
+
+        prior_token_ids = batch.prior_token_id
+        if not isinstance(prior_token_ids, torch.Tensor) or (
+            prior_token_ids.shape[0] != output_count
+        ):
+            actual_count = (
+                prior_token_ids.shape[0]
+                if isinstance(prior_token_ids, torch.Tensor)
+                else type(prior_token_ids).__name__
+            )
+            raise RuntimeError(
+                "Cannot split GLM-Image AR output for sequential inference: "
+                f"expected {output_count} token rows, got {actual_count}."
+            )
+
+        return map(
+            lambda output_index: self._make_sequential_request(
+                batch, prior_token_ids, output_index
+            ),
+            range(output_count),
+        )
+
+    @staticmethod
+    def _make_sequential_request(
+        batch: Req, prior_token_ids: torch.Tensor, output_index: int
+    ) -> Req:
+        output_req = copy(batch)
+        output_req.sampling_params = copy(batch.sampling_params)
+        output_req.extra = dict(batch.extra)
+        output_req.condition_inputs = dict(batch.condition_inputs)
+        output_req.metrics = deepcopy(batch.metrics)
+        output_req.num_outputs_per_prompt = 1
+        output_req.seed = _seed_for_output(batch.seed, output_index)
+        output_req.seeds = None
+        output_req.generator = None
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        usage_by_output = output_req.extra.pop("usage_by_output", None)
+        if usage_by_output is not None and output_index < len(usage_by_output):
+            output_req.usage = usage_by_output[output_index]
+        if batch.request_id is not None:
+            output_req.request_id = f"{batch.request_id}:{output_index}"
+            if output_req.metrics is not None:
+                output_req.metrics.request_id = output_req.request_id
+        return output_req
 
     @torch.no_grad()
     def forward(
@@ -400,7 +668,7 @@ class GlmImageAR(PipelineStage):
         width = batch.width
         if batch.image_path is not None:
             ar_condition_images = [
-                load_image(img_path)
+                resize_glm_image_to_alignment(load_image(img_path))
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
@@ -411,6 +679,20 @@ class GlmImageAR(PipelineStage):
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
+
+        requested_width = width
+        requested_height = height
+        width, height = align_glm_image_resolution(width, height)
+        if (width, height) != (requested_width, requested_height):
+            logger.warning(
+                "GLM-Image requires dimensions divisible by %s; adjusted "
+                "runtime resolution from %sx%s to %sx%s",
+                GLM_IMAGE_RESOLUTION_ALIGNMENT,
+                requested_width,
+                requested_height,
+                width,
+                height,
+            )
 
         time_start = time.time()
         num_outputs = _num_outputs_per_prompt(batch)
@@ -423,28 +705,27 @@ class GlmImageAR(PipelineStage):
             rng_devices.append(torch.npu.current_device())
             rng_device_type = "npu"
 
-        prior_token_ids = []
         prior_token_image_ids = None
-        for output_idx in range(num_outputs):
-            output_seed = _seed_for_output(seed, output_idx)
-            if output_seed is None:
-                prior_token_id, output_prior_token_image_ids = (
-                    self.generate_prior_tokens(
-                        prompt=prompt,
-                        image=ar_condition_images,
-                        height=height,
-                        width=width,
-                        server_args=server_args,
-                    )
-                )
-            else:
-                with torch.random.fork_rng(
-                    devices=rng_devices,
-                    enabled=True,
-                    device_type=rng_device_type,
-                ):
-                    torch.manual_seed(output_seed)
-                    prior_token_id, output_prior_token_image_ids = (
+        if (
+            num_outputs > 1
+            and getattr(server_args, "srt_encoder_url", None) is not None
+            and isinstance(prompt, str)
+            and ar_condition_images is None
+        ):
+            prior_token_ids, output_usages = self.generate_prior_tokens_batch(
+                prompts=[prompt] * num_outputs,
+                seeds=[_seed_for_output(seed, i) for i in range(num_outputs)],
+                height=height,
+                width=width,
+                server_args=server_args,
+            )
+        else:
+            prior_token_ids = []
+            output_usages = []
+            for output_idx in range(num_outputs):
+                output_seed = _seed_for_output(seed, output_idx)
+                if output_seed is None:
+                    prior_token_id, output_prior_token_image_ids, output_usage = (
                         self.generate_prior_tokens(
                             prompt=prompt,
                             image=ar_condition_images,
@@ -453,9 +734,27 @@ class GlmImageAR(PipelineStage):
                             server_args=server_args,
                         )
                     )
-            prior_token_ids.append(prior_token_id)
-            if prior_token_image_ids is None:
-                prior_token_image_ids = output_prior_token_image_ids
+                else:
+                    with torch.random.fork_rng(
+                        devices=rng_devices,
+                        enabled=True,
+                        device_type=rng_device_type,
+                    ):
+                        torch.manual_seed(output_seed)
+                        prior_token_id, output_prior_token_image_ids, output_usage = (
+                            self.generate_prior_tokens(
+                                prompt=prompt,
+                                image=ar_condition_images,
+                                height=height,
+                                width=width,
+                                server_args=server_args,
+                                seed=output_seed,
+                            )
+                        )
+                prior_token_ids.append(prior_token_id)
+                output_usages.append(output_usage)
+                if prior_token_image_ids is None:
+                    prior_token_image_ids = output_prior_token_image_ids
 
         prior_token_id = torch.cat(prior_token_ids, dim=0)
         prior_token_id = prior_token_id.to(device=device)
@@ -466,6 +765,10 @@ class GlmImageAR(PipelineStage):
         batch.prior_token_image_ids = prior_token_image_ids
         batch.height = height
         batch.width = width
+        batch.extra["usage_by_output"] = output_usages
+        usage = _merge_srt_usages(output_usages)
+        if usage is not None:
+            batch.usage = usage
 
         return batch
 
@@ -766,7 +1069,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
             ar_condition_images = [
-                load_image(img_path)
+                resize_glm_image_to_alignment(load_image(img_path))
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
@@ -837,9 +1140,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     if isinstance(img, PIL.Image.Image)
                     else img.shape[:2]
                 )
-                multiple_of = self.vae_scale_factor * self.transformer.config.patch_size
-                image_height = (image_height // multiple_of) * multiple_of
-                image_width = (image_width // multiple_of) * multiple_of
+                image_width, image_height = align_glm_image_resolution(
+                    image_width, image_height
+                )
                 img = self.image_processor.preprocess(
                     img, height=image_height, width=image_width
                 )
