@@ -275,22 +275,47 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
 
 
+def _is_supported_dspark_pd_prefill_cp(server_args: ServerArgs) -> bool:
+    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    attn_tp_size = (
+        server_args.tp_size // server_args.dp_size // server_args.attn_cp_size
+    )
+    return (
+        server_args.disaggregation_mode == "prefill"
+        and server_args.disaggregation_transfer_backend == "mooncake"
+        and server_args.pp_size == 1
+        and server_args.attn_cp_size > 1
+        and attn_tp_size == 1
+        and server_args.enable_prefill_cp
+        and server_args.cp_strategy == "interleave"
+        and model_arch == "DeepseekV4ForCausalLM"
+    )
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
 
-    if server_args.enable_dp_attention:
+    pd_prefill_cp = _is_supported_dspark_pd_prefill_cp(server_args)
+    if server_args.attn_cp_size > 1 and not pd_prefill_cp:
+        raise ValueError(
+            "DSpark context parallel is only supported for DeepSeek-V4 PD prefill "
+            "with Mooncake, pp_size == 1, attn_tp_size == 1, and interleave "
+            f"(round-robin-split) CP; got disaggregation_mode="
+            f"{server_args.disaggregation_mode!r}, pp_size={server_args.pp_size}, "
+            f"attn_cp_size={server_args.attn_cp_size}, attn_tp_size="
+            f"{server_args.tp_size // server_args.dp_size // server_args.attn_cp_size}, "
+            f"cp_strategy={server_args.cp_strategy!r}, transfer_backend="
+            f"{server_args.disaggregation_transfer_backend!r}."
+        )
+
+    if server_args.enable_dp_attention and not pd_prefill_cp:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
         if server_args.moe_a2a_backend != "none":
             raise ValueError(
                 "DSpark with dp attention only supports the built-in TP MoE "
                 f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
-            )
-        if server_args.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={server_args.attn_cp_size})."
             )
         if (
             server_args.speculative_moe_a2a_backend is not None

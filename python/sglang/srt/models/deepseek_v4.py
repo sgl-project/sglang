@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -2389,13 +2390,11 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
-            raise NotImplementedError(
-                "DSpark aux hidden-state capture is not supported together with "
-                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
-                "of them: DSpark static-verify is CP-off for v1."
-            )
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        dspark_aux_hidden_states = (
+            AuxHiddenStatePacker(len(self.dspark_layers_to_capture))
+            if capture_dspark
+            else None
+        )
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
@@ -2437,6 +2436,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
+                    assert dspark_aux_hidden_states is not None
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
@@ -2451,6 +2451,19 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if dspark_aux_hidden_states is not None:
+                dspark_aux_hidden = cp_all_gather_rerange_output(
+                    dspark_aux_hidden_states.finalize(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            else:
+                dspark_aux_hidden = None
+        elif dspark_aux_hidden_states is not None:
+            dspark_aux_hidden = dspark_aux_hidden_states.finalize()
+        else:
+            dspark_aux_hidden = None
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -2464,7 +2477,8 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            assert dspark_aux_hidden is not None
+            return (hidden_states, pre_hc_head), dspark_aux_hidden
 
         return hidden_states, pre_hc_head
 

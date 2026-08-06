@@ -46,10 +46,22 @@ class TargetHiddenKvInjector:
         n_real = positions.shape[0]
         if target_hidden.shape[0] > n_real:
             target_hidden = target_hidden[:n_real]
+        if target_hidden.shape[0] != n_real or cache_loc.shape[0] != n_real:
+            raise ValueError(
+                "DSpark target hidden injection requires one hidden row and cache "
+                f"location per position; got hidden_rows={target_hidden.shape[0]}, "
+                f"cache_locs={cache_loc.shape[0]}, positions={n_real}."
+            )
         if cache_loc_2d is not None:
             cache_loc_2d = cache_loc_2d.to(
                 device=device, dtype=torch.int64, non_blocking=True
             )
+            if cache_loc_2d.numel() != n_real:
+                raise ValueError(
+                    "DSpark target hidden injection requires cache_loc_2d to cover "
+                    f"every position; got cache_loc_2d={cache_loc_2d.numel()}, "
+                    f"positions={n_real}."
+                )
         if commit_lens is not None:
             commit_lens = commit_lens.to(
                 device=device, dtype=torch.int32, non_blocking=True
