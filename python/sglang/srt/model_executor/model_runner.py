@@ -1357,7 +1357,7 @@ class ModelRunner:
                 "Enabling decode CUDA graph on role switch (was disabled at startup)."
             )
             cfg.decode.backend = Backend.FULL
-            self.server_args.override(
+            get_context().override(
                 "model_runner.ensure_decode_cuda_graphs", disable_cuda_graph=False
             )
 

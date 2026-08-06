@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
@@ -36,15 +37,21 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     orchestration order without standing up a model.
     """
 
+    def setUp(self):
+        rc.reset_context()
+
+    def tearDown(self):
+        rc.reset_context()
+
     def _scheduler(self, mode, *, enable=True, idle=True):
         s = Scheduler.__new__(Scheduler)
         s.disaggregation_mode = mode
-        sa = SimpleNamespace(
-            enable_pd_role_switch=enable,
+        sa = ServerArgs(
+            model_path="dummy",
             disaggregation_mode=mode.value,
+            enable_pd_role_switch=enable,
         )
-        # Mirror the real ServerArgs mutation entry the flip path calls.
-        sa.override = lambda source, **fields: sa.__dict__.update(fields)
+        rc.get_context().set_server_args(sa)
         s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
         s._teardown_disaggregation = MagicMock()
@@ -110,9 +117,11 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertTrue(out.success)
         self.assertEqual(out.old_role, "prefill")
         self.assertEqual(out.new_role, "decode")
-        # Orchestration: drain -> teardown -> flip server arg -> rebuild -> signal.
+        # Orchestration: drain -> teardown -> flip config bag -> rebuild -> signal.
         s._teardown_disaggregation.assert_called_once()
-        self.assertEqual(s.server_args.disaggregation_mode, "decode")
+        self.assertEqual(rc.get_disagg().disaggregation_mode, "decode")
+        # The pristine startup record is never mutated.
+        self.assertEqual(s.server_args.disaggregation_mode, "prefill")
         s.init_disaggregation.assert_called_once()
         self.assertTrue(s._event_loop_should_restart)
         # Flip to decode ensures decode CUDA graphs exist (idempotent capture).
@@ -438,7 +447,12 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         # ABORT for an unknown room takes the "ignoring" branch and still
         # ACKs, giving a side-effect-free probe of the receive loop.
         m.request_status = {}
-        m._connect = MagicMock()
+        m._socket_send_locks = {}
+        def _connect(endpoint, is_ipv6=False):
+            m._socket_send_locks.setdefault(endpoint, threading.Lock())
+            return m._connect.return_value
+
+        m._connect = MagicMock(side_effect=_connect)
         self.m = m
         self._push = self._ctx.socket(zmq.PUSH)
         self._push.connect(f"tcp://127.0.0.1:{port}")

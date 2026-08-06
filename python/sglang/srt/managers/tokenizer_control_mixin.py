@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -848,9 +849,10 @@ class TokenizerControlMixin:
         if all_success:
             # Keep the tokenizer-manager's view of the role in sync so future
             # control ops and bootstrap routing behave consistently.
-            self.server_args.override(
+            self.record_config_updates(
                 "tokenizer.pd_role_switch", disaggregation_mode=obj.new_role
             )
+            self.disaggregation_mode = DisaggregationMode(obj.new_role)
             msg = "ok"
         else:
             # Surface only the failing workers' messages.

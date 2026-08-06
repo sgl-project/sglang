@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+from sglang.srt.runtime_context import get_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -56,9 +57,7 @@ def handle_pd_role_switch(
         # is no in-place rollback.
         try:
             scheduler._teardown_disaggregation()
-            scheduler.server_args.override(
-                "role_switch.flip", disaggregation_mode=new_role
-            )
+            get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
         except Exception as e:
             scheduler._pd_role_switch_unhealthy = True
