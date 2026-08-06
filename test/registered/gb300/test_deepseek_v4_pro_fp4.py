@@ -136,7 +136,7 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
                     accuracy_params=accuracy_params,
                     performance_params=PerformanceTestParams(
                         batch_sizes=PERFORMANCE_BATCH_SIZES[variant.variant],
-                        profile_dir="performance_profiles_gb300",
+                        result_dir="performance_results_gb300",
                     ),
                 )
             except AssertionError as e:
