@@ -241,79 +241,30 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         dispatcher.verify_kernel = SimpleNamespace()
         self.assertFalse(dispatcher.target_verify_supports_strided_qkv(None))
 
-    def test_flashinfer_selected_fp32_replayssm_fold_uses_strided_triton_qkv(self):
+    def test_target_verify_strided_qkv_routing(self):
         backend, nominal_capability = self.make_target_verify_routing_backend()
-
-        self.assertTrue(
-            backend._target_verify_supports_strided_qkv(
-                retrieve_parent_token=None,
-                use_replayssm_fold=True,
-                use_replayssm_spec=False,
-                ssm_dtype=torch.float32,
-                draft_token_num=4,
-            )
+        cases = (
+            ("fp32_fold", True, False, torch.float32, 4, True, False),
+            ("short_bf16_fold", True, False, torch.bfloat16, 2, True, False),
+            ("cutedsl_fold", True, False, torch.bfloat16, 4, False, False),
+            ("circular", False, True, torch.bfloat16, 4, True, False),
+            ("nominal", False, False, torch.bfloat16, 4, False, True),
         )
-        nominal_capability.assert_not_called()
-
-    def test_flashinfer_selected_short_bf16_replayssm_fold_uses_strided_triton_qkv(
-        self,
-    ):
-        backend, nominal_capability = self.make_target_verify_routing_backend()
-
-        self.assertTrue(
-            backend._target_verify_supports_strided_qkv(
-                retrieve_parent_token=None,
-                use_replayssm_fold=True,
-                use_replayssm_spec=False,
-                ssm_dtype=torch.bfloat16,
-                draft_token_num=2,
-            )
-        )
-        nominal_capability.assert_not_called()
-
-    def test_flashinfer_selected_bf16_replayssm_fold_keeps_contiguous_cutedsl_qkv(
-        self,
-    ):
-        backend, nominal_capability = self.make_target_verify_routing_backend()
-
-        self.assertFalse(
-            backend._target_verify_supports_strided_qkv(
-                retrieve_parent_token=None,
-                use_replayssm_fold=True,
-                use_replayssm_spec=False,
-                ssm_dtype=torch.bfloat16,
-                draft_token_num=4,
-            )
-        )
-        nominal_capability.assert_not_called()
-
-    def test_flashinfer_selected_circular_replayssm_uses_strided_triton_qkv(self):
-        backend, nominal_capability = self.make_target_verify_routing_backend()
-
-        self.assertTrue(
-            backend._target_verify_supports_strided_qkv(
-                retrieve_parent_token=None,
-                use_replayssm_fold=False,
-                use_replayssm_spec=True,
-                ssm_dtype=torch.bfloat16,
-                draft_token_num=4,
-            )
-        )
-        nominal_capability.assert_not_called()
-
-    def test_flashinfer_selected_without_replayssm_keeps_contiguous_qkv(self):
-        backend, nominal_capability = self.make_target_verify_routing_backend()
-
-        self.assertFalse(
-            backend._target_verify_supports_strided_qkv(
-                retrieve_parent_token=None,
-                use_replayssm_fold=False,
-                use_replayssm_spec=False,
-                ssm_dtype=torch.bfloat16,
-                draft_token_num=4,
-            )
-        )
-        nominal_capability.assert_called_once_with(None)
+        for name, fold, circular, dtype, draft_tokens, expected, delegates in cases:
+            with self.subTest(name=name):
+                nominal_capability.reset_mock()
+                actual = backend._target_verify_supports_strided_qkv(
+                    retrieve_parent_token=None,
+                    use_replayssm_fold=fold,
+                    use_replayssm_spec=circular,
+                    ssm_dtype=dtype,
+                    draft_token_num=draft_tokens,
+                )
+                self.assertEqual(actual, expected)
+                if delegates:
+                    nominal_capability.assert_called_once_with(None)
+                else:
+                    nominal_capability.assert_not_called()
 
 
 if __name__ == "__main__":

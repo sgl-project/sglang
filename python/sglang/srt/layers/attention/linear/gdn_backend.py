@@ -332,9 +332,7 @@ class GDNKernelDispatcher:
         )
 
     def _get_target_verify_kernel(self, retrieve_parent_token: Optional[torch.Tensor]):
-        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
-        # carry parent indices and must use Triton even when decode/prefill use
-        # FlashInfer.
+        # Tree drafts use Triton even when linear MTP verification uses FlashInfer.
         return (
             self.tree_verify_kernel
             if retrieve_parent_token is not None
@@ -407,9 +405,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_dtype: torch.dtype,
         draft_token_num: int,
     ) -> bool:
-        # ReplaySSM bypasses the nominal verify kernel. Fold uses CuTe DSL only
-        # for the FlashInfer-selected bf16 route; its fallback and the circular
-        # implementation are Triton kernels with explicit token strides.
+        # ReplaySSM Triton routes accept strides; the CuTeDSL fold does not.
         if use_replayssm_fold:
             return not self._replayssm_fold_uses_cutedsl(ssm_dtype, draft_token_num)
         if use_replayssm_spec:
@@ -627,8 +623,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        # FLA prefill requires materialized contiguous tensors. Triton verify
-        # reads token strides directly, so it can consume the split views.
+        # Prefill requires contiguous QKV; compatible verify kernels accept strides.
         use_strided_target_verify_qkv = (
             is_target_verify
             and self._target_verify_supports_strided_qkv(

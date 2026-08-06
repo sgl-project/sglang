@@ -297,26 +297,17 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
         with patch.object(
             gdn_backend,
             "fused_qkv_split_gdn_prefill",
-            side_effect=AssertionError(
-                "Triton target verify must consume strided Q/K/V views"
-            ),
+            side_effect=AssertionError,
         ):
-            run_gdn_eagle_verify_case(
-                self,
-                case,
-                topk=topk,
-                spec_kind=spec_kind,
-            )
+            run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
 
     def test_triton_prefill_keeps_contiguous_qkv_materialization(self):
-        split_impl = gdn_backend.fused_qkv_split_gdn_prefill
         with patch.object(
             gdn_backend,
             "fused_qkv_split_gdn_prefill",
-            wraps=split_impl,
+            wraps=gdn_backend.fused_qkv_split_gdn_prefill,
         ) as split_spy:
             run_gdn_attention_case(self, self.CASES[0])
-
         split_spy.assert_called()
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
