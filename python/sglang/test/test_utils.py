@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -957,8 +958,15 @@ def popen_launch_server(
     # 97% of CI prefill batches are under 1024 tokens -- a server that serves one
     # test file captures the rest and never replays it. Decode is left alone: its
     # capture cost is per-phase, not per-bucket. Pass the flag to opt out.
+    #
+    # Skip it for diffusion models: `sglang serve` dispatches those to the
+    # diffusion server, whose parser has no --cuda-graph-max-bs-prefill (there is
+    # no prefill phase to bucket), so appending it aborts the launch with
+    # "error: unrecognized arguments".
     prefill_flag = "--cuda-graph-max-bs-prefill"
-    if not any(str(arg).startswith(prefill_flag) for arg in other_args):
+    if not get_is_diffusion_model(model) and not any(
+        str(arg).startswith(prefill_flag) for arg in other_args
+    ):
         other_args = list(other_args) + [prefill_flag, "1024"]
 
     # CI-specific: Validate cache and enable offline mode if complete
