@@ -1478,6 +1478,45 @@ class SchedulerPPMixin:
         return None
 
 
+# Multiple of the median absolute deviation beyond which a profiled latency is
+# treated as a recompile/autotune spike rather than signal. Loose enough to keep
+# ordinary jitter (the real curve spans well under this), tight enough to catch
+# spikes, which run 3-7x the baseline.
+_LATENCY_OUTLIER_MAD_MULTIPLE: float = 6.0
+
+
+def _drop_latency_outliers(
+    seq_lens: "np.ndarray", latencies: "np.ndarray"
+) -> Tuple["np.ndarray", "np.ndarray"]:
+    """Filter recompile spikes out of profiled latencies via median/MAD.
+
+    Returns the inputs unchanged when the MAD is zero (degenerate) or when
+    filtering would leave too few points to fit — a bad fit is caught by the
+    coefficient validation in ``fit``, whereas dropping too much data would
+    trade a diagnosable error for a silently wrong model.
+    """
+    median = np.median(latencies)
+    mad = np.median(np.abs(latencies - median))
+    if mad <= 0:
+        return seq_lens, latencies
+
+    keep = np.abs(latencies - median) <= _LATENCY_OUTLIER_MAD_MULTIPLE * mad
+    if int(keep.sum()) < 8:
+        return seq_lens, latencies
+
+    dropped = int(keep.size - keep.sum())
+    if dropped:
+        logger.info(
+            "[PP Dynamic Chunk] Dropped %d/%d profiled samples as recompile "
+            "spikes (median=%.1fms, MAD=%.1fms)",
+            dropped,
+            keep.size,
+            float(median),
+            float(mad),
+        )
+    return seq_lens[keep], latencies[keep]
+
+
 class ChunkSizePredictor:
     """
     Predictor for dynamic chunk size based on quadratic latency model.
@@ -1504,6 +1543,17 @@ class ChunkSizePredictor:
                 f"Not enough data points for quadratic fitting ({len(L)} < 8). "
                 "Need at least 8 samples with different sequence lengths."
             )
+
+        # Drop kernel recompile / autotune spikes before fitting. Skipping only
+        # sample 0 (above) is not enough: JIT backends recompile at arbitrary
+        # points mid-sweep, and because those spikes can land at large seq_lens
+        # they invert the fitted curvature and make `a` negative, which the
+        # validation below rejects — silently disabling dynamic chunking.
+        # Measured on XPU/Triton: spikes of 172.8 ms @ l=256 and 127.5 ms @ l=192
+        # against a ~25-44 ms baseline drove a=-1.01e-04; dropping just those two
+        # yields a=+1.30e-04. Median/MAD is used rather than mean/stddev so the
+        # spikes cannot inflate the very threshold meant to exclude them.
+        L, T = _drop_latency_outliers(L, T)
 
         # Build design matrix for f(l) = al^2 + bl + c
         X = np.column_stack([L * L, L, np.ones_like(L)])  # [l^2, l, 1]

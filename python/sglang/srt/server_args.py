@@ -7194,6 +7194,19 @@ class ServerArgs:
         )
 
     def _resolve_layout_io_compatibility(self):
+        # Every hicache host<->device transfer path (both the "kernel" and
+        # "direct" io backends) resolves its movers from sgl_kernel.kvcacheio,
+        # which is CUDA/HIP-only — the XPU wheel does not ship the module at all.
+        # Without this check the server dies deep inside the host pool with a
+        # bare `NameError: transfer_kv_all_layer_lf_pf is not defined` several
+        # minutes into startup, which says nothing about the real cause.
+        if self.enable_hierarchical_cache and is_xpu():
+            raise ValueError(
+                "--enable-hierarchical-cache is not supported on XPU: the KV "
+                "transfer kernels live in sgl_kernel.kvcacheio, which is not "
+                "built for this platform. Run without hierarchical cache."
+            )
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -7330,7 +7343,7 @@ class ServerArgs:
         """True iff the checkpoint requires load_format=mistral.
 
         Looks for consolidated*.safetensors with no competing
-        model-*.safetensors; when both weight formats ship in the
+        model*.safetensors; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
@@ -7363,7 +7376,7 @@ class ServerArgs:
                     )
                 ),
                 has_hf_weights=bool(
-                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                    glob.glob(os.path.join(self.model_path, "model*.safetensors"))
                 ),
             )
 
@@ -7378,7 +7391,10 @@ class ServerArgs:
                     for f in files
                 ),
                 has_hf_weights=any(
-                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                    f.startswith("model")
+                    and f.endswith(".safetensors")
+                    and "/" not in f
+                    for f in files
                 ),
             )
         except Exception:
