@@ -114,8 +114,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.default, 8192
         )
         self.assertTrue(self._is_eligible())
-        # FP4 is now eligible (unified on fp8_fp4_mqa_logits).
-        self.assertTrue(self._is_eligible(fp4=True))
+        # FP4 indexer cannot use the non-paged path: get_index_k_scale_buffer
+        # reads K at FP8 strides (128 B/token), but FP4 buffers pack only
+        # 68 B/token — silent data corruption.  See PR #33288 review.
+        self.assertFalse(self._is_eligible(fp4=True))
         for case in (
             {"enabled": False},
             {"mode": ForwardMode.DECODE},
@@ -125,6 +127,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             {"tbo": (1, 2)},
             {"prefill_graph": True},
             {"piecewise_graph": True},
+            {"fp4": True},
         ):
             with self.subTest(case=case):
                 self.assertFalse(self._is_eligible(**case))
@@ -461,7 +464,13 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
         return out, token_to_kv_pool
 
     def test_single_request_chunked_topk_matches_unchunked(self):
-        """Chunked topk output matches single-pass baseline from same logits."""
+        """Chunked topk output matches single-pass baseline from same logits.
+
+        With the budget_bytes fix, the unchunked run (budget = all rows)
+        processes everything in one iteration while the chunked run
+        (budget = 3 rows) iterates 4 times (3+3+3+1).  topk is per-row,
+        so chunking must not change results.
+        """
         query_rows = 10
         max_c4_seq_len = 100
 
@@ -550,7 +559,14 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
         self.assertTrue((chunked_out[req1_rows:] != -1).any())
 
     def test_fp4_varlen_routing_uses_fp8_fp4_kernel(self):
-        """Task 4.5: FP4 oversize triggers fp8_fp4_mqa_logits with q_sf."""
+        """Task 4.5: FP4 oversize triggers fp8_fp4_mqa_logits with q_sf.
+
+        Note: FP4 is currently excluded from the oversize routing in
+        production (get_index_k_scale_buffer uses FP8 strides, see PR
+        #33288 review comment 2).  This test verifies the query-side FP4
+        handling inside _forward_oversize_varlen_chunked in isolation,
+        guarding the code path for when K-gather FP4 support is added.
+        """
         query_rows = 6
         max_c4_seq_len = 100
         budget_bytes = max_c4_seq_len * 4 * 2
@@ -776,14 +792,69 @@ class TestDSV4RoutingConditions(CustomTestCase):
             ),
         ):
             use_fp4_indexer = False
-            _is_deep_gemm_path = use_fp4_indexer or (
-                not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            _is_deep_gemm_path = (
+                not use_fp4_indexer
+                and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
                 and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
                 and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             )
             _is_cp = False
             _is_capture = False
             if _is_deep_gemm_path and not _is_cp and not _is_capture:
+                C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
+
+    def test_fp4_prevents_deep_gemm_path(self):
+        """FP4 must never enter the oversize varlen path: get_index_k_scale_buffer
+        reads K at FP8 strides (128 B/token) but FP4 buffers pack 68 B/token,
+        silently corrupting the gathered K."""
+        with (
+            patch(f"{_INDEXER}.is_cuda", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            patch.object(
+                C4IndexerBackendMixin,
+                "_should_chunk_mqa_logits",
+                side_effect=AssertionError(
+                    "must not be called with FP4 indexer active"
+                ),
+            ),
+        ):
+            use_fp4_indexer = True
+            _is_deep_gemm_path = (
+                not use_fp4_indexer
+                and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            )
+            _is_cp = False
+            _is_capture = False
+            if _is_deep_gemm_path and not _is_cp and not _is_capture:
+                C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
+
+    def test_breakable_graph_prevents_chunking(self):
+        """When inside a breakable CUDA graph, the oversize varlen path must
+        not be entered — mirroring the is_in_breakable_cuda_graph guard in
+        _can_use_nonpaged_indexer."""
+        with (
+            patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
+            patch(f"{_INDEXER}.is_in_breakable_cuda_graph", return_value=True),
+            patch.object(
+                C4IndexerBackendMixin,
+                "_should_chunk_mqa_logits",
+                side_effect=AssertionError(
+                    "must not be called inside a breakable CUDA graph"
+                ),
+            ),
+        ):
+            _is_capture = False
+            _is_cp = False
+            _is_deep_gemm_path = True
+            in_breakable_graph = True
+            if (
+                _is_deep_gemm_path
+                and not _is_cp
+                and not _is_capture
+                and not in_breakable_graph
+            ):
                 C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
 
     def test_sm80_prevents_varlen_routing(self):
