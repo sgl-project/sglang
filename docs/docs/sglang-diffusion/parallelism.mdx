@@ -27,7 +27,8 @@ axis with their own knob), and the [CLI reference](./api/cli).
 | Tensor parallel (TP) | weights and attention heads | all-reduce per transformer block | `--tp-size` |
 | Ulysses SP | sequence outside attention ↔ heads inside it | two all-to-alls per attention | `--ulysses-degree` |
 | Ring SP | sequence rows inside attention | neighbor-only K/V rotation, overlapped with compute | `--ring-degree` |
-| Data parallel | requests | — | not yet supported (`--dp-size > 1` is rejected at launch) |
+| K/V-gather CP | sequence rows inside attention | one K/V all-gather per attention | not yet available |
+| Data parallel | requests | none between replicas | `--dp-size` |
 
 Two strategies compose when they split different dimensions. TP and Ulysses
 both touch heads but compose serially — TP splits the projection weights, then
@@ -55,7 +56,11 @@ For `tp_size = T`, `ulysses_degree = U`, `ring_degree = R`, one attention runs:
 ```
 
 The ring merge (online softmax) requires every rank in a ring group to hold the
-*same heads* over *different rows*; the group construction guarantees this.
+*same heads* over *different rows*; the group construction guarantees this. A
+K/V-gather (CP-style) variant fills the same slot differently: instead of R−1
+overlapped hops it all-gathers K/V once and computes the local Q rows against
+the full sequence in one shot — fewer, larger transfers, paid for by holding the
+whole K/V per rank. Like ring it splits rows, so it adds no head constraint.
 Ulysses groups are laid out on contiguous ranks and ring groups on strided
 ranks, so with a node-major rank mapping, Ulysses traffic stays on intra-node
 NVLink (all-to-all needs full-bisection bandwidth) while ring hops cross the
@@ -114,6 +119,7 @@ to least cross-node friendly:
 | --- | --- | --- | --- |
 | Data parallel | none between replicas | zero on the request path | **Best.** Replicas only share startup init and control-op fan-out; no fast interconnect needed at all. |
 | CFG parallel | one branch-combine | one latent-sized exchange, once | **Good candidate.** Once per step, small payload, naturally deadline-tolerant. Unmeasured across nodes so far. |
+| K/V-gather CP | one K/V all-gather per attention | (R−1)/R of K/V, one unoverlapped burst | **Between Ulysses and ring** once available: only K/V moves (queries never do), but the burst cannot hide behind compute — prefer ring across nodes, gather at small degrees within one. |
 | Ring SP | neighbor-only K/V rotation | K/V ÷ ring_degree, (R−1) hops, overlapped with attention tiles | **Designed for it.** Validated cross-node for MiniMax H3 (Ulysses intra-node × ring across, net positive and growing with sequence length). |
 | Ulysses SP | all-to-all | full q/k/v activations, twice per attention, every layer | **Keep intra-node.** All-to-all needs full-bisection bandwidth; across nodes it becomes R² flows with receiver incast. |
 | Tensor parallel | all-reduce | hidden-sized reduction per transformer block (×60 blocks for qwen-class DiTs) | **Worst.** Highest frequency, no overlap, already ~70% of sharded kernel time on NVLink. |
@@ -141,12 +147,23 @@ mean profitable:
 - **Long video / packed sequences**: Ulysses up to the head-divisibility limit,
   then ring for the remaining factor — sequence length scales past the head
   count where Ulysses alone cannot.
+- **When Ulysses's head divisibility blocks the degree you need** (`H/T` not
+  divisible by the target `U`): the row-splitting slot sidesteps it — ring
+  today, K/V-gather once it lands.
 - **TP beyond 2 ranks** rarely improves image-DiT latency: the per-block
   all-reduce grows with rank count faster than the GEMM savings.
 
-## Not supported yet
+## Data parallelism
 
-- **Data parallelism**: `--data-parallel-size` exists and the process-group
-  layout reserves the dimension, but request dispatch is not implemented and
-  validation rejects `dp_size > 1`. For request-level scaling today, run
-  multiple server instances behind a load balancer.
+`--dp-size N` runs N full engine replicas on `num_gpus / N` GPUs each, every
+replica with its own ingress. Generation requests round-robin across replicas,
+realtime sessions stick to the replica holding their state, and control
+operations (weights, LoRA, memory occupation, shutdown) apply to every replica;
+replicas exchange nothing on the request path. Monolithic serving only, and the
+ingress currently binds on the local host — one replica per node needs
+per-replica host addressing first.
+
+## Not yet available
+
+- **K/V-gather (CP-style) attention** — the all-gather alternative for ring's
+  slot described above; under development.
