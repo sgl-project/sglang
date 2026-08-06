@@ -222,7 +222,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # number of data parallelism groups
     dp_size: int = 1
     # number of gpu in a dp group
-    dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
@@ -263,7 +262,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # filename logic.
     component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
-    # Quantization method for online quantization
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
@@ -315,29 +315,19 @@ class ServerArgs(DisaggServerArgsMixin):
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
 
-    # warmup
-    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
     #   - "server":  server-based warmup — a synthetic request right after the
     #                server is ready, before real traffic
     #   - "request": request-based warmup — warm on the first real request(s).
-    #                This is a BENCHMARK aid
-    # existing consumers keep working) and as deprecated CLI aliases. None means
-    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    #                This is a BENCHMARK aid.
+    # None is resolved by _adjust_warmup from the selected runtime features.
     warmup_mode: str | None = None
-
-    # deprecated: warmup and server_warmup
-    warmup: bool = False
-    server_warmup: bool = False
 
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
-
-    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
-    # When set, the transformer loader will use this instead of auto-detection.
-    quantization: str | None = None
 
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
@@ -356,6 +346,8 @@ class ServerArgs(DisaggServerArgsMixin):
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    # settled ingress ports, one per DP replica; None until ports are settled
+    scheduler_ports: list[int] | None = None
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
@@ -385,9 +377,6 @@ class ServerArgs(DisaggServerArgsMixin):
         }
     )
 
-    # # DMD parameters
-    # dmd_denoising_steps: List[int] | None = field(default=None)
-
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
@@ -416,7 +405,6 @@ class ServerArgs(DisaggServerArgsMixin):
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
     decoder_sp: int | None = None
-    decoder_tp: int | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
     pool_control_endpoint: str | None = None
@@ -462,7 +450,6 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
-        self._adjust_disagg_parallelism_aliases()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
@@ -484,21 +471,6 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
-
-    def _adjust_disagg_parallelism_aliases(self):
-        if self.decoder_tp is None:
-            return
-        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
-            raise ValueError(
-                "decoder_tp is deprecated in favor of decoder_sp; "
-                "please set only one of them or keep the same value."
-            )
-        if self.decoder_sp is None:
-            logger.warning(
-                "decoder_tp is deprecated and is treated as decoder_sp for "
-                "decoder/VAE parallel decode. Please use decoder_sp instead."
-            )
-            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -894,64 +866,37 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
-        #   --warmup-mode > --warmup/--server-warmup
-        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
-        legacy_explicit = self.is_arg_explicitly_set(
-            "warmup"
-        ) or self.is_arg_explicitly_set("server_warmup")
-        if self.warmup_mode is not None:
-            if self.warmup_mode not in WARMUP_MODES:
-                raise ValueError(
-                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
-                    f"expected one of {WARMUP_MODES}."
-                )
-            if mode_explicit and legacy_explicit:
-                logger.warning(
-                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
-                    "were set; --warmup-mode=%s takes precedence.",
-                    self.warmup_mode,
-                )
-            if mode_explicit or not legacy_explicit:
-                self.warmup = self.warmup_mode != "off"
-                self.server_warmup = self.warmup_mode == "server"
-            elif self.warmup:
-                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
+        if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
+            raise ValueError(
+                f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                f"expected one of {WARMUP_MODES}."
+            )
 
-        # Explicit resolutions imply warmup is on (request-based).
-        if self.warmup_resolutions is not None:
-            self.warmup = True
-
-        if (
-            self.enable_torch_compile
-            and self.warmup_mode is None
-            and not mode_explicit
-            and not legacy_explicit
-        ):
-            self.warmup = True
-            self.server_warmup = True
+        if self.enable_torch_compile and self.warmup_mode is None:
+            self.warmup_mode = "server"
             logger.info(
                 "Automatically enabled server warmup for torch.compile so first "
                 "real requests do not pay compile latency. Set --warmup-mode off "
                 "to disable this behavior."
             )
 
+        # Explicit resolutions need a request path unless an existing server
+        # default already supplies the synthetic startup request.
+        if self.warmup_resolutions is not None and self.warmup_mode in (None, "off"):
+            self.warmup_mode = "request"
+
         # BCG captures every graph during a synthetic warmup forward at startup
-        # so that serving never records a fresh graph. That requires
-        # server-based warmup (a real warmup request issued at startup), not
-        # request-based warmup which runs no forward until the first request.
+        # so serving never records a fresh graph.
         if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
-            self.warmup = True
-            self.server_warmup = True
+            self.warmup_mode = "server"
 
-        if self.disagg_role != RoleType.MONOLITHIC:
-            self.server_warmup = False
+        # Disaggregated roles do not host the HTTP startup request. Preserve
+        # warmup intent, but schedule it on the first request instead.
+        if self.disagg_role != RoleType.MONOLITHIC and self.warmup_mode == "server":
+            self.warmup_mode = "request"
 
-        if not self.warmup:
-            self.server_warmup = False
-
-        self.warmup_mode = (
-            "off" if not self.warmup else "server" if self.server_warmup else "request"
-        )
+        if self.warmup_mode is None:
+            self.warmup_mode = "off"
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -974,7 +919,10 @@ class ServerArgs(DisaggServerArgsMixin):
             requested_ports = []
             if needs_http:
                 requested_ports.append((self.port, "HTTP"))
-            requested_ports.append((self.scheduler_port, "Scheduler"))
+            for replica in range(self.dp_size or 1):
+                requested_ports.append(
+                    (self.scheduler_port + replica, f"Scheduler[{replica}]")
+                )
             if self.master_port is not None:
                 requested_ports.append((self.master_port, "Master"))
             seen_ports: dict[int, str] = {}
@@ -998,6 +946,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 initial_scheduler_port, avoid=settled_ports
             )
             settled_ports.add(self.scheduler_port)
+            self.scheduler_ports = [self.scheduler_port]
+            for _ in range((self.dp_size or 1) - 1):
+                port = self.settle_port(
+                    self.scheduler_ports[-1] + 1, avoid=settled_ports
+                )
+                settled_ports.add(port)
+                self.scheduler_ports.append(port)
             if self.master_port is not None:
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
@@ -1617,26 +1572,14 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=list(WARMUP_MODES),
             default=ServerArgs.warmup_mode,
             help=(
-                "Warmup mode (canonical knob). One of: "
-                "`off` (no warmup); `request` (request-based: warm on real "
-                "incoming requests); `server` (server-based: a synthetic warmup "
-                "request right after the server is ready, before traffic). "
-                "Takes precedence over the deprecated --warmup/--server-warmup. "
-                "`sglang serve` defaults to `server`; other entrypoints default "
+                "Warmup mode. One of: `off` (no warmup); `request` "
+                "(request-based: warm on real incoming requests); `server` "
+                "(server-based: a synthetic warmup request right after the server "
+                "is ready, before traffic). `sglang serve` defaults to `server`; "
+                "other entrypoints default "
                 "to request-based when warmup is enabled. When enabled, look for "
                 "the line ending with `(with warmup excluded)` for actual "
                 "processing time."
-            ),
-        )
-        parser.add_argument(
-            "--warmup",
-            action=StoreBoolean,
-            default=ServerArgs.warmup,
-            help=(
-                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
-                "traffic. Maps to --warmup-mode request (or server, combined "
-                "with --server-warmup). Recommended when benchmarking for fair "
-                "comparison and best performance."
             ),
         )
         parser.add_argument(
@@ -1652,16 +1595,6 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
-        parser.add_argument(
-            "--server-warmup",
-            action=StoreBoolean,
-            default=ServerArgs.server_warmup,
-            help=(
-                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
-                "request after the server is ready (server-based warmup)."
-            ),
-        )
-
         # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
@@ -2047,10 +1980,22 @@ class ServerArgs(DisaggServerArgsMixin):
         Internal endpoint for scheduler.
         Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
+        return self.scheduler_endpoint_for(0)
+
+    def scheduler_endpoint_for(self, replica: int) -> str:
+        """Ingress endpoint of one DP replica's driver rank."""
         scheduler_host = self.host
         if scheduler_host is None or scheduler_host == "localhost":
             scheduler_host = "127.0.0.1"
-        return f"tcp://{scheduler_host}:{self.scheduler_port}"
+        if self.scheduler_ports is not None:
+            port = self.scheduler_ports[replica]
+        else:
+            port = self.scheduler_port + replica
+        return f"tcp://{scheduler_host}:{port}"
+
+    @property
+    def scheduler_endpoints(self) -> list[str]:
+        return [self.scheduler_endpoint_for(r) for r in range(self.dp_size or 1)]
 
     def settle_port(
         self,
@@ -2221,6 +2166,7 @@ class ServerArgs(DisaggServerArgsMixin):
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
+        cls._reject_retired_args(kwargs)
         attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
         explicit_arg_names = kwargs.get("_explicit_arg_names")
@@ -2248,6 +2194,20 @@ class ServerArgs(DisaggServerArgsMixin):
         return cls(**server_args_kwargs)
 
     @staticmethod
+    def _reject_retired_args(kwargs: dict[str, Any]) -> None:
+        retired_args = {
+            "decoder_tp": "decoder_sp for decoder/VAE parallel decode",
+            "warmup": "warmup_mode=request or warmup_mode=off",
+            "server_warmup": "warmup_mode=server or warmup_mode=off",
+        }
+        removed = [name for name in retired_args if name in kwargs]
+        if removed:
+            replacements = "; ".join(
+                f"{name} -> {retired_args[name]}" for name in removed
+            )
+            raise ValueError(f"Removed server argument(s): {replacements}")
+
+    @staticmethod
     def load_config_file(config_file: str) -> dict[str, Any]:
         """Load a config file."""
         if config_file.endswith(".json"):
@@ -2268,6 +2228,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        cls._reject_retired_args(kwargs)
         explicit_arg_names = set(kwargs)
 
         # Convert backend string to enum if necessary
@@ -2459,8 +2420,11 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.dp_size < 1:
             raise ValueError("--dp-size must be a natural number")
 
-        if self.dp_size > 1:
-            raise ValueError("DP is not yet supported")
+        if self.dp_size > 1 and self.disagg_role != RoleType.MONOLITHIC:
+            raise ValueError(
+                "--dp-size > 1 is only supported for monolithic serving; "
+                "disaggregated roles scale by adding role instances instead"
+            )
 
         num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:

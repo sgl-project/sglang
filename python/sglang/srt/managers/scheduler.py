@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -50,12 +50,17 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
-from sglang.kernels.ops.mamba.triton_ops import (
-    initialize_mamba_selective_state_update_backend,
-)
+if TYPE_CHECKING:
+    from torch.cuda import Stream as CudaStream
+
+try:
+    from sglang.kernels.ops.mamba.triton_ops import (
+        initialize_mamba_selective_state_update_backend,
+    )
+except ImportError:
+    initialize_mamba_selective_state_update_backend = None
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -521,6 +526,11 @@ class Scheduler(
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            hicache_draft_plan=(
+                self.draft_worker.hicache_draft_plan
+                if self.draft_worker is not None
+                else None
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -556,16 +566,6 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
-
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            page_size=self.page_size,
-        )
 
         # Init running status
         self.init_running_status()
@@ -851,7 +851,8 @@ class Scheduler(
                 )
 
     def init_mamba_backend(self) -> None:
-        initialize_mamba_selective_state_update_backend(self.server_args)
+        if initialize_mamba_selective_state_update_backend is not None:
+            initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
         # For the MM models, check the text_config for MoE settings
@@ -904,27 +905,20 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        from sglang.srt.speculative.draft_worker_common import (
-            draft_server_args_copy,
-        )
-
-        # Launch a draft worker for speculative decoding
-        draft_server_args = draft_server_args_copy(
-            server_args=self.server_args,
-            target_model_config=self.tp_worker.model_runner.model_config,
-        )
+        # Launch a draft worker for speculative decoding. It builds its draft
+        # from this process's own config: what differs for the draft — the
+        # target's context length, the draft load format, its attention backend
+        # — is resolved per runner, not on a config copy.
         draft_worker_kwargs = dict(
-            server_args=draft_server_args,
+            server_args=self.server_args,
             gpu_id=self.ps.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
 
-        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
-        with get_context().preserve_config():
-            get_context().set_server_args(draft_server_args)
-            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -958,6 +952,7 @@ class Scheduler(
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
             )
+            self.draft_worker.init_hicache_draft_plan()
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1284,11 +1279,10 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
+        draft_token_to_kv_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
