@@ -1233,8 +1233,23 @@ class ModelConfig:
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
-        """Parse ModelOpt quantization config and return the appropriate quant_method."""
-        json_quant_configs = quant_config_dict["quantization"]
+        """Parse ModelOpt quantization config and return the appropriate quant_method.
+
+        Supports both nested LLM ``hf_quant_config.json``::
+
+            {"quantization": {"quant_algo": "FP8", ...}}
+
+        and flat formats (``config.json`` ``quantization_config``, or diffusion /
+        unified ModelOpt exports such as Cosmos3)::
+
+            {"quant_algo": "FP8", "quant_method": "modelopt", ...}
+        """
+        if "quantization" in quant_config_dict:
+            json_quant_configs = quant_config_dict["quantization"]
+        elif "quant_algo" in quant_config_dict:
+            json_quant_configs = quant_config_dict
+        else:
+            return None
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
