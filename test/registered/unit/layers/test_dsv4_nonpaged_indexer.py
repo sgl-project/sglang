@@ -70,7 +70,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 
 class TestDSV4TopKDispatch(CustomTestCase):
-    def test_raw_output_dispatch(self):
+    def test_v2_raw_output_uses_sparse_prefill_buffer_with_capture(self):
         page_table = torch.zeros((1, 1), dtype=torch.int32)
         c4_seq_lens = torch.ones(1, dtype=torch.int32)
         page_indices = torch.full((1, 512), -1, dtype=torch.int32)
@@ -85,7 +85,9 @@ class TestDSV4TopKDispatch(CustomTestCase):
 
         logits = torch.empty((1, 65), dtype=torch.float32)
         backend = C4IndexerBackendMixin()
-        backend.token_to_kv_pool = object()
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_mapping={0: SimpleNamespace(compress_layer_id=7)}
+        )
         backend.forward_metadata = SimpleNamespace(
             indexer_metadata=indexer_metadata,
             core_metadata=SimpleNamespace(
@@ -105,13 +107,17 @@ class TestDSV4TopKDispatch(CustomTestCase):
         backend._get_nonpaged_indexer_plan = MagicMock(return_value=object())
         backend._forward_nonpaged_indexer = MagicMock(return_value=logits)
 
+        indexer_capturer = MagicMock()
         with (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_TOPK_V2.override(True),
-            patch(f"{_INDEXER}.get_global_indexer_capturer", return_value=None),
+            patch(
+                f"{_INDEXER}.get_global_indexer_capturer",
+                return_value=indexer_capturer,
+            ),
             patch(f"{_INDEXER}.topk_transform_512") as topk_v1,
             patch(f"{_INDEXER}.topk_transform_512_v2") as topk_v2,
         ):
@@ -132,6 +138,7 @@ class TestDSV4TopKDispatch(CustomTestCase):
             raw_indices,
         )
         topk_v1.assert_not_called()
+        indexer_capturer.capture.assert_called_once_with(7, raw_indices)
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):

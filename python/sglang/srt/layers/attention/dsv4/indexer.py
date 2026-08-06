@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
-    plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -408,16 +407,6 @@ class C4IndexerBackendMixin:
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
 
-    @staticmethod
-    def _match_output_rows(
-        tensor: torch.Tensor, *, query_rows: int, name: str
-    ) -> torch.Tensor:
-        assert tensor.shape[0] >= query_rows, (
-            f"{name} has capacity for {tensor.shape[0]} rows, "
-            f"but the indexer produced {query_rows} query rows"
-        )
-        return tensor if tensor.shape[0] == query_rows else tensor[:query_rows]
-
     def _forward_prepare_multi_stream(
         self,
         x: torch.Tensor,
@@ -747,10 +736,8 @@ class C4IndexerBackendMixin:
         c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = self._match_output_rows(
-            core_metadata.c4_sparse_page_indices,
-            query_rows=query_rows,
-            name="C4 sparse page-index buffer",
+        c4_sparse_page_indices = match_num_queries(
+            core_metadata.c4_sparse_page_indices, value=-1
         )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
@@ -807,24 +794,15 @@ class C4IndexerBackendMixin:
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
 
-        # Functional consumers own the output storage. The capturer copies from
-        # it after TopK instead of diverting the kernel into a temporary buffer.
-        if hisparse_decode:
-            raw_indices = self._match_output_rows(
-                hisparse_coordinator.raw_indices_buffer,
-                query_rows=query_rows,
-                name="HiSparse raw-index buffer",
-            )
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = self._match_output_rows(
-                core_metadata.c4_sparse_raw_indices,
-                query_rows=query_rows,
-                name="sparse-prefill raw-index buffer",
-            )
+        raw_indices = None
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
         elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
-        else:
-            raw_indices = None
+        elif hisparse_decode:
+            raw_indices = hisparse_coordinator.raw_indices_buffer[
+                : c4_sparse_page_indices.size(0)
+            ]
 
         if (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
@@ -848,16 +826,13 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get():
-            topk_metadata = indexer_metadata.topk_metadata
-            if topk_metadata.shape[0] != c4_seq_lens.shape[0] + 1:
-                topk_metadata = plan_topk_v2(c4_seq_lens)
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
-                topk_metadata,
+                indexer_metadata.topk_metadata,
                 raw_indices,
             )
         else:
