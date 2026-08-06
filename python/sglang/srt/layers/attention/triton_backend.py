@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_a2a_lse_reduce,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -1835,7 +1836,17 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            dcp_comm_backend = get_parallel().dcp_comm_backend
+            if dcp_comm_backend in ("a2a", "fi_a2a"):
+                o = dcp_a2a_lse_reduce(
+                    o_for_decode,
+                    local_lse,
+                    group,
+                    is_lse_base_on_e=True,
+                    comm_backend=dcp_comm_backend,
+                )
+            else:
+                o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
