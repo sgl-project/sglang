@@ -4,6 +4,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
@@ -16,6 +19,10 @@ from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
     Flux2SamplingParams,
     FluxSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.glmimage import (
+    GlmImageSamplingParams,
+    align_glm_image_dimension,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -100,6 +107,65 @@ class TestSamplingParamsValidate(unittest.TestCase):
 
 
 class TestSamplingParamsSubclass(unittest.TestCase):
+    def test_glm_image_rounds_resolution_up_to_multiple_of_32(self):
+        server_args = SimpleNamespace(
+            pipeline_config=GlmImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+        )
+        cases = [
+            ((500, 500), (512, 512)),
+            ((1024, 600), (1024, 608)),
+            ((500, 600), (512, 608)),
+            ((550, 1009), (576, 1024)),
+            ((1280, 720), (1280, 736)),
+        ]
+
+        for requested, expected in cases:
+            with self.subTest(requested=requested):
+                params = GlmImageSamplingParams(
+                    width=requested[0],
+                    height=requested[1],
+                )
+
+                with patch(
+                    "sglang.multimodal_gen.configs.sample.glmimage.logger.warning"
+                ) as mock_warning:
+                    params._adjust(server_args)
+
+                self.assertEqual((params.width, params.height), expected)
+                mock_warning.assert_called_once_with(
+                    "GLM-Image requires dimensions divisible by %s; adjusted "
+                    "requested resolution from %sx%s to %sx%s",
+                    32,
+                    requested[0],
+                    requested[1],
+                    expected[0],
+                    expected[1],
+                )
+
+    def test_glm_image_resolution_rounds_up(self):
+        self.assertEqual(align_glm_image_dimension(560), 576)
+
+    def test_glm_image_resolution_keeps_minimum_alignment(self):
+        self.assertEqual(align_glm_image_dimension(0), 32)
+        self.assertEqual(align_glm_image_dimension(-1), 32)
+
+    def test_glm_image_does_not_warn_for_aligned_resolution(self):
+        server_args = SimpleNamespace(
+            pipeline_config=GlmImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+        )
+        params = GlmImageSamplingParams(width=1024, height=1024)
+
+        with patch(
+            "sglang.multimodal_gen.configs.sample.glmimage.logger.warning"
+        ) as mock_warning:
+            params._adjust(server_args)
+
+        mock_warning.assert_not_called()
+
     def test_flux_defaults_resolution_when_not_provided(self):
         params = FluxSamplingParams()
 
