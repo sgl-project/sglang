@@ -877,9 +877,6 @@ def build_prefill_registry(
                 )
             )
             if deepstack_replay_width > 0:
-                # Optional DeepStack replay slot — same lifecycle as
-                # input_embeds but wider on the feature axis (LM unpacks
-                # per-layer contributions from it).
                 slots.append(
                     GraphSlot(
                         "input_deepstack_embeds",

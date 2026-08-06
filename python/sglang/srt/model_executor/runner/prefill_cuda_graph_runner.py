@@ -296,10 +296,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
-        # Activate the optional DeepStack replay slot only when the
-        # model opted in AND reports a positive num_deepstack_embeddings.
-        # Every other arch (and Qwen3-VL with an empty DeepStack list)
-        # hits the zero branch → no allocation, no slot, no copy.
         deepstack_replay_width = (
             self.model_runner.model_config.hidden_size
             * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
@@ -679,10 +675,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                # Pass the DeepStack replay slot through only when the
-                # model opted in; the slot itself exists only in that
-                # case, so ``has_slot`` short-circuits for every other
-                # model and no extra kwarg reaches ``layer_model.forward``.
                 extra_kwargs = {}
                 if self.buffer_registry.has_slot("input_deepstack_embeds"):
                     extra_kwargs["input_deepstack_embeds"] = (
@@ -1682,6 +1674,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if de.shape[0] < static_num_tokens:
                         slot[de.shape[0] :].zero_()
                 else:
+                    if de is not None:
+                        logger.warning(
+                            "DeepStack replay slot rejected a non-empty "
+                            "input_deepstack_embeds (shape=%s, dtype=%s, device=%s); "
+                            "replaying with zero contribution.",
+                            tuple(de.shape),
+                            de.dtype,
+                            de.device,
+                        )
                     slot.zero_()
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
