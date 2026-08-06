@@ -124,12 +124,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
 
+        # The mask token needs an embedding row, not a tokenizer entry, so bound it
+        # by the embedding width. A padded vocab reserves rows past the real tokens
+        # and drafts place the mask there (Inkling: 200058 real, 201024 padded).
+        target_model_config = self.target_worker.model_runner.model_config
+        target_vocab_size = (
+            getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
+            or target_model_config.vocab_size
+        )
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            target_vocab_size=int(
-                self.target_worker.model_runner.model_config.vocab_size
-            ),
+            target_vocab_size=int(target_vocab_size),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
