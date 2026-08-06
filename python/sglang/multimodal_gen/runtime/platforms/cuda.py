@@ -519,6 +519,17 @@ class CudaPlatformBase(Platform):
     ) -> str:
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
+            if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
+                # cuDNN SDPA is 1.25-1.5x faster than the FA4 CuTe kernels on
+                # sm_100 for dense diffusion attention; DYNAMIC_CUDNN_SDPA
+                # keeps FA as the fallback for causal/unsupported shapes and
+                # cuDNN runtime errors.
+                fa_cls_str = cls._resolve_flash_attention_backend_cls_str(
+                    target_backend, head_size, dtype
+                )
+                if fa_cls_str == _SDPA_BACKEND_CLS_STR:
+                    return fa_cls_str
+                return _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
         else:
             resolver = _CUDA_ATTENTION_BACKEND_RESOLVERS.get(selected_backend)
             if resolver is None:
@@ -539,22 +550,25 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / Wan VAE decoder fast paths.
 
         Requests with quality == "high" run the fast paths; the "lossless"
         default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt for details.
+        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
                 maybe_optimize_flux2_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                maybe_optimize_wan_vae,
+            )
 
             vae = maybe_optimize_flux2_vae(vae)
+            vae = maybe_optimize_wan_vae(vae)
         except Exception:
             logger.warning(
-                "Failed to apply CUDA FLUX.2 VAE optimizations; "
-                "using the unmodified VAE.",
+                "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",
                 exc_info=True,
             )
         return vae
