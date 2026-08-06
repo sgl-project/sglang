@@ -80,6 +80,11 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "point, since with PP off the group is never touched, which is what lets "
         "the Indexer be constructed before distributed init"
     ),
+    ("srt/mem_cache/kv_cache_configurator.py", "configured_pp_size"): (
+        "decides whether the token capacity needs a cross-PP all-reduce at all; "
+        "asking the configured size keeps that decision independent of whether a "
+        "PP group is installed in this process"
+    ),
     ("srt/layers/dp_attention.py", "configured_attn_cp_size"): (
         "compared against the configured moe_dp_size below"
     ),
