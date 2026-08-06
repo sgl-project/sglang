@@ -452,3 +452,150 @@ def fused_conv_window_scatter_with_mask(
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+def scatter_mamba_states_after_mtp_verify(
+    mamba_caches,
+    state_indices_tensor: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_steps_to_track: torch.Tensor | None,
+) -> None:
+    """Scatter per-step verify states (ssm + all conv types) into the
+    persistent caches, plus the interval-crossing track slots."""
+    ssm_states = mamba_caches.temporal
+    intermediate_state_cache = mamba_caches.intermediate_ssm
+
+    if ssm_states.numel() > 0:
+        fused_mamba_state_scatter_with_mask(
+            ssm_states,
+            intermediate_state_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+    for conv_states, intermediate_conv_window_cache in zip(
+        mamba_caches.conv, mamba_caches.intermediate_conv_window
+    ):
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+        if ssm_states.numel() > 0:
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        for conv_states, intermediate_conv_window_cache in zip(
+            mamba_caches.conv, mamba_caches.intermediate_conv_window
+        ):
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+
+
+@triton.jit
+def track_mamba_states_all_layers_kernel(
+    conv_states_ptr,  # [num_layers, pool_size, ...] full conv pool
+    ssm_states_ptr,  # [num_layers, pool_size, ...] full ssm pool
+    cache_indices_ptr,
+    mamba_track_mask_ptr,
+    mamba_track_indices_ptr,
+    conv_layer_stride,
+    conv_row_stride,
+    ssm_layer_stride,
+    ssm_row_stride,
+    batch_size,
+    conv_state_numel_per_row: tl.constexpr,
+    ssm_state_numel_per_row: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    check_freed_slots: tl.constexpr,
+):
+    """All-layers variant of track_mamba_state_if_needed_kernel: one launch
+    covers every mamba layer (grid = num_layers * batch_size) instead of one
+    launch per layer. The track mask / source / destination indices are shared
+    across layers, so a single launch at the end of the step is equivalent to
+    the per-layer launches (each layer's state is final by then)."""
+    pid = tl.program_id(0)
+    layer_idx = (pid // batch_size).to(tl.int64)
+    batch_idx = pid % batch_size
+
+    track_mask = tl.load(mamba_track_mask_ptr + batch_idx)
+    if not track_mask:
+        return
+
+    src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
+    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
+    if check_freed_slots:
+        if src_idx < 0 or dst_idx < 0:
+            return
+
+    conv_base = conv_states_ptr + layer_idx * conv_layer_stride
+    for offset in range(0, conv_state_numel_per_row, BLOCK_SIZE):
+        element_indices = offset + tl.arange(0, BLOCK_SIZE)
+        mask = element_indices < conv_state_numel_per_row
+        data = tl.load(
+            conv_base + src_idx * conv_row_stride + element_indices,
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(
+            conv_base + dst_idx * conv_row_stride + element_indices, data, mask=mask
+        )
+
+    ssm_base = ssm_states_ptr + layer_idx * ssm_layer_stride
+    for offset in range(0, ssm_state_numel_per_row, BLOCK_SIZE):
+        element_indices = offset + tl.arange(0, BLOCK_SIZE)
+        mask = element_indices < ssm_state_numel_per_row
+        data = tl.load(
+            ssm_base + src_idx * ssm_row_stride + element_indices, mask=mask, other=0.0
+        )
+        tl.store(ssm_base + dst_idx * ssm_row_stride + element_indices, data, mask=mask)
+
+
+def track_mamba_states_all_layers(
+    conv_states_pool: torch.Tensor,
+    ssm_states_pool: torch.Tensor,
+    cache_indices: torch.Tensor,
+    mamba_track_mask: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    batch_size: int,
+    check_freed_slots: bool = False,
+):
+    """Track conv/ssm states for ALL mamba layers in one launch.
+
+    conv_states_pool / ssm_states_pool are the full [num_layers, pool_size,
+    ...] pools; per-row copy semantics are identical to
+    track_mamba_states_if_needed applied per layer.
+    """
+    num_layers = conv_states_pool.shape[0]
+    conv_state_numel_per_row = conv_states_pool[0, 0].numel()
+    ssm_state_numel_per_row = ssm_states_pool[0, 0].numel()
+
+    BLOCK_SIZE = 1024
+    grid = (num_layers * batch_size,)
+    track_mamba_states_all_layers_kernel[grid](
+        conv_states_pool,
+        ssm_states_pool,
+        cache_indices,
+        mamba_track_mask,
+        mamba_track_indices,
+        conv_states_pool.stride(0),
+        conv_states_pool.stride(1),
+        ssm_states_pool.stride(0),
+        ssm_states_pool.stride(1),
+        batch_size,
+        conv_state_numel_per_row,
+        ssm_state_numel_per_row,
+        BLOCK_SIZE,
+        check_freed_slots,
+    )

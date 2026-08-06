@@ -5,14 +5,18 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.dsv4 import linear_bf16_fp32, triton_create_paged_compress_data
-from sglang.jit_kernel.dsv4.compress_old import (
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+from sglang.kernels.ops.attention.dsv4 import (
+    linear_bf16_fp32,
+    triton_create_paged_compress_data,
+)
+from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
 )
-from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -22,7 +26,6 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
@@ -341,7 +344,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(MultiPlatformOp):
+class Compressor(BaseFusedOp):
     def __init__(
         self,
         config: DeepSeekV4Config,

@@ -91,6 +91,19 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
         prepare_flash_attention.assert_called_once_with()
 
+    def test_default_backend_prefers_dynamic_cudnn_sdpa_on_blackwell(self):
+        FakeCudaPlatform.is_blackwell_device = True
+
+        with patch.object(
+            FakeCudaPlatform,
+            "_prepare_flash_attention_for_blackwell",
+            return_value=True,
+        ):
+            self.assertEqual(
+                self.resolve(None),
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
+            )
+
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)

@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -38,7 +39,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -65,7 +66,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
     "GPTQLinearIntelAMXMethod",
     "GPTQMoEAscendMethod",
@@ -76,6 +76,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
     "HummingLinearMethod",
+    "QuarkLinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -669,6 +670,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+
+            # Needed for experimental ModelSlim W4A4 int4x2 packing support
+            # TODO: remove env variable once new packing is fully released
+            if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+                pack_factor = getattr(param, "pack_factor", None)
+                if pack_factor is not None:
+                    shard_size = shard_size // pack_factor
+                    shard_offset = shard_offset // pack_factor
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
@@ -1429,6 +1438,8 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
+        self.use_decode_attn_tp: bool = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -1549,7 +1560,13 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+    def forward(
+        self,
+        input_,
+        skip_all_reduce=False,
+        forward_batch=None,
+        output_tensor=None,
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1570,14 +1587,26 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if output_tensor is None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+            else:
+                apply_into = getattr(self.quant_method, "apply_into", None)
+                if apply_into is None:
+                    raise RuntimeError(
+                        f"{type(self.quant_method).__name__} cannot write into "
+                        "caller-owned linear output"
+                    )
+                output_parallel = apply_into(
+                    self, input_parallel, output_tensor, bias=bias_
+                )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
         # the decoder — callers should not thread those flags into modules.
         if (
-            self.reduce_results
-            and self.tp_size > 1
+            ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
             and not skip_all_reduce
             and not should_skip_mlp_all_reduce()
         ):
@@ -1587,7 +1616,7 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_server_args().enable_quant_communications
+                        and get_exec().comm.enable_quant_communications
                     )
                     if forward_batch is not None
                     else False

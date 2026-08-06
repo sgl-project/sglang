@@ -18,41 +18,10 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models import mimo_audio as _mimo_audio_module
 from sglang.srt.models.mimo import MiMoForCausalLM
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_override_audio_attn_for_blackwell() -> None:
-    """Swap mimo_audio.flash_attn_varlen_func to upstream FA2 on GPUs that
-    sgl-kernel's FA3 doesn't support.
-
-    sgl-kernel FA3 only covers sm80/86/89/90 — on Blackwell consumer cards
-    (sm_120 / RTX 50xx) its varlen kernel raises NotImplementedError. ASR is
-    small enough to be deployed on those GPUs, so when FA3 isn't supported
-    we replace the module-level reference with upstream flash-attn (FA2),
-    which works on sm_120. No-op on supported GPUs (FA3 stays).
-
-    MiMo-V2 (the heavy multimodal model) is only deployed on H100/A100, so
-    this override never triggers in its hot path.
-    """
-    try:
-        from sgl_kernel.flash_attn import is_fa3_supported
-    except ImportError:
-        return
-    if is_fa3_supported():
-        return
-    try:
-        from flash_attn import flash_attn_varlen_func
-    except ImportError as e:
-        raise RuntimeError(
-            "MiMo-V2-ASR audio encoder needs upstream flash-attn on this GPU "
-            "(sgl-kernel FA3 doesn't support sm_120). Install with "
-            "`pip install flash-attn --no-build-isolation`."
-        ) from e
-    _mimo_audio_module.flash_attn_varlen_func = flash_attn_varlen_func
 
 
 MiMoV2ASRConfig = Any
@@ -84,7 +53,6 @@ class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        _maybe_override_audio_attn_for_blackwell()
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         self.build_audio_encoder(MiMoAudioEncoderConfig(**config.audio_config))
 
