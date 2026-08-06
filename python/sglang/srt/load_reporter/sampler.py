@@ -2,10 +2,9 @@
 
 This module owns the single background task that calls
 ``snapshot_source.get_loads()`` and forwards results into
-``LatestSnapshotStore``.  All other components (MonitorTask, request-end
-hooks) funnel their wake-up signals through the three synchronous
-notification methods; only one in-flight ``get_loads`` call is ever active
-at a time.
+``LatestSnapshotStore``. Router sessions and request-end hooks funnel wake-up
+signals through synchronous notification methods; only one in-flight
+``get_loads`` call is ever active at a time.
 
 Coalescing rule (section 8.4 of the design doc):
   idle  + trigger  -> start refresh
@@ -34,9 +33,9 @@ class LoadSnapshotSource(Protocol):
     """Minimal protocol for a load-snapshot data source.
 
     ``LoadSampler`` depends only on this protocol, not on any concrete
-    manager type.  Two adapters are provided: one that wraps a live
-    ``TokenizerManager`` (single-tokenizer path) and one that wraps a
-    shared-memory reader (router path, multi-tokenizer future).
+    manager type. Two adapters are provided: one that wraps a live manager
+    (single-owner path) and one that wraps the router's shared-memory reader
+    (multi-tokenizer path).
     """
 
     async def get_loads(self) -> list:
@@ -48,24 +47,49 @@ class LoadSnapshotSource(Protocol):
         raise NotImplementedError
 
 
-class TokenizerManagerLoadSnapshotSource:
-    """Adapts a ``TokenizerManager`` to the ``LoadSnapshotSource`` protocol."""
+class ManagerLoadSnapshotSource:
+    """Adapts a manager to the ``LoadSnapshotSource`` protocol.
 
-    def __init__(self, tokenizer_manager: Any) -> None:
-        """Wrap one TokenizerManager as a snapshot source.
+    The expected DP rank set follows ``manager.elastic_worker_count`` when the
+    manager exposes it, and otherwise falls back to the construction-time set.
+    Used for both TokenizerManager and GrpcRequestManager.
+    """
+
+    def __init__(
+        self,
+        manager: Any,
+        expected_dp_ranks: Collection[int],
+        *,
+        snapshot_reader: Optional[Any] = None,
+    ) -> None:
+        """Wrap a manager with an authoritative rank fallback.
 
         Args:
-            tokenizer_manager: Manager exposing get_loads and elastic worker count.
+            manager: Manager exposing get_loads(include=["core"]).
+            expected_dp_ranks: DP ranks required for a full snapshot.
+            snapshot_reader: Optional synchronous reader used when the reporter
+                runs on an event loop different from the manager's loop.
         """
-        self._manager = tokenizer_manager
+        self._manager = manager
+        self._snapshot_reader = snapshot_reader
+        self._expected: frozenset[int] = frozenset(expected_dp_ranks)
 
     async def get_loads(self) -> list:
         """Fetch core load snapshots from the wrapped manager."""
+        if self._snapshot_reader is not None:
+            return self._snapshot_reader.read_all()
         return await self._manager.get_loads(include=["core"])
 
     def expected_dp_ranks(self) -> frozenset[int]:
-        """Return all DP ranks currently owned by the manager."""
-        return frozenset(range(self._manager.elastic_worker_count))
+        """Return the manager's current authoritative DP rank set."""
+        worker_count = getattr(self._manager, "elastic_worker_count", None)
+        if (
+            isinstance(worker_count, int)
+            and not isinstance(worker_count, bool)
+            and worker_count > 0
+        ):
+            return frozenset(range(worker_count))
+        return self._expected
 
 
 class RouterLoadSnapshotSource:
@@ -132,6 +156,7 @@ class LoadSampler:
         snapshot_source: Any,
         store: Any,
         interval_provider: Callable[[], Optional[int]],
+        on_sample_completed: Optional[Callable[[], None]] = None,
     ) -> None:
         """Initialize the coalescing sampler.
 
@@ -139,10 +164,12 @@ class LoadSampler:
             snapshot_source: Source implementing the LoadSnapshotSource protocol.
             store: Destination receiving validated full snapshots and errors.
             interval_provider: Callback returning the active sampling interval.
+            on_sample_completed: Optional callback after each sampling attempt.
         """
         self._snapshot_source = snapshot_source
         self._store = store
         self._interval_provider = interval_provider
+        self._on_sample_completed = on_sample_completed
 
         self._wake: asyncio.Event = asyncio.Event()
         self._active: bool = False
@@ -206,18 +233,48 @@ class LoadSampler:
         """Shut down the background task gracefully.
 
         Sets the closing flag, wakes the loop, and awaits the task.
-        Idempotent: safe to call more than once.  Swallows any background
-        exception after logging it.
+        Idempotent: safe to call more than once. The sampler task is shielded
+        so cancellation of a bounded graceful close does not corrupt its
+        state; the owner can then cancel and join it explicitly.
         """
         self._active = False
         self._closing = True
         self._wake.set()
+        task = self._task
+        if task is None:
+            return
+
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Load reporter sampler task raised: %s", exc)
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
+
+    def cancel(self) -> None:
+        """Request immediate cancellation of the sampler task."""
+        self._active = False
+        self._closing = True
+        self._wake.set()
         if self._task is not None:
-            try:
-                await self._task
-            except Exception as exc:
-                logger.warning("Load reporter sampler task raised: %s", exc)
-            self._task = None
+            self._task.cancel()
+
+    async def wait_stopped(self) -> None:
+        """Join a cancelled sampler task without propagating its result."""
+        task = self._task
+        if task is None:
+            return
+
+        try:
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(result, Exception):
+                logger.warning("Load reporter sampler task raised: %s", result)
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -238,6 +295,12 @@ class LoadSampler:
         except Exception as exc:
             self._store.record_error(exc)
             logger.warning("Load reporter sampling failed: %s", exc)
+        finally:
+            if self._on_sample_completed is not None:
+                try:
+                    self._on_sample_completed()
+                except Exception:
+                    logger.exception("Load reporter sample callback failed")
 
     async def _run(self) -> None:
         """Background loop — exactly one task ever calls ``_refresh_once``.

@@ -82,9 +82,6 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
-    LoadReporterRefreshReason,
-    LoadReporterStartIpcReqOutput,
-    LoadReporterStateBroadcastReq,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ScaleElasticEPReqInput,
@@ -100,6 +97,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     unwrap_from_pickle,
 )
+from sglang.srt.load_reporter.decorator import enable_load_monitor
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -505,6 +503,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             caller="TokenizerManager",
         )
 
+    @enable_load_monitor("scheduler_message")
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
@@ -531,20 +530,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
-
-        # Embedded load reporter request-end hook — set by http_server lifespan.
-        # Synchronous, non-throwing; wakes the reporter sampler on request end.
-        self._load_reporter_request_finished_hook: Optional[Callable[[], None]] = None
-
-        # Embedded load reporter request-event hook — set by http_server lifespan
-        # for multi-worker mode. Fires on DISPATCH/COMPLETION/ABORT with event counts.
-        self._load_reporter_request_event_hook: Optional[
-            Callable[[LoadReporterRefreshReason, int], None]
-        ] = None
-
-        # IPC components for multi-worker load reporter — attached by http_server.
-        self._load_reporter_control_proxy: Optional[Any] = None
-        self._load_reporter_refresh_notifier: Optional[Any] = None
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -705,15 +690,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
-                # Load reporter IPC response handlers (multi-worker mode)
-                (
-                    LoadReporterStartIpcReqOutput,
-                    self._handle_load_reporter_start_response,
-                ),
-                (
-                    LoadReporterStateBroadcastReq,
-                    self._handle_load_reporter_state_broadcast,
-                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -721,105 +697,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    @enable_load_monitor("request_lifecycle")
     async def generate_request(
-        self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-    ):
-        """Public entry point: delegates to ``_generate_request_impl`` and fires
-        the load-reporter request-finished hook exactly once after every normal,
-        error, or cancellation path.  Hook is synchronous and non-throwing; it
-        never adds latency to the response path.
-        """
-        try:
-            async for response in self._generate_request_impl(obj, request):
-                yield response
-        finally:
-            self._notify_load_reporter_request_event(
-                LoadReporterRefreshReason.COMPLETION, 1
-            )
-            hook = self._load_reporter_request_finished_hook
-            if hook is not None:
-                try:
-                    hook()
-                except Exception:
-                    logger.exception("Load reporter request-finished hook failed")
-
-    def set_load_reporter_request_finished_hook(
-        self, hook: Optional[Callable[[], None]]
-    ) -> None:
-        """Set or clear the synchronous request-finished hook.
-
-        Called by the http_server lifespan to attach / detach the reporter.
-        """
-        self._load_reporter_request_finished_hook = hook
-
-    def set_load_reporter_request_event_hook(
-        self, hook: Optional[Callable[[LoadReporterRefreshReason, int], None]]
-    ) -> None:
-        """Set or clear the synchronous request-event hook.
-
-        Called by the http_server lifespan to attach / detach the notifier
-        for multi-worker mode.  Fires on DISPATCH, COMPLETION, and ABORT
-        with event counts.
-        """
-        self._load_reporter_request_event_hook = hook
-
-    def _notify_load_reporter_request_event(
-        self, reason: LoadReporterRefreshReason, event_count: int = 1
-    ) -> None:
-        """Fire the request-event hook if attached.
-
-        Called at three sites: after dispatching tokenized input (DISPATCH),
-        in generate_request finally block (COMPLETION), and after dispatching
-        AbortReq (ABORT).  Synchronous and non-throwing.
-        """
-        hook = self._load_reporter_request_event_hook
-        if hook is None:
-            return
-        try:
-            hook(reason, event_count)
-        except Exception:
-            logger.exception("Load reporter request-event hook failed")
-
-    def attach_load_reporter_ipc_components(self, proxy: Any, notifier: Any) -> None:
-        """Attach IPC proxy and notifier for multi-worker load reporter.
-
-        Called by the http_server lifespan in multi-worker mode.
-        """
-        self._load_reporter_control_proxy = proxy
-        self._load_reporter_refresh_notifier = notifier
-
-    def _handle_load_reporter_start_response(
-        self, response: LoadReporterStartIpcReqOutput
-    ) -> None:
-        """Handle LoadReporterStartIpcReqOutput from router.
-
-        Routes the response to the attached proxy, which correlates it to
-        the pending start_reporting future.
-        """
-        if self._load_reporter_control_proxy is None:
-            logger.error("Received LoadReporterStartIpcReqOutput but no proxy attached")
-            return
-        self._load_reporter_control_proxy.handle_response(response)
-
-    def _handle_load_reporter_state_broadcast(
-        self, state: LoadReporterStateBroadcastReq
-    ) -> None:
-        """Handle LoadReporterStateBroadcastReq from router.
-
-        Routes the state to the attached notifier, which activates / deactivates
-        the refresh coalescing loop.
-        """
-        if self._load_reporter_refresh_notifier is None:
-            logger.debug(
-                "Received LoadReporterStateBroadcastReq but no notifier attached "
-                "(single-worker mode or multi-worker pre-start)"
-            )
-            return
-        self._load_reporter_refresh_notifier.handle_state(state)
-
-    async def _generate_request_impl(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
@@ -1588,7 +1467,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         time_stats = tokenized_obj.time_stats
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
-        self._notify_load_reporter_request_event(LoadReporterRefreshReason.DISPATCH, 1)
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1610,9 +1488,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self._dispatch_to_scheduler(batch_req)
-        self._notify_load_reporter_request_event(
-            LoadReporterRefreshReason.DISPATCH, len(tokenized_objs)
-        )
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -1940,7 +1815,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
-        self._notify_load_reporter_request_event(LoadReporterRefreshReason.ABORT, 1)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(

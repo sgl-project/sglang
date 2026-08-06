@@ -3,7 +3,6 @@
 import grpc
 import warnings
 
-from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 from . import load_monitor_pb2 as load__monitor__pb2
 
 GRPC_GENERATED_VERSION = '1.78.0'
@@ -19,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in load_monitor_pb2_grpc.py depends on'
+        + ' but the generated code in sglang/router/loadmonitor/v1/load_monitor_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -35,18 +34,20 @@ class LoadMonitorServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.Report = channel.stream_unary(
-                '/router.loadmonitor.v1.LoadMonitorService/Report',
-                request_serializer=load__monitor__pb2.LoadReport.SerializeToString,
-                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+        self.Monitor = channel.stream_stream(
+                '/sglang.router.loadmonitor.v1.LoadMonitorService/Monitor',
+                request_serializer=load__monitor__pb2.RouterFrame.SerializeToString,
+                response_deserializer=load__monitor__pb2.WorkerFrame.FromString,
                 _registered_method=True)
 
 
 class LoadMonitorServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
-    def Report(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+    def Monitor(self, request_iterator, context):
+        """Bidirectional stream: Router sends control frames, Worker sends load reports.
+        The first RouterFrame MUST be a RegisterRequest.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -54,16 +55,16 @@ class LoadMonitorServiceServicer(object):
 
 def add_LoadMonitorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'Report': grpc.stream_unary_rpc_method_handler(
-                    servicer.Report,
-                    request_deserializer=load__monitor__pb2.LoadReport.FromString,
-                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            'Monitor': grpc.stream_stream_rpc_method_handler(
+                    servicer.Monitor,
+                    request_deserializer=load__monitor__pb2.RouterFrame.FromString,
+                    response_serializer=load__monitor__pb2.WorkerFrame.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'router.loadmonitor.v1.LoadMonitorService', rpc_method_handlers)
+            'sglang.router.loadmonitor.v1.LoadMonitorService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('router.loadmonitor.v1.LoadMonitorService', rpc_method_handlers)
+    server.add_registered_method_handlers('sglang.router.loadmonitor.v1.LoadMonitorService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -71,7 +72,7 @@ class LoadMonitorService(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def Report(request_iterator,
+    def Monitor(request_iterator,
             target,
             options=(),
             channel_credentials=None,
@@ -81,12 +82,12 @@ class LoadMonitorService(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.stream_unary(
+        return grpc.experimental.stream_stream(
             request_iterator,
             target,
-            '/router.loadmonitor.v1.LoadMonitorService/Report',
-            load__monitor__pb2.LoadReport.SerializeToString,
-            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+            '/sglang.router.loadmonitor.v1.LoadMonitorService/Monitor',
+            load__monitor__pb2.RouterFrame.SerializeToString,
+            load__monitor__pb2.WorkerFrame.FromString,
             options,
             channel_credentials,
             insecure,

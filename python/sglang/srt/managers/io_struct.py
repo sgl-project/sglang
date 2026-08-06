@@ -1554,19 +1554,8 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
 
 
 # ---------------------------------------------------------------------------
-# Load Reporter IPC contracts (worker <-> router control / refresh channel)
+# Load Reporter IPC contracts (worker <-> router refresh channel)
 # ---------------------------------------------------------------------------
-
-
-class LoadReporterIpcCode(Enum):
-    """Status codes returned by the router to a load-reporter worker."""
-
-    OK = 1
-    CONFLICT = 2
-    CLOSING = 3
-    UNAVAILABLE = 4
-    DEPENDENCY_UNAVAILABLE = 5
-    INTERNAL = 6
 
 
 class LoadReporterRefreshReason(Enum):
@@ -1577,46 +1566,12 @@ class LoadReporterRefreshReason(Enum):
     ABORT = 3
 
 
-class LoadReporterStartIpcReqInput(BaseReq, kw_only=True):
-    """Worker -> router: register this worker with the load-reporter service.
-
-    ``http_worker_ipc`` (inherited from BaseReq) carries the IPC address to
-    which the router should send the corresponding
-    :class:`LoadReporterStartIpcReqOutput` reply.  Do NOT redeclare it here.
-    """
-
-    request_id: str
-    router_host: str
-    router_port: int
-    report_interval_ms: int
-    lease_ttl_ms: int
-    worker_addr: str
-
-
-class LoadReporterStartIpcReqOutput(BaseReq, kw_only=True):
-    """Router -> worker: response to a :class:`LoadReporterStartIpcReqInput`."""
-
-    request_id: str
-    code: LoadReporterIpcCode
-    status: Optional[str] = None
-    lease_ttl_ms: Optional[int] = None
-    renew_after_ms: Optional[int] = None
-    message: Optional[str] = None
-
-
 class LoadReporterRefreshIpcReq(BaseReq, kw_only=True):
     """Worker -> router: incremental load-count refresh event."""
 
     worker_id: str
     reason: LoadReporterRefreshReason
     event_count: int
-
-
-class LoadReporterStateBroadcastReq(BaseReq, kw_only=True):
-    """Router -> all workers: broadcast the current load-reporter active state."""
-
-    active: bool
-    coalesce_window_ms: int = 50
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):

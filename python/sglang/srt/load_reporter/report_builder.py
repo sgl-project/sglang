@@ -9,8 +9,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Optional
 
+from sglang.srt.load_reporter.config import WorkerMetadata
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
-from sglang.srt.load_reporter.registration import WorkerIdentity
 from sglang.srt.load_reporter.store import SnapshotView
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ class ReportBuilder:
     def build(
         self,
         view: SnapshotView,
-        identity: WorkerIdentity,
+        identity: WorkerMetadata,
         *,
         report_time_unix_ms: int,
     ) -> pb.LoadReport:
@@ -100,8 +100,6 @@ class ReportBuilder:
         )
         if identity.model is not None:
             report.worker.model = identity.model
-        if identity.zone is not None:
-            report.worker.zone = identity.zone
         if error is not None:
             report.last_error = error
         return report

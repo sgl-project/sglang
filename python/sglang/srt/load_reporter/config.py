@@ -1,12 +1,9 @@
 """Frozen configuration structs for the embedded SGLang load reporter.
 
-``LoadReporterConfig`` carries the only timing knob exposed on ``ServerArgs``
-(the snapshot stale threshold).  ``WorkerMetadata`` carries the identity fields
-that are stable for the lifetime of the worker process.
-
-gRPC transport/lifecycle knobs (connect/close timeout, reconnect backoff,
-shutdown timeout) are reporter-internal implementation constants defined in
-this module in seconds; they are intentionally not surfaced as CLI arguments.
+``LoadReporterConfig`` carries the snapshot stale threshold exposed on
+``ServerArgs``. ``WorkerMetadata`` carries identity fields that are stable for
+the lifetime of the worker process. Internal lifecycle timeouts are expressed
+in seconds and are intentionally not surfaced as CLI arguments.
 
 Both classes are constructed via ``from_server_args`` factory methods so that
 callers never reach into ``ServerArgs`` directly after the reporter starts.
@@ -22,32 +19,33 @@ from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-# Reporter-internal implementation constants (seconds). Not CLI arguments.
-GRPC_CONNECT_TIMEOUT_SECONDS = 3.0
-GRPC_CLOSE_TIMEOUT_SECONDS = 0.5
-RECONNECT_INITIAL_SECONDS = 0.25
-RECONNECT_MAX_SECONDS = 5.0
+# Reporter-internal implementation constants. Not CLI arguments.
+INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
+# Maximum accepted age of the oldest rank snapshot before a report is marked
+# STALE. Reporter-internal; intentionally not surfaced as a CLI argument.
+SNAPSHOT_STALE_AFTER_MS = 3000
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class LoadReporterConfig:
-    """Timing configuration for the load reporter derived from ServerArgs."""
+    """Timing configuration for the load reporter."""
 
     snapshot_stale_after_ms: int
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> LoadReporterConfig:
-        """Build reporter timing configuration from server arguments.
+        """Build reporter timing configuration.
 
         Args:
-            args: Resolved SGLang server configuration.
+            args: Resolved SGLang server configuration (unused; the stale
+                threshold is a reporter-internal constant).
 
         Returns:
             Frozen load-reporter timing configuration.
         """
         return cls(
-            snapshot_stale_after_ms=args.load_reporter_snapshot_stale_after_ms,
+            snapshot_stale_after_ms=SNAPSHOT_STALE_AFTER_MS,
         )
 
 
@@ -55,9 +53,9 @@ class LoadReporterConfig:
 class WorkerMetadata:
     """Stable identity fields reported with every load snapshot."""
 
+    worker_addr: str
     worker_type: int
     model: Optional[str]
-    zone: Optional[str]
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> WorkerMetadata:
@@ -67,14 +65,15 @@ class WorkerMetadata:
             args: Resolved SGLang server configuration.
 
         Returns:
-            Frozen worker type, model, and zone metadata.
+            Frozen worker address, type, and model metadata.
         """
         worker_type = {
             "prefill": pb.WORKER_TYPE_PREFILL,
             "decode": pb.WORKER_TYPE_DECODE,
         }.get(args.disaggregation_mode, pb.WORKER_TYPE_REGULAR)
+        worker_addr = f"{args.host}:{args.load_reporter_port}"
         return cls(
+            worker_addr=worker_addr,
             worker_type=worker_type,
             model=args.served_model_name,
-            zone=args.load_reporter_zone,
         )

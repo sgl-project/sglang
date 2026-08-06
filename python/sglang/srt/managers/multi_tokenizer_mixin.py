@@ -42,16 +42,6 @@ from sglang.srt.disaggregation.utils import TransferBackend
 # IPC/exception types are lightweight and safe to import at module load time;
 # the gRPC-backed runtime and sampler remain lazy to preserve the optional
 # dependency boundary.
-from sglang.srt.load_reporter.ipc import (
-    LoadReporterDependencyUnavailableError,
-    LoadReporterInternalError,
-    LoadReporterUnavailableError,
-)
-from sglang.srt.load_reporter.registration import (
-    RuntimeClosingError,
-    StartReportingRequest,
-    WorkerIdentityConflict,
-)
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -62,11 +52,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     FreezeGCReq,
-    LoadReporterIpcCode,
     LoadReporterRefreshIpcReq,
-    LoadReporterStartIpcReqInput,
-    LoadReporterStartIpcReqOutput,
-    LoadReporterStateBroadcastReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     TokenizerWorkerRegistrationReq,
@@ -95,6 +81,43 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _await_reporter_startup(
+    future: "concurrent.futures.Future",
+    loop: asyncio.AbstractEventLoop,
+    timeout: float,
+) -> Optional[Any]:
+    """Block on the router reporter startup future, cleaning up on timeout.
+
+    On timeout the pending startup coroutine is cancelled so it cannot keep
+    running (and bind the reporter port) after router construction has failed.
+    A done-callback also guards the cancel-vs-complete race: if the coroutine
+    had already produced a handle by the time we cancel, that late handle is
+    closed on ``loop`` so no listener leaks.  The ``TimeoutError`` is re-raised
+    to fail construction.
+    """
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+
+        def _close_if_produced(fut: "concurrent.futures.Future") -> None:
+            # Fires when the future settles.  A won cancel leaves it cancelled
+            # (the coroutine's own teardown releases the partial handle); a lost
+            # cancel leaves a real handle here that must not leak.
+            if fut.cancelled():
+                return
+            try:
+                handle = fut.result()
+            except Exception:
+                return
+            if handle is not None:
+                loop.call_soon_threadsafe(lambda: loop.create_task(handle.close()))
+
+        future.add_done_callback(_close_if_produced)
+        logger.warning("Timed out starting the router-owned load reporter")
+        raise TimeoutError("router load reporter startup timed out")
 
 
 class SocketMapping:
@@ -475,9 +498,7 @@ class MultiTokenizerRouter:
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
-        # Load reporter runtime (lazy-created on first start request)
-        self._load_reporter_runtime: Optional[Any] = None
-        self._load_reporter_active: bool = False
+        self._load_reporter_handle: Optional[Any] = self._start_load_reporter_owner()
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -513,178 +534,51 @@ class MultiTokenizerRouter:
         # Drain anything already queued before the fd was registered.
         self.load_snapshot_reader.poll()
 
-    # ------------------------------------------------------------------
-    # Load reporter ownership (router is the sole owner in multi-tokenizer mode)
-    # ------------------------------------------------------------------
+    def _start_load_reporter_owner(self) -> Optional[Any]:
+        """Start the router-owned reporter on the router loop (sole port owner).
 
-    async def _handle_load_reporter_start(
-        self, request: LoadReporterStartIpcReqInput
-    ) -> None:
-        """Handle start_reporting request from worker, send IPC response.
-
-        Lazy-creates the LoadReporterRuntime on first call. Maps all exceptions
-        to stable LoadReporterIpcCode values. Always sends a response back to
-        http_worker_ipc (if present).
+        Reads scheduler load from the router's shared-memory reader. Returns
+        ``None`` when reporting is disabled. Runs the async composition root on
+        ``self._loop`` and blocks until the listener is bound so an occupied
+        fixed port fails router construction explicitly.
         """
-        # Lazy-create runtime on first start request (singleton)
-        if self._load_reporter_runtime is None:
-            try:
-                from sglang.srt.load_reporter import (
-                    describe_optional_dependency_error,
-                )
-                from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-                from sglang.srt.load_reporter.sampler import RouterLoadSnapshotSource
+        if self.server_args.load_reporter_port is None:
+            return None
 
-                source = RouterLoadSnapshotSource(
-                    self.load_snapshot_reader,
-                    range(self.server_args.dp_size),
-                )
-                self._load_reporter_runtime = LoadReporterRuntime(
-                    source,
-                    self.server_args,
-                    active_changed=self._broadcast_load_reporter_state,
-                )
-            except (ModuleNotFoundError, RuntimeError) as exc:
-                dependency_error = describe_optional_dependency_error(exc)
-                if dependency_error is None:
-                    raise
-                self._send_load_reporter_start_response(
-                    request,
-                    LoadReporterStartIpcReqOutput(
-                        request_id=request.request_id,
-                        code=LoadReporterIpcCode.DEPENDENCY_UNAVAILABLE,
-                        message=dependency_error,
-                    ),
-                )
-                return
+        from sglang.srt.load_reporter import start_load_reporter
+        from sglang.srt.load_reporter.sampler import RouterLoadSnapshotSource
 
-        # Reconstruct StartReportingRequest from IPC input
-        payload = StartReportingRequest(
-            ip=request.router_host,
-            port=request.router_port,
-            report_interval_ms=request.report_interval_ms,
-            lease_ttl_ms=request.lease_ttl_ms,
+        source = RouterLoadSnapshotSource(
+            self.load_snapshot_reader, range(self.server_args.dp_size)
         )
-
-        response: LoadReporterStartIpcReqOutput
-        try:
-            result = await self._load_reporter_runtime.start_reporting(
-                payload, request.worker_addr
-            )
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.OK,
-                status=result.status,
-                lease_ttl_ms=result.lease_ttl_ms,
-                renew_after_ms=result.renew_after_ms,
-            )
-        except WorkerIdentityConflict as exc:
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.CONFLICT,
-                message=str(exc),
-            )
-        except RuntimeClosingError as exc:
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.CLOSING,
-                message=str(exc),
-            )
-        except LoadReporterUnavailableError as exc:
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.UNAVAILABLE,
-                message=str(exc),
-            )
-        except LoadReporterDependencyUnavailableError as exc:
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.DEPENDENCY_UNAVAILABLE,
-                message=str(exc),
-            )
-        except LoadReporterInternalError as exc:
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.INTERNAL,
-                message=str(exc),
-            )
-        except Exception as exc:
-            logger.exception("Load reporter start_reporting internal error")
-            response = LoadReporterStartIpcReqOutput(
-                request_id=request.request_id,
-                code=LoadReporterIpcCode.INTERNAL,
-                message=f"internal error: {type(exc).__name__}",
-            )
-
-        self._send_load_reporter_start_response(request, response)
-
-    def _send_load_reporter_start_response(
-        self,
-        request: LoadReporterStartIpcReqInput,
-        response: LoadReporterStartIpcReqOutput,
-    ) -> None:
-        """Return one load-reporter control response to its HTTP worker.
-
-        Args:
-            request: Original IPC request containing the reply address.
-            response: Correlated response to send.
-
-        Returns:
-            None.
-        """
-        if request.http_worker_ipc:
-            self.socket_mapping.send_output(
-                request.http_worker_ipc, response, is_tokenizer=True
-            )
-        else:
-            logger.error("LoadReporterStartIpcReqInput missing http_worker_ipc")
+        future = asyncio.run_coroutine_threadsafe(
+            start_load_reporter(self.server_args, source, event_owner=None),
+            self._loop,
+        )
+        return _await_reporter_startup(future, self._loop, timeout=10.0)
 
     def _handle_load_reporter_refresh(self, request: LoadReporterRefreshIpcReq) -> None:
-        """Handle refresh hint from worker.
-
-        If runtime not yet created, log and return (no-op). Otherwise, notify
-        the runtime to trigger a sampler refresh.
-        """
-        if self._load_reporter_runtime is None:
-            logger.debug("Received refresh hint but runtime not yet created")
+        """Forward a worker refresh hint to the router-owned reporter."""
+        if self._load_reporter_handle is None:
             return
-        self._load_reporter_runtime.notify_refresh()
-
-    def _broadcast_load_reporter_state(self, active: bool) -> None:
-        """Broadcast active-state change to all registered workers.
-
-        Called by LoadReporterRuntime when the active state changes (monitor
-        count goes 0→1 or 1→0). Workers need this to enable/disable their
-        refresh notifiers.
-        """
-        self._load_reporter_active = active
-        broadcast = LoadReporterStateBroadcastReq(
-            active=active,
-            coalesce_window_ms=50,
-        )
-        for ipc_name in self.all_worker_ipcs:
-            self.socket_mapping.send_output(ipc_name, broadcast, is_tokenizer=True)
+        self._load_reporter_handle.notify_refresh()
 
     def _update_load_reporter_expected_ranks(self, effective_ep_size: int) -> None:
-        """Update expected_dp_ranks after elastic scale change.
+        """Update expected_dp_ranks after an elastic scale change.
 
-        Called when dp_size changes (elastic scale up/down). If the source
-        reports that ranks changed, notify the runtime to trigger a refresh.
+        Called when dp_size changes (elastic scale up/down); triggers a refresh
+        if the source accepted a changed rank set.
         """
-        if self._load_reporter_runtime is None:
+        if self._load_reporter_handle is None:
             return
-        self._load_reporter_runtime.update_expected_dp_ranks(range(effective_ep_size))
+        self._load_reporter_handle.update_expected_dp_ranks(range(effective_ep_size))
 
     async def _close_load_reporter_owner(self) -> None:
-        """Close the load reporter runtime if it was created.
-
-        Called on the router event loop by the parent shutdown hook. Awaits
-        runtime.close() so all monitors and tasks are cleanly shut down.
-        """
-        runtime = self._load_reporter_runtime
-        if runtime is not None:
-            self._load_reporter_runtime = None
-            await runtime.close()
+        """Close the router-owned reporter handle on the router event loop."""
+        handle = self._load_reporter_handle
+        if handle is not None:
+            self._load_reporter_handle = None
+            await handle.close()
 
     def _close_load_snapshot_reader(self) -> None:
         """Close the Router-owned snapshot reader on the Router event loop.
@@ -722,20 +616,6 @@ class MultiTokenizerRouter:
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
-                    # Send current load-reporter state to newly-registered worker
-                    if self._load_reporter_runtime is not None:
-                        broadcast = LoadReporterStateBroadcastReq(
-                            active=self._load_reporter_active,
-                            coalesce_window_ms=50,
-                        )
-                        self.socket_mapping.send_output(
-                            recv_obj.worker_ipc_name, broadcast, is_tokenizer=True
-                        )
-                continue
-
-            # Intercept load-reporter control requests (do NOT forward to scheduler)
-            if isinstance(recv_obj, LoadReporterStartIpcReqInput):
-                await self._handle_load_reporter_start(recv_obj)
                 continue
 
             if isinstance(recv_obj, LoadReporterRefreshIpcReq):
@@ -798,7 +678,7 @@ class MultiTokenizerRouter:
         Returns:
             None.
         """
-        if self._load_reporter_runtime is None and self.load_snapshot_reader is None:
+        if self._load_reporter_handle is None and self.load_snapshot_reader is None:
             return
         future = asyncio.run_coroutine_threadsafe(
             self._close_router_owned_resources(), self._loop
