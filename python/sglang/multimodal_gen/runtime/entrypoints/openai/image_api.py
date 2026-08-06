@@ -252,13 +252,23 @@ def _get_response_resize(
                 width, height = output_image.size
             return f"{width}x{height}"
         except (OSError, ValueError):
-            # Fall back to the aligned sampling canvas if the output cannot be
-            # inspected (for example, for a custom output transport).
+            # Fall back to request metadata if the output cannot be inspected
+            # (for example, for a custom output transport).
             pass
 
-    if sampling_params.width is None or sampling_params.height is None:
+    width = (
+        sampling_params.requested_width
+        if sampling_params.requested_width is not None
+        else sampling_params.width
+    )
+    height = (
+        sampling_params.requested_height
+        if sampling_params.requested_height is not None
+        else sampling_params.height
+    )
+    if width is None or height is None:
         return None
-    return sampling_params.output_size_str()
+    return f"{width}x{height}"
 
 
 @router.post("/generations", response_model=ImageResponse)
