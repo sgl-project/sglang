@@ -401,6 +401,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         window_start = (window_start // page_size) * page_size
         return seq_len - window_start
 
+    def _swa_tail_charge(self, fill_len: int) -> int:
+        """SWA tokens the pool actually loses to a tail-only preallocation.
+
+        `alloc_extend_swa_tail` reserves whole pages --
+        `num_swa_pages = ceil(swa_tail_len / page_size)` -- while
+        `_swa_tail_len` subtracts a page-aligned window start from `fill_len`,
+        so its result is page-aligned only when `fill_len` is. `fill_len` is a
+        request's live token count (`_pre_alloc_fill_len`), which is arbitrary,
+        so the unrounded length under-charges by `page_size - (fill_len %
+        page_size)` on nearly every admission. The charge has to match the
+        debit: the FULL side already rounds via `_required_alloc_tokens`, and
+        an SWA charge that drifts below the debit drains the pool faster than
+        admission believes and ends at the `kv_loc is not None` assert.
+
+        Never exceeds the fallback charge: the tail path is only taken when the
+        raw tail fits in the delta, so rounding it up stays within the delta's
+        own page count.
+        """
+        tail = self._swa_tail_len(fill_len)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size <= 1:
+            return tail
+        return -(-tail // page_size) * page_size
+
     def _swa_retractable_len(self, req: Req) -> int:
         if not self._uses_swa_tail_prealloc():
             return len(req.origin_input_ids) + len(req.output_ids)
@@ -444,7 +468,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._takes_swa_tail_path(
             fill_len=allocated_kv_len, total_prefix_len=total_prefix_len
         ):
-            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
+            return allocated_kv_len, self._swa_tail_charge(allocated_kv_len)
         return allocated_kv_len, self._required_alloc_tokens(
             fill_len=allocated_kv_len, prefix_len=prefix_len
         )

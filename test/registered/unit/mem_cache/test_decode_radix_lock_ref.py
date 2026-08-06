@@ -255,6 +255,39 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         _, swa_no_gap = queue._prealloc_kv_lens(req, prefix_len=64)
         self.assertEqual(swa_no_gap, queue._swa_tail_len(fill_len))
 
+    def test_swa_charge_is_the_page_the_allocator_debits_not_the_raw_tail(self):
+        """The charge has to be what `alloc_extend_swa_tail` actually takes.
+
+        The allocator reserves whole pages --
+        `num_swa_pages = ceil(swa_tail_len / page_size)` -- while
+        `_swa_tail_len` subtracts a page-aligned window start from `fill_len`,
+        so it lands on a page boundary only when `fill_len` does. `fill_len` is
+        `_pre_alloc_fill_len`, a live token count, so it generally does not:
+        charging the raw tail under-reserves by up to a page on nearly every
+        admission, and an SWA charge below the SWA debit drains the pool faster
+        than admission believes until `_pre_alloc` hits its
+        `kv_loc is not None` assert.
+
+        DeepSeek-V4-Pro's geometry makes this unavoidable rather than a corner
+        case: window 128 is smaller than page 256, so the tail is a window plus
+        a partial page and can never be aligned unless `fill_len` is.
+        """
+        page_size, window = 256, 128
+        # 1000 = 3 * 256 + 232 -- the tail stops 24 tokens short of a page.
+        fill_len = 1000
+        queue = self._swa_queue(
+            page_size=page_size, window=window, fill_len=fill_len
+        )
+        req = MagicMock()
+
+        raw_tail = queue._swa_tail_len(fill_len)
+        self.assertEqual(raw_tail, 232)
+        self.assertNotEqual(raw_tail % page_size, 0)
+
+        _, swa = queue._prealloc_kv_lens(req, prefix_len=0)
+        self.assertEqual(swa, page_size)
+        self.assertGreater(swa, raw_tail)
+
     def test_a_hit_is_never_charged_more_than_a_miss(self):
         """The property the change buys, swept over every prefix length.
 
@@ -266,22 +299,39 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
           * window does not fit      -> the delta is SMALLER than the window,
                                         so the charge is smaller still
         Either way the hit is never the more expensive branch, in either pool.
+
+        Swept over both geometries because rounding the tail up to a page could
+        invert this: the production layout (window < page) is the one where the
+        rounding is not a no-op, so an over-correction there would make a hit
+        cost more than the miss it replaced and put the head-of-line block back.
         """
-        fill_len = 1024
-        queue = self._swa_queue(fill_len=fill_len)
-        req = MagicMock()
-        req.sampling_params.max_new_tokens = 0
+        for page_size, window in ((64, 128), (256, 128)):
+            with self.subTest(page_size=page_size, window=window):
+                fill_len = 1000
+                queue = self._swa_queue(
+                    page_size=page_size, window=window, fill_len=fill_len
+                )
+                req = MagicMock()
+                req.sampling_params.max_new_tokens = 0
 
-        _, swa_on_miss = queue._prealloc_kv_lens(req, prefix_len=0)
-        full_on_miss = queue._required_alloc_tokens(fill_len=fill_len, prefix_len=0)
+                _, swa_on_miss = queue._prealloc_kv_lens(req, prefix_len=0)
+                full_on_miss = queue._required_alloc_tokens(
+                    fill_len=fill_len, prefix_len=0
+                )
 
-        for prefix_len in range(0, fill_len, 64):
-            _, swa_on_hit = queue._prealloc_kv_lens(req, prefix_len=prefix_len)
-            full_on_hit = queue._required_alloc_tokens(
-                fill_len=fill_len, prefix_len=prefix_len
-            )
-            self.assertLessEqual(swa_on_hit, swa_on_miss, f"{prefix_len=} SWA")
-            self.assertLessEqual(full_on_hit, full_on_miss, f"{prefix_len=} FULL")
+                for prefix_len in range(0, fill_len, 8):
+                    _, swa_on_hit = queue._prealloc_kv_lens(
+                        req, prefix_len=prefix_len
+                    )
+                    full_on_hit = queue._required_alloc_tokens(
+                        fill_len=fill_len, prefix_len=prefix_len
+                    )
+                    self.assertLessEqual(
+                        swa_on_hit, swa_on_miss, f"{prefix_len=} SWA"
+                    )
+                    self.assertLessEqual(
+                        full_on_hit, full_on_miss, f"{prefix_len=} FULL"
+                    )
 
     def test_ordinary_hit_admitted_where_it_used_to_be_rejected(self):
         """An SWA budget that fits one window but not the delta: before the
