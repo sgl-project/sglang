@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     DenoisingStage,
+    EncoderOutputStage,
     ImageEncodingStage,
     ImageVAEEncodingStage,
     InputValidationStage,
@@ -103,8 +104,10 @@ class ComposedPipelineBase(ABC):
         use. The pipeline should be stateless and not hold any batch state.
         """
         self.server_args = server_args
-        self._disagg_role = server_args.disagg_role
-        self.validate_disagg_role(self._disagg_role)
+        self._role = (
+            RoleType.ENCODER if server_args.encode_only else server_args.disagg_role
+        )
+        self.validate_disagg_role(self._role)
 
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
@@ -123,22 +126,26 @@ class ComposedPipelineBase(ABC):
         self._required_config_modules = list(base_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
-        # Filter modules based on disaggregation role
-        if self._disagg_role != RoleType.MONOLITHIC:
+        # Filter modules based on pipeline role
+        if self._role != RoleType.MONOLITHIC:
             original_modules = list(self._required_config_modules)
             task_name = self.server_args.pipeline_config.task_type.name.lower()
+            extra_allowed_modules = self._get_extra_allowed_modules_for_role(
+                self._role, task_name
+            )
+            if server_args.encode_only:
+                extra_allowed_modules.add("vae")
+                server_args.pipeline_config.vae_config.load_encoder = True
             self._required_config_modules = filter_modules_for_role(
                 self._required_config_modules,
-                self._disagg_role,
-                extra_allowed_modules=self._get_extra_allowed_modules_for_role(
-                    self._disagg_role, task_name
-                ),
+                self._role,
+                extra_allowed_modules=extra_allowed_modules,
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:
                 logger.info(
-                    "Disagg role=%s: skipping modules %s",
-                    self._disagg_role.value,
+                    "Role=%s: skipping modules %s",
+                    self._role.value,
                     sorted(skipped),
                 )
 
@@ -165,6 +172,8 @@ class ComposedPipelineBase(ABC):
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
+        if self.server_args.encode_only:
+            self.add_stage(EncoderOutputStage(vae=self.get_module("vae")))
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -325,9 +334,9 @@ class ComposedPipelineBase(ABC):
                 if hasattr(pipeline_cfg, "post_init"):
                     pipeline_cfg.post_init()
                 logger.info(
-                    "Disagg role=%s: initialized %s config from HF JSON "
+                    "Role=%s: initialized %s config from HF JSON "
                     "(spatial_compression_ratio=%s)",
-                    self._disagg_role.value,
+                    self._role.value,
                     module_name,
                     getattr(
                         getattr(pipeline_cfg, "arch_config", None),
@@ -337,9 +346,9 @@ class ComposedPipelineBase(ABC):
                 )
             except Exception as e:
                 logger.warning(
-                    "Disagg role=%s: failed to read HF config for skipped "
+                    "Role=%s: failed to read HF config for skipped "
                     "component %s: %s",
-                    self._disagg_role.value,
+                    self._role.value,
                     module_name,
                     e,
                 )
@@ -397,15 +406,15 @@ class ComposedPipelineBase(ABC):
 
                     module_role = get_module_role("transformer_2")
                     if (
-                        self._disagg_role == RoleType.MONOLITHIC
+                        self._role == RoleType.MONOLITHIC
                         or module_role is None
-                        or module_role == self._disagg_role
+                        or module_role == self._role
                     ):
                         self.required_config_modules.append("transformer_2")
                     else:
                         logger.info(
-                            "Disagg role=%s: skipping dynamically added module transformer_2",
-                            self._disagg_role.value,
+                            "Role=%s: skipping dynamically added module transformer_2",
+                            self._role.value,
                         )
             else:
                 logger.info(
@@ -429,9 +438,9 @@ class ComposedPipelineBase(ABC):
             len(model_index) > 1
         ), "model_index.json must contain at least one pipeline module"
 
-        # In disagg mode, read HF config for skipped components (e.g., VAE)
+        # For partial roles, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
-        if self._disagg_role != RoleType.MONOLITHIC:
+        if self._role != RoleType.MONOLITHIC:
             self._init_skipped_component_configs(model_index, server_args)
 
         model_index = {
@@ -614,14 +623,14 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
-        if self._disagg_role == RoleType.MONOLITHIC:
+        if self._role == RoleType.MONOLITHIC:
             return True
-        if role_affinity == self._disagg_role:
+        if role_affinity == self._role:
             return True
 
         logger.info(
-            "Disagg role=%s: skipping stage %s (affinity=%s)",
-            self._disagg_role.value,
+            "Role=%s: skipping stage %s (affinity=%s)",
+            self._role.value,
             stage_name,
             role_affinity.value,
         )

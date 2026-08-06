@@ -380,6 +380,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Serve only encoder-side components (text encoders, VAE); no denoising/decoding
+    encode_only: bool = False
+
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600
@@ -474,6 +477,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        if self.encode_only and self.disagg_role != RoleType.MONOLITHIC:
+            raise ValueError("--encode-only cannot be combined with --disagg-role")
         self._validate_pipeline()
         self._validate_offload()
         if not current_platform.is_cpu():
@@ -1770,6 +1775,12 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
+            "--encode-only",
+            action="store_true",
+            default=ServerArgs.encode_only,
+            help="Serve only encoder-side components (text encoders, VAE); requests return encoder outputs instead of generated media.",
         )
         parser.add_argument(
             "--host",

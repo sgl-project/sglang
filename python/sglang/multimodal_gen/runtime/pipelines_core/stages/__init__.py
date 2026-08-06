@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_dmd import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encoding import EncodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    EncoderOutputStage,
     ImageEncodingStage,
     ImageVAEEncodingStage,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "ConditionEncodingStage",
     "AuxiliaryConditionEncodingStage",
     "DecodingStage",
+    "EncoderOutputStage",
     "ImageEncodingStage",
     "ImageVAEEncodingStage",
     "TextEncodingStage",

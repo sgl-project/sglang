@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+    encode_api,
     rollout_api,
     weights_api,
 )
@@ -413,6 +414,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
+    app.include_router(encode_api.router)
 
     app.state.server_args = server_args
     return app
