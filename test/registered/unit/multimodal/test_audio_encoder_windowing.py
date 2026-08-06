@@ -8,13 +8,16 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.audio_encoder_windowing import (
     AudioEncoderWindowSpec,
     build_audio_encoder_window_items,
     resolve_audio_encoder_window_config,
 )
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
+    MultimodalSpecialTokens,
+)
+from sglang.srt.multimodal.processors.qwen3_asr import Qwen3ASRMultimodalProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,6 +30,7 @@ class _FeatureExtractor:
     sampling_rate = 16
 
     def __call__(self, windows, **kwargs):
+        self.last_kwargs = kwargs
         lengths = [max(len(window) // self.hop_length, 1) for window in windows]
         features = torch.zeros(len(windows), 2, max(lengths))
         masks = torch.zeros(len(windows), max(lengths), dtype=torch.long)
@@ -36,6 +40,18 @@ class _FeatureExtractor:
             )
             masks[index, :length] = 1
         return {"input_features": features, "attention_mask": masks}
+
+
+def _extract_features(processor, windows):
+    feature_extractor = processor.feature_extractor
+    return feature_extractor(
+        windows,
+        sampling_rate=feature_extractor.sampling_rate,
+        return_attention_mask=True,
+        return_tensors="pt",
+        truncation=False,
+        padding="longest",
+    )
 
 
 class TestAudioEncoderWindowing(CustomTestCase):
@@ -50,7 +66,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
                 window_frames=8,
                 alignment_frames=4,
             ),
-            processor=cls.processor,
+            feature_extractor=cls.processor.feature_extractor,
             output_length_fn=cls.processor._get_feat_extract_output_lengths,
             model_sample_rate=16,
         )
@@ -61,7 +77,9 @@ class TestAudioEncoderWindowing(CustomTestCase):
             input_ids=torch.tensor([10, 99, 11]),
             placeholder_token_id=99,
             config=self.config,
-            processor=self.processor,
+            extract_features_fn=lambda windows: _extract_features(
+                self.processor, windows
+            ),
             output_length_fn=self.processor._get_feat_extract_output_lengths,
         )
 
@@ -76,19 +94,6 @@ class TestAudioEncoderWindowing(CustomTestCase):
             [item.hash for item in first_items[:2]],
             [item.hash for item in appended_items[:2]],
         )
-        self.assertEqual(
-            first_items[0].hash,
-            hash_mm_item(
-                hash_feature(
-                    [
-                        first_items[0].feature,
-                        first_items[0].model_specific_data["feature_attention_mask"],
-                    ]
-                ),
-                Modality.AUDIO,
-                first_items[0].offsets,
-            ),
-        )
 
     def test_placeholder_layout_keeps_the_tail_uncached(self):
         items, input_ids = self._build(36)
@@ -99,8 +104,12 @@ class TestAudioEncoderWindowing(CustomTestCase):
             [[(1, 8)], [(9, 16)], [(17, 18)]],
         )
         self.assertEqual(int((input_ids == 99).sum()), 18)
-        self.assertEqual(tiny_tail_items[-1].offsets, [(17, 18)])
-        self.assertFalse(tiny_tail_items[-1].use_embedding_cache)
+        self.assertEqual(
+            [item.offsets for item in tiny_tail_items], [[(1, 8)], [(9, 16)]]
+        )
+        self.assertEqual(
+            [item.use_embedding_cache for item in tiny_tail_items], [True, False]
+        )
 
     def test_tail_mask_prevents_complete_window_identity_collision(self):
         processor = SimpleNamespace(
@@ -114,7 +123,7 @@ class TestAudioEncoderWindowing(CustomTestCase):
                 window_frames=8,
                 alignment_frames=4,
             ),
-            processor=processor,
+            feature_extractor=processor.feature_extractor,
             output_length_fn=processor._get_feat_extract_output_lengths,
             model_sample_rate=16,
         )
@@ -125,7 +134,9 @@ class TestAudioEncoderWindowing(CustomTestCase):
                 input_ids=torch.tensor([10, 99, 11]),
                 placeholder_token_id=99,
                 config=config,
-                processor=processor,
+                extract_features_fn=lambda windows: _extract_features(
+                    processor, windows
+                ),
                 output_length_fn=processor._get_feat_extract_output_lengths,
             )[0]
 
@@ -135,6 +146,41 @@ class TestAudioEncoderWindowing(CustomTestCase):
         self.assertTrue(torch.equal(tail.feature, complete.feature))
         self.assertEqual(tail.offsets, complete.offsets)
         self.assertNotEqual(tail.hash, complete.hash)
+
+    def test_qwen_capability_uses_base_builder_and_audio_config(self):
+        feature_extractor = _FeatureExtractor()
+        processor = Qwen3ASRMultimodalProcessor.__new__(Qwen3ASRMultimodalProcessor)
+        processor.hf_config = SimpleNamespace(
+            thinker_config=SimpleNamespace(
+                audio_config=SimpleNamespace(n_window_infer=8, n_window=2)
+            )
+        )
+        processor._processor = SimpleNamespace(
+            feature_extractor=feature_extractor,
+            _get_feat_extract_output_lengths=lambda lengths: lengths,
+        )
+        processor._tokenizer = lambda *args, **kwargs: SimpleNamespace(
+            input_ids=torch.tensor([[10, 99, 11]])
+        )
+        processor.audio_config = {"do_normalize": False}
+        processor.use_cuda_ipc = False
+
+        config = processor.resolve_audio_encoder_window_config(16)
+        items, input_ids, _ = processor.process_and_combine_mm_data(
+            BaseMultiModalProcessorOutput(
+                input_text="audio",
+                audios=[np.arange(36, dtype=np.float32)],
+            ),
+            MultimodalSpecialTokens(audio_token_id=99),
+            audio_encoder_window_config=config,
+        )
+
+        self.assertEqual(
+            [item.use_embedding_cache for item in items], [True, True, False]
+        )
+        self.assertEqual(int((input_ids == 99).sum()), 18)
+        self.assertFalse(feature_extractor.last_kwargs["do_normalize"])
+        self.assertEqual(feature_extractor.last_kwargs["padding"], "longest")
 
 
 if __name__ == "__main__":

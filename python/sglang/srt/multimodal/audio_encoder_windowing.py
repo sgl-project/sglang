@@ -49,7 +49,7 @@ class _AudioWindowFeatures(msgspec.Struct, frozen=True):
 def resolve_audio_encoder_window_config(
     spec: AudioEncoderWindowSpec,
     *,
-    processor: Any,
+    feature_extractor: Any,
     output_length_fn: Callable[[Any], Any],
     model_sample_rate: int,
 ) -> AudioEncoderWindowConfig:
@@ -66,7 +66,6 @@ def resolve_audio_encoder_window_config(
         )
     ):
         raise ValueError("audio window tensor keys must be non-empty")
-    feature_extractor = processor.feature_extractor
     if int(feature_extractor.sampling_rate) != model_sample_rate:
         raise ValueError("audio windowing and realtime model sample rates differ")
 
@@ -84,7 +83,7 @@ def _extract_audio_window_features(
     samples: Any,
     config: AudioEncoderWindowConfig,
     *,
-    processor: Any,
+    extract_features_fn: Callable[[list[np.ndarray]], Any],
     output_length_fn: Callable[[Any], Any],
 ) -> tuple[list[_AudioWindowFeatures], int]:
     """Extract one feature row per complete window plus a mutable tail."""
@@ -93,9 +92,17 @@ def _extract_audio_window_features(
         raise ValueError("audio windowing requires mono audio")
 
     complete_count, tail_samples = divmod(samples.size, config.window_samples)
-    sample_counts = [config.window_samples] * complete_count
-    if tail_samples:
-        sample_counts.append(tail_samples)
+    if tail_samples and tail_samples < config.min_input_samples and complete_count:
+        # Keep the sub-n_fft tail attached to the preceding window. Padding it
+        # as a standalone item would make artificial samples look valid in the
+        # attention mask; the merged item remains uncached and is recomputed.
+        complete_count -= 1
+        sample_counts = [config.window_samples] * complete_count
+        sample_counts.append(config.window_samples + tail_samples)
+    else:
+        sample_counts = [config.window_samples] * complete_count
+        if tail_samples:
+            sample_counts.append(tail_samples)
     if not sample_counts:
         raise ValueError("audio windowing requires non-empty audio")
 
@@ -109,15 +116,7 @@ def _extract_audio_window_features(
         windows.append(window)
         offset += sample_count
 
-    feature_extractor = processor.feature_extractor
-    audio_inputs = feature_extractor(
-        windows,
-        sampling_rate=feature_extractor.sampling_rate,
-        return_attention_mask=True,
-        return_tensors="pt",
-        truncation=False,
-        padding="longest",
-    )
+    audio_inputs = extract_features_fn(windows)
     processed_features = audio_inputs[config.feature_output_key]
     processed_masks = audio_inputs[config.attention_mask_output_key]
     token_counts = [
@@ -210,14 +209,14 @@ def build_audio_encoder_window_items(
     placeholder_token_id: int,
     config: AudioEncoderWindowConfig,
     *,
-    processor: Any,
+    extract_features_fn: Callable[[list[np.ndarray]], Any],
     output_length_fn: Callable[[Any], Any],
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Convert one audio input into reusable complete windows and a mutable tail."""
     window_features, complete_count = _extract_audio_window_features(
         samples,
         config,
-        processor=processor,
+        extract_features_fn=extract_features_fn,
         output_length_fn=output_length_fn,
     )
     return _build_audio_window_items(

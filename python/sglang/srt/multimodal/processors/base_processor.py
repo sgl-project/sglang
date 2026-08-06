@@ -386,13 +386,37 @@ class BaseMultimodalProcessor(ABC):
         """Map feature-frame lengths to encoder token counts."""
         return self._processor._get_feat_extract_output_lengths(feature_lengths)
 
+    def extract_audio_encoder_window_features(self, windows):
+        """Extract window features with the normal audio preprocessing config."""
+        feature_extractor = self._processor.feature_extractor
+        required = {
+            "sampling_rate": feature_extractor.sampling_rate,
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+            "truncation": False,
+            "padding": "longest",
+        }
+        kwargs = dict(self.audio_config)
+        conflicts = [
+            key
+            for key, value in required.items()
+            if key in kwargs and kwargs[key] != value
+        ]
+        if conflicts:
+            raise ValueError(
+                "audio windowing requires fixed preprocessing values for "
+                + ", ".join(sorted(conflicts))
+            )
+        kwargs.update(required)
+        return feature_extractor(windows, **kwargs)
+
     def resolve_audio_encoder_window_config(self, model_sample_rate: int):
         spec = self.audio_encoder_window_spec
         if spec is None:
             raise ValueError("model does not support audio encoder windowing")
         return resolve_audio_encoder_window_config(
             spec,
-            processor=self._processor,
+            feature_extractor=self._processor.feature_extractor,
             output_length_fn=self.get_audio_encoder_output_lengths,
             model_sample_rate=model_sample_rate,
         )
@@ -422,7 +446,7 @@ class BaseMultimodalProcessor(ABC):
             input_ids=input_ids,
             placeholder_token_id=placeholder_token_id,
             config=config,
-            processor=self._processor,
+            extract_features_fn=self.extract_audio_encoder_window_features,
             output_length_fn=self.get_audio_encoder_output_lengths,
         )
         if self.use_cuda_ipc:

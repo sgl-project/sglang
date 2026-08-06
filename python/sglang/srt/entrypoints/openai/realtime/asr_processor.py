@@ -414,18 +414,28 @@ class RealtimeASRProcessor:
             encoder_window_config=policy.encoder_window_config,
         )
         text = generation.text
-        text = state.transcript.trim_decoder_prefix_echo(text, step.decoder_prefix)
+        text = state.transcript.trim_decoder_prefix_echo(
+            text,
+            step.decoder_prefix,
+            # During the one-way handoff the complete decoder prefix is known
+            # existing context. Its exact replay must not be combined with the
+            # cumulative holdback a second time.
+            trim_short_prefix=not state.encoder_window_active,
+        )
 
         new_pcm = state.audio.snapshot(
             state.audio.last_processed_offset_bytes, step.end_offset_bytes
         )
-        if not text and new_pcm and not is_near_silent_pcm(new_pcm):
-            if step.is_last:
-                raise RuntimeError(
-                    "final realtime ASR decode returned empty for voiced audio"
-                )
-            # Keep every untranscribed voiced byte recoverable. The next append
-            # may submit more than the nominal context until decoding recovers.
+        if (
+            not text
+            and new_pcm
+            and not step.is_last
+            and not is_near_silent_pcm(new_pcm)
+            and len(new_pcm) <= policy.window_bytes
+        ):
+            # Retry one encoder window with more context. Beyond that horizon,
+            # accept an empty transcript so unrecognized audio cannot make
+            # per-request work grow without bound.
             return _TranscriptionOutcome(audio_processed=False)
 
         if not state.encoder_window_active:
@@ -480,15 +490,19 @@ class RealtimeASRProcessor:
         after its decode enters transcript state."""
         audio = state.audio
         audio.last_attempted_offset_bytes = step.end_offset_bytes
-        if outcome.decoder_update is not None:
+        if (
+            outcome.decoder_update is not None
+            and outcome.decoder_update.pending_suffix is not None
+        ):
             state.transcript.commit_decoder_suffix_update(
                 outcome.decoder_update,
                 is_last=step.is_last,
             )
-            state.encoder_window_active = True
             state.final_replay_required = outcome.final_replay_required
         if not outcome.audio_processed:
             return
+        if step.uses_encoder_windows:
+            state.encoder_window_active = True
         audio.last_processed_offset_bytes = step.end_offset_bytes
         if step.is_last:
             return

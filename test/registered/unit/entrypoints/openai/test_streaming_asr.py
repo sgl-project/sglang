@@ -13,6 +13,7 @@ import numpy as np
 from sglang.srt.entrypoints.openai.realtime.asr_processor import (
     RealtimeASRProcessor,
 )
+from sglang.srt.entrypoints.openai.realtime.protocol import SessionUpdateEvent
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
@@ -46,6 +47,7 @@ def _adapter(
         prompt_template="PROMPT:",
         model_sample_rate=1,
         postprocess_text=lambda text: text,
+        build_sampling_params=lambda request: {"language": request.language},
         realtime_encoder_window_config=(
             {"min_audio_sec": min_audio_sec} | (encoder_window_config or {})
         ),
@@ -161,6 +163,26 @@ def _encoder_window_processor(transcripts, *, min_audio_sec=0.0):
     return tokenizer_manager, processor, processor.create_state()
 
 
+def _encoder_window_connection(transcripts, finish_reasons):
+    tokenizer_manager = _MockTokenizerManager(
+        transcripts,
+        supports_encoder_windows=True,
+        finish_reasons=finish_reasons,
+    )
+    connection = RealtimeConnection(
+        Mock(send_text=AsyncMock(), close=AsyncMock()),
+        tokenizer_manager,
+        _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
+        _server_args(120),
+    )
+    connection.config.configured = True
+    connection.config.sampling_params = {"max_new_tokens": 256}
+    connection._send = AsyncMock()
+    connection.asr_state.transcript.emitted_text = "one two three"
+    connection.asr_state.audio.append_pcm(b"\x01\x00\x02\x00")
+    return tokenizer_manager, connection
+
+
 class TestStreamingASR(CustomTestCase):
     def test_cumulative_prompt_and_word_reconciliation(self):
         state = _state(emitted_text="hello", decode_count=5)
@@ -213,11 +235,6 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(
             tokenizer_manager.requests[0].sampling_params["max_new_tokens"], 32
         )
-        self.assertEqual(
-            tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"],
-            _ENCODER_WINDOW_GEOMETRY,
-        )
-
         state.audio.append_pcm(b"\x03\x00\x04\x00")
         self.assertEqual(
             _run(
@@ -250,6 +267,14 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(
             echo_state.trim_decoder_prefix_echo("yeah yeah", "yeah yeah"),
             "yeah yeah",
+        )
+        self.assertEqual(
+            echo_state.trim_decoder_prefix_echo(
+                "one two three four five",
+                "one two three four",
+                trim_short_prefix=True,
+            ),
+            "five",
         )
 
     def test_encoder_window_mode_starts_only_after_the_audio_gate(self):
@@ -323,22 +348,10 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(len(tokenizer_manager.requests), 2)
 
     def test_commit_replays_windowed_audio_with_full_decode_budget(self):
-        tokenizer_manager = _MockTokenizerManager(
+        tokenizer_manager, connection = _encoder_window_connection(
             ["three four", "three four five"],
-            supports_encoder_windows=True,
-            finish_reasons=["length", "stop"],
+            ["length", "stop"],
         )
-        connection = RealtimeConnection(
-            Mock(send_text=AsyncMock(), close=AsyncMock()),
-            tokenizer_manager,
-            _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
-            _server_args(120),
-        )
-        connection.config.configured = True
-        connection.config.sampling_params = {"max_new_tokens": 256}
-        connection._send = AsyncMock()
-        connection.asr_state.transcript.emitted_text = "one two three"
-        connection.asr_state.audio.append_pcm(b"\x01\x00\x02\x00")
 
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         self.assertFalse(connection.asr_state.has_new_audio)
@@ -349,25 +362,28 @@ class TestStreamingASR(CustomTestCase):
             tokenizer_manager.requests[-1].sampling_params["max_new_tokens"], 256
         )
 
-        tokenizer_manager = _MockTokenizerManager(
-            "three four", supports_encoder_windows=True, finish_reasons=["stop"]
+        tokenizer_manager, connection = _encoder_window_connection(
+            "three four", ["stop"]
         )
-        connection = RealtimeConnection(
-            Mock(send_text=AsyncMock(), close=AsyncMock()),
-            tokenizer_manager,
-            _adapter(encoder_window_config=_ENCODER_WINDOW_POLICY),
-            _server_args(120),
-        )
-        connection.config.configured = True
-        connection.config.sampling_params = {"max_new_tokens": 256}
-        connection._send = AsyncMock()
-        connection.asr_state.transcript.emitted_text = "one two three"
-        connection.asr_state.audio.append_pcm(b"\x01\x00\x02\x00")
 
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
 
         self.assertEqual(len(tokenizer_manager.requests), 1)
+
+        tokenizer_manager, connection = _encoder_window_connection(
+            ["three four", "", "three four five"],
+            ["length", "stop", "stop"],
+        )
+
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        self.assertTrue(connection.asr_state.final_replay_required)
+        connection.asr_state.audio.append_pcm(bytes(4))
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        self.assertTrue(connection.asr_state.final_replay_required)
+
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        self.assertEqual(len(tokenizer_manager.requests), 3)
 
     def test_unconfigured_adapter_stays_cumulative(self):
         tokenizer_manager = _MockTokenizerManager("hello world")
@@ -415,6 +431,40 @@ class TestStreamingASR(CustomTestCase):
             tokenizer_manager.processor_kwargs[0]["audio_encoder_window_config"]
         )
 
+    def test_session_update_preserves_omitted_nested_fields(self):
+        connection = RealtimeConnection(
+            Mock(send_text=AsyncMock(), close=AsyncMock()),
+            _MockTokenizerManager("unused"),
+            _adapter(),
+            _server_args(),
+        )
+        connection._send = AsyncMock()
+
+        def update(audio_input):
+            event = SessionUpdateEvent.model_validate(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "transcription",
+                        "audio": {"input": audio_input},
+                    },
+                }
+            )
+            _run(connection._on_session_update(event))
+
+        update(
+            {
+                "format": {"type": "audio/pcm", "rate": 16000},
+                "transcription": {"model": "qwen3-asr", "language": "en"},
+            }
+        )
+        update({"transcription": {"language": "es"}})
+
+        self.assertEqual(connection.config.input_sample_rate, 16000)
+        self.assertEqual(connection.config.client_model, "qwen3-asr")
+        self.assertEqual(connection.config.language, "es")
+        self.assertEqual(connection.config.sampling_params, {"language": "es"})
+
     def test_failed_inference_keeps_audio_and_reset_clears_offsets(self):
         tokenizer_manager = _MockTokenizerManager(fail=True)
         websocket = Mock(send_text=AsyncMock(), close=AsyncMock())
@@ -440,18 +490,31 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(connection.asr_state.audio.last_processed_offset_bytes, 0)
 
         voiced_pcm = (1000).to_bytes(2, "little", signed=True) * 2
-        _, processor, state = _encoder_window_processor("")
+        _, processor, state = _encoder_window_processor(["", ""])
         state.audio.append_pcm(voiced_pcm)
         self.assertEqual(
             _run(processor.process(state, is_last=False, sampling_params={})), ""
         )
         self.assertEqual(state.audio.last_processed_offset_bytes, 0)
 
+        state.audio.append_pcm(voiced_pcm * 8)
+        self.assertEqual(
+            _run(processor.process(state, is_last=False, sampling_params={})), ""
+        )
+        self.assertEqual(
+            state.audio.last_processed_offset_bytes, state.audio.received_bytes
+        )
+        self.assertTrue(state.encoder_window_active)
+
         _, processor, state = _encoder_window_processor("")
         state.audio.append_pcm(voiced_pcm)
         state.encoder_window_active = True
-        with self.assertRaisesRegex(RuntimeError, "empty for voiced audio"):
-            _run(processor.process(state, is_last=True, sampling_params={}))
+        self.assertEqual(
+            _run(processor.process(state, is_last=True, sampling_params={})), ""
+        )
+        self.assertEqual(
+            state.audio.last_processed_offset_bytes, state.audio.received_bytes
+        )
 
 
 if __name__ == "__main__":

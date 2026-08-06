@@ -63,7 +63,6 @@ from sglang.srt.entrypoints.openai.realtime.protocol import (
     SUPPORTED_INPUT_SAMPLE_RATES,
     AudioPCM,
     SessionUpdateEvent,
-    TranscriptionSessionAudioInput,
     TranscriptionSessionConfig,
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
@@ -252,17 +251,20 @@ class RealtimeConnection:
     async def _on_session_update(self, event: SessionUpdateEvent) -> None:
         cfg = event.session
 
-        # Normalize audio to an empty input cfg if absent so downstream
-        # `audio.X is not None` reads as a business rule, not an existence check.
-        # transcription stays nullable so partial-update can detect whether
-        # the client sent the block.
+        # Realtime session updates are patches. Pydantic preserves which nested
+        # fields were sent, so omitted values must not reset earlier settings.
+        session_audio = cfg.audio if "audio" in cfg.model_fields_set else None
         audio = (
-            cfg.audio.input if cfg.audio else None
-        ) or TranscriptionSessionAudioInput()
-        transcription = audio.transcription
+            session_audio.input
+            if session_audio is not None and "input" in session_audio.model_fields_set
+            else None
+        )
+        audio_fields = audio.model_fields_set if audio is not None else set()
+        transcription_present = "transcription" in audio_fields
+        transcription = audio.transcription if transcription_present else None
 
         # Validate first, then mutate config only after the whole update is accepted.
-        if audio.turn_detection is not None:
+        if audio is not None and audio.turn_detection is not None:
             await self._send_error(
                 "not_supported",
                 "Server-side VAD is not implemented; "
@@ -270,7 +272,7 @@ class RealtimeConnection:
                 param="session.audio.input.turn_detection",
             )
             return
-        if audio.noise_reduction is not None:
+        if audio is not None and audio.noise_reduction is not None:
             await self._send_error(
                 "not_supported",
                 "audio.input.noise_reduction is not supported; set to null.",
@@ -299,9 +301,12 @@ class RealtimeConnection:
             return
 
         new_rate = self.config.input_sample_rate  # default: keep current
-        fmt = audio.format
-        if fmt is not None:
-            if not isinstance(fmt, AudioPCM):
+        format_present = "format" in audio_fields
+        fmt = audio.format if format_present else None
+        if format_present:
+            if fmt is None:
+                new_rate = DEFAULT_INPUT_SAMPLE_RATE
+            elif not isinstance(fmt, AudioPCM):
                 # G.711 (pcmu / pcma): not implemented.
                 await self._send_error(
                     "not_supported",
@@ -310,7 +315,7 @@ class RealtimeConnection:
                     param="session.audio.input.format.type",
                 )
                 return
-            if fmt.rate is not None and fmt.rate not in SUPPORTED_INPUT_SAMPLE_RATES:
+            elif fmt.rate is not None and fmt.rate not in SUPPORTED_INPUT_SAMPLE_RATES:
                 await self._send_error(
                     "invalid_value",
                     f"audio.input.format.rate must be one of "
@@ -318,7 +323,8 @@ class RealtimeConnection:
                     param="session.audio.input.format.rate",
                 )
                 return
-            new_rate = fmt.rate or DEFAULT_INPUT_SAMPLE_RATE
+            else:
+                new_rate = fmt.rate or DEFAULT_INPUT_SAMPLE_RATE
             # Changing the rate mid-item would leave already-buffered PCM
             # at the old rate mixed with new audio at the new rate, so
             # require the client to commit or clear before switching.
@@ -333,9 +339,15 @@ class RealtimeConnection:
 
         # Mutation pass — no early returns past this point.
         self.config.input_sample_rate = new_rate
-        if transcription is not None:
-            self.config.client_model = transcription.model
-            self.config.language = transcription.language
+        if transcription_present:
+            if transcription is None:
+                self.config.client_model = None
+                self.config.language = None
+            else:
+                if "model" in transcription.model_fields_set:
+                    self.config.client_model = transcription.model
+                if "language" in transcription.model_fields_set:
+                    self.config.language = transcription.language
         self.config.sampling_params = self.adapter.build_sampling_params(
             TranscriptionRequest(language=self.config.language)
         )

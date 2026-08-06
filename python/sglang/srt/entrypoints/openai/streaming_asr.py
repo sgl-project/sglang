@@ -266,13 +266,21 @@ class StreamingASRState:
             pending_suffix=" ".join(decoded_words[emit_count:]),
         )
 
-    def trim_decoder_prefix_echo(self, decoded_suffix: str, decoder_prefix: str) -> str:
-        """Remove an implausibly large echo of the exact requested prefix."""
+    def trim_decoder_prefix_echo(
+        self,
+        decoded_suffix: str,
+        decoder_prefix: str,
+        *,
+        trim_short_prefix: bool = False,
+    ) -> str:
+        """Remove an exact replay of text already supplied to the decoder."""
         decoded_words = decoded_suffix.split()
         prefix_words = decoder_prefix.split()
         max_words_for_chunk = max(24, int(self.chunk_size_sec * 16))
-        if len(prefix_words) < max_words_for_chunk or len(decoded_words) < len(
-            prefix_words
+        if (
+            not prefix_words
+            or (not trim_short_prefix and len(prefix_words) < max_words_for_chunk)
+            or len(decoded_words) < len(prefix_words)
         ):
             return decoded_suffix
         if _normalized_word_prefix_len(prefix_words, decoded_words) != len(
@@ -285,9 +293,9 @@ class StreamingASRState:
         self, update: DecoderSuffixUpdate, *, is_last: bool
     ) -> str:
         """Commit a computed update after the request mode is accepted."""
-        self.decode_count += 1
         if update.pending_suffix is None:
             return ""
+        self.decode_count += 1
         delta = self._append_emitted_text(update.delta)
         self._set_pending_suffix("" if is_last else update.pending_suffix)
         return delta
