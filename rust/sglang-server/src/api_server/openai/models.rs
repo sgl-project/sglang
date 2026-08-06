@@ -8,7 +8,8 @@ use axum::{
     routing::get,
 };
 
-use super::{AppState, openai_error, unix_seconds_u32};
+use super::{AppState, error_payload, unix_seconds_u32};
+use crate::utils::response::error_response;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -25,9 +26,13 @@ async fn available_models(State(state): State<AppState>) -> Response {
 
 async fn retrieve_model(State(state): State<AppState>, Path(model): Path<String>) -> Response {
     if model != state.server_args.served_model_name {
-        return openai_error(
+        return error_response(
             StatusCode::NOT_FOUND,
-            format!("The model `{model}` does not exist"),
+            error_payload(
+                StatusCode::NOT_FOUND,
+                format!("The model `{model}` does not exist"),
+            ),
+            false,
         );
     }
     Json(model_card(&state)).into_response()
