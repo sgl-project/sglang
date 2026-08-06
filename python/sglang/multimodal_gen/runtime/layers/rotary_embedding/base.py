@@ -171,7 +171,17 @@ class RotaryEmbedding(CustomOp):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if cos_sin_cache is None or hasattr(self, "cos_sin_cache"):
+        if cos_sin_cache is None and cos is not None and sin is not None:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+        can_use_cuda = cos_sin_cache is not None and not hasattr(self, "cos_sin_cache")
+
+        if not can_use_cuda:
             return self.forward_native(
                 query=query,
                 key=key,
