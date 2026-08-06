@@ -889,6 +889,40 @@ class TestDSAIndexer(CustomTestCase):
         with self.assertRaises(AssertionError):
             rotate_activation(x)
 
+    def test_k_only_rotary_inputs_do_not_alias(self):
+        """The K-only prefill path must not pass one view as both Q and K."""
+        indexer = Indexer.__new__(Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.rope_head_dim = 2
+        indexer.rope_dim_at_front = False
+
+        raw_key = torch.arange(8, device=self.device, dtype=self.dtype).reshape(2, 4)
+        indexer.wk = MagicMock(return_value=(raw_key.clone(), None))
+        indexer.k_norm = MagicMock(side_effect=lambda value: value)
+
+        def rotary(positions, query, key):
+            self.assertNotEqual(query.data_ptr(), key.data_ptr())
+            return query, key + 1
+
+        indexer.rotary_emb = MagicMock(side_effect=rotary)
+        positions = torch.arange(2, device=self.device)
+
+        with patch(
+            "sglang.srt.layers.attention.dsa.dsa_indexer.rotate_activation",
+            side_effect=lambda value: value,
+        ):
+            result = indexer._get_k_bf16(
+                torch.empty(2, 1, device=self.device), positions, False
+            )
+
+        expected = raw_key.clone()
+        expected[..., -2:] += 1
+        torch.testing.assert_close(result, expected)
+
+    def test_tail_rope_disables_incompatible_indexer_fusion(self):
+        indexer = self._create_indexer(is_neox_style=False, rope_dim_at_front=False)
+        self.assertFalse(indexer.use_dsa_indexer_fusion)
+
     def test_indexer_metadata_interface(self):
         """Test the BaseIndexerMetadata interface implementation."""
         batch_size = 4

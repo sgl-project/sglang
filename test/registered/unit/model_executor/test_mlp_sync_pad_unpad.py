@@ -103,6 +103,67 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
 
+    def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
+        spec_info = MagicMock()
+        spec_info.num_tokens_per_req = 4
+        spec_info.is_draft_input.return_value = False
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=1,
+            input_ids=torch.empty(0, dtype=torch.int64),
+            req_pool_indices=torch.empty(0, dtype=torch.int64),
+            seq_lens=torch.empty(0, dtype=torch.int64),
+            seq_lens_sum=0,
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int64),
+            seq_lens_cpu=torch.empty(0, dtype=torch.int64),
+            extend_seq_lens=torch.empty(0, dtype=torch.int32),
+            extend_prefix_lens=torch.empty(0, dtype=torch.int64),
+            extend_seq_lens_cpu=[],
+            extend_prefix_lens_cpu=[],
+            extend_logprob_start_lens_cpu=[],
+            spec_info=spec_info,
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=4, bs=1)
+
+        torch.testing.assert_close(
+            fb.extend_seq_lens, torch.tensor([4], dtype=torch.int32)
+        )
+        torch.testing.assert_close(fb.extend_prefix_lens, torch.tensor([0]))
+        self.assertEqual(fb.extend_seq_lens_cpu, [4])
+        self.assertEqual(fb.extend_prefix_lens_cpu, [0])
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+    def test_empty_draft_keeps_normalized_dummy_logits(self):
+        spec_info = MagicMock()
+        spec_info.is_draft_input.return_value = True
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.IDLE,
+            batch_size=1,
+            input_ids=torch.tensor([0]),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1]),
+            seq_lens_sum=1,
+            out_cache_loc=torch.tensor([0]),
+            positions=torch.tensor([0]),
+            seq_lens_cpu=torch.tensor([1]),
+            spec_info=spec_info,
+        )
+        # Overlap may retain a scheduler dummy position while the previous
+        # batch's draft state is empty/stale.
+        fb._original_batch_size = 1
+        fb._original_num_tokens = 1
+        fb.hidden_states_backup = torch.empty((0, 8))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn(1, 16), hidden_states=torch.randn(1, 8)
+        )
+
+        fb.post_forward_mlp_sync_batch(logits_output)
+
+        self.assertEqual(logits_output.next_token_logits.shape[0], 1)
+        self.assertEqual(logits_output.hidden_states.shape[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

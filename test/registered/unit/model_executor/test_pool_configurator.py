@@ -150,7 +150,9 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        eagle_draft_swa_num_layers=None,
+        dflash_draft_num_layers=None,
     )
 
     return mr
@@ -558,6 +560,44 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+    def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
+        """A Dots-style SWA draft must not be charged as a full KV layer."""
+        available = 10_000_000
+        ratio = 0.25
+        mr = _make_model_runner(
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=4,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+            swa_num_kv_heads=2,
+            swa_head_dim=32,
+            swa_v_head_dim=32,
+            swa_full_tokens_ratio=ratio,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        full_tokens = config.full_max_total_num_tokens
+        swa_tokens = config.swa_max_total_num_tokens
+        full_pt = _full_per_token(mr)
+        swa_pt = _swa_per_token(mr)
+        used = full_tokens * full_pt * 2 + swa_tokens * swa_pt * 3
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
 
 class TestFactory(unittest.TestCase):

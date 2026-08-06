@@ -392,10 +392,14 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.rope_dim_at_front = rope_dim_at_front
+        # The fused DSV3.2 Q/K kernels currently hard-code RoPE in the leading
+        # dimensions.  Tail-RoPE models such as dots3 must use the generic path
+        # until those kernels accept the layout explicitly.
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
+            and rope_dim_at_front
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -658,7 +662,11 @@ class Indexer(MultiPlatformOp):
         key = self.k_norm(key)
         k_rope = self._select_rope_slice(key)
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        # The CUDA rotary implementation may update both inputs in place.  Do
+        # not alias its query and key inputs: doing so can rotate/corrupt the
+        # index K twice in the K-only path used by early chunked prefill.
+        dummy_q_rope = torch.empty_like(k_rope)
+        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(self._select_rope_slice(key), k_rope)
         key = rotate_activation(key)
 

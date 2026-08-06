@@ -2662,7 +2662,13 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
         # Multimodal features are embedded only on the first pipeline rank.
-        if self.pp_group.is_first_rank:
+        # Honor the standard language-only mode so an encoder/LLM deployment
+        # can keep the vision and audio towers out of the LLM process.  This is
+        # also useful for text-only long-context evaluation, where the towers'
+        # weights would otherwise unnecessarily reduce the KV-cache capacity.
+        if self.pp_group.is_first_rank and not getattr(
+            config, "language_only", False
+        ):
             self.audio_tower = DotsNoteOmniAudioEncoder(
                 str(model_dir / "new_ae")
             )
