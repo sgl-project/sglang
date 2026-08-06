@@ -870,7 +870,6 @@ class UnifiedRadixCache(BasePrefixCache):
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-
             # Overlapping chain actions may revisit nodes with Full KV already
             # backed up. Skip only when no transfer remains.
             if device_value.numel() == 0 and not comp_xfers:

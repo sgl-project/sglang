@@ -990,7 +990,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         state.phase = _InsertPhase.TAIL
 
-    def _has_missing_host_component(self, node: UnifiedTreeNode) -> bool:
+    def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
         return any(
             component.needs_incremental_backup(node)
             for component in self.components
@@ -1010,7 +1010,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and not self.is_write_back
             and node.backuped
             and node.write_through_pending_id is None
-            and self._has_missing_host_component(node)
+            and self._needs_incremental_component_backup(node)
         )
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
@@ -1179,7 +1179,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-
         if not node.backuped:
             if is_write_back:
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
