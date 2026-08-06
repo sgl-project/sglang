@@ -1356,6 +1356,10 @@ class Envs:
     SGLANG_RUST_SERVER = EnvBool(False)
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # Embedded PD load balancer (decode front door): deadline in seconds for one
+    # prefill forward (connect + request + response drain).
+    SGLANG_PD_LB_PREFILL_TIMEOUT_SECS = EnvInt(1800)
+    SGLANG_ENABLE_EMBEDDED_PD_LB = EnvBool(False)
 
 
 envs = Envs()

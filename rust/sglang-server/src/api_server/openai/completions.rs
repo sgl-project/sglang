@@ -18,6 +18,7 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -60,14 +61,28 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<AppState>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let request = match body {
-        Ok(Json(request)) => request,
+    let mut value = match body {
+        Ok(Json(value)) => value,
         Err(rejection) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
+                false,
+            );
+        }
+    };
+    // PD routing on the raw JSON — the Dynamo request type drops unknown keys
+    // (see the chat handler for the full story).
+    let (bootstrap, pd_forward) =
+        super::super::pd_lb::resolve_openai_bootstrap(&state.prefill_worker_pool, &mut value);
+    let request = match CreateCompletionRequest::deserialize(&value) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error_payload(StatusCode::BAD_REQUEST, error.to_string()),
                 false,
             );
         }
@@ -204,6 +219,11 @@ async fn completions(
                     Err(response) => return response,
                 };
             }
+            // `room + index` per choice, matching the rust prefill peer's
+            // expansion of the forwarded scalar. A *Python* prefill orders a
+            // prompt-list × n>1 fan-out sample-major instead — that mixed
+            // topology mispairs rooms and is unsupported (see `pd_lb`).
+            let choice_bootstrap = bootstrap.for_choice(index);
             let native = GenerateRequest {
                 rid: rid.clone(),
                 text: text.clone(),
@@ -218,6 +238,10 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
+                bootstrap_host: choice_bootstrap.bootstrap_host,
+                bootstrap_port: choice_bootstrap.bootstrap_port,
+                bootstrap_room: choice_bootstrap.bootstrap_room,
+                bootstrap_pair_key: choice_bootstrap.bootstrap_pair_key,
                 ..Default::default()
             };
             let rx = match submit_generation(&state, native, stream, &mut guard).await {
@@ -232,6 +256,20 @@ async fn completions(
                 rx,
             });
         }
+    }
+
+    // All local choices armed — fire the prefill copy; a failed forward
+    // Fail-aborts every rid (see `pd_lb`).
+    if let Some((pool, endpoint)) = pd_forward {
+        let rids = submitted.iter().map(|choice| choice.rid.clone()).collect();
+        super::super::pd_lb::spawn_forward(
+            pool,
+            endpoint,
+            "/v1/completions",
+            &value,
+            rids,
+            state.senders.clone(),
+        );
     }
 
     if stream {
