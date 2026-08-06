@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import fnmatch
 import os
 from pathlib import Path
 from typing import Optional
@@ -24,12 +25,25 @@ def pull_files_from_db(
     ignore_pattern: Optional[list[str]] = None,
 ) -> None:
     prefix = f"{model_name}/files/"
-    local_dir = connector.get_local_dir()
+    download_root = connector.get_local_dir()
     files = connector.list(prefix)
 
+    if allow_pattern is not None:
+        files = [
+            file
+            for file in files
+            if any(fnmatch.fnmatch(file, pattern) for pattern in allow_pattern)
+        ]
+    if ignore_pattern is not None:
+        files = [
+            file
+            for file in files
+            if not any(fnmatch.fnmatch(file, pattern) for pattern in ignore_pattern)
+        ]
+
     for file in files:
-        destination_file = os.path.join(local_dir, file.removeprefix(prefix))
-        local_dir = Path(destination_file).parent
-        os.makedirs(local_dir, exist_ok=True)
+        destination_file = os.path.join(download_root, file.removeprefix(prefix))
+        parent_dir = Path(destination_file).parent
+        os.makedirs(parent_dir, exist_ok=True)
         with open(destination_file, "wb") as f:
             f.write(connector.getstr(file).encode("utf-8"))
