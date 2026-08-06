@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    BoundedConsistentHashingConfig, BoundedConsistentHashingPolicy, BucketConfig, BucketPolicy,
+    CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+    RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -60,6 +61,11 @@ impl PolicyFactory {
                 Arc::new(ManualPolicy::with_config(config))
             }
             PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
+            PolicyConfig::BoundedConsistentHashing { max_load_skew } => Arc::new(
+                BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+                    max_load_skew: *max_load_skew,
+                }),
+            ),
             PolicyConfig::PrefixHash {
                 prefix_token_count,
                 load_factor,
@@ -84,6 +90,9 @@ impl PolicyFactory {
             "manual" => Some(Arc::new(ManualPolicy::new())),
             "consistent_hashing" | "consistenthashing" => {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
+            }
+            "bounded_consistent_hashing" | "boundedconsistenthashing" => {
+                Some(Arc::new(BoundedConsistentHashingPolicy::with_defaults()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             _ => None,
@@ -133,6 +142,11 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);
         assert_eq!(policy.name(), "consistent_hashing");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::BoundedConsistentHashing {
+            max_load_skew: 1.5,
+        });
+        assert_eq!(policy.name(), "bounded_consistent_hashing");
     }
 
     #[tokio::test]
@@ -151,6 +165,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("Manual").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hashing").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
+        assert!(PolicyFactory::create_by_name("bounded_consistent_hashing").is_some());
+        assert!(PolicyFactory::create_by_name("BoundedConsistentHashing").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

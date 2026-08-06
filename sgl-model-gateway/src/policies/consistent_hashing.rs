@@ -66,7 +66,7 @@ impl ConsistentHashingPolicy {
     /// This correctly handles filtered worker arrays since we match by URL, not by index.
     ///
     /// Complexity: O(n) to build healthy URL map + O(log n) ring lookup + O(k) walk
-    fn find_by_consistent_hash(
+    pub(crate) fn find_by_consistent_hash(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,

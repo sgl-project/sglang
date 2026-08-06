@@ -10,6 +10,7 @@ use smg_mesh::OptionalMeshSyncManager;
 
 use crate::core::{HashRing, Worker};
 
+mod bounded_consistent_hashing;
 mod bucket;
 mod cache_aware;
 mod consistent_hashing;
@@ -22,6 +23,9 @@ mod registry;
 mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
+pub use bounded_consistent_hashing::{
+    BoundedConsistentHashingConfig, BoundedConsistentHashingPolicy,
+};
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
