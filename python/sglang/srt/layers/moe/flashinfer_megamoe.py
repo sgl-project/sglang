@@ -559,8 +559,7 @@ def run_flashinfer_megamoe(
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
     )
-    with torch.inference_mode():
-        y = mega.forward(t)
+    y = mega.forward(t)
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor
