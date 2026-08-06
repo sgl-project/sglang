@@ -262,7 +262,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # filename logic.
     component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
-    # Quantization method for online quantization
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
@@ -334,10 +335,6 @@ class ServerArgs(DisaggServerArgsMixin):
 
     disable_autocast: bool | None = None
 
-    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
-    # When set, the transformer loader will use this instead of auto-detection.
-    quantization: str | None = None
-
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
@@ -385,9 +382,6 @@ class ServerArgs(DisaggServerArgsMixin):
             "dual_tower_bridge": True,
         }
     )
-
-    # # DMD parameters
-    # dmd_denoising_steps: List[int] | None = field(default=None)
 
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
