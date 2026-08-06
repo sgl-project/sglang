@@ -1120,7 +1120,15 @@ class ModelRunner:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        load_kv_cache_scales(model=self.model, server_args=self.server_args)
+        # Same leaf `configure_kv_cache_dtype` reads: the bag, not the startup
+        # record, so the FP8 gate and the pool cannot disagree after an
+        # override. (The runner's own stamp is not set yet -- load_model runs
+        # before configure_kv_cache_dtype.)
+        load_kv_cache_scales(
+            model=self.model,
+            server_args=self.server_args,
+            kv_cache_dtype=get_model().kv_cache_dtype,
+        )
 
         self.sliding_window_size = resolve_sliding_window_size(
             self.model, self.model_config
@@ -1268,7 +1276,7 @@ class ModelRunner:
         spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
@@ -1287,7 +1295,7 @@ class ModelRunner:
         self.kv_cache_dtype_str = (
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
-            else self.server_args.kv_cache_dtype
+            else get_model().kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
