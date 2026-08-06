@@ -4,6 +4,7 @@ import concurrent.futures
 import dataclasses
 import logging
 import os
+import signal
 import struct
 import threading
 import time
@@ -12,6 +13,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import psutil
 import zmq
 from prometheus_client import Counter
 
@@ -401,22 +403,35 @@ class MooncakeKVManager(CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
-    def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
-        """Notify decode that a non-last staging chunk RDMA is complete."""
+    def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank) -> bool:
+        """Notify decode that a non-last staging chunk RDMA is complete.
+
+        Returns False when the decode endpoint is unreachable so the caller
+        can fail the room; raising would escalate one dead decode endpoint
+        into a rank-fatal transfer-worker crash.
+        """
         na = NetworkAddress(req.endpoint, req.dst_port)
-        self._send_multipart_locked(
-            na.to_tcp(),
-            [
-                b"CHUNK_READY",
-                str(req.room).encode("ascii"),
-                str(chunk_idx).encode("ascii"),
-                str(kv_chunk.index_slice.start).encode("ascii"),
-                str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                req.mooncake_session_id.encode("ascii"),
-                str(prefill_unique_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
-        )
+        try:
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"CHUNK_READY",
+                    str(req.room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(kv_chunk.index_slice.start).encode("ascii"),
+                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                    req.mooncake_session_id.encode("ascii"),
+                    str(prefill_unique_rank).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except zmq.Again as error:
+            logger.warning(
+                f"Failed to send CHUNK_READY for room {req.room} to decode "
+                f"endpoint {na.to_host_port_str()} ({error}); failing the room."
+            )
+            return False
+        return True
 
     def _do_staging_transfer(
         self,
@@ -478,7 +493,12 @@ class MooncakeKVManager(CommonKVManager):
             )
             return (-1, False)
         if ret == 0 and not kv_chunk.is_last_chunk:
-            self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
+            if not self._send_chunk_ready(
+                req, chunk_idx, kv_chunk, prefill_unique_rank
+            ):
+                # Same contract as the ring-overflow -1 above: the caller's
+                # ret != 0 path fails this room.
+                return (-1, False)
         return (ret, False)
 
     def _prefetch_staging_reqs(self, room: int):
@@ -1069,14 +1089,24 @@ class MooncakeKVManager(CommonKVManager):
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
 
-            self.send_aux_data_to_endpoint(
-                remote=req.endpoint,
-                dst_port=req.dst_port,
-                room=req.room,
-                buffer_index=i,
-                aux_index=req.dst_aux_index,
-                data=data,
-            )
+            try:
+                self.send_aux_data_to_endpoint(
+                    remote=req.endpoint,
+                    dst_port=req.dst_port,
+                    room=req.room,
+                    buffer_index=i,
+                    aux_index=req.dst_aux_index,
+                    data=data,
+                )
+            except zmq.Again as error:
+                # Report per-request failure (the caller's ret != 0 path)
+                # rather than escalating an unreachable decode endpoint into a
+                # rank-fatal transfer-worker crash.
+                logger.warning(
+                    f"Failed to send aux data for room {req.room} to decode "
+                    f"endpoint {req.endpoint}:{req.dst_port} ({error})."
+                )
+                return -1
 
         return 0
 
@@ -1501,15 +1531,26 @@ class MooncakeKVManager(CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._send_multipart_locked(
-            na.to_tcp(),
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
-        )
+        try:
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except zmq.Again as error:
+            # Best-effort: the local status is already recorded and decode
+            # discovers the outcome via its own waiting timeout. Raising would
+            # escalate one unreachable decode endpoint into a rank-fatal
+            # transfer-worker crash and skip the remaining endpoint syncs of
+            # this request.
+            logger.warning(
+                f"Failed to sync status {status} of room {room} to decode "
+                f"endpoint {na.to_host_port_str()} ({error})."
+            )
 
     def transfer_worker(
         self,
@@ -1519,6 +1560,10 @@ class MooncakeKVManager(CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
+        # Capture now, matching run_scheduler_process: if the launcher dies
+        # first, this thread gets reparented and a lookup at crash time would
+        # signal the adoptive parent instead.
+        parent_process = psutil.Process().parent()
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -1827,11 +1872,25 @@ class MooncakeKVManager(CommonKVManager):
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
-            except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+            except Exception:
+                # A raise here would only kill this daemon thread: the rank's
+                # HTTP process stays "healthy" while its transfer capacity
+                # silently drains away (each dead worker orphans one transfer
+                # queue). Treat it as fatal for the rank instead — signal the
+                # parent like a Scheduler crash does, so the launcher tears
+                # the rank down and the router ejects/restarts it.
+                # Endpoint send timeouts never reach here: decode-notify call
+                # sites convert them to per-request failures, so this path
+                # only sees unexpected bugs or process-wide resource errors.
+                logger.exception(
+                    f"Transfer worker {worker_index} failed; terminating rank "
+                    f"(bootstrap_port={self.bootstrap_port})."
                 )
+                if parent_process is not None:
+                    parent_process.send_signal(signal.SIGQUIT)
+                else:
+                    os.kill(os.getpid(), signal.SIGQUIT)
+                return
 
     def start_prefill_thread(self):
         def bootstrap_thread():

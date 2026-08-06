@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import errno
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -45,6 +46,68 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# A monitored PUSH endpoint consumes three sockets from the same ZMQ context:
+# the PUSH socket, libzmq's internal monitor socket, and the PAIR socket returned
+# by pyzmq's get_monitor_socket(). The manager also owns one PULL server socket.
+_ZMQ_SOCKETS_PER_MONITORED_ENDPOINT = 3
+_ZMQ_MANAGER_BASE_SOCKET_COUNT = 1
+
+# Socket destruction is asynchronous in libzmq. In particular, a newly created
+# socket can temporarily observe EMFILE while evicted sockets are still being
+# reaped. Keep retries short and bounded so endpoint churn does not kill a
+# transfer worker, while genuine configuration errors still surface promptly.
+_ZMQ_SOCKET_CREATION_MAX_ATTEMPTS = 8
+_ZMQ_SOCKET_CREATION_RETRY_BASE_DELAY = 0.001
+_TRANSIENT_ZMQ_SOCKET_ERRNOS = {errno.EADDRINUSE, errno.EMFILE, errno.ENFILE}
+
+
+def _validate_zmq_max_sockets(zmq_max_sockets: int) -> None:
+    if zmq_max_sockets <= 0:
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS must be greater than zero, "
+            f"got {zmq_max_sockets}."
+        )
+
+
+def _validate_zmq_socket_limits(
+    zmq_max_sockets: int, socket_cache_max_endpoints: int
+) -> None:
+    _validate_zmq_max_sockets(zmq_max_sockets)
+    if socket_cache_max_endpoints <= 0:
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SOCKET_CACHE_MAX_ENDPOINTS must be greater "
+            f"than zero, got {socket_cache_max_endpoints}."
+        )
+
+    steady_state_sockets = (
+        _ZMQ_MANAGER_BASE_SOCKET_COUNT
+        + _ZMQ_SOCKETS_PER_MONITORED_ENDPOINT * socket_cache_max_endpoints
+    )
+    if steady_state_sockets > zmq_max_sockets:
+        raise ValueError(
+            "SGLANG_DISAGGREGATION_SOCKET_CACHE_MAX_ENDPOINTS="
+            f"{socket_cache_max_endpoints} needs at least {steady_state_sockets} "
+            "ZMQ context sockets, but "
+            f"SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS={zmq_max_sockets}. "
+            "Raise the socket cap or lower the cache bound."
+        )
+
+    # A complete fleet replacement can leave one full cache awaiting libzmq's
+    # asynchronous reaper while the replacement cache is created.
+    full_replacement_sockets = (
+        _ZMQ_MANAGER_BASE_SOCKET_COUNT
+        + 2 * _ZMQ_SOCKETS_PER_MONITORED_ENDPOINT * socket_cache_max_endpoints
+    )
+    if full_replacement_sockets > zmq_max_sockets:
+        logger.warning(
+            "SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS=%s safely holds the live "
+            "socket cache but not a full cache replacement (%s sockets). "
+            "Endpoint churn may briefly rely on socket-creation retries.",
+            zmq_max_sockets,
+            full_replacement_sockets,
+        )
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -196,18 +259,34 @@ class CommonKVManager(BaseKVManager):
             or hybrid_decode_pulls_all_ranks
         )
 
+        # libzmq caps sockets per context (default 1023); each monitored decode
+        # endpoint consumes three context sockets, so a large decode fleet
+        # exhausts the default regardless of the OS nofile limit.
+        zmq_max_sockets = envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
+        self._socket_cache_max_endpoints = (
+            envs.SGLANG_DISAGGREGATION_SOCKET_CACHE_MAX_ENDPOINTS.get()
+        )
+        _validate_zmq_socket_limits(zmq_max_sockets, self._socket_cache_max_endpoints)
+
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        # Raise the per-context socket cap before any socket exists; the
+        # option does not apply retroactively.
+        self._zmq_ctx.set(zmq.MAX_SOCKETS, zmq_max_sockets)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
-        self._socket_cache: Dict[str, zmq.Socket] = {}
+        # LRU over decode endpoints, bounded by _socket_cache_max_endpoints;
+        # _monitor_cache and _socket_send_locks are kept in lockstep with it
+        # under _socket_lock.
+        self._socket_cache: OrderedDict[str, zmq.Socket] = OrderedDict()
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
+        self._monitor_endpoint_seq = 0
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -740,7 +819,91 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
+    @staticmethod
+    def _close_monitored_socket(
+        sock: Optional[zmq.Socket], monitor: Optional[zmq.Socket]
+    ) -> None:
+        """Best-effort, non-blocking teardown of a monitored ZMQ socket."""
+        if sock is not None:
+            try:
+                sock.disable_monitor()
+            except zmq.ZMQError:
+                pass
+        if monitor is not None:
+            try:
+                monitor.close(linger=0)
+            except zmq.ZMQError:
+                pass
+        if sock is not None:
+            try:
+                sock.close(linger=0)
+            except zmq.ZMQError:
+                pass
+
+    def _drop_endpoint_locked(self, endpoint: str) -> None:
+        """Remove and close an endpoint after any in-flight send finishes."""
+        sock = self._socket_cache.pop(endpoint, None)
+        monitor = self._monitor_cache.pop(endpoint, None)
+        send_lock = self._socket_send_locks.pop(endpoint, None)
+        if sock is None:
+            return
+        if send_lock is None:
+            self._close_monitored_socket(sock, monitor)
+            return
+        # Safe while holding _socket_lock: senders never acquire _socket_lock
+        # while holding an endpoint send lock.
+        with send_lock:
+            self._close_monitored_socket(sock, monitor)
+
+    def _evict_lru_endpoint_locked(self):
+        """Close and drop the least-recently-used cached endpoint."""
+        victim = next(iter(self._socket_cache))
+        self._drop_endpoint_locked(victim)
+        logger.debug(f"Evicted LRU decode endpoint socket: {victim}")
+
+    def _next_monitor_endpoint_locked(self) -> str:
+        self._monitor_endpoint_seq += 1
+        manager_id = id(self)
+        return f"inproc://sglang-kv-monitor-{manager_id}-{self._monitor_endpoint_seq}"
+
+    def _create_monitored_push_socket_locked(
+        self, endpoint: str, is_ipv6: bool
+    ) -> Tuple[zmq.Socket, zmq.Socket]:
+        """Create a PUSH socket and monitor, retrying transient reaper races."""
+        for attempt in range(_ZMQ_SOCKET_CREATION_MAX_ATTEMPTS):
+            sock = None
+            monitor = None
+            try:
+                sock = self._zmq_ctx.socket(zmq.PUSH)
+                if is_ipv6:
+                    sock.setsockopt(zmq.IPV6, 1)
+                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.SNDTIMEO, 30000)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+                sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+                sock.connect(endpoint)
+                monitor_endpoint = self._next_monitor_endpoint_locked()
+                sock.monitor(monitor_endpoint, zmq.EVENT_DISCONNECTED)
+                monitor = self._zmq_ctx.socket(zmq.PAIR)
+                monitor.connect(monitor_endpoint)
+                return sock, monitor
+            except zmq.ZMQError as error:
+                self._close_monitored_socket(sock, monitor)
+                if (
+                    error.errno not in _TRANSIENT_ZMQ_SOCKET_ERRNOS
+                    or attempt == _ZMQ_SOCKET_CREATION_MAX_ATTEMPTS - 1
+                ):
+                    raise
+                time.sleep(_ZMQ_SOCKET_CREATION_RETRY_BASE_DELAY * (2**attempt))
+
+        raise AssertionError("unreachable")
+
+    def _connect(
+        self, endpoint: str, is_ipv6: bool = False
+    ) -> Tuple[zmq.Socket, threading.Lock]:
         with self._socket_lock:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
@@ -755,39 +918,37 @@ class CommonKVManager(BaseKVManager):
                     except zmq.ZMQError:
                         disconnected = True
                 if not disconnected:
-                    return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
-                self._socket_cache.pop(endpoint, None)
-                self._monitor_cache.pop(endpoint, None)
+                    self._socket_cache.move_to_end(endpoint)
+                    return sock, self._socket_send_locks[endpoint]
+                self._drop_endpoint_locked(endpoint)
 
-            sock = self._zmq_ctx.socket(zmq.PUSH)
-            if is_ipv6:
-                sock.setsockopt(zmq.IPV6, 1)
-            sock.setsockopt(zmq.RECONNECT_IVL, -1)
-            sock.setsockopt(zmq.SNDTIMEO, 30000)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
-            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
-            sock.connect(endpoint)
+            while len(self._socket_cache) >= self._socket_cache_max_endpoints:
+                self._evict_lru_endpoint_locked()
+
+            sock, monitor = self._create_monitored_push_socket_locked(endpoint, is_ipv6)
+            send_lock = threading.Lock()
+            # Publish the three cache entries only after socket and monitor
+            # creation both succeed.
             self._socket_cache[endpoint] = sock
-            self._monitor_cache[endpoint] = sock.get_monitor_socket(
-                zmq.EVENT_DISCONNECTED
-            )
-            self._socket_send_locks.setdefault(endpoint, threading.Lock())
-            return sock
+            self._monitor_cache[endpoint] = monitor
+            self._socket_send_locks[endpoint] = send_lock
+            return sock, send_lock
 
     def _send_multipart_locked(
         self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
     ):
         # Cached sockets are shared across sender threads and zmq sockets are
-        # not thread-safe; serialize sends per endpoint.
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
-            sock.send_multipart(parts)
+        # not thread-safe; serialize sends per endpoint. One retry: LRU
+        # eviction may close the socket between lookup and send.
+        for attempt in range(2):
+            sock, send_lock = self._connect(endpoint, is_ipv6=is_ipv6)
+            with send_lock:
+                try:
+                    sock.send_multipart(parts)
+                    return
+                except zmq.ZMQError as error:
+                    if attempt == 1 or error.errno != errno.ENOTSOCK:
+                        raise
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1244,6 +1405,12 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
+    # One PUSH socket per prefill rank endpoint (no monitor socket); raise the
+    # cap so a large prefill fleet cannot exhaust the default 1023 either.
+    # Read at import time: the class-level context is created once per process.
+    _ctx_max_sockets = envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
+    _validate_zmq_max_sockets(_ctx_max_sockets)
+    _ctx.set(zmq.MAX_SOCKETS, _ctx_max_sockets)
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()

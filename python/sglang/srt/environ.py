@@ -427,6 +427,16 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Per-zmq-context socket cap (libzmq default is 1023) and the bound of the
+    # per-decode-endpoint PUSH-socket LRU cache in the KV manager. Each cached
+    # endpoint consumes 3 context sockets: PUSH, libzmq's internal monitor, and
+    # pyzmq's PAIR monitor receiver. The manager also owns one PULL socket.
+    # The default cap additionally leaves room for a complete cache replacement
+    # while libzmq asynchronously reaps evicted sockets
+    # (1 + 2 * 3 * 4096 = 24577 < 32768). Size the cache above the peak
+    # simultaneous endpoint count (decode replicas x DP ranks).
+    SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(32768)
+    SGLANG_DISAGGREGATION_SOCKET_CACHE_MAX_ENDPOINTS = EnvInt(4096)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
