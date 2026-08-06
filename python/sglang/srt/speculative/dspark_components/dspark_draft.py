@@ -323,9 +323,7 @@ class DraftBlockProposer:
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
 
-        draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
-            self.draft_model, "forward_embed"
-        )
+        draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
         if not draft_owns_embed:
             noise_embedding = embed_module(draft_block_ids)

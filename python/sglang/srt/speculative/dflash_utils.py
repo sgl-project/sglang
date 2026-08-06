@@ -57,7 +57,7 @@ elif is_hip():
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
 
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+    tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -68,7 +68,7 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
-def _dflash_ascend_top_k_top_p_renorm_prob(
+def _dflash_npu_top_k_top_p_renorm_prob(
     probs: torch.Tensor,
     *,
     top_ks: Optional[torch.Tensor] = None,
@@ -108,9 +108,9 @@ def _dflash_top_k_renorm_prob(
     if top_k_renorm_prob is not None:
         return top_k_renorm_prob(probs, top_ks)
 
-    ascend_probs = _dflash_ascend_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
-    if ascend_probs is not None:
-        return ascend_probs
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
+    if npu_probs is not None:
+        return npu_probs
 
     vocab_size = probs.shape[-1]
     top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
@@ -128,9 +128,9 @@ def _dflash_top_p_renorm_prob(
 ) -> torch.Tensor:
     if top_p_renorm_prob is not None:
         return top_p_renorm_prob(probs, top_ps)
-    ascend_probs = _dflash_ascend_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
-    if ascend_probs is not None:
-        return ascend_probs
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
+    if npu_probs is not None:
+        return npu_probs
     return top_p_normalize_probs_torch(probs, top_ps)
 
 
@@ -910,9 +910,6 @@ def build_dflash_verify_target_probs(
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
-
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

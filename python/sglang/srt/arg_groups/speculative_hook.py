@@ -276,10 +276,10 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
-    from sglang.srt.utils import is_npu
+    from sglang.srt.utils import is_cuda, is_npu
 
-    _is_npu = is_npu()
-    if not (server_args.device.startswith("cuda") or _is_npu):
+    _is_cuda, _is_npu = is_cuda(), is_npu()
+    if not (_is_cuda or _is_npu):
         raise ValueError(
             "DSpark speculative decoding only supports CUDA and NPU devices."
         )

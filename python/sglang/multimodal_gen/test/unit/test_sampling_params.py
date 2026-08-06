@@ -4,6 +4,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
@@ -16,6 +19,10 @@ from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
     Flux2SamplingParams,
     FluxSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.glmimage import (
+    GlmImageSamplingParams,
+    align_glm_image_dimension,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -92,8 +99,73 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
 
+    def test_teacache_and_spectrum_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(
+            ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
+        ):
+            SamplingParams(enable_teacache=True, enable_spectrum=True)
+
 
 class TestSamplingParamsSubclass(unittest.TestCase):
+    def test_glm_image_rounds_resolution_up_to_multiple_of_32(self):
+        server_args = SimpleNamespace(
+            pipeline_config=GlmImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+        )
+        cases = [
+            ((500, 500), (512, 512)),
+            ((1024, 600), (1024, 608)),
+            ((500, 600), (512, 608)),
+            ((550, 1009), (576, 1024)),
+            ((1280, 720), (1280, 736)),
+        ]
+
+        for requested, expected in cases:
+            with self.subTest(requested=requested):
+                params = GlmImageSamplingParams(
+                    width=requested[0],
+                    height=requested[1],
+                )
+
+                with patch(
+                    "sglang.multimodal_gen.configs.sample.glmimage.logger.warning"
+                ) as mock_warning:
+                    params._adjust(server_args)
+
+                self.assertEqual((params.width, params.height), expected)
+                mock_warning.assert_called_once_with(
+                    "GLM-Image requires dimensions divisible by %s; adjusted "
+                    "requested resolution from %sx%s to %sx%s",
+                    32,
+                    requested[0],
+                    requested[1],
+                    expected[0],
+                    expected[1],
+                )
+
+    def test_glm_image_resolution_rounds_up(self):
+        self.assertEqual(align_glm_image_dimension(560), 576)
+
+    def test_glm_image_resolution_keeps_minimum_alignment(self):
+        self.assertEqual(align_glm_image_dimension(0), 32)
+        self.assertEqual(align_glm_image_dimension(-1), 32)
+
+    def test_glm_image_does_not_warn_for_aligned_resolution(self):
+        server_args = SimpleNamespace(
+            pipeline_config=GlmImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+        )
+        params = GlmImageSamplingParams(width=1024, height=1024)
+
+        with patch(
+            "sglang.multimodal_gen.configs.sample.glmimage.logger.warning"
+        ) as mock_warning:
+            params._adjust(server_args)
+
+        mock_warning.assert_not_called()
+
     def test_flux_defaults_resolution_when_not_provided(self):
         params = FluxSamplingParams()
 
@@ -241,6 +313,38 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
         self.assertEqual(
             self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
+        )
+
+    def test_get_cli_args_maps_spectrum_prefixed_flags(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--enable-spectrum",
+                "--spectrum-window-size",
+                "2.5",
+                "--spectrum-flex-window",
+                "0.9",
+                "--spectrum-warmup-steps",
+                "6",
+                "--spectrum-m",
+                "3",
+                "--spectrum-lam",
+                "0.2",
+                "--spectrum-tau-num-steps",
+                "42",
+            ]
+        )
+
+        self.assertTrue(kwargs["enable_spectrum"])
+        self.assertEqual(
+            kwargs["spectrum_params"],
+            {
+                "window_size": 2.5,
+                "flex_window": 0.9,
+                "warmup_steps": 6,
+                "m": 3,
+                "lam": 0.2,
+                "tau_num_steps": 42,
+            },
         )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):

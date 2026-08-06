@@ -124,12 +124,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
 
+        # The mask token needs an embedding row, not a tokenizer entry, so bound it
+        # by the embedding width. A padded vocab reserves rows past the real tokens
+        # and drafts place the mask there (Inkling: 200058 real, 201024 padded).
+        target_model_config = self.target_worker.model_runner.model_config
+        target_vocab_size = (
+            getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
+            or target_model_config.vocab_size
+        )
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
-            target_vocab_size=int(
-                self.target_worker.model_runner.model_config.vocab_size
-            ),
+            target_vocab_size=int(target_vocab_size),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -333,12 +339,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                # Keep the draft model graph enabled when folded proposal is
-                # disabled, but do not capture the proposal head as a tail
-                # hook. The proposer will compute base logits and the Markov
-                # block eagerly from the graph's hidden states instead. Apart
-                # from being the intended precision fallback, skipping the
-                # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
                     self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
@@ -445,7 +445,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.prefix_lens, dtype=torch.int32, device=device
         )
         positions, _ = compute_position(
-            self.model_runner.server_args.attention_backend,
+            self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
             ctx_lens,
             int(sum(batch.extend_lens)),

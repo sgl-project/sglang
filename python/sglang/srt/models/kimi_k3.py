@@ -122,8 +122,8 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-_k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
-_k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
+_k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
+_k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -958,7 +958,6 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1286,11 +1285,7 @@ class KimiK3MoE(nn.Module):
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(
-                hidden_states,
-                prefix_sum=prefix_sum,
-                forward_batch=forward_batch,
-            )
+            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
         if use_dp:
             global_out = out
             out = get_local_dp_buffer(_dp_local_buffer_group())
