@@ -175,6 +175,17 @@ async fn main() -> Result<()> {
     );
     ctx.mark_ready();
 
+    // Sweep idle sessions out of the per-session stats collector on a 60 s
+    // cadence (its TTL is env-configured, default 15 min). Same janitor
+    // machinery as the active-load reaper. Only worth running when the
+    // collector is actually tracking something (a session id / sticky policy).
+    let session_stats = Arc::clone(&ctx.session_stats);
+    let session_stats_janitor = sgl_router::policies::active_load::spawn_sweeper(
+        move || session_stats.sweep(),
+        std::time::Duration::from_secs(60),
+        "session-stats",
+    );
+
     let app = sgl_router::server::app::build_router(ctx.clone());
 
     let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
@@ -195,6 +206,9 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     manager_handle.abort();
     janitor_handle.shutdown().await;
+    session_stats_janitor.shutdown().await;
+    // Final whole-file snapshot of session_timestamp.json (no-op when disabled).
+    ctx.session_stats.flush_dump();
     server_result
 }
 

@@ -89,6 +89,23 @@ impl Drop for RecordDurationOnDrop {
     }
 }
 
+/// RAII guard that records the session turn end (`SessionStats::on_turn_end`)
+/// when dropped. Same rationale as `RecordDurationOnDrop`: for streaming the
+/// true decode-end is when the SSE pump finishes, so this rides `stream_guards`
+/// rather than firing at response-headers time. Only created for requests that
+/// carry a session id.
+struct RecordSessionTurnOnDrop {
+    stats: Arc<crate::session_stats::SessionStats>,
+    session_id: String,
+}
+
+impl Drop for RecordSessionTurnOnDrop {
+    fn drop(&mut self) {
+        self.stats
+            .on_turn_end(&self.session_id, std::time::Instant::now());
+    }
+}
+
 /// POST /v1/chat/completions — parse model from body, select a healthy
 /// worker via the per-model policy, then proxy the request. If the
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
@@ -180,6 +197,15 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
+    // Per-session idleness signal (see `crate::session_stats`). The session is
+    // identified by the sticky routing key; other policies leave it `None` and
+    // are not tracked. Stamp the turn's receive instant (`start`) now — the
+    // first-token and turn-end instants are recorded by the SSE hooks below.
+    let session_id: Option<String> = routing_key.map(|s| s.to_string());
+    if let Some(sid) = session_id.as_deref() {
+        ctx.session_stats.on_turn_start(sid, start);
+    }
+
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     let worker =
@@ -299,8 +325,15 @@ pub async fn chat_completions(
         let metrics = Arc::clone(&ctx.metrics);
         let model = metrics_model.clone();
         let started = start;
+        // Also stamp the per-session first-token instant off the same first-byte
+        // signal that feeds the TTFT histogram (no session id → no-op).
+        let session_stats = Arc::clone(&ctx.session_stats);
+        let session_id = session_id.clone();
         Box::new(move || {
             metrics.observe_ttft(&model, started.elapsed().as_secs_f64());
+            if let Some(sid) = session_id.as_deref() {
+                session_stats.on_first_token(sid, std::time::Instant::now());
+            }
         })
     };
 
@@ -312,6 +345,16 @@ pub async fn chat_completions(
         metrics: Arc::clone(&ctx.metrics),
         model: metrics_model.clone(),
         start,
+    };
+
+    // Records the per-session turn end when the SSE pump finishes. Rides the
+    // streaming `stream_guards` alongside `make_duration_guard`. `None` when the
+    // request has no session id (nothing to record).
+    let make_session_guard = || -> Option<RecordSessionTurnOnDrop> {
+        session_id.as_ref().map(|sid| RecordSessionTurnOnDrop {
+            stats: Arc::clone(&ctx.session_stats),
+            session_id: sid.clone(),
+        })
     };
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
@@ -443,7 +486,7 @@ pub async fn chat_completions(
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
-                Box::new((decode_guard, make_duration_guard()));
+                Box::new((decode_guard, make_duration_guard(), make_session_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
@@ -477,8 +520,12 @@ pub async fn chat_completions(
         // Plain mode, streaming. Both guards ride the SSE pump until
         // the body completes — see the matching comment in the
         // non-streaming arm.
-        let stream_guards: Box<dyn Send + 'static> =
-            Box::new((guard, active_guard, make_duration_guard()));
+        let stream_guards: Box<dyn Send + 'static> = Box::new((
+            guard,
+            active_guard,
+            make_duration_guard(),
+            make_session_guard(),
+        ));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
