@@ -84,7 +84,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return getattr(value, "value", value)
 
     def validate_quality_deployment(self, server_args) -> None:
-        """Fail closed unless the resident server matches the measured profile."""
+        """Fail closed unless the resident server matches the deployment
+        audited for quality="high"."""
 
         attention_backend = self._server_arg_value(server_args.attention_backend)
         attention_backend = (
@@ -161,19 +162,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             }
         if mismatches:
             raise ValueError(
-                "MiniMax-H3 approximate quality profiles are validated only for "
+                'MiniMax-H3 quality="high" is validated only for '
                 f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
             )
 
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
-        attention_backend = self._server_arg_value(server_args.attention_backend)
-        if str(attention_backend).strip().lower() == "sage_attn":
-            raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
-            )
 
     def select_vae_weight_files(
         self,

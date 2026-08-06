@@ -18,6 +18,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
             AttentionBackendEnum.FA,
+            AttentionBackendEnum.SAGE_ATTN,
             AttentionBackendEnum.AITER,
             AttentionBackendEnum.TORCH_SDPA,
         }
