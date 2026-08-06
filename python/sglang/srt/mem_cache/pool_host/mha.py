@@ -167,6 +167,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         return buffer
 
+    def get_hybrid_pool_buffer(self):
+        """Return every host tensor that v2 storage backends must register."""
+        if isinstance(self.kv_buffer, (list, tuple)):
+            return list(self.kv_buffer)
+        return [self.kv_buffer]
+
     def _init_write_back_staging_buffers(self):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
