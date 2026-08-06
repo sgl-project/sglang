@@ -451,14 +451,15 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         try:
             import attentions  # noqa: F401
         except ImportError:
-            from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-            logger = init_logger(__name__)  # pylint: disable=invalid-name
-            logger.warning(
-                "The 'attentions' library is not installed. Falling back to native layernorm. "
-                "Installing this library may improve performance on NPU."
-                "See: sgl-project/sgl-kernel-npu"
-            )
+            if current_patform.is_npu:
+                from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+    
+                logger = init_logger(__name__)  # pylint: disable=invalid-name
+                logger.warning(
+                    "The 'attentions' library is not installed. Falling back to native layernorm. "
+                    "Installing this library may improve performance on NPU."
+                    "See: sgl-project/sgl-kernel-npu"
+                )
             self._forward_method = self.forward_native
 
     def _cached_fp32_param(
