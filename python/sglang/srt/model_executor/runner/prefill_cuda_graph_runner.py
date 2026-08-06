@@ -109,6 +109,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -336,6 +337,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mha_companion_layers = self.model_runner.mha_companion_layers
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
+        )
+        # Archs on the MLA-BCG allowlist pin the absorbed MLA path inside
+        # capture/replay (attention_backend_handler), so the MHA companion is
+        # never captured and the MHA-prefix restrictions below don't apply.
+        self.mla_pinned_under_bcg = (
+            self.model_runner.model_config.is_mla_breakable_cuda_graph_supported
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -1052,11 +1059,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         # A prefix forces the MHA companion path, whose captured state is
         # frozen prefix-free; DSA models are exempt (capture/replay force
-        # the sparse path, which takes any prefix via device metadata).
+        # the sparse path, which takes any prefix via device metadata), as
+        # are archs on the MLA-BCG allowlist (they pin the absorbed MLA path
+        # inside capture/replay, so the MHA companion is never captured).
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not self.dsa_sparse_prefill_forced
+            and not self.mla_pinned_under_bcg
             and prefix_lens is not None
             and any(prefix_lens)
         ):
@@ -1536,6 +1546,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and self.has_mha_companion_layers
+            and not self.mla_pinned_under_bcg
         ):
             self._restore_mha_capture_state(static_forward_batch)
 
@@ -1727,6 +1738,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
+            # Replay prep, including the optional chunked-prefix gather above,
+            # has finished every scheduler-shared read.
+            maybe_publish_prefill_war_read_done(
+                self.model_runner, forward_batch, self.device_module
+            )
 
             if self.enable_cp_v2_bcg_capture:
                 output = execute_prefill_cp_bcg(
