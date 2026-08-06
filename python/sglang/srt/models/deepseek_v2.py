@@ -2573,7 +2573,20 @@ class DeepseekV2Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self._init_forward_attrs(config)
+        self.config = config
+        self.use_dsa = is_deepseek_dsa(config)
+        self.padding_id = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
+        self.pp_group = get_pp_group()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.mla_enable_prefill_cp = (
+            is_prefill_context_parallel_enabled() and not self.use_dsa
+        )
+        if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_size = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -2635,7 +2648,10 @@ class DeepseekV2Model(nn.Module):
             ),
         )
 
-        self._init_next_full_attention_layer_id()
+        local_layer_ids = list(range(self.start_layer, self.end_layer))
+        self.next_full_attention_layer_id = dict(
+            zip(local_layer_ids, local_layer_ids[1:])
+        )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -2678,28 +2694,6 @@ class DeepseekV2Model(nn.Module):
                     self.embed_tokens.embedding_dim,
                 )
             )
-
-    def _init_forward_attrs(self, config: PretrainedConfig) -> None:
-        """Config-derived state that `forward` reads off `self`.
-
-        Subclasses that build their own submodules (the EAGLE draft models) skip
-        `__init__` but still inherit `forward`, so they must call this instead of
-        re-deriving a subset of the flags by hand.
-        """
-        self.config = config
-        self.use_dsa = is_deepseek_dsa(config)
-        self.padding_id = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not self.use_dsa
-        )
-        if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
-            self.cp_size = get_parallel().attn_cp_size
-        else:
-            self.cp_size = None
         self.layers_to_capture = []
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.enable_a2a_moe = True
@@ -2708,12 +2702,6 @@ class DeepseekV2Model(nn.Module):
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
-
-    def _init_next_full_attention_layer_id(self) -> None:
-        local_layer_ids = list(range(self.start_layer, self.end_layer))
-        self.next_full_attention_layer_id = dict(
-            zip(local_layer_ids, local_layer_ids[1:])
-        )
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
