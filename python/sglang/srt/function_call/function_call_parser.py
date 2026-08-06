@@ -42,6 +42,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.telechat4_detector import TeleChat4Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
@@ -85,6 +86,7 @@ class FunctionCallParser:
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "telechat4": TeleChat4Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
         "trinity": TrinityDetector,
