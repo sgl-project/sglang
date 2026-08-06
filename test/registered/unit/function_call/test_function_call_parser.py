@@ -30,17 +30,17 @@ from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.plamo3_detector import (
-    Plamo3ToolDetector,
-    BEGIN_TOOL_REQUESTS,
-    END_TOOL_REQUESTS,
-    BEGIN_TOOL_REQUEST,
-    END_TOOL_REQUEST,
-    BEGIN_TOOL_NAME,
-    END_TOOL_NAME,
     BEGIN_TOOL_ARGUMENTS,
-    END_TOOL_ARGUMENTS,
+    BEGIN_TOOL_NAME,
+    BEGIN_TOOL_REQUEST,
+    BEGIN_TOOL_REQUESTS,
     CONSTRAIN_JSON,
+    END_TOOL_ARGUMENTS,
+    END_TOOL_NAME,
+    END_TOOL_REQUEST,
+    END_TOOL_REQUESTS,
     MSG,
+    Plamo3ToolDetector,
 )
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -4653,6 +4653,26 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("auto")
         self.assertIsNone(result)
 
+    def test_plamo3_required_honors_parallel_tool_calls(self):
+        parser = self._make_parser("plamo3", strict=True)
+
+        parallel = parser.get_structure_constraint("required", parallel_tool_calls=True)
+        single = parser.get_structure_constraint("required", parallel_tool_calls=False)
+
+        self.assertEqual(parallel[0], "structural_tag")
+        self.assertEqual(single[0], "structural_tag")
+        parallel_content = parallel[1].model_dump()["format"]["tags"][0]["content"]
+        single_content = single[1].model_dump()["format"]["tags"][0]["content"]
+        self.assertEqual(parallel_content["type"], "plus")
+        self.assertEqual(single_content["type"], "sequence")
+
+    def test_plamo3_auto_no_strict_returns_structural_tag(self):
+        parser = self._make_parser("plamo3", strict=False)
+        result = parser.get_structure_constraint("auto", parallel_tool_calls=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
     def test_inkling_auto_constrains_json_after_tool_trigger(self):
         import xgrammar as xgr
 
@@ -5192,6 +5212,7 @@ class TestGemma4Detector(unittest.TestCase):
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
 
+
 class TestPlamo3ToolDetector(unittest.TestCase):
 
     def setUp(self):
@@ -5237,9 +5258,7 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(
-            json.loads(result.calls[0].parameters), {"city": "Tokyo"}
-        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
         self.assertEqual(result.normal_text, "")
 
     def test_detect_and_parse_with_prefix_text(self):
@@ -5250,9 +5269,7 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertIn("Some intro text", result.normal_text)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(
-            json.loads(result.calls[0].parameters), {"city": "Osaka"}
-        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Osaka"})
 
     def test_detect_and_parse_multiple_calls(self):
         text = (
@@ -5283,18 +5300,60 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "get_weather")
-        self.assertEqual(
-            json.loads(result.calls[0].parameters), {"city": "Tokyo"}
-        )
-        self.assertEqual(
-            json.loads(result.calls[1].parameters), {"city": "Osaka"}
-        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+        self.assertEqual(json.loads(result.calls[1].parameters), {"city": "Osaka"})
 
     def test_detect_and_parse_no_tool_call(self):
         text = "Hello world, no tools here."
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertIn("Hello world", result.normal_text)
+
+    def test_detect_and_parse_empty_arguments(self):
+        text = self._make_tool_request("get_weather", "   ")
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_detect_and_parse_ignores_wrapper_whitespace_and_preserves_suffix(self):
+        text = (
+            "prefix"
+            + BEGIN_TOOL_REQUESTS
+            + "\n  "
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Tokyo"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + "\n"
+            + END_TOOL_REQUESTS
+            + "suffix"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "prefixsuffix")
+        self.assertEqual(len(result.calls), 1)
+
+    def test_detect_and_parse_does_not_parse_calls_after_outer_wrapper(self):
+        text = (
+            self._make_tool_request("get_weather", '{"city": "Tokyo"}')
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Osaka"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertIn("Osaka", result.normal_text)
 
     def test_detect_and_parse_invalid_json(self):
         text = (
@@ -5331,9 +5390,7 @@ class TestPlamo3ToolDetector(unittest.TestCase):
                     tool_calls[idx]["parameters"] += call.parameters
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(
-            json.loads(tool_calls[0]["parameters"]), {"city": "Nagoya"}
-        )
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Nagoya"})
 
     def test_streaming_multiple_calls(self):
         full_text = (
@@ -5376,12 +5433,8 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[1]["name"], "get_weather")
-        self.assertEqual(
-            json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"}
-        )
-        self.assertEqual(
-            json.loads(tool_calls[1]["parameters"]), {"city": "Yokohama"}
-        )
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"})
+        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Yokohama"})
 
     def test_structure_info(self):
         get_info = self.detector.structure_info()
@@ -5390,13 +5443,153 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertIn(BEGIN_TOOL_REQUEST, info.begin)
         self.assertIn("get_weather", info.begin)
         self.assertIn(END_TOOL_ARGUMENTS, info.end)
+        self.assertIn(END_TOOL_REQUEST, info.end)
+        # The legacy fallback describes one complete request. The model-native
+        # structural tag below owns the repeated inner blocks used in parallel.
         self.assertIn(END_TOOL_REQUESTS, info.end)
 
     def test_has_tool_call(self):
+        # Only the outer marker signals a tool-call section; the inner marker
+        # alone must not trigger detection.
         self.assertTrue(self.detector.has_tool_call(BEGIN_TOOL_REQUESTS))
-        self.assertTrue(self.detector.has_tool_call(BEGIN_TOOL_REQUEST))
+        self.assertFalse(self.detector.has_tool_call(BEGIN_TOOL_REQUEST))
         self.assertFalse(self.detector.has_tool_call("plain text"))
 
+    def test_get_structural_tag_parallel(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                    strict=True,
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    parameters={"type": "object", "properties": {}},
+                    strict=True,
+                ),
+            ),
+        ]
+        tag = self.detector.get_structural_tag(tools=tools, tool_choice="required")
+        self.assertIsNotNone(tag)
+        blob = tag.model_dump_json()
+        self.assertIn("get_weather", blob)
+        self.assertIn("get_time", blob)
+
+        try:
+            import xgrammar
+        except ImportError:
+            self.skipTest("xgrammar not available")
+        vocab = [
+            BEGIN_TOOL_REQUESTS,
+            END_TOOL_REQUESTS,
+            BEGIN_TOOL_REQUEST,
+            END_TOOL_REQUEST,
+            BEGIN_TOOL_NAME,
+            END_TOOL_NAME,
+            BEGIN_TOOL_ARGUMENTS,
+            END_TOOL_ARGUMENTS,
+            CONSTRAIN_JSON,
+            MSG,
+            "get_weather",
+            "get_time",
+            "city",
+            "Tokyo",
+            "{",
+            "}",
+            '"',
+            ":",
+            ",",
+            " ",
+        ]
+        compiler = xgrammar.GrammarCompiler(xgrammar.TokenizerInfo(vocab))
+        ctx = compiler.compile_structural_tag(tag.model_dump_json())
+        matcher = xgrammar.GrammarMatcher(ctx)
+        sample = (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Tokyo"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_time"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + "{}"
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + END_TOOL_REQUESTS
+        )
+        # Both inner calls must be guided, not just the first one.
+        self.assertTrue(matcher.accept_string(sample))
+
+    def test_get_structural_tag_named_choice_excludes_other_tools(self):
+        tools = [
+            self.tools[0],
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    parameters={"type": "object", "properties": {}},
+                    strict=True,
+                ),
+            ),
+        ]
+        choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        tag = self.detector.get_structural_tag(tools=tools, tool_choice=choice)
+        self.assertIsNotNone(tag)
+        blob = tag.model_dump_json()
+        self.assertIn("get_weather", blob)
+        self.assertNotIn("get_time", blob)
+
+    def test_streaming_name_first(self):
+        # The function name is delimited before any arguments arrive, so the
+        # name must be emitted ahead of the argument payload.
+        header = (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+        )
+        rest = (
+            BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Kyoto"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + END_TOOL_REQUESTS
+        )
+        first = self.detector.parse_streaming_increment(header, self.tools)
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(first.calls[0].name, "get_weather")
+        self.assertEqual(first.calls[0].parameters, "")
+
+        second = self.detector.parse_streaming_increment(rest, self.tools)
+        params = first.calls[0].parameters
+        for call in second.calls:
+            params += call.parameters or ""
+        self.assertEqual(json.loads(params), {"city": "Kyoto"})
 
 
 if __name__ == "__main__":

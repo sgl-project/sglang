@@ -25,7 +25,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -35,6 +34,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -45,9 +45,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
-
-
-
 
 PLAMO3_POST_MIXER_NORM_OFFSET = 1.0 / 5
 PLAMO3_POST_MLP_NORM_OFFSET = 1.0 / (5**1.5)
@@ -158,7 +155,9 @@ class Plamo3Attention(nn.Module):
         self.rope_theta = (
             config.rope_local_theta if self.is_sliding else config.rope_theta
         )
-        rope_scaling = None if self.is_sliding else getattr(config, "rope_scaling", None)
+        rope_scaling = (
+            None if self.is_sliding else getattr(config, "rope_scaling", None)
+        )
         if rope_scaling is not None:
             # PLaMo3 config returns a nested dict keyed by attention type.
             key = "sliding_attention" if self.is_sliding else "full_attention"
@@ -285,6 +284,7 @@ class Plamo3DecoderLayer(nn.Module):
 
         return hidden_states, hidden_states
 
+
 class Plamo3TextModel(nn.Module):
     def __init__(
         self,
@@ -346,9 +346,7 @@ class Plamo3TextModel(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
         if self.pp_group.is_first_rank:
             hidden_states = (
-                self.embed_tokens(input_ids)
-                if input_embeds is None
-                else input_embeds
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
             )
             residual = None
         else:
@@ -374,10 +372,12 @@ class Plamo3TextModel(nn.Module):
             aux_hidden_states.append(hidden_states)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors({
-                "hidden_states": hidden_states,
-                "residual": residual,
-            })
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
 
         hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) == 0:
@@ -439,8 +439,7 @@ class Plamo3ForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         if self.config.tie_word_embeddings and (
-            self.model.pp_group.is_first_rank
-            and self.model.pp_group.is_last_rank
+            self.model.pp_group.is_first_rank and self.model.pp_group.is_last_rank
         ):
             # Only tie weights when both embeddings and lm_head exist.
             # In pipeline parallelism, one or both are PPMissingLayer.
