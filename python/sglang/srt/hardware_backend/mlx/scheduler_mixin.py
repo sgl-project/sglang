@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, List, Optional
 import mlx.core as mx
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.utils import DynamicGradMode
 
@@ -85,6 +86,18 @@ class MlxPendingJob:
 
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
+
+    def _drain_mlx_pending_jobs_for_pause(
+        self: Scheduler,
+        pending_curr: Optional[MlxPendingJob],
+        pending_next: Optional[MlxPendingJob],
+    ) -> tuple[None, None]:
+        """Finalize MLX lazy graphs before retract-pause recycles their caches."""
+        for pending in (pending_curr, pending_next):
+            if pending is not None:
+                self._finalize_mlx_pending_job(pending)
+                self.result_queue.popleft()
+        return None, None
 
     def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
         """Stamp scheduler bookkeeping before an MLX forward is launched."""
@@ -216,6 +229,22 @@ class SchedulerMlxOverlapMixin:
                 break
 
             recv_reqs = self.request_receiver.recv_requests()
+
+            # pause_generation(mode="retract") returns MLX private caches to
+            # the reuse pool.  A pending lazy graph may still reference those
+            # arrays, so finish every queued job before dispatching the pause
+            # request.  The generic overlap loop drains from result_queue in
+            # pause_generation itself; MLX jobs have a different shape and are
+            # owned by these local pending variables, so they must be drained
+            # here instead.
+            if any(
+                isinstance(req, PauseGenerationReqInput) and req.mode == "retract"
+                for req in recv_reqs
+            ):
+                pending_curr, pending_next = self._drain_mlx_pending_jobs_for_pause(
+                    pending_curr, pending_next
+                )
+
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue

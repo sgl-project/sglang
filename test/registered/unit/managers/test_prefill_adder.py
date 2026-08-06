@@ -178,6 +178,32 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_total_token_offset, 125)  # 50 + 75 + 100 - 100 = 125
         running_batch.release_req.assert_called_once()
 
+    def test_preempt_prepares_backend_state_before_releasing_request(self):
+        running_req = self.create_mock_req("run1", priority=0, max_new_tokens=50)
+        running_batch = self.create_running_batch([running_req])
+        events = []
+
+        def release(*_args, **kwargs):
+            kwargs["prepare_for_retraction"](running_req)
+            events.append("release")
+
+        running_batch.release_req.side_effect = release
+        adder = self.create_adder(
+            running_batch,
+            prepare_for_retraction=lambda req: events.append(f"prepare:{req.rid}"),
+        )
+        self.mock_token_allocator.available_size.return_value = 50
+        new_req = self.create_mock_req("new1", priority=1, max_new_tokens=49)
+
+        success = adder.preempt_to_schedule(
+            new_req,
+            self.create_server_args(schedule_low_priority_values_first=False),
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(events, ["prepare:run1", "release"])
+        self.assertIn(running_req, adder.preempt_list)
+
     def test_preempt_fail_low_priority_values_first(self):
         params = [
             ("run1", 0, 50),

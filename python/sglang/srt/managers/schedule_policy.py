@@ -31,7 +31,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Union
 
 import torch
 
@@ -463,6 +463,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        prepare_for_retraction: Optional[Callable[[Req], None]] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -556,6 +557,7 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.prepare_for_retraction = prepare_for_retraction
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -1375,7 +1377,10 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i,
+                    len(self.running_batch.reqs) - release_counter,
+                    server_args,
+                    prepare_for_retraction=self.prepare_for_retraction,
                 )
             else:
                 keep_indices.append(i)

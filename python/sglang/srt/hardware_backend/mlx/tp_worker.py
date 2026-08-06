@@ -79,6 +79,21 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        # Requests whose KV-cache release point has passed (finished or
+        # aborted) but whose MLX per-request state may still be referenced by
+        # an in-flight overlap pending job.  Actually released by
+        # _cleanup_stale_rids on the next scheduler-built forward, by which
+        # point every pending job containing them has been finalized.
+        # Bind each release marker to the concrete scheduler request object,
+        # not only its client-provided rid.  The tokenizer manager permits an
+        # immediate resubmit with the same rid after finish; object identity
+        # lets _cleanup_stale_rids distinguish that new incarnation from an
+        # overlap-chained forward that still contains the old request.
+        self._mlx_released_rids: dict[str, object] = {}
+        # OOM retraction can run while the overlap loop has already launched a
+        # chained decode.  Invalidate row ownership immediately, but defer the
+        # physical cache removal until that pending job has finalized.
+        self._mlx_retracted_rids: set[str] = set()
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -116,23 +131,121 @@ class MlxTpModelWorker(TpModelWorker):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
-        """Remove MLX state for decode-mode requests that dropped out of the batch."""
+    def _cleanup_stale_rids(self, forward_mode, current_reqs) -> None:
+        """Remove MLX state for requests that dropped out of the batch.
+
+        Decode batches drop every request not in the current composition.
+        Extend batches release only requests explicitly marked at their KV
+        release point (prepare_for_kv_cache_release): without this, workloads
+        that never form a decode batch (prefill-only traffic, e.g.
+        max_new_tokens=1 classification/scoring) leak one per-request
+        ContiguousAttentionKVCache list per request, unbounded.
+
+        Both paths run at the start of a scheduler-built forward, after every
+        previously launched overlap pending job has been finalized, so no
+        in-flight chained decode can still reference the removed state.
+        """
+        current_by_rid = {req.rid: req for req in current_reqs}
+        current_rids = set(current_by_rid)
+
+        # A released request may legitimately appear once more in an already
+        # launched overlap-chained batch.  Keep it only when this forward holds
+        # the exact same Req object.  Absence, or a new request incarnation with
+        # the same rid, makes the old state safe to retire before routing.
+        releasable = set(self._mlx_retracted_rids)
+        releasable.update(
+            {
+                rid
+                for rid, released_req in self._mlx_released_rids.items()
+                if current_by_rid.get(rid) is not released_req
+            }
+        )
+        for rid in releasable:
+            self._mlx_runner.remove_request(rid)
+            self._mlx_active_rids.discard(rid)
+            self._mlx_released_rids.pop(rid, None)
+            self._mlx_retracted_rids.discard(rid)
+
         if forward_mode.is_decode():
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
                 self._mlx_runner.remove_request(rid)
             self._mlx_active_rids = current_rids
+            for rid in stale_rids:
+                self._mlx_released_rids.pop(rid, None)
+                self._mlx_retracted_rids.discard(rid)
         else:
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point.
+
+        This is the pre-release hook: it runs while ``req.req_pool_idx`` still
+        maps to this request, immediately before the scheduler frees the row.
+        It is therefore the last safe point to read the row, so it is also where
+        the final decode-KV flush happens (:meth:`sync_and_release_request`).
+        Later stale-rid cleanup only discards state and never re-reads the row.
+        """
         if self._mlx_runner.has_request(req.rid):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.mamba_last_track_seqlen = None
+            self._mlx_runner.sync_and_release_request(req.rid)
+
+            # Mark for deferred release; see _cleanup_stale_rids. Removing
+            # here would break overlap: a chained pending job launched before
+            # this request was known to be finished may still reference its
+            # per-request caches and token list.
+            self._mlx_released_rids[req.rid] = req
+
+    def prepare_for_retraction(self, req) -> None:
+        """Drop MLX runner state when the scheduler retracts (or OOM-aborts) a request.
+
+        Retraction frees the request's row and KV slots via
+        ``release_kv_cache(..., is_insert=False)`` — *without* the finish
+        pre-release hook — and the request goes back to the waiting queue to
+        restart from scratch. Dropping its runner state now guarantees:
+
+        * a re-scheduled request is routed as a fresh ``"prefill"``
+          (``has_request`` is False), so it re-reads its cached prefix from the
+          pool instead of extending a now-invalid private cache; and
+        * no later ``flush_decode_kv_for_slots`` reads its freed row or recycled
+          KV slots (the row-generation check only catches a *reused* row, not a
+          freed one whose KV slots were handed to a different-row request).
+
+        ``remove_request`` is a pure discard — it never syncs, which is correct
+        because the retracted request's KV slots are already freed.
+        """
+        self._mlx_runner.remove_request(req.rid)
+        self._mlx_active_rids.discard(req.rid)
+        self._mlx_released_rids.pop(req.rid, None)
+        self._mlx_retracted_rids.discard(req.rid)
+
+    def defer_retraction(self, req) -> None:
+        """Invalidate a retracted request while an overlap job may still use it.
+
+        The scheduler row and shared KV slots are about to be freed, so routing
+        and pool flushes must stop immediately.  The private cache/token list
+        stay alive until the next scheduler-built forward, after the already
+        launched chained decode has finalized.
+        """
+        self._mlx_runner.invalidate_request(req.rid)
+        self._mlx_released_rids.pop(req.rid, None)
+        self._mlx_retracted_rids.add(req.rid)
+
+    def _gather_prefill_prefix_slots(self, reqs) -> set[int]:
+        """Union of prefix slot IDs for reqs that will start a fresh prefill.
+
+        Only prefill-routed reqs read their prefix from the pool, so only their
+        prefix slots must be current before pool-backed attention runs. Matches
+        the ``"prefill"`` condition in :meth:`_route_extend_request`.
+        """
+        needed_slots: set[int] = set()
+        for req in reqs:
+            if not self._mlx_runner.has_request(req.rid):
+                needed_slots.update(req.prefix_indices.tolist())
+        return needed_slots
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -172,14 +285,18 @@ class MlxTpModelWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
 
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
+        self._cleanup_stale_rids(forward_mode, reqs)
 
         next_token_ids_list: list[int] = []
 
         if forward_mode.is_extend():
             # Ensure pool is up-to-date before pool-backed attention reads it
-            # for prefix-cached prefills.  Only runs on extend batches.
-            self._mlx_runner.flush_all_decode_kv()
+            # for prefix-cached prefills. Only flush decode KV for the slots
+            # this batch's prefills will actually read. Only runs on extend
+            # batches.
+            self._mlx_runner.flush_decode_kv_for_slots(
+                self._gather_prefill_prefix_slots(reqs)
+            )
             input_ids_cpu = batch.input_ids.cpu().tolist()
             out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
             extend_seq_lens = batch.extend_lens
@@ -294,7 +411,7 @@ class MlxTpModelWorker(TpModelWorker):
         if forward_mode.is_idle():
             return None, [], [], None, "idle"
 
-        self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
+        self._cleanup_stale_rids(forward_mode, reqs)
 
         if forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
@@ -303,10 +420,12 @@ class MlxTpModelWorker(TpModelWorker):
             return pending_decode.lazy_tokens, [], [], pending_decode, "decode"
 
         if forward_mode.is_extend():
-            # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before pool-backed attention
-            # reads it for prefix-cached prefills. Mirror the sync path.
-            self._mlx_runner.flush_all_decode_kv()
+            # Ensure the pool is up-to-date before pool-backed attention reads
+            # it for prefix-cached prefills, flushing only the decode KV for the
+            # slots this batch's prefills will read. Mirror the sync path.
+            self._mlx_runner.flush_decode_kv_for_slots(
+                self._gather_prefill_prefix_slots(reqs)
+            )
             return self._async_extend_batch(batch)
 
         raise ValueError(

@@ -2837,6 +2837,29 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def _prepare_model_worker_retraction(self, req: Req) -> None:
+        """Invalidate backend-owned request state at a release/requeue boundary.
+
+        Most backends keep all request state in scheduler-owned pools and have
+        no hook.  MLX also owns a private per-request cache, which must be
+        discarded whenever ``release_kv_cache(..., is_insert=False)`` resets a
+        request for a fresh prefill.
+        """
+        prepare_retraction = getattr(
+            getattr(self, "tp_worker", None), "prepare_for_retraction", None
+        )
+        if callable(prepare_retraction):
+            prepare_retraction(req)
+
+    def _defer_model_worker_retraction(self, req: Req) -> None:
+        """Invalidate backend state without freeing overlap-owned arrays yet."""
+        tp_worker = getattr(self, "tp_worker", None)
+        defer_retraction = getattr(tp_worker, "defer_retraction", None)
+        if callable(defer_retraction):
+            defer_retraction(req)
+        else:
+            self._prepare_model_worker_retraction(req)
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -2872,6 +2895,7 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
+        self._prepare_model_worker_retraction(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -3173,6 +3197,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            prepare_for_retraction=self._prepare_model_worker_retraction,
         )
 
         if self.chunked_req is not None:
@@ -3404,8 +3429,14 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
+            # Retraction frees each request's row and KV slots without the finish
+            # pre-release hook. Invalidate backend-owned state at the common
+            # release boundary so no later flush can read freed row/slots. MLX
+            # defers physical removal because an overlap-chained decode may
+            # already be in flight; other backends keep the eager behavior.
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args,
+                prepare_for_retraction=self._defer_model_worker_retraction,
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -4484,7 +4515,7 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.enable_overlap and self.last_batch and self.result_queue:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
@@ -4525,6 +4556,10 @@ class Scheduler(
                 tree_cache=self.tree_cache,
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
+                # The MLX overlap loop drains all pending lazy graphs before a
+                # retract-mode pause reaches here, so backend state can be
+                # retired at the common pre-release boundary.
+                prepare_for_retraction=self._prepare_model_worker_retraction,
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
