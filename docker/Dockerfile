@@ -499,7 +499,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     less \
     rdma-core \
     openssh-server \
-    gnuplot \
     infiniband-diags \
     perftest \
     ibverbs-providers \

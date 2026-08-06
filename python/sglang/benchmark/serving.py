@@ -1222,7 +1222,18 @@ def calculate_metrics(
                 )
                 fig.show()
             else:
-                print("tip: install termplotlib and gnuplot to plot the metrics")
+                missing = [
+                    name
+                    for name, present in (
+                        (
+                            "termplotlib",
+                            importlib.util.find_spec("termplotlib") is not None,
+                        ),
+                        ("gnuplot", shutil.which("gnuplot") is not None),
+                    )
+                    if not present
+                ]
+                print(f"tip: install {' and '.join(missing)} to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
@@ -2481,7 +2492,7 @@ def cli_main():
     parser.add_argument(
         "--plot-throughput",
         action="store_true",
-        help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
+        help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot; gnuplot is not preinstalled in the Docker image.",
     )
     # TODO unify all these
     parser.add_argument(
