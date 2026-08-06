@@ -124,7 +124,8 @@ jobs:
           export SGLANG_TEST_MAX_RETRY=0
           export SGLANG_SET_CPU_AFFINITY=1
           echo "SGLANG_SET_CPU_AFFINITY: $SGLANG_SET_CPU_AFFINITY"
-          
+
+
           # Copy the checked‑out test common utility code to the sglang installation directory.
           sglang_pkg_path=/sgl-workspace/sglang/python
           ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
