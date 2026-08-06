@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
+    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
 
@@ -374,6 +375,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache controller is not attached.")
+        for spec, entry in zip(specs, entries, strict=True):
+            self.cache_controller.register_host_pool_entry(entry)
+            self.register_sidecar_pool(spec)
 
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
