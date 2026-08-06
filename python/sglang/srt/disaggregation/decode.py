@@ -406,30 +406,55 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return len(req.origin_input_ids) + len(req.output_ids)
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
-    def _prealloc_kv_lens(self, req: Req, *, prefix_len: int = 0) -> Tuple[int, int]:
+    def _takes_swa_tail_path(self, *, fill_len: int, total_prefix_len: int) -> bool:
+        """Whether this preallocation can debit the SWA pool for the tail only.
+
+        THE decision, shared by the admission charge and the allocator call --
+        they must not be able to disagree, because a charge that undercounts what
+        `_pre_alloc` then allocates exhausts the SWA pool and trips its
+        `kv_loc is not None` assert mid-serving.
+
+        `alloc_extend_swa_tail` maps the freshly allocated sliding window onto the
+        LAST `swa_tail_len` slots it just handed out, so the window has to fit
+        inside the newly allocated `[total_prefix_len, fill_len)` delta. When a
+        decode-radix hit is long enough that the window would reach back into the
+        reused prefix, those slots belong to the radix tree rather than to this
+        allocation and the tail path is not expressible; fall back to
+        `alloc_extend`, which debits the SWA pool for the whole delta.
+        """
+        if not self._uses_swa_tail_prealloc():
+            return False
+        return self._swa_tail_len(fill_len) <= fill_len - total_prefix_len
+
+    def _prealloc_kv_lens(
+        self, req: Req, *, prefix_len: int = 0, total_prefix_len: Optional[int] = None
+    ) -> Tuple[int, int]:
         """(full, swa) token counts this request will debit from the two pools.
 
-        `prefix_len` must be the device-resident prefix the request will reuse,
-        because it decides which allocator path `_pre_alloc` takes. Tail-only
-        SWA allocation is valid only from an empty prefix, so on a decode-radix
-        hit `_pre_alloc` falls back to `alloc_extend`, which debits the SWA pool
-        for the whole delta -- not one sliding window. Charging the window there
-        under-counts by (delta - window), which exhausts the SWA pool and trips
-        the `kv_loc is not None` assert in `_pre_alloc`.
+        `total_prefix_len` is the prefix committed to prefill (L1 + L2 + L3) and
+        defines the delta this call allocates; it decides which allocator path
+        `_pre_alloc` takes. It defaults to `prefix_len`, which is the whole prefix
+        whenever decode-side HiCache is off.
         """
         allocated_kv_len = self._pre_alloc_fill_len(req)
         if not self._uses_swa_tail_prealloc():
             return allocated_kv_len, allocated_kv_len
-        if prefix_len > 0:
-            return allocated_kv_len, self._required_alloc_tokens(
-                fill_len=allocated_kv_len, prefix_len=prefix_len
-            )
-        return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
+        if total_prefix_len is None:
+            total_prefix_len = prefix_len
+        if self._takes_swa_tail_path(
+            fill_len=allocated_kv_len, total_prefix_len=total_prefix_len
+        ):
+            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
+        return allocated_kv_len, self._required_alloc_tokens(
+            fill_len=allocated_kv_len, prefix_len=prefix_len
+        )
 
     def _prealloc_required_tokens(
-        self, req: Req, *, prefix_len: int = 0
+        self, req: Req, *, prefix_len: int = 0, total_prefix_len: Optional[int] = None
     ) -> Tuple[int, int]:
-        full_len, swa_len = self._prealloc_kv_lens(req, prefix_len=prefix_len)
+        full_len, swa_len = self._prealloc_kv_lens(
+            req, prefix_len=prefix_len, total_prefix_len=total_prefix_len
+        )
         swa_reserved = self.num_reserved_decode_tokens
         if self.scheduler.server_args.disable_radix_cache:
             swa_reserved = 0
@@ -443,6 +468,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req: Req,
         *,
         prefix_len: int,
+        total_prefix_len: Optional[int] = None,
         origin_input_len: int,
         full_allocatable_tokens: int,
         swa_allocatable_tokens: int,
@@ -453,9 +479,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Whether `req` fits both pools when admitted against `prefix_len`.
 
         Returns (fits, required_alloc_tokens). Both pool charges depend on
-        `prefix_len`, and they move in OPPOSITE directions: a larger prefix
-        shrinks the FULL charge but grows the SWA one, because `_pre_alloc`
-        only takes the cheap tail-only SWA path from an empty prefix.
+        `prefix_len`. The FULL charge shrinks monotonically as the prefix grows.
+        The SWA charge is the sliding window whenever the window fits inside the
+        delta this call allocates -- so it is flat for most hits -- and only jumps
+        to the whole delta for a prefix so long that the window reaches back into
+        it (see `_takes_swa_tail_path`).
         """
         fill_len = self._pre_alloc_fill_len(req)
         required_alloc_tokens = self._required_alloc_tokens(
@@ -476,8 +504,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return False, required_alloc_tokens
 
         if uses_swa_tail_prealloc:
-            _, swa_required = self._prealloc_required_tokens(req, prefix_len=prefix_len)
-            _, swa_len = self._prealloc_kv_lens(req, prefix_len=prefix_len)
+            swa_kwargs = dict(prefix_len=prefix_len, total_prefix_len=total_prefix_len)
+            _, swa_required = self._prealloc_required_tokens(req, **swa_kwargs)
+            _, swa_len = self._prealloc_kv_lens(req, **swa_kwargs)
             if (
                 max(swa_required, swa_len + max_new_tokens - retractable_swa_tokens)
                 > swa_allocatable_tokens
@@ -1140,7 +1169,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 uses_swa_tail_prealloc=uses_swa_tail_prealloc,
             )
             fits, required_alloc_tokens = self._admission_fits(
-                decode_req.req, prefix_len=prefix_len, **budget_kwargs
+                decode_req.req,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                **budget_kwargs
             )
             if not fits and prefix_len > 0:
                 # A radix hit costs MORE SWA than a miss: `_pre_alloc` only takes
@@ -1154,7 +1186,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len = 0
                 total_prefix_len = 0
                 fits, required_alloc_tokens = self._admission_fits(
-                    decode_req.req, prefix_len=0, **budget_kwargs
+                    decode_req.req,
+                    prefix_len=0,
+                    total_prefix_len=0,
+                    **budget_kwargs
                 )
             if not fits:
                 break
@@ -1200,7 +1235,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # against the prefix this request was actually admitted with --
                 # the miss-retry above may have dropped it back to 0.
                 _, swa_required = self._prealloc_required_tokens(
-                    decode_req.req, prefix_len=prefix_len
+                    decode_req.req,
+                    prefix_len=prefix_len,
+                    total_prefix_len=total_prefix_len,
                 )
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
@@ -1668,7 +1705,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.host_token_len(fill_len),
             )
         else:
-            uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
+            uses_swa_tail = self._takes_swa_tail_path(
+                fill_len=fill_len, total_prefix_len=total_prefix_len
+            )
             swa_tail_len = self._swa_tail_len(fill_len)
             kv_loc = alloc_for_decode_prealloc(
                 allocator,
@@ -1804,17 +1843,22 @@ def alloc_for_decode_prealloc(
                 device=device,
             )
         if uses_swa_tail:
-            # Tail-only SWA allocation: only valid when prefix_len == 0.
-            # When prefix_len > 0 (radix cache hit), we fall back to
-            # alloc_extend which allocates SWA at full page count;
-            # `_prealloc_kv_lens` charges the admission budget accordingly.
+            # Tail-only SWA allocation. The full pool is extended from
+            # `total_prefix_len` exactly as `alloc_extend` would, while the SWA
+            # pool only takes the sliding window -- which `_takes_swa_tail_path`
+            # has already established lies inside this delta. A decode-radix hit
+            # reaches here too: the reused prefix keeps whatever SWA mapping the
+            # radix tree holds for it, and SWA attention never reads that far
+            # back anyway.
             kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                prefix_lens=torch.tensor(
+                    [total_prefix_len], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
-                extend_num_tokens=fill_len,
+                extend_num_tokens=delta_len,
                 swa_tail_len=swa_tail_len,
                 **extra_kwargs,
             )

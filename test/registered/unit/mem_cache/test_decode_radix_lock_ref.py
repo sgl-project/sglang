@@ -25,6 +25,9 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
+import ast
+import inspect
+import textwrap
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -32,7 +35,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    alloc_for_decode_prealloc,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -180,73 +186,230 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(req.swa_uuid_for_lock, 99)
         self.assertEqual(req.skip_lock_node_ids, {ComponentType.SWA: {7}})
 
-    def test_swa_admission_charge_matches_the_allocator_path(self):
-        """`_pre_alloc` only takes the tail-only SWA path from an empty prefix
-        (`uses_swa_tail = ... and prefix_len == 0`). On a decode-radix hit it
-        falls back to `alloc_extend`, which debits the SWA pool for the whole
-        delta. If the admission budget still charged one sliding window, the
-        SWA pool would be over-subscribed by (delta - window) per request and
-        the `kv_loc is not None` assert in `_pre_alloc` would fire.
-        """
+    @staticmethod
+    def _swa_queue(*, page_size: int = 64, window: int = 128, fill_len: int = 1024):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
         queue.num_reserved_decode_tokens = 0
         queue.scheduler = MagicMock()
-        queue.scheduler.sliding_window_size = 128
+        queue.scheduler.sliding_window_size = window
         queue.scheduler.server_args.disable_radix_cache = False
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-
-        fill_len = 1024
-        req = MagicMock()
         queue._pre_alloc_fill_len = MagicMock(return_value=fill_len)
+        return queue
 
-        # Miss: tail-only allocation, so one window is the honest charge.
-        _, swa_on_miss = queue._prealloc_kv_lens(req, prefix_len=0)
-        self.assertEqual(swa_on_miss, queue._swa_tail_len(fill_len))
-        self.assertEqual(swa_on_miss, 128)
+    def test_swa_admission_charge_matches_the_allocator_path(self):
+        """The admission charge must equal what `_pre_alloc` then allocates.
 
-        # Hit: alloc_extend debits every new page, so the charge must be the
-        # delta, not the window -- otherwise we under-charge by 768 tokens.
-        prefix_len = 128
-        _, swa_on_hit = queue._prealloc_kv_lens(req, prefix_len=prefix_len)
-        self.assertEqual(
-            swa_on_hit,
-            queue._required_alloc_tokens(fill_len=fill_len, prefix_len=prefix_len),
-        )
-        self.assertEqual(swa_on_hit, fill_len - prefix_len)
-
-    def test_admission_falls_back_to_miss_when_the_hit_costs_too_much_swa(self):
-        """Because a radix hit disables tail-only SWA allocation, the hit-path
-        SWA charge can exceed the pool while the miss-path charge fits. If
-        admission just gave up there, the request would requeue, re-derive the
-        same hit, and head-of-line-block the whole decode queue forever. It must
-        fall back to prefix_len=0 instead."""
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
-        queue.num_reserved_decode_tokens = 0
-        queue.scheduler = MagicMock()
-        queue.scheduler.sliding_window_size = 128
-        queue.scheduler.server_args.disable_radix_cache = False
-        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-
+        `_takes_swa_tail_path` is the single predicate both consult. Whenever the
+        sliding window fits inside the delta this call allocates, the SWA debit
+        is one window -- on a decode-radix hit exactly as on a miss. Charging the
+        delta there would over-reserve; charging the window when the allocator
+        instead falls back to `alloc_extend` would under-reserve by
+        (delta - window) per request and trip the `kv_loc is not None` assert.
+        """
         fill_len = 1024
+        queue = self._swa_queue(fill_len=fill_len)
+        req = MagicMock()
+        window = queue._swa_tail_len(fill_len)
+        self.assertEqual(window, 128)
+
+        # Miss: tail-only, one window.
+        _, swa_on_miss = queue._prealloc_kv_lens(req, prefix_len=0)
+        self.assertEqual(swa_on_miss, window)
+
+        # Hit with room for the window inside the delta: still one window.
+        _, swa_on_hit = queue._prealloc_kv_lens(req, prefix_len=128)
+        self.assertEqual(swa_on_hit, window)
+        self.assertEqual(swa_on_hit, swa_on_miss)
+
+        # Hit so long that the window would reach back into the reused prefix:
+        # the tail path is not expressible, so the charge is the whole delta.
+        deep_prefix = fill_len - 64  # delta 64 < window 128
+        _, swa_deep = queue._prealloc_kv_lens(req, prefix_len=deep_prefix)
+        self.assertFalse(
+            queue._takes_swa_tail_path(fill_len=fill_len, total_prefix_len=deep_prefix)
+        )
+        self.assertEqual(
+            swa_deep,
+            queue._required_alloc_tokens(fill_len=fill_len, prefix_len=deep_prefix),
+        )
+
+    def test_swa_charge_follows_total_prefix_not_l1_prefix(self):
+        """The delta is measured from `total_prefix_len` (L1+L2+L3), which is
+        what `_pre_alloc` extends from. With decode HiCache on they diverge, and
+        charging against the L1 prefix alone would disagree with the allocator.
+        """
+        fill_len = 1024
+        queue = self._swa_queue(fill_len=fill_len)
+        req = MagicMock()
+        # L1 hit is small, but prefill was promised nearly the whole prompt, so
+        # the delta is tiny and the tail path is unavailable.
+        _, swa = queue._prealloc_kv_lens(
+            req, prefix_len=64, total_prefix_len=fill_len - 64
+        )
+        self.assertEqual(
+            swa, queue._required_alloc_tokens(fill_len=fill_len, prefix_len=64)
+        )
+        # Same L1 prefix, no HiCache gap: the tail path applies.
+        _, swa_no_gap = queue._prealloc_kv_lens(req, prefix_len=64)
+        self.assertEqual(swa_no_gap, queue._swa_tail_len(fill_len))
+
+    def test_a_hit_is_never_charged_more_than_a_miss(self):
+        """The property the change buys, swept over every prefix length.
+
+        Before, a hit paid the whole delta while a miss paid one window, so a
+        hit could be rejected where the same request would have been admitted as
+        a miss -- and the retry would re-derive the same hit, head-of-line
+        blocking the decode queue. Now:
+          * window fits in the delta -> hit charge == miss charge (one window)
+          * window does not fit      -> the delta is SMALLER than the window,
+                                        so the charge is smaller still
+        Either way the hit is never the more expensive branch, in either pool.
+        """
+        fill_len = 1024
+        queue = self._swa_queue(fill_len=fill_len)
         req = MagicMock()
         req.sampling_params.max_new_tokens = 0
-        queue._pre_alloc_fill_len = MagicMock(return_value=fill_len)
 
-        # SWA pool fits one window (128) but not the 896-token hit-path delta.
+        _, swa_on_miss = queue._prealloc_kv_lens(req, prefix_len=0)
+        full_on_miss = queue._required_alloc_tokens(fill_len=fill_len, prefix_len=0)
+
+        for prefix_len in range(0, fill_len, 64):
+            _, swa_on_hit = queue._prealloc_kv_lens(req, prefix_len=prefix_len)
+            full_on_hit = queue._required_alloc_tokens(
+                fill_len=fill_len, prefix_len=prefix_len
+            )
+            self.assertLessEqual(swa_on_hit, swa_on_miss, f"{prefix_len=} SWA")
+            self.assertLessEqual(full_on_hit, full_on_miss, f"{prefix_len=} FULL")
+
+    def test_ordinary_hit_admitted_where_it_used_to_be_rejected(self):
+        """An SWA budget that fits one window but not the delta: before the
+        change this hit was rejected and fell back to a miss; now it is admitted
+        with its prefix intact, which is the whole point of the feature."""
+        fill_len = 1024
+        queue = self._swa_queue(fill_len=fill_len)
+        req = MagicMock()
+        req.sampling_params.max_new_tokens = 0
+
         budget = dict(
             origin_input_len=fill_len,
             full_allocatable_tokens=10**9,
-            swa_allocatable_tokens=256,
+            swa_allocatable_tokens=256,  # one window fits, an 896-token delta does not
             retractable_tokens=0,
             retractable_swa_tokens=0,
             uses_swa_tail_prealloc=True,
         )
         fits_hit, _ = queue._admission_fits(req, prefix_len=128, **budget)
-        fits_miss, _ = queue._admission_fits(req, prefix_len=0, **budget)
-        self.assertFalse(fits_hit)
-        self.assertTrue(fits_miss)
+        self.assertTrue(fits_hit)
+
+    def test_tail_path_allocates_the_delta_when_hicache_owns_part_of_the_prefix(self):
+        """L1 miss with an L2/L3 hit: `prefix_len == 0` but `total_prefix_len > 0`.
+
+        The old gate (`uses_swa_tail = ... and prefix_len == 0`) took the tail
+        branch here and asked for the WHOLE sequence -- `prefix_lens=[0]`,
+        `extend_num_tokens=fill_len` -- while `_pre_alloc` writes the result at
+        offset `total_prefix_len`. That over-allocates by `total_prefix_len`
+        slots and writes `[fill_len, total_prefix_len + fill_len)`, past the end
+        of the sequence.
+
+        The combination is only reachable once the decode radix cache is allowed
+        on a hybrid-SWA pool: `_uses_swa_tail_prealloc()` is true exactly for
+        those pools, and `enable_decode_hicache` requires
+        `disaggregation_decode_enable_radix_cache`.
+        """
+        fill_len, total_prefix_len = 1024, 256
+        delta_len = fill_len - total_prefix_len
+
+        allocator = MagicMock(page_size=64, device=torch.device("cpu"))
+        allocator.alloc_extend_swa_tail.return_value = torch.arange(
+            delta_len, dtype=torch.int64
+        )
+        del allocator.c4_attn_allocator  # not the NPU allocator
+
+        req = MagicMock()
+        req.kv = None
+        alloc_for_decode_prealloc(
+            allocator,
+            req=req,
+            fill_len=fill_len,
+            delta_len=delta_len,
+            prefix_len=0,
+            total_prefix_len=total_prefix_len,
+            prefix_indices=None,
+            uses_swa_tail=True,
+            swa_tail_len=128,
+        )
+
+        allocator.alloc_extend_swa_tail.assert_called_once()
+        kwargs = allocator.alloc_extend_swa_tail.call_args.kwargs
+        self.assertEqual(
+            kwargs["extend_num_tokens"],
+            delta_len,
+            "asked for the whole sequence; the caller writes at total_prefix_len",
+        )
+        self.assertEqual(int(kwargs["prefix_lens_cpu"][0]), total_prefix_len)
+        self.assertEqual(int(kwargs["seq_lens_cpu"][0]), fill_len)
+
+    def test_allocator_site_asks_the_same_predicate_as_the_charge(self):
+        """The charge and the allocation must not be able to disagree.
+
+        `_prealloc_kv_lens` bills the SWA pool for one window whenever
+        `_takes_swa_tail_path` says so. If `_pre_alloc` decided the allocator
+        branch by any other rule, a request could be billed for a window and
+        then allocate the whole delta -- the SWA pool drains silently until
+        `_pre_alloc`'s own `kv_loc is not None` assert fires mid-serving, which
+        is not a failure any charge-side test can see.
+
+        Pinned at the source level because reaching the branch for real needs a
+        GPU-sized two-pool allocator.
+        """
+        source = inspect.getsource(DecodePreallocQueue._pre_alloc)
+        tree = ast.parse(textwrap.dedent(source))
+
+        assigns = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "uses_swa_tail" for t in node.targets
+            )
+        ]
+        self.assertEqual(len(assigns), 1, "expected one uses_swa_tail decision")
+        (decision,) = assigns
+        self.assertIsInstance(
+            decision.value, ast.Call, f"not a call: {ast.unparse(decision.value)}"
+        )
+        self.assertEqual(decision.value.func.attr, "_takes_swa_tail_path")
+        self.assertEqual(
+            sorted(kw.arg for kw in decision.value.keywords),
+            ["fill_len", "total_prefix_len"],
+        )
+
+        # ...and the tail call must extend from that same prefix, not from zero.
+        alloc_tree = ast.parse(
+            textwrap.dedent(inspect.getsource(alloc_for_decode_prealloc))
+        )
+        calls = [
+            node
+            for node in ast.walk(alloc_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "alloc_extend_swa_tail"
+        ]
+        self.assertEqual(len(calls), 1)
+        kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+        self.assertIn("total_prefix_len", kwargs["prefix_lens"])
+        self.assertIn("total_prefix_len", kwargs["prefix_lens_cpu"])
+        self.assertEqual(kwargs["extend_num_tokens"], "delta_len")
+
+    def test_miss_fallback_still_wired_even_though_swa_can_no_longer_trigger_it(self):
+        """The fallback at `pop_preallocated` is now belt-and-braces for the SWA
+        budget, but it must stay wired: it is the only thing standing between a
+        future non-monotonic charge and a permanently blocked decode queue."""
+        source = inspect.getsource(DecodePreallocQueue.pop_preallocated)
+        self.assertIn("_release_prefix_lock", source)
+        self.assertIn("prefix_len=0", source)
 
     def test_incremental_transfer_success(self):
         """Scenario 1: prefix match > 0, transfer succeeds.
