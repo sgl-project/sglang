@@ -3845,6 +3845,7 @@ class HybridLinearKVPool(KVCache):
                     write_loc,
                     cache_k,
                     cache_v,
+                    dcp_kv_mask=dcp_kv_mask,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -4022,17 +4023,23 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         parallel = get_parallel()
-        if parallel.dcp_enabled:
+        if dcp_kv_mask is not None:
+            # Triton DCP already maps logical allocation IDs to this rank's
+            # physical KV rows (out_cache_loc // dcp_size). Keep the graph
+            # shape static and route non-owned tokens to padding row 0.
+            # Ownership is defined by token position, not collapsed row ID.
+            loc = torch.where(dcp_kv_mask, loc, 0)
+        elif parallel.dcp_enabled:
             valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+            # Fallback for callers that provide logical, uncollapsed locs.
+            loc = torch.where(valid_mask, loc // parallel.attn_dcp_size, 0)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
