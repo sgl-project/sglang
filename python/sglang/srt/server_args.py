@@ -4686,18 +4686,6 @@ class ServerArgs:
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
 
-        # The defaults above assume a long-lived server that amortizes the capture
-        # over days; a CI server serves one test file, so its largest buckets are
-        # captured and never replayed. Measured over a full CI run, 97% of decode
-        # steps sit at bs <= 32. Only ever shrink, and only when the test did not
-        # ask for a range -- passing --cuda-graph-max-bs-decode opts back out.
-        if (
-            is_in_ci()
-            and self.cuda_graph_max_bs_decode is None
-            and decode_cuda_graph_config.max_bs
-        ):
-            decode_cuda_graph_config.max_bs = min(decode_cuda_graph_config.max_bs, 64)
-
         # Set cuda graph batch sizes
         if self.device != "cpu":
             if decode_cuda_graph_config.bs is None:
@@ -4747,18 +4735,6 @@ class ServerArgs:
                 prefill_cuda_graph_config.max_bs = min(
                     prefill_cuda_graph_config.max_bs, 4096
                 )
-
-        # Same reasoning as the decode bound above: 97% of prefill batches in CI
-        # are <= 1024 tokens, while this list runs to chunked_prefill_size (8192
-        # on H100-class GPUs) and its largest buckets cost seconds each to capture.
-        if (
-            is_in_ci()
-            and self.cuda_graph_max_bs_prefill is None
-            and prefill_cuda_graph_config.max_bs
-        ):
-            prefill_cuda_graph_config.max_bs = min(
-                prefill_cuda_graph_config.max_bs, 1024
-            )
 
         if prefill_cuda_graph_config.bs is None:
             prefill_cuda_graph_config.bs = (

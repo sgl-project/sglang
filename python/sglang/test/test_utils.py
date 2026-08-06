@@ -956,6 +956,18 @@ def popen_launch_server(
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
+    # The graph defaults are sized for a server that runs for days and amortizes
+    # the capture; a test server serves one file and captures buckets it never
+    # replays (97% of measured CI prefill batches are <= 1024 tokens, 97% of
+    # decode steps at bs <= 32). A test that needs the deployed range -- a
+    # benchmark, say -- passes the flag itself and keeps it.
+    for flag, value in (
+        ("--cuda-graph-max-bs-prefill", "1024"),
+        ("--cuda-graph-max-bs-decode", "64"),
+    ):
+        if not any(str(arg).startswith(flag) for arg in other_args):
+            other_args = list(other_args) + [flag, value]
+
     # CI-specific: Validate cache and enable offline mode if complete
     if env is None:
         env = os.environ.copy()
