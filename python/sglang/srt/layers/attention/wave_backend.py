@@ -105,7 +105,11 @@ class WaveAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        # This rank's first local layer, not global layer 0: the pool indexes as
+        # `layer_id - start_layer`, so under PP a non-first rank would read a
+        # negative index for layer 0 and raise IndexError.
+        _kv_pool = model_runner.token_to_kv_pool
+        self.v_head_dim = _kv_pool.get_value_buffer(_kv_pool.start_layer).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
 

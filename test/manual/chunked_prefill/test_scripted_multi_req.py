@@ -11,6 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_all_finished,
     run_until_finished,
+    run_until_finished_and_rid_released,
 )
 
 
@@ -182,7 +183,9 @@ class TestMultiReqBasic(ScriptedTestCase):
     def _script_rid_reuse_after_finish(t: ScriptedContext):
         baseline = t.engine_stats()
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
-        yield from run_until_finished(r1)
+        # Reusing the rid requires the TokenizerManager to have released it, which
+        # lags the scheduler's "finished" — see run_until_finished_and_rid_released.
+        yield from run_until_finished_and_rid_released(r1)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, rid="reuse-rid")
         yield from run_until_finished(r2)
         assert r1.finished and r2.finished
