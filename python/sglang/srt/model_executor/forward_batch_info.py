@@ -1389,12 +1389,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
-                    # Count the dummy tokens as real, else MoE topk/all-to-all
-                    # treats this rank as empty and starves later layers.
-                    # (num_token_non_padded is None unless moe_ep_size > 1.)
-                    if self.num_token_non_padded is not None:
-                        self.num_token_non_padded.fill_(num_tokens)
-                    self.num_token_non_padded_cpu = num_tokens
+                    # Keep idle non-hybrid fabricated rows masked by default.
+                    # Hybrid-SSM needs the real count for its state update.
+                    mask_dummy_tokens = (
+                        not hybrid_ssm and self._original_forward_mode.is_idle()
+                    )
+                    if mask_dummy_tokens:
+                        if self.num_token_non_padded is not None:
+                            self.num_token_non_padded.fill_(0)
+                        self.num_token_non_padded_cpu = 0
+                    else:
+                        if self.num_token_non_padded is not None:
+                            self.num_token_non_padded.fill_(num_tokens)
+                        self.num_token_non_padded_cpu = num_tokens
                 else:
                     self.extend_num_tokens = bs
                     self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
