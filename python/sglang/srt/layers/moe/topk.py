@@ -82,6 +82,7 @@ try:
 except ImportError:
     pass
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
 from sglang.srt.distributed import (
     get_tp_group,
@@ -101,7 +102,6 @@ from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -392,7 +392,7 @@ def _make_round_robin_expert_ids(
 # -------------------------------- TopK ---------------------------------------
 
 
-class TopK(MultiPlatformOp):
+class TopK(BaseFusedOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
@@ -471,6 +471,18 @@ class TopK(MultiPlatformOp):
             return topk_output
         assert TopKOutputChecker.format_is_standard(topk_output)
         return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
+
+    def forward_musa(self, *args, **kwargs) -> TopKOutput:
+        # MUSA follows the CUDA path explicitly: select_experts branches on
+        # _is_musa internally (hardware_backend.musa topk kernels), so the
+        # native path would bypass them.
+        return self.forward_cuda(*args, **kwargs)
+
+    def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
+        # torch.compile of the native TopK only pays off at bs=1; for larger
+        # batches keep the current optimized dispatch (see MultiPlatformOp
+        # history: the compiled path regressed bs > 1).
+        return self.forward_native if num_tokens == 1 else None
 
     def forward_native(
         self,
