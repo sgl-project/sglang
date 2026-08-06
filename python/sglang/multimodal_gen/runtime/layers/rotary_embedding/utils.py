@@ -84,7 +84,7 @@ def _apply_rotary_emb_complex(
         torch.Tensor: The same shape and dtype as x.
     """
     b, s, h, d = x.shape
-    dtype_c = torch.float32
+    dtype_c = torch.float64
 
     x_complex = torch.view_as_complex(x.to(dtype_c).reshape(b, s, h, d // 2, 2))
     x_out = torch.view_as_real(x_complex * freqs)
