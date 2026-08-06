@@ -41,6 +41,7 @@ from sglang.srt.configs import (
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK3Config,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
@@ -100,6 +101,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
+        KimiK3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
         FalconH1Config,
@@ -493,12 +495,13 @@ def get_generation_config(
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        logger.warning(
-            "Failed to load generation config for %s: %s. "
-            "Proceeding without generation config.",
+    except (FileNotFoundError, OSError) as e:
+        # A missing generation_config.json is normal for many checkpoints and
+        # is surfaced by HF as a generic OSError (not FileNotFoundError). Treat
+        # it as benign — proceed without a generation config, at DEBUG level so
+        # normal startup logs stay quiet.
+        logger.debug(
+            "No generation config for %s: %s. Proceeding without it.",
             model,
             e,
         )
