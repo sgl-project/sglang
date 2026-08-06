@@ -868,10 +868,6 @@ def _get_chunked_prefill_embedding(
             if _is_hip or _is_npu or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
                 # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
-                # XPU hit the same class of bug: torch.cat shape mismatch in
-                # phi4mm.get_image_feature when images with different patch/crop
-                # counts get batched together across requests in one ViT call
-                # (build #4529: "Expected size 7 but got size 11").
                 chunk = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
