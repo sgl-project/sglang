@@ -247,10 +247,6 @@ class DsparkFoldedSampling(IntEnum):
 
 class Envs:
 
-    # Raise on bare server_args field assignments after resolution; mutation
-    # must go through ServerArgs.override() (enabled by the test harness).
-    SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
-
     # Per-role config-namespace bookkeeping: off / record / enforce (value is
     # validated fail-loud in runtime_context, which resolves it once at import
     # so the read stays dynamo-prunable).
@@ -332,6 +328,10 @@ class Envs:
     )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
+    # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
+    # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE (single combined trace) takes
+    # precedence when both are set.
+    SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
@@ -1045,12 +1045,6 @@ class Envs:
     SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
-    # Raise if Triton loads a kernel after the engine starts serving. This
-    # verifies that startup warmup covers every kernel specialization used at
-    # serving time.
-    SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
-    SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
-    SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
 
     # Encoder gRPC
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
@@ -1332,7 +1326,7 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
-    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+    SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

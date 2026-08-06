@@ -2,6 +2,7 @@ from typing import Union
 
 import torch
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
@@ -11,13 +12,12 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import set_weight_attrs
 
 
-class Mixer2RMSNormGated(MultiPlatformOp):
+class Mixer2RMSNormGated(BaseFusedOp):
     def __init__(
         self,
         full_hidden_size: int,
