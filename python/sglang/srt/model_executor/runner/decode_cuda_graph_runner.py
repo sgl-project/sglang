@@ -81,6 +81,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.model_executor.runner_utils import WarReadDonePolicy
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
@@ -203,6 +204,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+        self._war_read_done_node_planted = False
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -417,6 +419,49 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _plant_war_read_done_node(self):
+        """Record the read-done event as a graph node right after the in-graph
+        metadata hook. Safe for both full and breakable capture: capture is
+        active here (breakable opens segment 1 on context entry) and every
+        segment replays, re-arming the node. Non-capturing runs (warmup,
+        debug-eager, no external-event support) leave the flag unset and stay
+        on the fallback paths."""
+        if (
+            self.model_runner.war_read_done_event is not None
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            self.model_runner.war_read_done_event.record()
+            self._war_read_done_node_planted = True
+
+    def _war_read_done_policy(self, attn_backend, forward_mode) -> WarReadDonePolicy:
+        """Whether and where this replay records its WAR read-done event."""
+        if forward_mode.is_target_verify():
+            if (
+                not self.model_runner.spec_algorithm.supports_target_verify_war_read_done()
+            ):
+                return WarReadDonePolicy.NONE
+            if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph:
+                return WarReadDonePolicy.POST_REPLAY
+            if self._war_read_done_node_planted:
+                return WarReadDonePolicy.IN_GRAPH
+            return WarReadDonePolicy.PRE_REPLAY
+        elif forward_mode.is_decode():
+            if self._war_read_done_node_planted:
+                return WarReadDonePolicy.IN_GRAPH
+            return WarReadDonePolicy.PRE_REPLAY
+        return WarReadDonePolicy.NONE
+
+    def _publish_war_read_done(self, in_graph: bool):
+        """Publish the read-done event the scheduler's WAR barrier waits on."""
+        if in_graph:
+            self.model_runner.war_fastpath_read_done_event = (
+                self.model_runner.war_read_done_event
+            )
+        else:
+            read_done = self.device_module.Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
@@ -958,6 +1003,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
+                self._plant_war_read_done_node()
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
@@ -1195,20 +1241,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
-        # Publish a read-done event for the WAR barrier: a cuda-graph forward
-        # finishes its shared req_to_token / SWA reads at this pre-replay
-        # snapshot, so plain DECODE and block-draft TARGET_VERIFY qualify.
-        publish_read_done = forward_batch.forward_mode.is_decode() or (
-            forward_batch.forward_mode.is_target_verify()
-            and self.model_runner.spec_algorithm.is_dflash_family()
-        )
-        # Exception: breakable-graph verify replays (captured forward metadata)
-        # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead.
-        read_done_post_replay = (
-            publish_read_done
-            and forward_batch.forward_mode.is_target_verify()
-            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        war_policy = self._war_read_done_policy(
+            self.attn_backend, forward_batch.forward_mode
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
@@ -1226,15 +1260,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if publish_read_done and not read_done_post_replay:
-                read_done = self.device_module.Event()
-                read_done.record()
-                self.model_runner.war_fastpath_read_done_event = read_done
+            if war_policy is WarReadDonePolicy.PRE_REPLAY:
+                self._publish_war_read_done(in_graph=False)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
-            if read_done_post_replay:
-                read_done = self.device_module.Event()
-                read_done.record()
-                self.model_runner.war_fastpath_read_done_event = read_done
+            if war_policy is WarReadDonePolicy.POST_REPLAY:
+                self._publish_war_read_done(in_graph=False)
+            elif war_policy is WarReadDonePolicy.IN_GRAPH:
+                self._publish_war_read_done(in_graph=True)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
