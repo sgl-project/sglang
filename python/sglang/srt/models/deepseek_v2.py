@@ -67,6 +67,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
@@ -2729,18 +2730,21 @@ class DeepseekV2Model(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            initial_topk_indices = None
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-            topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+            initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+        index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
+        if not self.pp_group.is_first_rank:
             assert not (
                 not forward_batch.forward_mode.is_idle()
                 and hidden_states.shape[0] != 0
                 and self.use_dsa
                 and dsa_forward_uses_topk
                 and dsa_layer_skips_topk(self.config, self.start_layer)
-                and topk_indices is None
+                and index_topk_share.topk_indices is None
             ), (
                 f"PP stage starting at layer {self.start_layer} requires DSA "
                 "topk_indices from the previous stage."
@@ -2802,8 +2806,6 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         # Append-compatible, so the shared capture path below is unchanged.
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
-        if self.pp_group.is_first_rank:
-            topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2821,7 +2823,7 @@ class DeepseekV2Model(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     llama_4_scaling,
-                    prev_topk_indices=topk_indices,
+                    prev_topk_indices=index_topk_share.topk_indices,
                     captured_last_layer_outputs=(
                         aux_hidden_states if i in self.layers_to_capture else None
                     ),
@@ -2829,6 +2831,7 @@ class DeepseekV2Model(nn.Module):
                         i
                     ),
                 )
+                index_topk_share.update(topk_indices)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2855,6 +2858,7 @@ class DeepseekV2Model(nn.Module):
                 and self.end_layer < self.config.num_hidden_layers
                 and dsa_layer_skips_topk(self.config, self.end_layer)
             ):
+                topk_indices = index_topk_share.topk_indices
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and hidden_states.shape[0] != 0

@@ -322,6 +322,11 @@ class MockModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -331,6 +336,7 @@ class MockModelRunner(ModelRunner):
         self.pp_size = 1
         self.ps = ParallelState.trivial()
         self.is_draft_worker = False
+        self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
         # this dense mock declares none.
         self.model = nn.Module()
