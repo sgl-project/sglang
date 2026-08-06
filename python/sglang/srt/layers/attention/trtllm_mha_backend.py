@@ -102,6 +102,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    # Prefill metadata initialization snapshots all scheduler-shared inputs.
+    prefill_shared_reads_end_at_metadata_init: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -340,9 +343,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                swa_loc = self.forward_metadata.swa_out_cache_loc
+                assert (
+                    swa_loc is not None
+                    and swa_loc.shape[0] >= forward_batch.out_cache_loc.shape[0]
+                ), (
+                    "SWA write locs missing or too short: init_forward_metadata "
+                    "must translate out_cache_loc once; a per-layer gather of "
+                    "the live mapping would race the scheduler after the WAR "
+                    "fence releases"
                 )
+                # Piecewise prefill narrows out_cache_loc per attention call;
+                # the snapshot keeps the padded batch length.
+                return swa_loc[: forward_batch.out_cache_loc.shape[0]]
         return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(

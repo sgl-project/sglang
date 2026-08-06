@@ -1064,13 +1064,39 @@ ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 
 
+# Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
+# Enabled incrementally and AMD-only: the CUDA `multimodal-gen-unit-test`
+# lane keeps the flat glob below. Files that still need fixes/skips are added
+# in follow-up PRs. Paths are relative to the unit/ dir.
+_AMD_READY_NESTED_UNIT_TESTS = (
+    "realtime/test_causal_denoising.py",
+    "realtime/test_output_materialization.py",
+    "realtime/test_realtime_consistency_harness.py",
+    "realtime/test_realtime_control_signals.py",
+    "realtime/test_realtime_output_transport.py",
+    "realtime/test_realtime_vae.py",
+    "sana_wm/test_streaming_cached.py",
+    "sana_wm/test_streaming_stage.py",
+    "sana_wm/test_streaming_vae.py",
+)
+
+
 def _discover_unit_tests() -> list[str]:
     unit_dir = Path(__file__).resolve().parent.parent / "unit"
     if not unit_dir.is_dir():
         return []
-    return sorted(
-        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
-    )
+    # Flat unit/ tests run on every lane (unchanged). This keeps the CUDA
+    # `multimodal-gen-unit-test` job byte-identical.
+    flat = [f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()]
+    if not current_platform.is_hip():
+        return sorted(flat)
+    # AMD/ROCm additionally runs the vetted nested-subdir tests.
+    nested = [
+        f"../unit/{rel}"
+        for rel in _AMD_READY_NESTED_UNIT_TESTS
+        if (unit_dir / rel).is_file()
+    ]
+    return sorted(flat + nested)
 
 
 FILE_SUITES = {
@@ -1118,6 +1144,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_dp_serving_2_gpu.py",
     ],
 }
 
@@ -1152,6 +1179,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        # zimage server startup dominates; six short requests after warmup
+        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
     },
 }
 
