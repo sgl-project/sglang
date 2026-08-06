@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
@@ -27,6 +28,11 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
 from sglang.kernels.ops.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
@@ -282,10 +288,44 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
+        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
         hidden_states, _ = self.proj(hidden_states)
         return self.gelu(hidden_states)
+
+
+class FluxFusedGELUProj(nn.Module):
+    """tanh-GELU up-projection site for the shared (diffusers-style) FeedForward.
+
+    Drop-in replacement for ``diffusers.models.activations.GELU`` with
+    ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
+    default path is the bit-exact reference (plain Linear + tanh-GELU); the
+    cublasLt GELU epilogue is mounted per batch by the denoising stage for
+    quality="high" requests only.
+    """
+
+    def __init__(self, proj: nn.Linear):
+        super().__init__()
+        self.proj = proj
+        mark_fused_gelu_site(self, "proj")
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
+        return F.gelu(self.proj(hidden_states), approximate="tanh")
 
 
 class FluxParallelFeedForward(nn.Module):
@@ -663,6 +703,9 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
+            # quality="high" fusion site: proj_mlp GEMM + tanh-GELU in the
+            # cublasLt epilogue (mounted per batch by the denoising stage).
+            mark_fused_gelu_site(self, "proj_mlp")
             proj_out_cls = (
                 RowParallelLinear if shard_single_block else ColumnParallelLinear
             )
@@ -762,8 +805,15 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-            mlp_hidden_states = self.act_mlp(proj_hidden_states)
+            if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+                self.proj_mlp, norm_hidden_states
+            ):
+                mlp_hidden_states = fused_linear_gelu_tanh(
+                    norm_hidden_states, self.proj_mlp.weight, self.proj_mlp.bias
+                )
+            else:
+                proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
+                mlp_hidden_states = self.act_mlp(proj_hidden_states)
 
             attn_output = self.attn(
                 x=norm_hidden_states,
@@ -868,6 +918,10 @@ class FluxTransformerBlock(nn.Module):
                 dim_out=dim,
                 activation_fn="gelu-approximate",
             )
+            # Re-home each FF's tanh-GELU up-projection onto a marked
+            # quality="high" fusion site (bit-exact reference by default).
+            self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
+            self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 
     def forward(
         self,
