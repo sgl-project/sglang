@@ -1,0 +1,44 @@
+name: Helm Lint and Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'helm/**'
+  pull_request:
+    paths:
+      - 'helm/**'
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.14.0
+
+      - name: Lint chart
+        run: helm lint helm/sglang
+
+      - name: Template chart (without model.path - expected to fail)
+        continue-on-error: true
+        run: |
+          helm template sglang helm/sglang \
+            --set replicaCount=1 \
+            --set hfSecret.token=test-token \
+            --debug
+
+      - name: Template chart (with model.path)
+        run: |
+          helm template sglang helm/sglang \
+            --set replicaCount=1 \
+            --set model.path=meta-llama/Llama-3.1-8B-Instruct \
+            --set hfSecret.token=test-token \
+            --debug
