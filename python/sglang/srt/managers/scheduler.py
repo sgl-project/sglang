@@ -301,7 +301,6 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
-    triton_load_watch,
 )
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
@@ -527,6 +526,11 @@ class Scheduler(
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            hicache_draft_plan=(
+                self.draft_worker.hicache_draft_plan
+                if self.draft_worker is not None
+                else None
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -562,16 +566,6 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
-
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            page_size=self.page_size,
-        )
 
         # Init running status
         self.init_running_status()
@@ -958,6 +952,7 @@ class Scheduler(
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
             )
+            self.draft_worker.init_hicache_draft_plan()
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1284,11 +1279,10 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
+        draft_token_to_kv_pool = (
+            self.draft_worker.primary_draft_kv_pool
+            if self.draft_worker is not None
+            else None
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
@@ -1634,11 +1628,6 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
-        # Engine init (graph capture, warmups) is done; from here on any
-        # Triton kernel device-load is a lazy first-use at serving time.
-        triton_load_watch.install()
-        triton_load_watch.mark_serving_started()
-
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.

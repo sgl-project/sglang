@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
+    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
 
@@ -394,6 +395,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache controller is not attached.")
+        for spec, entry in zip(specs, entries, strict=True):
+            self.cache_controller.register_host_pool_entry(entry)
+            self.register_sidecar_pool(spec)
 
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
@@ -1559,7 +1569,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -1578,10 +1587,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained += 1
                 yield item
 
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
-
         def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
@@ -1591,6 +1596,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
+                    self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
                     continue
 
@@ -1668,7 +1677,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -1679,7 +1687,6 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
         local_qsize_list = [
-            cc.prefetch_revoke_queue.qsize(),
             cc.prefetch_hit_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
@@ -1694,13 +1701,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_revoke, n_storage_hit, n_backup, n_release = qsize_list[:4]
+        n_storage_hit, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
         }
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
@@ -1824,7 +1830,6 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             storage_queue_sizes = (
                 (
-                    cc.prefetch_revoke_queue.qsize(),
                     cc.prefetch_hit_queue.qsize(),
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
@@ -2015,16 +2020,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
                 extra_release_counts = {
                     pool_name: count
                     for pool_name, count in zip(
                         extra_pool_names,
-                        storage_queue_sizes[4:],
+                        storage_queue_sizes[3:],
                     )
                 }
                 self._drain_storage_control_queues_impl(
-                    n_revoke=n_revoke,
                     n_storage_hit=n_storage_hit,
                     n_backup=n_backup,
                     n_release=n_release,
