@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter, defaultdict
 from typing import Iterable, List, Optional, Tuple
 
 import msgspec
@@ -55,7 +54,6 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
-from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
 
 logger = logging.getLogger(__name__)
 
