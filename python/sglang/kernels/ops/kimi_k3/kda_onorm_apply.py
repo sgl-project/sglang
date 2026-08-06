@@ -5,7 +5,7 @@ with no V-slice cluster; this kernel performs the per-(token, head) RMS
 reduction and the gate/weight apply in a second, cluster-free launch. The
 verify kernel therefore never co-schedules clusters of V-slice CTAs, which
 was the multi-request cliff for the split family (see
-benchmark/bench_linear_attention/WORKLOG.md, [2stage]).
+benchmark/bench_linear_attention/bench_kda_mtp_verify.py, [2stage]).
 """
 
 import cuda.bindings.driver as cuda

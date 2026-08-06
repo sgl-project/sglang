@@ -976,7 +976,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         num_req = query_start_loc.shape[0] - 1
         draft_num = seq_len // num_req if num_req > 0 else 0
         # Width-8/16 kernel dispatch (all validated bitwise per request; see
-        # benchmark/bench_linear_attention/WORKLOG.md for the measured table).
+        # benchmark/bench_linear_attention/bench_kda_mtp_verify.py for the
+        # measured table).
         # With the two-stage onorm the split kernels never co-schedule V-slice
         # clusters - the small onorm-apply kernel performs the cross-slice RMS
         # reduce + gate/weight in a second cluster-free launch:

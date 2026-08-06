@@ -231,7 +231,8 @@ def _run_cutedsl(
 
 def run_cutedsl(inp: Inputs) -> torch.Tensor:
     """Run the production CuTeDSL dispatch policy (mirrors kda_backend;
-    all validated bitwise per request; see WORKLOG.md):
+    all validated bitwise per request; see the measured table in
+    kda_backend.py):
     N==1 -> z16 cluster (accept-length fidelity; see [bs1-cluster-fidelity]),
     N 2..3 -> z32 two-stage, N 4..6 w16 -> z64 cluster (512t, fused onorm),
     else serial family."""
@@ -444,7 +445,7 @@ def check_invariants(args: argparse.Namespace) -> None:
     elif resident_v:
         split_v = False
     else:
-        # production policy (mirrors kda_backend; see WORKLOG.md)
+        # production policy (mirrors kda_backend)
         split_v = batch_size == 1 and width in (8, 16)
         if batch_size in (2, 3) and width in (8, 16) and split_tile_v is None:
             split_v = False
