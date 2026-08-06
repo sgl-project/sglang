@@ -2,8 +2,8 @@
 //!
 //! Two mechanics live here; the WIRE SHAPES stay owned by their endpoints:
 //! the native `{"error": {"message", "code"}}` body (Python
-//! `http_server.generate_request` parity) built by [`error_value`], and the
-//! SSE variant [`sse_error_response`] used by any
+//! `http_server.generate_request` parity) built by [`error_value`] and formed
+//! by [`json_error`], and the SSE variant [`sse_error_response`] used by any
 //! endpoint family (native and OpenAI alike — the caller supplies its own
 //! body shape). The OpenAI error payload and the PD bootstrap registry's
 //! plain-text bodies are protocol-owned and deliberately not unified here.
@@ -23,6 +23,11 @@ use axum::{
 /// path emits, not bare text, which a client parsing JSON chokes on.
 pub fn error_value(code: u16, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": { "message": message, "code": code } })
+}
+
+/// Unary native-shape error response: `code` + [`error_value`] body.
+pub fn json_error(code: StatusCode, message: &str) -> Response {
+    error_response(code, error_value(code.as_u16(), message), false)
 }
 
 /// Form an error in the shape the client committed to: unary → `code` plus

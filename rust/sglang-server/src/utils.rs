@@ -2,4 +2,5 @@
 
 pub mod regex;
 pub mod response;
+pub mod serialize;
 pub mod sock;
