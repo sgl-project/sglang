@@ -225,7 +225,16 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
-def _apply_wo_a_bf16_matmul(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+# Flipped once if the aiter ``batched_gemm_bf16`` path fails, so a missing or
+# incompatible aiter install falls back to the einsum for the rest of the
+# process instead of re-raising (and re-logging) on every layer/token on the
+# decode critical path.
+_wo_a_aiter_batched_gemm_disabled = False
+
+
+def _apply_wo_a_bf16_matmul(
+    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+) -> torch.Tensor:
     """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
 
     ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
@@ -237,11 +246,17 @@ def _apply_wo_a_bf16_matmul(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor
     ``batched_gemm_bf16`` for exactly this shape (``Y[i] = X[i] @ W[i]^T``),
     which is the kernel the reference ATOM stack uses. Routing to it is
     numerically bf16-equivalent (validated max rel-err <=5e-4). Opt-in via
-    ``SGLANG_OPT_USE_AITER_BATCHED_GEMM`` (default off); any failure falls
-    back to the einsum.
+    ``SGLANG_OPT_USE_AITER_BATCHED_GEMM`` (default off) and gated on the global
+    ``SGLANG_USE_AITER`` switch; the reroute is only applied on the ``is_decode``
+    path it was benchmarked on (prefill keeps the einsum). Any failure disables
+    the path for the process and falls back to the einsum.
     """
+    global _wo_a_aiter_batched_gemm_disabled
     if (
-        envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get()
+        is_decode
+        and not _wo_a_aiter_batched_gemm_disabled
+        and envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get()
+        and _use_aiter
         and _is_hip
         and _is_gfx95_supported
     ):
@@ -257,8 +272,11 @@ def _apply_wo_a_bf16_matmul(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor
             y = batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
             return y.transpose(0, 1).contiguous()
         except Exception as err:
+            _wo_a_aiter_batched_gemm_disabled = True
             logger.warning(
-                "aiter wo_a batched_gemm_bf16 failed, einsum fallback: %s", err
+                "aiter wo_a batched_gemm_bf16 failed; disabling the reroute and "
+                "falling back to einsum for the rest of this process: %s",
+                err,
             )
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
@@ -1302,7 +1320,9 @@ class MQALayer(MqaAttentionBase):
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = _apply_wo_a_bf16_matmul(o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+            )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:

@@ -6,9 +6,12 @@ bf16 GEMM off the rocBLAS/Tensile ``Cijk_*`` batched GEMM onto aiter's tuned
 ``batched_gemm_bf16``, with an einsum fallback.
 
 Validates:
-1. Gating -- flag off / non-HIP / non-gfx95 all keep the plain
+1. Gating -- flag off / global ``SGLANG_USE_AITER`` off / non-HIP / non-gfx95 /
+   prefill (``is_decode=False``) all keep the plain
    ``torch.einsum("tgd,grd->tgr", ...)`` path (bit-identical to the old code).
-2. Fallback -- any failure inside the aiter branch degrades to the einsum.
+2. Fallback -- any failure inside the aiter branch degrades to the einsum and
+   disables the reroute for the rest of the process (no per-call retry / log
+   spam on the decode critical path).
 3. Numerics -- on gfx95 with aiter, the aiter kernel is genuinely used and its
    result matches the einsum within bf16 tolerance across ``T/G/D/R`` shapes
    (the PR's model-free bit-check).
@@ -29,7 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _AITER_BATCHED_GEMM_MODULE = "aiter.ops.triton.gemm.batched.batched_gemm_bf16"
 
@@ -46,6 +49,9 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0)
+        # The one-shot disable flag is process-global; reset it so a failure
+        # case in one test cannot leak into another.
+        self.dsv4._wo_a_aiter_batched_gemm_disabled = False
 
     def _rand(self, T, G, D, R):
         o = torch.randn(T, G, D, device=self.device, dtype=torch.bfloat16)
@@ -74,9 +80,39 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
             envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(False),
             mock.patch("torch.einsum", wraps=torch.einsum) as spy,
         ):
-            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
+            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
         spy.assert_called_once()  # took the einsum path, not the aiter kernel
         self.assertEqual(out.shape, (8, 4, 32))
+        self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
+
+    def test_global_use_aiter_off_uses_einsum(self):
+        # The reroute must stay behind the global SGLANG_USE_AITER switch even
+        # when the opt-in flag is set on HIP/gfx95.
+        o, wo_a = self._rand(8, 4, 128, 32)
+        with (
+            mock.patch.object(self.dsv4, "_use_aiter", False),
+            mock.patch.object(self.dsv4, "_is_hip", True),
+            mock.patch.object(self.dsv4, "_is_gfx95_supported", True),
+            envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
+            mock.patch("torch.einsum", wraps=torch.einsum) as spy,
+        ):
+            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
+        spy.assert_called_once()
+        self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
+
+    def test_prefill_uses_einsum(self):
+        # The reroute is benchmarked/validated for decode only; prefill
+        # (is_decode=False) must keep the einsum even with everything enabled.
+        o, wo_a = self._rand(8, 4, 128, 32)
+        with (
+            mock.patch.object(self.dsv4, "_use_aiter", True),
+            mock.patch.object(self.dsv4, "_is_hip", True),
+            mock.patch.object(self.dsv4, "_is_gfx95_supported", True),
+            envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
+            mock.patch("torch.einsum", wraps=torch.einsum) as spy,
+        ):
+            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=False)
+        spy.assert_called_once()
         self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
 
     def test_flag_on_non_hip_uses_einsum(self):
@@ -86,7 +122,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
             envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
             mock.patch("torch.einsum", wraps=torch.einsum) as spy,
         ):
-            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
+            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
         spy.assert_called_once()
         self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
 
@@ -97,33 +133,46 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
             envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
             mock.patch("torch.einsum", wraps=torch.einsum) as spy,
         ):
-            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
+            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
         spy.assert_called_once()
         self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
 
     # ---------------------------------------------------------------- fallback
 
-    def test_aiter_failure_falls_back_to_einsum(self):
+    def test_aiter_failure_falls_back_and_disables_reroute(self):
         o, wo_a = self._rand(8, 4, 128, 32)
 
         fake = types.ModuleType(_AITER_BATCHED_GEMM_MODULE)
 
+        call_count = {"n": 0}
+
         def _boom(*args, **kwargs):
+            call_count["n"] += 1
             raise RuntimeError("kernel missing")
 
         fake.batched_gemm_bf16 = _boom
 
         with (
             mock.patch.dict(sys.modules, {_AITER_BATCHED_GEMM_MODULE: fake}),
+            mock.patch.object(self.dsv4, "_use_aiter", True),
             mock.patch.object(self.dsv4, "_is_hip", True),
             mock.patch.object(self.dsv4, "_is_gfx95_supported", True),
             envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
         ):
-            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
+            out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
 
-        # Failure inside the aiter branch must not raise and must match einsum.
-        self.assertEqual(out.shape, (8, 4, 32))
-        self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
+            # Failure inside the aiter branch must not raise and must match einsum.
+            self.assertEqual(out.shape, (8, 4, 32))
+            self.assertTrue(torch.equal(out, self._einsum(o, wo_a)))
+
+            # The reroute is disabled after the first failure, so a subsequent
+            # decode step does not retry the broken kernel (no per-call log spam
+            # on the critical path).
+            self.assertTrue(self.dsv4._wo_a_aiter_batched_gemm_disabled)
+            out2 = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
+            self.assertTrue(torch.equal(out2, self._einsum(o, wo_a)))
+
+        self.assertEqual(call_count["n"], 1)  # kernel attempted exactly once
 
     # ---------------------------------------------------------------- numerics
 
@@ -142,9 +191,12 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
                 o, wo_a = self._rand(T, G, D, R)
                 ref = self._einsum(o, wo_a).float()
 
-                with envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True):
-                    with mock.patch("torch.einsum", wraps=torch.einsum) as spy:
-                        out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
+                with (
+                    mock.patch.object(self.dsv4, "_use_aiter", True),
+                    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
+                    mock.patch("torch.einsum", wraps=torch.einsum) as spy,
+                ):
+                    out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a, is_decode=True)
                 # The aiter kernel -- not the einsum fallback -- must have run,
                 # otherwise this check would be trivially satisfied.
                 spy.assert_not_called()
