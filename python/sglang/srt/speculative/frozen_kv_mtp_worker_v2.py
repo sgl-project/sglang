@@ -44,6 +44,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
@@ -141,6 +142,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
                 context_length=self.target_worker.model_runner.model_config.context_len,
+                # Hand the runner the backend this algorithm resolved, so its
+                # stamped pair carries --speculative-draft-attention-backend
+                # instead of the target's ordinary decode/base choice.
+                draft_attention_backend=(
+                    get_spec().speculative_draft_attention_backend
+                    or attention_backends()[1]
+                ),
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -228,11 +236,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         pass
 
     def _resolve_draft_backend_type(self) -> str:
-        return (
-            self.server_args.speculative_draft_attention_backend
-            or self.server_args.decode_attention_backend
-            or self.server_args.attention_backend
-        )
+        # This worker hands its runner the resolved draft backend at
+        # construction (--speculative-draft-attention-backend, else the
+        # configured decode/base pair), so the runner's stamp *is* that
+        # decision -- read it instead of re-deriving the same chain.
+        return self.draft_model_runner.decode_attention_backend_str
 
     def _init_draft_attn_backend(self):
         if self.topk == 1:
