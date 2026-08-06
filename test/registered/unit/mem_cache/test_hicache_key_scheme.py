@@ -7,6 +7,7 @@ import unittest
 import msgspec
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    CellAdapter,
     KVCacheNamespace,
     build_canonical_cell_suffixes,
     derive_namespace,
@@ -1170,6 +1171,107 @@ class TestCellAdapterGatherScatter(CustomTestCase):
                         self.assertTrue(
                             torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
                         )
+
+
+class TestCellAdapterStaging(CustomTestCase):
+    """Backend-neutral CellAdapter: key fan-out, arena-sized sub-batching,
+    and the pointer round trip a backend performs — no store involved."""
+
+    class _UnpinnedCellAdapter(CellAdapter):
+        # CPU-only test hosts cannot pin memory.
+        def _alloc_arena(self, numel):
+            import torch
+
+            return torch.empty(numel, dtype=torch.uint8)
+
+    def _config(self, suffixes, layer_ranges, head_ranges, extra=None):
+        return HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=head_ranges is None,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="m",
+            extra_config=extra,
+            canonical_suffix=suffixes,
+            canonical_layer_ranges=layer_ranges,
+            canonical_head_ranges=head_ranges,
+        )
+
+    def test_all_direct_pool_allocates_no_arenas(self):
+        # MLA on page_first_direct: every slab pool-contiguous.
+        mla = TestMlaCellAdapter()
+        pool = mla._pool("page_first_direct", mla._logical())
+        registered = []
+        adapter = CellAdapter(
+            pool,
+            self._config(["ns_L0-2", "ns_L2-6"], [(0, 2), (2, 6)], None),
+            register_buffer=registered.append,
+        )
+        self.assertIsNone(adapter.arena_set)
+        self.assertIsNone(adapter.arena_get)
+        self.assertEqual(registered, [])
+        self.assertEqual(adapter.keys_per_page, 2)
+        self.assertEqual(
+            adapter.cell_keys(["h1", "h2"]),
+            ["h1_ns_L0-2_k", "h1_ns_L2-6_k", "h2_ns_L0-2_k", "h2_ns_L2-6_k"],
+        )
+
+    def test_staged_round_trip_with_single_page_sub_batches(self):
+        import ctypes
+
+        import torch
+
+        gs = TestCellAdapterGatherScatter()
+        logical = gs._logical()
+        layer_ranges, head_ranges = gs._grid()
+        suffixes = [
+            f"ns_L{l0}-{l1}_H{j}"
+            for l0, l1 in layer_ranges
+            for j in range(len(head_ranges))
+        ]
+        # cell_arena_mb=0 floors the arenas at ONE page's cells, forcing a
+        # sub-batch per page and arena reuse across sub-batches.
+        config = self._config(
+            suffixes, layer_ranges, head_ranges, extra={"cell_arena_mb": 0}
+        )
+        writer = self._UnpinnedCellAdapter(gs._pool("page_head", logical), config)
+        self.assertEqual(writer.arena_pages, 1)
+        self.assertEqual(writer.keys_per_page, 8)
+
+        page_keys = [f"h{p}" for p in range(gs._PAGES)]
+        indices = torch.arange(gs._PAGES * gs._PS)
+        store = {}
+        for sub_keys, sub_indices in writer.sub_batches(page_keys, indices):
+            self.assertEqual(len(sub_keys), 1)
+            ptrs, sizes = writer.gather(sub_indices)
+            for key, ptr, size in zip(writer.cell_keys(sub_keys), ptrs, sizes):
+                store[key] = ctypes.string_at(ptr, size)
+        self.assertEqual(len(store), gs._PAGES * 8)
+
+        registered = []
+        reader = self._UnpinnedCellAdapter(
+            gs._pool("page_first", [torch.zeros_like(l) for l in logical]),
+            config,
+            register_buffer=registered.append,
+        )
+        self.assertEqual(len(registered), 2)
+        for sub_keys, sub_indices in reader.sub_batches(page_keys, indices):
+            ptrs, sizes = reader.read_metas(sub_indices)
+            for key, ptr, size in zip(reader.cell_keys(sub_keys), ptrs, sizes):
+                ctypes.memmove(ptr, store[key], size)
+            reader.scatter(sub_indices, [True] * len(sub_keys))
+        for p, L in enumerate(logical):
+            got = reader.pool._page_kv_view_canonical(p * gs._PS)
+            for l0, l1 in layer_ranges:
+                for h0, h1 in head_ranges:
+                    self.assertTrue(
+                        torch.equal(got[:, h0:h1, l0:l1], L[:, h0:h1, l0:l1])
+                    )
 
 
 if __name__ == "__main__":
