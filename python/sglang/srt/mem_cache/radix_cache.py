@@ -511,6 +511,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
+        # kv_indices aliases req_to_token, which is overwritten below. Use the copy
+        # so deferred free groups retain the original request-owned indices.
         self.token_to_kv_pool_allocator.free_segment(
             values[req.cache_protected_len : new_prefix_len],
             start_pos=req.cache_protected_len,
