@@ -46,7 +46,6 @@ def _build_batch(seq_specs, with_token_ids):
         input_logprob_indices.extend([lp_pt + i for i in range(n_lp)])
         lp_pt += rows
         pruned_lens.append(n_lp)
-    token_to_seq_idx.append(len(seq_specs) - 1)
     metadata = SimpleNamespace(
         extend_return_top_logprob=True,
         extend_token_ids_logprob=with_token_ids,
@@ -109,25 +108,21 @@ class TestLogprobChunkStitching(CustomTestCase):
                     ref, ref_sampled = _run(proc, batch, False, 10**9)
                     got, got_sampled = _run(proc, batch, True, chunk_size)
                     label = f"specs={list(combo)} chunk={chunk_size}"
-                    self.assertEqual(
-                        ref.input_top_logprobs_val, got.input_top_logprobs_val, label
-                    )
-                    self.assertEqual(
-                        ref.input_top_logprobs_idx, got.input_top_logprobs_idx, label
-                    )
+                    self.assertEqual(ref.top_logprobs_val, got.top_logprobs_val, label)
+                    self.assertEqual(ref.top_logprobs_idx, got.top_logprobs_idx, label)
                     if with_token_ids:
                         self.assertEqual(
-                            ref.input_token_ids_logprobs_val,
-                            got.input_token_ids_logprobs_val,
+                            ref.token_ids_logprobs_val,
+                            got.token_ids_logprobs_val,
                             label,
                         )
                         self.assertEqual(
-                            ref.input_token_ids_logprobs_idx,
-                            got.input_token_ids_logprobs_idx,
+                            ref.token_ids_logprobs_idx,
+                            got.token_ids_logprobs_idx,
                             label,
                         )
                     torch.testing.assert_close(
-                        ref.input_token_logprobs, got.input_token_logprobs, msg=label
+                        ref.token_logprobs, got.token_logprobs, msg=label
                     )
                     torch.testing.assert_close(ref_sampled, got_sampled, msg=label)
         self.assertGreater(tried, 1000)

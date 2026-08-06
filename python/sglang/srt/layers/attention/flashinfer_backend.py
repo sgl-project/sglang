@@ -49,11 +49,11 @@ from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
+    get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
     is_sm100_supported,
     next_power_of_2,
-    require_gathered_buffer,
 )
 
 if TYPE_CHECKING:
@@ -61,18 +61,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
-    """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
-    mul_base = 1
-    if server_args.enable_two_batch_overlap:
-        mul_base *= 2
-    if require_gathered_buffer(server_args):
-        mul_base *= get_parallel().attn_tp_size
-    if mul_base % get_parallel().attn_cp_size != 0:
-        mul_base *= get_parallel().attn_cp_size
-    return (max_bs + mul_base - 1) // mul_base * mul_base
 
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
@@ -331,9 +319,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "flashinfer"
         )
-        prefill_backend, decode_backend = (
-            model_runner.server_args.get_attention_backends()
-        )
+        prefill_backend = model_runner.prefill_attention_backend_str
+        decode_backend = model_runner.decode_attention_backend_str
         if self.__class__ is FlashInferAttnBackend:
             if prefill_backend == "flashinfer":
                 self._check_kv_attention_access("prefill", self.prefill_kv_access)
@@ -447,7 +434,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = _cuda_graph_capture_max_bs(
+        max_bs = get_cuda_graph_max_batch_size(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
         if kv_indptr_buf is None:
@@ -1480,8 +1467,12 @@ class FlashInferAttnBackend(AttentionBackend):
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
+        # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
+        # into the plan, and layers running more heads than planned are
+        # silently corrupted. Over-planning is safe.
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+            model_runner.model_config.get_max_num_attention_heads()
+            // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
@@ -1748,8 +1739,12 @@ class FlashInferIndicesUpdaterDecode:
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
+        # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
+        # into the plan, and layers running more heads than planned are
+        # silently corrupted. Over-planning is safe.
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+            model_runner.model_config.get_max_num_attention_heads()
+            // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
@@ -1894,7 +1889,8 @@ class FlashInferIndicesUpdaterPrefill:
                         prefix_lens, seq_lens, effective_start
                     )
                 else:
-                    # window attention use paged only
+                    # window attention use paged only; the trim below is
+                    # request-granular, exactness comes from plan-time window_left
                     paged_kernel_lens = torch.minimum(
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
@@ -1927,6 +1923,13 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                # paged-only SWA path only; ragged keeps its custom prefix
+                # mask, spec-verify keeps its tree mask
+                window_left=(
+                    sliding_window_size
+                    if (wrapper_id == 0 and not use_ragged and spec_info is None)
+                    else -1
+                ),
             )
 
     def _build_swa_prefix_custom_mask(
@@ -2043,6 +2046,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        window_left: int = -1,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -2178,6 +2182,10 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
+        if window_left >= 0:
+            # selects the module with the per-element window mask compiled in
+            paged_plan_kwargs["window_left"] = window_left
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -2217,7 +2225,7 @@ class FlashInferMultiStepDraftBackend:
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
-        max_bs = _cuda_graph_capture_max_bs(
+        max_bs = get_cuda_graph_max_batch_size(
             model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
         )
         self.kv_indptr = torch.zeros(

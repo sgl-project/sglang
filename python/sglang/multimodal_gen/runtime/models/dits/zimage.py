@@ -89,7 +89,7 @@ def zimage_rmsnorm_tanh_mul_add(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.jit_kernel.diffusion.triton.zimage_native_norm import (
+        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
             zimage_rmsnorm_tanh_residual,
         )
 
@@ -112,7 +112,7 @@ def zimage_rmsnorm_scale(
     enable_fused: bool = True,
 ) -> torch.Tensor:
     if enable_fused:
-        from sglang.jit_kernel.diffusion.triton.zimage_native_norm import (
+        from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
             zimage_rmsnorm_scale as fused_zimage_rmsnorm_scale,
         )
 
@@ -125,14 +125,6 @@ def zimage_rmsnorm_scale(
         if y is not None:
             return y
     return norm(x) * scale
-
-
-class SelectFirstElement(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x[0]
 
 
 class TimestepEmbedder(nn.Module):
@@ -754,8 +746,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
-    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping

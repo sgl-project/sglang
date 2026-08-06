@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import RealKvSource
+from sglang.kernels.ops.kv_canary.verify import RealKvSource
 
 
 class PoolKind(IntEnum):
