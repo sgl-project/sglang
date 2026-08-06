@@ -1729,7 +1729,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -2742,10 +2742,11 @@ class ServerArgs:
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc"]],
         "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "Unset resolves automatically: single-node CUDA deployments (without "
-        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
-        "back to CPU transport per tensor when the pool is full.",
+        "Unset resolves automatically: multimodal models on single-node CUDA "
+        "deployments (without disaggregation) use cuda_ipc, everything else uses "
+        "cpu. CUDA IPC reserves SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on "
+        "the base GPU and falls back to CPU transport per tensor when the pool is "
+        "full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -7598,13 +7599,17 @@ class ServerArgs:
                     "encoder-only serving; encoder outputs use "
                     "--encoder-transfer-backend instead."
                 )
-            elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
+            elif (
+                self.get_model_config().is_multimodal
+                and is_cuda()
+                and self.nnodes == 1
+                and self.disaggregation_mode == "null"
+            ):
                 # Auto policy: single-node CUDA serving defaults to the bounded
-                # CUDA-IPC pool. The pool is only allocated when a multimodal
-                # processor exists, so text-only deployments are unaffected; a
-                # full pool degrades to CPU transport per tensor. Multi-node
-                # (IPC handles are intra-node) and PD-disaggregated deployments
-                # keep CPU transport.
+                # CUDA-IPC pool for multimodal models. Text-only deployments do
+                # not need feature transport. Multi-node (IPC handles are
+                # intra-node) and PD-disaggregated deployments keep CPU transport.
+                # A full pool degrades to CPU transport per tensor.
                 requested_transport = "cuda_ipc"
                 logger.info(
                     "Multimodal feature transport auto-resolved to cuda_ipc "
