@@ -138,7 +138,10 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
-    if server_args.max_running_requests is None:
+    if (
+        server_args.max_running_requests is None
+        and server_args.speculative_algorithm is None
+    ):
         server_args.max_running_requests = 256
         logger.warning(
             f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
