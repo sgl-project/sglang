@@ -1516,20 +1516,26 @@ def _generate_block_kvcache(
     reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
 )
 @pytest.mark.parametrize(
-    "nheads,nheads_k,num_splits",
+    "seqlen_q,seqlen_k,nheads,nheads_k,num_splits",
     [
-        (8, 1, 1),  # DeepSeek-style MQA, tile-compatible head ratio
-        (8, 4, 1),  # GQA
-        (20, 1, 0),  # GLM-4.7-Flash TP1: padded head ratio, auto split selection
-    ],
-)
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (1, 128),  # plain decode
-        (4, 1024),  # speculative decode (multiple q rows per request)
-        (64, 800),  # chunked extend
-        (16, 20000),  # long context
+        (*sequence_shape, *head_config)
+        for sequence_shape, head_config in itertools.product(
+            [
+                (1, 128),  # plain decode
+                (4, 1024),  # speculative decode (multiple q rows per request)
+                (64, 800),  # chunked extend
+                (16, 20000),  # long context
+            ],
+            [
+                (8, 1, 1),  # DeepSeek-style MQA, tile-compatible head ratio
+                (8, 4, 1),  # GQA
+                (20, 1, 0),  # GLM-4.7-Flash TP1, padded head ratio
+            ],
+        )
+    ]
+    + [
+        pytest.param(1, 128, 10, 1, 0, id="glm-tp2"),
+        pytest.param(1, 128, 5, 1, 0, id="glm-tp4"),
     ],
 )
 def test_flash_attn_varlen_qv_deepseek_absorbed(
@@ -1570,7 +1576,7 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(
         torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
     )
 
-    out_unpad = flash_attn_varlen_func(
+    out_unpad, lse_unpad = flash_attn_varlen_func(
         rearrange(q, "b s h d -> (b s) h d"),
         k_cache_paged,
         v_cache_paged,
@@ -1581,13 +1587,16 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(
         page_table=page_table,
         causal=True,
         num_splits=num_splits,
+        return_softmax_lse=True,
         ver=4,
     )
+    assert out_unpad.shape == (batch_size * seqlen_q, nheads, dv)
+    assert lse_unpad.shape == (batch_size * seqlen_q, nheads)
     out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
 
     # Decode enters through the flash_attn_with_kvcache wrapper; it must
     # thread qv/num_splits down to the same varlen kernel call bit-for-bit.
-    out_kvcache = flash_attn_with_kvcache(
+    out_kvcache, lse_kvcache = flash_attn_with_kvcache(
         q=rearrange(q, "b s h d -> (b s) h d"),
         k_cache=k_cache_paged,
         v_cache=v_cache_paged,
@@ -1598,15 +1607,36 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(
         max_seqlen_q=seqlen_q,
         causal=True,
         num_splits=num_splits,
+        return_softmax_lse=True,
         ver=4,
     )
     assert torch.equal(out_kvcache, out_unpad)
+    assert torch.equal(lse_kvcache, lse_unpad)
 
     key_padding_mask = rearrange(
         torch.arange(seqlen_k, device=device), "s -> 1 s"
     ) < rearrange(cache_seqlens, "b -> b 1")
     k_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    scores = torch.einsum(
+        "bthd,bshd->bhts", q.float() / math.sqrt(d + dv), k_rep.float()
+    )
+    scores += torch.einsum(
+        "bthd,bshd->bhts", qv.float() / math.sqrt(d + dv), v_rep.float()
+    )
+    scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+    scores.masked_fill_(
+        construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            (None, 0),
+            key_padding_mask=key_padding_mask,
+            device=device,
+        ),
+        float("-inf"),
+    )
+    lse_ref = rearrange(torch.logsumexp(scores, dim=-1), "b h s -> (b s) h")
+    torch.testing.assert_close(lse_unpad, lse_ref, rtol=1e-4, atol=1e-4)
     out_ref, _ = attention_ref(
         q, k_rep, v_rep, None, key_padding_mask, causal=True, qv=qv
     )
@@ -1630,6 +1660,139 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(
     assert (out - out_ref).abs().mean().item() <= 1.5 * (
         out_pt - out_ref
     ).abs().mean().item()
+
+
+@pytest.mark.skipif(
+    not is_sm100_or_sm110_supported(),
+    reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
+)
+def test_flash_attn_qv_paged_decode_cuda_graph():
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k = 2, 1, 128
+    nheads, nheads_k, d, dv = 20, 1, 64, 512
+    torch.random.manual_seed(0)
+
+    q = torch.randn(batch_size, nheads, d, device=device, dtype=dtype)
+    qv = torch.randn(batch_size, nheads, dv, device=device, dtype=dtype)
+    _, _, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        seqlen_k,
+        128,
+        batch_size,
+        nheads_k,
+        d,
+        dv,
+        device,
+        dtype,
+        dtype,
+    )
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+
+    def run(q_input, qv_input):
+        return flash_attn_with_kvcache(
+            q=q_input,
+            k_cache=k_cache_paged,
+            v_cache=v_cache_paged,
+            qv=qv_input,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=seqlen_q,
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=True,
+            ver=4,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        run(q, qv)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = run(q, qv)
+
+    q_replay = torch.randn_like(q)
+    qv_replay = torch.randn_like(qv)
+    q.copy_(q_replay)
+    qv.copy_(qv_replay)
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_out, replay_lse = graph_out.clone(), graph_lse.clone()
+
+    eager_out, eager_lse = run(q_replay, qv_replay)
+    torch.testing.assert_close(replay_out, eager_out, rtol=0, atol=0)
+    torch.testing.assert_close(replay_lse, eager_lse, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not is_sm100_or_sm110_supported(),
+    reason="The dedicated hd256 kernel runs on SM100/SM110 only.",
+)
+@pytest.mark.parametrize("strided_input", ["q", "k", "v"])
+def test_flash_attn_hd256_noncontiguous_inputs(strided_input):
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, nheads, d = 2, 4, 128, 4, 256
+    torch.random.manual_seed(0)
+
+    inputs = {}
+    for name, seqlen in (("q", seqlen_q), ("k", seqlen_k), ("v", seqlen_k)):
+        fused = torch.randn(
+            batch_size * seqlen,
+            nheads * 2,
+            d,
+            device=device,
+            dtype=dtype,
+        )
+        view = fused[:, ::2, :]
+        inputs[name] = view if name == strided_input else view.contiguous()
+
+    strided = inputs[strided_input]
+    assert not strided.is_contiguous()
+    assert strided.stride(-1) == 1
+
+    cu_seqlens_q = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    )
+    cu_seqlens_k = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seqlen_k
+    )
+    dense_inputs = {name: tensor.contiguous() for name, tensor in inputs.items()}
+
+    out, lse = flash_attn_varlen_func(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=1,
+        pack_gqa=False,
+        return_softmax_lse=True,
+        ver=4,
+    )
+    out_dense, lse_dense = flash_attn_varlen_func(
+        dense_inputs["q"],
+        dense_inputs["k"],
+        dense_inputs["v"],
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=1,
+        pack_gqa=False,
+        return_softmax_lse=True,
+        ver=4,
+    )
+    assert torch.equal(out, out_dense)
+    assert torch.equal(lse, lse_dense)
 
 
 if __name__ == "__main__":
