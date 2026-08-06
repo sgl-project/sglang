@@ -444,7 +444,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch.prefix_lens, dtype=torch.int32, device=device
         )
         positions, _ = compute_position(
-            self.model_runner.server_args.attention_backend,
+            self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
             ctx_lens,
             int(sum(batch.extend_lens)),

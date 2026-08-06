@@ -21,7 +21,7 @@ from sglang.srt.multimodal.kimi_k3_vit_cuda_graph_runner import (
     KimiK3ViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -357,7 +357,7 @@ def test_kimi_k3_position_interpolation_uses_contiguous_chw(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch):
+def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch, request):
     metadata_ids = []
     values_are_contiguous = []
 
@@ -370,11 +370,13 @@ def test_kimi_k3_prepares_shared_attention_metadata_once(monkeypatch):
             values_are_contiguous.append(v.is_contiguous())
             return q
 
-    monkeypatch.setattr(
-        kimi_k3_vl,
-        "get_server_args",
-        lambda: SimpleNamespace(mm_attention_backend="flashinfer_cudnn"),
+    # Force the backend through the context, not by patching an import binding:
+    # production reads the published config bag (get_mm().mm_attention_backend).
+    override = get_context().override_server_args(
+        mm_attention_backend="flashinfer_cudnn"
     )
+    override.install()
+    request.addfinalizer(override.restore)
     monkeypatch.setitem(kimi_k3_vl.QKV_BACKEND_IMPL, "flashinfer_cudnn", FakeAttention)
 
     encoder = MoonViT3dEncoder(
