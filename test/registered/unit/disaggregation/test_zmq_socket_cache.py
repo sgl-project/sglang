@@ -110,13 +110,13 @@ class TestZmqSocketCache(CustomTestCase):
 
     def test_rapid_endpoint_churn_stays_bounded(self):
         # Seven is the exact steady-state requirement for a PULL socket and
-        # two monitored endpoints. This forces the retry path whenever the
-        # asynchronous reaper has not released an evicted endpoint yet.
+        # two monitored endpoints. Queue a message on every endpoint so an
+        # eviction would retain context slots if it used nonzero linger.
         manager = self._make_manager(zmq_max_sockets=7, cache_bound=2)
         endpoints = [f"tcp://127.0.0.1:{20000 + index}" for index in range(200)]
 
         for endpoint in endpoints:
-            manager._connect(endpoint)
+            manager._send_multipart_locked(endpoint, [b"payload"])
 
         self.assertEqual(list(manager._socket_cache), endpoints[-2:])
         self.assertEqual(set(manager._monitor_cache), set(endpoints[-2:]))

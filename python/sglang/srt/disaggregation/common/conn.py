@@ -62,15 +62,6 @@ _ZMQ_SOCKET_CREATION_MAX_ATTEMPTS = 8
 _ZMQ_SOCKET_CREATION_RETRY_BASE_DELAY = 0.001
 _TRANSIENT_ZMQ_SOCKET_ERRNOS = {errno.EADDRINUSE, errno.EMFILE, errno.ENFILE}
 
-# LRU eviction closes *healthy* sockets that may still hold accepted-but-
-# unflushed control messages (send_multipart returns once queued, not once
-# delivered). A bounded linger lets libzmq flush them in the background —
-# close() itself never blocks — instead of dropping them and stranding the
-# decode peer until its waiting timeout. A lingering socket keeps its context
-# slot until drained; the cap's full-replacement headroom and the transient
-# EMFILE creation retry absorb that.
-_ZMQ_EVICTED_SOCKET_LINGER_MS = 3000
-
 
 def _validate_zmq_max_sockets(zmq_max_sockets: int) -> None:
     if zmq_max_sockets <= 0:
@@ -830,9 +821,7 @@ class CommonKVManager(BaseKVManager):
 
     @staticmethod
     def _close_monitored_socket(
-        sock: Optional[zmq.Socket],
-        monitor: Optional[zmq.Socket],
-        linger_ms: int = 0,
+        sock: Optional[zmq.Socket], monitor: Optional[zmq.Socket]
     ) -> None:
         """Best-effort, non-blocking teardown of a monitored ZMQ socket."""
         if sock is not None:
@@ -847,11 +836,11 @@ class CommonKVManager(BaseKVManager):
                 pass
         if sock is not None:
             try:
-                sock.close(linger=linger_ms)
+                sock.close(linger=0)
             except zmq.ZMQError:
                 pass
 
-    def _drop_endpoint_locked(self, endpoint: str, linger_ms: int = 0) -> None:
+    def _drop_endpoint_locked(self, endpoint: str) -> None:
         """Remove and close an endpoint after any in-flight send finishes."""
         sock = self._socket_cache.pop(endpoint, None)
         monitor = self._monitor_cache.pop(endpoint, None)
@@ -859,22 +848,17 @@ class CommonKVManager(BaseKVManager):
         if sock is None:
             return
         if send_lock is None:
-            self._close_monitored_socket(sock, monitor, linger_ms=linger_ms)
+            self._close_monitored_socket(sock, monitor)
             return
         # Safe while holding _socket_lock: senders never acquire _socket_lock
         # while holding an endpoint send lock.
         with send_lock:
-            self._close_monitored_socket(sock, monitor, linger_ms=linger_ms)
+            self._close_monitored_socket(sock, monitor)
 
     def _evict_lru_endpoint_locked(self):
-        """Close and drop the least-recently-used cached endpoint.
-
-        Unlike the disconnected-peer path, the victim is a healthy socket, so
-        give queued messages a bounded background linger instead of dropping
-        them.
-        """
+        """Close and drop the least-recently-used cached endpoint."""
         victim = next(iter(self._socket_cache))
-        self._drop_endpoint_locked(victim, linger_ms=_ZMQ_EVICTED_SOCKET_LINGER_MS)
+        self._drop_endpoint_locked(victim)
         logger.debug(f"Evicted LRU decode endpoint socket: {victim}")
 
     def _next_monitor_endpoint_locked(self) -> str:

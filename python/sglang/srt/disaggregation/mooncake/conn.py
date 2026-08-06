@@ -425,7 +425,7 @@ class MooncakeKVManager(CommonKVManager):
                 ],
                 is_ipv6=na.is_ipv6,
             )
-        except zmq.ZMQError as error:
+        except zmq.Again as error:
             logger.warning(
                 f"Failed to send CHUNK_READY for room {req.room} to decode "
                 f"endpoint {na.to_host_port_str()} ({error}); failing the room."
@@ -1098,7 +1098,7 @@ class MooncakeKVManager(CommonKVManager):
                     aux_index=req.dst_aux_index,
                     data=data,
                 )
-            except zmq.ZMQError as error:
+            except zmq.Again as error:
                 # Report per-request failure (the caller's ret != 0 path)
                 # rather than escalating an unreachable decode endpoint into a
                 # rank-fatal transfer-worker crash.
@@ -1541,7 +1541,7 @@ class MooncakeKVManager(CommonKVManager):
                 ],
                 is_ipv6=na.is_ipv6,
             )
-        except zmq.ZMQError as error:
+        except zmq.Again as error:
             # Best-effort: the local status is already recorded and decode
             # discovers the outcome via its own waiting timeout. Raising would
             # escalate one unreachable decode endpoint into a rank-fatal
@@ -1879,9 +1879,9 @@ class MooncakeKVManager(CommonKVManager):
                 # queue). Treat it as fatal for the rank instead — signal the
                 # parent like a Scheduler crash does, so the launcher tears
                 # the rank down and the router ejects/restarts it.
-                # Endpoint-level ZMQ send failures never reach here: the
-                # decode-notify call sites convert them to per-request
-                # failures, so this path only sees unexpected bugs.
+                # Endpoint send timeouts never reach here: decode-notify call
+                # sites convert them to per-request failures, so this path
+                # only sees unexpected bugs or process-wide resource errors.
                 logger.exception(
                     f"Transfer worker {worker_index} failed; terminating rank "
                     f"(bootstrap_port={self.bootstrap_port})."
