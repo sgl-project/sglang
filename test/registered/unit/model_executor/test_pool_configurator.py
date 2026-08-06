@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -99,6 +100,7 @@ def _make_model_runner(
     mc.v_head_dim = v_head_dim
     mc.kv_lora_rank = kv_lora_rank
     mc.qk_rope_head_dim = qk_rope_head_dim
+    mc.attention_arch = AttentionArch.MLA if use_mla_backend else AttentionArch.MHA
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -158,7 +160,9 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        eagle_draft_swa_num_layers=None,
+        dflash_draft_num_layers=None,
     )
 
     return mr
@@ -657,6 +661,45 @@ class TestEagleConfigurator(CustomTestCase):
             config.max_total_num_tokens * actual_bytes_per_token,
             available,
         )
+
+    def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
+        """A Dots-style SWA draft must not be charged as a full KV layer."""
+        available = 10_000_000
+        ratio = 0.25
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+            num_layers=4,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+            swa_num_kv_heads=2,
+            swa_head_dim=32,
+            swa_v_head_dim=32,
+            swa_full_tokens_ratio=ratio,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 1
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        full_tokens = config.full_max_total_num_tokens
+        swa_tokens = config.swa_max_total_num_tokens
+        full_pt = _full_per_token(mr)
+        swa_pt = _swa_per_token(mr)
+        used = full_tokens * full_pt * 2 + swa_tokens * swa_pt * 3
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
