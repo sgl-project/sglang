@@ -116,6 +116,7 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
+
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
         return True
