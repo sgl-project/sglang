@@ -241,5 +241,10 @@ fallback_version = "0.0.0.dev0"
 # This CUDA pyproject builds all of them; platform variants restrict the set
 # via [tool.sglang] rust-extensions (see pyproject_other.toml).
 
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.mem_cache._mem_cache_core"
+path = "../rust/sglang-mem-cache/Cargo.toml"
+binding = "PyO3"
+
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1
