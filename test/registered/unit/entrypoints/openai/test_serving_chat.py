@@ -1590,6 +1590,132 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
+    def _kimi_k3_request_with_history(self):
+        """Request whose history already contains one assistant tool call."""
+        return ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "What's the weather today in paris?"},
+                {
+                    "role": "assistant",
+                    "content": "Let me do some search first.",
+                    "tool_calls": [
+                        {
+                            "id": "call_2b1f0a9c8d7e6f5a4b3c2d1e",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Paris"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "It's rainy in paris now.",
+                    "tool_call_id": "call_2b1f0a9c8d7e6f5a4b3c2d1e",
+                },
+                {"role": "assistant", "content": "It's rainy now."},
+                {"role": "user", "content": "What about LA and Tokyo?"},
+            ],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=False,
+        )
+
+    def test_kimi_k3_tool_call_id_is_opaque_and_unique(self):
+        """kimi_k3 must mint opaque unique ids, not positional ``name:ordinal``.
+
+        The K3 XTML wire format carries no id field and its chat encoding treats
+        ``tool_call_id`` as opaque, so a positional id only creates collisions
+        once a client truncates or replays tool-call history.
+        """
+        self.chat.tool_call_parser = "kimi_k3"
+
+        call_info = Mock()
+        call_info.name = "get_weather"
+        call_info.tool_index = 0
+
+        # Same call item, same history count: ids must still differ.
+        first = self.chat._process_tool_call_id(call_info, 1)
+        second = self.chat._process_tool_call_id(call_info, 1)
+
+        self.assertNotEqual(first, second)
+        for tool_call_id in (first, second):
+            self.assertTrue(tool_call_id.startswith("call_"))
+            self.assertNotIn(":", tool_call_id)
+            self.assertNotIn(call_info.name, tool_call_id)
+
+    def test_kimi_k3_non_streaming_tool_call_ids_survive_frozen_history(self):
+        """Repeated identical requests must not reuse ids for kimi_k3.
+
+        A client that keeps replaying the same windowed history pins
+        ``history_tool_calls_cnt``. Under the old positional scheme every retry
+        minted the same ``name:ordinal`` id and collided with the earlier call.
+        """
+        self.chat.tool_call_parser = "kimi_k3"
+        req = self._kimi_k3_request_with_history()
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser_instance = ParserMock.return_value
+
+            call_info = Mock()
+            call_info.name = "get_weather"
+            call_info.parameters = '{"city":"Los Angeles"}'
+            call_info.tool_index = 0
+
+            call_info2 = Mock()
+            call_info2.name = "get_weather"
+            call_info2.parameters = '{"city":"Tokyo"}'
+            call_info2.tool_index = 1
+
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = (
+                "",
+                [call_info, call_info2],
+            )
+
+            tools = [{"type": "function", "function": {"name": "get_weather"}}]
+            history_tool_calls_cnt = self.chat._get_history_tool_calls_cnt(req)
+
+            seen = set()
+            for _ in range(2):
+                tool_calls, _, _ = self.chat._process_tool_calls(
+                    text="<|open|>tools<|sep|>...",
+                    tools=tools,
+                    finish_reason={"type": "stop", "matched": None},
+                    history_tool_calls_cnt=history_tool_calls_cnt,
+                )
+                self.assertIsNotNone(tool_calls)
+                self.assertEqual(len(tool_calls), 2)
+                for tool_call in tool_calls:
+                    self.assertTrue(tool_call.id.startswith("call_"))
+                    self.assertNotIn(tool_call.id, seen)
+                    seen.add(tool_call.id)
+
+            # history count is still derived from the array length only, so an
+            # opaque history id does not disturb it.
+            self.assertEqual(history_tool_calls_cnt, 1)
+            self.assertEqual(len(seen), 4)
+
+    def test_kimi_k2_tool_call_id_stays_positional(self):
+        """kimi_k2 keeps ``functions.{name}:{ordinal}``.
+
+        Unlike K3, the K2 wire format emits the id itself and its detector parses
+        the function name back out of it, so that contract must not change.
+        """
+        self.chat.tool_call_parser = "kimi_k2"
+
+        call_info = Mock()
+        call_info.name = "get_weather"
+        call_info.tool_index = 1
+
+        self.assertEqual(
+            self.chat._process_tool_call_id(call_info, 2),
+            "functions.get_weather:3",
+        )
+
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
         from sglang.srt.parser.template_manager import TemplateManager
