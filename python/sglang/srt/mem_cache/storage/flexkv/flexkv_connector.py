@@ -50,7 +50,11 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
 )
 
 try:
-    from flexkv.common.config import LayerGroupSpec, recompute_cache_block_counts
+    from flexkv.common.config import (
+        LayerGroupSpec,
+        assert_mooncake_prefetch_ready,
+        recompute_cache_block_counts,
+    )
     from flexkv.common.request import KVResponseStatus
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     from flexkv.integration.config import FlexKVConfig
@@ -291,11 +295,14 @@ class FlexKVConnector:
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
         self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
+        # rid -> actual tokens published after wait-complete prefetch (M1).
+        self._prefetch_loaded_tokens: Dict[str, int] = {}
         self._prefetch_enabled = bool(
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
             or self.cache_config.enable_kv_sharing
         )
+        assert_mooncake_prefetch_ready(self.cache_config, self._prefetch_enabled)
         self._shutdown_done = False
 
         # Keep FlexKV lifecycle self-contained (avoid scattering hooks in
@@ -1245,9 +1252,17 @@ class FlexKVConnector:
         prefetch_error: Optional[Exception] = None
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                task_id = self.kv_manager.prefetch_async(
-                    token_ids=np.asarray(token_ids, dtype=np.int64)
+                ret = self.kv_manager.prefetch_async(
+                    token_ids=np.asarray(token_ids, dtype=np.int64),
+                    # Match lookup: SWA models joint-prefetch Full+SWA so
+                    # compute GET (mooncake-local) can find the SWA window.
+                    swa_aware=self._swa_kv_pool is not None,
                 )
+                # Launch returns (task_id, planned_tokens); actual arrives on wait.
+                if isinstance(ret, tuple):
+                    task_id = int(ret[0])
+                else:
+                    task_id = int(ret)
             except Exception as exc:  # noqa: BLE001
                 prefetch_error = exc
                 task_id = -1
@@ -1261,6 +1276,7 @@ class FlexKVConnector:
             context.task_id = task_id
             self._ongoing_prefetches[rid] = task_id
             self._prefetch_contexts[rid] = context
+            self._prefetch_loaded_tokens.pop(rid, None)
             self._log_cache_op(
                 context,
                 "launch",
@@ -1285,8 +1301,12 @@ class FlexKVConnector:
             return True
         done = False
         status = "running"
+        actual_tokens = 0
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
+                # try_wait is non-blocking; FlexKV check_completed forces
+                # completely=True for PREFETCH so early task_end (e.g. SWA
+                # alone) does not surface as SUCCESS before graph terminal.
                 completed = self.kv_manager.try_wait(task_ids=[task_id]) or {}
             except Exception as exc:  # noqa: BLE001
                 context = getattr(self, "_prefetch_contexts", {}).get(rid)
@@ -1301,24 +1321,42 @@ class FlexKVConnector:
                 )
                 completed = {}
             if task_id in completed:
-                status = _status_value(completed[task_id])
+                response = completed[task_id]
+                status = _status_value(response)
                 done = _is_terminal_status(status)
+                if done:
+                    mask = getattr(response, "return_mask", None)
+                    if mask is not None and not isinstance(mask, list):
+                        actual_tokens = int(np.sum(mask))
+                    elif status == "failed":
+                        actual_tokens = 0
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"done": done, "status": status},
+                {
+                    "done": done,
+                    "status": status,
+                    "actual_tokens": actual_tokens,
+                },
                 channel=FlexKVScatterChannel.PREFETCH_PROGRESS,
             )
             done = payload["done"]
             status = payload["status"]
+            actual_tokens = int(payload.get("actual_tokens", 0))
         if done:
             self._ongoing_prefetches.pop(rid, None)
+            self._prefetch_loaded_tokens[rid] = actual_tokens
             context = self._pop_context("_prefetch_contexts", rid, "prefetch", task_id)
             self._log_cache_op(
                 context,
                 "complete",
                 status,
+                hit_tokens=actual_tokens,
             )
         return done
+
+    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+        """Consume actual tokens published by the last completed prefetch."""
+        return int(self._prefetch_loaded_tokens.pop(rid, 0))
 
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_lookups.pop(rid, None)
@@ -1334,6 +1372,7 @@ class FlexKVConnector:
         # FlexKV doesn't currently support prefetch cancellation, but
         # we still drop our tracking entry.
         task_id = self._ongoing_prefetches.pop(rid, -1)
+        self._prefetch_loaded_tokens.pop(rid, None)
         context = getattr(self, "_prefetch_contexts", {}).pop(rid, None)
         if context is not None:
             self._log_cache_op(
@@ -1441,6 +1480,7 @@ class FlexKVConnector:
             )
         self._prefetch_contexts.clear()
         self._ongoing_prefetches.clear()
+        self._prefetch_loaded_tokens.clear()
         self._inflight_loads.clear()
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
