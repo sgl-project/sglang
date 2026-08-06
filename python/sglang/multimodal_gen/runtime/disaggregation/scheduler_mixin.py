@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     TransferMsgType,
     TransferPushedMsg,
     TransferRegisterMsg,
+    TransferStagedMsg,
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
@@ -115,15 +116,7 @@ _EXCLUDE_FIELDS = frozenset(
     }
 )
 
-# Sampling-params fields that should never be transferred across roles:
-#   - data_type / supported_resolutions: enums / non-JSON classvars reconstructed on the receiver
-#   - teacache_params: model-specific object, not JSON-safe
-#   - output_* / save_output / return_*: output-side concerns owned by the decoder role
-#
-# Everything else on SamplingParams is forwarded automatically via a field-walk
-# below; this keeps new request-level features (e.g. Qwen-Image's
-# true_cfg_scale, guidance_rescale, cfg_normalization, ...) from silently
-# getting dropped just because nobody remembered to add them to a whitelist.
+# SamplingParams fields that are reconstructed locally or not JSON-safe.
 _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     {
         "data_type",
@@ -131,11 +124,6 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
         "teacache_params",
     }
 )
-
-_BASE_SP_DEFAULTS: dict[str, Any] = {}
-for _f in dataclasses.fields(SamplingParams):
-    if _f.default is not dataclasses.MISSING:
-        _BASE_SP_DEFAULTS[_f.name] = _f.default
 
 
 def _is_tensor_like(value) -> bool:
@@ -299,8 +287,7 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             value = getattr(sp, name, None)
             if value is None:
                 continue
-            base_default = _BASE_SP_DEFAULTS.get(name, dataclasses.MISSING)
-            if base_default is not dataclasses.MISSING and value == base_default:
+            if _is_default(value, f):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
@@ -707,12 +694,11 @@ class SchedulerDisaggMixin:
         Called from the recv prefetch thread. Loads on _transfer_stream
         and builds the Req, so the main thread can start compute immediately.
 
-        Returns (req, load_event, request_id, role_name, prealloc_slot_id).
+        Returns (req, load_event, request_id, prealloc_slot_id).
         """
         request_id = msg["request_id"]
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
-        role_name = self._disagg_role.value.upper()
 
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
@@ -748,7 +734,7 @@ class SchedulerDisaggMixin:
         # running denoising loop on the main thread. Deferred to main thread
         # in _disagg_prefetch_event_loop, right before compute.
 
-        return (req, load_event, request_id, role_name, prealloc_slot_id, scalar_fields)
+        return req, load_event, request_id, prealloc_slot_id
 
     # ------------------------------------------------------------------
     # Broadcast
@@ -903,11 +889,7 @@ class SchedulerDisaggMixin:
           - queue timeout: broadcast "skip"
           - shutdown: broadcast None
         """
-        is_multi_rank = (
-            self.server_args.sp_degree != 1
-            or self.server_args.tp_size > 1
-            or self.server_args.enable_cfg_parallel
-        )
+        is_multi_rank = self._is_multi_rank()
 
         while self._running:
             try:
@@ -920,9 +902,7 @@ class SchedulerDisaggMixin:
 
                 if msg_type == "transfer_compute":
                     # Load already done by recv thread
-                    req, load_event, request_id, rn, prealloc_slot_id, scalar_fields = (
-                        data
-                    )
+                    req, load_event, request_id, prealloc_slot_id = data
                     # Wait for load to complete on compute stream
                     if load_event is not None:
                         torch.get_device_module().current_stream().wait_event(
@@ -951,9 +931,9 @@ class SchedulerDisaggMixin:
                         _init_disagg_request_scheduler(self, req)
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
-                        self._disagg_denoiser_compute(req, request_id, rn)
+                        self._disagg_denoiser_compute(req, request_id)
                     elif self._disagg_role == RoleType.DECODER:
-                        self._disagg_decoder_compute(req, request_id, rn)
+                        self._disagg_decoder_compute(req, request_id)
 
                 elif msg_type == "transfer_control":
                     # alloc, push messages — handle on main thread (rank 0 only)
@@ -1299,8 +1279,6 @@ class SchedulerDisaggMixin:
         request_id = msg["request_id"]
         manifest = msg.get("manifest", {})
         scalar_fields = msg.get("scalar_fields", {})
-        role_name = self._disagg_role.value.upper()
-
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
 
@@ -1349,9 +1327,9 @@ class SchedulerDisaggMixin:
 
         # 7. Run compute
         if self._disagg_role == RoleType.DENOISER:
-            self._disagg_denoiser_compute(req, request_id, role_name)
+            self._disagg_denoiser_compute(req, request_id)
         elif self._disagg_role == RoleType.DECODER:
-            self._disagg_decoder_compute(req, request_id, role_name)
+            self._disagg_decoder_compute(req, request_id)
 
     # ------------------------------------------------------------------
     # Compute
@@ -1462,9 +1440,7 @@ class SchedulerDisaggMixin:
         with trace_slice(ctx, DiffStage.SCHEDULER_DISPATCH, thread_finish_flag=True):
             yield
 
-    def _disagg_denoiser_compute(
-        self: Scheduler, req: Req, request_id: str, role_name: str
-    ) -> None:
+    def _disagg_denoiser_compute(self: Scheduler, req: Req, request_id: str) -> None:
         """Run denoiser compute in transfer mode, then stage output for decoder.
 
         Note: Scheduler timestep init is done in _handle_transfer_ready
@@ -1579,9 +1555,7 @@ class SchedulerDisaggMixin:
             time.monotonic() - start_time,
         )
 
-    def _disagg_decoder_compute(
-        self: Scheduler, req: Req, request_id: str, role_name: str
-    ) -> None:
+    def _disagg_decoder_compute(self: Scheduler, req: Req, request_id: str) -> None:
         """Run decoder compute in transfer mode, send result to DS.
 
         Decoder result is sent as raw ZMQ multipart frames (same format as
@@ -1721,22 +1695,20 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
-        # 2. Build transfer metadata dict while staging runs (CPU work, overlapped)
-        staged_data = {
-            "msg_type": "transfer_staged",
-            "request_id": request_id,
-            "data_size": staged.slot.size if staged.slot else 0,
-            "manifest": staged.manifest,
-            "session_id": self._transfer_manager.session_id,
-            "pool_ptr": self._transfer_manager.pool_data_ptr,
-            "slot_offset": staged.slot.offset if staged.slot else 0,
-            "scalar_fields": staged.scalar_fields,
-        }
-        msg_bytes = json.dumps(staged_data, separators=(",", ":")).encode("utf-8")
+        # 2. Build transfer metadata while staging runs (CPU work, overlapped)
+        staged_msg = TransferStagedMsg(
+            request_id=request_id,
+            data_size=staged.slot.size if staged.slot else 0,
+            manifest=staged.manifest,
+            session_id=self._transfer_manager.session_id,
+            pool_ptr=self._transfer_manager.pool_data_ptr,
+            slot_offset=staged.slot.offset if staged.slot else 0,
+            scalar_fields=staged.scalar_fields,
+        )
 
         # 3. Wait for staging to complete before sending (buffer must be ready)
         if stage_event is not None:
             stage_event.synchronize()
 
         # 4. Send transfer staged message
-        self._pool_result_push.send_multipart([TRANSFER_MAGIC, msg_bytes])
+        self._pool_result_push.send_multipart(encode_transfer_msg(staged_msg))
