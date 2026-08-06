@@ -15,7 +15,6 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -793,10 +792,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
     """
-
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.DENOISER
 
     def __init__(
         self,

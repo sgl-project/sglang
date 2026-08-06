@@ -1515,6 +1515,7 @@ class SchedulerDisaggMixin:
         return (
             self._disagg_role == RoleType.DENOISER
             and self.worker.pipeline.pipeline_name == "GlmImagePipeline"
+            and self.server_args.srt_encoder_url is not None
         )
 
     def _disagg_terminal_denoiser_compute(

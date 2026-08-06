@@ -20,6 +20,12 @@ class GlmImageTerminalDecodingStage(DecodingStage):
         return RoleType.DENOISER
 
 
+class GlmImageTerminalBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
+
+
 class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "GlmImagePipeline"
 
@@ -34,6 +40,10 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
+        is_terminal_denoiser = (
+            self._disagg_role == RoleType.DENOISER
+            and server_args.srt_encoder_url is not None
+        )
         self.add_stage(
             GlmImageAR(
                 processor=self.get_module("processor"),
@@ -42,8 +52,13 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             "glm_image_ar",
         )
 
+        before_denoising_stage_cls = (
+            GlmImageTerminalBeforeDenoisingStage
+            if is_terminal_denoiser
+            else GlmImageBeforeDenoisingStage
+        )
         self.add_stage(
-            GlmImageBeforeDenoisingStage(
+            before_denoising_stage_cls(
                 vae=self.get_module("vae"),
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
@@ -60,7 +75,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
         )
 
-        if self._disagg_role == RoleType.DENOISER:
+        if is_terminal_denoiser:
             self.add_stage(
                 GlmImageTerminalDecodingStage(
                     vae=self.get_module("vae"), pipeline=self

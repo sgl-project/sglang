@@ -720,7 +720,13 @@ def launch_disagg_role(server_args: ServerArgs):
     cfg_degree = (
         server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
     )
-    if role_tp * role_sp * cfg_degree * server_args.dp_size > server_args.num_gpus:
+    cfg_parallel_explicit = server_args.is_arg_explicitly_set(
+        "enable_cfg_parallel"
+    ) or server_args.is_arg_explicitly_set("cfg_parallel_degree")
+    if (
+        not cfg_parallel_explicit
+        and role_tp * role_sp * cfg_degree * server_args.dp_size > server_args.num_gpus
+    ):
         logger.warning(
             "Disabling CFG parallel for %s role because tp=%d, sp=%d, cfg=%d, "
             "dp=%d requires more than %d devices",

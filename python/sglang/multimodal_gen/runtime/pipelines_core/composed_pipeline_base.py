@@ -256,19 +256,24 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
                 "MOVA": {"video_vae", "audio_vae"},
                 "MOVAPipeline": {"video_vae", "audio_vae"},
             },
-            RoleType.DENOISER: {
-                "GlmImagePipeline": {"text_encoder", "tokenizer", "vae"},
-            },
+            RoleType.DENOISER: {},
             RoleType.DECODER: {},
         }
         extra_allowed_modules = set(
             role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
         )
+        if (
+            role == RoleType.DENOISER
+            and self.pipeline_name == "GlmImagePipeline"
+            and getattr(self.server_args, "srt_encoder_url", None) is not None
+        ):
+            extra_allowed_modules.update({"text_encoder", "tokenizer", "vae"})
 
         if role == RoleType.DENOISER and task_name == "ti2v":
             if self.pipeline_name in {

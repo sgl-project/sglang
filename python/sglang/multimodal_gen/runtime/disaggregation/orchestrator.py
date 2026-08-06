@@ -464,6 +464,15 @@ class DiffusionServer:
         except ValueError:
             pass
         if self._glm_ar_fanout:
+            if (
+                not isinstance(req.prompt, str)
+                or getattr(req, "image_path", None) is not None
+            ):
+                self._complete_with_error(
+                    request_id,
+                    "GLM AR fan-out supports one text prompt without image input",
+                )
+                return
             now = time.monotonic()
             self._glm_ar_queue.append(
                 _GlmClientEntry(request_id, client_identity, req, now)
@@ -589,15 +598,6 @@ class DiffusionServer:
                 )
             return
 
-        for client in clients:
-            try:
-                self._tracker.transition(client.request_id, RequestState.ENCODER_DONE)
-                self._tracker.transition(
-                    client.request_id, RequestState.DENOISING_WAITING
-                )
-            except ValueError:
-                pass
-
         group_id = f"glm-fanout::{time.monotonic_ns()}"
         output_start = 0
         sequential_multi_output = (
@@ -606,6 +606,16 @@ class DiffusionServer:
         for client_index, client in enumerate(clients):
             output_count = max(1, int(client.req.num_outputs_per_prompt or 1))
             output_end = output_start + output_count
+            if self._tracker.get(client.request_id) is None:
+                output_start = output_end
+                continue
+            try:
+                self._tracker.transition(client.request_id, RequestState.ENCODER_DONE)
+                self._tracker.transition(
+                    client.request_id, RequestState.DENOISING_WAITING
+                )
+            except ValueError:
+                pass
             shard_req = deepcopy(client.req)
             shard_req.extra = dict(shard_req.extra or {})
             shard_req.request_id = f"{group_id}::shard::{client_index}"

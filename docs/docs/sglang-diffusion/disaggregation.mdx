@@ -164,11 +164,13 @@ transferred.
 # Two terminal workers, each on two devices with SP=2
 sglang serve --model-path zai-org/GLM-Image --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19001 \
+  --srt-encoder-url http://127.0.0.1:30020 \
   --num-gpus 2 --base-gpu-id 0 --denoiser-sp 2 \
   --cfg-parallel-size 1 --batching-max-size 1 --attention-backend fa
 
 sglang serve --model-path zai-org/GLM-Image --disagg-role denoiser \
   --disagg-server-addr tcp://127.0.0.1:19655 --scheduler-port 19002 \
+  --srt-encoder-url http://127.0.0.1:30020 \
   --num-gpus 2 --base-gpu-id 2 --denoiser-sp 2 \
   --cfg-parallel-size 1 --batching-max-size 1 --attention-backend fa
 
