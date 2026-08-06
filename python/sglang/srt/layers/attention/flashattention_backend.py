@@ -1062,9 +1062,15 @@ class FlashAttentionBackend(AttentionBackend):
                 ).to(torch.int32)
             )
             if forward_batch.out_cache_loc is not None:
+                swa_out_cache_loc = self._get_swa_out_cache_loc_for_draft_step(
+                    forward_batch.out_cache_loc,
+                    batch_size,
+                    forward_batch.forward_mode,
+                    forward_batch.spec_info,
+                )
                 metadata.swa_out_cache_loc = (
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
+                        swa_out_cache_loc
                     )
                 )
 
@@ -2622,6 +2628,33 @@ class FlashAttentionBackend(AttentionBackend):
         src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
         return src.max().item()
 
+    def _get_swa_out_cache_loc_for_draft_step(
+        self,
+        out_cache_loc: torch.Tensor,
+        bs: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> torch.Tensor:
+        """Select this draft step's SWA write locations.
+
+        The EAGLE draft runner stores all speculative steps in request-major
+        order, while each FlashAttention backend represents exactly one step.
+        Normal draft forwards already pass a per-step view; CUDA graph capture
+        and replay pass the combined buffer and need the selection here.
+        """
+        expected_numel = bs * self.topk * self.speculative_num_steps
+        if (
+            forward_mode.is_decode_or_idle()
+            and spec_info is not None
+            and self.topk == 1
+            and self.speculative_num_steps > 0
+            and out_cache_loc.numel() == expected_numel
+        ):
+            return out_cache_loc.reshape(
+                bs, self.topk, self.speculative_num_steps
+            )[:, :, self.speculative_step_id].reshape(-1)
+        return out_cache_loc
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -2653,6 +2686,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Refill the SWA write-target buffer (bound as a metadata view in
         # _bind_metadata_buffers) from the live out_cache_loc before replay.
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            out_cache_loc = self._get_swa_out_cache_loc_for_draft_step(
+                out_cache_loc, bs, forward_mode, spec_info
+            )
             n = out_cache_loc.shape[0]
             self.swa_out_cache_loc_buf[n:].zero_()
             self.swa_out_cache_loc_buf[:n].copy_(
