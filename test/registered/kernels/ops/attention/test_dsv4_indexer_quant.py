@@ -181,3 +181,9 @@ def test_v4_strided_weight_matches_contiguous():
     torch.cuda.synchronize()
     assert torch.equal(a_fp8, b_fp8)
     assert torch.equal(a_w, b_w)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
