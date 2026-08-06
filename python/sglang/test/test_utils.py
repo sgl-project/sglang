@@ -961,6 +961,15 @@ def popen_launch_server(
     if not any(str(arg).startswith(prefill_flag) for arg in other_args):
         other_args = list(other_args) + [prefill_flag, "1024"]
 
+    # argparse keeps the last value, so a repeated flag either says nothing or
+    # silently overrides an earlier one -- both are mistakes, and a test class
+    # that extends a shared args list in place produces them without a trace.
+    seen = [
+        str(arg).split("=", 1)[0] for arg in other_args if str(arg).startswith("--")
+    ]
+    repeated = sorted({flag for flag in seen if seen.count(flag) > 1})
+    assert not repeated, f"server args repeat {repeated}: {other_args}"
+
     # CI-specific: Validate cache and enable offline mode if complete
     if env is None:
         env = os.environ.copy()

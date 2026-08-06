@@ -84,10 +84,6 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--dtype",
     "bfloat16",
     "--trust-remote-code",
-    "--reasoning-parser",
-    "minimax-append-think",
-    "--tool-call-parser",
-    "minimax-m2",
 ]
 
 
