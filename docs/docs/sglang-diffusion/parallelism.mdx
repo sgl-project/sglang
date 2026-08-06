@@ -103,6 +103,29 @@ Independently of the transport, the three Q/K/V input exchanges can be packed
 into one collective; models opt in per attention layer
 (`enable_packed_qkv_input_a2a`).
 
+## Which axes tolerate crossing nodes
+
+Each axis has a fixed communication pattern, and the pattern — volume per step,
+how often it fires, and whether it can hide behind compute — decides whether the
+axis survives the drop from NVLink to the inter-node fabric. Ordered from most
+to least cross-node friendly:
+
+| Axis | Pattern | Traffic per denoise step | Cross-node verdict |
+| --- | --- | --- | --- |
+| Data parallel | none between replicas | zero on the request path | **Best.** Replicas only share startup init and control-op fan-out; no fast interconnect needed at all. |
+| CFG parallel | one branch-combine | one latent-sized exchange, once | **Good candidate.** Once per step, small payload, naturally deadline-tolerant. Unmeasured across nodes so far. |
+| Ring SP | neighbor-only K/V rotation | K/V ÷ ring_degree, (R−1) hops, overlapped with attention tiles | **Designed for it.** Validated cross-node for MiniMax H3 (Ulysses intra-node × ring across, net positive and growing with sequence length). |
+| Ulysses SP | all-to-all | full q/k/v activations, twice per attention, every layer | **Keep intra-node.** All-to-all needs full-bisection bandwidth; across nodes it becomes R² flows with receiver incast. |
+| Tensor parallel | all-reduce | hidden-sized reduction per transformer block (×60 blocks for qwen-class DiTs) | **Worst.** Highest frequency, no overlap, already ~70% of sharded kernel time on NVLink. |
+
+Two caveats keep this a map rather than a promise. Cross-node launch itself
+(`--nnodes`) is not merged yet, and per-model ring support is still partial (see
+the constraints above), so today the validated cross-node configuration is the
+H3 recipe. And the data-parallel row describes the design: the current
+implementation binds each replica's ingress on the local host, so replicas
+spanning hosts additionally need per-replica host addressing before `--dp-size`
+can place one replica per node.
+
 ## Choosing a configuration
 
 Measured guidance rather than rules — the right combination depends on the
