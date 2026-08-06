@@ -1,23 +1,12 @@
-"""Single composition root for the embedded load reporter.
+"""Composition root for the embedded load reporter.
 
-``start_load_reporter`` is the only public bootstrap symbol.  Every serving
-mode (HTTP, native gRPC, embedded Engine, multi-tokenizer, standalone SMG RPC)
-calls it and only sees ``start`` and ``close``; no reporter-internal type
-(runtime, sampler, IPC notifier, gRPC/protobuf) leaks into serving entrypoints.
+``start_load_reporter`` is the only public bootstrap symbol. Returns a handle
+with ``close()`` and optionally ``notify_refresh`` / ``update_expected_dp_ranks``.
 
-Path selection
---------------
-* ``load_reporter_port is None`` → return ``None`` *before* importing the
-  optional gRPC/protobuf stack.  Zero socket, task, or dependency overhead.
-* ``snapshot_source is None`` (multi-tokenizer HTTP worker) → install a
-  coalescing refresh notifier bound to ``event_owner`` that forwards refresh
-  hints to the sole router over IPC.  No gRPC server, no port is bound.
-* otherwise (single-owner) → own a ``LoadReporterRuntime`` + a ``grpc.aio``
-  server listening on ``host:load_reporter_port``, and optionally bind
-  ``event_owner`` so decorator events wake the sampler.
-
-The returned :class:`LoadReporterHandle` owns every resource it created and
-tears them down in reverse order on an idempotent ``close()``.
+Path selection:
+* load_reporter_port is None → return None (no overhead).
+* snapshot_source is None → IPC-worker path (refresh notifier only).
+* otherwise → owner path (runtime + gRPC server).
 """
 
 from __future__ import annotations
@@ -31,12 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class LoadReporterHandle:
-    """Owns the reporter resources for one Worker process.
+    """Owns reporter resources for one Worker process.
 
-    Serving entrypoints keep the handle opaque: they call ``close()`` on
-    shutdown and, in the multi-tokenizer router only, ``notify_refresh`` /
-    ``update_expected_dp_ranks``.  All methods are idempotent and safe to call
-    after ``close()``.
+    Opaque handle with close() and optional delegation methods. All methods are
+    idempotent and safe to call after close().
     """
 
     def __init__(self) -> None:
@@ -55,11 +42,7 @@ class LoadReporterHandle:
             self._runtime.notify_refresh()
 
     def update_expected_dp_ranks(self, ranks: Iterable[int]) -> bool:
-        """Update the rank-aware source after elastic scaling.
-
-        Returns ``False`` when there is no owning runtime (IPC-worker handle)
-        or the source did not accept a changed rank set.
-        """
+        """Update the rank-aware source after elastic scaling."""
         if self._runtime is None:
             return False
         return self._runtime.update_expected_dp_ranks(ranks)
@@ -69,14 +52,8 @@ class LoadReporterHandle:
     async def close(self) -> None:
         """Idempotent, cancellation-safe teardown.
 
-        The teardown runs once on a shared task shielded from the caller's
-        cancellation, so a caller cancelled mid-``close()`` never abandons the
-        remaining steps and every subsequent caller awaits the same completion.
-
-        Order: stop accepting Router sessions/reports, stop sampling, close the
-        IPC notifier, then unbind the decorator registry callback and restore
-        any shadowed bound method.  Each step is guarded so a partially started
-        handle (e.g. failed port bind) closes cleanly.
+        Runs once on a shared shielded task. Teardown order: stop server, stop
+        runtime, close notifier, unbind registry, restore shadowed method.
         """
         if self._close_task is None:
             self._close_task = asyncio.create_task(
@@ -122,21 +99,7 @@ async def start_load_reporter(
 ) -> Optional[LoadReporterHandle]:
     """Start the embedded load reporter for one serving entrypoint.
 
-    Args:
-        server_args: Resolved SGLang server configuration.  Only
-            ``load_reporter_port`` gates activation.
-        snapshot_source: A ``LoadSnapshotSource`` for the owner path, or
-            ``None`` for a multi-tokenizer HTTP worker (IPC-forwarding path).
-        event_owner: The instance whose decorated ``generate_request`` /
-            ``_dispatch_to_scheduler`` should wake the sampler.  ``None`` means
-            interval + register-time sampling only.
-        request_lifecycle_method: When set (standalone SMG RPC), the named bound
-            async-generator method on ``event_owner`` is wrapped at runtime with
-            the same ``enable_load_monitor("request_lifecycle")`` decorator and
-            installed on that single instance; restored on ``close()``.
-
-    Returns:
-        A :class:`LoadReporterHandle` when reporting is enabled, else ``None``.
+    Returns a handle when reporting is enabled, else None.
     """
     if getattr(server_args, "load_reporter_port", None) is None:
         return None
@@ -151,17 +114,12 @@ async def start_load_reporter(
 async def _start_ipc_worker(
     server_args: Any, event_owner: Optional[Any]
 ) -> Optional[LoadReporterHandle]:
-    """Multi-tokenizer HTTP worker: coalesce refresh hints to the sole owner.
-
-    Binds a refresh notifier to ``event_owner`` and forwards its coalesced
-    events to the router over the existing scheduler IPC channel.  No gRPC
-    server is started and no reporter port is bound.
-    """
+    """Multi-tokenizer HTTP worker: coalesce and forward refresh hints to router."""
     if event_owner is None:
         return None
 
-    from sglang.srt.load_reporter.decorator import bind_load_monitor
-    from sglang.srt.load_reporter.ipc import LoadReporterRefreshNotifier
+    from sglang.srt.load_reporter.event_hooks import bind_load_monitor
+    from sglang.srt.load_reporter.worker_notifier import LoadReporterRefreshNotifier
 
     handle = LoadReporterHandle()
     notifier = LoadReporterRefreshNotifier(
@@ -183,7 +141,7 @@ async def _start_owner(
     """Single-owner path: own a runtime + gRPC listener on the reporter port."""
     import grpc.aio
 
-    from sglang.srt.load_reporter.decorator import bind_load_monitor
+    from sglang.srt.load_reporter.event_hooks import bind_load_monitor
     from sglang.srt.load_reporter.runtime import LoadReporterRuntime
     from sglang.srt.load_reporter.service import add_service_to_server
 
@@ -215,14 +173,11 @@ async def _start_owner(
 def _install_lifecycle_shadow(
     handle: LoadReporterHandle, owner: Any, method_name: str
 ) -> None:
-    """Wrap ``owner.<method_name>`` with the request-lifecycle decorator.
+    """Wrap owner.<method_name> with the request-lifecycle decorator.
 
-    Installs the decorated callable as an instance attribute on this single
-    ``owner`` only — the class method and every other instance are untouched.
-    Registers an identity-safe restore that removes the instance shadow only
-    while it still resolves to this wrapper.
+    Installs the wrapper as an instance attribute on this owner only.
     """
-    from sglang.srt.load_reporter.decorator import enable_load_monitor
+    from sglang.srt.load_reporter.event_hooks import enable_load_monitor
 
     had_instance_override = method_name in owner.__dict__
     instance_override = owner.__dict__.get(method_name)

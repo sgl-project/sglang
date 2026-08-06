@@ -1,11 +1,7 @@
 """Top-level assembly of the embedded load reporter.
 
-``LoadReporterRuntime`` is the composition root: it constructs the store,
-builder, sampler, and session table, wires them into one asyncio event loop,
-and exposes the seams the serving layer uses: ``register_session`` (inbound
-Router sessions), ``notify_refresh`` / ``notify_source_changed`` (data-plane
-refresh), and ``close``
-(bounded shutdown). Nothing here computes load metrics.
+``LoadReporterRuntime`` constructs store, builder, sampler, and session table,
+and exposes: register_session, notify_refresh, notify_source_changed, close.
 """
 
 from __future__ import annotations
@@ -44,9 +40,8 @@ def _validate_timing(
 class _RouterSession:
     """Per-Router-ID inbound bidi-stream session.
 
-    Owns one ``asyncio.Queue(maxsize=1)`` response queue (latest-wins) and a
-    background report loop. A ``None`` sentinel is placed in the queue when the
-    session ends so the service write loop exits cleanly.
+    Owns one asyncio.Queue(maxsize=1) response queue (latest-wins) and a
+    background report loop.
     """
 
     def __init__(
@@ -112,7 +107,7 @@ class _RouterSession:
         report_interval_ms: Optional[int] = None,
         lease_ttl_ms: Optional[int] = None,
     ) -> None:
-        """Atomically update timing and re-anchor changed schedules from now."""
+        """Atomically update timing and re-anchor schedules from now."""
         _validate_timing(report_interval_ms, lease_ttl_ms)
         now = time.monotonic()
 
@@ -134,11 +129,7 @@ class _RouterSession:
         self._config_changed.set()
 
     def cancel(self) -> None:
-        """Hard-cancel the report task without triggering on_close.
-
-        Used by the runtime's timeout shutdown path to avoid the replaced
-        session being deleted from the table by a stale on_close callback.
-        """
+        """Hard-cancel the report task without triggering on_close."""
         self._on_close = lambda _rid, _session: None  # defuse callback before cancel
         self._task.cancel()
 
@@ -279,9 +270,7 @@ class _RouterSession:
 class LoadReporterRuntime:
     """Owns the reporter collaborators for any serving mode.
 
-    Manages inbound Router sessions.  The snapshot source may be any object
-    satisfying ``LoadSnapshotSource`` -- no FastAPI, TokenizerManager, or
-    GrpcRequestManager imports here.
+    Manages inbound Router sessions and snapshot sampling.
     """
 
     def __init__(
@@ -289,12 +278,7 @@ class LoadReporterRuntime:
         snapshot_source: Any,
         server_args: Any,
     ) -> None:
-        """Assemble reporter collaborators around one snapshot source.
-
-        Args:
-            snapshot_source: Adapter providing load snapshots and expected ranks.
-            server_args: SGLang server configuration.
-        """
+        """Assemble reporter collaborators around one snapshot source."""
         self._closing = False
         self._close_task: Optional[asyncio.Task[None]] = None
         self._config = LoadReporterConfig.from_server_args(server_args)
@@ -323,13 +307,7 @@ class LoadReporterRuntime:
         )
 
     def _on_sample_completed(self) -> None:
-        """Advance the sampling generation and wake waiters once per sample.
-
-        Uses swap-on-set (rather than set-then-clear) so a waiter that has
-        created its wait task but not yet parked on the event still observes the
-        completion: the old event stays set forever and future waiters block on
-        a fresh event.
-        """
+        """Advance the sampling generation and wake waiters once per sample."""
         self._sample_generation += 1
         completed, self._sample_completed = self._sample_completed, asyncio.Event()
         completed.set()

@@ -1,8 +1,7 @@
 """Atomic latest-snapshot store for the embedded load reporter.
 
-Maintains an immutable ``SnapshotView`` of the most recent per-DP-rank
-``LoadSnapshot`` values.  All mutation goes through ``apply_full_snapshot``
-or ``record_error``; readers always receive a frozen, consistent view.
+Maintains an immutable SnapshotView of the most recent per-DP-rank LoadSnapshot
+values. All mutation goes through apply_full_snapshot or record_error.
 """
 
 from __future__ import annotations
@@ -89,18 +88,7 @@ class SnapshotValidationError(ValueError):
 
 
 def _require_non_negative_int64(field: str, value: object) -> int:
-    """Validate one non-negative protobuf int64 field.
-
-    Args:
-        field: Field name used in validation errors.
-        value: Candidate numeric value.
-
-    Returns:
-        The validated integer.
-
-    Raises:
-        SnapshotValidationError: If the value is not in the accepted range.
-    """
+    """Validate one non-negative protobuf int64 field."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise SnapshotValidationError(f"{field} must be an integer")
     if value < 0 or value > _INT64_MAX:
@@ -111,18 +99,7 @@ def _require_non_negative_int64(field: str, value: object) -> int:
 
 
 def _require_finite_float(field: str, value: object) -> float:
-    """Validate and normalize one finite floating-point field.
-
-    Args:
-        field: Field name used in validation errors.
-        value: Candidate numeric value.
-
-    Returns:
-        The validated value as a float.
-
-    Raises:
-        SnapshotValidationError: If the value is non-numeric or non-finite.
-    """
+    """Validate and normalize one finite floating-point field."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SnapshotValidationError(f"{field} must be numeric")
     result = float(value)
@@ -160,18 +137,7 @@ def _snapshot_time_unix_ms(load: LoadSnapshot, collected_at_unix_ms: int) -> int
 def _rank_snapshot_from_load(
     load: LoadSnapshot, *, collected_at_unix_ms: int
 ) -> RankSnapshot:
-    """Validate one scheduler snapshot and freeze its core metrics.
-
-    Args:
-        load: Raw scheduler load snapshot.
-        collected_at_unix_ms: Fallback timestamp for missing source time.
-
-    Returns:
-        A validated immutable rank snapshot.
-
-    Raises:
-        SnapshotValidationError: If any rank or metric is invalid.
-    """
+    """Validate one scheduler snapshot and freeze its core metrics."""
     dp_rank = load.dp_rank
     if isinstance(dp_rank, bool) or not isinstance(dp_rank, int):
         raise SnapshotValidationError("dp_rank must be an integer")
@@ -226,20 +192,7 @@ class LatestSnapshotStore:
         collected_at_unix_ms: int,
         collected_at_monotonic: float,
     ) -> SnapshotView:
-        """Validate and atomically publish one authoritative full snapshot.
-
-        Args:
-            loads: Raw snapshots collected in one sampling pass.
-            expected_dp_ranks: Exact rank set required for publication.
-            collected_at_unix_ms: Wall-clock collection time in milliseconds.
-            collected_at_monotonic: Monotonic collection time in seconds.
-
-        Returns:
-            The newly published immutable view.
-
-        Raises:
-            SnapshotValidationError: If fields or the rank set are invalid.
-        """
+        """Validate and atomically publish one authoritative full snapshot."""
         collected_at_unix_ms = _require_non_negative_int64(
             "collected_at_unix_ms", collected_at_unix_ms
         )
@@ -308,14 +261,7 @@ class LatestSnapshotStore:
         return new_view
 
     def record_error(self, error: BaseException | str) -> SnapshotView:
-        """Publish a sampling error while preserving the last good ranks.
-
-        Args:
-            error: Exception or diagnostic message from sampling.
-
-        Returns:
-            The updated immutable view containing the error text.
-        """
+        """Publish a sampling error while preserving the last good ranks."""
         message = str(error).strip()
         if not message:
             message = (

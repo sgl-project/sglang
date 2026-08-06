@@ -1,11 +1,7 @@
-"""Refresh notifier for the multi-tokenizer load reporter.
+"""Refresh notifier for multi-tokenizer load reporter.
 
-This module provides a single collaborator:
-
-* ``LoadReporterRefreshNotifier`` -- a single-background-task coalescer that
-  emits at most ONE ``LoadReporterRefreshIpcReq`` per broadcast window.
-  Deterministic priority: ABORT > COMPLETION > DISPATCH.  Event counts are
-  summed across all ``notify()`` calls within one window.
+``LoadReporterRefreshNotifier`` coalesces events into at most ONE IPC request
+per broadcast window. Priority: ABORT > COMPLETION > DISPATCH.
 """
 
 from __future__ import annotations
@@ -47,31 +43,12 @@ _REASON_PRIORITY: Final[Dict[LoadReporterRefreshReason, int]] = {
 class LoadReporterRefreshNotifier:
     """Single-background-task coalescer for load-reporter refresh events.
 
-    At most ONE ``LoadReporterRefreshIpcReq`` is sent per broadcast window.
-    The background task waits for an ``asyncio.Event``, sleeps for the
-    configured window, then atomically swaps out the accumulated state and
-    calls ``send`` exactly once.
-
-    Coalescing semantics:
-    * ``event_count`` values are **summed** across all ``notify()`` calls in
-      the window.
-    * ``reason`` is the **maximum-priority** value seen (ABORT > COMPLETION >
-      DISPATCH).
-
-    The completion/abort/dispatch hooks MUST NOT send socket messages directly;
-    they only call ``notify()``.  Only ``_run()`` calls ``send``.
+    Emits at most ONE IPC request per broadcast window. Event counts are summed;
+    reason is the maximum-priority value (ABORT > COMPLETION > DISPATCH).
     """
 
     def __init__(self, worker_id: str, send: Callable[[Any], None]) -> None:
-        """Initialize one per-HTTP-worker refresh coalescer.
-
-        Args:
-            worker_id: Stable diagnostic identifier for the HTTP worker.
-            send: Synchronous IPC dispatch callback.
-
-        Returns:
-            None.
-        """
+        """Initialize per-HTTP-worker refresh coalescer."""
         self._worker_id = worker_id
         self._send = send
         # Coalesce-window duration in milliseconds.
@@ -120,13 +97,6 @@ class LoadReporterRefreshNotifier:
 
     def notify(self, reason: LoadReporterRefreshReason, event_count: int = 1) -> None:
         """Accumulate a refresh event and wake the background task.
-
-        Args:
-            reason: Highest-priority event type observed by this call.
-            event_count: Number of events represented by the call.
-
-        Returns:
-            None.
 
         Counts are summed; reason is updated to the maximum priority value.
         """

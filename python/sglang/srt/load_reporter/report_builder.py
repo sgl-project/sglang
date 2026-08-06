@@ -1,7 +1,7 @@
 """Pure report builder for the embedded load reporter.
 
-Converts a ``SnapshotView`` into a ``pb.LoadReport`` proto, applying
-staleness logic and assigning a monotonically increasing sequence ID.
+Converts a SnapshotView into a pb.LoadReport proto, applying staleness logic
+and assigning monotonically increasing sequence IDs.
 """
 
 from __future__ import annotations
@@ -45,13 +45,7 @@ class ReportBuilder:
         stale_after_ms: int,
         sequence: SequenceAllocator,
     ) -> None:
-        """Initialize report identity, staleness policy, and sequence allocation.
-
-        Args:
-            source_instance_id: Stable UUID for this runtime instance.
-            stale_after_ms: Maximum accepted age of the oldest rank snapshot.
-            sequence: Allocator for monotonically increasing report IDs.
-        """
+        """Initialize report identity, staleness policy, and sequence allocation."""
         self._source_instance_id = source_instance_id
         self._stale_after_ms = stale_after_ms
         self._sequence = sequence
@@ -63,16 +57,7 @@ class ReportBuilder:
         *,
         report_time_unix_ms: int,
     ) -> pb.LoadReport:
-        """Build one report from the latest full snapshot.
-
-        Args:
-            view: Immutable validated snapshot view.
-            identity: Worker identity attached to the report.
-            report_time_unix_ms: Report construction time in Unix milliseconds.
-
-        Returns:
-            A populated LoadReport protobuf message.
-        """
+        """Build one report from the latest full snapshot."""
         if not view.ranks:
             status = pb.REPORT_STATUS_UNREACHABLE
             error: Optional[str] = view.last_error or "no authoritative rank snapshot"

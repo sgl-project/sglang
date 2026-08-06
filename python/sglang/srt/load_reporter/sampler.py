@@ -1,16 +1,11 @@
 """Single-flight async load sampler for the embedded load reporter.
 
-This module owns the single background task that calls
-``snapshot_source.get_loads()`` and forwards results into
-``LatestSnapshotStore``. Router sessions and request-end hooks funnel wake-up
-signals through synchronous notification methods; only one in-flight
-``get_loads`` call is ever active at a time.
+Owns the background task that calls snapshot_source.get_loads() and forwards
+results into LatestSnapshotStore. Only one in-flight get_loads call is active
+at a time.
 
-Coalescing rule (section 8.4 of the design doc):
-  idle  + trigger  -> start refresh
-  inflight + trigger -> set _pending flag
-  refresh done + pending -> one more refresh, clear _pending
-  refresh done, no pending -> idle
+Coalescing: idle + trigger → start refresh; inflight + trigger → set pending;
+refresh done + pending → one more refresh; refresh done, no pending → idle.
 """
 
 from __future__ import annotations

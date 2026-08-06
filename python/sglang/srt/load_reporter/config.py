@@ -1,12 +1,7 @@
-"""Frozen configuration structs for the embedded SGLang load reporter.
+"""Configuration and metadata structs for the load reporter.
 
-``LoadReporterConfig`` carries the snapshot stale threshold exposed on
-``ServerArgs``. ``WorkerMetadata`` carries identity fields that are stable for
-the lifetime of the worker process. Internal lifecycle timeouts are expressed
-in seconds and are intentionally not surfaced as CLI arguments.
-
-Both classes are constructed via ``from_server_args`` factory methods so that
-callers never reach into ``ServerArgs`` directly after the reporter starts.
+``LoadReporterConfig`` holds timing thresholds. ``WorkerMetadata`` holds stable
+identity fields. Both are built via ``from_server_args`` factory methods.
 """
 
 from __future__ import annotations
@@ -35,15 +30,7 @@ class LoadReporterConfig:
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> LoadReporterConfig:
-        """Build reporter timing configuration.
-
-        Args:
-            args: Resolved SGLang server configuration (unused; the stale
-                threshold is a reporter-internal constant).
-
-        Returns:
-            Frozen load-reporter timing configuration.
-        """
+        """Build reporter timing configuration from ServerArgs."""
         return cls(
             snapshot_stale_after_ms=SNAPSHOT_STALE_AFTER_MS,
         )
@@ -59,14 +46,7 @@ class WorkerMetadata:
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> WorkerMetadata:
-        """Build stable worker metadata from server arguments.
-
-        Args:
-            args: Resolved SGLang server configuration.
-
-        Returns:
-            Frozen worker address, type, and model metadata.
-        """
+        """Build worker metadata from server arguments."""
         worker_type = {
             "prefill": pb.WORKER_TYPE_PREFILL,
             "decode": pb.WORKER_TYPE_DECODE,

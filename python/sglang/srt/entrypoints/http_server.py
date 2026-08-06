@@ -383,6 +383,10 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
+    # Start the native gRPC server and warmup inside the try so a failure in
+    # either still runs the finally cleanup below. Native gRPC is enabled via
+    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
+    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     single_tokenizer = getattr(fast_api_app, "is_single_tokenizer_mode", False)
     reporter_handle = None
     if server_args.load_reporter_port is not None:

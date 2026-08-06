@@ -87,7 +87,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     unwrap_from_pickle,
 )
-from sglang.srt.load_reporter.decorator import enable_load_monitor
+from sglang.srt.load_reporter.event_hooks import enable_load_monitor
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors

@@ -1,12 +1,7 @@
 """gRPC servicer for the inbound Router bidi stream.
 
-``LoadMonitorService`` implements ``LoadMonitorServiceServicer.Monitor``.
-It depends ONLY on the runtime and the generated proto — no FastAPI,
-TokenizerManager, GrpcRequestManager, or any serving entrypoint.
-
-Transport inversion: the Router dials INTO the Worker's reporter port.
-The first RouterFrame MUST be a ``register``; all others yield a
-``WorkerFrame(error=StreamError(code="INVALID_FIRST_FRAME", ...))``.
+LoadMonitorService implements LoadMonitorServiceServicer.Monitor. The Router
+dials into the Worker's reporter port. First frame must be a register request.
 """
 
 from __future__ import annotations
@@ -49,12 +44,7 @@ def _validate_register(request: pb.RegisterRequest) -> Optional[pb.StreamError]:
 
 
 def add_service_to_server(runtime: Any, server: grpc.aio.Server) -> None:
-    """Register a ``LoadMonitorService`` servicer onto *server*.
-
-    Args:
-        runtime: A ``LoadReporterRuntime`` (or any object with ``register_session``).
-        server: A ``grpc.aio.Server`` to add the servicer to.
-    """
+    """Register a LoadMonitorService servicer onto server."""
     pb_grpc.add_LoadMonitorServiceServicer_to_server(
         LoadMonitorService(runtime), server
     )
@@ -67,21 +57,14 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
     """
 
     def __init__(self, runtime: Any) -> None:
-        """Bind to the given runtime.
-
-        Args:
-            runtime: Object exposing ``register_session`` and session management.
-        """
+        """Bind to the given runtime."""
         self._runtime = runtime
 
     async def Monitor(self, request_iterator: Any, context: Any) -> Any:
         """Bidirectional stream handler.
 
-        The first RouterFrame MUST be ``register``.  If it is not, yield a
-        ``WorkerFrame(error=StreamError(code="INVALID_FIRST_FRAME", ...))``.
-        On valid register: yield the ``RegisterResponse`` ack, then run a
-        read loop + write loop concurrently until EOF / cancel / stop / lease
-        timeout / server shutdown.  Never leaks a task; never raises.
+        First frame must be register. Runs read + write loops concurrently until
+        EOF, cancel, lease timeout, or server shutdown.
         """
         session = None
         read_task = None
