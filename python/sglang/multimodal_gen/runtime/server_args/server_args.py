@@ -203,6 +203,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
+    enable_nccl_nvls: bool = False
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -1382,6 +1383,12 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         # Parallelism
+        parser.add_argument(
+            "--enable-nccl-nvls",
+            action=StoreBoolean,
+            default=ServerArgs.enable_nccl_nvls,
+            help="Enable NCCL NVLS when available.",
+        )
         parser.add_argument(
             "--num-gpus",
             type=int,
