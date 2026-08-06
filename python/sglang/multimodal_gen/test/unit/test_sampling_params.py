@@ -48,12 +48,17 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
 
-    def test_quality_must_be_a_non_empty_profile_name(self):
+    def test_quality_defaults_to_lossless(self):
+        self.assertEqual(SamplingParams().quality, "lossless")
+
+    def test_quality_accepts_the_two_validated_levels(self):
+        self.assertEqual(SamplingParams(quality="lossless").quality, "lossless")
         self.assertEqual(SamplingParams(quality="high").quality, "high")
-        with self.assertRaisesRegex(ValueError, r"quality must be a non-empty string"):
-            SamplingParams(quality="")
-        with self.assertRaisesRegex(ValueError, r"quality must be a non-empty string"):
-            SamplingParams(quality=True)  # type: ignore[arg-type]
+
+    def test_quality_rejects_invalid_values(self):
+        for bad in ("ultra", "draft", "fast", "", True, 1):
+            with self.assertRaisesRegex(ValueError, r"quality must be one of"):
+                SamplingParams(quality=bad)  # type: ignore[arg-type]
 
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)
@@ -93,6 +98,12 @@ class TestSamplingParamsValidate(unittest.TestCase):
             SamplingParams(boundary_ratio=1.5)
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
+
+    def test_teacache_and_spectrum_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(
+            ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
+        ):
+            SamplingParams(enable_teacache=True, enable_spectrum=True)
 
 
 class TestSamplingParamsSubclass(unittest.TestCase):
@@ -301,7 +312,39 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
     def test_quality_is_request_scoped_cli_arg(self):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
         self.assertEqual(
-            self._parse_cli_kwargs(["--quality", "medium"])["quality"], "medium"
+            self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
+        )
+
+    def test_get_cli_args_maps_spectrum_prefixed_flags(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--enable-spectrum",
+                "--spectrum-window-size",
+                "2.5",
+                "--spectrum-flex-window",
+                "0.9",
+                "--spectrum-warmup-steps",
+                "6",
+                "--spectrum-m",
+                "3",
+                "--spectrum-lam",
+                "0.2",
+                "--spectrum-tau-num-steps",
+                "42",
+            ]
+        )
+
+        self.assertTrue(kwargs["enable_spectrum"])
+        self.assertEqual(
+            kwargs["spectrum_params"],
+            {
+                "window_size": 2.5,
+                "flex_window": 0.9,
+                "warmup_steps": 6,
+                "m": 3,
+                "lam": 0.2,
+                "tau_num_steps": 42,
+            },
         )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
