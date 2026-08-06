@@ -213,7 +213,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     self._index_buffer_shape(
-                        num_pages if self._is_layer_owned(self.start_layer + i) else 0
+                        num_pages
+                        if self._is_layer_owned(self.start_layer + i)
+                        and not self.skip_topk_layers[i]
+                        else 0
                     ),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=self.device,
@@ -505,7 +508,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         ]
         data_lens = [self.index_k_with_scale_buffer[i].nbytes for i in owned_layer_ids]
         item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in owned_layer_ids
+            (
+                0
+                if self.skip_topk_layers[i]
+                else self.index_k_with_scale_buffer[i][0].nbytes
+            )
+            for i in owned_layer_ids
         ]
         return data_ptrs, data_lens, item_lens
 
