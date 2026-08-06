@@ -7,9 +7,11 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers import cache_controller as manager_cache_controller
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
+    LayerShardInfo,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
@@ -397,6 +399,26 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         self.assertIs(pool_transfers[0].host_indices, mock.sentinel.host_indices)
         self.assertIs(pool_transfers[0].device_indices, mock.sentinel.device_indices)
+
+    def test_layer_shard_selects_one_writer_per_attention_tp_group(self):
+        shard = LayerShardInfo(rank=1, size=2)
+
+        self.assertTrue(
+            manager_cache_controller._is_storage_writer(
+                is_mla_model=True,
+                layer_shard=shard,
+                tp_rank=2,
+                attn_tp_rank=0,
+            )
+        )
+        self.assertFalse(
+            manager_cache_controller._is_storage_writer(
+                is_mla_model=True,
+                layer_shard=shard,
+                tp_rank=3,
+                attn_tp_rank=1,
+            )
+        )
 
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
