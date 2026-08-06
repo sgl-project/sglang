@@ -133,7 +133,7 @@ jobs:
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
-      partitions: toJson({"size":2,"arr":[0, 1],"max_parallel":2})
+      partitions: toJson({"size":2,"arr":[0, 1]})
     secrets: inherit
 
   base-b-test-8-npu-a3:

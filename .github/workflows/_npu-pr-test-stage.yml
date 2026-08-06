@@ -29,9 +29,9 @@ on:
         type: string
         default: ''
       partitions:
-        description: 'partitions config, e.g. {"size":1,"arr":[0],"max_parallel":1}'
+        description: 'partitions config, e.g. {"size":1,"arr":[0]}'
         type: string
-        default: toJson({"size":1,"arr":[0],"max_parallel":1})
+        default: toJson({"size":1,"arr":[0])
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
@@ -60,11 +60,10 @@ jobs:
     container:
       image: ${{ inputs.image }}
     timeout-minutes: 240
-    # strategy:
-    #   fail-fast: false
-    #   max-parallel: ${{ fromJson(inputs.partitions).max_parallel }}
-    #   matrix:
-    #     partition: ${{ fromJson(inputs.partitions).arr }}
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ${{ fromJson(inputs.partitions).arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -189,7 +188,7 @@ jobs:
         run: |
           cd test
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
-            --auto-partition-id 0 \
-            --auto-partition-size 1 \
+            --auto-partition-id ${{ matrix.partition }} \
+            --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
