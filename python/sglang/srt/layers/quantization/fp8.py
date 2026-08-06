@@ -2303,6 +2303,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            if (
+                moe_runner_backend.is_flashinfer_trtllm()
+                or moe_runner_backend.is_flashinfer_trtllm_routed()
+            ):
+                num_local_experts = int(getattr(layer, "num_local_experts"))
+                device = layer.w13_weight.device
+
+                def per_expert(value: Optional[float]) -> Optional[torch.Tensor]:
+                    return (
+                        None
+                        if value is None
+                        else torch.full(
+                            (num_local_experts,),
+                            value,
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                    )
+
+                self._gemm1_alpha_tensor = per_expert(moe_runner_config.gemm1_alpha)
+                self._gemm1_beta_tensor = per_expert(
+                    1.0 if moe_runner_config.gemm1_alpha is not None else None
+                )
+                self._gemm1_clamp_limit_tensor = per_expert(
+                    moe_runner_config.gemm1_clamp_limit
+                )
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -2557,6 +2583,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     else None
                 ),
                 activation_type=activation_type,
+                gemm1_alpha=self._gemm1_alpha_tensor,
+                gemm1_beta=self._gemm1_beta_tensor,
+                gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)

@@ -656,6 +656,9 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 
     # Activation type (None = kernel default / Swiglu)
     activation_type: int | None = None
+    gemm1_alpha: torch.Tensor | None = None
+    gemm1_beta: torch.Tensor | None = None
+    gemm1_clamp_limit: torch.Tensor | None = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -768,6 +771,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -799,6 +805,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
         output = symm_output
     else:
