@@ -103,6 +103,7 @@ def _add_admin_routes(app, request_manager):
             record_shapes = body.get("record_shapes")
             env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "true")
             record_shapes = (record_shapes is not False) and env_record_shapes
+            shape_discovery = bool(body.get("shape_discovery", False))
 
             req = ProfileReq(
                 req_type=ProfileReqType.START_PROFILE,
@@ -117,6 +118,7 @@ def _add_admin_routes(app, request_manager):
                 merge_profiles=body.get("merge_profiles", False),
                 profile_prefix=body.get("profile_prefix"),
                 profile_stages=body.get("profile_stages"),
+                shape_discovery=shape_discovery,
             )
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
