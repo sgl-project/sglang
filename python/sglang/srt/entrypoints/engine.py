@@ -677,13 +677,13 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
+        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
         from sglang.srt.weight_cache.protocol import (
             cleanup_stale_daemon_files,
             compute_global_rank,
             compute_local_gpu_id,
             get_ready_path,
         )
-        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
