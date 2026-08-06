@@ -2054,6 +2054,8 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_ptrs=[self.index_k_with_scale_buffer],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
+                    # Each indexer row stores one packed page, and indices are
+                    # already page-based.
                     page_size=1,
                 )
                 return
