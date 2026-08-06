@@ -710,6 +710,10 @@ class Envs:
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
+    # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
+    # would select Lean. Used to isolate the Lean kernel in benchmarks.
+    SGLANG_DISABLE_LEAN_ATTENTION = EnvBool(False)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)

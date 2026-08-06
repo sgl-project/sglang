@@ -21,7 +21,10 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import logging
+import math
+from typing import Optional
 
+import torch
 import triton
 import triton.language as tl
 
@@ -987,6 +990,11 @@ def decode_attention_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    enable_lean=None,
+    lean_Mp=None,
+    lean_Lp=None,
+    lean_Op=None,
+    lean_locks=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -995,6 +1003,41 @@ def decode_attention_fwd(
     # head_num lives at dim 1 (3-D) or dim 2 (4-D shared view).
     kv_head_num = v_buffer.shape[-2]
     kv_group_num = q.shape[1] // kv_head_num
+
+    # Work-Centric (Lean) Attention: a persistent-CTA + work-stealing decode kernel
+    # that helps on long sequences where there are many more KV tiles than CUs. The
+    # persistent grid is fixed to the device CU count and the kernel derives its own tile
+    # schedule from kv_indptr on-device, so this path involves no host sync and is safe to
+    # capture in a CUDA graph. Whether Lean pays off for a given shape is decided cheaply by
+    # the backend's host-side seqlen gate (lean_decode_seqlen_gate) before we get here.
+    # Lean assumes a contiguous 3-D [N, head, dim] KV buffer, so it only runs at page_size==1.
+    if (
+        page_size == 1
+        and _lean_head_dim_ok(k_buffer.shape[-1], v_buffer.shape[-1])
+        and _should_use_lean_decode(
+            enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
+        )
+    ):
+        total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
+            v_buffer.shape[1], kv_group_num
+        )
+        _decode_lean_attention_fwd(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            total_programs,
+            sm_scale,
+            XCD_REMAP,
+            NUM_XCDS,
+            lean_Mp,
+            lean_Lp,
+            lean_Op,
+            lean_locks,
+        )
+        return
 
     if kv_group_num == 1:
         # MHA
@@ -1042,3 +1085,659 @@ def decode_attention_fwd(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
         )
+
+
+# ============================================================================
+# Work-Centric (Lean) Attention: persistent-CTA + work-stealing decode kernel.
+# ============================================================================
+
+_LEAN_BLOCK_M = 16
+
+_NUM_CU = None
+
+
+def _lean_head_dim_ok(qk_head_dim: int, v_head_dim: int) -> bool:
+    """Whether the Lean decode kernel's tiles fit in shared memory for this head dim.
+
+    The non-MLA kernel sets ``BLOCK_DMODEL = next_power_of_2(qk_head_dim)``; at head_dim 256
+    (e.g. Gemma-2/3) the K/V tiles overflow the 160 KB LDS budget and the launch raises
+    OutOfResources. head_dim <= 128 fits. MLA's rope-split dims (288/576) are special-cased in
+    the kernel into a smaller-tiled path and are handled separately. This guard makes the Lean
+    dispatch fall back safely instead of crashing, even under an explicit ``enable_lean=True``.
+    """
+    if qk_head_dim in (288, 576):  # MLA rope-split, special-cased in the kernel
+        return True
+    return qk_head_dim <= 128 and v_head_dim <= 128
+
+
+def _lean_num_cus() -> int:
+    """Number of compute units on the current device (cached).
+
+    Lean Attention sizes its persistent grid to the hardware CU count so work-stealing can
+    fill the GPU. Falls back to 304 (MI300X) if the device cannot be queried.
+    """
+    global _NUM_CU
+    if _NUM_CU is None:
+        try:
+            _NUM_CU = torch.cuda.get_device_properties(0).multi_processor_count
+        except Exception:
+            _NUM_CU = 304
+    return _NUM_CU
+
+
+def _lean_decode_block_n(Lk: int) -> int:
+    """KV block size for the Lean decode kernel.
+
+    Large head dims (MLA, Lk in {288, 576}) use a small KV block to bound LDS/register
+    usage; standard head dims use a large block since decode is memory-bound. The value
+    must be identical everywhere it is used so the tile schedule stays consistent.
+    """
+    if not _is_hip:
+        return 64
+    return 16 if Lk > 256 else 128
+
+
+@triton.jit
+def remap_xcd(pid, GRID_MN: tl.constexpr, NUM_XCDS: tl.constexpr = 8):
+    """Remap program ID across XCDs for AMD MI300X."""
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = GRID_MN % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+    return pid, pids_per_xcd
+
+
+@triton.jit
+def cal_num_split_wgs(
+    xcd_pid: tl.int32,
+    tile_iter_end: tl.int32,
+    cta_end_tile_gid: tl.int32,
+    max_tiles_per_wg: tl.int32,
+    high_load_wgs: tl.int32,
+    num_splits: tl.int32,
+):
+    zero_i = tl.full((), 0, dtype=tl.int32)
+    start_cta = tl.cast(xcd_pid + 1, tl.int32)
+    remaining = tl.maximum(tl.cast(tile_iter_end - cta_end_tile_gid, tl.int32), zero_i)
+    cap_high = tl.cast(max_tiles_per_wg, tl.int32)
+    cap_low = tl.cast(max_tiles_per_wg - 1, tl.int32)
+    cap_low = tl.where(cap_low > 0, cap_low, tl.full((), 1, dtype=tl.int32))
+    ctas_high_avail = tl.maximum(tl.cast(high_load_wgs, tl.int32) - start_cta, zero_i)
+    total_high_capacity = ctas_high_avail * cap_high
+    need_high_only = (remaining + cap_high - 1) // cap_high
+    rem_after_high = tl.maximum(remaining - total_high_capacity, zero_i)
+    need_low_after_high = (rem_after_high + cap_low - 1) // cap_low
+    ctas_needed = tl.where(
+        remaining <= total_high_capacity,
+        need_high_only,
+        ctas_high_avail + need_low_after_high,
+    )
+    max_ctas_allowed = tl.maximum(tl.cast(num_splits - 1, tl.int32), zero_i)
+    ctas_to_use = tl.minimum(ctas_needed, max_ctas_allowed)
+    k = ctas_to_use
+    cap_by_k = tl.where(
+        k <= ctas_high_avail,
+        k * cap_high,
+        total_high_capacity + (k - ctas_high_avail) * cap_low,
+    )
+    last_cta = start_cta + ctas_to_use
+    last_cta = tl.where(ctas_to_use == 0, start_cta - 1, last_cta)
+    return last_cta
+
+
+@triton.jit
+def _lean_attention_decode_kernel(
+    Q,
+    K_Buffer,
+    V_Buffer,
+    Mp,  # Partial max
+    Lp,  # Partial sum
+    Op,  # Partial output
+    O,  # Final output
+    batch_num_block_n,
+    locks,
+    kv_indptr,
+    kv_indices,
+    sm_scale,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_obs,
+    stride_oh,
+    kv_group_num: tl.constexpr,
+    NUM_HEAD_BLOCKS: tl.constexpr,
+    ROWS_PER_XCD: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    XCD_REMAP: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    batch_size: tl.constexpr,
+    total_programs: tl.constexpr,
+    num_query_heads: tl.constexpr,
+    num_rows: tl.constexpr,
+    xcd_programs: tl.constexpr,
+    max_output_tile_cnt: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """Lean Attention decode kernel - persistent CTA with work stealing.
+
+    The tile schedule (``tiles_per_khead``, ``max_tiles_per_wg``, ``high_load_wgs``,
+    ``num_splits``) is computed here on-device from ``kv_indptr`` rather than passed in from
+    the host. This keeps the launch free of any host sync (so it is CUDA-graph capturable)
+    and lets the schedule adapt to the per-replay sequence length: ``total_programs`` is a
+    fixed persistent grid and the work simply re-distributes when the KV length changes.
+    """
+    current_pid = tl.program_id(0)
+
+    # On-device tile schedule (mirrors the former host-side la_get_num_splits). Reads only
+    # GPU state so it is safe under CUDA-graph capture. tiles_per_khead is the number of KV
+    # tiles in one row summed over the batch: it MUST match batch_num_block_n (the per-batch
+    # cumulative tile count) exactly, so it is read from that array's last entry rather than
+    # recomputed as ceil(total_tokens / BLOCK_N) -- those differ whenever a sequence length
+    # is not a multiple of BLOCK_N (the common case for a ragged decode batch), which would
+    # desync the row<->tile mapping below.
+    tiles_per_khead = tl.load(batch_num_block_n + batch_size - 1)
+    # Effective rows per XCD (constexpr-folded); total tiles distributed over this XCD.
+    eff_rows: tl.constexpr = num_rows // NUM_XCDS if XCD_REMAP else num_rows
+    total_tiles = tiles_per_khead * eff_rows
+    max_tiles_per_wg = (total_tiles + xcd_programs - 1) // xcd_programs
+    max_tiles_per_wg = tl.maximum(max_tiles_per_wg, 1)
+    high_load_wgs = total_tiles - (max_tiles_per_wg - 1) * xcd_programs
+    # Safe over-estimate of the split count: a row spans at most ceil(tiles/(mtpw-1))+1
+    # CTAs; the guarded divisor also covers the max_tiles_per_wg == 1 case.
+    split_denom = tl.maximum(max_tiles_per_wg - 1, 1)
+    num_splits = 1 + (tiles_per_khead + split_denom - 1) // split_denom
+
+    if XCD_REMAP:
+        current_pid, pids_per_xcd = remap_xcd(
+            current_pid, GRID_MN=total_programs, NUM_XCDS=NUM_XCDS
+        )
+        xcd_pid = current_pid % pids_per_xcd
+        xcd_id = current_pid // pids_per_xcd
+    else:
+        xcd_pid = current_pid
+        xcd_id = 0
+        pids_per_xcd = total_programs
+
+    if xcd_pid < high_load_wgs:
+        iter = max_tiles_per_wg * xcd_pid
+        cta_end_tile_gid = iter + max_tiles_per_wg
+    else:
+        iter = (max_tiles_per_wg - 1) * (
+            xcd_pid - high_load_wgs
+        ) + high_load_wgs * max_tiles_per_wg
+        cta_end_tile_gid = iter + (max_tiles_per_wg - 1)
+
+    for i in tl.static_range(max_output_tile_cnt + 1):
+        if iter >= cta_end_tile_gid:
+            return
+
+        tile_row_idx = iter // tiles_per_khead
+        tile_idx = tile_row_idx * batch_size
+        tile_iter = tile_row_idx * tiles_per_khead
+
+        if batch_size == 1:
+            req_size = tl.full((), tiles_per_khead, dtype=tl.int32)
+        else:
+            req_size = tl.cast(tl.load(batch_num_block_n), tl.int32)
+        tile_iter_end = tile_iter + req_size
+
+        for b in range(1, batch_size):
+            next_req_size = tl.load(batch_num_block_n + b)
+            local_head_iter = iter % tiles_per_khead
+            if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
+                tile_iter = tile_iter + req_size
+                tile_idx = tile_idx + b
+                tile_iter_end = tile_iter + (next_req_size - req_size)
+            req_size = next_req_size
+
+        local_iter = iter - tile_iter
+        local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
+        host_block = iter == tile_iter
+        finishing_block = cta_end_tile_gid >= tile_iter_end
+
+        # A tiling "row" is a (kv_head, head_block) pair. For MHA/GQA NUM_HEAD_BLOCKS == 1
+        # so a row is just a kv head. For MLA, kv_group_num > BLOCK_M, so a kv head spans
+        # NUM_HEAD_BLOCKS head blocks of BLOCK_M query heads each.
+        tile_row_idx_global = ROWS_PER_XCD * xcd_id + tile_row_idx
+        cur_kv_head = tile_row_idx_global // NUM_HEAD_BLOCKS
+        head_block_idx = tile_row_idx_global % NUM_HEAD_BLOCKS
+        group_start = cur_kv_head * kv_group_num
+        q_head_base = group_start + head_block_idx * BLOCK_M
+        tile_batch_idx = tile_idx % batch_size
+        cur_batch = tile_batch_idx
+
+        cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
+        cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+
+        # SGLang-style offsets
+        offs_d = tl.arange(0, BLOCK_DMODEL)
+        offs_dv = tl.arange(0, BLOCK_DV)
+        mask_d = offs_d < Lk
+        mask_dv = offs_dv < Lv
+
+        # Query head block: this row covers BLOCK_M query heads of its kv group, bounded
+        # by the group end (group_start + kv_group_num) and the total head count.
+        offs_h = q_head_base + tl.arange(0, BLOCK_M)
+        mask_h = offs_h < (group_start + kv_group_num)
+        mask_h = mask_h & (offs_h < num_query_heads)
+
+        off_q = cur_batch * stride_qbs + offs_h[:, None] * stride_qh + offs_d[None, :]
+        q = tl.load(
+            Q + off_q, mask=mask_h[:, None] & mask_d[None, :], other=0.0
+        )  # [BLOCK_M, BLOCK_DMODEL]
+
+        # MLA rope split: the positional-encoding dims live in [BLOCK_DMODEL, Lk).
+        if BLOCK_DPE > 0:
+            offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+            mask_dpe = offs_dpe < Lk
+            off_qpe = (
+                cur_batch * stride_qbs + offs_h[:, None] * stride_qh + offs_dpe[None, :]
+            )
+            qpe = tl.load(
+                Q + off_qpe, mask=mask_h[:, None] & mask_dpe[None, :], other=0.0
+            )
+
+        e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+
+        local_iter_ptr = local_iter * BLOCK_N
+        local_iter_end_ptr = local_iter_end * BLOCK_N
+        # Effective token bound: the last tile of a sequence whose length is not a multiple
+        # of BLOCK_N is only partially valid. Clamp to cur_batch_seq_len so the KV-index /
+        # K / V loads never read past this batch's tokens -- for the final batch that would
+        # otherwise run off the end of kv_indices and fault the GPU. For BLOCK_N-aligned
+        # sequences this equals local_iter_end_ptr, so the aligned path is unchanged.
+        tok_end = tl.minimum(local_iter_end_ptr, cur_batch_seq_len)
+        for start_n in range(local_iter_ptr, local_iter_end_ptr, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=offs_n < tok_end,
+                other=0,
+            )
+
+            # Load K transposed: [BLOCK_DMODEL, BLOCK_N] so qk = q @ k directly.
+            offs_buf_k = (
+                kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d[:, None]
+            )
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[None, :] < tok_end) & (mask_d[:, None]),
+                other=0.0,
+            )
+
+            qk = tl.dot(q, k)  # [BLOCK_M, BLOCK_N]
+            if BLOCK_DPE > 0:
+                offs_buf_kpe = (
+                    kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(
+                    K_Buffer + offs_buf_kpe,
+                    mask=(offs_n[None, :] < tok_end) & (mask_dpe[:, None]),
+                    other=0.0,
+                )
+                qk += tl.dot(qpe, kpe)
+            qk *= sm_scale
+            qk = tl.where(
+                mask_h[:, None] & (offs_n[None, :] < tok_end),
+                qk,
+                float("-inf"),
+            )
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+
+            offs_buf_v = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[:, None] < tok_end) & (mask_dv[None, :]),
+                other=0.0,
+            )
+
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)  # [BLOCK_M, BLOCK_DV]
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        if not host_block:
+            mp_ptrs = Mp + current_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+            lp_ptrs = Lp + current_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+            op_ptrs = (
+                Op
+                + current_pid * BLOCK_M * BLOCK_DV
+                + tl.arange(0, BLOCK_M)[:, None] * BLOCK_DV
+                + offs_dv[None, :]
+            )
+            tl.store(mp_ptrs, e_max, cache_modifier=".wb")
+            tl.store(lp_ptrs, e_sum, cache_modifier=".wb")
+            tl.store(op_ptrs, acc, mask=mask_dv[None, :], cache_modifier=".wb")
+            tl.debug_barrier()
+            tl.atomic_xchg(locks + current_pid, 1)
+        else:
+            if not finishing_block:
+                last_cta = cal_num_split_wgs(
+                    xcd_pid=xcd_pid,
+                    tile_iter_end=tile_iter_end,
+                    cta_end_tile_gid=cta_end_tile_gid,
+                    max_tiles_per_wg=max_tiles_per_wg,
+                    high_load_wgs=high_load_wgs,
+                    num_splits=num_splits,
+                )
+                # Defensive clamp: the partial-result buffers (Mp/Lp/Op/locks) hold one slot
+                # per program, and a CTA only ever steals from later CTAs within its own XCD.
+                # Clamp to pids_per_xcd so a degenerate schedule (e.g. a forced tiny shape
+                # that slips past the host gate) can never index a buffer out of bounds.
+                last_cta = tl.minimum(last_cta, pids_per_xcd)
+                temp_pid = current_pid
+                for cta in range((xcd_pid + 1), last_cta):
+                    temp_pid = temp_pid + 1
+                    while tl.atomic_cas(locks + temp_pid, 1, 1) != 1:
+                        pass
+                    mp_ptrs = Mp + temp_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+                    lp_ptrs = Lp + temp_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+                    op_ptrs = (
+                        Op
+                        + temp_pid * BLOCK_M * BLOCK_DV
+                        + tl.arange(0, BLOCK_M)[:, None] * BLOCK_DV
+                        + offs_dv[None, :]
+                    )
+
+                    m_cta = tl.load(mp_ptrs)
+                    l_cta = tl.load(lp_ptrs)
+                    acc_cta = tl.load(op_ptrs, mask=mask_dv[None, :])
+                    m_new = tl.maximum(m_cta, e_max)
+                    alpha = tl.exp(m_cta - m_new)
+                    alpha1 = tl.exp(e_max - m_new)
+                    l_new = alpha * l_cta + alpha1 * e_sum
+                    acc = acc_cta * alpha[:, None] + acc * alpha1[:, None]
+                    e_max = m_new
+                    e_sum = l_new
+
+            acc = acc / e_sum[:, None]
+            offs_o = (
+                cur_batch * stride_obs + offs_h[:, None] * stride_oh + offs_dv[None, :]
+            )
+            tl.store(O + offs_o, acc, mask=mask_h[:, None] & mask_dv[None, :])
+
+        iter = iter + (local_iter_end - local_iter)
+
+
+def lean_decode_seqlen_gate(
+    num_q_heads: int,
+    kv_group_num: int,
+    batch: int,
+    seq_lens_sum: int,
+    is_mla: bool = False,
+) -> bool:
+    """Cheap host-side pre-gate for Lean decode (no GPU sync).
+
+    Lean Attention only beats the standard decode kernel for long-enough sequences; for
+    short context it both loses and would pay a ``kv_indptr[batch].item()`` host-sync in
+    :func:`decode_attention_fwd` just to discover it should fall back. The attention backend
+    calls this first, using host-side metadata it already has (``num_q_heads``,
+    ``kv_group_num``, ``seq_lens_sum``, ``batch``), so short-context decode skips Lean
+    entirely without a sync.
+
+    What actually drives the Lean-vs-SplitK crossover is how well the standard grouped
+    kernel already fills the device, i.e. its query-head **parallelism**, not ``kv_group_num``.
+    The standard kernel launches ``tiles = ceil(num_q_heads / min(16, kv_group_num))``
+    head-tile programs per (sequence, kv-split); when ``tiles`` is large it saturates the CUs
+    at short context and Lean wins only much later, while with few query heads per GPU (heavy
+    tensor-parallel shards) it under-fills and Lean needs a long context to amortise its
+    fixed persistent-grid overhead. Keying the threshold on ``kv_group_num`` alone mispredicts
+    this badly: e.g. Llama-3-70B at TP=8 (8 query heads/GPU, ``kv_group_num`` still 8) is 4x
+    SLOWER under Lean at 32K, yet the old gate enabled it there. So we tier the base threshold
+    on ``tiles`` instead. Thresholds are the crossovers measured by ``benchmark/lean_gate_sweep.py``
+    on MI355X (256 CUs); they should scale with the device CU count on other GPUs.
+
+    MLA layers (``is_mla``, i.e. ``qk_head_dim != v_head_dim``) are disabled: although the
+    isolated MLA decode kernel can win, that win does not survive the full decode step of the
+    MoE + tensor-parallel models that use MLA (attention is only ~12-19% of the step, dominated
+    by expert GEMMs and the TP all-reduce), where Lean is a measured net regression.
+
+    The thresholds are set for the END-TO-END crossover, which is LATER than the isolated
+    kernel crossover: Lean's decode kernel has a nearly flat per-call cost, so even after the
+    standard kernel's attention becomes slower the *whole decode step* only turns over once
+    the standard attention has grown enough to clear Lean's flat floor. Measured end-to-end on
+    several GQA models, the crossover clusters at ~56-64K largely independent of the exact tile
+    count: Qwen2.5-7B (tiles=4) 0.84x@32K, 1.11x@64K, 1.88x@128K; Llama-3.1-8B (tiles=8)
+    1.06x@64K, 1.83x@128K; Ministral-8B (tiles=8) 0.86x@32K. So grouped decode uses a single
+    64K base and only heavy tensor-parallel shards with very few query-head tiles (tiles<4,
+    e.g. Llama-70B @TP=8, whose kernel crossover is already ~128K) push it to 128K. MHA (many
+    tiles) uses a lower 16K base (kernel crossover ~8K).
+
+    Thresholds relax as the batch grows, since more concurrent requests fill the persistent
+    grid at shorter lengths, and Lean is never enabled below a floor of 4K average tokens,
+    keeping the workload clear of the degenerate tiny-tile regime. The relaxation rate is
+    tier-dependent, from a saturated batch sweep on MI355X (range-ratio 0.25 ragged, batch =
+    concurrency, num_prompts>=6*batch):
+
+    * ``tiles >= 4`` (GQA/MHA): divisor ``batch // 2``. Measured E2E (throughput / median ITL)
+      confirms Lean wins well below the old ``batch // 4`` threshold once the batch fills the
+      grid. Qwen2.5-7B (tiles=4) @ batch: b4 0.997x/0.97x (neutral -> keep off), b8 1.05x/1.26x,
+      b12 1.13x/1.40x, b16 1.20x/1.84x, b32 1.28x/2.31x @ ~18.75K; and @ batch 16 it already
+      wins by ~7.5K avg (1.13x/1.39x). Llama-3.1-8B (tiles=8) @ batch 16 wins at every context
+      7.5K->30K (1.27-1.31x thrpt, 1.6-2.2x ITL). ``batch // 2`` enables from batch 8 @ ~18K
+      and batch 16 @ ~8K while keeping batch 4 conservative (32K threshold, correctly off at
+      18.75K where Lean is neutral).
+    * ``tiles < 4`` (heavy TP shard): keeps the conservative ``batch // 4``. Its E2E win needs
+      very long context (Llama-70B @TP=8 was 4x SLOWER at 32K); the isolated kernel can win at
+      high batch/long context but that does not survive the MoE + TP-all-reduce full step, and
+      a single-GPU microbench cannot replicate it, so this tier stays protected.
+    """
+    if batch <= 0 or is_mla:
+        return False
+    avg_len = seq_lens_sum / batch
+    block_h = min(16, max(1, kv_group_num))
+    tiles = -(-num_q_heads // block_h)  # ceil(num_q_heads / block_h)
+    if tiles >= 16:
+        base = (
+            16384  # MHA / many query heads: standard kernel fills late, Lean wins early
+        )
+    elif tiles >= 4:
+        base = 65536  # typical GQA: measured E2E crossover ~56-64K
+    else:
+        base = (
+            131072  # few query heads/GPU (heavy TP shard): Lean needs very long context
+        )
+    # Heavy TP shards (tiles<4) relax slowly (batch//4); GQA/MHA relax at batch//2, matching
+    # the measured saturated-batch crossovers (see docstring).
+    div = batch // 2 if tiles >= 4 else batch // 4
+    threshold = max(4096, base // max(1, div))
+    return avg_len >= threshold
+
+
+def _should_use_lean_decode(
+    enable_lean: Optional[bool],
+    logit_cap: float,
+    sinks,
+    xai_temperature_len: int,
+    score_mod,
+) -> bool:
+    """Decide whether the Work-Centric (Lean) Attention decode kernel may be used.
+
+    ``enable_lean`` is the resolved activation flag passed by the caller:
+
+    * ``False`` — never use Lean Attention.
+    * ``True``  — use Lean Attention (the caller has already decided it is appropriate).
+    * ``None``  — do NOT self-enable here. Lean is only beneficial for long sequences and
+      its persistent-grid schedule misbehaves on tiny workloads, but this function has no
+      cheap way to know the sequence length (reading it would force a host sync that breaks
+      CUDA-graph capture). The attention backend resolves ``None`` to ``True``/``False`` via
+      :func:`lean_decode_seqlen_gate` using host-side metadata before calling in, so a
+      ``None`` that reaches here (e.g. a direct call) conservatively means "off".
+
+    Regardless of the override, Lean Attention is only eligible when the request uses
+    none of the features the kernel does not implement. The kernel supports MHA, GQA, and
+    MLA (rope split), but ignores logit capping, attention sinks, xAI temperature scaling,
+    and score modification, so we fall back to the standard kernel whenever any of those
+    are requested rather than silently returning wrong results.
+    """
+    if not enable_lean:  # False or None
+        return False
+    if logit_cap and logit_cap > 0:
+        return False
+    if sinks is not None:
+        return False
+    if xai_temperature_len and xai_temperature_len > 0:
+        return False
+    if score_mod is not None:
+        return False
+    return True
+
+
+def _lean_decode_launch_params(num_kv_heads, kv_group_num):
+    """Lean decode launch parameters that depend only on shape (no seqlen, no sync).
+
+    Returns ``(total_programs, XCD_REMAP, NUM_XCDS)``. ``total_programs`` is the fixed
+    persistent-grid size (2× device CU count for better occupancy, rounded to a whole
+    number of XCDs when the XCD remap is active). The per-call tile schedule is computed
+    inside the kernel from ``kv_indptr``. Shared by :func:`decode_attention_fwd` and the
+    test so the grid/XCD decision stays in sync with the kernel.
+    """
+    num_head_blocks = (kv_group_num + _LEAN_BLOCK_M - 1) // _LEAN_BLOCK_M
+    # XCD remap for ROCm only when rows are one-per-kv-head and divisible by 8.
+    XCD_REMAP = (num_kv_heads % 8 == 0 and num_head_blocks == 1) if _is_hip else False
+    NUM_XCDS = 8 if XCD_REMAP else 1
+    total_programs = _lean_num_cus() * 2
+    if XCD_REMAP:
+        # The XCD remap requires the grid to be a whole number of XCDs.
+        total_programs = max((total_programs // NUM_XCDS) * NUM_XCDS, NUM_XCDS)
+    return total_programs, XCD_REMAP, NUM_XCDS
+
+
+def _decode_lean_attention_fwd(
+    q,
+    k_buffer,
+    v_buffer,
+    o,
+    kv_indptr,
+    kv_indices,
+    total_programs,
+    sm_scale,
+    XCD_REMAP,
+    NUM_XCDS,
+    Mp,
+    Lp,
+    Op,
+    locks,
+):
+    """Wrapper for Lean Attention kernel.
+
+    ``total_programs`` is the fixed persistent-grid size (2× device CU count). The kernel
+    derives its own tile schedule from ``kv_indptr`` on-device, so no host sync is needed and
+    the launch is CUDA-graph capturable. ``Mp``, ``Lp``, ``Op``, ``locks`` are pre-allocated
+    persistent-grid partial-result buffers reused across decode steps.
+    """
+    batch, head_num = q.shape[0], q.shape[1]
+    num_kv_heads = k_buffer.shape[1]
+    Lk = k_buffer.shape[-1]
+    Lv = v_buffer.shape[-1]
+    kv_group_num = head_num // num_kv_heads
+
+    # MLA rope split: K carries an extra positional-encoding block (Lk > Lv).
+    if Lk == 576:
+        BLOCK_DMODEL, BLOCK_DPE = 512, 64
+    elif Lk == 288:
+        BLOCK_DMODEL, BLOCK_DPE = 256, 32
+    else:
+        BLOCK_DMODEL, BLOCK_DPE = triton.next_power_of_2(Lk), 0
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    BLOCK_M = _LEAN_BLOCK_M
+    BLOCK_N = _lean_decode_block_n(Lk)
+    # A kv group wider than BLOCK_M is processed as several head blocks; each
+    # (kv_head, head_block) pair is one scheduling "row".
+    num_head_blocks = (kv_group_num + BLOCK_M - 1) // BLOCK_M
+    num_rows = num_kv_heads * num_head_blocks
+    rows_per_xcd = num_rows // NUM_XCDS if XCD_REMAP else num_rows
+    xcd_programs = total_programs // NUM_XCDS if XCD_REMAP else total_programs
+
+    # Pre-allocated persistent-grid partial-result buffers (Mp, Lp, Op, locks) are passed
+    # in and reused across decode steps; they hold running softmax state for BLOCK_M query
+    # heads (one head block of a kv group) per program. Reset locks to zero each call.
+    locks.zero_()
+
+    # Prepare batch_num_block_n (cumulative tiles per sequence) over the active batch.
+    # seq_len[i] = kv_indptr[i+1] - kv_indptr[i]
+    seq_lens = (kv_indptr[1 : batch + 1] - kv_indptr[:batch]).to(
+        torch.int64
+    )  # use int64 for safe arithmetic
+    tiles_per_batch = (seq_lens + (BLOCK_N - 1)) // BLOCK_N
+    batch_num_block_n = (
+        torch.cumsum(tiles_per_batch, dim=0).to(torch.int32).contiguous()
+    )
+
+    max_output_tile_cnt = math.ceil((head_num * batch) / total_programs) + 4
+
+    _lean_attention_decode_kernel[(total_programs,)](
+        q,
+        k_buffer,
+        v_buffer,
+        Mp,
+        Lp,
+        Op,
+        o,
+        batch_num_block_n,
+        locks,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        o.stride(0),
+        o.stride(1),
+        kv_group_num=kv_group_num,
+        NUM_HEAD_BLOCKS=num_head_blocks,
+        ROWS_PER_XCD=rows_per_xcd,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        XCD_REMAP=XCD_REMAP,
+        NUM_XCDS=NUM_XCDS,
+        batch_size=batch,
+        total_programs=total_programs,
+        num_query_heads=head_num,
+        num_rows=num_rows,
+        xcd_programs=xcd_programs,
+        max_output_tile_cnt=max_output_tile_cnt,
+        Lk=Lk,
+        Lv=Lv,
+        num_warps=4,
+        num_stages=2,
+    )
