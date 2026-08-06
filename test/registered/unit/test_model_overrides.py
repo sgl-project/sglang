@@ -988,12 +988,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
 
-        def _hf(quant_algo="NVFP4"):
-            return SimpleNamespace(
+        def _hf(quant_algo="NVFP4", *, include_quantization_config=True):
+            hf = SimpleNamespace(
                 architectures=["NemotronHForCausalLM"],
                 mlp_hidden_act="relu2",
-                quantization_config={"quant_algo": quant_algo},
             )
+            if include_quantization_config:
+                hf.quantization_config = {"quant_algo": quant_algo}
+            return hf
 
         def _args(mc_quant, hf, **kw):
             mc = SimpleNamespace(quantization=mc_quant, hf_config=hf)
@@ -1049,6 +1051,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _nemotron_h_overrides(_args(None, hf, moe_runner_backend="triton"), hf),
                 {},
             )
+
+        hf_without_quant_cfg = _hf(include_quantization_config=False)
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            for modelopt_quantization in ("modelopt_fp8", "modelopt_fp4"):
+                with self.subTest(modelopt_quantization=modelopt_quantization):
+                    self.assertEqual(
+                        _nemotron_h_overrides(
+                            _args(modelopt_quantization, hf_without_quant_cfg),
+                            hf_without_quant_cfg,
+                        ),
+                        {
+                            "quantization": modelopt_quantization,
+                            "moe_runner_backend": "flashinfer_trtllm",
+                            "attention_backend": "flashinfer",
+                        },
+                    )
 
     def test_speculative_moe_runner_default_pass(self):
         from sglang.srt.arg_groups.overrides import (

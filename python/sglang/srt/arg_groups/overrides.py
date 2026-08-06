@@ -1186,12 +1186,6 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         "modelopt_mixed",
     ]
     quantization = server_args.quantization
-    has_w4a16_moe_layers = is_modelopt and any(
-        info.get("quant_algo") == "W4A16_NVFP4" and ".experts." in name
-        for name, info in hf_config.quantization_config.get(
-            "quantized_layers", {}
-        ).items()
-    )
     if is_modelopt:
         assert model_config.hf_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
@@ -1205,6 +1199,15 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
+
+    has_w4a16_moe_layers = False
+    if is_modelopt and quantization == "modelopt_mixed":
+        has_w4a16_moe_layers = any(
+            info.get("quant_algo") == "W4A16_NVFP4" and ".experts." in name
+            for name, info in hf_config.quantization_config.get(
+                "quantized_layers", {}
+            ).items()
+        )
 
     if has_w4a16_moe_layers:
         if server_args.moe_a2a_backend != "none":
