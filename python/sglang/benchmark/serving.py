@@ -977,7 +977,13 @@ def flush_server_cache(base_url: str, backend: str) -> None:
     cache_endpoint = (
         "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
     )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    # Pass timeout so the server waits for idle instead of failing immediately
+    params = {"timeout": 10.0} if not backend.startswith("vllm") else {}
+    response = requests.post(
+        base_url + cache_endpoint,
+        headers=get_auth_headers(),
+        params=params,
+    )
     response.raise_for_status()
 
 

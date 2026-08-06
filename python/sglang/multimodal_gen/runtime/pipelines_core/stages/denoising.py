@@ -20,6 +20,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    mount_fused_gate_rmsnorm,
+    unmount_fused_gate_rmsnorm,
+)
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    mount_fused_linear_gelu,
+    unmount_fused_linear_gelu,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -75,6 +83,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -219,6 +230,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        # quality="high" fusion state: whether the cublasLt linear+GELU and
+        # fused gate-RMSNorm sites are currently mounted on the transformers.
+        self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
         self._bcg_runners: dict[int, Any] = {}
@@ -227,7 +241,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         num_attention_heads = (
             self.server_args.pipeline_config.dit_config.num_attention_heads
         )
-        attn_head_size = hidden_size // num_attention_heads
+        attn_head_size = getattr(
+            self.server_args.pipeline_config.dit_config,
+            "attention_head_dim",
+            hidden_size // num_attention_heads,
+        )
 
         # torch compile
         # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
@@ -341,10 +359,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             not args.enable_torch_compile
             or not args.offload_during_compile
             or not args.warmup
-            # a subclass with its own forward would never run the restore
-            or type(self).forward is not DenoisingStage.forward
+            or not self._owns_compile_warmup_lifecycle()
             or args.use_fsdp_inference
-            or envs.SGLANG_CACHE_DIT_ENABLED
+            or self._cache_dit_requested()
             or not isinstance(module, LayerwiseOffloadableModuleMixin)
             or is_layerwise_offloaded_module(module)
         ):
@@ -352,6 +369,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         module.configure_layerwise_offload(args)
         if is_layerwise_offloaded_module(module):
             self._offloaded_dit_modules_for_compile.append(module)
+
+    def _owns_compile_warmup_lifecycle(self) -> bool:
+        """Whether ``forward`` enters ``_offload_for_torch_compile_warmup``.
+
+        Custom denoising loops opt in explicitly after wiring the same restore
+        lifecycle. This keeps the safety guard without silently disabling the
+        optimization solely because a model overrides ``forward``.
+        """
+        return type(self).forward is DenoisingStage.forward
 
     def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
         """Move resident non-DiT components off-device while the warmup
@@ -365,6 +391,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if (
                 isinstance(module, torch.nn.Module)
                 and id(module) not in dit_ids
+                and not is_fsdp_managed_module(module)
                 and not is_layerwise_offloaded_module(module)
             ):
                 param = next(module.parameters(), None)
@@ -386,7 +413,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.server_args, "enable_torch_compile", False
         ) or not isinstance(module, nn.Module):
             return
-        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+        if self._cache_dit_requested() and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
         if self._torch_compile_registry.is_compiled(module):
@@ -427,12 +454,53 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
 
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        """Mount/unmount the ``quality="high"`` fusions for this batch.
+
+        The cublasLt linear+GELU epilogue and the fused gate-RMSNorm Triton
+        kernels are numerically equivalent only at half-precision rounding
+        level (not bit-exact), so they are mounted for ``quality="high"``
+        requests and unmounted otherwise -- the ``"lossless"`` default runs
+        the unmodified reference path bit-for-bit. ``quality`` participates
+        in the dynamic-batch signature, so a worker batch is uniform in
+        ``quality`` and this process-wide transition is safe at the batch
+        boundary. Mounting is all-or-nothing per transformer and per fusion
+        family (any ineligible marked site keeps the whole transformer on
+        that family's reference path); models without marked sites are
+        no-ops.
+        """
+        want = getattr(batch.sampling_params, "quality", "lossless") == "high"
+        if want == self._quality_fusions_mounted:
+            return
+        mounted_gelu = False
+        mounted_gate_norm = False
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if want:
+                mounted_gelu |= mount_fused_linear_gelu(transformer)
+                mounted_gate_norm |= mount_fused_gate_rmsnorm(transformer)
+            else:
+                unmount_fused_linear_gelu(transformer)
+                unmount_fused_gate_rmsnorm(transformer)
+        self._quality_fusions_mounted = want
+        if want and mounted_gelu:
+            logger.info(
+                "Mounted fused linear+GELU (cublasLt epilogue) for quality=high"
+            )
+        if want and mounted_gate_norm:
+            logger.info(
+                "Mounted fused gate RMSNorm (Z-Image Triton suite) for quality=high"
+            )
+
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
+
+    def _cache_dit_requested(self) -> bool:
+        return envs.SGLANG_CACHE_DIT_ENABLED
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
         return False
@@ -604,7 +672,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
         # warmup to mount cache-dit before Dynamo traces the transformer.
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
+        if not self._cache_dit_requested():
             return
         if batch.is_warmup and not getattr(
             self.server_args, "enable_torch_compile", False
@@ -692,9 +760,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
                 primary_num_steps,
-                envs.SGLANG_CACHE_DIT_FN,
-                envs.SGLANG_CACHE_DIT_BN,
-                envs.SGLANG_CACHE_DIT_RDT,
+                primary_config.Fn_compute_blocks,
+                primary_config.Bn_compute_blocks,
+                primary_config.residual_diff_threshold,
             )
 
         self._cache_dit_enabled = True

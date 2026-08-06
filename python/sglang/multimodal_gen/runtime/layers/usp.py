@@ -8,6 +8,10 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
+from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
+    pack_qkv_destination_major,
+)
+from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_rank,
@@ -35,12 +39,45 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+_A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def _a2a_staging_buffer(
+    role: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Reusable staging buffer for a Ulysses collective.
+
+    A buffer of a given role is fully consumed (in stream order) before the
+    next collective with the same role overwrites it, so caching by
+    (role, shape, dtype) is exact and removes per-block allocator churn.
+    Bypassed under autograd and CUDA graph capture: a buffer first allocated
+    while capturing would live in the graph's private memory pool and must
+    not be shared with eager replays.
+    """
+    if (
+        torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or device.type != "cuda"
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return torch.empty(shape, dtype=dtype, device=device)
+    key = (role, tuple(shape), dtype, device.index)
+    buffer = _A2A_STAGING_BUFFERS.get(key)
+    if buffer is None:
+        buffer = torch.empty(shape, dtype=dtype, device=device)
+        _A2A_STAGING_BUFFERS[key] = buffer
+    return buffer
+
+
+def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
-    output = torch.empty_like(x)
+    if role is None:
+        output = torch.empty_like(x)
+    else:
+        output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
@@ -266,7 +303,7 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     h_local, s_global = h_global // world_size, s_local * world_size
 
     x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+    x = _usp_all_to_all_single(x, role="usp_input")
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
@@ -278,6 +315,128 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
 
     return x
+
+
+def _usp_input_all_to_all_packed_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange 3D Q/K/V with one destination-major Ulysses collective."""
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    assert q.ndim == 3 and q.shape == k.shape == v.shape
+    s_local, h_global, head_size = q.shape
+    assert h_global % world_size == 0
+    h_local = h_global // world_size
+
+    if (
+        q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+        and not torch.compiler.is_compiling()
+    ):
+        packed = pack_qkv_destination_major(
+            q,
+            k,
+            v,
+            world_size,
+            out=_a2a_staging_buffer(
+                "usp_packed_qkv_src",
+                (world_size, s_local, h_local, 3 * head_size),
+                q.dtype,
+                q.device,
+            ),
+        )
+    else:
+        packed = torch.empty(
+            (world_size, s_local, h_local, 3 * head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        for index, tensor in enumerate((q, k, v)):
+            head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
+                1, 0, 2, 3
+            )
+            packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
+
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
+    q, k, v = packed.split(head_size, dim=-1)
+    return q, k, v
+
+
+def _can_use_packed_qkv_a2a_4d(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
+) -> bool:
+    return (
+        q.is_cuda
+        and q.ndim == 4
+        and q.shape == k.shape == v.shape
+        and q.dtype == k.dtype == v.dtype
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.shape[2] % world_size == 0
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _usp_input_all_to_all_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ulysses input exchange for Q/K/V with heads at dim=2.
+
+    [b, s_local, h, d] x3 -> [b, s_global, h_local, d] x3. Q/K/V are packed
+    destination-major by one relayout kernel and exchanged in a single
+    collective instead of three; only data movement changes, so the result is
+    bit-identical to the unpacked path, which stays as the fallback for
+    ineligible inputs (CPU, GQA-mismatched shapes, non-contiguous layouts).
+    Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+    if not _can_use_packed_qkv_a2a_4d(q, k, v, world_size):
+        return (
+            _usp_input_all_to_all(q, head_dim=2),
+            _usp_input_all_to_all(k, head_dim=2),
+            _usp_input_all_to_all(v, head_dim=2),
+        )
+
+    b, s_local, h_global, d = q.shape
+    h_local = h_global // world_size
+    rows = b * s_local
+    packed = pack_qkv_destination_major(
+        q.view(rows, h_global, d),
+        k.view(rows, h_global, d),
+        v.view(rows, h_global, d),
+        world_size,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src", (world_size, rows, h_local, 3 * d), q.dtype, q.device
+        ),
+    )
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    if b == 1:
+        # Received chunks are already sequence-major: rank j's rows arrive at
+        # offset j * s_local, so flattening the leading dims is a free view.
+        packed = packed.view(1, world_size * s_local, h_local, 3 * d)
+    else:
+        packed = (
+            packed.view(world_size, b, s_local, h_local, 3 * d)
+            .permute(1, 0, 2, 3, 4)
+            .contiguous()
+            .view(b, world_size * s_local, h_local, 3 * d)
+        )
+    q, k, v = packed.split(d, dim=-1)
+    # Copy out before the staging buffer is recycled by the next collective.
+    return q.contiguous(), k.contiguous(), v.contiguous()
 
 
 def _usp_input_all_to_all_varlen(
@@ -410,7 +569,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     s_local, h_global = s_global // world_size, h_local * world_size
 
     x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+    x = _usp_all_to_all_single(x, role="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
@@ -419,7 +578,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
-        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
+        x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
 
     return x
 

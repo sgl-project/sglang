@@ -68,6 +68,8 @@ pub enum FinishReason {
     /// This arm is why the outer enum is untagged: a finish reason added Python-side
     /// must not fail the header decode, which rejects the whole frame — every
     /// request in the batch, not just the one that carried it.
+    // Keep the native frame compact even when HTTP/rendering dependencies turn
+    // on serde_json's large `preserve_order` map representation.
     Unknown(Box<serde_json::Map<String, serde_json::Value>>),
 }
 
@@ -78,6 +80,16 @@ impl From<FinishKind> for FinishReason {
 }
 
 impl FinishReason {
+    /// Returns the wire type without reserializing the finish reason.
+    pub fn kind_name(&self) -> Option<&str> {
+        match self {
+            FinishReason::Known(FinishKind::Stop { .. }) => Some("stop"),
+            FinishReason::Known(FinishKind::Length { .. }) => Some("length"),
+            FinishReason::Known(FinishKind::Abort(_)) => Some("abort"),
+            FinishReason::Unknown(fields) => fields.get("type").and_then(|value| value.as_str()),
+        }
+    }
+
     /// The stop this request matched, if it stopped on one. `None` for
     /// length/abort and for an unknown type.
     pub fn matched(&self) -> Option<&Matched> {

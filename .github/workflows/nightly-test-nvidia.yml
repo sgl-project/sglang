@@ -204,32 +204,11 @@ jobs:
         if: always()
         timeout-minutes: 300
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-h200"
           IS_H200: "1"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
-
-      - name: Publish traces to storage repo
-        if: always()
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          TRACE_ARGS=""
-          for dir in test/performance_profiles_*/; do
-            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
-          done
-          if [ -n "$TRACE_ARGS" ]; then
-            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
-            find test/performance_profiles_*/ -name '*.json.gz' -delete
-          else
-            echo "No trace directories found, skipping publish"
-          fi
 
       - name: Run test
         timeout-minutes: 30
@@ -247,7 +226,7 @@ jobs:
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
             --output test/metrics-8gpu-h200-partition-${{ matrix.partition }}.json \
-            --search-dir test/performance_profiles_8_gpu \
+            --search-dir test/performance_results_8_gpu \
             --search-dir test
 
       - name: Upload partition metrics
@@ -318,31 +297,10 @@ jobs:
         if: always()
         timeout-minutes: 200
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
-
-      - name: Publish traces to storage repo
-        if: always()
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          TRACE_ARGS=""
-          for dir in test/performance_profiles_*/; do
-            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
-          done
-          if [ -n "$TRACE_ARGS" ]; then
-            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
-            find test/performance_profiles_*/ -name '*.json.gz' -delete
-          else
-            echo "No trace directories found, skipping publish"
-          fi
 
       - name: Collect performance metrics
         if: always()
@@ -352,7 +310,7 @@ jobs:
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
             --output test/metrics-8gpu-b200-partition-${{ matrix.partition }}.json \
-            --search-dir test/performance_profiles_8_gpu \
+            --search-dir test/performance_results_8_gpu \
             --search-dir test
 
       - name: Upload partition metrics
@@ -413,21 +371,11 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 30
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-h100"
         run: |
           cd test
-          rm -rf performance_profiles_text_models/
+          rm -rf performance_results_text_models/
           python3 run_suite.py --hw cuda --suite nightly-perf-text-2-gpu --nightly --continue-on-error --timeout-per-file 3600
-
-      - name: Publish traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_text_models
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -476,21 +424,11 @@ jobs:
       - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 30
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-h100"
         run: |
           cd test
-          rm -rf performance_profiles_vlms/
+          rm -rf performance_results_vlms/
           python3 run_suite.py --hw cuda --suite nightly-perf-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 3600
-
-      - name: Publish traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_vlms
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -514,31 +452,10 @@ jobs:
       - name: Run test
         timeout-minutes: 200
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "4-gpu-b200"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
-
-      - name: Publish traces to storage repo
-        if: always()
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          TRACE_ARGS=""
-          for dir in test/performance_profiles_*/; do
-            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
-          done
-          if [ -n "$TRACE_ARGS" ]; then
-            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
-            find test/performance_profiles_*/ -name '*.json.gz' -delete
-          else
-            echo "No trace directories found, skipping publish"
-          fi
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -577,31 +494,10 @@ jobs:
       - name: Run test
         timeout-minutes: 600
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "4-gpu-gb300"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite ${{ matrix.suite }} --nightly --continue-on-error --timeout-per-file 7200
-
-      - name: Publish traces to storage repo
-        if: always()
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          TRACE_ARGS=""
-          for dir in test/performance_profiles_*/; do
-            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
-          done
-          if [ -n "$TRACE_ARGS" ]; then
-            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
-            find test/performance_profiles_*/ -name '*.json.gz' -delete
-          else
-            echo "No trace directories found, skipping publish"
-          fi
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()

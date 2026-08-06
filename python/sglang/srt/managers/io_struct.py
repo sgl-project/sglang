@@ -53,7 +53,11 @@ from pydantic import PlainValidator
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    ReturnHiddenStatesMode,
+    get_return_hidden_states_mode,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -154,8 +158,9 @@ MultimodalDataInputFormat = Union[
 
 @dataclass
 class GenerateReqInput:
-    # Request ID(s). If omitted, generated during normalization. For batch
-    # requests, a string is expanded to per-item IDs using it as a prefix.
+    # Logical request ID(s). If omitted, generated during normalization. For
+    # batch requests, a string is expanded to one ID per original batch item.
+    # Parallel-sampling child IDs are internal to TokenizerManager.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
@@ -219,7 +224,9 @@ class GenerateReqInput:
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
+    return_hidden_states: Union[
+        List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
+    ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -270,6 +277,9 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+    # Per-request thinking budget. Requires strict thinking so the runtime can
+    # enforce the limit rather than silently treating it as metadata.
+    max_thinking_tokens: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -313,12 +323,17 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
-    def regenerate_rid(self):
+    def regenerate_rid(self, prefix: Optional[str] = None):
         """Generate a new request ID and return it."""
+
+        def new_rid() -> str:
+            suffix = uuid.uuid4().hex
+            return f"{prefix}_{suffix}" if prefix is not None else suffix
+
         if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+            self.rid = [new_rid() for _ in range(len(self.rid))]
         else:
-            self.rid = uuid.uuid4().hex
+            self.rid = new_rid()
         return self.rid
 
     def _validate_rid_uniqueness(self):
@@ -474,13 +489,14 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_rid(num)
+        self._normalize_rid()
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
+        self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
@@ -583,16 +599,16 @@ class GenerateReqInput:
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
-    def _normalize_rid(self, num):
-        """Normalize request IDs for batch processing."""
+    def _normalize_rid(self):
+        """Normalize one logical request ID per original batch item."""
         if self.rid is None:
-            self.rid = [uuid.uuid4().hex for _ in range(num)]
+            self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
-            self.rid = new_rids
+            if self.batch_size == 1:
+                self.rid = [self.rid]
+            else:
+                self.rid = [f"{self.rid}_{i}" for i in range(self.batch_size)]
         elif isinstance(self.rid, list):
-            # Note: the length of rid shall be the same as the batch_size,
-            # as the rid would be expanded for parallel sampling in tokenizer_manager
             if len(self.rid) != self.batch_size:
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
@@ -643,6 +659,22 @@ class GenerateReqInput:
             raise ValueError(
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
             )
+
+    def _normalize_return_hidden_states(self, num):
+        """Normalize and validate per-request hidden-state return modes."""
+        if isinstance(self.return_hidden_states, list):
+            if len(self.return_hidden_states) != self.batch_size:
+                raise ValueError(
+                    "The length of return_hidden_states should be equal to the batch size."
+                )
+            for mode in self.return_hidden_states:
+                get_return_hidden_states_mode(mode)
+            self.return_hidden_states = (
+                self.return_hidden_states * self.parallel_sample_num
+            )
+        else:
+            get_return_hidden_states_mode(self.return_hidden_states)
+            self.return_hidden_states = [self.return_hidden_states] * num
 
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
@@ -728,8 +760,9 @@ class GenerateReqInput:
         cache = self.__dict__.setdefault("_sub_obj_cache", {})
         if i in cache:
             return cache[i]
+        logical_index = i % self.batch_size
         sub = GenerateReqInput(
-            rid=self.rid[i],
+            rid=self.rid[logical_index],
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -790,6 +823,8 @@ class GenerateReqInput:
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
+            require_reasoning=self.require_reasoning,
+            max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
@@ -838,7 +873,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_flat_raw_top_logprobs: bool = False
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: ReturnHiddenStatesMode = False
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -2225,7 +2260,10 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
         return None
     if _USE_PICKLE_IPC:
         return obj
-    assert isinstance(obj, PickleWrapper)
+    if not isinstance(obj, PickleWrapper):
+        # Already materialized: the embedded Rust server attaches in-process
+        # objects (native-MM `mm_inputs`) without a pickle hop.
+        return obj
     return pickle.loads(obj.data)
 
 

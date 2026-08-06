@@ -74,7 +74,7 @@ class TestGptOss120B(unittest.TestCase):
             test_name="GPT-OSS-120B",
             accuracy_params=None,
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gpt_oss_120b",
+                result_dir="performance_results_gpt_oss_120b",
             ),
         )
 

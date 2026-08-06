@@ -15,7 +15,7 @@ COMMON_ARGS = [
     "--trust-remote-code",
     "--reasoning-parser=glm45",
     "--tool-call-parser=glm47",
-    "--mem-fraction-static=0.85",
+    "--mem-fraction-static=0.8",
     "--enable-metrics",
 ]
 
@@ -59,7 +59,7 @@ class TestGlm52Fp8(unittest.TestCase):
             test_name="GLM-5.2-FP8",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_glm_52_fp8",
+                result_dir="performance_results_glm_52_fp8",
             ),
         )
 

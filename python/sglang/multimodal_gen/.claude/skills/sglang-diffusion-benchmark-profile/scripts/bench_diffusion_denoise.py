@@ -249,6 +249,38 @@ MODELS = {
         ],
     },
     # Source-tracked extras from current registry / GPU test coverage.
+    # MiniMax-H3 owns its temporal canvas through target.duration_seconds, so
+    # the model-specific sampling fields are passed through --config instead
+    # of generic --width/--height/--num-frames flags.
+    "minimax-h3-t2va": {
+        "path": "MiniMaxAI/MiniMax-H3",
+        "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+        "seed": 1101,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 5.0,
+            },
+            "audio_flow_shift": 3.0,
+            "flow_shift": 12.0,
+            "num_inference_steps": 50,
+        },
+        "extra_args": [
+            "--model-variant=fl2va",
+            "--num-gpus=4",
+            "--tp-size=2",
+            "--ulysses-degree=2",
+            "--performance-mode=speed",
+            "--enable-torch-compile=false",
+        ],
+        # H3 eager BF16/FP32 is the consistency ground truth. Current
+        # torch.compile changes numerical output, so never add the global
+        # helper default --enable-torch-compile flag for this preset.
+        "force_eager": True,
+    },
     "ltx2": {
         "path": "Lightricks/LTX-2",
         "prompt": "A cat and a dog baking a cake together in a kitchen.",
@@ -730,6 +762,7 @@ def build_sglang_cmd(
     torch_compile: bool = True,
     seed: int = 42,
     save_output: bool = True,
+    artifact_dir: Optional[Path] = None,
 ) -> list[str]:
     """
     Build the `sglang generate` command for the given model.
@@ -756,9 +789,12 @@ def build_sglang_cmd(
         cmd.append(f"--image-path={cfg['image_path']}")
 
     if "config_overrides" in cfg:
-        config_dir = ensure_dir(
-            get_output_dir("benchmarks", REPO_ROOT) / "generated_configs"
+        config_root = (
+            Path(artifact_dir)
+            if artifact_dir is not None
+            else get_output_dir("benchmarks", REPO_ROOT)
         )
+        config_dir = ensure_dir(config_root / "generated_configs")
         config_path = config_dir / f"{model_key}.json"
         with open(config_path, "w") as f:
             json.dump(cfg["config_overrides"], f, indent=2, sort_keys=True)
@@ -770,7 +806,7 @@ def build_sglang_cmd(
         cmd.append("--save-output")
     if warmup:
         cmd.append("--warmup")
-    if torch_compile:
+    if torch_compile and not cfg.get("force_eager", False):
         cmd.append("--enable-torch-compile")
     if perf_dump_path:
         cmd.extend(["--perf-dump-path", perf_dump_path])
@@ -793,6 +829,7 @@ def run_benchmark_once(
         perf_dump_path=str(perf_path),
         warmup=warmup,
         torch_compile=torch_compile,
+        artifact_dir=output_dir,
     )
 
     env = os.environ.copy()

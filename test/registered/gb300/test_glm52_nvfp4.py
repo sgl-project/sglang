@@ -61,7 +61,7 @@ class TestGlm52Nvfp4(unittest.TestCase):
             test_name="GLM-5.2-NVFP4",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
+                result_dir="performance_results_gb300",
             ),
         )
 

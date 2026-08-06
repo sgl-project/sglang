@@ -169,6 +169,12 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+# JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
+# `os.lstat`, etc.) that Dynamo cannot trace. When a lazily-loaded kernel is
+# first reached from inside a `@torch.compile`d region, tracing into it produces
+# spurious "Dynamo does not know how to trace the builtin `posix.lstat`" graph
+# breaks. The load happens once and is memoized, so keep it out of the graph.
+@torch.compiler.disable
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,

@@ -24,6 +24,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
@@ -38,6 +39,20 @@ _is_npu = is_npu()
 
 
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
+def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
+    precompile = getattr(model, "precompile_kernels_after_loading", None)
+    if precompile is None:
+        return
+
+    if device == "cuda":
+        current_platform.synchronize()
+        current_platform.empty_cache()
+    precompile()
+    if device == "cuda":
+        current_platform.synchronize()
+        current_platform.empty_cache()
 
 
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
@@ -64,10 +79,13 @@ def maybe_downgrade_dtype_for_legacy_gpu(
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, server_args: ServerArgs, tp_rank: int
+    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
+    """``load_format`` is this runner's effective format: a draft loading under
+    ``--speculative-draft-draft-load-format`` needs its own send group, and the
+    target's format cannot answer for it."""
     if (
-        server_args.load_format == LoadFormat.REMOTE_INSTANCE
+        (load_format or server_args.load_format) == LoadFormat.REMOTE_INSTANCE
         and server_args.remote_instance_weight_loader_backend
         == RemoteInstanceWeightLoaderBackend.NCCL
     ):
@@ -169,6 +187,7 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
+    load_format: Optional[str] = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
     draft_model_idx: Optional[int],
@@ -186,7 +205,7 @@ def build_load_config(
     )
 
     return LoadConfig(
-        load_format=server_args.load_format,
+        load_format=load_format or server_args.load_format,
         download_dir=server_args.download_dir,
         model_loader_extra_config=server_args.model_loader_extra_config,
         tp_rank=tp_rank,

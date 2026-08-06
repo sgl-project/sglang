@@ -62,7 +62,7 @@ RUN set -eu; \
 # Keep the installed extension modules, but discard Rust and pip build
 # artifacts that are not used at runtime.
 RUN rm -rf /sgl-workspace/sglang && \
-    git clone --branch kimi-k3 \
+    git clone --branch main \
       https://github.com/sgl-project/sglang.git /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang && \
     rm -rf .git && \

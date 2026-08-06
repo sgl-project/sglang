@@ -37,6 +37,10 @@ class Ideogram4Transformer2DModel(torch.nn.Module):
     pass
 
 
+class MiniMaxH3DiTModel(torch.nn.Module):
+    pass
+
+
 class ZImageTransformer2DModel(torch.nn.Module):
     def rotary_emb(self, pos_ids):
         return torch.zeros(pos_ids.shape[0], 8, device=pos_ids.device)
@@ -47,6 +51,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage = DenoisingStage.__new__(DenoisingStage)
         self.qwen_model = QwenImageTransformer2DModel()
         self.ideogram_model = Ideogram4Transformer2DModel()
+        self.minimax_h3_model = MiniMaxH3DiTModel()
         self.zimage_model = ZImageTransformer2DModel()
         self.other_model = OtherTransformer2DModel()
 
@@ -190,6 +195,93 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertFalse(short["encoder_hidden_states_mask"][0, 19:].any())
         self.assertFalse(longer["encoder_hidden_states_mask"][0, 47:].any())
         self.assertEqual(short["freqs_cis"][0].shape, (64, 8))
+        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+
+    def _minimax_h3_kwargs(self, text_seq: int):
+        image_seq = 4
+        audio_seq = 2
+        media_seq = image_seq + audio_seq
+        used = text_seq + media_seq
+        packed_seq = 64
+        audio_pos = torch.arange(text_seq, text_seq + audio_seq)
+        img_pos = torch.arange(text_seq + audio_seq, used)
+        return {
+            "x": torch.zeros(1, packed_seq, 96),
+            "audio_x": torch.zeros(1, packed_seq, 32),
+            "img_position_ids": torch.zeros(1, packed_seq, 3),
+            "unique_timesteps": torch.zeros(1),
+            "inverse_indices": torch.zeros(packed_seq, dtype=torch.long),
+            "update_mask": torch.ones(image_seq, dtype=torch.bool),
+            "token_tags": torch.full((packed_seq,), -1, dtype=torch.long),
+            "skip_mask_out_condition": False,
+            "prompt_embeds": torch.ones(text_seq, 8),
+            "refined_prompt_embeds_length": text_seq,
+            "img_pos_info": {"position_ids": img_pos},
+            "audio_pos_info": {"position_ids": audio_pos},
+            "text_pos_info": {"position_ids": torch.arange(text_seq, dtype=torch.long)},
+            "img_pos_for_infer_output_info": {"position_ids": img_pos},
+            "local_embedding_layout": {
+                "text_source_ids": torch.arange(text_seq),
+                "text_row_ids": torch.arange(text_seq),
+            },
+            "packed_seq_params": {
+                "cu_seqlens_q": torch.tensor([0, used, packed_seq], dtype=torch.int32),
+                "max_seqlen_q": used,
+            },
+            "refiner_packed_seq_params": {
+                "cu_seqlens_q": torch.tensor(
+                    [0, text_seq, text_seq], dtype=torch.int32
+                ),
+                "max_seqlen_q": text_seq,
+            },
+        }
+
+    def test_minimax_h3_prompt_lengths_share_bucket_signature(self):
+        with self._patch_buckets(64, 128):
+            short = self.stage._bcg_pad_prompt_kwargs(
+                self._minimax_h3_kwargs(19), current_model=self.minimax_h3_model
+            )
+            longer = self.stage._bcg_pad_prompt_kwargs(
+                self._minimax_h3_kwargs(47), current_model=self.minimax_h3_model
+            )
+
+        # H3 keeps the original aligned main sequence: growing it changes SP
+        # row partitions and loses bitwise eager equivalence.
+        self.assertEqual(short["x"].shape, (1, 64, 96))
+        self.assertEqual(longer["x"].shape, (1, 64, 96))
+        self.assertEqual(short["audio_x"].shape, (1, 64, 32))
+        self.assertEqual(short["prompt_embeds"].shape, (64, 8))
+        self.assertEqual(longer["prompt_embeds"].shape, (64, 8))
+        self.assertNotIn("local_embedding_layout", short)
+        self.assertNotIn("local_embedding_layout", longer)
+        self.assertEqual(
+            short["refined_prompt_embeds_length"].shape,
+            torch.Size([]),
+        )
+        self.assertEqual(short["refined_prompt_embeds_length"].item(), 19)
+        self.assertEqual(longer["refined_prompt_embeds_length"].item(), 47)
+        self.assertEqual(
+            short["packed_seq_params"]["cu_seqlens_q"].tolist(), [0, 25, 64]
+        )
+        self.assertEqual(
+            longer["packed_seq_params"]["cu_seqlens_q"].tolist(), [0, 53, 64]
+        )
+        self.assertEqual(short["packed_seq_params"]["max_seqlen_q"], 64)
+        self.assertEqual(short["refiner_packed_seq_params"]["max_seqlen_q"], 64)
+        self.assertEqual(
+            short["refiner_packed_seq_params"]["cu_seqlens_q"].tolist(),
+            [0, 19, 64],
+        )
+        # Dummy prompt rows occupy the independent packed-attention segment;
+        # real text/media remain in the first segment.
+        self.assertEqual(
+            short["text_pos_info"]["position_ids"][19:].tolist(),
+            list(range(25, 70)),
+        )
+        self.assertEqual(
+            longer["text_pos_info"]["position_ids"][47:].tolist(),
+            list(range(53, 70)),
+        )
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
     def _ideogram_kwargs(self, text_seq: int, *, image_seq: int = 4):

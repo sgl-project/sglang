@@ -636,8 +636,13 @@ class _ConfigBag:
 
     @contextmanager
     def override(self, **kwargs):
-        """Scoped, transactional test-only override of this bag's own leaves
-        (keys validated before any write; restored on exit)."""
+        """Scoped, transactional override of this bag's own leaves (keys
+        validated before any write; restored on exit).
+
+        For a window where one runner's value differs from the process's — a
+        draft model loading under ``--speculative-draft-load-format`` while the
+        target keeps ``--load-format`` — and for tests forcing a code path.
+        A permanent change goes through ``get_context().override``."""
         fields = object.__getattribute__(self, "_fields")
         unknown = set(kwargs) - set(fields)
         if unknown:
@@ -912,17 +917,23 @@ class RuntimeContext:
         """Serialize the *resolved* config: the pristine ``server_args`` fields
         with every post-publish ``override`` overlaid.
 
-        Reporting endpoints (``/server_info``, ``get_internal_state``) surface
-        the config the process is *currently* running, not the startup record,
-        so they read this rather than serializing ``server_args`` directly —
-        otherwise runtime updates (weight version, model path, tunables set via
-        ``/set_internal_state``) never show up in the readback.
+        ``get_internal_state`` reports this, and ``/server_info`` carries it in
+        the ``internal_states`` block, so scheduler-side runtime changes show up
+        in a readback: HiCache attach/detach, the generated forward-pass-metrics
+        endpoint, tunables set via ``/set_internal_state``.
 
         ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
         ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first (``/server_info``). Override
-        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
-        top level of either base is exact.
+        dataclass fields must be expanded first. Override leaves are flat
+        ``ServerArgs`` field names, so overlaying them onto the top level of
+        either base is exact.
+
+        This covers the process-global bags only. Per-engine control-plane
+        changes (weight version, model path, the tokenizer's HiCache mirror)
+        live on the tokenizer manager — several ``Engine``s can share one
+        process — and ``TokenizerManager.resolved_config_dict`` overlays those
+        for the top-level ``/server_info`` body. The two are separate logs, not
+        one merged dict.
         """
         d = dict(vars(self.server_args)) if base is None else dict(base)
         for _source, fields in self._overrides_log:
@@ -1005,8 +1016,7 @@ class _ServerArgsOverride:
 
     def install(self) -> ServerArgs:
         """Publish a fresh dummy-boundary ``ServerArgs`` carrying the
-        overrides (written through ``ServerArgs.override`` for provenance);
-        returns the published instance."""
+        overrides; returns the published instance."""
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
@@ -1019,7 +1029,7 @@ class _ServerArgsOverride:
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         server_args = ServerArgs(model_path="dummy")
         if self._fields:
-            server_args.override(source="test-override", **self._fields)
+            server_args = server_args.derive("test-override", **self._fields)
         # The dummy boundary skips materialization, which would leave the
         # strict mutation guard unarmed on the published object — mark it
         # materialized so bare post-publish writes raise like they do on a
