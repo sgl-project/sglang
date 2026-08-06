@@ -81,15 +81,17 @@ jobs:
         with:
           github-token: ${{ inputs.github-token || github.token }}
           script: |
+            core.notice(`[health-check] START — event=${context.eventName}, runId=${context.runId}`);
+
             // Skip when explicitly requested via env var (e.g. release branch cut)
             if (process.env.SKIP_PR_TEST_HEALTH_CHECK === 'true') {
-              core.info('Skipping health check (SKIP_PR_TEST_HEALTH_CHECK=true)');
+              core.notice('[health-check] SKIP: SKIP_PR_TEST_HEALTH_CHECK=true');
               return;
             }
 
             // Skip for scheduled runs — they should collect all failures, not fast-fail
             if (context.eventName === 'schedule') {
-              core.info('Skipping health check for scheduled run');
+              core.notice('[health-check] SKIP: scheduled run');
               return;
             }
 
@@ -97,6 +99,7 @@ jobs:
             // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
             // checks.listForRef which queries by commit SHA across ALL workflows.
             const ref = context.payload.pull_request?.head?.sha || context.sha;
+            core.info(`[health-check] Checking lint for ref=${ref}`);
             const { data } = await github.rest.checks.listForRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -106,6 +109,7 @@ jobs:
             const lintRun = data.check_runs.find(
               cr => cr.app?.slug === 'github-actions'
             );
+            core.info(`[health-check] Lint check: status=${lintRun?.status}, conclusion=${lintRun?.conclusion}`);
             if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
               core.setFailed('Fast-fail: lint check failed');
               return;
@@ -126,8 +130,9 @@ jobs:
                 labels = prs[0].labels.map(l => l.name);
               }
             }
+            core.info(`[health-check] PR labels: [${labels.join(', ')}]`);
             if (labels.includes('bypass-fastfail')) {
-              core.info('Skipping jobs-failed check (bypass-fastfail label present)');
+              core.notice('[health-check] SKIP jobs-failed check: bypass-fastfail label present');
               return;
             }
 
@@ -137,6 +142,10 @@ jobs:
               run_id: context.runId,
               per_page: 100,
             });
+            core.info(`[health-check] Total jobs in run: ${jobs.length}`);
+            const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
+            core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
+
             // Find jobs that failed from a real error, not from fast-fail cascade
             const rootCauseFailures = jobs.filter(j => {
               if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
@@ -148,17 +157,23 @@ jobs:
               // 'h20' with the 'h200' prefix.
               const baseName = j.name.split(/[ /]/)[0];
               if (baseName === 'base-c-test-8-gpu-h20') {
+                core.info(`[health-check] Filtered out h20 job: ${j.name}`);
                 return false;
               }
               // If the failing step is the health check, it's a cascade — skip it
               const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
               if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
+                core.info(`[health-check] Filtered out cascade failure: ${j.name} (failed step: ${failedStep.name})`);
                 return false;
               }
               return true;
             });
+            core.info(`[health-check] Root cause failures (after filtering): ${rootCauseFailures.map(j => j.name).join(', ') || 'none'}`);
+
             if (rootCauseFailures.length > 0) {
               core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
+            } else {
+              core.notice('[health-check] PASS: no root cause failures detected');
             }
 
       - name: Install dependencies
