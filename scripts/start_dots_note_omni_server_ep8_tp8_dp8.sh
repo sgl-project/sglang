@@ -36,6 +36,11 @@ if [[ "${LANGUAGE_ONLY:-0}" == "1" ]]; then
   EXTRA_SERVER_ARGS+=(--language-only)
 fi
 
+CUDA_GRAPH_ARGS=()
+if [[ "${ENABLE_CUDA_GRAPH:-0}" != "1" ]]; then
+  CUDA_GRAPH_ARGS+=(--disable-cuda-graph)
+fi
+
 SPECULATIVE_ARGS=()
 if [[ "${DISABLE_SPECULATIVE:-0}" != "1" ]]; then
   SPECULATIVE_ARGS+=(
@@ -71,7 +76,7 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --page-size 64 \
   --moe-dense-tp-size 1 \
   --watchdog-timeout "${WATCHDOG_TIMEOUT:-1800}" \
-  --disable-cuda-graph \
+  "${CUDA_GRAPH_ARGS[@]}" \
   "${SPECULATIVE_ARGS[@]}" \
   --moe-a2a-backend deepep \
   --deepep-mode auto \
