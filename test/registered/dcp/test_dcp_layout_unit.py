@@ -23,9 +23,11 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -132,6 +134,29 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
+
+    def test_configurator_uses_instantiated_kv_head_layout(self):
+        model = torch.nn.Sequential(
+            RadixAttention(
+                num_heads=4,
+                head_dim=128,
+                scaling=128**-0.5,
+                num_kv_heads=1,
+                layer_id=0,
+            )
+        )
+        configurator = SimpleNamespace(
+            model=model,
+            is_draft_worker=True,
+            model_config=SimpleNamespace(
+                get_num_kv_heads=lambda tp_size, dcp_size=1: 4
+            ),
+        )
+
+        with get_parallel().override(attn_tp_size=4, attn_dcp_size=4):
+            self.assertEqual(
+                KVCacheConfigurator._resolve_mha_kv_head_num(configurator), 1
+            )
 
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
         hidden_size = 4
