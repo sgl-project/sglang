@@ -1275,7 +1275,7 @@ class DeepseekSparseAttnBackend(
                 self._build_aiter_sparse_mla_metadata(
                     dsa_cu_seqlens_q, dsa_cu_seqlens_k
                 )
-                if forward_batch.forward_mode.is_decode_or_idle()
+                if _is_hip and forward_batch.forward_mode.is_decode_or_idle()
                 else None
             ),
         )
@@ -1606,8 +1606,12 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
-            aiter_sparse_mla=self._build_aiter_sparse_mla_metadata(
-                dsa_cu_seqlens_q, dsa_cu_seqlens_k
+            aiter_sparse_mla=(
+                self._build_aiter_sparse_mla_metadata(
+                    dsa_cu_seqlens_q, dsa_cu_seqlens_k
+                )
+                if _is_hip
+                else None
             ),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -1920,9 +1924,10 @@ class DeepseekSparseAttnBackend(
         # Re-plan aiter's work buffers for the new sequence lengths. The buffers
         # are the same objects the captured graph reads, so this must stay a
         # write into them and never a reallocation.
-        self._build_aiter_sparse_mla_metadata(
-            metadata.dsa_cu_seqlens_q, metadata.dsa_cu_seqlens_k
-        )
+        if _is_hip:
+            self._build_aiter_sparse_mla_metadata(
+                metadata.dsa_cu_seqlens_q, metadata.dsa_cu_seqlens_k
+            )
 
         self.forward_metadata = metadata
 
@@ -2086,9 +2091,10 @@ class DeepseekSparseAttnBackend(
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
-        self._build_aiter_sparse_mla_metadata(
-            metadata.dsa_cu_seqlens_q, metadata.dsa_cu_seqlens_k
-        )
+        if _is_hip:
+            self._build_aiter_sparse_mla_metadata(
+                metadata.dsa_cu_seqlens_q, metadata.dsa_cu_seqlens_k
+            )
 
         self.forward_metadata = metadata
 
