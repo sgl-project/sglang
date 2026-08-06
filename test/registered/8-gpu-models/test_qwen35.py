@@ -30,7 +30,7 @@ class TestQwen35(unittest.TestCase):
             "--tool-call-parser=qwen3_coder",
             "--mem-fraction-static=0.8",
         ]
-        dp_args = ["--dp=8", "--enable-dp-attention"]
+        dp_args = ["--dp=8", "--enable-dp-attention", "--disable-prefill-cuda-graph"]
         mtp_args = [
             "--speculative-algorithm=EAGLE",
             "--speculative-num-steps=3",
