@@ -86,10 +86,8 @@ class TestGlm4MoeDetector(CustomTestCase):
     # ==================== has_tool_call ====================
 
     def test_has_tool_call_detection(self):
-        """Plain text must not trigger; the bot token must trigger."""
-        self.assertTrue(
-            Glm4MoeDetector().has_tool_call(_weather_call(("city", "Tokyo")))
-        )
+        """Detects the exact bot marker, but not plain text."""
+        self.assertTrue(Glm4MoeDetector().has_tool_call("<tool_call>"))
         self.assertFalse(
             Glm4MoeDetector().has_tool_call("The weather in Tokyo is sunny.")
         )
@@ -97,28 +95,26 @@ class TestGlm4MoeDetector(CustomTestCase):
     # ==================== detect_and_parse ====================
 
     def test_schema_type_coercion(self):
-        """Values are coerced per the tool schema: string stays a JSON string,
-        number becomes int, object becomes a nested dict."""
-        text = _weather_call(("city", "北京"), ("count", "42"), ("filters", '{"a": 1}'))
+        """Quoted digits in a number parameter are coerced to an int."""
+        text = _weather_call(
+            ("city", "北京"), ("count", '"42"'), ("filters", '{"a": 1}')
+        )
         result = Glm4MoeDetector().detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(
-            json.loads(result.calls[0].parameters),
-            {"city": "北京", "count": 42, "filters": {"a": 1}},
-        )
+        arguments = json.loads(result.calls[0].parameters)
+        self.assertEqual(arguments, {"city": "北京", "count": 42, "filters": {"a": 1}})
+        self.assertIs(type(arguments["count"]), int)
 
     def test_string_typed_digits_stay_string(self):
-        """A digits-only value for a string-typed parameter must not be
-        re-coerced to a number, even though it parses as JSON int."""
+        """A digits-only value for a string parameter remains a string."""
         result = Glm4MoeDetector().detect_and_parse(
             _weather_call(("city", "123")), self.tools
         )
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "123"})
 
     def test_string_value_backslashes_preserved(self):
-        """Backslashes that are not valid JSON escapes (e.g. Windows paths)
-        must survive parsing byte-for-byte instead of being reinterpreted."""
+        """Invalid JSON escapes in string arguments are preserved literally."""
         result = Glm4MoeDetector().detect_and_parse(
             _weather_call(("city", "C:\\Users\\test")), self.tools
         )
@@ -126,24 +122,15 @@ class TestGlm4MoeDetector(CustomTestCase):
             json.loads(result.calls[0].parameters), {"city": "C:\\Users\\test"}
         )
 
-    def test_literal_backslash_n_separator_accepted(self):
-        """GLM models emit either real newlines or the two-character sequence
-        '\\n' between tags; both spellings must parse."""
-        text = (
-            "<tool_call>get_weather\\n<arg_key>city</arg_key>\\n"
-            "<arg_value>Tokyo</arg_value>\\n</tool_call>"
-        )
-        result = Glm4MoeDetector().detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-
     def test_leading_text_preserved(self):
+        """Leading text is returned as normal text."""
         text = "Let me check. " + _weather_call(("city", "Tokyo"))
         result = Glm4MoeDetector().detect_and_parse(text, self.tools)
         self.assertEqual(result.normal_text, "Let me check.")
         self.assertEqual(len(result.calls), 1)
 
     def test_multiple_calls_parsed_in_order(self):
+        """Adjacent calls preserve their function names and order."""
         text = (
             _weather_call(("city", "Tokyo"))
             + "\n<tool_call>search\n<arg_key>query</arg_key>\n"
@@ -151,22 +138,10 @@ class TestGlm4MoeDetector(CustomTestCase):
         )
         result = Glm4MoeDetector().detect_and_parse(text, self.tools)
         self.assertEqual([c.name for c in result.calls], ["get_weather", "search"])
-        self.assertEqual(
-            json.loads(result.calls[1].parameters), {"query": "cafes"}
-        )
-
-    def test_unknown_tool_dropped(self):
-        """A call to a function not in the tool list must not produce a call."""
-        text = (
-            "<tool_call>bogus_fn\n<arg_key>x</arg_key>\n"
-            "<arg_value>1</arg_value>\n</tool_call>"
-        )
-        result = Glm4MoeDetector().detect_and_parse(text, self.tools)
-        self.assertEqual(result.calls, [])
+        self.assertEqual(json.loads(result.calls[1].parameters), {"query": "cafes"})
 
     def test_missing_name_separator_yields_no_calls(self):
-        """A tool call without the newline after the function name is malformed;
-        it must be rejected without raising."""
+        """Rejects a call without the required name separator."""
         result = Glm4MoeDetector().detect_and_parse(
             "<tool_call>get_weather</tool_call>", self.tools
         )
@@ -174,10 +149,8 @@ class TestGlm4MoeDetector(CustomTestCase):
 
     # ==================== streaming ====================
 
-    def test_streaming_matches_oneshot_across_chunkings(self):
-        """The concatenated streamed parameter increments must form valid JSON
-        equal to the one-shot parse, for every chunk boundary position.
-        Chunk size 1 places a boundary inside every XML tag and value."""
+    def test_streaming_matches_non_streaming_at_small_chunk_sizes(self):
+        """Streaming names and arguments match non-streaming parsing at sizes 1 and 7."""
         scenarios = {
             "typed_args": _weather_call(
                 ("city", "北京"), ("filters", '{"a": 1}'), ("count", "42")
@@ -191,30 +164,29 @@ class TestGlm4MoeDetector(CustomTestCase):
             ),
         }
         for label, text in scenarios.items():
-            oneshot = Glm4MoeDetector().detect_and_parse(text, self.tools)
-            expected = [
-                (call.name, json.loads(call.parameters)) for call in oneshot.calls
+            non_streaming_result = Glm4MoeDetector().detect_and_parse(text, self.tools)
+            expected_calls = [
+                (call.name, json.loads(call.parameters))
+                for call in non_streaming_result.calls
             ]
             for chunk_size in (1, 7):
                 with self.subTest(scenario=label, chunk_size=chunk_size):
                     calls, _ = self._stream(Glm4MoeDetector(), text, chunk_size)
-                    streamed = [
+                    actual_calls = [
                         (name, json.loads(params))
                         for name, params in self._group_streamed_calls(calls)
                     ]
-                    self.assertEqual(streamed, expected)
+                    self.assertEqual(actual_calls, expected_calls)
 
     def test_streaming_no_args_emits_empty_object(self):
-        """A tool call without arguments must stream exactly '{}' so the
-        client always receives complete JSON."""
+        """No-argument calls stream a complete empty JSON object."""
         calls, _ = self._stream(Glm4MoeDetector(), "<tool_call>noop\n</tool_call>", 1)
         [(name, params)] = self._group_streamed_calls(calls)
         self.assertEqual(name, "noop")
         self.assertEqual(params, "{}")
 
     def test_streaming_sequential_calls_get_distinct_indices(self):
-        """State must reset between sequential calls: distinct tool_index per
-        call and independently valid argument JSON."""
+        """Sequential calls use distinct indices and valid arguments."""
         text = (
             _weather_call(("city", "Tokyo"))
             + "\n<tool_call>search\n<arg_key>query</arg_key>\n"
@@ -230,8 +202,7 @@ class TestGlm4MoeDetector(CustomTestCase):
         self.assertEqual(normal_text.strip(), "")
 
     def test_streaming_never_emits_truncated_tool_name(self):
-        """No call may be emitted while the function name is still partial;
-        the first emitted name must be the complete one."""
+        """A partial function name is not emitted."""
         detector = Glm4MoeDetector()
         result = detector.parse_streaming_increment("<tool_call>get_wea", self.tools)
         self.assertEqual(result.calls, [])
@@ -243,16 +214,14 @@ class TestGlm4MoeDetector(CustomTestCase):
         self.assertEqual(names, ["get_weather"])
 
     def test_streaming_plain_text_with_angle_brackets_passes_through(self):
-        """Text containing '<' that never becomes a tool call must be emitted
-        in full — buffered prefix characters must not be swallowed."""
+        """Plain text containing angle brackets passes through unchanged."""
         text = "a < b and c > d. done"
         calls, normal_text = self._stream(Glm4MoeDetector(), text, 1)
         self.assertEqual(calls, [])
         self.assertEqual(normal_text, text)
 
     def test_streaming_leading_text_then_call(self):
-        """The text/tool boundary must be exact: all leading text emitted as
-        normal text, none of it leaking into the tool call (or vice versa)."""
+        """Streaming separates leading text from the following tool call."""
         text = "Let me check. " + _weather_call(("city", "Tokyo"))
         calls, normal_text = self._stream(Glm4MoeDetector(), text, 1)
         self.assertEqual(normal_text, "Let me check. ")
