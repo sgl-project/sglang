@@ -72,6 +72,9 @@ class DeepSeekV4SingleKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        # Byte-packed pool: backing tensor is always uint8 regardless of the
+        # logical kv-cache dtype (base KVCache only sets this for fp8-enum dtypes).
+        self.store_dtype = torch.uint8
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
 
