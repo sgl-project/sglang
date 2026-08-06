@@ -112,10 +112,15 @@ def _get_flashinfer_packed_kda_kernel():
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
             from flashinfer import packed_kda_decode
+            from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
-            _flashinfer_packed_kda_decode = packed_kda_decode
-            _flashinfer_packed_kda_available = (
-                is_cuda() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+            capability = torch.cuda.get_device_capability() if is_cuda() else None
+            _flashinfer_packed_kda_available = bool(
+                (capability == (10, 0) and is_cuda_version_at_least("12.8"))
+                or (capability == (10, 3) and is_cuda_version_at_least("12.9"))
+            )
+            _flashinfer_packed_kda_decode = (
+                packed_kda_decode if _flashinfer_packed_kda_available else None
             )
             if _flashinfer_packed_kda_available:
                 logger.info("FlashInfer CAKE packed KDA decode loaded successfully")
@@ -856,6 +861,7 @@ class CakeKDAKernel(FlashInferKDAKernel):
 
         if (
             batch_size <= 0
+            or batch_size > 65535
             or tuple(mixed_qkv.shape) != (batch_size, _CAKE_PACKED_QKV_WIDTH)
             or mixed_qkv.dtype != torch.bfloat16
             or not mixed_qkv.is_cuda

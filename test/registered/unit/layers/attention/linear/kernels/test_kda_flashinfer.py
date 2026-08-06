@@ -1,15 +1,130 @@
 """CPU contract tests for the FlashInfer CAKE KDA adapter."""
 
+import sys
 import unittest
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.linear.kernels import kda_flashinfer
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import CakeKDAKernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestFlashInferPackedKDALoader(CustomTestCase):
+    def setUp(self):
+        self._original_loader_state = (
+            kda_flashinfer._flashinfer_packed_kda_available,
+            kda_flashinfer._flashinfer_packed_kda_decode,
+        )
+        self.addCleanup(self._restore_loader_state)
+        self._reset_loader_state()
+
+    @staticmethod
+    def _reset_loader_state():
+        kda_flashinfer._flashinfer_packed_kda_available = None
+        kda_flashinfer._flashinfer_packed_kda_decode = None
+
+    def _restore_loader_state(self):
+        (
+            kda_flashinfer._flashinfer_packed_kda_available,
+            kda_flashinfer._flashinfer_packed_kda_decode,
+        ) = self._original_loader_state
+
+    @staticmethod
+    def _fake_flashinfer_modules(
+        packed_decode: Mock,
+        version_check: Mock,
+        *,
+        expose_api: bool = True,
+    ) -> dict[str, ModuleType]:
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.__path__ = []
+        if expose_api:
+            flashinfer.packed_kda_decode = packed_decode
+
+        jit = ModuleType("flashinfer.jit")
+        jit.__path__ = []
+        cpp_ext = ModuleType("flashinfer.jit.cpp_ext")
+        cpp_ext.is_cuda_version_at_least = version_check
+        flashinfer.jit = jit
+        jit.cpp_ext = cpp_ext
+        return {
+            "flashinfer": flashinfer,
+            "flashinfer.jit": jit,
+            "flashinfer.jit.cpp_ext": cpp_ext,
+        }
+
+    def test_loader_enforces_per_arch_cuda_floor_and_caches_result(self):
+        for capability, required_version in (((10, 0), "12.8"), ((10, 3), "12.9")):
+            with self.subTest(capability=capability):
+                self._reset_loader_state()
+                packed_decode = Mock(name="packed_kda_decode")
+                version_check = Mock(return_value=True)
+                modules = self._fake_flashinfer_modules(packed_decode, version_check)
+                with (
+                    patch.dict(sys.modules, modules),
+                    patch.object(kda_flashinfer, "is_cuda", return_value=True),
+                    patch.object(
+                        torch.cuda,
+                        "get_device_capability",
+                        return_value=capability,
+                    ),
+                ):
+                    first = kda_flashinfer._get_flashinfer_packed_kda_kernel()
+                    second = kda_flashinfer._get_flashinfer_packed_kda_kernel()
+
+                self.assertEqual(first, (True, packed_decode))
+                self.assertEqual(second, first)
+                version_check.assert_called_once_with(required_version)
+
+    def test_loader_rejects_cuda_below_target_floor(self):
+        packed_decode = Mock(name="packed_kda_decode")
+        version_check = Mock(return_value=False)
+        modules = self._fake_flashinfer_modules(packed_decode, version_check)
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(kda_flashinfer, "is_cuda", return_value=True),
+            patch.object(
+                torch.cuda,
+                "get_device_capability",
+                return_value=(10, 3),
+            ),
+        ):
+            available, loaded = kda_flashinfer._get_flashinfer_packed_kda_kernel()
+
+        self.assertFalse(available)
+        self.assertIsNone(loaded)
+        version_check.assert_called_once_with("12.9")
+
+    def test_loader_caches_missing_public_api(self):
+        packed_decode = Mock(name="packed_kda_decode")
+        version_check = Mock(return_value=True)
+        modules = self._fake_flashinfer_modules(
+            packed_decode,
+            version_check,
+            expose_api=False,
+        )
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(kda_flashinfer, "is_cuda", return_value=True),
+            patch.object(
+                torch.cuda,
+                "get_device_capability",
+                return_value=(10, 0),
+            ),
+        ):
+            first = kda_flashinfer._get_flashinfer_packed_kda_kernel()
+            modules["flashinfer"].packed_kda_decode = packed_decode
+            second = kda_flashinfer._get_flashinfer_packed_kda_kernel()
+
+        self.assertEqual(first, (False, None))
+        self.assertEqual(second, first)
+        version_check.assert_not_called()
 
 
 class TestCakeKDAIndexedStateAdapter(CustomTestCase):
@@ -235,12 +350,42 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
         fallback.assert_called_once()
         packed_decode.assert_not_called()
 
-    def test_replayssm_explicitly_falls_back_to_triton_packed_decode(self):
+    def test_selector_rejects_batch_outside_cuda_grid_y(self):
+        class OversizedMixedQKV:
+            ndim = 2
+            shape = (65536, 4608)
+
+        self.assertFalse(
+            CakeKDAKernel._cake_packed_decode_is_supported(
+                OversizedMixedQKV(),
+                None,
+                None,
+                A_log=None,
+                dt_bias=None,
+                scale=128**-0.5,
+                ssm_states=None,
+                cache_indices=None,
+                num_v_heads=12,
+                head_v_dim=128,
+                lower_bound=-5.0,
+            )
+        )
+
+    def test_replayssm_triton_safe_gate_error_propagates(self):
         packed_decode = Mock(side_effect=AssertionError("ReplaySSM reached CAKE"))
         kernel = self._kernel(packed_decode)
         inputs = self._inputs()
-        replayssm_d = torch.empty(1)
-        sentinel = torch.empty(1, 2, 12, 128, dtype=torch.bfloat16)
+        replay_args = {
+            "replayssm_d": torch.empty(5, 12, 4, 128, dtype=torch.bfloat16),
+            "replayssm_k": torch.empty(5, 12, 4, 128, dtype=torch.bfloat16),
+            "replayssm_g": torch.empty(5, 12, 4, 128, dtype=torch.bfloat16),
+            "replayssm_write_pos": torch.zeros(2, dtype=torch.int32),
+            "replayssm_force_flush": torch.zeros(2, dtype=torch.bool),
+        }
+        safe_gate_error = (
+            "KDA safe gate (lower_bound) is not implemented in the ReplaySSM "
+            "decode kernel"
+        )
         with (
             patch.object(
                 kernel,
@@ -250,14 +395,16 @@ class TestCakeKDAPackedDecodeAdapter(CustomTestCase):
             patch.object(
                 kernel,
                 "_packed_decode_triton",
-                return_value=sentinel,
+                side_effect=NotImplementedError(safe_gate_error),
             ) as fallback,
+            self.assertRaisesRegex(NotImplementedError, "KDA safe gate"),
         ):
-            output = kernel.packed_decode(replayssm_d=replayssm_d, **inputs)
+            kernel.packed_decode(**replay_args, **inputs)
 
-        self.assertIs(output, sentinel)
         fallback.assert_called_once()
-        self.assertIs(fallback.call_args.kwargs["replayssm_d"], replayssm_d)
+        for name, tensor in replay_args.items():
+            self.assertIs(fallback.call_args.kwargs[name], tensor)
+        self.assertEqual(fallback.call_args.kwargs["lower_bound"], -5.0)
         packed_decode.assert_not_called()
 
 
