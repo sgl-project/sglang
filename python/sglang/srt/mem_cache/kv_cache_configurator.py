@@ -101,22 +101,18 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 _is_npu = is_npu()
 
 
-def _should_enable_lazy_compaction(spec_algorithm=None) -> bool:
+def _should_enable_lazy_compaction() -> bool:
     """Lazy compaction default — ON unless
     `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
     Centralized here so both unified-memory-pool factory call sites stay in sync.
 
-    Forced OFF under speculative decoding: DSPARK rewrites
-    ``batch.out_cache_loc`` inside the verify executor (alloc_verify_window)
-    AFTER the scheduler registered the batch's write-set with
-    ``set_inflight_forward``, so lazy compaction's in-flight WAR protection
-    would not cover the verify-window writes — a page could be moved while the
-    captured verify forward still writes its old physical location. Eager
-    compaction frees/moves only on the schedule stream behind a
-    ``wait_stream(forward_stream)``, which orders it after the whole forward.
+    Speculative decoding (DSPARK) needs no special-casing: the scheduler
+    registers the in-flight write-set (``set_inflight_forward``) AFTER
+    ``forward_batch_generation`` returns, and the DSPARK verify executor has
+    by then rebound ``ScheduleBatch.out_cache_loc`` to the verify-window locs
+    (never restored), so ``_flush``'s write-race classification covers the
+    verify window exactly like a decode write.
     """
-    if spec_algorithm is not None and not spec_algorithm.is_none():
-        return False
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
@@ -580,7 +576,7 @@ class KVCacheConfigurator:
             # v2p/KV reads. Near-no-op in normal mode.
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
-            lazy_compaction=_should_enable_lazy_compaction(self.spec_algorithm),
+            lazy_compaction=_should_enable_lazy_compaction(),
         )
         return bundle
 
@@ -669,7 +665,7 @@ class KVCacheConfigurator:
             # `_init_unified_mamba_pools`.
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
-            lazy_compaction=_should_enable_lazy_compaction(self.spec_algorithm),
+            lazy_compaction=_should_enable_lazy_compaction(),
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
