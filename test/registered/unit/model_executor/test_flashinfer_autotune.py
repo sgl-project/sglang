@@ -37,7 +37,7 @@ def _fake_autotune(*args, **kwargs):
 
 
 class TestFlashInferAutotuneContext(CustomTestCase):
-    def test_uses_no_grad_without_creating_inference_tensors(self):
+    def test_does_not_override_grad_mode_or_create_inference_tensors(self):
         fake_flashinfer = ModuleType("flashinfer")
         fake_autotuner = ModuleType("flashinfer.autotuner")
         fake_autotuner.autotune = _fake_autotune
@@ -82,7 +82,7 @@ class TestFlashInferAutotuneContext(CustomTestCase):
                 with autotune_module.flashinfer_autotune_context(
                     model_runner, skip_logits=False
                 ):
-                    self.assertFalse(torch.is_grad_enabled())
+                    self.assertTrue(torch.is_grad_enabled())
                     self.assertFalse(torch.is_inference_mode_enabled())
                     lazy_buffer = torch.zeros(1)
 

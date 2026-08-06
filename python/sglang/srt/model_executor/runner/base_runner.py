@@ -620,11 +620,13 @@ class BaseRunner(ABC):
 
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
-        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
-            # Match the serving forward's default no-grad context so buffers
-            # lazily created by warmup remain safe for later in-place updates.
-            with torch.no_grad(), run_ctx or empty_context():
-                run_once()
+        # Do not impose a grad-mode context here so buffers lazily created by
+        # warmup remain ordinary tensors and safe for later in-place updates.
+        with (
+            forward_context(ForwardContext(attn_backend=mr.attn_backend)),
+            run_ctx or empty_context(),
+        ):
+            run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
         """Return (buffers, bs) for the autotune dummy forward to reuse; the

@@ -190,10 +190,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
 
             maybe_skip_logits = autotune_dummy_run_mode()
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        # Match the serving forward's default no-grad context. Lazy workspaces
+        # Do not impose a grad-mode context here. In particular, lazy workspaces
         # created while autotuning must remain ordinary tensors because CUDA
         # graph capture and eager serving may update them in place later.
-        with torch.no_grad(), autotune(
+        with autotune(
             True,
             cache=str(autotune_cache),
             skip_ops=skip_ops,
