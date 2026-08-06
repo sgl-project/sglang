@@ -226,6 +226,34 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
+    def _dsml_section_start(self, text: str) -> int:
+        """Index where the (possibly partial) DSML tool-call section starts.
+
+        -1 when the text carries no marker. Looking for ``bot_token`` alone is
+        not enough: DeepSeek-V4 frequently opens with ``<｜DSML｜invoke`` (no
+        enclosing ``tool_calls`` wrapper) and, with speculative decoding, a
+        single delta can carry both the tail of the preamble and a partial
+        tag — so search every marker form and treat a trailing tag prefix as
+        the boundary too.
+        """
+        positions = [
+            i
+            for i in (
+                text.find(self.bot_token),
+                text.find("<｜DSML｜invoke"),
+                text.find("<｜DSML｜"),
+                text.find("｜DSML｜"),
+            )
+            if i != -1
+        ]
+        if positions:
+            return min(positions)
+        stripped = text.rstrip()
+        for prefix in ("</｜", "<｜", "</", "<"):
+            if stripped.endswith(prefix):
+                return len(stripped) - len(prefix)
+        return -1
+
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
@@ -257,6 +285,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
+
+        # Preserve assistant prose that shares a delta with the tool-call
+        # opener: without this, everything before the DSML marker in
+        # current_text is silently dropped. V4 emits bare ``<｜DSML｜invoke``
+        # (no wrapper token), which is what actually bites under speculative
+        # decoding's multi-token deltas. Guarded to the first tool call so
+        # text between consecutive invokes is not re-emitted.
+        normal_text = ""
+        if self.current_tool_id == -1:
+            split_at = self._dsml_section_start(current_text)
+            if split_at > 0:
+                normal_text = current_text[:split_at]
+                self._buffer = current_text[split_at:]
+                current_text = self._buffer
 
         all_calls: list[ToolCallItem] = []
         try:
@@ -355,11 +397,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
