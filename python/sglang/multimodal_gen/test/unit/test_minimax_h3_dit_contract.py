@@ -223,7 +223,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
         head_slice = slice(destination * 2, (destination + 1) * 2)
         return torch.cat((q[:, head_slice], k[:, head_slice], v[:, head_slice]), dim=-1)
 
-    def fake_all_to_all(actual):
+    def fake_all_to_all(actual, role=None):
         expected_input = torch.stack(
             [
                 packet(q_ranks[0], k_ranks[0], v_ranks[0], destination)
