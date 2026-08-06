@@ -142,18 +142,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
-        if self.ps.tp_rank == 0:
-            logger.info(
-                "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
-                bundle.resolved_attention_backend,
-                self.draft_model.__class__.__name__,
-                self.gamma,
-                self.verify_num_draft_tokens,
-                self._mask_token_id,
-                type(self.draft_model.markov_head).__name__,
-            )
+        # This is also an all-rank startup attestation consumed by the K3 TP
+        # launch harness.  Logging only TP0 concealed partial draft-runner
+        # initialization failures on the other tensor-parallel ranks.
+        logger.info(
+            "Initialized DSpark draft runner. tp_rank=%s, "
+            "attention_backend=%s, model=%s, gamma=%s, "
+            "verify_num_draft_tokens=%s, mask_token_id=%s, markov_head=%s",
+            self.ps.tp_rank,
+            bundle.resolved_attention_backend,
+            self.draft_model.__class__.__name__,
+            self.gamma,
+            self.verify_num_draft_tokens,
+            self._mask_token_id,
+            type(self.draft_model.markov_head).__name__,
+        )
 
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
