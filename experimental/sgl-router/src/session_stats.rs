@@ -1,9 +1,10 @@
-//! Per-session turn timestamps — a router-side idleness signal.
+//! Per-session turn-timing statistics — a router-side measurement collector.
 //!
 //! sgl-router already records *global* TTFT and request-duration histograms
 //! (see `server/metrics.rs`), but nothing per session. This module fills that
-//! gap: for every session (identified by the sticky routing key, e.g. the
-//! `x-session-id` header) it stamps three instants per turn —
+//! gap by *collecting and reporting* per-session timing only — it does not act
+//! on the data. For every session (identified by the sticky routing key, e.g.
+//! the `x-session-id` header) it stamps three instants per turn —
 //!
 //!   * `t_recv`  — the request was received / dispatched,
 //!   * `t_first` — the first streamed token arrived,

@@ -197,10 +197,11 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    // Per-session idleness signal (see `crate::session_stats`). The session is
-    // identified by the sticky routing key; other policies leave it `None` and
-    // are not tracked. Stamp the turn's receive instant (`start`) now — the
-    // first-token and turn-end instants are recorded by the SSE hooks below.
+    // Per-session timing statistics (see `crate::session_stats`; measurement
+    // only). The session is identified by the sticky routing key; other policies
+    // leave it `None` and are not tracked. Stamp the turn's receive instant
+    // (`start`) now — the first-token and turn-end instants are recorded by the
+    // SSE hooks below.
     let session_id: Option<String> = routing_key.map(|s| s.to_string());
     if let Some(sid) = session_id.as_deref() {
         ctx.session_stats.on_turn_start(sid, start);
