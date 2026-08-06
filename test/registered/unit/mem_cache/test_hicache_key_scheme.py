@@ -891,7 +891,7 @@ class TestCellAdapterGatherScatter(CustomTestCase):
         layer_ranges, head_ranges = self._grid()
         indices = torch.arange(self._PAGES * self._PS)
         arenas = {}
-        for layout in ("page_first", "page_first_direct", "page_head"):
+        for layout in ("layer_first", "page_first", "page_first_direct", "page_head"):
             pool = self._pool(layout, logical)
             arena = torch.zeros(
                 self._PAGES * pool.cell_bytes(layer_ranges, head_ranges),
@@ -931,7 +931,7 @@ class TestCellAdapterGatherScatter(CustomTestCase):
 
         # Scatter into an EMPTY pool of a different layout; the covered
         # rectangles must reproduce the writer's logical values.
-        reader = self._pool("page_first_direct", [torch.zeros_like(l) for l in logical])
+        reader = self._pool("layer_first", [torch.zeros_like(l) for l in logical])
         reader.scatter_cells_canonical(indices, layer_ranges, head_ranges, arena)
         for p, L in enumerate(logical):
             got = reader._page_kv_view_canonical(p * self._PS)

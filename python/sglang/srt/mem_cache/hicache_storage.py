@@ -55,8 +55,9 @@ class HiCacheStorageConfig:
     # Cell adapter (head x layer fan-out): the LOCAL half-open kv-head ranges
     # of this rank's cells. When set, objects use the layout-neutral
     # canonical byte order and the backend gathers/scatters them through a
-    # registered staging arena (canonical_layer_ranges is then always set
-    # too, possibly a single range). None outside adapter namespaces.
+    # registered staging arena — any host layout participates, layer_first
+    # included (canonical_layer_ranges is then always set too, possibly a
+    # single range). None outside adapter namespaces.
     canonical_head_ranges: Optional[List[Tuple[int, int]]] = None
 
 

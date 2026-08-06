@@ -134,7 +134,7 @@ cell key          = {ns}:{page_hash}:{component}:L{i}:H{j}
 > `(head, layer, token, dim)` per K/V half, the `page_head_layer_direct`
 > byte order — gathered/scattered through pinned store-registered staging
 > arenas (one per IO direction). The `object_layout` identity becomes the
-> constant `cell-v1`, so any page-first-family host layout interops, and
+> constant `cell-v1`, so any host layout interops (layer_first included), and
 > the layout *mandates* in section 4.4 apply only to the zero-copy
 > single-axis schemes. Cost: one host memcpy per direction on the async
 > backup/prefetch threads; this is the section 4.4 "optional new layout"

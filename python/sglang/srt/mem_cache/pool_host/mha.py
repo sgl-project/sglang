@@ -544,8 +544,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         The canonical cell byte order — (head, layer, token, dim) per K/V
         half — is the page_head_layer_direct order, so cells gathered here
         stay byte-compatible with a future zero-copy layout. Works for every
-        page-first-family layout because torch handles the strided permute.
+        host layout (layer_first included) because torch handles the strided
+        permute.
         """
+        if self.layout == "layer_first":
+            page = self.kv_buffer[:, :, index : index + self.page_size]
+            return page.permute(0, 3, 1, 2, 4)
         if self.layout == "page_first":
             page = self.kv_buffer[:, index : index + self.page_size]
             return page.permute(0, 3, 2, 1, 4)

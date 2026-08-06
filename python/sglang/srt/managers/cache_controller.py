@@ -759,10 +759,11 @@ class HiCacheController:
         )
         if adapter_mode:
             # The adapter waives the zero-copy layout requirements, but its
-            # gather/scatter supports only single-tensor page-first-family
-            # pools — fail at attach, not on the first backup (a raise on
+            # gather/scatter supports only single-tensor pools with a known
+            # layout — fail at attach, not on the first backup (a raise on
             # the storage threads would silently wedge write-back).
             if self.mem_pool_host.layout not in (
+                "layer_first",
                 "page_first",
                 "page_first_direct",
                 "page_head",
