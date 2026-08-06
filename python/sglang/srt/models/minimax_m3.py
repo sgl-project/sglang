@@ -55,6 +55,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
     get_moe_a2a_backend,
     is_shared_experts_fusion_disabled,
 )
@@ -325,8 +326,10 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_alpha=config.swiglu_alpha,
             gemm1_beta=1.0,
             gemm1_clamp_limit=config.swiglu_limit,
+            routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
+            routing_method_type=RoutingMethodType.MiniMax2,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -336,7 +339,9 @@ class MiniMaxM3MoE(nn.Module):
             correction_bias=self.e_score_correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=True,
+            apply_routed_scaling_factor_on_output=(
+                self.experts.should_fuse_routed_scaling_factor_in_topk
+            ),
         )
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
