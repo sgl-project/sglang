@@ -3843,11 +3843,7 @@ class ServerArgs:
         # kernels; the triton HIP DCP path has no such head-count constraint, so
         # don't reject it here. (Backends are resolved later, so gate on the
         # explicit request.)
-        if (
-            self.dcp_size > 1
-            and is_hip()
-            and self.attention_backend == "aiter"
-        ):
+        if self.dcp_size > 1 and is_hip() and self.attention_backend == "aiter":
             self._validate_aiter_mla_dcp()
 
     def _validate_aiter_mla_dcp(self):
@@ -3866,9 +3862,10 @@ class ServerArgs:
 
         # Keep FP8 blocked by default while allowing the validated local
         # benchmark path to opt in explicitly.
-        if "fp8" in (self.kv_cache_dtype or "") and os.environ.get(
-            "SGLANG_EXPERIMENTAL_AITER_DCP_FP8", "0"
-        ) != "1":
+        if (
+            "fp8" in (self.kv_cache_dtype or "")
+            and os.environ.get("SGLANG_EXPERIMENTAL_AITER_DCP_FP8", "0") != "1"
+        ):
             raise ValueError(
                 "aiter MLA decode context parallel (--dcp-size > 1) currently "
                 "requires bf16 kv-cache; fp8 kv-cache under DCP is not yet "

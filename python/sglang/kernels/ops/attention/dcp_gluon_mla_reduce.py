@@ -253,9 +253,7 @@ def _dcp_gluon_mla_reduce_kernel(
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * KV_LORA_RANK
         + tl.arange(0, KV_LORA_RANK)[None, :]
     )
-    segm_output = tl.load(
-        segm_output_ptr + out_off, mask=segm_mask[:, None], other=0.0
-    )
+    segm_output = tl.load(segm_output_ptr + out_off, mask=segm_mask[:, None], other=0.0)
     segm_output = segm_output * tl.math.exp2(segm_max - overall_max)[:, None]
     acc = tl.sum(segm_output, axis=0)
     acc = tl.where(overall_expsum == 0.0, 0.0, acc / overall_expsum)

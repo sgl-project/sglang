@@ -898,7 +898,9 @@ class AiterAttnBackend(AttentionBackend):
             # path keeps the legacy single-return contract so it stays agnostic
             # to the installed aiter's mla_decode_fwd signature.
             if return_lse:
-                _, lse = mla_decode_fwd(q_in, k_buffer_flat, o, return_lse=True, **kwargs)
+                _, lse = mla_decode_fwd(
+                    q_in, k_buffer_flat, o, return_lse=True, **kwargs
+                )
                 return o[:, ::repeat_factor, :], lse[:, ::repeat_factor]
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
             return o[:, ::repeat_factor, :]
