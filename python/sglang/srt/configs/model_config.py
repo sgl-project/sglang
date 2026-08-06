@@ -632,6 +632,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTP"
         if is_draft_model and self.hf_config.architectures[0] in MIMO_V2_MODEL_ARCHS:
             self.hf_config.architectures[0] = "MiMoV2MTP"
+            self.hf_config.num_nextn_predict_layers = 1
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
