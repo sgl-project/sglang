@@ -309,6 +309,13 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
+
+
 try:
     import sgl_kernel  # noqa: F401
 
@@ -1016,21 +1023,11 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
-    """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
-
-
 @lru_cache(maxsize=1)
 def is_gfx95_supported():
-    """
-    Returns whether the current platform supports MX types.
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
