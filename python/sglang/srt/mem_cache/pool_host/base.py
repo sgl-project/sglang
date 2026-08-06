@@ -150,12 +150,26 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
-            logger.info(
-                "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                pool_label,
-                self.size,
-                requested_bytes / 1e9,
-            )
+            draft_layer_num = self.layer_num - self.target_layer_num
+            if draft_layer_num > 0:
+                logger.info(
+                    "Allocating %s hierarchical KV host pool: %d tokens, "
+                    "%.2f GB host memory, packed MTP KV layers: "
+                    "target_layers=%d, draft_layers=%d, total_layers=%d.",
+                    pool_label,
+                    self.size,
+                    requested_bytes / 1e9,
+                    self.target_layer_num,
+                    draft_layer_num,
+                    self.layer_num,
+                )
+            else:
+                logger.info(
+                    "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                    pool_label,
+                    self.size,
+                    requested_bytes / 1e9,
+                )
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
@@ -215,7 +229,6 @@ class HostKVCache(abc.ABC):
         return start <= layer_id < end
 
     def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
-        """Map a full local device layer id to its compacted host-buffer slot."""
         start, _ = self._device_owned_layer_range(device_pool)
         return layer_id - start
 
@@ -229,7 +242,14 @@ class HostKVCache(abc.ABC):
 
     @abc.abstractmethod
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
