@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
@@ -409,6 +410,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
+    @rank_consensus(
+        same_params=["params"],
+        same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
+    )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -1330,6 +1335,7 @@ class UnifiedRadixCache(BasePrefixCache):
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
+    @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -1518,6 +1524,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:

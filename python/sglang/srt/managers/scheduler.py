@@ -297,6 +297,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     kill_itself_when_parent_died,
+    rank_consensus_checker,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -641,6 +642,8 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        self.init_rank_consensus_checker()
 
         self.is_initializing = False
         self.init_startup_timing_summary()
@@ -1628,6 +1631,8 @@ class Scheduler(
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
 
+        rank_consensus_checker.shutdown()
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
@@ -2057,6 +2062,16 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
+
+    def init_rank_consensus_checker(self) -> None:
+        groups = []
+        if self.attn_cp_group is not None and self.attn_tp_group is not None:
+            groups += [self.attn_cp_group, self.attn_tp_group]
+        else:
+            groups += [self.tp_group]
+        if self.pp_group is not None:
+            groups += [self.pp_group]
+        rank_consensus_checker.configure(groups)
 
     def init_kv_events_publisher(self) -> None:
         self.kv_events_publisher = SchedulerKvEventsPublisher(
