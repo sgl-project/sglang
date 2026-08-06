@@ -5,7 +5,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import get_bool_env_var, get_num_new_pages
 
 _is_npu = is_npu()
 
@@ -95,6 +95,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         self._kvcache = kvcache
         self.clear()
@@ -358,6 +359,55 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Fixed-shape counterpart of free_swa(): none of unique, the ``> 0``
+        filter, or the inner allocator's unique runs, so no output shape depends
+        on device data and the call stays a pure async launch.
+
+        Contract, beyond base: ``start_pos`` is page aligned, and every page the
+        slice touches still holds a live SWA mapping -- i.e. the caller owns the
+        range exclusively and has not freed it before. Ranges that may already be
+        dead must keep using ``free_swa``.
+
+        Like ``free_swa``, this does not participate in the free group: with no
+        data-dependent op left there is nothing to amortize, and deferring would
+        mean reading the caller's ``req_to_token`` view after the call, which is
+        only valid while nobody rewrites that row.
+        """
+        if free_index.numel() == 0:
+            return
+
+        ps = self.page_size
+        assert start_pos % ps == 0, f"{start_pos=} must be page aligned"
+
+        full_reps = free_index[::ps]
+        swa_reps = self.full_to_swa_index_mapping[full_reps]
+        if self.debug_mode:
+            assert bool(
+                (swa_reps > 0).all()
+            ), "free_swa_segment on a range whose SWA mapping is already dead"
+
+        self.swa_attn_allocator.free_page_reps(swa_reps)
+        self._clear_mapping_pages(full_reps)
+
+    def _clear_mapping_pages(self, page_reps: torch.Tensor) -> None:
+        """Zero full_to_swa_index_mapping for the whole page of each rep, with a
+        broadcast index instead of unique-then-expand.
+
+        index_fill_ rather than ``mapping[idx] = 0``: the scalar setitem form
+        synchronizes on CUDA, index_fill_ does not.
+        """
+        page_reps = page_reps.to(torch.int64)
+        ps = self.page_size
+        if ps == 1:
+            self.full_to_swa_index_mapping.index_fill_(0, page_reps, 0)
+            return
+        offsets = torch.arange(ps, dtype=torch.int64, device=page_reps.device)
+        page_starts = (page_reps // ps) * ps
+        self.full_to_swa_index_mapping.index_fill_(
+            0, (page_starts[:, None] + offsets[None, :]).reshape(-1), 0
+        )
+
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
         page_offsets = torch.arange(
@@ -437,6 +487,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         self._kvcache = kvcache
         self.swa_attn_allocator.clear()
@@ -490,6 +541,19 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
         self.swa_attn_allocator.free(free_index[free_index > 0])
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Here full == swa and the mapping is a constant identity table, so the
+        base fast path's gather and page clearing are both wrong: never zero the
+        table, and the slot is its own SWA rep. Drops the ``> 0`` padding filter,
+        which the contract's exclusive-ownership requirement already covers."""
+        if free_index.numel() == 0:
+            return
+        if self.debug_mode:
+            assert bool(
+                (free_index > 0).all()
+            ), "free_swa_segment on the padding slot 0"
+        self.swa_attn_allocator.free_page_reps(free_index)
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
