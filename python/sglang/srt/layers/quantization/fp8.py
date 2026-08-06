@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    swizzle_mxfp8_scale_128x4,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -772,6 +773,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
+        elif backend.is_flashinfer_cutedsl():
+            n, k = layer.weight.shape
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_cutedsl",
+                swizzle_mxfp8_scale_128x4(layer.weight_scale_inv.data, m=n, k=k),
+            )
         elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
@@ -962,6 +970,8 @@ class Fp8LinearMethod(LinearMethodBase):
             backend = get_fp8_gemm_runner_backend()
             if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
+            elif backend.is_flashinfer_cutedsl():
+                weight_scale = layer.weight_scale_inv_cutedsl
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             elif get_fp8_gemm_runner_backend().is_deep_gemm():

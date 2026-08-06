@@ -67,7 +67,12 @@ def _fp8_block_backends():
 def _mxfp8_backends():
     # MXFP8 linear is validated on SM100/103 only.
     if 100 <= get_device_sm() < 110:
-        return ["triton", "flashinfer_trtllm", "flashinfer_cutlass"]
+        return [
+            "triton",
+            "flashinfer_trtllm",
+            "flashinfer_cutlass",
+            "flashinfer_cutedsl",
+        ]
     return []
 
 
@@ -196,6 +201,9 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
 
     def test_flashinfer_cutlass(self):
         self._run("flashinfer_cutlass")
+
+    def test_flashinfer_cutedsl(self):
+        self._run("flashinfer_cutedsl")
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
