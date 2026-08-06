@@ -1121,6 +1121,17 @@ class AiterAttnBackend(AttentionBackend):
         kv_lora_rank = layer.v_head_dim
         qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
 
+        # The decode and verify paths swap in a static upper bound under capture;
+        # this one cannot. There is no per-graph bound to fall back on, and the
+        # repack below allocates per batch, so the whole path is uncapturable --
+        # prefill cuda graphs are disabled for K3 DCP. Assert that invariant so a
+        # future change that enables them fails here with a readable message
+        # instead of an opaque error from the .item() inside capture.
+        assert not self.forward_metadata.run_graph, (
+            "gluon DCP prefill cannot run under cuda-graph capture: it does a "
+            "GPU->CPU sync for max_kv and repacks KV into pages per batch. "
+            "Keep prefill cuda graphs disabled on this path."
+        )
         seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
         max_kv = int(seqused_k.max().item())
         # gluon takes its KV tile straight from the paged block size, so feeding

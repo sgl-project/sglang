@@ -3839,12 +3839,20 @@ class ServerArgs:
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
 
-        # Only the aiter MLA backend goes through the round-robin CP (cprr)
-        # kernels; the triton HIP DCP path has no such head-count constraint, so
-        # don't reject it here. (Backends are resolved later, so gate on the
-        # explicit request.)
-        if self.dcp_size > 1 and is_hip() and self.attention_backend == "aiter":
-            self._validate_aiter_mla_dcp()
+        # Only the aiter MLA decode backend runs the gluon DCP path; the triton
+        # HIP DCP path has different constraints, so don't reject it here.
+        # Resolve the decode backend the same way the model overrides do
+        # (attention_backends_of: the split field falls back to the base one) --
+        # gating on self.attention_backend alone missed
+        # `--decode-attention-backend aiter` without `--attention-backend aiter`,
+        # which is exactly what the K3 PD recipe passes, so the fp8 rejection
+        # below never fired on it.
+        if self.dcp_size > 1 and is_hip():
+            from sglang.srt.arg_groups.overrides import attention_backends_of
+
+            _, decode_backend = attention_backends_of(self)
+            if decode_backend == "aiter":
+                self._validate_aiter_mla_dcp()
 
     def _validate_aiter_mla_dcp(self):
         """Validate aiter MLA decode-context-parallel (DCP).
@@ -3864,7 +3872,7 @@ class ServerArgs:
         # benchmark path to opt in explicitly.
         if (
             "fp8" in (self.kv_cache_dtype or "")
-            and os.environ.get("SGLANG_EXPERIMENTAL_AITER_DCP_FP8", "0") != "1"
+            and not envs.SGLANG_EXPERIMENTAL_AITER_DCP_FP8.get()
         ):
             raise ValueError(
                 "aiter MLA decode context parallel (--dcp-size > 1) currently "
