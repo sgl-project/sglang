@@ -20,7 +20,8 @@ use crate::{
 /// Configuration for the bounded consistent hashing policy.
 #[derive(Debug, Clone, Copy)]
 pub struct BoundedConsistentHashingConfig {
-    /// Maximum allowed worker load divided by the average healthy-worker load.
+    /// Maximum allowed worker load divided by the healthy-worker load baseline.
+    /// The baseline is the greater of the average load and one active request.
     pub max_load_skew: f64,
 }
 
@@ -83,7 +84,8 @@ impl BoundedConsistentHashingPolicy {
         }
 
         let average_load = total_load as f64 / worker_count as f64;
-        worker_load as f64 <= average_load * self.config.max_load_skew
+        let load_baseline = average_load.max(1.0);
+        worker_load as f64 <= load_baseline * self.config.max_load_skew
     }
 
     fn find_bounded_by_consistent_hash(
@@ -300,6 +302,28 @@ mod tests {
         for worker in &workers {
             worker.increment_load();
         }
+
+        let headers = headers_with_routing_key(&key);
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            hash_ring: Some(ring),
+            ..Default::default()
+        };
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+
+        assert_eq!(result, Some(0));
+        assert_eq!(branch, Branch::ExplicitRoutingKeyHit);
+    }
+
+    #[tokio::test]
+    async fn uses_one_request_floor_for_low_load() {
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 1.0,
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        workers[0].increment_load();
 
         let headers = headers_with_routing_key(&key);
         let info = SelectWorkerInfo {

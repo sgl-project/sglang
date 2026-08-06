@@ -46,6 +46,7 @@ class TestEnumConversions:
             "bucket": PolicyType.Bucket,
             "manual": PolicyType.Manual,
             "consistent_hashing": PolicyType.ConsistentHashing,
+            "bounded_consistent_hashing": PolicyType.BoundedConsistentHashing,
             "prefix_hash": PolicyType.PrefixHash,
         }
         for s, expected in cases.items():
@@ -355,6 +356,7 @@ class TestRouterFromArgsKitchenSink:
             "bucket",
             "manual",
             "consistent_hashing",
+            "bounded_consistent_hashing",
             "prefix_hash",
         ):
             args = RouterArgs(
@@ -658,6 +660,7 @@ class TestPolicyChoiceListConsistency:
             "bucket",
             "manual",
             "consistent_hashing",
+            "bounded_consistent_hashing",
             "prefix_hash",
         ],
     )
@@ -677,6 +680,7 @@ class TestPolicyChoiceListConsistency:
             "bucket",
             "manual",
             "consistent_hashing",
+            "bounded_consistent_hashing",
             "prefix_hash",
         ],
     )
