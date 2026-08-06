@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import concurrent
 import concurrent.futures
@@ -8,7 +6,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -20,6 +18,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputFormat,
     MultimodalProcessorOutput,
+)
+from sglang.srt.multimodal.audio_encoder_windowing import (
+    AudioEncoderWindowConfig,
+    AudioEncoderWindowSpec,
+    build_audio_encoder_window_items,
+    resolve_audio_encoder_window_config,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.utils import (
@@ -40,12 +44,6 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.multimodal.audio_encoder_windowing import (
-        AudioEncoderWindowConfig,
-        AudioEncoderWindowSpec,
-    )
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -389,12 +387,10 @@ class BaseMultimodalProcessor(ABC):
         return self._processor._get_feat_extract_output_lengths(feature_lengths)
 
     def resolve_audio_encoder_window_config(self, model_sample_rate: int):
-        from sglang.srt.multimodal import audio_encoder_windowing
-
         spec = self.audio_encoder_window_spec
         if spec is None:
             raise ValueError("model does not support audio encoder windowing")
-        return audio_encoder_windowing.resolve_audio_encoder_window_config(
+        return resolve_audio_encoder_window_config(
             spec,
             processor=self._processor,
             output_length_fn=self.get_audio_encoder_output_lengths,
@@ -408,8 +404,6 @@ class BaseMultimodalProcessor(ABC):
         config: AudioEncoderWindowConfig,
     ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
         """Build cacheable complete windows and one uncached mutable tail."""
-        from sglang.srt.multimodal import audio_encoder_windowing
-
         audios = base_output.audios or []
         if len(base_output.organize_results()) != 1 or len(audios) != 1:
             raise ValueError("audio windowing requires exactly one audio item")
@@ -423,7 +417,7 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             padding=False,
         ).input_ids.flatten()
-        mm_items, input_ids = audio_encoder_windowing.build_audio_encoder_window_items(
+        mm_items, input_ids = build_audio_encoder_window_items(
             samples=audios[0],
             input_ids=input_ids,
             placeholder_token_id=placeholder_token_id,

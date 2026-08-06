@@ -15,7 +15,6 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
 
@@ -149,6 +148,8 @@ def _build_audio_window_items(
     complete_window_count: int,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Expand one audio placeholder and create feature-backed window items."""
+    from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
+
     input_ids = input_ids.flatten()
     token_counts = [window.token_count for window in window_features]
 
