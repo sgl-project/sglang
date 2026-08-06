@@ -25,7 +25,7 @@ on:
       install_sglang_deps:
         required: false
         type: boolean
-        default: 'false'
+        default: false
         description: install sglang dependencies (e.g. PyTorch, CANN packages) when using source installation
       device_type_for_deps:
         required: false
