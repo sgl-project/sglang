@@ -95,9 +95,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
     if backend.is_cutedsl():
         if not is_sm100_supported():
-            raise ValueError(
-                "--bf16-gemm-backend cutedsl requires SM100/SM103 (Blackwell)"
-            )
+            raise ValueError("--bf16-gemm-backend cutedsl requires an SM10x GPU")
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,

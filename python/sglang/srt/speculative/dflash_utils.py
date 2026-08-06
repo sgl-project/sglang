@@ -51,7 +51,7 @@ elif is_hip():
         top_k_renorm_probs_triton as top_k_renorm_prob,
     )
 
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+    tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None

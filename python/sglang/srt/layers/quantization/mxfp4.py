@@ -69,6 +69,10 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
 
+# Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
+# post-load transforms and dummy initialization; 127 is the neutral scale (1.0).
+_UE8M0_ONE = 127
+
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -472,10 +476,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                hidden_size // mxfp4_block,
+            torch.full(
+                (
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    hidden_size // mxfp4_block,
+                ),
+                fill_value=_UE8M0_ONE,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -511,10 +518,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                hidden_size,
-                intermediate_size_per_partition_after_pad // mxfp4_block,
+            torch.full(
+                (
+                    layer.num_local_experts,
+                    hidden_size,
+                    intermediate_size_per_partition_after_pad // mxfp4_block,
+                ),
+                fill_value=_UE8M0_ONE,
                 dtype=scale_dtype,
             ),
             requires_grad=False,

@@ -952,15 +952,6 @@ def popen_launch_server(
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
-    # Prefill dominates capture time: the bucket list runs to chunked_prefill_size
-    # (8192 on H100-class GPUs) and its largest buckets cost seconds each, while
-    # 97% of CI prefill batches are under 1024 tokens -- a server that serves one
-    # test file captures the rest and never replays it. Decode is left alone: its
-    # capture cost is per-phase, not per-bucket. Pass the flag to opt out.
-    prefill_flag = "--cuda-graph-max-bs-prefill"
-    if not any(str(arg).startswith(prefill_flag) for arg in other_args):
-        other_args = list(other_args) + [prefill_flag, "1024"]
-
     # CI-specific: Validate cache and enable offline mode if complete
     if env is None:
         env = os.environ.copy()

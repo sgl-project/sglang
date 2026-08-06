@@ -47,7 +47,7 @@ class TestLlama4(unittest.TestCase):
             test_name="Llama-4-Scout",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.9),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_llama4",
+                result_dir="performance_results_llama4",
             ),
         )
 
