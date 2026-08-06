@@ -54,22 +54,23 @@ class LingBotWorldCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args) -> None:
         self.add_stage(RealtimeInputValidationStage())
-        self.add_stage(
+        condition_stages = [
             RealtimeTextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
                 tokenizers=[self.get_module("tokenizer")],
             )
-        )
+        ]
 
         image_encoder = self.get_module("image_encoder", None)
         image_processor = self.get_module("image_processor", None)
-        self.add_stage_if(
-            image_encoder is not None and image_processor is not None,
-            ImageEncodingStage(
-                image_encoder=image_encoder,
-                image_processor=image_processor,
-            ),
-        )
+        if image_encoder is not None and image_processor is not None:
+            condition_stages.append(
+                ImageEncodingStage(
+                    image_encoder=image_encoder,
+                    image_processor=image_processor,
+                )
+            )
+        self.add_parallel_stages(condition_stages)
 
         self.add_stage(AuxiliaryConditionEncodingStage())
         self.add_stage(

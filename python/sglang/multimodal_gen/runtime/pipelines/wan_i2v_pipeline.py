@@ -40,7 +40,10 @@ class WanImageToVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_ti2v_stages()
+        # text (UMT5), CLIP image, and image-VAE encodes read only request
+        # inputs and write disjoint fields; the executor enables overlap only
+        # for resident CUDA components with a deterministic collective order.
+        self.add_standard_ti2v_stages(overlap_condition_encoders=True)
 
 
 EntryClass = WanImageToVideoPipeline

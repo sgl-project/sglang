@@ -151,11 +151,28 @@ class PipelineStage(StageDedupMixin, ABC):
         del server_args
         return iter((batch,))
 
+    # execution-group token: stages sharing a token were declared mutually
+    # independent (ComposedPipelineBase.add_parallel_stages) and may run
+    # concurrently; None keeps strict declaration-order execution
+    _execution_group: str | None = None
+    # a stage may only overlap with its group siblings after it opts in. The
+    # pipeline declaration remains responsible for avoiding request-state
+    # write conflicts between its members.
+    concurrency_safe: bool = False
+
+    # Collectives are sequenced in declaration order when a parallel level has
+    # more than one collective-issuing member. Non-collective siblings can
+    # still overlap with the first collective epoch.
+    may_use_collectives: bool = False
+
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 
     def set_registered_stage_name(self, stage_name: str) -> None:
         self._registered_stage_name = stage_name
+
+    def set_execution_group(self, group_token: str) -> None:
+        self._execution_group = group_token
 
     def set_profile_stage_name(self, stage_name: str) -> None:
         self._profile_stage_name = stage_name
@@ -208,7 +225,7 @@ class PipelineStage(StageDedupMixin, ABC):
         target_dtype: torch.dtype | None = None,
     ) -> ComponentUse:
         manager = self._component_residency_manager
-        stage_name = self._active_component_stage_name()
+        stage_name = self._component_stage_name()
         server_args = manager.server_args if manager is not None else self.server_args
         for use in self.component_uses(server_args, stage_name):
             if use.component_name != component_name:

@@ -31,17 +31,17 @@ class LongLive2Pipeline(WanCausalDMDPipeline):
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
-        self.add_stage(
-            LongLive2TextEncodingStage(
-                text_encoders=[self.get_module("text_encoder")],
-                tokenizers=[self.get_module("tokenizer")],
-            )
-        )
-        self.add_stage(
-            LongLive2ImageVAEEncodingStage(
-                vae=self.get_module("vae"),
-                component_name="vae",
-            )
+        self.add_parallel_stages(
+            [
+                LongLive2TextEncodingStage(
+                    text_encoders=[self.get_module("text_encoder")],
+                    tokenizers=[self.get_module("tokenizer")],
+                ),
+                LongLive2ImageVAEEncodingStage(
+                    vae=self.get_module("vae"),
+                    component_name="vae",
+                ),
+            ]
         )
         self.add_stage(
             LongLive2LatentPreparationStage(

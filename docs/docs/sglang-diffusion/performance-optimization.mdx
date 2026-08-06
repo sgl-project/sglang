@@ -57,6 +57,11 @@ These settings should preserve model behavior while changing residency, parallel
       <td style={{padding: "9px 12px"}}><a href="./encoder_parallel">Encoder Parallelism</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><code>--parallel-stage-execution</code></td>
+      <td style={{padding: "9px 12px"}}>A latency-sensitive, low-step request leaves enough GPU memory for independent conditioning encoders to overlap.</td>
+      <td style={{padding: "9px 12px"}}>Defaults to <code>serial</code>; explicitly select <code>auto</code> only after measuring the exact model, shape, step count, and GPU.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Attention backend</td>
       <td style={{padding: "9px 12px"}}>Kernel choice dominates DiT latency or memory.</td>
       <td style={{padding: "9px 12px"}}><a href="./attention_backends">Attention Backends</a></td>
@@ -68,6 +73,50 @@ These settings should preserve model behavior while changing residency, parallel
     </tr>
   </tbody>
 </table>
+
+## Parallel Conditioning Stages
+
+`--parallel-stage-execution serial` is the default and preserves the established
+execution order and VRAM behavior. `--parallel-stage-execution auto` explicitly
+overlaps declared independent conditioning stages on separate CUDA streams, without
+changing the denoising graph or sampling parameters. The current native
+pipelines cover Wan I2V and I2V-DMD, Flux2, Qwen Image Edit, Joy Image Edit,
+MOVA, LongLive2, and the independent text/image branches of LingBot realtime.
+
+Overlapping stages can increase the temporary activation and workspace peak, and
+its latency benefit is workload-dependent. It is not a throughput optimization:
+at saturated QPS the same encoders contend for the GPU, and a longer denoising
+loop makes their overlap a negligible fraction of the request. Use `auto` only
+after confirming headroom and end-to-end latency for the deployment workload.
+SGLang selects serial execution automatically for CPU/layerwise offload,
+non-CUDA execution, or groups with an unsupported execution paradigm. Within an `auto` group,
+collective-issuing stages retain declaration order across ranks; non-collective
+siblings can still overlap with the first collective stage. This makes TP encoder
+plus VAE conditioning safe without allowing rank-dependent NCCL ordering.
+
+<Warning>
+`auto` can increase the temporary VRAM peak. It is appropriate only when all
+components in the group remain resident and the target request has verified
+headroom. Keep `serial` for memory-constrained deployments, offload, and any
+workload without a measured latency gain.
+</Warning>
+
+### What to expect
+
+The opportunity is greatest when conditioning is a meaningful fraction of a
+single request, typically an image-to-image or image-to-video request with a
+small denoising-step count. It is not determined solely by the model family:
+two independent GPU-bound encoders can slow each other down enough that their
+overlap provides no end-to-end benefit.
+
+For example, on H200, Flux2 Klein Base I2I at 512x512 and four steps reduced
+steady-state E2E latency by 2.5% on one GPU and 6.3% with TP2; the serial and
+auto outputs were byte-identical for the fixed input and seed. The same model
+at its 50-step example configuration improved by only 0.5% with TP2 while
+raising peak memory. LongLive2 I2V at 832x480, 61 frames, and four steps also
+showed no material gain. Treat these values as examples, not performance
+guarantees: profile your production GPU, prompt, input modality, resolution,
+frame count, and step count.
 
 ## Quality-Tradeoff / Lossy Or Approximate Levers
 

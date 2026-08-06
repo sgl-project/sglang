@@ -24,6 +24,7 @@ class JoyImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
             prompt_encoding="image_encoding",
             image_processor_key="processor",
             prompt_text_encoder_key="text_encoder",
+            overlap_condition_encoders=True,
         )
 
 

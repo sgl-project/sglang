@@ -19,7 +19,10 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -150,6 +153,19 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
+    @property
+    def concurrency_safe(self) -> bool:
+        """Pipeline declarations determine whether request writes are disjoint."""
+        return True
+
+    @property
+    def may_use_collectives(self) -> bool:
+        """Whether the configured encoder can enter a distributed collective."""
+        encoder = self.image_encoder or self.text_encoder
+        return encoder is not None and (
+            get_tp_world_size() > 1 or encoder.config.parallel_folding_mode is not None
+        )
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
@@ -163,7 +179,7 @@ class ImageEncodingStage(PipelineStage):
 
     def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
         """Encode image-edit text features via pipeline-configured postprocess hook."""
-        postprocess_funcs = getattr(pipeline_config, "postprocess_text_funcs", ())
+        postprocess_funcs = pipeline_config.postprocess_text_funcs
         if not postprocess_funcs or not callable(postprocess_funcs[0]):
             raise ValueError(
                 "Image-edit pipeline requires a callable postprocess_text_funcs[0]."
@@ -825,6 +841,9 @@ class ImageVAEEncodingStage(PipelineStage):
     input format (e.g., image_latents).
     """
 
+    # writes only the image-latent fields
+    concurrency_safe = True
+
     deduplicated_output_fields = (
         "image_latent",
         "condition_image_latent_ids",
@@ -840,6 +859,10 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.component_name = component_name
+
+    @property
+    def may_use_collectives(self) -> bool:
+        return self.vae.encode_uses_collectives
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None

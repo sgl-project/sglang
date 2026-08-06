@@ -128,6 +128,26 @@ class PipelineExecutor(ABC):
         if profiler:
             profiler.step_stage()
 
+    @staticmethod
+    def group_stages_into_execution_levels(
+        stages: List["PipelineStage"],
+    ) -> list[list["PipelineStage"]]:
+        """Split the flat stage list into sequential execution levels.
+
+        Consecutive stages sharing an execution-group token (declared via
+        add_parallel_stages) form one multi-stage level; every other stage is
+        its own level. Running levels in order with any schedule inside a
+        level is a valid execution of the declared dependencies.
+        """
+        levels: list[list[PipelineStage]] = []
+        for stage in stages:
+            token = stage._execution_group
+            if token is not None and levels and levels[-1][0]._execution_group == token:
+                levels[-1].append(stage)
+            else:
+                levels.append([stage])
+        return levels
+
     def execute_with_profiling(
         self,
         stages: List["PipelineStage"],
@@ -185,8 +205,7 @@ class PipelineExecutor(ABC):
         if server_args.use_fsdp_inference:
             return True
 
-        stage_name = stage._active_component_stage_name()
-        for use in stage.component_uses(server_args, stage_name):
+        for use in stage.component_uses(server_args):
             component_name = use.component_name
             if server_args.dit_cpu_offload and component_name in (
                 "transformer",
