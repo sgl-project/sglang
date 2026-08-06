@@ -372,18 +372,37 @@ class TestStreamingASR(CustomTestCase):
         self.assertEqual(len(tokenizer_manager.requests), 1)
 
         tokenizer_manager, connection = _encoder_window_connection(
-            ["three four", "", "three four five"],
+            ["one two three", "", "three four five"],
             ["length", "stop", "stop"],
         )
+        connection.asr_state.audio.append_pcm(bytes(96))
 
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         self.assertTrue(connection.asr_state.final_replay_required)
         connection.asr_state.audio.append_pcm(bytes(4))
         self.assertTrue(_run(connection._run_inference(is_last=False)))
         self.assertTrue(connection.asr_state.final_replay_required)
+        self.assertEqual(connection.asr_state.audio.base_offset_bytes, 0)
 
         _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
         self.assertEqual(len(tokenizer_manager.requests), 3)
+        self.assertEqual(tokenizer_manager.requests[-1].audio_data.size, 52)
+
+        tokenizer_manager, connection = _encoder_window_connection(
+            ["three four", "three four five"],
+            ["length", "length"],
+        )
+        self.assertTrue(_run(connection._run_inference(is_last=False)))
+        _run(connection._on_input_audio_buffer_commit(SimpleNamespace()))
+        sent_event_types = [
+            call.args[0].type for call in connection._send.call_args_list
+        ]
+        self.assertIn(
+            "conversation.item.input_audio_transcription.failed", sent_event_types
+        )
+        self.assertNotIn(
+            "conversation.item.input_audio_transcription.completed", sent_event_types
+        )
 
     def test_unconfigured_adapter_stays_cumulative(self):
         tokenizer_manager = _MockTokenizerManager("hello world")

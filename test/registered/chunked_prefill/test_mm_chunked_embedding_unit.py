@@ -2,9 +2,8 @@
 
 A DataEmbeddingFunc may return either one combined [tokens, hidden] tensor or
 one tensor per item (see mm_schedule.DataEmbeddingFunc). These tests assert the
-two forms produce bitwise-identical chunked-prefill embeddings, and that the
-per-item form yields cache entries that own their storage (a torch.split view
-of the combined tensor pins the whole concatenated buffer).
+two forms produce bitwise-identical chunked-prefill embeddings and cache each
+item in independently owned storage.
 
 CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
@@ -169,20 +168,53 @@ def test_list_cache_entries_own_storage():
         assert emb.untyped_storage().nbytes() == own_bytes
 
 
-def test_tensor_cache_entries_share_storage():
-    # Documents the motivation for the per-item form: split views of the
-    # combined tensor keep the whole concatenated buffer alive.
+def test_tensor_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(
         _encoder_tensor, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
     )
-    total_tokens = sum(_num_tokens(item) for item in items)
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
-        assert (
-            emb.untyped_storage().nbytes() == total_tokens * HIDDEN * emb.element_size()
+        own_bytes = emb.numel() * emb.element_size()
+        assert emb.untyped_storage().nbytes() == own_bytes
+
+
+def test_cross_request_misses_group_incompatible_feature_shapes():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    calls = []
+
+    def encoder(items):
+        calls.append([tuple(item.feature.shape) for item in items])
+        torch.cat([item.feature for item in items], dim=0)
+        return torch.cat(
+            [torch.zeros(_num_tokens(item), HIDDEN) for item in items], dim=0
         )
+
+    requests = []
+    for index, width in enumerate((800, 801)):
+        offset = (0, 3 + index)
+        item = MultimodalDataItem(
+            modality=Modality.AUDIO,
+            hash=2000 + index,
+            feature=torch.zeros(1, 128, width),
+            offsets=[offset],
+            model_specific_data={"feature_attention_mask": torch.ones(1, width)},
+        )
+        requests.append(
+            mm_schedule.PerImageRequestInfo(
+                req_idx=index,
+                items=[item],
+                items_offset=[offset],
+                extend_prefix_len=0,
+                extend_seq_len=offset[1] + 1,
+            )
+        )
+
+    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+
+    assert len(embeddings) == 2
+    assert calls == [[(1, 128, 800)], [(1, 128, 801)]]
 
 
 if __name__ == "__main__":

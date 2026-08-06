@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -219,6 +220,82 @@ def _embedding_token_count(embedding: torch.Tensor) -> int:
     return embedding.numel() // embedding.shape[-1]
 
 
+def _mm_item_batch_signature(item: MultimodalDataItem) -> tuple:
+    """Describe tensor geometry that must agree inside one encoder call."""
+
+    def tensor_signature(value):
+        if isinstance(value, torch.Tensor):
+            return ("torch", tuple(value.shape), value.dtype)
+        if isinstance(value, np.ndarray):
+            return ("numpy", tuple(value.shape), value.dtype.str)
+        return None
+
+    fields = [("feature", item.feature)]
+    fields.extend(sorted(item.model_specific_data.items()))
+    return tuple(
+        (name, signature)
+        for name, value in fields
+        if (signature := tensor_signature(value)) is not None
+    )
+
+
+def _encode_compatible_per_image_misses(
+    data_embedding_func: DataEmbeddingFunc,
+    unique_misses: Dict[int, Tuple[MultimodalDataItem, int]],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """Encode one cache-miss group whose tensor inputs can be batched."""
+    ordered_hashes = list(unique_misses.keys())
+    miss_items = [unique_misses[h][0] for h in ordered_hashes]
+    token_counts = [unique_misses[h][1] for h in ordered_hashes]
+
+    if not _can_skip_pre_embed_feature_move(data_embedding_func):
+        _move_items_to_device(miss_items, device)
+    all_miss_embedding = data_embedding_func(miss_items)
+
+    if isinstance(all_miss_embedding, list):
+        assert len(all_miss_embedding) == len(miss_items), (
+            f"per-item embedding count {len(all_miss_embedding)} != "
+            f"cache-miss item count {len(miss_items)}"
+        )
+        split_embeddings = [
+            emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+        ]
+        split_from_concatenated_tensor = False
+        if any(
+            _embedding_token_count(embedding) != token_count
+            for embedding, token_count in zip(split_embeddings, token_counts)
+        ):
+            raise RuntimeError(
+                "Multimodal encoder output does not match per-item token geometry"
+            )
+    else:
+        all_miss_embedding = all_miss_embedding.reshape(
+            -1, all_miss_embedding.shape[-1]
+        )
+        if all_miss_embedding.shape[0] != sum(token_counts):
+            raise RuntimeError(
+                "Multimodal encoder output does not match per-item token geometry: "
+                f"expected={sum(token_counts)}, "
+                f"actual={all_miss_embedding.shape[0]}"
+            )
+        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        split_from_concatenated_tensor = True
+
+    hash_to_embedding = {}
+    for (item_hash, (item, _)), embedding in zip(
+        unique_misses.items(), split_embeddings
+    ):
+        if item.use_embedding_cache:
+            # A split view would keep the complete encoder batch alive through
+            # every cached item, so cache an independently owned tensor.
+            if split_from_concatenated_tensor:
+                embedding = embedding.clone()
+            embedding_cache.set(item_hash, EmbeddingResult(embedding=embedding))
+        hash_to_embedding[item_hash] = embedding
+    return hash_to_embedding
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -360,57 +437,19 @@ def _batch_encode_per_image_misses(
             else:
                 _acknowledge_deferred_cuda_ipc_cache_hits([item])
 
-    # Phase 1b: single ViT call for all unique cache misses
+    # Phase 1b: batch compatible misses. Audio tails from concurrent requests
+    # can have different feature widths, which cannot share one encoder call.
     if unique_misses:
-        ordered_hashes = list(unique_misses.keys())
-        miss_items = [unique_misses[h][0] for h in ordered_hashes]
-        token_counts = [unique_misses[h][1] for h in ordered_hashes]
-
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(miss_items, device)
-        all_miss_embedding = data_embedding_func(miss_items)
-
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-            split_from_concatenated_tensor = False
-            if any(
-                _embedding_token_count(embedding) != token_count
-                for embedding, token_count in zip(split_embeddings, token_counts)
-            ):
-                raise RuntimeError(
-                    "Multimodal encoder output does not match per-item token geometry"
+        compatible_groups = {}
+        for item_hash, miss in unique_misses.items():
+            signature = _mm_item_batch_signature(miss[0])
+            compatible_groups.setdefault(signature, {})[item_hash] = miss
+        for compatible_misses in compatible_groups.values():
+            hash_to_embedding.update(
+                _encode_compatible_per_image_misses(
+                    data_embedding_func, compatible_misses, device
                 )
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
             )
-            if all_miss_embedding.shape[0] != sum(token_counts):
-                raise RuntimeError(
-                    "Multimodal encoder output does not match per-item token geometry: "
-                    f"expected={sum(token_counts)}, "
-                    f"actual={all_miss_embedding.shape[0]}"
-                )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-            split_from_concatenated_tensor = True
-        for (h, (item, _)), emb in zip(unique_misses.items(), split_embeddings):
-            if item.use_embedding_cache:
-                # torch.split returns views. Clone cacheable slices so one small
-                # entry does not keep the full batched encoder output alive.
-                if split_from_concatenated_tensor:
-                    emb = emb.clone()
-                embedding_cache.set(h, EmbeddingResult(embedding=emb))
-            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
-            hash_to_embedding[h] = emb
 
     return hash_to_embedding
 

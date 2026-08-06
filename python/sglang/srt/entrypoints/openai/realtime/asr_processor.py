@@ -88,8 +88,9 @@ class RealtimeASRState(msgspec.Struct):
     encoder_window_disabled: bool = False
     # True after cumulative transcript state has handed off to suffix decoding.
     encoder_window_active: bool = False
-    # A length-limited intermediate decode needs one full-budget commit replay.
-    final_replay_required: bool = False
+    # A length-limited decode must keep audio from this absolute offset until a
+    # full-budget commit replay succeeds.
+    final_replay_start_offset_bytes: Optional[int] = None
 
     @property
     def has_audio(self) -> bool:
@@ -102,6 +103,10 @@ class RealtimeASRState(msgspec.Struct):
     @property
     def has_new_audio(self) -> bool:
         return self.audio.received_bytes > self.audio.last_processed_offset_bytes
+
+    @property
+    def final_replay_required(self) -> bool:
+        return self.final_replay_start_offset_bytes is not None
 
 
 class _TranscriptionStep(msgspec.Struct, frozen=True):
@@ -124,7 +129,7 @@ class _TranscriptionOutcome(msgspec.Struct, frozen=True):
     audio_processed: bool
     cumulative_delta: str = ""
     decoder_update: Optional[DecoderSuffixUpdate] = None
-    final_replay_required: bool = False
+    replay_start_offset_bytes: Optional[int] = None
 
     @property
     def delta(self) -> str:
@@ -343,6 +348,8 @@ class RealtimeASRProcessor:
             complete_end - policy.context_window_count * window_bytes,
             audio.last_processed_offset_bytes // window_bytes * window_bytes,
         )
+        if state.final_replay_start_offset_bytes is not None:
+            start = min(start, state.final_replay_start_offset_bytes)
         return max(audio.base_offset_bytes, start)
 
     async def _execute_step(
@@ -413,6 +420,11 @@ class RealtimeASRProcessor:
             self.adapter.prompt_template + step.decoder_prefix,
             encoder_window_config=policy.encoder_window_config,
         )
+        if step.is_last and generation.finish_reason == "length":
+            raise RuntimeError("final realtime ASR decode reached max_new_tokens")
+        replay_start_offset_bytes = (
+            step.start_offset_bytes if generation.finish_reason == "length" else None
+        )
         text = generation.text
         text = state.transcript.trim_decoder_prefix_echo(
             text,
@@ -436,7 +448,10 @@ class RealtimeASRProcessor:
             # Retry one encoder window with more context. Beyond that horizon,
             # accept an empty transcript so unrecognized audio cannot make
             # per-request work grow without bound.
-            return _TranscriptionOutcome(audio_processed=False)
+            return _TranscriptionOutcome(
+                audio_processed=False,
+                replay_start_offset_bytes=replay_start_offset_bytes,
+            )
 
         if not state.encoder_window_active:
             text = state.transcript.prepend_unemitted_cumulative_text(text)
@@ -449,9 +464,7 @@ class RealtimeASRProcessor:
         return _TranscriptionOutcome(
             audio_processed=True,
             decoder_update=update,
-            final_replay_required=(
-                not step.is_last and generation.finish_reason == "length"
-            ),
+            replay_start_offset_bytes=replay_start_offset_bytes,
         )
 
     async def _snapshot_samples(
@@ -498,7 +511,13 @@ class RealtimeASRProcessor:
                 outcome.decoder_update,
                 is_last=step.is_last,
             )
-            state.final_replay_required = outcome.final_replay_required
+        if outcome.replay_start_offset_bytes is not None:
+            replay_start = outcome.replay_start_offset_bytes
+            if state.final_replay_start_offset_bytes is not None:
+                replay_start = min(replay_start, state.final_replay_start_offset_bytes)
+            state.final_replay_start_offset_bytes = replay_start
+        elif step.is_last:
+            state.final_replay_start_offset_bytes = None
         if not outcome.audio_processed:
             return
         if step.uses_encoder_windows:
