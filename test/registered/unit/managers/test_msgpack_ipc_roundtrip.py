@@ -24,12 +24,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetWeightsByNameReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
-    LoadReporterIpcCode,
     LoadReporterRefreshIpcReq,
     LoadReporterRefreshReason,
-    LoadReporterStartIpcReqInput,
-    LoadReporterStartIpcReqOutput,
-    LoadReporterStateBroadcastReq,
     ParallelismInfo,
     RpcReqInput,
     SetInternalStateReq,
@@ -139,30 +135,10 @@ REGISTRY_TYPE_INSTANCES = {
     "DumperControlReqOutput": DumperControlReqOutput(
         success=True, response=[{"worker": 0, "ok": True}]
     ),
-    "load-reporter-start": LoadReporterStartIpcReqInput(
-        request_id="r1",
-        http_worker_ipc="ipc://worker",
-        router_host="127.0.0.1",
-        router_port=50051,
-        report_interval_ms=100,
-        lease_ttl_ms=3000,
-        worker_addr="http://127.0.0.1:30000",
-    ),
-    "load-reporter-output": LoadReporterStartIpcReqOutput(
-        request_id="r1",
-        code=LoadReporterIpcCode.OK,
-        status="reporting",
-        lease_ttl_ms=3000,
-        renew_after_ms=1000,
-    ),
     "load-reporter-refresh": LoadReporterRefreshIpcReq(
         worker_id="w1",
         reason=LoadReporterRefreshReason.COMPLETION,
         event_count=7,
-    ),
-    "load-reporter-state": LoadReporterStateBroadcastReq(
-        active=True,
-        coalesce_window_ms=50,
     ),
 }
 
