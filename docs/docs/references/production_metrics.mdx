@@ -7,6 +7,8 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+When running multiple workers behind the [SGLang Model Gateway](/docs/advanced_features/sgl_model_gateway), the gateway's `GET /engine_metrics` endpoint returns these engine metrics for all registered workers in a single call, with each series labeled by `worker_addr`.
+
 Here is an example of the metrics:
 
 ```text Output
