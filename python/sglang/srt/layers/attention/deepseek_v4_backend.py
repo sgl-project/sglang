@@ -46,7 +46,11 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4IndexerBackendMixin,
+    GvrTopkState,
+    check_flashinfer_gvr_available,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -532,6 +536,22 @@ class DeepseekV4AttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        if self.dsa_topk_backend.is_flashinfer_gvr():
+            check_flashinfer_gvr_available()
+            assert self.hisparse_coordinator is None, (
+                "--dsa-topk-backend flashinfer-gvr does not support hisparse "
+                "(it consumes raw indices via a different top-k path)."
+            )
+            assert model_runner.server_args.speculative_algorithm is None, (
+                "--dsa-topk-backend flashinfer-gvr does not support "
+                "speculative decoding (MTP) yet."
+            )
+            self.gvr_state = GvrTopkState(
+                num_layers=model_runner.model_config.num_hidden_layers,
+                num_slots=model_runner.req_to_token_pool.req_to_token.shape[0],
+                top_k=self.c4_topk,
+                device=self.device,
+            )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0

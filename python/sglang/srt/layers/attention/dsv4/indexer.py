@@ -401,11 +401,142 @@ def topk_transform_512_flashinfer_unfused(
     )
 
 
+def check_flashinfer_gvr_available() -> None:
+    """Fail fast at server start when flashinfer lacks the GVR kernel."""
+    try:
+        from flashinfer import top_k_varlen  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "--dsa-topk-backend flashinfer-gvr requires a flashinfer build "
+            "with top_k_varlen (flashinfer PR #3901); the pinned release "
+            "does not include it."
+        ) from e
+
+
+class GvrTopkState:
+    """Persistent cross-step hint buffers plus per-call staging for the
+    flashinfer GVR (Guess-Verify-Refine) top-k decode path.
+
+    ``hints`` holds, per (layer, request slot), the raw compressed-space top-k
+    indices this layer selected at the request's previous decode step. GVR
+    writes each step's output back into it, so persisting the hint is free.
+    All buffers are static and only mutated in place - CUDA-graph safe.
+    """
+
+    def __init__(
+        self, *, num_layers: int, num_slots: int, top_k: int, device: torch.device
+    ):
+        i32 = {"dtype": torch.int32, "device": device}
+        # Iota init: a valid in-range cold-start hint for any row (after the
+        # per-step stale check), and matches the GVR convention that the hint
+        # covers distinct positions.
+        self.hints = (
+            torch.arange(top_k, **i32).expand(num_layers, num_slots, top_k).contiguous()
+        )
+        self.iota_row = torch.arange(top_k, **i32).unsqueeze(0)
+        self.pre_idx_staging = torch.zeros(num_slots, top_k, **i32)
+        self.raw_out_staging = torch.zeros(num_slots, top_k, **i32)
+        self.seq_lens_staging = torch.zeros(num_slots, **i32)
+        # Reusable LB-path workspace (see top_k_varlen docs). The kernel
+        # requires gvr_order_row of exactly the smallest power of 2 in
+        # [64, 1024] >= batch, so the max-sized buffer is sliced per call.
+        # Single-stream use only.
+        self._order_row = torch.zeros(1024, **i32)
+        self._counters = torch.zeros(2, **i32)
+
+    def workspace_for_batch(self, num_rows: int) -> dict:
+        m = max(64, 1 << (num_rows - 1).bit_length())
+        return {
+            "gvr_order_row": self._order_row[:m],
+            "gvr_counters": self._counters,
+        }
+
+
+def gvr_topk_transform_decode(
+    *,
+    logits: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    c4_page_size: int,
+    layer_id: int,
+    req_pool_indices: torch.Tensor,
+    state: GvrTopkState,
+    top_k: int,
+) -> None:
+    """GVR top-k over decode logits + raw->page transform.
+
+    ``logits``: fp32 ``[num_rows, N]`` in compressed (c4) index space.
+    ``c4_seq_lens``: int32 compressed lengths (``seq_len // 4``, >= 0; padded
+    DP-idle rows carry 1 and whatever slot ``req_pool_indices`` padding points
+    at, which only degrades that slot's hint quality).
+    Writes page-slot indices (``-1`` for invalid) into
+    ``out_page_indices[:, :top_k]``; pad columns beyond ``top_k`` stay ``-1``.
+    """
+    import flashinfer
+
+    num_rows = logits.shape[0]
+    # next_n == 1: one decode row per request (MTP topk > 1 is rejected at init).
+    assert c4_seq_lens.shape[0] == num_rows == req_pool_indices.shape[0]
+
+    pre_idx = state.pre_idx_staging[:num_rows]
+    torch.index_select(state.hints[layer_id], 0, req_pool_indices, out=pre_idx)
+    # Genuinely chained hints are always in-length (previous step's positions
+    # < the grown length). A stale row (slot reused after a longer request, or
+    # kernel pad slots from a short row) can hold out-of-length entries whose
+    # logit values are garbage - and clamping them would create duplicate
+    # positions, which degenerate GVR's threshold search into a wrong result.
+    # Reset such rows wholesale to iota, the known-exact cold-start hint.
+    stale = (pre_idx >= c4_seq_lens.unsqueeze(1)).any(dim=1, keepdim=True) | (
+        pre_idx < 0
+    ).any(dim=1, keepdim=True)
+    pre_idx.copy_(torch.where(stale, state.iota_row, pre_idx))
+    # Safety belt for the tiny-width regime (N < top_k, all rows trivial):
+    # keep hint reads inside the logits row to rule out an IMA.
+    pre_idx.clamp_(max=logits.shape[1] - 1)
+
+    # The kernel expects uncompressed lengths and floor-divides by
+    # compress_ratio, so *4 round-trips to exactly c4_seq_lens.
+    seq_lens = state.seq_lens_staging[:num_rows]
+    torch.mul(c4_seq_lens, 4, out=seq_lens)
+
+    raw = state.raw_out_staging[:num_rows]
+    flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=pre_idx,
+        compress_ratio=4,
+        next_n=1,
+        out_indices=raw,
+        backend="gvr",
+        workspace=state.workspace_for_batch(num_rows),
+    )
+    state.hints[layer_id].index_copy_(0, req_pool_indices, raw)
+
+    # Raw compressed positions -> physical page-slot indices, mirroring
+    # _topk_transform_512_vectorized. Rows with c4_seq_lens <= top_k leave
+    # surplus slots holding arbitrary values; the range mask turns any
+    # out-of-length entry into -1, matching the downstream padding contract.
+    page_bits = (c4_page_size - 1).bit_length()
+    invalid = (raw < 0) | (raw >= c4_seq_lens.unsqueeze(1))
+    page_idx = (raw >> page_bits).clamp(min=0)
+    physical = torch.gather(page_table, dim=1, index=page_idx.long())
+    page_indices = ((physical << page_bits) | (raw & (c4_page_size - 1))).to(
+        torch.int32
+    )
+    page_indices.masked_fill_(invalid, -1)
+    out_page_indices[:, :top_k].copy_(page_indices)
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        # Set by DeepSeekV4AttnBackend.__init__ when --dsa-topk-backend
+        # flashinfer-gvr is selected.
+        self.gvr_state: Optional[GvrTopkState] = None
 
     def _forward_prepare_multi_stream(
         self,
@@ -824,6 +955,23 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 raw_indices,
+            )
+        elif (
+            self.dsa_topk_backend.is_flashinfer_gvr()
+            and forward_batch.forward_mode.is_decode()
+            and raw_indices is None
+            and self.gvr_state is not None
+        ):
+            gvr_topk_transform_decode(
+                logits=logits,
+                c4_seq_lens=c4_seq_lens,
+                page_table=page_table,
+                out_page_indices=c4_sparse_page_indices,
+                c4_page_size=indexer_metadata.c4_page_size,
+                layer_id=c4_indexer.layer_id,
+                req_pool_indices=forward_batch.req_pool_indices,
+                state=self.gvr_state,
+                top_k=self.c4_topk,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
             topk_transform_512_v2(

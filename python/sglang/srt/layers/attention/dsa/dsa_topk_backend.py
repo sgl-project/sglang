@@ -24,6 +24,9 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    # GVR (Guess-Verify-Refine) top-k via flashinfer.top_k_varlen, warm-started
+    # from the previous decode step's indices. DeepSeek V4 decode only, SM100+.
+    FLASHINFER_GVR = "flashinfer-gvr"
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
@@ -33,6 +36,9 @@ class DSATopKBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
+
+    def is_flashinfer_gvr(self) -> bool:
+        return self == DSATopKBackend.FLASHINFER_GVR
 
     def topk_func(
         self,
