@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import (
+    get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
 )
@@ -1148,6 +1149,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         sparse_attention_config = getattr(config, "sparse_attention_config", None)
         if sparse_attention_config is not None:
+            # Use the unified accessor so layer_types is injected into the
+            # sparse config. Some checkpoints ship sparse_attention_freq as
+            # all-zero placeholders; without layer_types, get_minimax_sparse_layer_ids
+            # would treat every layer as dense and skip the indexer weights.
+            sparse_attention_config = get_minimax_sparse_attention_config(config)
             _, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_attention_config)
             is_sparse_attention_layer = layer_id in sparse_layer_ids
             disable_value_layer_ids = set(

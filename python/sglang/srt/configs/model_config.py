@@ -155,20 +155,54 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
 
 
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
+    # text_config may be a PreTrainedConfig object OR a plain dict (e.g. when
+    # sglang loads MiniMaxM3VLConfig). getattr(dict, ...) returns None for
+    # missing keys instead of raising, but also returns None for *present*
+    # keys, so use a unified accessor that handles both shapes.
+    def _get(obj, key, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
     text_cfg = getattr(config, "text_config", None)
-    cfg = (
-        getattr(text_cfg, "sparse_attention_config", None)
-        if text_cfg is not None
-        else None
-    )
+    cfg = _get(text_cfg, "sparse_attention_config", None)
     if cfg is None:
-        cfg = getattr(config, "sparse_attention_config", None)
+        cfg = _get(config, "sparse_attention_config", None)
     if cfg is None:
         raise ValueError("Could not find sparse config. Is it MiniMax M3 Sparse model?")
+    # Inject ``layer_types`` into the returned sparse config so downstream
+    # helpers can identify sparse layers from the authoritative per-layer type
+    # ("minimax_m3_sparse") rather than ``sparse_attention_freq``. Some
+    # MiniMax-M3 checkpoints ship ``sparse_attention_freq`` as all-zero
+    # placeholders, which would make every layer look dense and cause the
+    # lightning indexer weights to be skipped entirely. ``layer_types`` lives
+    # on text_config, so it must be pulled from there.
+    if not isinstance(cfg, dict):
+        cfg = dict(cfg)
+    if "layer_types" not in cfg:
+        layer_types = _get(text_cfg, "layer_types", None)
+        if layer_types is None:
+            layer_types = _get(config, "layer_types", None)
+        if layer_types is not None:
+            cfg["layer_types"] = layer_types
     return cfg
 
 
 def get_minimax_sparse_layer_ids(sparse_cfg: dict) -> tuple[list[int], list[int]]:
+    # Prefer ``layer_types`` to identify sparse layers. ``sparse_attention_freq``
+    # is all-zero (placeholder) on some checkpoints, which would yield an empty
+    # sparse_layer_ids list and cause all indexer weights to be dropped.
+    layer_types = sparse_cfg.get("layer_types", None)
+    if layer_types is not None:
+        dense_layer_ids = [
+            i for i, t in enumerate(layer_types) if t != "minimax_m3_sparse"
+        ]
+        sparse_layer_ids = [
+            i for i, t in enumerate(layer_types) if t == "minimax_m3_sparse"
+        ]
+        return dense_layer_ids, sparse_layer_ids
     sparse_freq = sparse_cfg["sparse_attention_freq"]
     dense_layer_ids = [i for i, f in enumerate(sparse_freq) if f == 0]
     sparse_layer_ids = [i for i, f in enumerate(sparse_freq) if f != 0]
@@ -177,9 +211,23 @@ def get_minimax_sparse_layer_ids(sparse_cfg: dict) -> tuple[list[int], list[int]
 
 def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list[int]:
     flags = sparse_cfg.get("sparse_disable_index_value")
-    if flags is None:
-        return []
-    return [i for i, f in enumerate(flags) if f != 0]
+    if flags is not None:
+        return [i for i, f in enumerate(flags) if f != 0]
+    # MiniMax-M3's lightning indexer only has index_q/k_proj (block selection);
+    # index_v_proj / index_o_proj do not exist by design, and the checkpoint's
+    # quantization ignore list covers only ``index_[qk]_proj``. Without an
+    # explicit ``sparse_disable_index_value`` flag the previous default ([])
+    # left disable_index_value always False, so index_v/o_proj were
+    # unconditionally constructed and quantized -- but no weights exist for
+    # them, leaving weight_packed/scale as torch.empty (CUDA zero pages). The
+    # numerical output happened to be harmless but relied on undefined
+    # behaviour (a source of non-determinism) and wasted work on two phantom
+    # projections plus a phantom sparse attention per sparse layer. Default to
+    # disabling value for every sparse layer instead. Requires ``layer_types``
+    # in sparse_cfg (injected by get_minimax_sparse_attention_config); falls
+    # back to sparse_attention_freq otherwise.
+    _, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+    return sparse_layer_ids
 
 
 def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
