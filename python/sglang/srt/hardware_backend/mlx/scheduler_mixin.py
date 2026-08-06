@@ -184,15 +184,42 @@ class SchedulerMlxOverlapMixin:
 
         def _launch_chained(prev: MlxPendingJob) -> MlxPendingJob:
             assert prev.decode is not None
-            # Composition is identical to prev: reuse a fresh batch copy
-            # of the same underlying ScheduleBatch so process_batch_result
-            # updates the same req objects with the new token.
-            batch_copy = prev.batch_copy.copy()
-            self._prepare_mlx_launch(batch_copy)
-            # Keep the live scheduler batch's iteration aligned: when the
-            # chain breaks, prepare_for_decode() may run SWA maintenance
-            # before the next fresh launch gets a chance to re-stamp it.
-            prev.schedule_batch.forward_iter = batch_copy.forward_iter
+            # Stamp the live scheduler batch directly (not a copy), BEFORE
+            # prepare_for_decode(): maybe_evict_swa() (called from inside
+            # prepare_for_decode() -> alloc_for_decode()) keys its
+            # maintenance cadence off batch.forward_iter, so that field must
+            # already reflect this step's iteration when allocation runs.
+            self._prepare_mlx_launch(prev.schedule_batch)
+            # Give this chained token the same allocation and accounting
+            # lifecycle as an ordinary decode token: a real req_to_token
+            # slot, and matching seq_lens / kv_committed_len advancement.
+            # Without this, chained steps skip the scheduler entirely, so
+            # req_to_token and kv_committed_len never learn about the
+            # tokens they produce (#30093) -- those positions are then
+            # neither radix-cacheable nor a safe upper bound for the
+            # decode-KV pool sync. prepare_for_decode() is pure CPU/host
+            # bookkeeping (the MLX scheduler tensors all live on
+            # device="cpu"; see model_runner_stub.py), so this adds no MLX
+            # evaluation barrier or host<->device sync. schedule_batch is
+            # the same object identity as self.running_batch for the whole
+            # chain, so this keeps both consistent with what a normal
+            # scheduled decode step would have done.
+            prev.schedule_batch.prepare_for_decode()
+            # Slot 0 is reserved padding (kv_cache/attention_kv_pool.py); a
+            # real allocator draw never returns it. Carries the slot-0 assert
+            # from the #30147 review (jlee5814/LarrySimingDeng, issue #30093
+            # thread): redundant under that PR's sync-side clamp alone, but
+            # this is the allocation that makes each chained position a real,
+            # committed one, so this is where the invariant now lives.
+            assert bool(
+                (prev.schedule_batch.out_cache_loc != 0).all()
+            ), "chained decode committed a position to padding slot 0"
+            # Snapshot AFTER prepare_for_decode() so process_batch_result
+            # observes this step's committed seq_lens / kv_committed_len
+            # instead of a stale pre-allocation copy. Composition (reqs) is
+            # identical to prev, so the copied req objects are the same
+            # ones process_batch_result already knows how to update.
+            batch_copy = prev.schedule_batch.copy()
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_chained_decode_mlx(prev.decode)
             )
@@ -229,11 +256,22 @@ class SchedulerMlxOverlapMixin:
                 and not self.waiting_queue
             )
             if can_chain and pending_next is None:
-                # Build + launch the chained step BEFORE we block on
-                # pending_curr — this is the "no idle gap" trick.
-                # GPU now has 2 steps queued.
-                pending_next = _launch_chained(pending_curr)
-                self.result_queue.append(pending_next)
+                # Chained steps now allocate a real KV-pool slot per token
+                # (see _launch_chained), so — unlike before, when chaining
+                # had zero allocator cost — extending the chain can run the
+                # pool out of budget. Check before committing to the
+                # allocation instead of letting alloc_for_decode() raise
+                # from inside the hot chained path; on insufficient budget,
+                # decline to chain this iteration and fall through to the
+                # chain-break path below, whose
+                # get_next_batch_to_run() -> update_running_batch() already
+                # knows how to evict/retract correctly.
+                if pending_curr.schedule_batch.check_decode_mem():
+                    # Build + launch the chained step BEFORE we block on
+                    # pending_curr — this is the "no idle gap" trick.
+                    # GPU now has 2 steps queued.
+                    pending_next = _launch_chained(pending_curr)
+                    self.result_queue.append(pending_next)
 
             # 2. Finalize/process on pending_curr's tokens.  (GPU is already
             #    executing pending_next at this point.)
