@@ -117,6 +117,18 @@ class TestUSPAttentionKVGather(unittest.TestCase):
 
         torch.testing.assert_close(out, expected)
 
+    def test_pre_all_to_all_convention_is_rejected(self):
+        q = torch.randn(1, 4, self.heads, self.head_dim)
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=SimpleNamespace(attn_metadata=None),
+            ),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=2),
+        ):
+            with self.assertRaises(NotImplementedError):
+                self.attn.forward(q, q, q, qkv_pre_all_to_all=True)
+
     def test_padding_mask_uses_local_queries_and_global_keys(self):
         q = torch.randn(2, 3, self.heads, self.head_dim)
         k = torch.randn(2, 3, self.heads, self.head_dim)

@@ -767,6 +767,11 @@ class USPAttention(nn.Module):
             and not effective_skip_sp
             and get_sequence_parallel_world_size() > 1
         ):
+            if qkv_pre_all_to_all:
+                raise NotImplementedError(
+                    "K/V-gather SP expects sequence-sharded Q/K/V; "
+                    "caller-side pre-all-to-all is Ulysses-only."
+                )
             if replicated_mode_count > 1:
                 raise ValueError(
                     "K/V-gather SP supports at most one replicated-token mode per call."
