@@ -243,7 +243,7 @@ Used to simulate multi-LoRA serving scenarios.
 Tools for deep performance analysis.
 
 - `--profile`: Enables Torch Profiler (Requires `SGLANG_TORCH_PROFILER_DIR` env var on server).
-- `--plot-throughput`: Generates throughput/concurrency plots (requires `termplotlib` and `gnuplot`).
+- `--plot-throughput`: Generates throughput/concurrency plots. `termplotlib` ships in the Docker image; `gnuplot` does not — install it with `apt-get install -y gnuplot`.
 - `--profile-activities`: Activities to profile (CPU, GPU, CUDA_PROFILER).
 - `--profile-num-steps`: Number of steps to profile.
 - `--profile-by-stage` / `--profile-stages`: Profile specific processing stages.
