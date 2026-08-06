@@ -9,30 +9,30 @@
 //!   * `t_first` — the first streamed token arrived,
 //!   * `t_end`   — the last decode token / stream end.
 //!
-//! There are two outputs, both opt-in via `SGL_ROUTER_SESSION_STATS_DUMP`:
+//! Two outputs, both opt-in via `SGL_ROUTER_SESSION_STATS_DUMP`:
 //!
 //!   1. **`session_timestamp.json`** — the raw triples per session, written to
-//!      the configured path as a whole-file snapshot:
+//!      the configured path as a whole-file snapshot (Unix seconds):
 //!
 //!          { "<session-id>": [[t_recv, t_first, t_end], ...], ... }
 //!
-//!      (Unix seconds.) Refreshed on the sweep tick and on shutdown.
+//!      Refreshed by a periodic flush task and once more on shutdown.
 //!
-//!   2. **A log line per session whenever its timing `t` changes** — carrying
-//!      the three derived durations of a turn:
+//!   2. **One log line per received `t_recv`**, carrying the *previous* turn's
+//!      timing `t` — each phase's share of the whole turn cycle, in [0, 1]:
 //!
-//!          prefill_t = t_first - t_recv
-//!          decode_t  = t_end   - t_first
-//!          total_t   = next_t_recv - t_recv   (full turn cycle incl. acting)
+//!          prefill_t = prefill_ms / total_ms
+//!          decode_t  = decode_ms  / total_ms
+//!          acting_t  = acting_ms  / total_ms
 //!
-//!      `total_t` is only knowable once the *next* turn arrives, so a turn's
-//!      line is emitted at the start of the following turn.
+//!      where `prefill_ms = t_first - t_recv`, `decode_ms = t_end - t_first`,
+//!      `acting_ms = total_ms - prefill_ms - decode_ms`, and
+//!      `total_ms = next_t_recv - t_recv` (the full cycle incl. client acting).
+//!      `total_ms` is only knowable once the next turn arrives, so a turn's line
+//!      is emitted at the start of the following turn.
 //!
-//! Config:
-//!   * `SGL_ROUTER_SESSION_STATS_DUMP` — path to `session_timestamp.json`; when
-//!     set, the feature (JSON dump + log lines) is enabled. Unset → no-op.
-//!   * `SGL_ROUTER_SESSION_STATS_TTL_SECS` — evict the per-session *log* state
-//!     after N secs of inactivity (default 900). The JSON archive is retained.
+//! Config: `SGL_ROUTER_SESSION_STATS_DUMP` = path to `session_timestamp.json`.
+//! When set, the feature (JSON dump + log lines) is enabled; unset → no-op.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,13 +40,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
+/// How often the periodic task rewrites `session_timestamp.json`.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// One completed turn's raw timestamps, in Unix seconds:
 /// `[t_recv, t_first, t_end]`. `t_first` falls back to `t_recv` if no token was
 /// streamed (degenerate; streaming turns always have a first token).
 type Triple = [f64; 3];
 
-/// Live per-session log state (the JSON archive is kept separately so TTL
-/// sweeping the log state never drops recorded timestamps).
+/// Shared session → triples map (behind `Arc` so the periodic flush task can
+/// snapshot it independently of the collector).
+type Archive = Arc<DashMap<String, Vec<Triple>>>;
+
+/// Live per-session log state.
 #[derive(Debug)]
 struct SessionStat {
     /// Current turn's receive instant.
@@ -54,45 +60,45 @@ struct SessionStat {
     /// Current turn's first-token instant.
     t_first: Option<Instant>,
     /// Derived `(prefill_ms, decode_ms)` of a completed turn awaiting its
-    /// `total_t` (computed when the next turn starts, then logged).
+    /// `total_ms` (computed when the next turn starts, then logged).
     pending: Option<(f32, f32)>,
     turns: u64,
-    last_seen: Instant,
 }
 
 /// Concurrent per-session timestamp collector.
 #[derive(Debug)]
 pub struct SessionStats {
-    /// Live log state, TTL-swept.
+    /// Live log state (in-flight turn timing per session).
     map: DashMap<String, SessionStat>,
-    ttl: Duration,
-    /// Append-only raw-triple archive → `session_timestamp.json`. `None` when
-    /// the feature is disabled.
-    archive: Option<DashMap<String, Vec<Triple>>>,
+    /// Raw-triple archive → `session_timestamp.json`. `None` when disabled.
+    archive: Option<Archive>,
     /// Destination path for the JSON snapshot. `None` in tests (archive only).
     dump_path: Option<String>,
 }
 
 impl SessionStats {
     /// Build from the environment. Enabled iff `SGL_ROUTER_SESSION_STATS_DUMP`
-    /// is set (to the `session_timestamp.json` path).
+    /// is set (to the `session_timestamp.json` path). When enabled, spawns the
+    /// periodic flush task (must be called from within a tokio runtime).
     pub fn from_env() -> Arc<Self> {
-        let ttl = Duration::from_secs(env_parse("SGL_ROUTER_SESSION_STATS_TTL_SECS", 900u64));
         let dump_path = std::env::var("SGL_ROUTER_SESSION_STATS_DUMP")
             .ok()
             .filter(|p| !p.is_empty());
-        let enabled = dump_path.is_some();
-        if let Some(path) = &dump_path {
-            tracing::info!(
-                path,
-                ttl_secs = ttl.as_secs(),
-                "session-stats: per-session timestamp collector enabled"
-            );
-        }
+        let archive = match &dump_path {
+            Some(path) => {
+                tracing::info!(
+                    path,
+                    "session-stats: per-session timestamp collector enabled"
+                );
+                let archive: Archive = Arc::new(DashMap::new());
+                spawn_periodic_flush(Arc::clone(&archive), path.clone());
+                Some(archive)
+            }
+            None => None,
+        };
         Arc::new(Self {
             map: DashMap::new(),
-            ttl,
-            archive: enabled.then(DashMap::new),
+            archive,
             dump_path,
         })
     }
@@ -102,7 +108,6 @@ impl SessionStats {
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
             map: DashMap::new(),
-            ttl: Duration::from_secs(900),
             archive: None,
             dump_path: None,
         })
@@ -114,8 +119,8 @@ impl SessionStats {
     }
 
     /// A request for `sid` was received. Stamps `t_recv`, and — if the previous
-    /// turn is complete — logs that turn's `t` (`prefill_t` / `decode_t` /
-    /// `total_t`) now that `total_t` is known. One line per received `t_recv`.
+    /// turn is complete — logs that turn's `t` now that `total_ms` is known.
+    /// One line per received `t_recv`.
     pub fn on_turn_start(&self, sid: &str, now: Instant) {
         if !self.enabled() {
             return;
@@ -128,7 +133,6 @@ impl SessionStats {
                 t_first: None,
                 pending: None,
                 turns: 0,
-                last_seen: now,
             });
 
         // The completed prior turn's total cycle = this turn's recv minus that
@@ -138,10 +142,7 @@ impl SessionStats {
             let total_ms = dur_ms(now.saturating_duration_since(e.t_recv));
             // acting = client thinking / tool time = total - (prefill + decode).
             let acting_ms = (total_ms - prefill_ms - decode_ms).max(0.0);
-            // Each `t` is that phase's share of the whole turn cycle, in [0, 1]:
-            //   prefill_t = prefill_ms / total_ms
-            //   decode_t  = decode_ms  / total_ms
-            //   acting_t  = acting_ms  / total_ms   (== 1 - prefill_t - decode_t)
+            // Each `t` is that phase's share of the whole turn cycle, in [0, 1].
             let (prefill_t, decode_t, acting_t) = if total_ms > 0.0 {
                 (
                     prefill_ms / total_ms,
@@ -168,7 +169,6 @@ impl SessionStats {
 
         e.t_recv = now;
         e.t_first = None;
-        e.last_seen = now;
     }
 
     /// The first streamed token for `sid` arrived. Idempotent within a turn.
@@ -180,17 +180,16 @@ impl SessionStats {
             if e.t_first.is_none() {
                 e.t_first = Some(now);
             }
-            e.last_seen = now;
         }
     }
 
     /// The last decode token / stream end for `sid`. Records the raw triple into
     /// the JSON archive and marks the turn's `(prefill, decode)` pending its
-    /// `total_t` at the next turn start.
+    /// `total_ms` at the next turn start.
     pub fn on_turn_end(&self, sid: &str, now: Instant) {
-        if !self.enabled() {
+        let Some(archive) = &self.archive else {
             return;
-        }
+        };
         let mut e = match self.map.get_mut(sid) {
             Some(e) => e,
             // No matching start (e.g. enabled mid-session) — ignore.
@@ -205,70 +204,68 @@ impl SessionStats {
             .unwrap_or(0.0);
         e.pending = Some((prefill_ms, decode_ms));
         e.turns += 1;
-        e.last_seen = now;
 
         // Raw triple in wall-clock Unix seconds. We know `t_end`'s wall clock
         // and the Instant deltas, so back-compute `t_recv` / `t_first` — no need
         // to capture SystemTime at all three points.
-        if let Some(archive) = &self.archive {
-            let end_unix = unix_secs();
-            let recv_unix = end_unix - now.saturating_duration_since(e.t_recv).as_secs_f64();
-            let first_unix = t_first
-                .map(|f| end_unix - now.saturating_duration_since(f).as_secs_f64())
-                .unwrap_or(recv_unix);
-            archive
-                .entry(sid.to_string())
-                .or_default()
-                .push([recv_unix, first_unix, end_unix]);
-        }
+        let end_unix = unix_secs();
+        let recv_unix = end_unix - now.saturating_duration_since(e.t_recv).as_secs_f64();
+        let first_unix = t_first
+            .map(|f| end_unix - now.saturating_duration_since(f).as_secs_f64())
+            .unwrap_or(recv_unix);
+        archive
+            .entry(sid.to_string())
+            .or_default()
+            .push([recv_unix, first_unix, end_unix]);
     }
 
     /// Number of sessions in the JSON archive.
     pub fn len(&self) -> usize {
-        self.archive.as_ref().map(DashMap::len).unwrap_or(0)
+        self.archive.as_ref().map(|a| a.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Evict log state inactive for longer than the TTL, then refresh the JSON
-    /// snapshot. Returns the number of log entries removed. Driven by
-    /// `active_load::spawn_sweeper`. (The archive is never swept.)
-    pub fn sweep(&self) -> usize {
-        if !self.enabled() {
-            return 0;
-        }
-        let now = Instant::now();
-        let ttl = self.ttl;
-        let before = self.map.len();
-        self.map
-            .retain(|_, e| now.saturating_duration_since(e.last_seen) <= ttl);
-        let removed = before - self.map.len();
-        self.flush_dump();
-        removed
-    }
-
     /// Write the raw-triple archive to `session_timestamp.json` (whole-file
-    /// overwrite). No-op when disabled or when no path is configured (tests).
+    /// overwrite). Called on shutdown for a final snapshot. No-op when disabled
+    /// or when no path is configured (tests).
     pub fn flush_dump(&self) {
-        let (Some(archive), Some(path)) = (&self.archive, &self.dump_path) else {
-            return;
-        };
-        // Snapshot into an ordered map so the JSON is stable/diff-friendly.
-        let snapshot: BTreeMap<String, Vec<Triple>> = archive
-            .iter()
-            .map(|kv| (kv.key().clone(), kv.value().clone()))
-            .collect();
-        match serde_json::to_vec(&snapshot) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, &bytes) {
-                    tracing::warn!(path, error = %e, "session-stats: timestamp dump write failed");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "session-stats: timestamp dump serialize failed"),
+        if let (Some(archive), Some(path)) = (&self.archive, &self.dump_path) {
+            write_snapshot(archive, path);
         }
     }
+}
+
+/// Serialize the archive to `path` as a whole-file JSON snapshot.
+fn write_snapshot(archive: &DashMap<String, Vec<Triple>>, path: &str) {
+    // Snapshot into an ordered map so the JSON is stable / diff-friendly.
+    let snapshot: BTreeMap<String, Vec<Triple>> = archive
+        .iter()
+        .map(|kv| (kv.key().clone(), kv.value().clone()))
+        .collect();
+    match serde_json::to_vec(&snapshot) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(path, &bytes) {
+                tracing::warn!(path, error = %e, "session-stats: timestamp dump write failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "session-stats: timestamp dump serialize failed"),
+    }
+}
+
+/// Spawn the periodic flush task that rewrites `session_timestamp.json` every
+/// [`FLUSH_INTERVAL`]. Runs until the runtime is torn down at shutdown.
+fn spawn_periodic_flush(archive: Archive, path: String) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            write_snapshot(&archive, &path);
+        }
+    });
 }
 
 fn dur_ms(d: Duration) -> f32 {
@@ -290,24 +287,16 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Enabled collector with an in-memory archive but no file (asserts the
-    /// triple/log logic without touching disk).
+    /// triple/log logic without touching disk or spawning the flush task).
     fn test_stats() -> Arc<SessionStats> {
         Arc::new(SessionStats {
             map: DashMap::new(),
-            ttl: Duration::from_secs(900),
-            archive: Some(DashMap::new()),
+            archive: Some(Arc::new(DashMap::new())),
             dump_path: None,
         })
     }
@@ -350,7 +339,7 @@ mod tests {
         let [r1, f1, e1] = ts[1];
         assert!((f1 - r1 - 0.100).abs() < 0.02, "prefill≈100ms: {}", f1 - r1);
         assert!((e1 - f1 - 0.200).abs() < 0.02, "decode≈200ms: {}", e1 - f1);
-        // (Cross-turn cycle is validated via the log/`total_t` path, not the
+        // (Cross-turn cycle is validated via the log/`total_ms` path, not the
         // triples: each triple's wall clock is anchored at its own `t_end`, so
         // comparing across turns would mix synthetic test instants with the real
         // clock. The within-triple deltas above are the meaningful invariant.)
@@ -389,8 +378,7 @@ mod tests {
         s.on_first_token("sid", at(t0, 100));
         s.on_turn_end("sid", at(t0, 600));
         assert!(s.map.get("sid").unwrap().pending.is_some());
-        // Turn 2's t_recv → prior turn's `t` is logged (total_t = 1600 - 0) and
-        // the pending slot is cleared.
+        // Turn 2's t_recv → prior turn's `t` is logged and pending is cleared.
         s.on_turn_start("sid", at(t0, 1600));
         assert!(
             s.map.get("sid").unwrap().pending.is_none(),
@@ -406,6 +394,5 @@ mod tests {
         s.on_first_token("sid", at(t0, 10));
         s.on_turn_end("sid", at(t0, 50));
         assert!(s.is_empty());
-        assert_eq!(s.sweep(), 0);
     }
 }
