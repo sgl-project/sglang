@@ -822,6 +822,9 @@ class TestShardConfig(unittest.TestCase):
             "sglang.srt.model_loader.loader.get_server_args",
             return_value=server_args,
         ), mock.patch(
+            "sglang.srt.model_loader.loader.configured_moe_dp_size",
+            return_value=2,
+        ), mock.patch(
             "sglang.srt.model_loader.loader.get_parallel",
             return_value=parallel,
         ), mock.patch(

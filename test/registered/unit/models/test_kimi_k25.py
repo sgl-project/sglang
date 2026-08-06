@@ -479,12 +479,7 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     model.mm_projector = _IdentityProjector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
 
-    with get_parallel().override(
-        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
-    ), patch(
-        "sglang.srt.models.kimi_k25.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
-    ):
+    with get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0):
         model.get_image_feature(items)
 
     # A device copy would cost one sync per .tolist() inside MoonViT3d.

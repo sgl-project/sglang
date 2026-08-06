@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -1036,7 +1037,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             get_exec().mamba.mamba_track_interval,
-            server_args.max_speculative_num_draft_tokens,
+            max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
