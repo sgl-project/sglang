@@ -40,13 +40,13 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             patch.object(vmm, "_get_cuda_driver", return_value=driver),
             patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
             patch.object(vmm, "check_drv", side_effect=check_driver),
-            self.assertRaisesRegex(RuntimeError, "Failed to release"),
+            self.assertRaisesRegex(RuntimeError, "forced address-free failure"),
         ):
             pool._release_allocation()
 
         self.assertFalse(pool._allocation_mapped)
         self.assertEqual(pool._pool_pointer, 123)
-        self.assertIsNone(pool._allocation_handle)
+        self.assertEqual(pool._allocation_handle, 456)
 
         with (
             patch.object(vmm, "_get_cuda_driver", return_value=driver),
@@ -56,6 +56,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             pool._release_allocation()
 
         self.assertIsNone(pool._pool_pointer)
+        self.assertIsNone(pool._allocation_handle)
         self.assertEqual(driver.cuMemUnmap.call_count, 1)
         self.assertEqual(driver.cuMemAddressFree.call_count, 2)
         self.assertEqual(driver.cuMemRelease.call_count, 1)

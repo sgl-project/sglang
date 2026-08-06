@@ -1191,6 +1191,7 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
+        startup_complete = False
         try:
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
@@ -1212,17 +1213,10 @@ class Engine(EngineScoreMixin, EngineBase):
                 processes=processes, process_names=names
             )
             subprocess_watchdog.start()
-        except BaseException as error:
-            if isinstance(tokenizer_manager, TokenizerManager):
-                try:
-                    tokenizer_manager.cuda_vmm_feature_transport.shutdown()
-                except BaseException as cleanup_error:
-                    error.add_note(
-                        "CUDA VMM feature transport cleanup also failed during "
-                        "engine startup rollback"
-                    )
-                    raise error from cleanup_error
-            raise
+            startup_complete = True
+        finally:
+            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
+                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
         return (
             tokenizer_manager,

@@ -623,62 +623,31 @@ class CudaVmmMemoryPool:
 
     def _release_allocation(self) -> None:
         self.memory_pool = None
-        errors = []
         if not self.use_fabric and self.shareable_handle is not None:
-            try:
-                os.close(self.shareable_handle)
-            except BaseException as error:
-                errors.append(error)
-            else:
-                self.shareable_handle = None
-
-        if self._pool_pointer is not None or self._allocation_handle is not None:
-            try:
-                drv = _get_cuda_driver()
-                with torch.cuda.device(self.device_index):
-                    if self._allocation_mapped:
-                        try:
-                            check_drv(
-                                drv.cuMemUnmap(
-                                    self._pool_pointer, self.allocation_size
-                                ),
-                                "cuMemUnmap(VMM transport pool)",
-                            )
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._allocation_mapped = False
-
-                    if self._pool_pointer is not None and not self._allocation_mapped:
-                        try:
-                            check_drv(
-                                drv.cuMemAddressFree(
-                                    self._pool_pointer, self.allocation_size
-                                ),
-                                "cuMemAddressFree(VMM transport pool)",
-                            )
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._pool_pointer = None
-
-                    if self._allocation_handle is not None:
-                        try:
-                            check_drv(
-                                drv.cuMemRelease(self._allocation_handle),
-                                "cuMemRelease(VMM transport pool)",
-                            )
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._allocation_handle = None
-            except BaseException as error:
-                errors.append(error)
-
-        if errors:
-            raise RuntimeError(
-                f"Failed to release {len(errors)} CUDA VMM pool resource(s)"
-            ) from errors[0]
+            os.close(self.shareable_handle)
+            self.shareable_handle = None
+        if self._pool_pointer is None and self._allocation_handle is None:
+            return
+        drv = _get_cuda_driver()
+        with torch.cuda.device(self.device_index):
+            if self._allocation_mapped:
+                check_drv(
+                    drv.cuMemUnmap(self._pool_pointer, self.allocation_size),
+                    "cuMemUnmap(VMM transport pool)",
+                )
+                self._allocation_mapped = False
+            if self._pool_pointer is not None:
+                check_drv(
+                    drv.cuMemAddressFree(self._pool_pointer, self.allocation_size),
+                    "cuMemAddressFree(VMM transport pool)",
+                )
+                self._pool_pointer = None
+            if self._allocation_handle is not None:
+                check_drv(
+                    drv.cuMemRelease(self._allocation_handle),
+                    "cuMemRelease(VMM transport pool)",
+                )
+                self._allocation_handle = None
 
     def shutdown(self) -> None:
         with self._shutdown_lock:

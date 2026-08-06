@@ -374,14 +374,14 @@ class TestCudaVmmTransport(CustomTestCase):
             try:
                 with patch("torch.cuda.current_stream", return_value=stream):
                     pool.wrap_tensor(torch.ones(16, device="cuda:0"))
-            except BaseException as error:  # pragma: no cover
+            except Exception as error:  # pragma: no cover
                 errors.append(error)
 
         def shutdown():
             shutdown_entered.set()
             try:
                 pool.shutdown()
-            except BaseException as error:  # pragma: no cover
+            except Exception as error:  # pragma: no cover
                 errors.append(error)
             finally:
                 shutdown_finished.set()
