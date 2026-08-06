@@ -31,7 +31,7 @@ on:
       partitions:
         description: 'partitions config, e.g. {"size":1,"arr":[0]}'
         type: string
-        default: toJson({"size":1,"arr":[0])
+        default: '{"size":1,"arr":[0]}'
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
