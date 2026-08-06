@@ -656,6 +656,56 @@ class TestLayerPartition(CustomTestCase):
             namespace_digest(_mla_namespace()),
         )
 
+    def test_integer_layer_grid_spelling(self):
+        # layer_partition may be an integer (uniform layers per cell); the
+        # equivalent boundary list canonicalizes to the SAME digest, so both
+        # spellings of one grid share one keyspace.
+        from sglang.srt.mem_cache.hicache_key_scheme import canonical_layer_grid
+
+        common = dict(
+            model_id="x",
+            dtype="bfloat16",
+            page_size=64,
+            rank_replicated=True,
+            total_kv_heads=0,
+            head_group=0,
+            object_layout="page_first_direct",
+        )
+        ns_int = derive_namespace(layer_group=40, **common)
+        ns_list = derive_namespace(layer_boundaries=[0, 40, 80], **common)
+        self.assertEqual(namespace_digest(ns_int), namespace_digest(ns_list))
+        self.assertEqual(ns_list.layer_group, 40)
+        self.assertEqual(ns_list.layer_boundaries, [])
+
+        def suffixes(ns, start, end):
+            return build_canonical_cell_suffixes(
+                ns,
+                attn_tp_rank=0,
+                attn_tp_size=2,
+                attn_cp_size=1,
+                start_layer=start,
+                end_layer=end,
+                local_kv_heads=0,
+                dtype="bfloat16",
+                page_size=64,
+                model_id="x",
+                rank_replicated=True,
+                object_layout="page_first_direct",
+            )
+
+        digest = namespace_digest(ns_int)
+        self.assertEqual(
+            suffixes(ns_int, 0, 80), [f"{digest}_L0-40", f"{digest}_L40-80"]
+        )
+        self.assertEqual(suffixes(ns_list, 0, 80), suffixes(ns_int, 0, 80))
+        # Misaligned stage (uneven model) fails with the list-form remedy.
+        with self.assertRaisesRegex(ValueError, "layer_partition"):
+            suffixes(ns_int, 30, 61)
+        # The two spellings are mutually exclusive; non-uniform lists stay.
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            canonical_layer_grid(40, [0, 30, 61])
+        self.assertEqual(canonical_layer_grid(0, [0, 30, 61]), (0, [0, 30, 61]))
+
     def test_bad_boundaries_rejected(self):
         for bad in ([0], [5, 30], [0, 30, 30]):
             with self.assertRaises(ValueError):

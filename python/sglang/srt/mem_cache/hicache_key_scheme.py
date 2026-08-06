@@ -97,9 +97,13 @@ class KVCacheNamespace(
     # such namespaces have no head axis (total_kv_heads/head_group are 0).
     rank_replicated: bool
     total_kv_heads: int
-    # Head grid: kv heads per cell. Layer cells are absolute per-stage layer
-    # ranges in v1; layer_group must stay 0 (uniform layer grids with
-    # fan-out are the follow-up).
+    # Head grid: kv heads per cell. Layer grid, one of two spellings:
+    # layer_group > 0 = uniform grid (Lg layers per cell; every stage must
+    # start AND end on multiples of Lg, which also forces Lg to divide the
+    # model's layer count via the last stage); layer_boundaries = explicit
+    # boundary list for uneven partitions. Mutually exclusive; a uniform
+    # boundary list is canonicalized to layer_group so both spellings of the
+    # same grid share one digest.
     layer_group: int = 0
     head_group: int
     # Optional kernel/build ABI digest; deployments whose numerics must not
@@ -162,6 +166,7 @@ def derive_namespace(
     head_group: int,
     object_layout: str,
     layer_boundaries: Optional[list[int]] = None,
+    layer_group: int = 0,
 ) -> KVCacheNamespace:
     """Derive the namespace from deployment facts plus the fleet agreements.
 
@@ -175,6 +180,7 @@ def derive_namespace(
     All other mismatches (model, logical dtype, page size) partition into
     disjoint keyspaces — safe, never a geometry collision.
     """
+    layer_group, boundaries = canonical_layer_grid(layer_group, layer_boundaries)
     namespace = KVCacheNamespace(
         model_id=model_id,
         dtype=dtype,
@@ -183,18 +189,41 @@ def derive_namespace(
         total_kv_heads=0 if rank_replicated else total_kv_heads,
         head_group=0 if rank_replicated else head_group,
         object_layout=object_layout,
-        layer_boundaries=list(layer_boundaries) if layer_boundaries else [],
+        layer_group=layer_group,
+        layer_boundaries=boundaries,
     )
     _validate_grid(namespace)
     return namespace
 
 
+def canonical_layer_grid(
+    layer_group: int, layer_boundaries: Optional[list[int]]
+) -> tuple[int, list[int]]:
+    """Normalize the two layer-grid spellings to one canonical form.
+
+    A uniform boundary list ([0, 40, 80]) and the equivalent integer
+    (layer_group=40) must produce the same namespace digest, so uniform
+    lists collapse to the integer form here.
+    """
+    boundaries = list(layer_boundaries) if layer_boundaries else []
+    if layer_group and boundaries:
+        raise ValueError(
+            "layer_group and layer_boundaries are mutually exclusive "
+            "spellings of the layer grid; set one."
+        )
+    if len(boundaries) >= 2:
+        diffs = {b - a for a, b in zip(boundaries, boundaries[1:])}
+        if len(diffs) == 1:
+            return diffs.pop(), []
+    return layer_group, boundaries
+
+
 def _validate_grid(namespace: KVCacheNamespace) -> None:
-    if namespace.layer_group != 0:
-        raise NotImplementedError(
-            f"layer_group={namespace.layer_group}: uniform layer grids with "
-            f"multi-cell fan-out are not implemented; v1 uses per-stage layer "
-            f"ranges (layer_group=0)."
+    if namespace.layer_group < 0:
+        raise ValueError(f"layer_group must be non-negative: {namespace}")
+    if namespace.layer_group and namespace.layer_boundaries:
+        raise ValueError(
+            f"layer_group and layer_boundaries are mutually exclusive: " f"{namespace}"
         )
     boundaries = namespace.layer_boundaries
     if boundaries:
@@ -286,7 +315,17 @@ def build_canonical_cell_suffixes(
     # align to boundaries and owns one cell per contained range (layer
     # fan-out — this is what lets a reader consume cells written under a
     # different pipeline split).
-    if namespace.layer_boundaries:
+    if namespace.layer_group:
+        lg = namespace.layer_group
+        if start_layer % lg != 0 or end_layer % lg != 0:
+            raise ValueError(
+                f"this rank's layer range [{start_layer}, {end_layer}) does "
+                f"not align to the uniform layer_group={lg}; stages must "
+                f"start and end on multiples of it (uneven models need the "
+                f"layer_partition boundary-list form instead)."
+            )
+        layer_coords = [f"L{a}-{a + lg}" for a in range(start_layer, end_layer, lg)]
+    elif namespace.layer_boundaries:
         boundaries = namespace.layer_boundaries
         if start_layer not in boundaries or end_layer not in boundaries:
             raise ValueError(

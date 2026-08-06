@@ -640,15 +640,24 @@ class HiCacheController:
 
         if head_group_knob is not None and not _is_exact_int(head_group_knob):
             raise ValueError(f"head_group must be an integer, got {head_group_knob!r}.")
-        if layer_partition is not None and (
-            not isinstance(layer_partition, list)
-            or len(layer_partition) < 2
-            or not all(_is_exact_int(b) for b in layer_partition)
-        ):
-            raise ValueError(
-                f"layer_partition must be a list of at least two integer "
-                f"boundaries, got {layer_partition!r}."
-            )
+        if layer_partition is not None:
+            # Two spellings: a positive integer (uniform grid, layers per
+            # cell) or an explicit boundary list for uneven partitions.
+            if _is_exact_int(layer_partition):
+                if layer_partition <= 0:
+                    raise ValueError(
+                        f"layer_partition must be positive: {layer_partition}"
+                    )
+            elif (
+                not isinstance(layer_partition, list)
+                or len(layer_partition) < 2
+                or not all(_is_exact_int(b) for b in layer_partition)
+            ):
+                raise ValueError(
+                    f"layer_partition must be a positive integer (uniform "
+                    f"layers per cell) or a list of at least two integer "
+                    f"boundaries, got {layer_partition!r}."
+                )
         if get_memory().hicache_storage_key_scheme == "canonical-grid":
             if tp_lcm_size:
                 raise ValueError(
@@ -865,7 +874,10 @@ class HiCacheController:
             # produces identical canonical bytes, so the identity field is a
             # constant and mixed-layout fleets share one keyspace.
             object_layout="cell-v1" if adapter_mode else self.mem_pool_host.layout,
-            layer_boundaries=layer_partition,
+            layer_boundaries=(
+                layer_partition if isinstance(layer_partition, list) else None
+            ),
+            layer_group=(layer_partition if isinstance(layer_partition, int) else 0),
         )
 
         suffixes = build_canonical_cell_suffixes(
@@ -907,11 +919,19 @@ class HiCacheController:
                     "--hicache-mem-layout page_first_direct (layer-major "
                     "page blocks give one contiguous slab per cell)."
                 )
-            boundaries = [b for b in layer_partition if start_layer <= b <= end_layer]
-            canonical_layer_ranges = [
-                (a - start_layer, b - start_layer)
-                for a, b in zip(boundaries, boundaries[1:])
-            ]
+            if isinstance(layer_partition, int):
+                canonical_layer_ranges = [
+                    (a - start_layer, a + layer_partition - start_layer)
+                    for a in range(start_layer, end_layer, layer_partition)
+                ]
+            else:
+                boundaries = [
+                    b for b in layer_partition if start_layer <= b <= end_layer
+                ]
+                canonical_layer_ranges = [
+                    (a - start_layer, b - start_layer)
+                    for a, b in zip(boundaries, boundaries[1:])
+                ]
             if adapter_mode:
                 # Cell adapter: objects are canonical-order gathers, so the
                 # backend also needs the local head ranges; the suffix list
