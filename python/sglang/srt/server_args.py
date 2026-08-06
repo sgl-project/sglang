@@ -1130,6 +1130,11 @@ class ServerArgs:
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
         NS("parallel"),
     ] = False
+    enable_kv_cache_sharding: A[
+        bool,
+        "Shard at-rest KV cache storage at page granularity across the group that currently replicates it (attention-CP ranks for GQA models under prefill CP; attention-TP ranks for MLA models), multiplying the group's unique KV capacity. Prefill workers of PD disaggregation only.",
+        NS("parallel"),
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -3569,6 +3574,9 @@ class ServerArgs:
 
         # Handle context parallelism.
         self._handle_context_parallelism()
+
+        # Validate logical-page KV cache sharding (needs resolved attn_cp_size).
+        self._handle_kv_cache_sharding()
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
@@ -6370,6 +6378,168 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def kv_shard_group_size(self) -> int:
+        """Shard-group size of logical-page KV sharding; 1 when the feature is
+        off. Must agree with mem_cache.page_interleave.get_kv_shard_group: the
+        shard axis is chosen by topology — an active attention-CP group takes
+        precedence (CP replicates KV at rest for every attention type);
+        without CP, MLA latent KV is still replicated across attention-TP."""
+        if not self.enable_kv_cache_sharding:
+            return 1
+        view = self._resolved()
+        if view.attn_cp_size > 1:
+            return view.attn_cp_size
+        if self.use_mla_backend():
+            # Plain-TP MLA prefill (enable_dp_attention and prefill CP are
+            # validated off in this arm), so attn_tp_size == tp_size.
+            return self.tp_size
+        return 1
+
+    def _handle_kv_cache_sharding(self):
+        if not self.enable_kv_cache_sharding:
+            return
+
+        if self.disaggregation_mode != "prefill":
+            raise ValueError(
+                "--enable-kv-cache-sharding is only supported on PD prefill "
+                "workers: a rank's pool holds only its stripe of every cached "
+                "page, which is incompatible with local decode."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support speculative decoding."
+            )
+        if self.dcp_size > 1:
+            raise ValueError(
+                "--enable-kv-cache-sharding and decode context parallelism "
+                "(--dcp-size) are mutually exclusive users of the widened "
+                "allocator index space."
+            )
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support "
+                "--enable-hierarchical-cache yet: HiCache backup/load assumes "
+                "each rank holds full pages."
+            )
+        if self.enable_lmcache:
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support --enable-lmcache."
+            )
+        if self.enable_dynamic_chunking:
+            raise ValueError(
+                "--enable-kv-cache-sharding requires fixed chunk sizes; "
+                "disable --enable-dynamic-chunking."
+            )
+        if self.enable_two_batch_overlap:
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support "
+                "--enable-two-batch-overlap: the sharded pool's per-batch "
+                "gather plan is a process-wide singleton, but TBO rebuilds "
+                "attention metadata for the primary and both micro-batch "
+                "children, calling begin_shard_extend multiple times per "
+                "extend forward and clobbering the plan mid-batch."
+            )
+        if self.get_model_config().attention_chunk_size is not None:
+            raise ValueError(
+                "--enable-kv-cache-sharding does not support chunked/local-"
+                "attention models yet: local-attention metadata is built from "
+                "the page table before the scratch translation."
+            )
+        prefill_backend, _ = self.get_attention_backends()
+        if prefill_backend != "fa3":
+            raise ValueError(
+                "--enable-kv-cache-sharding currently requires the fa3 "
+                f"prefill attention backend, got {prefill_backend!r}."
+            )
+        if self.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+            raise ValueError(
+                "--enable-kv-cache-sharding currently only supports the "
+                "mooncake and nixl transfer backends: both route sends "
+                "through CommonKVSender._prepare_send_indices (the "
+                "owner-strided filter) and pair destinations by fancy "
+                "index. Got --disaggregation-transfer-backend "
+                f"{self.disaggregation_transfer_backend!r}."
+            )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            raise ValueError(
+                "--enable-kv-cache-sharding is incompatible with "
+                "SGLANG_DISAGG_STAGING_BUFFER (the staging path assumes "
+                "contiguous send slices)."
+            )
+
+        view = self._resolved()
+        if self.use_mla_backend():
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            if is_deepseek_dsa(self.get_model_config().hf_config):
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support DSA models "
+                    "yet (indexer buffers are not striped)."
+                )
+            # With prefill CP active MLA shards across the attn-CP group and
+            # reads through the absorbed-MLA CP path; dp-attention (forced on
+            # by the DeepSeek CP overrides) is fine there because the CP group
+            # is the replicated axis. Without CP the shard axis falls back to
+            # attn-TP, which requires plain-TP attention.
+            if view.attn_cp_size <= 1:
+                if view.enable_dp_attention:
+                    raise ValueError(
+                        "--enable-kv-cache-sharding for MLA models without "
+                        "prefill CP shards across attention-TP and requires "
+                        "plain TP attention; disable --enable-dp-attention."
+                    )
+                if self.tp_size <= 1:
+                    raise ValueError(
+                        "--enable-kv-cache-sharding for MLA models without "
+                        "prefill CP shards across attention-TP ranks and "
+                        "needs tp_size > 1."
+                    )
+        else:
+            if not self.enable_prefill_cp or view.attn_cp_size <= 1:
+                raise ValueError(
+                    "--enable-kv-cache-sharding for GQA models shards across "
+                    "attention-CP ranks and requires --enable-prefill-cp with "
+                    "attn_cp_size > 1."
+                )
+
+        # page_size is a resolvable field, so mid-resolution it must be read
+        # through the pass view rather than off self.
+        resolved_page_size = view.page_size if view.page_size is not None else 1
+        if resolved_page_size <= 1:
+            raise ValueError(
+                "--enable-kv-cache-sharding requires a real page size "
+                "(--page-size 64 recommended): the physical page is the P/D "
+                "transfer descriptor and the gather-copy unit; page_size=1 "
+                "degenerates both into per-token operations."
+            )
+        granule = self.kv_shard_group_size() * resolved_page_size
+        if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
+            raise ValueError(
+                "--enable-kv-cache-sharding requires chunked prefill "
+                "(--chunked-prefill-size > 0)."
+            )
+        if self.chunked_prefill_size % granule != 0:
+            rounded = (self.chunked_prefill_size + granule - 1) // granule * granule
+            logger.warning(
+                "Rounding --chunked-prefill-size up from %d to %d "
+                "(a multiple of shard_size * page_size = %d) for KV sharding.",
+                self.chunked_prefill_size,
+                rounded,
+                granule,
+            )
+            self.chunked_prefill_size = rounded
+
+        # The sharded prefill path issues NCCL gathers and host-side plan
+        # building per batch, and a captured prefill graph pins absorbed MLA,
+        # which cannot read a sharded pool. Keep prefill eager.
+        if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            logger.warning(
+                "Prefill CUDA graph (%s) is incompatible with "
+                "--enable-kv-cache-sharding; disabling it.",
+                self.cuda_graph_config.prefill.backend,
+            )
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _handle_dwdp(self):
         if self.dwdp_size <= 1:

@@ -13,6 +13,7 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -127,6 +128,32 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         available_size = allocator.available_size()
         if available_size < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+            _evict_until_allocatable(tree_cache, allocator, num_tokens)
+
+
+def _evict_until_allocatable(
+    tree_cache: BasePrefixCache, allocator, num_tokens: int
+) -> None:
+    """Keep evicting the shortfall until `num_tokens` are allocatable.
+
+    Under classed page sharding available_size() reports the MIN-CLASS
+    capacity floor, so a single evict() sized in tokens can raise that floor by
+    less than the number of tokens it freed: the evicted pages spread across
+    all owner classes. Looping is deterministic, so it stays mirrored across
+    the ranks of a shard group. Stock allocators need no extra pass.
+    """
+    if page_interleave_shard_size(allocator) <= 1:
+        return
+    while True:
+        available_size = allocator.available_size()
+        if available_size >= num_tokens:
+            return
+        shortfall = num_tokens - available_size
+        result = tree_cache.evict(
+            EvictParams(num_tokens=max(shortfall, allocator.page_size))
+        )
+        if result.num_tokens_evicted == 0:
+            return
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
@@ -189,6 +216,10 @@ def _release_overallocated_kv_indices(
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
+    # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
+    # page: paged free() releases the whole page containing any freed index, so
+    # a boundary aligned only to the kernel page could free a widened page whose
+    # head rows are still live.
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
@@ -196,8 +227,8 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        # start_p is aligned to the allocator's physical page size above, so it
-        # never shares a page with cache_finished_req's tail free in this group.
+        # start_p is aligned to the allocator's page above, so it never shares a
+        # page with cache_finished_req's tail free in this group.
         allocator.free_segment(indices_to_free, start_pos=start_p)
 
 

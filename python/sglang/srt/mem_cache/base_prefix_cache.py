@@ -74,6 +74,11 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # Logical-page KV sharding: rotation base of the chain the inserted
+    # values belong to (stamped onto new TreeNodes; None when sharding is
+    # off). See TreeNode.rotation_base.
+    rotation_base: Optional[int] = None
+
 
 @dataclasses.dataclass
 class InsertResult:
@@ -83,6 +88,13 @@ class InsertResult:
     total_len: int = 0
     last_device_node: Any = None
     mamba_exist: bool = False
+
+    # Logical-page KV sharding: the un-matched tail was NOT inserted because
+    # its rotation base disagrees with the matched chain's (a cross-chain
+    # graft would break the cyclic-owner gather contract). The tail's pages
+    # stay owned by the inserting request; callers must not dedup/rebind
+    # past prefix_len.
+    rotation_tail_declined: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.

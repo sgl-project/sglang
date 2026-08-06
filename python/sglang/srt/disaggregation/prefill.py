@@ -57,6 +57,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -65,7 +66,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -144,8 +145,13 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        # Capacity bound in the allocator's (logical) token units — widened
+        # by the shard-group size under logical-page KV sharding.
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            * page_interleave_shard_size(
+                self.scheduler.tp_worker.model_runner.token_to_kv_pool_allocator
+            )
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
@@ -340,6 +346,21 @@ class PrefillBootstrapQueue:
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        if (
+            get_parallel().enable_kv_cache_sharding
+            and self.kv_manager.kv_shard_size > 1
+        ):
+            # Logical-page KV sharding: chunk starts must stay page-aligned —
+            # the sender samples one wire entry per physical page (stride
+            # ps), so an off-page start would misalign every sample.
+            # Ownership itself is value-derived (owner = logical page % N in
+            # filter_kv_indices_for_shard_rank), independent of where send
+            # position 0 sits.
+            physical_page_size = self.token_to_kv_pool.page_size
+            assert decode_prefix_len % physical_page_size == 0, (
+                f"decode-cached prefix ({decode_prefix_len}) must be "
+                f"page-aligned under KV sharding"
+            )
         req.pending_bootstrap = False
         return True
 
@@ -590,6 +611,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
@@ -642,6 +665,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1088,9 +1113,9 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
-            # DCP radix hits can end on a logical cache-page boundary that is
-            # not a complete physical DCP page. The regular final send covers
-            # the full range; only skip this optional early-send optimization.
+            # Under DCP the allocator page is wider than the kernel page and
+            # a radix hit may end inside one. The regular final send covers the
+            # full range; only this optional early send is skipped.
             return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
@@ -1241,6 +1266,11 @@ class SchedulerDisaggregationPrefillMixin:
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
         ]
+        # Under logical-page KV sharding this is one LOGICAL page id
+        # (loc // ps) per physical page position — the canonical array is
+        # identical on every rank; each rank's sender derives ownership from
+        # the value (owner = l % N) and emits the wire value l // N (the
+        # owner's local page id) in filter_kv_indices_for_shard_rank.
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return

@@ -161,6 +161,8 @@ class TestGetDcpLens(CustomTestCase):
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,
+                kv_shard_size=1,
+                kv_shard_spec=None,
             )
             with patch(
                 "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
