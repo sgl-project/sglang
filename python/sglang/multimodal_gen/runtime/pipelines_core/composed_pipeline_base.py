@@ -256,13 +256,14 @@ class ComposedPipelineBase(ABC):
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
-                "GlmImagePipeline": {"vae", "transformer"},
                 "WanImageToVideoPipeline": {"vae"},
                 "WanImageToVideoDmdPipeline": {"vae"},
                 "MOVA": {"video_vae", "audio_vae"},
                 "MOVAPipeline": {"video_vae", "audio_vae"},
             },
-            RoleType.DENOISER: {},
+            RoleType.DENOISER: {
+                "GlmImagePipeline": {"text_encoder", "tokenizer", "vae"},
+            },
             RoleType.DECODER: {},
         }
         extra_allowed_modules = set(

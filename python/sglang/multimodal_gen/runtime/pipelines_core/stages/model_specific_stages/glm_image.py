@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -476,8 +477,9 @@ class GlmImageAR(PipelineStage):
         height: int,
         width: int,
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
-        device = get_local_torch_device()
+        device = device or get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         input_ids = []
@@ -791,6 +793,10 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
     """
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
 
     def __init__(
         self,
