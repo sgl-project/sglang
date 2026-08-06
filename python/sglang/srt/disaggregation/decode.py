@@ -456,6 +456,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            # Snapshot the target-model K/V layer count BEFORE appending draft
+            # pointers. Sent over the wire to prefill so that
+            # get_mha_kv_ptrs_with_pp can compute the correct V offset:
+            # without this, `len(dst_kv_ptrs) // 2` overcounts by the number
+            # of draft K layers and every V pointer is shifted, corrupting
+            # both target V (each layer off by one) and draft K (overwritten
+            # by the last target V write on the last PP rank).
+            kv_args.num_target_kv_layers = len(kv_data_ptrs) // 2
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens

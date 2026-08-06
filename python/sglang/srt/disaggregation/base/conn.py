@@ -84,6 +84,17 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Number of TARGET-model KV layers (K or V section length) BEFORE any
+    # draft-model KV pointers have been appended to kv_data_ptrs. Populated
+    # on the engine side (decode.py / prefill.py) so PD KV transfer can
+    # compute the correct V-pointer offset when the receiver has appended
+    # its NEXTN/MTP draft KV to a target-model KV pool. The transport
+    # forwards this value across the wire so the sender can override the
+    # unsafe `len(dst_kv_ptrs) // 2` assumption in
+    # CommonKVManager.get_mha_kv_ptrs_with_pp (else-branch, case 3).
+    # -1 sentinel means "not populated" -> keep the legacy `len // 2`
+    # behavior (equivalent to no MTP on decode side).
+    num_target_kv_layers: int
 
 
 class KVPoll:

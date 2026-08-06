@@ -220,6 +220,11 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            # Symmetric snapshot with decode.py: record target-model layer
+            # count before draft pointers are appended so downstream code
+            # (either side, if ever used as sender) can compute the correct
+            # V-pointer offset instead of relying on `len // 2`.
+            kv_args.num_target_kv_layers = len(kv_data_ptrs) // 2
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens

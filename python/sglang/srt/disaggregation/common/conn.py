@@ -790,7 +790,10 @@ class CommonKVManager(BaseKVManager):
             sock.send_multipart(parts)
 
     def get_mha_kv_ptrs_with_pp(
-        self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        num_dst_target_kv_layers: Optional[int] = None,
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
@@ -814,10 +817,30 @@ class CommonKVManager(BaseKVManager):
                 v_ptr_offset + start_layer : v_ptr_offset + end_layer
             ]
         else:
-            # Decode pp size should be equal to prefill pp size or 1
+            # Case: PP>1 and non-equal layer counts. dst_kv_ptrs layout is
+            # [K_target..., V_target..., K_draft..., V_draft...] whenever the
+            # decode side has appended MTP/NEXTN draft KV to a target-model
+            # KV pool. `len(dst_kv_ptrs) // 2` therefore OVERCOUNTS the
+            # target section by the number of draft K layers, and every V
+            # slice below would be shifted by that amount -- corrupting
+            # target V (each layer off by draft_layers) and, on the last PP
+            # rank, overwriting draft K with the tail-end target V writes.
+            # To handle this, decode.py sends `num_target_kv_layers` (the
+            # target-only K/V section length, captured BEFORE draft ptrs
+            # were appended) over the wire; we prefer it when available and
+            # fall back to the legacy `len // 2` when the wire field is
+            # absent (older receivers, or no MTP -> the two values agree).
+            v_layer_offset = (
+                num_dst_target_kv_layers
+                if (
+                    num_dst_target_kv_layers is not None
+                    and num_dst_target_kv_layers > 0
+                )
+                else dst_num_total_layers
+            )
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+                v_layer_offset + start_layer : v_layer_offset + end_layer
             ]
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
