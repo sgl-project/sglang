@@ -4517,8 +4517,13 @@ class ServerArgs:
                 return
 
     def _disable_full_prefill_cudagraph_if_incompatible(self):
-        """Full prefill CG: empty rule list today; see the experimental warning."""
-        rules = []
+        """Full prefill CG: see the experimental warning for anything not listed."""
+        rules = [
+            # Capture runs before any prepare_lora_batch, so the recorded graph
+            # applies no adapter; adapter-bearing prefill batches would replay
+            # it and silently drop their LoRA deltas.
+            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
+        ]
         for name, predicate in rules:
             if predicate():
                 logger.warning(
