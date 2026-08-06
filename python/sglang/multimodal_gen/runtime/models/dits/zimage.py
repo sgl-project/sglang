@@ -1,5 +1,5 @@
 import math
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -181,6 +181,7 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        activation: Optional[nn.Module] = None,
     ):
         super().__init__()
         # Use MergedColumnParallelLinear for gate and up projection (fused)
@@ -200,7 +201,7 @@ class FeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.w2",
         )
-        self.act = SiluAndMul()
+        self.act = activation if activation is not None else SiluAndMul()
 
     def forward(self, x):
         x13, _ = self.w13(x)
@@ -219,6 +220,8 @@ class ZImageAttention(nn.Module):
         eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qk_norm_factory: Optional[Callable[..., nn.Module]] = None,
+        allow_fused_qk_norm_rope: bool = True,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -226,7 +229,8 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
-        self.enable_zimage_qk_fusion = quant_config is None
+        # The fused norm+RoPE kernel cannot represent every injected norm policy.
+        self.enable_zimage_qk_fusion = allow_fused_qk_norm_rope and quant_config is None
 
         tp_size = get_tp_world_size()
         assert (
@@ -277,8 +281,9 @@ class ZImageAttention(nn.Module):
             )
 
         if self.qk_norm:
-            self.norm_q = ZImageRMSNorm(self.head_dim, eps=eps)
-            self.norm_k = ZImageRMSNorm(self.head_dim, eps=eps)
+            norm_cls = qk_norm_factory if qk_norm_factory is not None else ZImageRMSNorm
+            self.norm_q = norm_cls(self.head_dim, eps=eps)
+            self.norm_k = norm_cls(self.head_dim, eps=eps)
         else:
             self.norm_q = None
             self.norm_k = None
@@ -680,10 +685,13 @@ class RopeEmbedder:
         theta: float = 256.0,
         axes_dims: List[int] = (16, 56, 56),
         axes_lens: List[int] = (64, 128, 128),
+        freqs_dtype: torch.dtype = torch.float32,
     ):
         self.theta = theta
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
+        # Precision used to evaluate the phase before storing fp32 tables.
+        self.freqs_dtype = freqs_dtype
         assert len(axes_dims) == len(
             axes_lens
         ), "axes_dims and axes_lens must have the same length"
@@ -692,7 +700,12 @@ class RopeEmbedder:
         self.sin_cached = None
 
     @staticmethod
-    def precompute_freqs(dim: List[int], end: List[int], theta: float = 256.0):
+    def precompute_freqs(
+        dim: List[int],
+        end: List[int],
+        theta: float = 256.0,
+        freqs_dtype: torch.dtype = torch.float32,
+    ):
         with torch.device("cpu"):
             cos_list = []
             sin_list = []
@@ -702,10 +715,10 @@ class RopeEmbedder:
                     ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d)
                 )
                 timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
-                freqs = torch.outer(timestep, freqs).float()
+                freqs = torch.outer(timestep, freqs).to(freqs_dtype)
 
-                cos_list.append(torch.cos(freqs))
-                sin_list.append(torch.sin(freqs))
+                cos_list.append(torch.cos(freqs).float())
+                sin_list.append(torch.sin(freqs).float())
 
             return cos_list, sin_list
 
@@ -723,7 +736,10 @@ class RopeEmbedder:
 
         if self.cos_cached is None:
             self.cos_cached, self.sin_cached = self.precompute_freqs(
-                self.axes_dims, self.axes_lens, theta=self.theta
+                self.axes_dims,
+                self.axes_lens,
+                theta=self.theta,
+                freqs_dtype=self.freqs_dtype,
             )
             self.cos_cached = [c.to(device) for c in self.cos_cached]
             self.sin_cached = [s.to(device) for s in self.sin_cached]

@@ -754,6 +754,15 @@ class LoRAPipeline(ComposedPipelineBase):
                         for i in range(num_params_to_merge)
                     ]
                     # Use stack instead of cat because it needs to be compatible with TP.
+                    shapes = {tuple(t.shape) for t in sorted_tensors}
+                    if len(shapes) > 1:
+                        raise ValueError(
+                            f"Cannot fuse LoRA shards for {target_name}: the stacked "
+                            f"(N, out, r) layout needs equal shards, got {sorted(shapes)}. "
+                            "GQA attention hits this because lora_B is wider for q "
+                            "than for k/v; such adapters need a block-diagonal fused "
+                            "form, which is not implemented."
+                        )
                     weight = torch.stack(sorted_tensors, dim=0)
                     del to_merge_params[target_name]
                 else:

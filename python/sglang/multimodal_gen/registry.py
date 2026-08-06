@@ -75,6 +75,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.lumina2 import Lumina2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -142,6 +143,7 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.lumina2 import Lumina2SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -1095,6 +1097,18 @@ def _register_configs():
                 "sana" in hf_id.lower()
                 and "sana-wm" not in hf_id.lower()
                 and "sana_wm" not in hf_id.lower()
+            )
+        ],
+    )
+
+    # Lumina-Image-2.0
+    register_configs(
+        sampling_param_cls=Lumina2SamplingParams,
+        pipeline_config_cls=Lumina2PipelineConfig,
+        hf_model_paths=["Alpha-VLLM/Lumina-Image-2.0"],
+        model_detectors=[
+            lambda hf_id: (
+                "lumina-image-2" in hf_id.lower() or "lumina2" in hf_id.lower()
             )
         ],
     )

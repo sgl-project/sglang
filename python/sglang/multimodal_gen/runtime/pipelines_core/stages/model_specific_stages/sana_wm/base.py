@@ -754,6 +754,7 @@ class SanaWMTextEncodingStage(TextEncodingStage):
                 max_length=max_length,
                 padding="max_length",
                 truncation=True,
+                is_negative=True,
             )
             neg_seq_lens_list = self._seq_lens_from_masks(neg_masks_list)
 

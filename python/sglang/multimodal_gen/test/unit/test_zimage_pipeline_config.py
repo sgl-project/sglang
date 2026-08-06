@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,9 +7,83 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.runtime.models.dits.zimage import (
+    FeedForward,
+    RopeEmbedder,
+    ZImageAttention,
     ZImageRMSNorm,
     ZImageTransformer2DModel,
 )
+
+
+@contextmanager
+def _single_process_parallel():
+    """Stub the TP / SP world so parallel-linear modules (ZImageAttention,
+    FeedForward) construct on the 'meta' device."""
+    fake_tp_group = SimpleNamespace(world_size=1, rank_in_group=0)
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+            return_value=fake_tp_group,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.zimage.get_tp_world_size",
+            return_value=1,
+        ),
+    ):
+        yield
+
+
+class TestZImageSharedPrimitiveDefaults(unittest.TestCase):
+    """Shared primitive defaults preserve Z-Image behavior."""
+
+    def test_rope_default_reproduces_the_pre_hook_fp32_formula_bitwise(self) -> None:
+        axes_dims, axes_lens, theta = (16, 56, 56), (64, 128, 128), 256.0
+
+        cos_list, sin_list = RopeEmbedder.precompute_freqs(
+            axes_dims, axes_lens, theta=theta
+        )
+
+        for i, (d, e) in enumerate(zip(axes_dims, axes_lens)):
+            inv = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64) / d))
+            phase = torch.outer(torch.arange(e, dtype=torch.float64), inv).float()
+            self.assertTrue(torch.equal(cos_list[i], torch.cos(phase)))
+            self.assertTrue(torch.equal(sin_list[i], torch.sin(phase)))
+
+    def test_rope_fp64_phase_is_opt_in_and_actually_differs(self) -> None:
+        args = ((16, 56, 56), (64, 128, 128))
+        cos32, _ = RopeEmbedder.precompute_freqs(*args)
+        cos64, _ = RopeEmbedder.precompute_freqs(*args, freqs_dtype=torch.float64)
+
+        self.assertEqual(cos32[0].dtype, torch.float32)
+        self.assertEqual(cos64[0].dtype, torch.float32)
+        self.assertFalse(all(torch.equal(a, b) for a, b in zip(cos32, cos64)))
+
+    def test_attention_defaults_keep_zimage_norm_and_fusion(self) -> None:
+        with _single_process_parallel(), torch.device("meta"):
+            attn = ZImageAttention(dim=64, num_heads=4, num_kv_heads=4)
+
+        self.assertIsInstance(attn.norm_q, ZImageRMSNorm)
+        self.assertIsInstance(attn.norm_k, ZImageRMSNorm)
+        self.assertTrue(attn.enable_zimage_qk_fusion)
+
+    def test_allow_fused_qk_norm_rope_only_ever_disables(self) -> None:
+        with _single_process_parallel(), torch.device("meta"):
+            off = ZImageAttention(
+                dim=64, num_heads=4, num_kv_heads=4, allow_fused_qk_norm_rope=False
+            )
+        self.assertFalse(off.enable_zimage_qk_fusion)
+
+    def test_feed_forward_defaults_to_the_fused_silu(self) -> None:
+        from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+
+        with _single_process_parallel(), torch.device("meta"):
+            ff = FeedForward(dim=64, hidden_dim=128)
+
+        self.assertIsInstance(ff.act, SiluAndMul)
 
 
 class TestZImagePipelineConfig(unittest.TestCase):

@@ -202,6 +202,11 @@ class TextEncodingStage(ConditionEncodingStage):
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
+            is_negative=True,
+            # Must match the positive branch. _build_negative_text_cache_key
+            # already varies on this, so omitting it cached one length under a
+            # key that named another.
+            max_length=batch.max_sequence_length,
         )
         self._maybe_cache_negative_text_embedding(
             negative_cache_key, negative_text_outputs
@@ -575,6 +580,7 @@ class TextEncodingStage(ConditionEncodingStage):
         padding: bool | str | None = None,
         return_overflowing_tokens=None,
         return_length=None,
+        is_negative: bool = False,
     ):
         """
         Encode plain text using selected text encoder(s) and return embeddings.
@@ -595,6 +601,8 @@ class TextEncodingStage(ConditionEncodingStage):
             max_length: Optional per-call tokenizer override.
             truncation: Optional per-call tokenizer override.
             padding: Optional per-call tokenizer override.
+            is_negative: Select the pipeline's negative-branch text
+                preprocessors when configured.
 
         Returns:
             Depending on return_type and return_attention_mask:
@@ -643,7 +651,9 @@ class TextEncodingStage(ConditionEncodingStage):
         embeds_masks_list: list[torch.Tensor] = []
         seq_lens_list: list[list[int]] = []
 
-        preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs
+        preprocess_funcs = server_args.pipeline_config.get_preprocess_text_funcs(
+            is_negative=is_negative
+        )
         postprocess_funcs = server_args.pipeline_config.postprocess_text_funcs
         text_encoder_extra_args = server_args.pipeline_config.text_encoder_extra_args
         encoder_cfgs = server_args.pipeline_config.text_encoder_configs

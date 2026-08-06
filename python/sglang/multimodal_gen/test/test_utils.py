@@ -182,6 +182,9 @@ DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST = (
     "black-forest-labs/FLUX.2-klein-base-4B"
 )
 
+# Lumina image generation models
+DEFAULT_LUMINA_IMAGE_2_MODEL_NAME_FOR_TEST = "Alpha-VLLM/Lumina-Image-2.0"
+
 # Wan video generation models
 DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-14B-Diffusers"

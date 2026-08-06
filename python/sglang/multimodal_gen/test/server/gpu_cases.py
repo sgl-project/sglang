@@ -46,6 +46,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
+    DEFAULT_LUMINA_IMAGE_2_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
@@ -118,6 +119,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
+    ),
+    DiffusionTestCase(
+        "lumina_image_2_t2i",
+        DiffusionServerArgs(model_path=DEFAULT_LUMINA_IMAGE_2_MODEL_NAME_FOR_TEST),
     ),
     # TODO: modeling of flux different from official flux, so weights can't be loaded
     # consider opting for a different quantized hf-repo
