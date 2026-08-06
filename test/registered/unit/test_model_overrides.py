@@ -68,6 +68,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
+                    "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
                     "ep_size",
                     "moe_dense_tp_size",
