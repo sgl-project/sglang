@@ -89,6 +89,7 @@ jobs:
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
+              - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
