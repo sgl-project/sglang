@@ -4,11 +4,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import (
-    bpreshuffle_fp8_scale_nocopy,
-    bpreshuffle_fp8_scale_nocopy_tuple,
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
-    view_aiter_fused_rms_transposed_fp8_scale,
+    view_transposed_fp8_scale_nocopy,
+    view_transposed_fp8_scale_nocopy_tuple,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -60,9 +60,9 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
         logical_scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         aiter_scale = logical_scale.t().contiguous().view(logical_scale.shape)
 
-        repaired = view_aiter_fused_rms_transposed_fp8_scale(aiter_scale)
+        repaired = view_transposed_fp8_scale_nocopy(aiter_scale)
         materialized = materialize_bpreshuffle_fp8_scale(repaired)
-        renormalized = view_aiter_fused_rms_transposed_fp8_scale(repaired)
+        renormalized = view_transposed_fp8_scale_nocopy(repaired)
 
         self.assertTrue(torch.equal(repaired, logical_scale))
         self.assertTrue(torch.equal(materialized, logical_scale))
@@ -129,7 +129,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
                 values = torch.arange(m * g, dtype=torch.float32).reshape(m, g)
                 emitted = _simulate_transpose_scale_emit(values)
 
-                nocopy = bpreshuffle_fp8_scale_nocopy(emitted)
+                nocopy = view_transposed_fp8_scale_nocopy(emitted)
                 # Row-major producer path (transpose_scale=False + materialize).
                 materialized = materialize_bpreshuffle_fp8_scale(values)
 
@@ -142,7 +142,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
         values = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         emitted = _simulate_transpose_scale_emit(values)
 
-        nocopy = bpreshuffle_fp8_scale_nocopy(emitted)
+        nocopy = view_transposed_fp8_scale_nocopy(emitted)
 
         # The whole point of the optimization: reinterpret, do not copy.
         self.assertEqual(nocopy.data_ptr(), emitted.data_ptr())
@@ -156,7 +156,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
             torch.arange(24, dtype=torch.float32).reshape(2, 3, 4),  # 3-D
         ):
             with self.subTest(dim=scale.dim()):
-                self.assertIs(bpreshuffle_fp8_scale_nocopy(scale), scale)
+                self.assertIs(view_transposed_fp8_scale_nocopy(scale), scale)
 
     def test_tuple_helper_reinterprets_only_the_scale_slot(self):
         q_input = torch.ones((3, 8), dtype=torch.float8_e4m3fn)
@@ -164,7 +164,7 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
         emitted = _simulate_transpose_scale_emit(values)
         bf16_side = torch.ones((3, 8), dtype=torch.bfloat16)
 
-        q_out, scale_out, bf16_out = bpreshuffle_fp8_scale_nocopy_tuple(
+        q_out, scale_out, bf16_out = view_transposed_fp8_scale_nocopy_tuple(
             (q_input, emitted, bf16_side)
         )
 
@@ -175,6 +175,46 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
         )
         self.assertEqual(scale_out.stride(), (1, values.shape[0]))
         self.assertEqual(scale_out.data_ptr(), emitted.data_ptr())
+
+
+class TestEmitTransposedBpreshuffleScaleGate(CustomTestCase):
+    """Pins the producer emit-gate shared by the MoE-down and MLA o_proj sites:
+    the transposed zero-copy path is taken only on gfx95 bpreshuffle and only for
+    M(tokens) >= 2; M == 1 must fall back to the materialize path. Guards the
+    ``>= 2`` boundary against being widened to `M >= 1` (which would send a
+    degenerate single-token scale down the stride-swap path)."""
+
+    def test_gate_false_off_gfx95_regardless_of_m(self):
+        for m in (1, 2, 8):
+            with self.subTest(m=m):
+                self.assertFalse(
+                    emit_transposed_bpreshuffle_scale(m, on_bpreshuffle_gfx95=False)
+                )
+
+    def test_gate_requires_m_ge_2_on_gfx95(self):
+        # M == 1 -> materialize fallback; M >= 2 -> transposed zero-copy path.
+        self.assertFalse(
+            emit_transposed_bpreshuffle_scale(1, on_bpreshuffle_gfx95=True)
+        )
+        for m in (2, 3, 16):
+            with self.subTest(m=m):
+                self.assertTrue(
+                    emit_transposed_bpreshuffle_scale(m, on_bpreshuffle_gfx95=True)
+                )
+
+    def test_m1_materialize_path_produces_correct_values_and_layout(self):
+        # The path M == 1 actually takes: transpose_scale=False output relaid out
+        # by materialize. A single-token scale must survive with its values intact
+        # and the bpreshuffle (1, M) == (1, 1) column-major stride.
+        self.assertFalse(
+            emit_transposed_bpreshuffle_scale(1, on_bpreshuffle_gfx95=True)
+        )
+        scale = torch.arange(4, dtype=torch.float32).reshape(1, 4)  # [M=1, G=4]
+        materialized = materialize_bpreshuffle_fp8_scale(scale)
+        self.assertTrue(torch.equal(materialized, scale))
+        self.assertEqual(materialized.shape, (1, 4))
+        self.assertEqual(materialized.stride(), (1, 1))
+        self.assertTrue(materialized.t().is_contiguous())
 
 
 if __name__ == "__main__":
