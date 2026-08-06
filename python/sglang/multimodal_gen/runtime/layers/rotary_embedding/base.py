@@ -80,7 +80,7 @@ class RotaryEmbedding(CustomOp):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if hasattr(self, "cos_sin_cache"):
+        if hasattr(self, "cos_sin_cache") or query.dim() == 3 or key.dim() == 3:
             return self.forward_native(
                 query=query,
                 key=key,
@@ -238,37 +238,8 @@ class RotaryEmbedding(CustomOp):
             num_tokens = positions.shape[0]
             cos_sin = self.cos_sin_cache.index_select(0, positions)
             cos, sin = cos_sin.chunk(2, dim=-1)
-
         else:
-            if query.dim() != 4 or key.dim() != 4:
-                raise ValueError(
-                    f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
-                    f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
-                )
-
-            batch_size, seq_len, _, _ = query.shape
-            num_tokens = batch_size * seq_len
-
-            if positions is None:
-                pos_1d = torch.arange(
-                    position_offset,
-                    position_offset + seq_len,
-                    device=query.device,
-                    dtype=torch.int64,
-                )
-                positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
-            else:
-                if positions.dim() != 1 or positions.numel() != num_tokens:
-                    raise ValueError(
-                        f"positions must be 1D of length {num_tokens}, got shape={tuple(positions.shape)}"
-                    )
-                positions = positions.to(device=query.device, dtype=torch.long)
-
-        if complex_freqs is not None:
-            return (
-                _apply_rotary_emb_complex(query, complex_freqs),
-                _apply_rotary_emb_complex(key, complex_freqs),
-            )
+            num_tokens = query.shape[:-2].numel()
         if cos is not None and sin is not None:
             q_shape = query.shape
             q_flat = query.reshape(num_tokens, -1, self.head_size)
@@ -298,7 +269,37 @@ class RotaryEmbedding(CustomOp):
             k = torch.cat((k_rotated, k_pass), dim=-1).reshape(k_shape)
             return q, k
 
+        if query.dim() != 4 or key.dim() != 4:
+            raise ValueError(
+                f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
+                f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
+            )
+
+        if complex_freqs is not None:
+            return (
+                _apply_rotary_emb_complex(query, complex_freqs),
+                _apply_rotary_emb_complex(key, complex_freqs),
+            )
+
         if cos_sin_cache is not None:
+            batch_size, seq_len, _, _ = query.shape
+            num_tokens = batch_size * seq_len
+
+            if positions is None:
+                pos_1d = torch.arange(
+                    position_offset,
+                    position_offset + seq_len,
+                    device=query.device,
+                    dtype=torch.int64,
+                )
+                positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+            else:
+                if positions.dim() != 1 or positions.numel() != num_tokens:
+                    raise ValueError(
+                        f"positions must be 1D of length {num_tokens}, got shape={tuple(positions.shape)}"
+                    )
+                positions = positions.to(device=query.device, dtype=torch.long)
+
             return apply_flashinfer_rope_qk_inplace(
                 q=query,
                 k=key,
