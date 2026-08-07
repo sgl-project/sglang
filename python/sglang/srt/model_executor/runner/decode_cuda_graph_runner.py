@@ -858,7 +858,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        capture_ragged_verify_layout = self._capture_ragged_verify_layout(num_tokens)
+        spec_info = self.get_spec_info(
+            num_tokens, ragged_verify_layout=capture_ragged_verify_layout
+        )
         self.capture_hidden_mode = get_required_capture_hidden_mode(
             self.capture_hidden_mode,
             spec_info,
@@ -912,9 +915,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            # Algorithm-private field; only the dflash-family capture inputs
-            # carry a synthetic layout.
-            ragged_verify_layout=getattr(spec_info, "ragged_verify_layout", None),
+            ragged_verify_layout=capture_ragged_verify_layout,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
@@ -1366,7 +1367,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1429,7 +1430,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
-                ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
+                ragged_verify_layout=ragged_verify_layout,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():
