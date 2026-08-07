@@ -679,25 +679,45 @@ class USPAttention(nn.Module):
             assert (
                 get_sequence_parallel_world_size() == 1 or effective_skip_sp
             ), "static_no_pack_cu is a single-rank path"
-            assert self.backend == AttentionBackendEnum.FA
             cu = attn_mask_meta["static_no_pack_cu"]
             bs, seq = q.shape[0], q.shape[1]
             assert bs == 1, "static_no_pack_cu supports batch size 1"
-            out = flash_attn_varlen_func(
-                q=q.reshape(bs * seq, *q.shape[2:]),
-                k=k.reshape(bs * seq, *k.shape[2:]),
-                v=v.reshape(bs * seq, *v.shape[2:]),
-                cu_seqlens_q=cu,
-                cu_seqlens_k=cu,
-                max_seqlen_q=bs * seq,
-                max_seqlen_k=bs * seq,
-                softmax_scale=self.softmax_scale,
-                causal=False,
-                ver=_fa_backend.fa_ver,
+            if self.backend == AttentionBackendEnum.FA:
+                out = flash_attn_varlen_func(
+                    q=q.reshape(bs * seq, *q.shape[2:]),
+                    k=k.reshape(bs * seq, *k.shape[2:]),
+                    v=v.reshape(bs * seq, *v.shape[2:]),
+                    cu_seqlens_q=cu,
+                    cu_seqlens_k=cu,
+                    max_seqlen_q=bs * seq,
+                    max_seqlen_k=bs * seq,
+                    softmax_scale=self.softmax_scale,
+                    causal=False,
+                    ver=_fa_backend.fa_ver,
+                )
+                if isinstance(out, tuple):
+                    out = out[0]
+                return out.view(bs, seq, *out.shape[1:])
+            # SDPA-family backends take a dense mask derived from the cu VALUE:
+            # arange < valid is shape-static, so it stays capturable.
+            tail_mask = (
+                torch.arange(seq, device=q.device, dtype=torch.int32)
+                < cu[1].to(torch.int32)
+            )[None, None, None, :]
+            sdpa_context = (
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                if self.allow_cudnn_sdp and q.device.type == "cuda"
+                else nullcontext()
             )
-            if isinstance(out, tuple):
-                out = out[0]
-            return out.view(bs, seq, *out.shape[1:])
+            with sdpa_context:
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    attn_mask=tail_mask,
+                    scale=self.softmax_scale,
+                )
+            return out.transpose(1, 2)
 
         # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
         # pad span) also opts into the masked SP branch. gap_* = legacy alias.
