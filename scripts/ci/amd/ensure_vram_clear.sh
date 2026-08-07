@@ -42,7 +42,12 @@ stop_all_gpu_containers() {
     for cid in $gpu_ids; do
         docker ps -a --filter "id=$cid" --format '  {{.ID}} {{.Image}} {{.Status}} {{.Names}}' 2>/dev/null || true
     done
-    echo "$gpu_ids" | xargs -r docker stop --time 5 2>/dev/null || true
+    # Give containers a real chance to tear down gracefully so the sglang
+    # server can free VRAM before we pull the plug. A 5s window used to
+    # SIGKILL an 8-GPU TP server mid-HIP-op, which is exactly what leaves an
+    # unreclaimable KFD context behind. Configurable via DOCKER_STOP_TIMEOUT.
+    local stop_timeout="${DOCKER_STOP_TIMEOUT:-60}"
+    echo "$gpu_ids" | xargs -r docker stop --time "$stop_timeout" 2>/dev/null || true
     echo "$gpu_ids" | xargs -r docker rm -f 2>/dev/null || true
 }
 
@@ -156,6 +161,89 @@ dump_gpu_diagnostics() {
     timeout 30 rocm-smi --showmemuse 2>&1 || echo "rocm-smi --showmemuse timed out"
 }
 
+# List PIDs (host, container, or zombie) that still hold a GPU device file.
+# Empty output means the only thing keeping VRAM allocated is a driver/KFD
+# context with no owning process -- the ROCm/aiter#2061 signature.
+list_gpu_device_holders() {
+    local pids=""
+    if command -v fuser >/dev/null 2>&1; then
+        pids+=" $(fuser /dev/kfd 2>/dev/null || true)"
+        for dev in /dev/dri/renderD*; do
+            [ -e "$dev" ] || continue
+            pids+=" $(fuser "$dev" 2>/dev/null || true)"
+        done
+    elif command -v lsof >/dev/null 2>&1; then
+        pids+=" $(lsof -t /dev/kfd 2>/dev/null || true)"
+        for dev in /dev/dri/renderD*; do
+            [ -e "$dev" ] || continue
+            pids+=" $(lsof -t "$dev" 2>/dev/null || true)"
+        done
+    fi
+    echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u || true
+}
+
+# Last-resort recovery for a driver/KFD-level VRAM leak: VRAM is still
+# allocated but NO process (host, container, or zombie) owns it. A per-device
+# `rocm-smi --gpureset` clears the orphaned KFD context without a full node
+# reboot, letting CI self-heal on an otherwise-blocked node.
+#
+# SAFETY: we only reset GPUs that are (a) still dirty AND (b) have no process
+# holding any GPU device file. A GPU actively running another tenant's job
+# always has a device-file holder, so it is never eligible -- this cannot
+# disturb a co-scheduled job on the same node (e.g. GPUs 4-7 busy while 0-3
+# leaked). Gated by AMD_CI_GPU_RESET (default: auto); set to 0 to disable.
+attempt_gpu_reset() {
+    local mode="${AMD_CI_GPU_RESET:-auto}"
+    case "${mode,,}" in
+        0|false|off|no|disable|disabled)
+            echo "GPU reset disabled (AMD_CI_GPU_RESET=${mode}); skipping self-heal."
+            return 1
+            ;;
+    esac
+
+    if ! command -v rocm-smi >/dev/null 2>&1; then
+        echo "rocm-smi not available; cannot attempt GPU reset."
+        return 1
+    fi
+
+    # A reset while any process is still attached can wedge the driver, so
+    # bail out if any GPU device file still has a holder.
+    local holders
+    holders=$(list_gpu_device_holders)
+    if [ -n "$holders" ]; then
+        echo "Skipping GPU reset: processes still hold GPU device files (PIDs below)."
+        echo "$holders"
+        return 1
+    fi
+
+    local dirty_gpus
+    dirty_gpus=$(get_dirty_gpu_indices)
+    if [ -z "$dirty_gpus" ]; then
+        echo "No dirty GPUs detected; nothing to reset."
+        return 1
+    fi
+
+    echo "=== Driver-level leak detected: attempting scoped GPU reset ==="
+    echo "Leaked GPUs with no owning process: $(echo "$dirty_gpus" | tr '\n' ' ')"
+
+    local idx
+    for idx in $dirty_gpus; do
+        echo "Resetting GPU ${idx} (rocm-smi --gpureset -d ${idx})..."
+        timeout 60 rocm-smi --gpureset -d "$idx" 2>&1 \
+            || echo "  GPU ${idx}: reset returned non-zero (unsupported, busy, or needs reboot)."
+    done
+
+    echo "Waiting 15s for GPUs to settle after reset..."
+    sleep 15
+
+    if check_vram_clear; then
+        echo "✓ Scoped GPU reset recovered the leaked VRAM."
+        return 0
+    fi
+    echo "✗ GPU reset did not clear VRAM; a node reboot is still required."
+    return 1
+}
+
 ensure_vram_clear() {
     local max_retries=3
     local retry_count=0
@@ -169,9 +257,11 @@ ensure_vram_clear() {
     echo "========================"
     echo "Running in ROCm mode"
 
-    # Always stop the well-known CI container first (best-effort).
+    # Always stop the well-known CI container first (best-effort). Use a
+    # generous grace period so a leftover sglang server frees VRAM instead of
+    # being SIGKILLed mid-HIP-op (the root cause of the driver-level leak).
     echo "Stopping any existing ci_sglang container..."
-    docker stop ci_sglang 2>/dev/null || true
+    docker stop --time "${DOCKER_STOP_TIMEOUT:-60}" ci_sglang 2>/dev/null || true
     docker rm -f ci_sglang 2>/dev/null || true
 
     # Show initial GPU status
@@ -249,6 +339,15 @@ ensure_vram_clear() {
         fi
     done
 
+    # Process/container-based cleanup exhausted. If the leak is purely
+    # driver-level (VRAM allocated, no owning process — the ROCm/aiter#2061
+    # signature), try a scoped, guarded GPU reset before giving up and
+    # forcing a manual node reboot.
+    if attempt_gpu_reset; then
+        echo "=== RECOVERED: VRAM cleared via scoped GPU reset ==="
+        return 0
+    fi
+
     # Failed after all retries — diagnostics for the last cleanup attempt
     # were already dumped above; just print the actionable hint.
     echo "=== FAILED: VRAM cleanup unsuccessful after $max_retries attempts ==="
@@ -256,7 +355,9 @@ ensure_vram_clear() {
     echo "=================================================================="
     echo "Hint: if no host process / container holds the GPU but VRAM is"
     echo "still allocated, this is almost certainly a zombie KFD context"
-    echo "(see ROCm/aiter#2061). The node will need to be rebooted before"
+    echo "(see ROCm/aiter#2061). A scoped 'rocm-smi --gpureset' was already"
+    echo "attempted automatically (unless AMD_CI_GPU_RESET=0); if it did not"
+    echo "recover the GPUs, the node must be rebooted (or drained) before"
     echo "subsequent jobs can succeed."
     echo "=================================================================="
     return 1
