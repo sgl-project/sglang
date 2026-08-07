@@ -190,7 +190,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.self_name }}
+          bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy gsm8k dataset
