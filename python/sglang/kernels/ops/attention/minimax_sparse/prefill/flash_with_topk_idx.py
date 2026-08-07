@@ -124,6 +124,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     DISABLE_INDEX_VALUE: tl.constexpr,
     IS_FP8: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    ONE_PAGE_PER_BLOCK: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -196,14 +197,20 @@ def _flash_attn_fwd_with_block_score_kernel(
         # Resolve logical positions through the per-forward page-table snapshot.
         pos = i + off_k
         pos_mask = pos < seq_len
-        slots = load_token_slots(
-            page_table_ptr,
-            pid_b,
-            pos,
-            stride_pt_b,
-            pos_mask,
-            PAGE_SIZE,
-        )
+        if ONE_PAGE_PER_BLOCK:
+            physical_page = tl.load(
+                page_table_ptr + pid_b * stride_pt_b + i // block_size
+            ).to(tl.int64)
+            slots = physical_page * block_size + off_k
+        else:
+            slots = load_token_slots(
+                page_table_ptr,
+                pid_b,
+                pos,
+                stride_pt_b,
+                pos_mask,
+                PAGE_SIZE,
+            )
         # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
         k = tl.load(
             k_cache_ptr
@@ -577,6 +584,7 @@ def flash_prefill_with_topk_index(
         DISABLE_INDEX_VALUE=disable_index_value,
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
+        ONE_PAGE_PER_BLOCK=page_size == block_size_k,
     )
 
     # topk extraction kernel
