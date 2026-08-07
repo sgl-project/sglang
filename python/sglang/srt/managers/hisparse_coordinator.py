@@ -68,9 +68,14 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        hisparse_c4_layout = None
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
+            hisparse_c4_layout = self.token_to_kv_pool_allocator.hisparse_c4_layout
             page_size = self.mem_pool_device.page_size
+            if hisparse_c4_layout is not None:
+                self.top_k = hisparse_c4_layout.top_k
+                self.device_buffer_size = hisparse_c4_layout.device_buffer_size
             num_host_pages = (
                 self.token_to_kv_pool_allocator.size_full // self.compress_ratio
                 + page_size
@@ -106,16 +111,20 @@ class HiSparseCoordinator:
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
-        max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
-        max_context_len = req_to_token_pool.max_context_len
-        max_compressed_context_len = (
-            max_context_len + self.compress_ratio - 1
-        ) // self.compress_ratio
-
-        # to have an extra page for new tokens
-        self.padded_buffer_size = (
-            self.device_buffer_size + self.mem_pool_device.page_size
-        )
+        if hisparse_c4_layout is not None:
+            max_num_req_slots = hisparse_c4_layout.req_slot_count
+            max_compressed_context_len = hisparse_c4_layout.compressed_context_len
+            self.padded_buffer_size = hisparse_c4_layout.padded_per_req
+        else:
+            max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
+            max_context_len = req_to_token_pool.max_context_len
+            max_compressed_context_len = (
+                max_context_len + self.compress_ratio - 1
+            ) // self.compress_ratio
+            # Keep one extra page for new tokens in generic DSA HiSparse.
+            self.padded_buffer_size = (
+                self.device_buffer_size + self.mem_pool_device.page_size
+            )
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),

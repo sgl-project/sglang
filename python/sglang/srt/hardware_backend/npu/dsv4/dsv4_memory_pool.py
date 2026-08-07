@@ -62,12 +62,17 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         self.kernel_page_size = kernel_page_size
         super().__init__(*args, **kwargs)
 
+    def _init_layout_metadata(self) -> None:
+        if self.store_dtype != torch.bfloat16:
+            super()._init_layout_metadata()
+            return
+        self.kv_cache_total_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.kv_cache_total_dim = kv_dim
+        kv_dim = self.kv_cache_total_dim
         # GLOBAL kernel_page_size keeps cmp_kv.shape[1] == ori_kv.shape[1]; writes
         # are flat-indexed by loc, so page granularity affects shape not location.
         npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
