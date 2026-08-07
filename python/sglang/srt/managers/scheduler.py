@@ -3157,6 +3157,13 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        # Get BLOCK_M from the backend for tile-budget admission logic
+        attn_backend = self.tp_worker.model_runner.attn_backend
+        if hasattr(attn_backend, "extend_attention_block_m"):
+            prefill_tile_block_m = attn_backend.extend_attention_block_m
+        else:
+            prefill_tile_block_m = 64  # Fallback for non-Triton backends
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -3173,6 +3180,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            prefill_tile_block_m=prefill_tile_block_m,
         )
 
         if self.chunked_req is not None:
