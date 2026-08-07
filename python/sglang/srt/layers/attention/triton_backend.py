@@ -14,6 +14,7 @@ from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
     linear_attn_model_spec,
+    mamba2_config,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -200,8 +201,9 @@ class TritonAttnBackend(AttentionBackend):
             hybrid_gdn_config(model_runner.model_config) is not None
             or kimi_linear_config(model_runner.model_config) is not None
             or linear_attn_model_spec(model_runner.model_config) is not None
+            or mamba2_config(model_runner.model_config) is not None
         ):
-            # For hybrid linear models, layer_id = 0 may not be full attention
+            # For hybrid linear/mamba models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:

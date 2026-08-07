@@ -1734,7 +1734,7 @@ def biased_grouped_topk_gpu(
                 topk_indices,
                 gating_output,
                 renormalize,
-                correction_bias,
+                correction_bias.to(torch.float32),
                 scale,
             )
 

@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_musa,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -51,6 +52,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -63,6 +65,10 @@ if _is_cuda or _is_musa:
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
+elif _is_xpu:
+    # sgl-kernel-xpu registers these fp8 quant ops natively for XPU (unlike
+    # fp8_scaled_mm), just missing from this import block.
+    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
 if _is_musa:
     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
