@@ -37,6 +37,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative.ragged_verify import spec_info_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -472,7 +473,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     def _verify_graph_key(bs: int, spec_info: Optional[SpecInput]):
         """bs for uniform graphs; token tier for ragged (tiers share slot
         counts but each graph must replay its own recorded plan buffers)."""
-        layout = spec_info.ragged_verify_layout if spec_info is not None else None
+        layout = spec_info_ragged_verify_layout(spec_info)
         if layout is None:
             return bs
         return ("ragged", layout.graph_num_tokens)

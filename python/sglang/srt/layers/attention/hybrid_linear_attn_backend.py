@@ -27,6 +27,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.ragged_verify import (
+    resolve_ragged_verify_layout,
+    spec_info_ragged_verify_layout,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
@@ -179,7 +183,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # skip mamba metadata.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                ragged_layout = resolve_ragged_verify_layout(forward_batch)
                 if ragged_layout is not None:
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
@@ -491,9 +495,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
-            )
+            ragged_layout = spec_info_ragged_verify_layout(spec_info)
             if ragged_layout is not None:
                 # Ragged capture: qsl from the runner's synthetic layout.
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
@@ -667,9 +669,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
-            )
+            ragged_layout = spec_info_ragged_verify_layout(spec_info)
             if ragged_layout is not None:
                 # Mamba kernels index dense [bs, N] scratch, so they need the
                 # capped variant (see padded_to_bucket). Padding rows carry

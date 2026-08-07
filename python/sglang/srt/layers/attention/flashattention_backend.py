@@ -31,7 +31,11 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
-from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_target_verify_geometry,
+    resolve_ragged_verify_layout,
+    spec_info_ragged_verify_layout,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend
@@ -787,9 +791,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                ragged_layout = getattr(
-                    forward_batch.spec_info, "ragged_verify_layout", None
-                )
+                ragged_layout = resolve_ragged_verify_layout(forward_batch)
                 if ragged_layout is not None:
                     geometry = build_ragged_target_verify_geometry(
                         seq_lens=forward_batch.seq_lens, layout=ragged_layout
@@ -2820,7 +2822,7 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+                ragged_layout = spec_info_ragged_verify_layout(spec_info)
                 if ragged_layout is not None:
                     padded = ragged_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(
