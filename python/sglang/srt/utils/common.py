@@ -56,6 +56,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
 from json import JSONDecodeError
+from multiprocessing import parent_process
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -2183,9 +2184,10 @@ def configure_logger(server_args, prefix: str = ""):
 
     # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
     # hint) are deduplicated per process, so a TP-N launch repeats each one N
-    # times. A prefix means this is a worker process; keep those warnings only
-    # in the main process, where they are printed exactly once.
-    if prefix:
+    # times. Keep them only in the launching process -- every worker (scheduler,
+    # detokenizer, DP controller, ...) is spawned via multiprocessing, whether
+    # or not it passes a log prefix -- where they are printed exactly once.
+    if parent_process() is not None:
         logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
     if is_flashinfer_available():
