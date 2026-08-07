@@ -94,6 +94,7 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    WEIGHT_PER_GROUP: tl.constexpr = True,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -152,8 +153,14 @@ def _layer_norm_fwd_1pass_kernel(
     rstd_mask = rows < M
     tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
 
-    # Load weights and biases (broadcast across rows)
-    w_offsets = cols + group * N
+    # Load weights and biases (broadcast across rows).
+    # WEIGHT_PER_GROUP=False means one `group_size`-wide weight vector is shared
+    # by every group (used by the head-grouped GDN path, where the H heads of a
+    # token are the groups and all heads share the same per-head-dim weight).
+    if WEIGHT_PER_GROUP:
+        w_offsets = cols + group * N
+    else:
+        w_offsets = cols
     w_mask = cols < N
     w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
 
@@ -216,21 +223,25 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    weight_per_group=True,
 ):
     M, N = x.shape
     if group_size is None:
         group_size = N
     assert N % group_size == 0
     ngroups = N // group_size
+    # `weight_per_group=False`: a single `group_size`-wide weight/bias vector is
+    # shared by all `ngroups` groups instead of one `N`-wide vector.
+    w_numel = N if weight_per_group else group_size
     assert x.stride(-1) == 1
     if z is not None:
         assert z.stride(-1) == 1
         assert z.shape == (M, N)
-    assert weight.shape == (N,)
+    assert weight.shape == (w_numel,)
     assert weight.stride(-1) == 1
     if bias is not None:
         assert bias.stride(-1) == 1
-        assert bias.shape == (N,)
+        assert bias.shape == (w_numel,)
     # allocate output
     if out is not None:
         assert out.shape == x.shape
@@ -292,6 +303,7 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            WEIGHT_PER_GROUP=weight_per_group,
             **pdl_kwargs,
         )
     return out, mean, rstd
@@ -299,6 +311,87 @@ def _layer_norm_fwd(
 
 if _is_npu:
     from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+
+
+def _flatten_head_dim(t: torch.Tensor):
+    """View a ``(..., H, D)`` tensor as 2D ``(M, H*D)`` **without copying**.
+
+    Returns ``None`` when the layout cannot be expressed with a single row
+    stride (then the caller must fall back to the generic path).
+    """
+    if t.dim() < 3:
+        return None
+    H, D = t.shape[-2], t.shape[-1]
+    # The (H, D) block must be contiguous so it can collapse into one row.
+    if t.stride(-1) != 1 or t.stride(-2) != D:
+        return None
+    # Drop leading singleton dims, e.g. the (1, T, H, D) linear-attention output.
+    while t.dim() > 3 and t.shape[0] == 1:
+        t = t[0]
+    if t.dim() != 3:
+        return None
+    return t.as_strided((t.shape[0], H * D), (t.stride(0), 1), t.storage_offset())
+
+
+def rms_norm_gated_heads(
+    *,
+    x,
+    weight,
+    z,
+    eps=1e-6,
+    norm_before_gate=True,
+    activation: str = "swish",
+):
+    """Gated RMSNorm over the last dim of ``(..., H, D)`` inputs, keeping heads
+    as *groups* rather than folding them into the row dimension.
+
+    The generic :func:`rms_norm_gated` entry point wants 2D ``(M, D)`` inputs, so
+    callers first do ``t.reshape(-1, D)``. For a tensor whose head stride is
+    larger than ``D`` -- e.g. the GDN gate ``z``, which is a trailing column slice
+    of the packed ``qkvz`` projection and therefore has strides ``(qkvz_dim, D, 1)``
+    -- that reshape is not a view and PyTorch materializes a full contiguous copy
+    (an ``elementwise/direct_copy`` kernel over the whole tensor) purely as data
+    movement before the norm.
+
+    Flattening to ``(M, H*D)`` with ``group_size=D`` instead expresses exactly the
+    same computation (``_layer_norm_fwd_1pass_kernel`` normalizes each group
+    independently and the same per-head-dim ``weight`` is shared by every group,
+    hence ``weight_per_group=False``), and it only ever needs *one* row stride per
+    tensor -- so the strided ``z`` is consumed in place and the copy disappears.
+    The launch geometry is unchanged: the grid goes from ``(ceil(M*H/rpb), 1)`` to
+    ``(ceil(M/rpb'), H)`` covering the same blocks.
+
+    Returns ``None`` if the layout/kernel preconditions do not hold, so callers
+    can fall back to :func:`rms_norm_gated`.
+    """
+    if _is_npu or _use_cpu:
+        return None
+    if x.dim() < 3 or z.dim() < 3:
+        return None
+    H, D = x.shape[-2], x.shape[-1]
+    if z.shape[-2:] != x.shape[-2:]:
+        return None
+    if weight.dim() != 1 or weight.shape[0] != D or weight.stride(-1) != 1:
+        return None
+    x_2d = _flatten_head_dim(x)
+    z_2d = _flatten_head_dim(z)
+    if x_2d is None or z_2d is None or x_2d.shape != z_2d.shape:
+        return None
+    out_2d = torch.empty(x_2d.shape, dtype=x.dtype, device=x.device)
+    _layer_norm_fwd(
+        x_2d,
+        weight,
+        None,
+        eps,
+        z=z_2d,
+        out=out_2d,
+        group_size=D,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation=activation,
+        weight_per_group=False,
+    )
+    return out_2d.view(-1, H, D)
 
 
 def rms_norm_gated(
@@ -457,6 +550,24 @@ class RMSNorm(torch.nn.Module):
 
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
+
+    def forward_heads(self, x, z):
+        """Head-grouped fast path for ``(..., H, D)`` inputs.
+
+        Avoids the contiguous copy that ``x.reshape(-1, D)`` / ``z.reshape(-1, D)``
+        would force when the head stride is larger than ``D``. Returns ``None``
+        when unsupported so the caller falls back to :meth:`forward`.
+        """
+        if self.group_size is not None or self.bias is not None:
+            return None
+        return rms_norm_gated_heads(
+            x=x,
+            weight=self.weight,
+            z=z,
+            eps=self.eps,
+            norm_before_gate=self.norm_before_gate,
+            activation=self.activation,
+        )
 
     def forward(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""

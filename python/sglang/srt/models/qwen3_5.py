@@ -667,17 +667,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         z_shape_og = z.shape
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
 
-        # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
-            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
-            core_attn_out = core_attn_out_pad
+        # Fused data-movement path: keep the (tokens, heads, head_dim) layout and
+        # let the gated-RMSNorm kernel treat the heads as groups. The generic path
+        # below first flattens to 2D, and for `z` -- a trailing column slice of the
+        # packed qkvz projection, so its head stride is the whole qkvz width -- that
+        # flatten is not a view, so PyTorch materializes a full contiguous copy of
+        # `z` (a direct_copy elementwise kernel) purely as data movement before the
+        # norm. The head-grouped form needs only one row stride per tensor, so the
+        # strided `z` is read in place and the copy disappears. Numerically
+        # identical: the same per-head-dim weight normalizes the same head_v_dim
+        # wide groups. Returns None (-> fall back) if the layout is unsupported.
+        fused_out = None
+        if core_attn_out.numel() == z.numel():
+            fused_out = self.norm.forward_heads(core_attn_out, z)
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if fused_out is not None:
+            core_attn_out = fused_out
+        else:
+            # reshape input data into 2D tensor
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z = z.reshape(-1, z.shape[-1])
+
+            # Add padding for DP-Attn
+            if core_attn_out.shape != z.shape:
+                core_attn_out_pad = torch.zeros_like(z)
+                core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+                core_attn_out = core_attn_out_pad
+
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
