@@ -199,13 +199,10 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     // Per-session timing statistics (see `crate::session_stats`; measurement
     // only). The session is identified by the sticky routing key; other policies
-    // leave it `None` and are not tracked. Stamp the turn's receive instant
-    // (`start`) now — the first-token and turn-end instants are recorded by the
-    // SSE hooks below.
+    // leave it `None` and are not tracked. The dispatch / first-token / turn-end
+    // instants are stamped below — dispatch is taken just before forwarding to
+    // the worker (so router-internal route/tokenize time is excluded).
     let session_id: Option<String> = routing_key.map(|s| s.to_string());
-    if let Some(sid) = session_id.as_deref() {
-        ctx.session_stats.on_turn_start(sid, start);
-    }
 
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
@@ -402,6 +399,18 @@ pub async fn chat_completions(
     // untouched when neither applies.
     let outgoing_body =
         build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+
+    // Stamp the per-session dispatch instant (prefill start) for streaming
+    // requests — taken here, just before forwarding, so router-side route/
+    // tokenize time is excluded. A client retry re-enters the handler and
+    // re-stamps it. Non-streaming requests aren't tracked (their first token ==
+    // total latency, already in the global histograms).
+    if streaming {
+        if let Some(sid) = session_id.as_deref() {
+            ctx.session_stats
+                .on_dispatch(sid, std::time::Instant::now());
+        }
+    }
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
