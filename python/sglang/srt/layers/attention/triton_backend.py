@@ -134,6 +134,7 @@ class TritonAttnBackend(AttentionBackend):
             _LEAN_BLOCK_M,
             _lean_decode_launch_params,
             decode_attention_fwd,
+            lean_capture_policy,
             lean_decode_seqlen_gate,
         )
         from sglang.kernels.ops.attention.extend_attention import (
@@ -152,6 +153,7 @@ class TritonAttnBackend(AttentionBackend):
         # seqlen metadata in forward_decode; True/False => explicit override.
         self.enable_lean_attention = model_runner.server_args.enable_lean_attention
         self._lean_decode_seqlen_gate = lean_decode_seqlen_gate
+        self._lean_capture_policy = lean_capture_policy
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -1843,12 +1845,18 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        # Resolve Work-Centric (Lean) Attention activation. In auto mode (None) decide
-        # from cheap host-side metadata (batch size, seq_lens_sum) whether the sequences
-        # are long enough for Lean to win; an explicit True/False override is respected.
-        # This keeps Lean off the short-context regime where it loses to the standard kernel.
-        # The SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel regardless.
+        # Resolve Work-Centric (Lean) Attention activation. In auto mode (None) the decision
+        # depends on whether this forward is a CUDA-graph capture: during capture seq_lens are
+        # the fill value (1), so the seq-len gate would always bake the standard kernel and Lean
+        # would never activate on the default path. There we key the bake on capture-time-known
+        # signals (batch, head-tiles, is_mla) via lean_capture_policy -- Lean's fixed persistent
+        # grid still adapts to raggedness on-device at replay. In eager decode, real seq_lens
+        # are known, so lean_decode_seqlen_gate uses them. An explicit True/False override is
+        # respected; the SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel.
         from sglang.srt.environ import envs
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
 
         if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
             enable_lean = False
@@ -1856,13 +1864,22 @@ class TritonAttnBackend(AttentionBackend):
             enable_lean = self.enable_lean_attention
             if enable_lean is None:
                 kv_group_num = layer.tp_q_head_num // layer.tp_k_head_num
-                enable_lean = self._lean_decode_seqlen_gate(
-                    layer.tp_q_head_num,
-                    kv_group_num,
-                    forward_batch.batch_size,
-                    forward_batch.seq_lens_sum,
-                    layer.qk_head_dim != layer.v_head_dim,
-                )
+                is_mla = layer.qk_head_dim != layer.v_head_dim
+                if get_is_capture_mode():
+                    enable_lean = self._lean_capture_policy(
+                        layer.tp_q_head_num,
+                        kv_group_num,
+                        forward_batch.batch_size,
+                        is_mla,
+                    )
+                else:
+                    enable_lean = self._lean_decode_seqlen_gate(
+                        layer.tp_q_head_num,
+                        kv_group_num,
+                        forward_batch.batch_size,
+                        forward_batch.seq_lens_sum,
+                        is_mla,
+                    )
 
         if self.dcp_size > 1:
             if score_mod is not None:

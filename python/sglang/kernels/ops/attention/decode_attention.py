@@ -1503,6 +1503,58 @@ def _lean_attention_decode_kernel(
         iter = iter + (local_iter_end - local_iter)
 
 
+def _lean_head_tiles(num_q_heads: int, kv_group_num: int) -> int:
+    """Head-tile programs the standard grouped decode kernel launches per (sequence,
+    kv-split): ``ceil(num_q_heads / min(16, kv_group_num))``. This is the standard
+    kernel's query-head parallelism, which drives how well it already fills the device
+    and hence where the Lean-vs-SplitK crossover sits (see :func:`lean_decode_seqlen_gate`).
+    """
+    block_h = min(16, max(1, kv_group_num))
+    return -(-num_q_heads // block_h)  # ceil(num_q_heads / block_h)
+
+
+def lean_capture_policy(
+    num_q_heads: int,
+    kv_group_num: int,
+    batch: int,
+    is_mla: bool = False,
+) -> bool:
+    """CUDA-graph capture-time bake decision for Lean decode.
+
+    During decode-graph capture ``seq_lens`` are set to the fill value (1), so the
+    seq-len based :func:`lean_decode_seqlen_gate` always sees ``avg_len == 1`` and returns
+    ``False`` -- baking the *standard* kernel into every captured graph. Since the default
+    (auto) path replays those captured graphs, keying the bake on ``seq_lens_sum`` makes
+    Lean a no-op under CUDA graphs. But Lean's *fixed* 512-CTA persistent grid derives its
+    work schedule on-device from ``kv_indptr`` read at replay (work-stealing), so a baked
+    Lean graph still adapts to the real per-step raggedness. The bake decision therefore
+    keys only on capture-time-known signals -- ``batch``, the standard kernel's head-tile
+    parallelism (``tiles``), and ``is_mla`` -- calibrated to the realistic (ragged) regime.
+
+    Thresholds from ``CALIBRATION.md`` (MI355X, triton 3.7.0, CUDA graphs on, seed 42):
+
+    * MLA (``is_mla``): bake at ``batch >= 8``. ``b1`` is a catastrophic 0.40-0.55x loss
+      (the ~128-query-head decode already saturates the CUs, so Lean's fixed grid is pure
+      overhead), while ``b >= 8`` is uniform-parity and a 1.09-1.18x ragged win (p99 ITL
+      1.24-1.99x lower). This replaces the former blanket ``is_mla -> off``, which was based
+      on unrepresentative uniform ``b1`` data.
+    * GQA/MHA (``tiles >= 4``): bake at ``batch >= 16`` -- the unconditional-win boundary at
+      both 16K and 64K (up to 1.49x on ragged, 1.05-1.13x even on uniform). ``batch < 16``
+      is context-split (``b1`` wins at 64K but ``b1-4`` lose at 16K) and cannot be decided
+      from batch alone, so it is left to the eager :func:`lean_decode_seqlen_gate`.
+    * Heavy TP shard (``tiles < 4``, e.g. Llama-70B @TP=8): never bake. Not calibrated for
+      capture and known to regress ~4x at 32K; its rare long-context win still activates via
+      the eager seq-len gate (131072 base).
+    """
+    if batch <= 0:
+        return False
+    if is_mla:
+        return batch >= 8
+    if _lean_head_tiles(num_q_heads, kv_group_num) < 4:
+        return False
+    return batch >= 16
+
+
 def lean_decode_seqlen_gate(
     num_q_heads: int,
     kv_group_num: int,
@@ -1531,10 +1583,14 @@ def lean_decode_seqlen_gate(
     on ``tiles`` instead. Thresholds are the crossovers measured by ``benchmark/lean_gate_sweep.py``
     on MI355X (256 CUs); they should scale with the device CU count on other GPUs.
 
-    MLA layers (``is_mla``, i.e. ``qk_head_dim != v_head_dim``) are disabled: although the
-    isolated MLA decode kernel can win, that win does not survive the full decode step of the
-    MoE + tensor-parallel models that use MLA (attention is only ~12-19% of the step, dominated
-    by expert GEMMs and the TP all-reduce), where Lean is a measured net regression.
+    MLA layers (``is_mla``, i.e. ``qk_head_dim != v_head_dim``) are gated on ``batch`` rather
+    than average length: their Lean win is driven by batch raggedness (work-stealing across
+    mixed-length requests), not context. Calibration shows ``b1`` loses hard (~0.40-0.55x: the
+    ~128-query-head decode already saturates the CUs at batch 1, so Lean's fixed persistent grid
+    is pure overhead) while ``b >= 8`` is uniform-parity and a ragged win, so MLA enables at
+    ``batch >= 8`` above a small length floor. This replaces the former blanket ``is_mla -> off``
+    (which was based on unrepresentative uniform ``b1`` data). In practice MLA models serve under
+    CUDA graphs, where :func:`lean_capture_policy` -- not this seq-len gate -- makes the decision.
 
     The thresholds are set for the END-TO-END crossover, which is LATER than the isolated
     kernel crossover: Lean's decode kernel has a nearly flat per-call cost, so even after the
@@ -1566,11 +1622,14 @@ def lean_decode_seqlen_gate(
       high batch/long context but that does not survive the MoE + TP-all-reduce full step, and
       a single-GPU microbench cannot replicate it, so this tier stays protected.
     """
-    if batch <= 0 or is_mla:
+    if batch <= 0:
         return False
     avg_len = seq_lens_sum / batch
-    block_h = min(16, max(1, kv_group_num))
-    tiles = -(-num_q_heads // block_h)  # ceil(num_q_heads / block_h)
+    if is_mla:
+        # Gate on batch (raggedness proxy), not average length; b1 is a hard loss, b>=8
+        # is parity-uniform / ragged-win. The 4K floor keeps degenerate tiny workloads off.
+        return batch >= 8 and avg_len >= 4096
+    tiles = _lean_head_tiles(num_q_heads, kv_group_num)
     if tiles >= 16:
         base = (
             16384  # MHA / many query heads: standard kernel fills late, Lean wins early

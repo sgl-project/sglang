@@ -10,8 +10,11 @@ its launch/reduction path cannot silently regress correctness.
 Two things are checked:
   1. **Parity** — Lean output matches the standard SplitK kernel (cosine sim ~1.0)
      across representative GQA head shapes / batches / contexts.
-  2. **Gate logic** — ``lean_decode_seqlen_gate`` enables Lean in the long-context
-     / low-batch regime and keeps it off for short context, and stays off for MLA.
+  2. **Gate logic** — the eager ``lean_decode_seqlen_gate`` enables Lean in the
+     long-context / low-batch regime and keeps it off for short context, and the
+     CUDA-graph ``lean_capture_policy`` bakes Lean from capture-time signals (batch,
+     head-tiles, is_mla) since captured seq_lens are the fill value. MLA is gated on
+     batch (off at b1, on at b>=8), not blanket-off.
 
 Correctness is triton-version-independent (only performance varies with the triton
 build), so this makes a robust per-commit gate on MI35x hardware.
@@ -26,6 +29,7 @@ from sglang.kernels.ops.attention.decode_attention import (
     _lean_decode_launch_params,
     decode_attention_fwd,
     decode_attention_fwd_grouped,
+    lean_capture_policy,
     lean_decode_seqlen_gate,
 )
 from sglang.test.ci.ci_register import register_amd_ci
@@ -270,14 +274,22 @@ class TestLeanSeqlenGate(CustomTestCase):
             "gate should keep Lean off for batch=1 @ 2K (standard kernel wins)",
         )
 
-    def test_gate_off_for_mla(self):
-        # MLA's isolated win does not survive the MoE/TP decode step, so it is gated off.
+    def test_gate_mla_batch_threshold(self):
+        # MLA is gated on batch, not a blanket off: b1 loses hard (CU-saturated), b>=8
+        # is parity/ragged-win. The eager gate must reflect that boundary. (Guards against
+        # both a regression to the old blanket-off and to an always-on for MLA.)
         H_Q, kv_group = 128, 128
         self.assertFalse(
             lean_decode_seqlen_gate(
                 H_Q, kv_group, batch=1, seq_lens_sum=131072, is_mla=True
             ),
-            "gate must keep Lean off for MLA regardless of context",
+            "MLA at batch=1 is a catastrophic loss; gate must stay off",
+        )
+        self.assertTrue(
+            lean_decode_seqlen_gate(
+                H_Q, kv_group, batch=8, seq_lens_sum=8 * 65536, is_mla=True
+            ),
+            "MLA at batch>=8 with long context is a win; gate must enable",
         )
 
     def test_gate_threshold_falls_with_batch(self):
@@ -295,6 +307,46 @@ class TestLeanSeqlenGate(CustomTestCase):
         self.assertTrue(
             high_batch or not low_batch,
             "gate batch relaxation is inconsistent (higher batch should not be stricter)",
+        )
+
+
+class TestLeanCapturePolicy(CustomTestCase):
+    """The CUDA-graph capture-time bake policy keys on (tiles, is_mla, batch) only —
+    captured seq_lens are the fill value, so it cannot use context. These pin the
+    calibrated thresholds (CALIBRATION.md): a threshold drift or a degraded predicate
+    (always-on / always-off) turns the corresponding case red."""
+
+    def test_gqa_bakes_at_and_above_batch_16(self):
+        # Qwen GQA (28Q/4KV -> tiles=4): unconditional-win boundary is batch>=16.
+        H_Q, kv_group = 28, 7
+        self.assertFalse(
+            lean_capture_policy(H_Q, kv_group, batch=8, is_mla=False),
+            "GQA capture must not bake at batch=8 (context-split / uniform-short regresses)",
+        )
+        self.assertTrue(
+            lean_capture_policy(H_Q, kv_group, batch=16, is_mla=False),
+            "GQA capture must bake at batch>=16 (unconditional win)",
+        )
+
+    def test_mla_bakes_at_and_above_batch_8_never_at_low_batch(self):
+        # MLA (128Q/128KV): b1 is a catastrophic loss, b>=8 is parity/ragged-win.
+        H_Q, kv_group = 128, 128
+        self.assertFalse(
+            lean_capture_policy(H_Q, kv_group, batch=1, is_mla=True),
+            "MLA capture must never bake at batch=1 (0.4-0.55x loss)",
+        )
+        self.assertTrue(
+            lean_capture_policy(H_Q, kv_group, batch=8, is_mla=True),
+            "MLA capture must bake at batch>=8",
+        )
+
+    def test_heavy_tp_shard_never_bakes(self):
+        # tiles<4 (e.g. Llama-70B @TP=8: 8 query heads/GPU, kv_group=1 -> tiles=8?) —
+        # use a genuine heavy shard: 2 query heads, kv_group=1 -> tiles=2 (<4). Known ~4x
+        # regression at 32K, not calibrated for capture -> never bake even at high batch.
+        self.assertFalse(
+            lean_capture_policy(2, 1, batch=32, is_mla=False),
+            "heavy TP shard (tiles<4) must never bake under capture",
         )
 
 
