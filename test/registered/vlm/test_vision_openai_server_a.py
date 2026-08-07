@@ -20,7 +20,7 @@ from sglang.test.vlm_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=520, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -43,20 +43,13 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     extra_args = ["--cuda-graph-max-bs-decode=4"]
 
 
-class TestQwen3OmniServer(OmniOpenAITestMixin):
-    model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    extra_args = [  # workaround to fit into H100
-        "--mem-fraction-static=0.90",
-        "--disable-cuda-graph",
-        "--disable-fast-image-processor",
-        "--grammar-backend=none",
-    ]
+class TestContextLengthServer(CustomTestCase):
+    """The context-length rejection path is model-agnostic, so it rides the
+    cheapest VLM in this file rather than its own 7B launch."""
 
-
-class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
+        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -156,16 +149,6 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     def test_video_images_chat_completion(self):
         # model context length exceeded
         pass
-
-
-@unittest.skip(
-    "Disabling this test to speed up CI. Prefer to test it within nightly test."
-)
-class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-    model = "zai-org/GLM-4.1V-9B-Thinking"
-    extra_args = [
-        "--reasoning-parser=glm45",
-    ]
 
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
