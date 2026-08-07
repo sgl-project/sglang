@@ -51,7 +51,7 @@ class RolloutDitTrajectory:
     # [B, T+1, ...]: per-step noisy latents x_{t_0..t_{T-1}} followed by the
     # final denoised latent x_{t_T} (last scheduler.step output).
     latents: torch.Tensor | None = None
-    timesteps: torch.Tensor | None = None  # [T]
+    timesteps: torch.Tensor | None = None  # [T+1]
     # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
     sigmas: torch.Tensor | None = None
 

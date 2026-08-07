@@ -206,10 +206,14 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             ),
             dit_trajectory=RolloutDitTrajectory(
                 latents=torch.randn(1, 5, 4, 2, 2, 2),
-                timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
+                timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
                 sigmas=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
             ),
         )
+        dit = rtd.dit_trajectory
+        self.assertEqual(dit.timesteps.shape[0], dit.latents.shape[1])
+        self.assertEqual(dit.sigmas.shape[0], dit.latents.shape[1])
+        self.assertEqual(dit.timesteps[-1].item(), 0.0)
         _, _, env, dit_traj = _serialize_rollout_trajectory(
             rtd,
             serialized_dit_timesteps=_maybe_serialize(rtd.dit_trajectory.timesteps),
