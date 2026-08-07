@@ -595,7 +595,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # its IPC proxy lazy until that assignment is known, avoiding a full
         # image copy to every rank. The scheduler only honors this marker once
         # the processor has already set the item's hash and pad value.
-        if self.use_cuda_ipc and self.server_args.mm_enable_dp_encoder:
+        if self.use_gpu_feature_transport and self.server_args.mm_enable_dp_encoder:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True

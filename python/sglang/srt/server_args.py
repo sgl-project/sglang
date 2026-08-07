@@ -2746,13 +2746,14 @@ class ServerArgs:
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc"]],
-        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
+        Optional[Literal["cpu", "cuda_ipc", "fabric"]],
+        "Transport multimodal features through CPU memory, a bounded CUDA IPC "
+        "pool, or a bounded MNNVL FABRIC pool. "
         "Unset resolves automatically: multimodal models on single-node CUDA "
         "deployments (without disaggregation) use cuda_ipc, everything else uses "
-        "cpu. CUDA IPC reserves SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on "
-        "the base GPU and falls back to CPU transport per tensor when the pool is "
-        "full.",
+        "cpu. GPU transports reserve SGLANG_MM_FEATURE_CACHE_MB (default 1024 "
+        "MiB) on the base GPU and fall back to CPU transport per tensor when the "
+        "pool is full. Use fabric for cross-node GB200/GB300 MNNVL deployments.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -7638,11 +7639,12 @@ class ServerArgs:
                 int(legacy_ipc_enabled),
             )
 
-        if self.encoder_only and requested_transport == "cuda_ipc":
+        if self.encoder_only and requested_transport in ("cuda_ipc", "fabric"):
             logger.warning(
-                "--mm-feature-transport=cuda_ipc does not control encoder-only "
+                "--mm-feature-transport=%s does not control encoder-only "
                 "output transfer; using cpu for this inactive transport. Select "
-                "--encoder-transfer-backend for encoder outputs."
+                "--encoder-transfer-backend for encoder outputs.",
+                requested_transport,
             )
             requested_transport = "cpu"
 
@@ -7674,6 +7676,25 @@ class ServerArgs:
                     if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
                     else "disabled"
                 ),
+            )
+
+        if requested_transport == "fabric":
+            if not is_cuda():
+                raise ValueError("--mm-feature-transport=fabric requires NVIDIA CUDA.")
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--mm-feature-transport=fabric does not yet support "
+                    "PD-disaggregated serving."
+                )
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            logger.info(
+                "Using MNNVL FABRIC for multimodal features: reserving up to "
+                "%d MiB on base GPU %d across %d tokenizer worker(s). The pool "
+                "uses one fabric handle and GPU-resident lease metadata; a full "
+                "pool falls back to CPU transport per tensor.",
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
             )
 
         self.mm_feature_transport = requested_transport

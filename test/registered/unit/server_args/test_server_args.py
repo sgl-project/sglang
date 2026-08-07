@@ -259,6 +259,45 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "single node"):
             server_args._handle_multimodal_feature_transport()
 
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_fabric_is_explicit_bounded_and_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="fabric",
+            nnodes=2,
+            tokenizer_worker_num=2,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "fabric")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("MNNVL FABRIC", output)
+        self.assertIn("2 tokenizer worker", output)
+        self.assertIn("falls back to CPU", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_fabric_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="fabric")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_fabric_rejects_pd_disaggregation(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="fabric",
+            disaggregation_mode="prefill",
+        )
+
+        with self.assertRaisesRegex(ValueError, "PD-disaggregated"):
+            server_args._handle_multimodal_feature_transport()
+
 
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
