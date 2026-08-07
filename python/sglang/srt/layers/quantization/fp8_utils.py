@@ -1378,6 +1378,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             if weight_scale.ndim == 2
             else weight_scale.contiguous()
         )
+        backend = "cute-dsl" if m <= 64 else "cutlass"
         output = flashinfer_mm_mxfp8(
             q_input,
             weight_t,
@@ -1385,7 +1386,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             weight_scale_t,
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
-            backend="cutlass",
+            backend=backend,
         )
 
     if bias is not None:

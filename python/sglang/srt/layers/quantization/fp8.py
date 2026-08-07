@@ -2566,11 +2566,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale_inv=(
                     layer.w2_weight_scale_inv if self.block_quant else None
                 ),
-                gemm1_alpha=getattr(layer, "_flashinfer_trtllm_gemm1_alpha", None),
-                gemm1_beta=getattr(layer, "_flashinfer_trtllm_gemm1_beta", None),
-                gemm1_clamp_limit=getattr(
-                    layer, "_flashinfer_trtllm_gemm1_clamp_limit", None
-                ),
+                gemm1_alpha=layer._flashinfer_trtllm_gemm1_alpha,
+                gemm1_beta=layer._flashinfer_trtllm_gemm1_beta,
+                gemm1_clamp_limit=layer._flashinfer_trtllm_gemm1_clamp_limit,
                 w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
                 output1_scales_scalar=(
                     getattr(layer, "output1_scales_scalar", None)
