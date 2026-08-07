@@ -526,6 +526,53 @@ def _flash_mla_flashinfer(
         else extra_indices
     )
 
+    # FlashInfer instantiates decode-dsv4 only for a fixed (num_heads, topk)
+    # table. Normal decode always arrives with an instantiated topk, but
+    # DSpark's draft attention does not (topk=192 on DeepSeek-V4-Flash), and an
+    # unlisted shape falls through to the prefill orchestrator, whose first
+    # check is `num_tokens > 64`. Speculative verify submits
+    # batch * (gamma + 1) tokens, so that check can never pass and the server
+    # dies during CUDA graph capture.
+    #
+    # Widen the index to the next instantiated width and bound the real length
+    # with topk_length, which the kernel already honours. This must happen
+    # before num_splits is computed below, so the scratch buffers are sized for
+    # the width FlashInfer will actually see.
+    if B <= _FI_DECODE_MAX_TOKENS:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _DECODE_DSV4_DISPATCH as _FI_DSV4_TABLE,
+        )
+
+        _topk_real = idx.shape[-1]
+        if (H, _topk_real) not in _FI_DSV4_TABLE:
+            _target = next(
+                (
+                    width
+                    for width in sorted(
+                        w for heads, w in _FI_DSV4_TABLE if heads == H
+                    )
+                    if width > _topk_real
+                ),
+                None,
+            )
+            if _target is not None:
+                if topk_length is None:
+                    topk_length = torch.full(
+                        (idx.shape[0],),
+                        _topk_real,
+                        dtype=torch.int32,
+                        device=idx.device,
+                    )
+                idx = torch.cat(
+                    [
+                        idx,
+                        idx[..., :1].expand(
+                            *idx.shape[:-1], _target - _topk_real
+                        ),
+                    ],
+                    dim=-1,
+                ).contiguous()
+
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
