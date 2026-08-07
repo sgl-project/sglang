@@ -49,6 +49,7 @@ def _adapter(
     *,
     min_audio_sec=0.0,
     encoder_window_config=None,
+    chunk_size_sec=2.0,
     unfixed_token_num=1,
 ):
     return SimpleNamespace(
@@ -60,7 +61,7 @@ def _adapter(
             {"min_audio_sec": min_audio_sec} | (encoder_window_config or {})
         ),
         chunked_streaming_config={
-            "chunk_size_sec": 2.0,
+            "chunk_size_sec": chunk_size_sec,
             "unfixed_chunk_num": 2,
             "unfixed_token_num": unfixed_token_num,
         },
@@ -169,6 +170,19 @@ def _encoder_window_processor(transcripts, *, min_audio_sec=0.0):
         _server_args(120),
     )
     return tokenizer_manager, processor, processor.create_state()
+
+
+class TestRealtimeASRProcessorConfig(unittest.TestCase):
+    def test_rejects_invalid_chunk_size(self):
+        tokenizer_manager = _MockTokenizerManager("text")
+        for chunk_size_sec in (0.0, -1.0, float("inf"), 1e-20):
+            with self.subTest(chunk_size_sec=chunk_size_sec):
+                with self.assertRaises(ValueError):
+                    RealtimeASRProcessor(
+                        tokenizer_manager,
+                        _adapter(chunk_size_sec=chunk_size_sec),
+                        _server_args(),
+                    )
 
 
 def _realtime_connection(transcripts, finish_reasons, *, encoder_windows=True):

@@ -147,7 +147,13 @@ class RealtimeASRProcessor:
         self.max_buffer_seconds = server_args.asr_max_buffer_seconds
 
         state = StreamingASRState(**self.adapter.chunked_streaming_config)
+        if not math.isfinite(state.chunk_size_sec) or state.chunk_size_sec <= 0:
+            raise ValueError("realtime ASR chunk_size_sec must be finite and positive")
         self.chunk_size_bytes = int(state.chunk_size_sec * self.pcm_bytes_per_second)
+        if self.chunk_size_bytes <= 0:
+            raise ValueError(
+                "realtime ASR chunk_size_sec is shorter than one PCM sample"
+            )
         self.max_buffer_bytes = self.max_buffer_seconds * self.pcm_bytes_per_second
         self._encoder_window_policy = self._resolve_encoder_window_policy(
             state, server_args
