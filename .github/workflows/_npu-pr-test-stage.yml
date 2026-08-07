@@ -197,7 +197,7 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
-        timeout-minutes: ${{ inputs.run_timeout_minutes }}
+        timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
