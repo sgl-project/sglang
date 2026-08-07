@@ -675,6 +675,7 @@ def ring_attn(
     attn_impl: "AttentionImpl",
     is_causal: bool = False,
     dropout_p: float = 0.0,
+    return_softmax_lse: bool = False,
 ):
     """
     Ring Attention implementation.
@@ -748,18 +749,40 @@ def ring_attn(
     if use_segment_id:
         # For torch >= 2.6, segment_id is required. The value '1' is a placeholder
         # as we are not using complex segmentation features.
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             seq_dim=1,  # segment_id
             **attn_kwargs,
         )
     else:
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             **attn_kwargs,
         )
 
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])
+    if return_softmax_lse:
+        return output, lse
     return output
+
+
+def _merge_attention_partials(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> torch.Tensor:
+    """Merge two attention partials computed over disjoint KV sets.
+
+    `out_*` are `[B, S, H, D]`; `lse_*` are the dense-FA LSE layout `[B, H, S]`.
+    Each partial is self-normalized over its own KV, so the exact combine is a
+    two-term logsumexp reweighting; done in fp32 for stability.
+    """
+    lse_a = lse_a.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    lse_b = lse_b.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    new_lse = torch.logaddexp(lse_a, lse_b)
+    return out_a.to(torch.float32) * torch.exp(lse_a - new_lse) + out_b.to(
+        torch.float32
+    ) * torch.exp(lse_b - new_lse)
 
 
 def _ring_merge_attention(
