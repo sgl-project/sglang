@@ -1,10 +1,11 @@
 """Public APIs of the language."""
 
+from __future__ import annotations
+
 import re
-from typing import Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 from sglang.global_config import global_config
-from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
 from sglang.lang.ir import (
     SglExpr,
@@ -18,6 +19,9 @@ from sglang.lang.ir import (
     SglSeparateReasoning,
     SglVideo,
 )
+
+if TYPE_CHECKING:
+    from sglang.lang.backend.base_backend import BaseBackend
 
 
 def function(
