@@ -33,7 +33,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
-    get_server_args,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
@@ -139,7 +138,7 @@ class RelLogitsProj(nn.Module):
         # the batch composition.
         self._proj_dispatch = (
             envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
-            and not get_server_args().enable_deterministic_inference
+            and not get_exec().deterministic.enable_deterministic_inference
         )
 
     def _project(self, r: torch.Tensor) -> torch.Tensor:

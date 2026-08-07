@@ -7,7 +7,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -460,7 +460,7 @@ def symm_mem_all_reduce(
         res = (
             _get_inkling_ar_resources(comm)
             if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
-            and not get_server_args().enable_deterministic_inference
+            and not get_exec().deterministic.enable_deterministic_inference
             else None
         )
         # Custom kernels need a 16B-vector-multiple size (validate() enforces it);
