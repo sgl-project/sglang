@@ -35,6 +35,7 @@ from sglang.kernels.ops.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -154,6 +155,17 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+
+def _aiter_mla_out_dtype(q_dtype: torch.dtype) -> torch.dtype:
+    """Output dtype for `aiter.mla.mla_decode_fwd`.
+
+    The callers below size their output buffer off q, but on the a8w8 path q is
+    fp8 while the attention output is not: aiter's reduce kernels
+    (`kn_mla_reduce_v1*`, aiter csrc/kernels/mla/reduce.cu) only instantiate
+    bf16 and fp16 `out_t` and hard-fail on anything else.
+    """
+    return torch.bfloat16 if q_dtype == fp8_dtype else q_dtype
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -278,6 +290,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "aiter",
     "trtllm",
 ]
 
@@ -377,10 +390,14 @@ class DeepseekSparseAttnBackend(
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
             ) and model_runner.kv_cache_dtype == fp8_dtype:
+                # Warm the buffers with the dtype pair the forward will actually
+                # use, so no reallocation happens inside CUDA graph capture.
+                # With an fp8 KV cache the ROCm default routes q through
+                # `fused_qk_rope_cat_and_cache_mla`, which emits fp8 q.
                 self._ensure_aiter_dsa_decode_metadata_buffer(
                     max_seqlen_q=1,
                     batch_size=max_bs,
-                    q_dtype=torch.bfloat16,
+                    q_dtype=fp8_dtype,
                     kv_dtype=fp8_dtype,
                 )
 
@@ -558,6 +575,28 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             ),
         )
+
+    def _aiter_mla_scales(
+        self, q_dtype: torch.dtype, kv_dtype: torch.dtype
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Scale pair for `aiter.mla.mla_decode_fwd`.
+
+        `mla_decode_stage1_asm_fwd` hard-requires BOTH scales once q is fp8 and
+        only kv_scale when q stays bf16 (aiter csrc/py_itfs_cu/asm_mla.cu). q is
+        fp8 whenever `fused_qk_rope_cat_and_cache_mla` produced it, which is the
+        default on ROCm with an fp8 KV cache -- that op already folds k_scale
+        into q, so q and kv share one fp8 domain and both scales are identity.
+        Same convention as the fp8 sparse-MLA prefill path
+        (`_forward_sparse_mla_q8kv8`, `_q8kv8_identity_scale`).
+        """
+        if q_dtype != fp8_dtype and kv_dtype != fp8_dtype:
+            return None, None
+        if self._q8kv8_identity_scale is None:
+            self._q8kv8_identity_scale = torch.tensor(
+                [1.0], dtype=torch.float32, device=self.device
+            )
+        identity = self._q8kv8_identity_scale
+        return (identity if q_dtype == fp8_dtype else None), identity
 
     def _ensure_aiter_dsa_decode_metadata_buffer(
         self,
@@ -2944,10 +2983,18 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        # The output buffer must not inherit q's dtype on the a8w8 path: aiter's
+        # reduce (kn_mla_reduce_v1*) only instantiates bf16/fp16 `out_t`
+        # (csrc/kernels/mla/reduce.cu), and an fp8 q carries its scale
+        # out-of-band anyway, so the attention output is never fp8.
+        out_dtype = _aiter_mla_out_dtype(q.dtype)
+
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=out_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -2958,17 +3005,15 @@ class DeepseekSparseAttnBackend(
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        q_scale = None
-        kv_scale = None
+        q_scale, kv_scale = self._aiter_mla_scales(q_kernel.dtype, kv_cache.dtype)
         aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         kv_indptr = self.kv_indptr
 
@@ -2978,6 +3023,17 @@ class DeepseekSparseAttnBackend(
 
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
+
+        # aiter takes its batch count from kv_indptr's LENGTH, not from
+        # qo_indptr: get_mla_metadata_v1_0_device (aiter csrc/kernels/mla/
+        # metadata/v1_0_device.cuh) does `num_batches = seqlens_kv_indptr.size(0)
+        # - 1`. self.kv_indptr is a max_bs+1 capacity buffer, so handing it over
+        # whole makes the metadata kernel emit work items for every stale slot
+        # past bs, with qo_start = bid * uni_seqlen_qo running far past the end
+        # of q/o -- the persistent MLA kernel then reads and writes out of
+        # bounds (GPU memory access fault). cu_seqlens_q is already a [: bs + 1]
+        # view; kv_indptr has to match it.
+        kv_indptr = kv_indptr[: bs + 1]
 
         kv_last_page_lens = metadata.cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
@@ -3022,10 +3078,14 @@ class DeepseekSparseAttnBackend(
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        out_dtype = _aiter_mla_out_dtype(q.dtype)
+
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim), dtype=out_dtype
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=out_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -3036,17 +3096,15 @@ class DeepseekSparseAttnBackend(
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        q_scale = None
-        kv_scale = None
+        q_scale, kv_scale = self._aiter_mla_scales(q_kernel.dtype, kv_cache.dtype)
         aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)

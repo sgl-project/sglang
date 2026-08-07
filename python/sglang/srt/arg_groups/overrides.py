@@ -1669,7 +1669,15 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     if not user_set_prefill and not user_set_decode and is_hip():
         declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
+        # ROCm decode default: aiter MLA. The aiter decode pair
+        # (aiter::mla_a8w8_qh16_qseqlen1_gqaratio16_ps + kn_mla_reduce_v1_ps)
+        # measures ~1.17 ms/iter faster at bs=64 on gfx950 than the tilelang
+        # sparse-MLA decode split/reduce pair. It needs an fp8_e4m3 KV cache
+        # (see DSABackend._prepare_aiter_dsa_decode_metadata), so every other
+        # KV dtype keeps tilelang. Override with --dsa-decode-backend tilelang.
+        declared["dsa_decode_backend"] = (
+            "aiter" if kv_cache_dtype == "fp8_e4m3" else "tilelang"
+        )
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
