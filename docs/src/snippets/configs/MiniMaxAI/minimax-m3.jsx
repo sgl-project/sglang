@@ -14,10 +14,7 @@
 export const config = {
   modelName: "MiniMax-M3",
 
-  // TTFT/TPOT are P50 (median_ttft_ms / median_tpot_ms from bench_serving). The
-  // 0.5.16 re-benched cells (b200/b300/gb300) are measured P50; legacy cells not
-  // yet re-benched carried Mean numbers (~P50 for these steady-state balanced runs)
-  // pending re-measurement.
+  // TTFT/TPOT are P50 (median_ttft_ms / median_tpot_ms from bench_serving).
   latencyPercentile: "P50",
 
   supportedHardware: ["b200", "b300", "gb200", "gb300", "mi300x", "mi325x", "mi350x", "mi355x", "h200"],
@@ -97,8 +94,7 @@ sgl-eval run mmmu_pro \\
   dockerImages: {
     // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
     // (B300/GB300) + Grace arm64 builds; cu12 is the Hopper/CUDA-12 build;
-    // dev-minimax-m3 is the rolling default. (M3 support is in sglang 0.5.16; these
-    // dev images carry the arch-specific CUDA-13/CUDA-12 + Grace arm64 builds.)
+    // dev-minimax-m3 is the default.
     b200: "lmsysorg/sglang:dev-minimax-m3",
     b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
     gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
@@ -212,14 +208,14 @@ sgl-eval run mmmu_pro \\
   cells: [
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-      // PENDING the 0.5.16 re-bench: tp8 needs a full 8x-b200 node, none currently
-      // available. On 0.5.16 serving requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      // (--mem-fraction-static 0.65 OOMs at cuda-graph capture without it).
+      // Pending — not yet measured. env PYTORCH_CUDA_ALLOC_CONF required on 0.5.16.
       verified: false,
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -236,6 +232,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -253,6 +251,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -269,6 +269,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
@@ -286,6 +288,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -303,6 +307,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -322,6 +328,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -343,6 +351,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--quantization mxfp8",
         "--dtype bfloat16",
@@ -369,6 +379,8 @@ sgl-eval run mmmu_pro \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
         "--tp 8",
         "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
