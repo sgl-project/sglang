@@ -15,6 +15,7 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+from ..page_table import load_token_slots
 
 
 @triton.heuristics(
@@ -74,14 +75,12 @@ def _flash_attn_fwd_with_block_score_kernel(
     sink_ptr,  # Sink: h x d
     o_ptr,  # O: n x h x d
     score_ptr,  # Score: h x n x max_seqblock
-    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    page_table_ptr,  # batch-local physical page ids
     # seqlens
     cu_seqlens,
     seq_lens,
     prefix_lens,
-    slot_ids,
     # shape
-    max_slots,
     num_heads,
     gqa_group_size,
     qk_head_dim,
@@ -113,7 +112,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     stride_s_h,
     stride_s_q,
     stride_s_k,
-    stride_r2t_b,
+    stride_pt_b,
     # META parameters
     BLOCK_SIZE_Q: tl.constexpr,  # q block size
     BLOCK_SIZE_K: tl.constexpr,  # k block size
@@ -124,6 +123,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     SCORE_TYPE: tl.constexpr,
     DISABLE_INDEX_VALUE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -139,9 +139,6 @@ def _flash_attn_fwd_with_block_score_kernel(
     q_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
-    sid = (
-        tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
-    ) % max_slots  # safety against negative
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
     block_num = (seq_len + block_size - 1) // block_size
@@ -196,15 +193,17 @@ def _flash_attn_fwd_with_block_score_kernel(
     diag_start = (prefix_len + pid_q * BLOCK_SIZE_Q) // BLOCK_SIZE_K * BLOCK_SIZE_K
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
     for i in tl.range(0, hi, BLOCK_SIZE_K):
-        # paged load K via req_to_token: pos -> slot -> k_cache
+        # Resolve logical positions through the per-forward page-table snapshot.
         pos = i + off_k
         pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        slots = load_token_slots(
+            page_table_ptr,
+            pid_b,
+            pos,
+            stride_pt_b,
+            pos_mask,
+            PAGE_SIZE,
+        )
         # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
         k = tl.load(
             k_cache_ptr
@@ -445,8 +444,7 @@ def flash_prefill_with_topk_index(
     k_cache: torch.Tensor,  # paged
     v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
     sink: Optional[torch.Tensor],
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,
+    page_table: torch.Tensor,
     cu_seqlens: torch.Tensor,
     seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
@@ -467,6 +465,7 @@ def flash_prefill_with_topk_index(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    page_size: int = 1,
 ):
     assert score_type in (
         "max",
@@ -482,7 +481,7 @@ def flash_prefill_with_topk_index(
     assert cu_seqlens.dtype == torch.int32
     # shape
     total_q, num_heads, qk_head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
+    _, num_kv_heads, _ = k_cache.shape
     if disable_index_value:
         # placeholder for BLOCK_SIZE_VD; V is never loaded
         v_head_dim = qk_head_dim
@@ -492,6 +491,8 @@ def flash_prefill_with_topk_index(
         v_head_dim = v_cache.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     batch_size = cu_seqlens.shape[0] - 1
+    assert page_table.dtype == torch.int32 and page_table.dim() == 2
+    assert page_table.shape[0] == batch_size
     assert qk_head_dim <= 256 and v_head_dim <= 256, "head_dim must be less than 256"
     if sink is not None:
         assert sink.shape[0] == num_heads and sink.shape[1] == qk_head_dim
@@ -507,7 +508,15 @@ def flash_prefill_with_topk_index(
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
-    max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
+    # Replay-time prefixes may be longer than the capture-time fill value.
+    max_seqblock_k = triton.cdiv(
+        (
+            page_table.shape[1] * page_size
+            if torch.cuda.is_current_stream_capturing()
+            else max_seqlen_k
+        ),
+        block_size_k,
+    )
     if disable_index_value:
         o = None
     else:
@@ -532,12 +541,10 @@ def flash_prefill_with_topk_index(
         sink,
         o,
         score,
-        req_to_token,
+        page_table,
         cu_seqlens,
         seq_lens,
         prefix_lens,
-        slot_ids,
-        max_slots,
         num_heads,
         gqa_group_size,
         qk_head_dim,
@@ -565,10 +572,11 @@ def flash_prefill_with_topk_index(
         score.stride(0),
         score.stride(1),
         score.stride(2),
-        req_to_token.stride(0),
+        page_table.stride(0),
         SCORE_TYPE=score_type,
         DISABLE_INDEX_VALUE=disable_index_value,
         IS_FP8=is_fp8,
+        PAGE_SIZE=page_size,
     )
 
     # topk extraction kernel

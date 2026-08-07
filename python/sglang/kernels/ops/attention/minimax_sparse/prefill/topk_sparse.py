@@ -13,6 +13,7 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+from ..page_table import load_token_slots
 
 
 @triton.heuristics(
@@ -54,15 +55,13 @@ def _gqa_share_sparse_fwd_kernel(
     sink_ptr,  # Sink: h x d
     t_ptr,  # topk_idx: kh x n x k
     o_ptr,  # O: n x h x d
-    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    page_table_ptr,  # batch-local physical page ids
     # seqlens
     cu_seqlens_q,
     cu_seqblocks_q,
     seq_lens,
     prefix_lens,
-    slot_ids,
     # shape
-    max_slots,
     num_kv_heads,
     gqa_group_size,
     qk_head_dim,
@@ -93,7 +92,7 @@ def _gqa_share_sparse_fwd_kernel(
     stride_on,
     stride_oh,
     stride_od,
-    stride_r2t_b,
+    stride_pt_b,
     # META parameters
     BLOCK_SIZE_Q: tl.constexpr,  # q block size
     BLOCK_SIZE_K: tl.constexpr,  # k block size
@@ -106,6 +105,7 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -120,9 +120,6 @@ def _gqa_share_sparse_fwd_kernel(
     q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
-    sid = (
-        tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
-    ) % max_slots  # safety against negative
     if pid_q * num_q_loop >= q_block_len:
         return
     real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
@@ -191,15 +188,17 @@ def _gqa_share_sparse_fwd_kernel(
             # get current block start index (absolute K position)
             c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
             t_ptr_j = t_ptr_j + stride_tk
-            # paged load K via req_to_token: pos -> slot -> k_cache
+            # Resolve from graph-owned page ids during replay.
             pos = c + off_n
             pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
+            slots = load_token_slots(
+                page_table_ptr,
+                pid_b,
+                pos,
+                stride_pt_b,
+                pos_mask,
+                PAGE_SIZE,
+            )
             # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
             k = tl.load(
                 k_cache_ptr
@@ -273,8 +272,7 @@ def flash_prefill_with_gqa_share_sparse(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     sink: Optional[torch.Tensor],
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,
+    page_table: torch.Tensor,
     topk_idx: torch.Tensor,
     block_size_q: int,
     block_size_k: int,
@@ -289,6 +287,7 @@ def flash_prefill_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
@@ -298,10 +297,12 @@ def flash_prefill_with_gqa_share_sparse(
     assert block_size_k in {16, 32, 64, 128}
     # shape
     total_q, num_q_heads, qk_head_dim = q.shape
-    max_slots, num_k_heads, _ = k_cache.shape
+    _, num_k_heads, _ = k_cache.shape
     _, num_v_heads, v_head_dim = v_cache.shape
     batch_size = cu_seqlens.shape[0] - 1
     topk = topk_idx.shape[-1]
+    assert page_table.dtype == torch.int32 and page_table.dim() == 2
+    assert page_table.shape[0] == batch_size
     assert topk_idx.shape[0] == num_k_heads
     # gqa
     assert num_k_heads == num_v_heads
@@ -339,13 +340,11 @@ def flash_prefill_with_gqa_share_sparse(
         sink,
         topk_idx,
         o,
-        req_to_token,
+        page_table,
         cu_seqlens,
         cu_seqblocks_q,
         seq_lens,
         prefix_lens,
-        slot_ids,
-        max_slots,
         num_k_heads,
         gqa_group_size,
         qk_head_dim,
@@ -372,10 +371,11 @@ def flash_prefill_with_gqa_share_sparse(
         o.stride(0),
         o.stride(1),
         o.stride(2),
-        req_to_token.stride(0),
+        page_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
+        PAGE_SIZE=page_size,
     )
     return o

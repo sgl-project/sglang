@@ -349,14 +349,15 @@ __global__ void minimax_decode_topk_block_kernel(
 // Page-table output: for each (batch b, kv-head h) pseudo-request emit the
 // trtllm/fa3 page table -- selected blocks sorted ascending (so the final partial
 // block's pages land last), each expanded to its ppb = block_size/page_size pages
-// via req_to_token -- plus the effective KV length seq_lens_out.
+// via a batch-local physical page table -- plus the effective KV length
+// seq_lens_out.
 //
 // DP attention (num_kv_heads > 1): each kv head selects its OWN blocks, so the
 // per-request page table can't be shared across heads. We flatten (b, h) into
 // num_heads*batch pseudo-requests laid out batch-major (row = b*num_heads + h,
-// matching q.view(bs, nkv, gqa, d).reshape(bs*nkv, gqa, d)). seq_lens / slot_ids /
-// req_to_token are per-batch (head-independent: a token's cache slot is the same
-// for every head). The page index is head-encoded (head-minor) as
+// matching q.view(bs, nkv, gqa, d).reshape(bs*nkv, gqa, d)). The mapping is
+// head-independent: a token's cache slot is the same for every head. The page
+// index is head-encoded (head-minor) as
 // base_page*num_heads + h, which is exactly the page index into an HND cache
 // [num_pages, nkv, page_size, D] reshaped to [num_pages*nkv, 1, page_size, D] (a
 // free view when the cache is contiguous HND). num_heads == 1 (h == 0) reproduces
@@ -365,8 +366,7 @@ template <typename SeqLenT, bool kUsePDL>
 __global__ void minimax_decode_topk_page_table_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
-    const int32_t* __restrict__ req_to_token,
-    const int64_t* __restrict__ slot_ids,
+    const int32_t* __restrict__ source_page_table,
     int32_t* __restrict__ page_table,
     int32_t* __restrict__ seq_lens_out,
     int batch,
@@ -375,22 +375,22 @@ __global__ void minimax_decode_topk_page_table_kernel(
     int block_size,
     int topk,
     int page_size,
-    int r2t_stride,
-    int max_kv_len,
+    int source_page_table_stride,
+    int source_page_table_width,
     int max_sparse_pages) {
   const int b = blockIdx.x;  // grid.x = batch
   const int h = blockIdx.y;  // grid.y = num_heads (kv head)
   const int tx = threadIdx.x;
 
-  // Prefetch seq_lens / slot_ids (from earlier kernels) and the cheap setup
-  // before waiting on the score producer, so the prologue overlaps its tail (PDL).
+  // Resolve the mapping row and cheap setup before waiting on the score
+  // producer, so the prologue overlaps its tail (PDL).
   const int64_t seq_len = static_cast<int64_t>(seq_lens[b]);
   const int num_blocks_raw = static_cast<int>((seq_len + block_size - 1) / block_size);
   const int num_blocks = num_blocks_raw < max_seqblock ? num_blocks_raw : max_seqblock;
   const int ppb = block_size / page_size;
   const int64_t out_row = static_cast<int64_t>(b) * num_heads + h;  // flattened pseudo-request
   int32_t* __restrict__ pt_row = page_table + out_row * max_sparse_pages;
-  const int64_t r2t_base = static_cast<int64_t>(slot_ids[b]) * r2t_stride;
+  const int64_t source_row = static_cast<int64_t>(b) * source_page_table_stride;
   device::PDLWaitPrimary<kUsePDL>();
 
   if (num_blocks <= topk) {  // trivial: every block selected, all tokens valid
@@ -401,8 +401,10 @@ __global__ void minimax_decode_topk_page_table_kernel(
       const int slot = e / ppb;
       const int pp = e % ppb;
       int tok = slot * block_size + pp * page_size;
-      if (tok >= max_kv_len) tok = max_kv_len - 1;
-      pt_row[e] = req_to_token[r2t_base + tok] / page_size * num_heads + h;
+      int mapping_idx = tok / page_size;
+      if (mapping_idx >= source_page_table_width) mapping_idx = source_page_table_width - 1;
+      const int32_t base_page = source_page_table[source_row + mapping_idx];
+      pt_row[e] = base_page * num_heads + h;
     }
     return;
   }
@@ -440,8 +442,10 @@ __global__ void minimax_decode_topk_page_table_kernel(
     const int slot = e / ppb;
     const int pp = e % ppb;
     int tok = s_sorted[slot] * block_size + pp * page_size;
-    if (tok >= max_kv_len) tok = max_kv_len - 1;
-    pt_row[e] = req_to_token[r2t_base + tok] / page_size * num_heads + h;
+    int mapping_idx = tok / page_size;
+    if (mapping_idx >= source_page_table_width) mapping_idx = source_page_table_width - 1;
+    const int32_t base_page = source_page_table[source_row + mapping_idx];
+    pt_row[e] = base_page * num_heads + h;
   }
 }
 
@@ -509,12 +513,11 @@ void minimax_decode_topk(
 // page_table and seq_lens_out are allocated by the caller.
 template <typename SeqLenT, bool kUsePDL>
 void minimax_decode_topk_page_table(
-    tvm::ffi::TensorView score,         // [H, B, S] fp32 (H = num_kv_heads)
-    tvm::ffi::TensorView seq_lens,      // [B] int32/int64
-    tvm::ffi::TensorView req_to_token,  // [max_reqs, max_kv_len] int32
-    tvm::ffi::TensorView slot_ids,      // [B] int64 (req_pool_indices)
-    tvm::ffi::TensorView page_table,    // [B*H, max_sparse_pages] int32 (out)
-    tvm::ffi::TensorView seq_lens_out,  // [B*H] int32 (effective KV length, out)
+    tvm::ffi::TensorView score,              // [H, B, S] fp32 (H = num_kv_heads)
+    tvm::ffi::TensorView seq_lens,           // [B] int32/int64
+    tvm::ffi::TensorView source_page_table,  // [B, max_pages] physical page ids
+    tvm::ffi::TensorView page_table,         // [B*H, max_sparse_pages] int32 (out)
+    tvm::ffi::TensorView seq_lens_out,       // [B*H] int32 (effective KV length, out)
     int64_t block_size,
     int64_t topk,
     int64_t page_size) {
@@ -523,8 +526,7 @@ void minimax_decode_topk_page_table(
   SymbolicSize H = {"num_heads"};
   SymbolicSize B = {"batch"};
   SymbolicSize S = {"max_seqblock"};
-  SymbolicSize R = {"max_reqs"};
-  SymbolicSize KV = {"max_kv_len"};
+  SymbolicSize KV = {"source_page_table_width"};
   SymbolicSize BH = {"batch_heads"};
   SymbolicSize P = {"max_sparse_pages"};
   SymbolicDevice device_;
@@ -532,17 +534,16 @@ void minimax_decode_topk_page_table(
 
   TensorMatcher({H, B, S}).with_dtype<fp32_t>().with_device(device_).verify(score);
   TensorMatcher({B}).with_dtype<SeqLenT>().with_device(device_).verify(seq_lens);
-  TensorMatcher({R, KV}).with_dtype<int32_t>().with_device(device_).verify(req_to_token);
-  TensorMatcher({B}).with_dtype<int64_t>().with_device(device_).verify(slot_ids);
+  TensorMatcher({B, KV}).with_dtype<int32_t>().with_device(device_).verify(source_page_table);
   TensorMatcher({BH, P}).with_dtype<int32_t>().with_device(device_).verify(page_table);
   TensorMatcher({BH}).with_dtype<int32_t>().with_device(device_).verify(seq_lens_out);
 
   const int num_heads = static_cast<int>(H.unwrap());
   const int batch = static_cast<int>(B.unwrap());
   const int max_seqblock = static_cast<int>(S.unwrap());
-  const int max_kv_len = static_cast<int>(KV.unwrap());
+  const int source_page_table_width = static_cast<int>(KV.unwrap());
   const int max_sparse_pages = static_cast<int>(P.unwrap());
-  const int r2t_stride = static_cast<int>(req_to_token.stride(0));
+  const int source_page_table_stride = static_cast<int>(source_page_table.stride(0));
   const DLDevice device = device_.unwrap();
 
   RuntimeCheck(
@@ -564,8 +565,7 @@ void minimax_decode_topk_page_table(
           minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL>,
           static_cast<const float*>(score.data_ptr()),
           static_cast<const SeqLenT*>(seq_lens.data_ptr()),
-          static_cast<const int32_t*>(req_to_token.data_ptr()),
-          static_cast<const int64_t*>(slot_ids.data_ptr()),
+          static_cast<const int32_t*>(source_page_table.data_ptr()),
           static_cast<int32_t*>(page_table.data_ptr()),
           static_cast<int32_t*>(seq_lens_out.data_ptr()),
           batch,
@@ -574,8 +574,8 @@ void minimax_decode_topk_page_table(
           static_cast<int>(block_size),
           static_cast<int>(topk),
           static_cast<int>(page_size),
-          r2t_stride,
-          max_kv_len,
+          source_page_table_stride,
+          source_page_table_width,
           max_sparse_pages);
 }
 
