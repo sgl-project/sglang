@@ -67,7 +67,9 @@ async def _wait_until_http_ready(server_args: ServerArgs) -> None:
         for _ in range(120):
             try:
                 response = await client.get(health_url, timeout=5.0)
-                if response.status_code == 200:
+                # Accepts status code 503 to prevent the warmup task, which awaits
+                # this probe, from deadlocking on itself.
+                if response.status_code in (200, 503):
                     return
             except httpx.HTTPError:
                 pass
