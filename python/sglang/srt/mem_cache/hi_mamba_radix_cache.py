@@ -99,16 +99,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
-
         self.page_size = params.page_size
         self.hybrid_kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(self.hybrid_kv_cache, HybridLinearKVPool):
@@ -455,7 +445,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.dec_lock_ref(end_node)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
@@ -465,9 +461,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
-
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()
@@ -898,7 +891,12 @@ class HiMambaRadixCache(MambaRadixCache):
             else:
                 if prev_prefix_len < total_prefix_length + prefix_len:
                     start = max(0, prev_prefix_len - total_prefix_length)
-                    self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                    # same as MambaRadixCache._insert_helper: page-exact segment
+                    # at offset total_prefix_length of the kv row
+                    self.token_to_kv_pool_allocator.free_segment(
+                        value[start:prefix_len],
+                        start_pos=total_prefix_length + start,
+                    )
                 total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 
@@ -1476,7 +1474,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def _drain_storage_control_queues_local(self):
         self._drain_storage_control_queues_impl(
-            n_revoke=None,
             n_storage_hit=0,
             n_backup=None,
             n_release=None,
@@ -1497,7 +1494,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -1515,10 +1511,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 drained += 1
                 yield item
 
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
-
         def _drain_and_alloc_storage_hit():
             # The L3 hit count is now known, so reserve exactly that much host
             # KV memory. NOTE: alloc/evict here is rank-local but deterministic
@@ -1534,6 +1526,10 @@ class HiMambaRadixCache(MambaRadixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
+                    self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
                     continue
 
@@ -1589,7 +1585,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -1700,7 +1695,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
         qsizes = torch.tensor(
             [
-                cc.prefetch_revoke_queue.qsize(),
                 cc.prefetch_hit_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
@@ -1712,9 +1706,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
+        n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,

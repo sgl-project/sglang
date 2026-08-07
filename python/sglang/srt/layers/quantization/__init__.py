@@ -64,14 +64,13 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_hip,
+    is_gfx95_supported,
     is_mps,
     is_npu,
     is_xpu,
-    mxfp_supported,
 )
 
-_is_mxfp_supported = mxfp_supported()
+_is_gfx95_supported = is_gfx95_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -109,7 +108,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or _is_gfx95_supported:
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -28,11 +28,13 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -101,7 +103,9 @@ def organize_draft_results(
     parents_list: List[torch.Tensor],
     num_draft_token: int,
 ):
+    # b, n, topk; n = 1 + (num_steps-1) * topk
     score_list = torch.cat(score_list, dim=1).flatten(1)
+    # b, (topk + (num_steps-1) * topk)
     ss_token_list = torch.cat(token_list, dim=1)
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
@@ -149,7 +153,7 @@ def build_tree_kernel_efficient(
     num_verify_tokens: int,
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
-    position_buf: Optional[torch.Tensor] = None,
+    fill_prefix_mask: bool = True,
 ):
     draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
@@ -166,7 +170,11 @@ def build_tree_kernel_efficient(
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
             tree_mask.fill_(0)
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-            tree_mask.fill_(True)
+            # Only the [0, seq_len) prefix columns depend on this fill; the
+            # kernel below writes every tree cell itself. Skip the (up to
+            # 100s of MB) per-step memset when nothing reads the mask.
+            if fill_prefix_mask:
+                tree_mask.fill_(True)
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
@@ -185,13 +193,15 @@ def build_tree_kernel_efficient(
             device=device,
         )
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-        tree_mask = torch.full(
-            (
-                seq_lens_sum * num_verify_tokens
-                + num_verify_tokens * num_verify_tokens * bs,
-            ),
-            True,
-            device=device,
+        mask_shape = (
+            seq_lens_sum * num_verify_tokens
+            + num_verify_tokens * num_verify_tokens * bs,
+        )
+        # Same reasoning as the preallocated branch above.
+        tree_mask = (
+            torch.full(mask_shape, True, dtype=torch.bool, device=device)
+            if fill_prefix_mask
+            else torch.empty(mask_shape, dtype=torch.bool, device=device)
         )
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
@@ -204,12 +214,7 @@ def build_tree_kernel_efficient(
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
-    if position_buf is not None:
-        positions = position_buf
-    else:
-        positions = torch.empty(
-            (bs * num_verify_tokens,), device=device, dtype=torch.long
-        )
+    positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
     if _is_npu:
         torch.ops.npu.build_tree_kernel_efficient(
@@ -489,7 +494,7 @@ def eagle_prepare_for_verify(
     target_worker: TpModelWorker,
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
+        assign_extend_cache_locs_uniform_func,
     )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -509,11 +514,13 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        batch.out_cache_loc = assign_extend_cache_locs_func(
+        # Uniform variant: end offsets (= start + draft_token_num) are computed
+        # inside the kernel, keeping the eager `seq_lens + N` add off the host
+        # critical path (bs=1 MTP inter-phase seam).
+        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
             req_pool_indices=batch.req_pool_indices,
             req_to_token=req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + verify_input.draft_token_num,
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
@@ -566,11 +573,81 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+def _seeded_verify_coins(
+    *,
+    sampling_seed: torch.Tensor,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive deterministic verify-side coins from per-request sampling seeds.
+
+    Mirrors the main seeded-sampling path: murmur_hash32(seed, seq_lens,
+    column) mapped to [0, 1). Columns [0, draft_token_num) drive the
+    per-draft rejection coins; column draft_token_num drives the final
+    fallback-sampling coin.
+
+    Scope: this seeds only the verify-side RNG. With rejection sampling the
+    draft workers still pick candidates via unseeded multinomial
+    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
+    until the draft RNG is seeded in a follow-up; top-k/greedy draft
+    selection is already deterministic.
+    """
+    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+    cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
+    hashed = murmur_hash32(
+        sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
+    )
+    uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    # The float32 cast rounds the top 129 uint32 hashes to exactly 1.0, but
+    # the sampling kernels expect half-open [0, 1) coins: a 1.0 coin walks
+    # past the last CDF bucket and can return a zero-probability token.
+    # Clamp to the largest float32 below one; every other coin value is
+    # untouched, so previously verified bitwise baselines stay intact.
+    max_coin = 1.0 - 2**-24
+    coins = (
+        uniforms[:, :draft_token_num].to(torch.float32).clamp_(max=max_coin)
+    ).contiguous()
+    coins_for_final_sampling = (
+        uniforms[:, draft_token_num].to(torch.float32).clamp_(max=max_coin)
+    ).contiguous()
+    return coins, coins_for_final_sampling
+
+
+def _verify_coins(
+    *,
+    sampling_info: SamplingBatchInfo,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    candidates: torch.Tensor,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rejection and final-sampling coins for verify: deterministic seeded
+    coins when sampling_seed is set (see _seeded_verify_coins), torch.rand
+    otherwise.
+    """
+    if sampling_info.sampling_seed is not None:
+        return _seeded_verify_coins(
+            sampling_seed=sampling_info.sampling_seed,
+            seq_lens=seq_lens,
+            draft_token_num=draft_token_num,
+            device=device,
+        )
+    # coins for rejection sampling
+    coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+    # coins for final sampling
+    coins_for_final_sampling = torch.rand(
+        (candidates.shape[0],), dtype=torch.float32, device=device
+    )
+    return coins, coins_for_final_sampling
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
-    vocab_mask: torch.Tensor = None,
+    grammar_mask: Optional[GrammarMask] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -582,7 +659,6 @@ def eagle_sample(
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
-    from sglang.srt.runtime_context import get_server_args
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
@@ -631,11 +707,8 @@ def eagle_sample(
         )
 
     # Apply grammar mask if provided
-    if vocab_mask is not None:
-        assert verify_input.grammar is not None
-        verify_input.grammar.apply_vocab_mask(
-            logits=next_token_logits, vocab_mask=vocab_mask
-        )
+    if grammar_mask is not None:
+        grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -672,7 +745,7 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
+        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -717,10 +790,13 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        # coins for rejection sampling
-        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-        # coins for final sampling
-        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
 
         sampling_fn = (
             chain_speculative_sampling_triton
@@ -842,9 +918,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.runtime_context import get_server_args
 
-    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
+    if page_size > 1 and (get_spec().speculative_eagle_topk or 1) > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (

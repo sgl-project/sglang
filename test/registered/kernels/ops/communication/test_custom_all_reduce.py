@@ -235,12 +235,13 @@ def test_custom_all_reduce(
 
 
 if __name__ == "__main__":
-    # Only sweep the common world sizes (2, 4, 8) by default: testing every
-    # count in 2..8 serially overruns the per-file CI time budget, and 3/5/6/7
-    # are rare in practice. Use --num-gpu to exercise them explicitly.
+    # Only sweep the common world sizes (2, 4, 8, 16) by default: testing every
+    # count in 2..16 serially overruns the per-file CI time budget, and numbers
+    # in the middle are rare in practice. Use --num-gpu to exercise them
+    # explicitly.
     multigpu_pytest_main(
         __name__,
         __file__,
-        num_gpus=(2, 4, 8),
+        num_gpus=(2, 4, 8, 16),
         pre_launch_fn=_precompile_kernels,
     )

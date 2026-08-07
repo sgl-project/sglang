@@ -30,7 +30,7 @@ from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
-    _dequant_fp8_wo_a,
+    _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -49,11 +49,16 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported
-from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
 
 
 def apply_rotary_emb(
@@ -749,18 +754,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_embed_stack = None
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
         confidence = confidence_head.apply_sts(confidence_raw)
-        maybe_detect_in_closed_range(
-            confidence, 0.0, 1.0, "DSpark confidence must lie in [0, 1]."
-        )
+        expect(_CONFIDENCE, confidence)
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
-        weights = list(weights)
-        if any(name.endswith(".wo_a.scale") for name, _ in weights):
-            weights = list(_dequant_fp8_wo_a(weights))
+        weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
