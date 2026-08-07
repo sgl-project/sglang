@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
+from importlib.util import find_spec
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -54,14 +56,48 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
 from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
 
+logger = logging.getLogger(__name__)
+
 _NPU_MHC_BACKEND = os.environ.get(
-    "SGLANG_TELECHAT4_MHC_BACKEND", "triton"
+    "SGLANG_TECHAT4_MHC_BACKEND", "auto"
 ).lower()
-if _NPU_MHC_BACKEND not in ("triton", "torch"):
+if _NPU_MHC_BACKEND not in ("auto", "ascendc", "triton", "torch"):
     raise ValueError(
-        "SGLANG_TELECHAT4_MHC_BACKEND must be 'triton' or 'torch', "
+        "SGLANG_TELECHAT4_MHC_BACKEND must be 'auto', 'ascendc', 'triton', "
+        "or 'torch', "
         f"got {_NPU_MHC_BACKEND!r}"
     )
+
+
+def _load_ascendc_mhc() -> bool:
+    try:
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops.npu, "hc_pre") and hasattr(
+        torch.ops.npu, "hc_post"
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_npu_mhc_backend() -> str:
+    if _NPU_MHC_BACKEND == "ascendc":
+        if not _load_ascendc_mhc():
+            raise RuntimeError(
+                "The AscendC TeleChat4 mHC backend requires hc_pre and hc_post "
+                "from sgl-kernel-npu."
+            )
+        backend = "ascendc"
+    elif _NPU_MHC_BACKEND != "auto":
+        backend = _NPU_MHC_BACKEND
+    elif _load_ascendc_mhc():
+        backend = "ascendc"
+    elif find_spec("triton") is not None:
+        backend = "triton"
+    else:
+        backend = "torch"
+    logger.info("TeleChat4 NPU mHC backend: %s", backend)
+    return backend
 
 
 def _mhc_pre_fake(
@@ -110,7 +146,30 @@ def mhc_pre(
     n_splits_pre: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if is_npu():
-        if _NPU_MHC_BACKEND == "torch":
+        backend = _get_npu_mhc_backend()
+        if backend == "ascendc":
+            if hc_sinkhorn_eps != hc_pre_eps:
+                raise ValueError(
+                    "The AscendC hc_pre kernel uses one epsilon for pre and "
+                    "Sinkhorn."
+                )
+            if hc_post_mult_value != 2.0:
+                raise ValueError(
+                    "The AscendC hc_pre kernel requires post multiplier 2.0."
+                )
+            layer_input, post_mix, comb_mix = torch.ops.npu.hc_pre(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                hc_mult=residual.shape[-2],
+                hc_sinkhorn_iters=sinkhorn_repeat,
+                norm_eps=rms_eps,
+                hc_eps=hc_pre_eps,
+            )
+            return post_mix.unsqueeze(-1), comb_mix, layer_input
+
+        if backend == "torch":
             from sglang.srt.layers.telechat4_mhc_torch import (
                 telechat4_mhc_pre_torch,
             )
@@ -169,7 +228,13 @@ def mhc_post(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     if is_npu():
-        if _NPU_MHC_BACKEND == "torch":
+        backend = _get_npu_mhc_backend()
+        if backend == "ascendc":
+            return torch.ops.npu.hc_post(
+                x, residual, post_layer_mix.squeeze(-1), comb_res_mix
+            )
+
+        if backend == "torch":
             from sglang.srt.layers.telechat4_mhc_torch import (
                 telechat4_mhc_post_torch,
             )
@@ -183,9 +248,6 @@ def mhc_post(
         return telechat4_mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
     return _mhc_post_orig(x, residual, post_layer_mix, comb_res_mix)
-
-
-logger = logging.getLogger(__name__)
 
 
 class mHCModule(nn.Module):
@@ -239,9 +301,10 @@ class mHCModule(nn.Module):
     @torch.no_grad()
     def finalize(self) -> None:
         """Build the fused-kernel operands from the loaded parameters."""
+        npu_backend = _get_npu_mhc_backend() if is_npu() else None
         fn_dtype = (
             torch.bfloat16
-            if is_npu() and _NPU_MHC_BACKEND == "triton"
+            if npu_backend == "triton"
             else torch.float32
         )
         self.fn = self.mapping_proj.weight.detach().to(fn_dtype).contiguous()

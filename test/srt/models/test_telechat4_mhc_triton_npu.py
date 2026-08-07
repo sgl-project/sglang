@@ -163,3 +163,81 @@ def test_telechat4_mhc_auto_layout_only_for_eager_extend():
         eager_extend_comb.transpose(-1, -2).contiguous().data_ptr()
         == eager_extend_comb.data_ptr()
     )
+
+
+def test_telechat4_mhc_ascendc_dispatch_matches_torch(monkeypatch, request):
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Ascend NPU is required")
+
+    try:
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError:
+        pytest.skip("sgl-kernel-npu is required")
+    if not hasattr(torch.ops.npu, "hc_pre") or not hasattr(
+        torch.ops.npu, "hc_post"
+    ):
+        pytest.skip("sgl-kernel-npu was built without mHC operators")
+
+    from sglang.srt.models import telechat4 as telechat4_model
+
+    monkeypatch.setattr(telechat4_model, "_NPU_MHC_BACKEND", "ascendc")
+    telechat4_model._get_npu_mhc_backend.cache_clear()
+    request.addfinalizer(telechat4_model._get_npu_mhc_backend.cache_clear)
+    assert telechat4_model._get_npu_mhc_backend() == "ascendc"
+
+    torch.manual_seed(20260807)
+    num_tokens = 8
+    residual = torch.randn(
+        num_tokens,
+        MHC_STREAMS,
+        MHC_HIDDEN_SIZE,
+        device="npu",
+        dtype=torch.bfloat16,
+    )
+    fn = (
+        torch.randn(
+            MHC_OUTPUT_SIZE,
+            MHC_FLAT_SIZE,
+            device="npu",
+            dtype=torch.float32,
+        )
+        / MHC_FLAT_SIZE**0.5
+    ).contiguous()
+    hc_scale = torch.tensor([0.8, 1.1, 0.7], device="npu")
+    hc_base = torch.randn(MHC_OUTPUT_SIZE, device="npu") * 0.1
+
+    actual_pre = telechat4_model.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        1,
+        8,
+    )
+    expected_pre = telechat4_mhc_pre_torch(
+        residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20
+    )
+    for actual, expected in zip(actual_pre, expected_pre):
+        torch.testing.assert_close(actual, expected, atol=0.03125, rtol=5e-3)
+
+    x = torch.randn(
+        num_tokens,
+        MHC_HIDDEN_SIZE,
+        device="npu",
+        dtype=torch.bfloat16,
+    )
+    comb_for_post = actual_pre[1].transpose(-1, -2).contiguous()
+    actual_post = telechat4_model.mhc_post(
+        x, residual, actual_pre[0], comb_for_post
+    )
+    expected_post = telechat4_mhc_post_torch(
+        x, residual, actual_pre[0], comb_for_post
+    )
+    torch.testing.assert_close(
+        actual_post, expected_post, atol=0.03125, rtol=5e-3
+    )
