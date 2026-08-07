@@ -32,6 +32,60 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+
+def _disable_runai_streamer_rank_discovery_collective() -> None:
+    """Neutralize a RunAI Model Streamer bug: ``DistributedStreamer.stream_files()``
+    calls ``_distributedStreamerParams.set_params()`` before it even looks at the
+    caller's ``is_distributed`` flag, and ``set_params()`` unconditionally calls
+    ``find_local_ranks()`` the first time it runs for a given streamer instance.
+    ``find_local_ranks()`` issues a real collective (``dist.new_group`` +
+    ``dist.all_gather_object`` over the full world) whenever
+    ``torch.distributed.is_initialized()`` and world_size > 1 -- regardless of
+    ``is_distributed``, and even for the header-only metadata reads that pass
+    ``is_distributed=False`` explicitly. Its only purpose is to populate the
+    ``RUNAI_STREAMER_PROCESS_GROUP_SIZE`` env var for the library's own
+    distributed-streaming path, which this loader never opts into: every
+    ``stream_files()`` call below passes ``is_distributed=False`` because each
+    rank loads its own independent full copy of the checkpoint.
+
+    Left unpatched, the collective still fires once per component per rank (a
+    fresh ``SafetensorsStreamer()`` resets the cache each time), so any
+    per-rank divergence in load order or timing -- different layerwise-offload
+    memory state, warm vs. cold page cache -- can call it out of lockstep
+    across ranks and hang. Upstream:
+    https://github.com/run-ai/runai-model-streamer/issues/84.
+
+    Patch ``find_local_ranks`` to take the early-return path it already uses
+    for the single-process case, so it reports "1 process, no peers" without
+    ever touching ``torch.distributed``. Safe if upstream fixes this: the only
+    behavior given up is the collective this loader never wanted.
+    """
+    try:
+        from runai_model_streamer.distributed_streamer.distributed_streamer import (
+            _distributedStreamerParams,
+        )
+    except ImportError:
+        return
+    if not hasattr(_distributedStreamerParams, "find_local_ranks"):
+        logger.warning(
+            "runai_model_streamer._distributedStreamerParams.find_local_ranks "
+            "not found; skipping the rank-discovery-collective workaround. If "
+            "this version still runs a stream_files() collective regardless "
+            "of is_distributed, multi-rank diffusion weight loading may hang "
+            "-- see https://github.com/run-ai/runai-model-streamer/issues/84."
+        )
+        return
+
+    def _find_local_ranks_no_collective(self):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return 1, rank, [[rank]]
+
+    _distributedStreamerParams.find_local_ranks = _find_local_ranks_no_collective
+
+
+if HAS_RUNAI_MODEL_STREAMER:
+    _disable_runai_streamer_rank_discovery_collective()
+
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the
