@@ -89,6 +89,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        kda_cp = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -201,14 +202,27 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
-                query_start_loc = torch.empty(
-                    (bs + 1,), dtype=torch.int32, device=self.device
-                )
-                query_start_loc[:bs] = forward_batch.extend_start_loc
-                query_start_loc[bs] = (
-                    forward_batch.extend_start_loc[-1]
-                    + forward_batch.extend_seq_lens[-1]
-                )
+                kda_cp = self._build_kda_cp_metadata(forward_batch)
+                if kda_cp is not None:
+                    # CP prefill: the linear layers see this rank's contiguous
+                    # shard; query_start_loc is shard-local and compacted while
+                    # mamba_cache_indices stay global pool slots.
+                    query_start_loc = kda_cp.query_start_loc
+                    if has_mamba_track_mask:
+                        raise NotImplementedError(
+                            "mamba radix tracking is not supported under "
+                            "prefill context parallelism yet; launch with "
+                            "--mamba-radix-cache-strategy no_buffer"
+                        )
+                else:
+                    query_start_loc = torch.empty(
+                        (bs + 1,), dtype=torch.int32, device=self.device
+                    )
+                    query_start_loc[:bs] = forward_batch.extend_start_loc
+                    query_start_loc[bs] = (
+                        forward_batch.extend_start_loc[-1]
+                        + forward_batch.extend_seq_lens[-1]
+                    )
                 if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
@@ -240,6 +254,46 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
+            kda_cp=kda_cp,
+        )
+
+    def _build_kda_cp_metadata(self, forward_batch: ForwardBatch):
+        """KDA shard metadata when this prefill runs under contiguous CP.
+
+        Returns None outside CP. Raises for CP layouts the linear layers
+        cannot run on (non-contiguous strategies, padded batches).
+        """
+        if forward_batch.attn_cp_metadata is None:
+            return None
+        from sglang.srt.layers.cp.base import (
+            ContextParallelStrategyKind,
+            get_cp_strategy,
+        )
+
+        strategy = get_cp_strategy()
+        if (
+            strategy is None
+            or strategy.kind != ContextParallelStrategyKind.CONTIGUOUS
+        ):
+            raise NotImplementedError(
+                "prefill context parallelism for hybrid linear-attention "
+                "models requires --cp-strategy contiguous"
+            )
+        extend_seq_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        if forward_batch.attn_cp_metadata.total_seq_lens != sum(extend_seq_lens):
+            raise NotImplementedError(
+                "padded CP prefill batches are not supported for hybrid "
+                "linear-attention models"
+            )
+        from sglang.srt.layers.attention.linear.kda_cp import (
+            build_kda_cp_prefill_metadata,
+        )
+
+        return build_kda_cp_prefill_metadata(
+            extend_seq_lens=extend_seq_lens,
+            world_size=strategy.cp_size,
+            rank=strategy.cp_rank,
+            device=self.device,
         )
 
     def init_forward_metadata_out_graph(

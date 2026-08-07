@@ -66,6 +66,13 @@ class ForwardMetadata:
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
 
+    # KDA prefill context parallelism (contiguous strategy): the shard layout
+    # of this forward. When set, query_start_loc above is shard-local and
+    # compacted while mamba_cache_indices stay GLOBAL pool slots. Built in
+    # MambaAttnBackendBase._forward_metadata, consumed by
+    # KDAAttnBackend.forward_extend. None outside CP prefill.
+    kda_cp: Optional[object] = None
+
 
 @dataclass(kw_only=True)
 class Mamba2Metadata(ForwardMetadata):

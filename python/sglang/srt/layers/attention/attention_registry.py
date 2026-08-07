@@ -334,18 +334,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
         from sglang.srt.runtime_context import get_parallel
 
-        if is_prefill_context_parallel_enabled() or get_parallel().attn_cp_size > 1:
-            # The CP-v2 runner shards prefill tokens across ranks, but the
-            # linear layers' recurrent state has no position axis to shard —
-            # without a state hand-off (pre-scan + all-gather + merge, see
-            # kernels/ops/attention/fla/chunk_delta_h_cp.py) the state would be
-            # silently corrupted. Fail loudly until the backend integration
-            # lands.
-            raise NotImplementedError(
-                "Prefill context parallelism is not yet supported for hybrid "
-                "linear-attention models (Mamba / GDN / KDA). Remove "
-                "--enable-prefill-cp / --attention-context-parallel-size."
-            )
         from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
 
         if isinstance(
@@ -484,6 +472,33 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "Expected hybrid GDN or NemotronH models, but got unknown model. "
                     "If this is a custom hybrid model, use register_linear_attn_model() "
                     "from sglang.srt.configs.linear_attn_model_registry."
+                )
+        from sglang.srt.layers.utils.cp_utils import (
+            is_prefill_context_parallel_enabled,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        if (
+            is_prefill_context_parallel_enabled()
+            or get_parallel().attn_cp_size > 1
+        ):
+            # The CP-v2 runner shards prefill tokens across ranks, but linear
+            # layers' recurrent state has no position axis to shard — it needs
+            # the KDA state hand-off (pre-scan + all-gather + merge, see
+            # kernels/ops/attention/fla/chunk_delta_h_cp.py), which is wired
+            # only for the KDA backend under the contiguous shard layout.
+            # Fail loudly for every other hybrid linear combination.
+            kda_cp_ready = (
+                isinstance(linear_attn_backend, KDAAttnBackend)
+                and runner.server_args.cp_strategy == "contiguous"
+            )
+            if not kda_cp_ready:
+                raise NotImplementedError(
+                    "Prefill context parallelism for hybrid linear-attention "
+                    "models is only supported for KDA models with "
+                    "--cp-strategy contiguous. Remove --enable-prefill-cp / "
+                    "--attention-context-parallel-size, or switch the "
+                    "strategy."
                 )
         if runner.is_draft_worker:
             # FIXME: we assume that MTP/NEXTN always use full-attention.
