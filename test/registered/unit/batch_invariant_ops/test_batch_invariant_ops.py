@@ -158,6 +158,26 @@ class TestBatchInvariantOps(CustomTestCase):
                             )
                             self._assert_batch_invariant_results(difflist, dtype, name)
 
+    def test_rmsnorm_preserves_higher_rank_shape(self):
+        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.runtime_context import get_context, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        context = get_context()
+        saved_server_args = context._server_args
+        context.set_server_args(ServerArgs(model_path="dummy"))
+        try:
+            x = torch.randn(2, 3, 16, dtype=torch.bfloat16)
+            norm = RMSNorm(16).to(dtype=torch.bfloat16)
+            with set_batch_invariant_mode(True):
+                out = norm(x)
+            self.assertEqual(out.shape, x.shape)
+        finally:
+            if saved_server_args is None:
+                reset_context()
+            else:
+                context.set_server_args(saved_server_args)
+
     def _test_bmm_batch_invariance(self, B, M, K, N, dtype):
         """
         Test that BMM operations produce identical results for:
