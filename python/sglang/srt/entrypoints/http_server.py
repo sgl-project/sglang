@@ -2041,8 +2041,10 @@ async def vertex_generate(
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
-    if isinstance(ret, Response):
-        return ret
+    if isinstance(ret, Response) and ret.status_code == 200 and hasattr(ret, "body"):
+        return ORJSONResponse({"predictions": orjson.loads(ret.body)})
+    return ret
+
     return ORJSONResponse({"predictions": ret})
 
 

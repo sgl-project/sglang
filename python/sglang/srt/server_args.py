@@ -2165,6 +2165,12 @@ class ServerArgs:
         ),
         NS("spec"),
     ] = None
+    # Internal provenance used after the public draft quantization inherits the
+    # target value. It is a dataclass field so ServerArgs round-trips preserve
+    # whether the user explicitly set the draft option; it has no CLI surface.
+    _speculative_draft_quantization_explicitly_set: A[
+        Optional[bool], Arg(no_cli=True), NS("spec")
+    ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,
         "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
@@ -4073,6 +4079,10 @@ class ServerArgs:
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self._speculative_draft_quantization_explicitly_set is None:
+            self._speculative_draft_quantization_explicitly_set = (
+                self.speculative_draft_model_quantization is not None
+            )
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
 
@@ -5999,7 +6009,7 @@ class ServerArgs:
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
-        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # MambaRadixCache. The host-offload path (enabled by
         # --enable-hierarchical-cache) and custom radix-cache backends are NOT
         # int8-aware: they would read int8 checkpoint slots as bf16 active slots
         # (wrong pool / out-of-range). Reject the combination up front rather than
@@ -6010,7 +6020,7 @@ class ServerArgs:
             raise ValueError(
                 "--enable-int8-mamba-checkpoint is not supported together with "
                 "--enable-hierarchical-cache: the host-offload path "
-                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+                "is not int8-aware. Disable one of them."
             )
         if self.radix_cache_backend is not None:
             raise ValueError(

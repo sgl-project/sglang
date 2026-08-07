@@ -362,8 +362,10 @@ def _dspark_verify_on_decode_backend(
     if backend == "tokenspeed_mla":
         return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
-        # The cute-dsl kernel rejects q_len >= 5 with no fallback.
-        return q_len <= 4
+        # cute-dsl monolithic MLA decode folds the verify tokens into the head
+        # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer
+        # >= 0.6.15 (older builds reject q_len >= 5).
+        return True
     return False
 
 
@@ -1235,7 +1237,29 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
 
-    if (is_modelopt or model_config.quantization is None) and (
+    has_w4a16_moe_layers = False
+    if is_modelopt and quantization == "modelopt_mixed":
+        has_w4a16_moe_layers = any(
+            info.get("quant_algo") == "W4A16_NVFP4" and ".experts." in name
+            for name, info in hf_config.quantization_config.get(
+                "quantized_layers", {}
+            ).items()
+        )
+
+    if has_w4a16_moe_layers:
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
+        if server_args.moe_runner_backend not in ("auto", "marlin"):
+            raise ValueError(
+                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+            )
+        if server_args.moe_runner_backend == "auto":
+            overrides["moe_runner_backend"] = "marlin"
+            logger.info(
+                "Use marlin as MoE runner backend for "
+                f"{model_arch} with W4A16_NVFP4 MoE layers"
+            )
+    elif (is_modelopt or model_config.quantization is None) and (
         server_args.moe_runner_backend == "auto"
     ):
         if is_sm100_supported() and server_args.moe_a2a_backend == "none":
