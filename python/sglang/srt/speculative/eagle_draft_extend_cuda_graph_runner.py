@@ -54,13 +54,9 @@ if TYPE_CHECKING:
 def resolve_draft_extend_seq_len_fill_value(
     attn_backend, captured_req_width: int
 ) -> int:
-    """Return a capture-only sequence length that is safe for DSA KPool.
-
-    DRAFT_EXTEND_V2 subtracts the fixed draft width when constructing the
-    KPool write plan.  Padding rows therefore need enough synthetic history
-    for both that subtraction and the KPool offset.  Hybrid linear-attention
-    backends keep the DSA backend under ``full_attn_backend``.
-    """
+    """DRAFT_EXTEND_V2 subtracts the fixed draft width when building the KPool
+    write plan; padding rows need enough synthetic history for that subtraction
+    plus the KPool offset."""
     fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
     full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
     dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
