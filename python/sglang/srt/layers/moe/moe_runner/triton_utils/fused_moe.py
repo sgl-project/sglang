@@ -685,6 +685,17 @@ def _fused_moe_kernel_sequence(
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+    elif activation == "situ" and is_gated:
+        d = N // 2
+        x = intermediate_cache1.view(-1, N)
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
+        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        situ_linear_beta = gemm1_limit
+        if situ_linear_beta is not None:
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
