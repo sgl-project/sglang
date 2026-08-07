@@ -386,6 +386,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def get_mamba_device_value(self, node: Any) -> Optional[torch.Tensor]:
+        """Return the device-resident Mamba checkpoint attached to ``node``."""
+        return None
+
     def supports_streaming_session(self) -> bool:
         return False
 

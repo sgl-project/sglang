@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_kv_transfer_layer_ids,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -212,6 +213,8 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        target_kv_entry_count = len(kv_data_ptrs)
+        draft_kv_entry_count = 0
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
@@ -224,6 +227,7 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            draft_kv_entry_count = len(draft_kv_data_ptrs)
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -231,11 +235,11 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = build_kv_transfer_layer_ids(
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            target_kv_entry_count,
+            draft_kv_entry_count,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -1171,13 +1175,48 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
+                indices = [
+                    int(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ].item()
+                    )
                 ]
+                # Canonical Decode-origin L3 publication needs the historical
+                # KDA state at the widened DCP page boundary, in addition to
+                # the active post-prefill state used for normal decoding.
+                extra_config = (
+                    self.server_args.hicache_storage_backend_extra_config_dict
+                )
+                checkpoint_len = (
+                    seq_len // self.server_args.mamba_track_interval
+                ) * self.server_args.mamba_track_interval
+                if (
+                    int(extra_config.get("canonical_dcp_size", 0)) > 0
+                    and checkpoint_len > 0
+                ):
+                    # ``cache_unfinished_req`` runs before this final PD send.
+                    # It donates the tracked ping-pong slot to the newly inserted
+                    # radix node and clears ``mamba_last_track_seqlen``.  The
+                    # request lock keeps that node (and its Mamba component)
+                    # alive until the transfer poll succeeds and release_kv_cache
+                    # drops the lock.
+                    if req.cache_protected_len != checkpoint_len:
+                        raise RuntimeError(
+                            "Canonical Mooncake KDA checkpoint mismatch before "
+                            f"PD transfer: cached={req.cache_protected_len}, "
+                            f"expected={checkpoint_len}, rid={req.rid}."
+                        )
+                    checkpoint = self.tree_cache.get_mamba_device_value(
+                        req.last_node
+                    )
+                    if checkpoint is None or checkpoint.numel() != 1:
+                        raise RuntimeError(
+                            "Canonical Mooncake KDA checkpoint is not device "
+                            f"resident on the protected radix node for rid={req.rid}."
+                        )
+                    indices.append(int(checkpoint.item()))
+                return indices
 
             def _swa_payload():
                 window_size = self.sliding_window_size

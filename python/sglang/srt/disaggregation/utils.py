@@ -46,6 +46,7 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+_DRAFT_KV_LAYER_ID_BASE = 1 << 31
 
 
 def poll_and_all_reduce_pp(
@@ -963,6 +964,46 @@ def resolve_dcp_dst_entry_indices(
         for _, j in build_transfer_entry_pairs(
             src_layer_ids, dst_layer_ids, n_src, n_dst
         )
+    ]
+
+
+def build_kv_transfer_layer_ids(
+    token_to_kv_pool,
+    draft_token_to_kv_pool,
+    target_entry_count: int,
+    draft_entry_count: int,
+) -> List[int]:
+    """Build metadata aligned with the target and optional draft KV buffers.
+
+    Hybrid target pools expose global model-layer ids, which are required to
+    pair PP-local Prefill entries with Decode entries. Speculative Decode also
+    appends draft-model buffers. Those entries are not present on a target-only
+    Prefill peer, but the metadata still has to describe every registered
+    destination entry. Give draft entries a separate positional namespace so
+    target ids remain matchable without confusing target and draft layers that
+    happen to use the same model-layer numbers.
+    """
+    if not hasattr(token_to_kv_pool, "get_kv_layer_ids"):
+        return []
+
+    target_layer_ids = list(token_to_kv_pool.get_kv_layer_ids())
+    if len(target_layer_ids) != target_entry_count:
+        raise RuntimeError(
+            "Target KV layer metadata length must match registered entries: "
+            f"metadata={len(target_layer_ids)}, entries={target_entry_count}"
+        )
+
+    if draft_token_to_kv_pool is None:
+        if draft_entry_count != 0:
+            raise RuntimeError(
+                "Draft KV entries were registered without a draft KV pool"
+            )
+        return target_layer_ids
+
+    if draft_entry_count >= _DRAFT_KV_LAYER_ID_BASE:
+        raise RuntimeError(f"Too many draft KV entries: {draft_entry_count}")
+    return target_layer_ids + [
+        _DRAFT_KV_LAYER_ID_BASE + i for i in range(draft_entry_count)
     ]
 
 

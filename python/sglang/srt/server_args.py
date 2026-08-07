@@ -51,6 +51,9 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.hicache_storage import (
+    load_hicache_storage_backend_extra_config,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -7163,16 +7166,114 @@ class ServerArgs:
         # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
 
+        # Step 4: A Decode-origin hybrid checkpoint must describe the exact
+        # token boundary used by the canonical DCP storage page.  Prefill keeps
+        # that historical KDA state in an extra buffer; Decode receives it and
+        # continues tracking the same boundaries even though its request cache
+        # remains ChunkCache.
+        self._resolve_canonical_hybrid_checkpointing()
+
+    def _resolve_canonical_hybrid_checkpointing(self):
+        if self.hicache_storage_backend != "mooncake":
+            return
+        try:
+            extra_config = self.hicache_storage_backend_extra_config_dict
+        except (OSError, ValueError) as e:
+            raise ValueError(
+                f"Invalid hicache storage backend extra config: {e}"
+            ) from e
+        canonical_dcp_size = int(extra_config.get("canonical_dcp_size", 0))
+        if canonical_dcp_size <= 0:
+            return
+        canonical_page_size = int(extra_config.get("canonical_page_size", 0))
+        if canonical_page_size <= 0:
+            # HiCacheController emits the full paired-option diagnostic. Avoid
+            # deriving a bogus checkpoint interval here first.
+            return
+
+        model_arches = self.get_model_config().hf_config.architectures
+        supported = {"KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"}
+        if not supported.intersection(model_arches):
+            return
+
+        checkpoint_interval = canonical_page_size * canonical_dcp_size
+        # Keep this separate from ``mamba_cache_chunk_size``.  KDA kernels
+        # materialize intermediate recurrent states at their native chunk
+        # stride (64 for Kimi KDA), while a canonical DCP object may only be
+        # publishable at a wider boundary (for example 64 * DCP8 = 512).
+        self._canonical_hybrid_checkpoint_interval = checkpoint_interval
+        if self.mamba_track_interval != checkpoint_interval:
+            logger.warning(
+                "Canonical Mooncake DCP hybrid checkpoints require "
+                "mamba_track_interval=%d; overriding %d.",
+                checkpoint_interval,
+                self.mamba_track_interval,
+            )
+            self.mamba_track_interval = checkpoint_interval
+
+        if (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_decode_enable_offload_kvcache
+        ):
+            # ChunkCache still needs a historical KDA checkpoint slot for L3
+            # publication. This does not enable Decode RadixCache.
+            self.mamba_radix_cache_strategy = "extra_buffer"
+
     def _resolve_hicache_dcp_compatibility(self):
-        if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
+        if self.dcp_size <= 1:
+            return
+
+        def require_canonical_mooncake() -> None:
+            if self.hicache_storage_backend != "mooncake":
+                raise NotImplementedError(
+                    "Kimi DCP L3 currently requires the Mooncake HiCache "
+                    "backend, got "
+                    f"{self.hicache_storage_backend!r}."
+                )
+            canonical_dcp_size = int(
+                self.hicache_storage_backend_extra_config_dict.get(
+                    "canonical_dcp_size", 0
+                )
+            )
+            if canonical_dcp_size <= 0:
+                raise ValueError(
+                    "Kimi DCP L3 requires canonical_dcp_size in "
+                    "--hicache-storage-backend-extra-config."
+                )
+
+        def is_supported_kimi_hybrid() -> tuple[bool, list[str]]:
+            model_arches = self.get_model_config().hf_config.architectures
+            supported = {"KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"}
+            return bool(supported.intersection(model_arches)), model_arches
+
+        if self.disaggregation_decode_enable_offload_kvcache:
+            require_canonical_mooncake()
+            supported, model_arches = is_supported_kimi_hybrid()
+            if not supported:
+                raise ValueError(
+                    "Decode KV offload with --dcp-size > 1 is only supported "
+                    "for the Kimi MLA+KDA hybrid models, got "
+                    f"{model_arches}."
+                )
+            logger.info(
+                "PD Decode ChunkCache + DCP L3 offload enabled: every DCP "
+                "rank archives its MLA shard and KDA state."
+            )
+            return
+        if not self.enable_hierarchical_cache:
             return
         if self.hicache_storage_backend is not None:
-            raise NotImplementedError(
-                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-                "supported yet: under DCP each rank holds a distinct "
-                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-                "backup and the storage keys must become dcp_rank-aware "
-                "first. Run HiCache+DCP with L1/L2 only."
+            require_canonical_mooncake()
+            supported, model_arches = is_supported_kimi_hybrid()
+            if not supported:
+                raise NotImplementedError(
+                    "--hicache-storage-backend (L3) with --dcp-size > 1 is "
+                    "only supported for the Kimi MLA+KDA hybrid models, got "
+                    f"{model_arches}."
+                )
+            logger.info(
+                "Kimi HiCache + DCP L3 enabled: every DCP rank stores its "
+                "MLA shard and rank-local KDA state."
             )
         if self.speculative_algorithm is not None:
             raise NotImplementedError(
@@ -8669,8 +8770,12 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
+        checkpoint_only_decode = (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_decode_enable_offload_kvcache
+        )
         return (
-            self.disable_radix_cache is False
+            (self.disable_radix_cache is False or checkpoint_only_decode)
             and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
         )
 
@@ -8722,6 +8827,27 @@ class ServerArgs:
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
+
+    @property
+    def mamba_radix_checkpoint_interval(self) -> int:
+        """Token interval represented by a tracked Radix Mamba checkpoint.
+
+        Normally this is the native cache chunk stride. Canonical Mooncake DCP
+        objects use a wider interval without changing the kernel's intermediate
+        state stride.
+        """
+        canonical_interval = getattr(
+            self, "_canonical_hybrid_checkpoint_interval", None
+        )
+        if canonical_interval is not None:
+            return canonical_interval
+        return self.mamba_cache_chunk_size
+
+    @cached_property
+    def hicache_storage_backend_extra_config_dict(self) -> dict:
+        return load_hicache_storage_backend_extra_config(
+            self.hicache_storage_backend_extra_config
+        )
 
     def _check_two_batch_overlap(self):
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP

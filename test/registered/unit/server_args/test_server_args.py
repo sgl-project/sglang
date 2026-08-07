@@ -365,6 +365,22 @@ class TestLoadBalanceMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
             server_args._handle_pd_disaggregation()
 
+    def test_pd_decode_dcp_rejects_non_mooncake_l3_before_normalization(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+            dcp_size=4,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires.*mooncake"):
+            server_args._handle_pd_disaggregation()
+
+        self.assertTrue(server_args.enable_hierarchical_cache)
+        self.assertFalse(server_args.disaggregation_decode_enable_offload_kvcache)
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",

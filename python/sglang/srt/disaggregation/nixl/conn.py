@@ -2046,10 +2046,13 @@ class NixlKVManager(CommonKVManager):
         dst_layer_ids: list[int] = None,
     ):
         """Transfer Mamba states via RDMA."""
-        assert len(prefill_state_indices) == 1, "Mamba should have single state index"
-        assert len(dst_state_indices) == len(
-            prefill_state_indices
-        ), "State indices count mismatch between Prefill and Decode"
+        if len(prefill_state_indices) != len(dst_state_indices):
+            raise ValueError(
+                "Mamba state index count mismatch between Prefill and Decode: "
+                f"prefill={len(prefill_state_indices)}, "
+                f"decode={len(dst_state_indices)}."
+            )
+        state_pairs = list(zip(prefill_state_indices, dst_state_indices))
 
         src_addrs = []
         dst_addrs = []
@@ -2061,15 +2064,18 @@ class NixlKVManager(CommonKVManager):
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
         )
-        for i, j in pairs:
-            dst_state_ptr = dst_state_data_ptrs[j]
-            length = src_state_item_lens[i]
-            if length == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
-                continue
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_state_indices[0])
-            dst_addr = dst_state_ptr + length * int(dst_state_indices[0])
-            src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, length, dst_gpu_id))
+        for src_state_index, dst_state_index in state_pairs:
+            for i, j in pairs:
+                dst_state_ptr = dst_state_data_ptrs[j]
+                length = src_state_item_lens[i]
+                if length == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
+                    continue
+                src_addr = (
+                    src_state_data_ptrs[i] + length * int(src_state_index)
+                )
+                dst_addr = dst_state_ptr + length * int(dst_state_index)
+                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, length, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
@@ -2122,7 +2128,13 @@ class NixlKVManager(CommonKVManager):
             f"Prefill attn_tp_size={self.attn_tp_size}, "
             f"Decode attn_tp_size={decode_tp_size}."
         )
-        assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+        if len(prefill_state_indices) != len(dst_state_indices):
+            raise ValueError(
+                "Mamba state index count mismatch between Prefill and Decode: "
+                f"prefill={len(prefill_state_indices)}, "
+                f"decode={len(dst_state_indices)}."
+            )
+        state_pairs = list(zip(prefill_state_indices, dst_state_indices))
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
@@ -2151,54 +2163,62 @@ class NixlKVManager(CommonKVManager):
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
         )
-        for i, j in pairs:
-            dst_state_ptr = dst_state_data_ptrs[j]
-            src_item_len = src_state_item_lens[i]
-            dst_item_len = dst_state_item_lens[j]
-            if src_item_len == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
-                continue
-            src_dim = src_state_dim_per_tensor[i]
-            dst_dim = dst_state_dim_per_tensor[j]
+        for src_state_index, dst_state_index in state_pairs:
+            for i, j in pairs:
+                dst_state_ptr = dst_state_data_ptrs[j]
+                src_item_len = src_state_item_lens[i]
+                dst_item_len = dst_state_item_lens[j]
+                if (
+                    src_item_len == 0
+                    or src_state_data_ptrs[i] == 0
+                    or dst_state_ptr == 0
+                ):
+                    continue
+                src_dim = src_state_dim_per_tensor[i]
+                dst_dim = dst_state_dim_per_tensor[j]
 
-            conv_shard_groups = (
-                src_state_conv_shard_groups[i]
-                if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
-                else None
-            )
-            outer_count = (
-                src_state_slice_outer_counts[i]
-                if src_state_slice_outer_counts
-                and i < len(src_state_slice_outer_counts)
-                else 1
-            )
-            for (
-                src_offset,
-                dst_offset,
-                bytes_to_send,
-            ) in compute_mamba_state_slice_byte_blocks(
-                src_item_len=src_item_len,
-                dst_item_len=dst_item_len,
-                src_dim=src_dim,
-                dst_dim=dst_dim,
-                outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
-                dst_attn_tp_size=decode_tp_size,
-                dst_tp_rank_in_group=dst_tp_rank_in_group,
-                local_tp_rank_in_group=local_tp_rank_in_group,
-                conv_shard_groups=conv_shard_groups,
-            ):
-                src_addr = (
-                    src_state_data_ptrs[i]
-                    + src_item_len * int(prefill_state_indices[0])
-                    + src_offset
+                conv_shard_groups = (
+                    src_state_conv_shard_groups[i]
+                    if src_state_conv_shard_groups
+                    and i < len(src_state_conv_shard_groups)
+                    else None
                 )
-                dst_addr = (
-                    dst_state_ptr
-                    + dst_item_len * int(dst_state_indices[0])
-                    + dst_offset
+                outer_count = (
+                    src_state_slice_outer_counts[i]
+                    if src_state_slice_outer_counts
+                    and i < len(src_state_slice_outer_counts)
+                    else 1
                 )
-                src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
+                for (
+                    src_offset,
+                    dst_offset,
+                    bytes_to_send,
+                ) in compute_mamba_state_slice_byte_blocks(
+                    src_item_len=src_item_len,
+                    dst_item_len=dst_item_len,
+                    src_dim=src_dim,
+                    dst_dim=dst_dim,
+                    outer_count=outer_count,
+                    src_attn_tp_size=self.attn_tp_size,
+                    dst_attn_tp_size=decode_tp_size,
+                    dst_tp_rank_in_group=dst_tp_rank_in_group,
+                    local_tp_rank_in_group=local_tp_rank_in_group,
+                    conv_shard_groups=conv_shard_groups,
+                ):
+                    src_addr = (
+                        src_state_data_ptrs[i]
+                        + src_item_len * int(src_state_index)
+                        + src_offset
+                    )
+                    dst_addr = (
+                        dst_state_ptr
+                        + dst_item_len * int(dst_state_index)
+                        + dst_offset
+                    )
+                    src_addrs.append(
+                        (src_addr, bytes_to_send, self.kv_args.gpu_id)
+                    )
+                    dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")

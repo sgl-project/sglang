@@ -1374,7 +1374,13 @@ class MooncakeKVManager(CommonKVManager):
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
     ):
-        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+        if len(prefill_mamba_index) != len(dst_mamba_index):
+            raise ValueError(
+                "Mamba state index count mismatch between Prefill and Decode: "
+                f"prefill={len(prefill_mamba_index)}, "
+                f"decode={len(dst_mamba_index)}."
+            )
+        state_pairs = list(zip(prefill_mamba_index, dst_mamba_index))
 
         transfer_blocks = []
         pairs = build_transfer_entry_pairs(
@@ -1384,12 +1390,15 @@ class MooncakeKVManager(CommonKVManager):
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
         )
-        for i, j in pairs:
-            dst_state_ptr = dst_state_data_ptrs[j]
-            length = src_state_item_lens[i]
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
-            transfer_blocks.append((src_addr, dst_addr, length))
+        for src_state_index, dst_state_index in state_pairs:
+            for i, j in pairs:
+                dst_state_ptr = dst_state_data_ptrs[j]
+                length = src_state_item_lens[i]
+                src_addr = (
+                    src_state_data_ptrs[i] + length * int(src_state_index)
+                )
+                dst_addr = dst_state_ptr + length * int(dst_state_index)
+                transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1428,7 +1437,13 @@ class MooncakeKVManager(CommonKVManager):
             f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
             "Performance may be affected."
         )
-        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+        if len(prefill_mamba_index) != len(dst_mamba_index):
+            raise ValueError(
+                "Mamba state index count mismatch between Prefill and Decode: "
+                f"prefill={len(prefill_mamba_index)}, "
+                f"decode={len(dst_mamba_index)}."
+            )
+        state_pairs = list(zip(prefill_mamba_index, dst_mamba_index))
 
         # If no dimension info available, fall back to regular transfer
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
@@ -1454,49 +1469,53 @@ class MooncakeKVManager(CommonKVManager):
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
         )
-        for i, j in pairs:
-            dst_state_ptr = dst_state_data_ptrs[j]
-            src_item_len = src_state_item_lens[i]
-            dst_item_len = dst_state_item_lens[j]
-            src_dim = src_state_dim_per_tensor[i]
-            dst_dim = dst_state_dim_per_tensor[j]
+        for src_state_index, dst_state_index in state_pairs:
+            for i, j in pairs:
+                dst_state_ptr = dst_state_data_ptrs[j]
+                src_item_len = src_state_item_lens[i]
+                dst_item_len = dst_state_item_lens[j]
+                src_dim = src_state_dim_per_tensor[i]
+                dst_dim = dst_state_dim_per_tensor[j]
 
-            conv_shard_groups = (
-                src_state_conv_shard_groups[i]
-                if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
-                else None
-            )
-            outer_count = (
-                src_state_slice_outer_counts[i]
-                if src_state_slice_outer_counts
-                and i < len(src_state_slice_outer_counts)
-                else 1
-            )
-            for (
-                src_offset,
-                dst_offset,
-                bytes_to_send,
-            ) in compute_mamba_state_slice_byte_blocks(
-                src_item_len=src_item_len,
-                dst_item_len=dst_item_len,
-                src_dim=src_dim,
-                dst_dim=dst_dim,
-                outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
-                dst_attn_tp_size=dst_attn_tp_size,
-                dst_tp_rank_in_group=dst_tp_rank_in_group,
-                local_tp_rank_in_group=local_tp_rank_in_group,
-                conv_shard_groups=conv_shard_groups,
-            ):
-                src_addr = (
-                    src_state_data_ptrs[i]
-                    + src_item_len * int(prefill_mamba_index[0])
-                    + src_offset
+                conv_shard_groups = (
+                    src_state_conv_shard_groups[i]
+                    if src_state_conv_shard_groups
+                    and i < len(src_state_conv_shard_groups)
+                    else None
                 )
-                dst_addr = (
-                    dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_offset
+                outer_count = (
+                    src_state_slice_outer_counts[i]
+                    if src_state_slice_outer_counts
+                    and i < len(src_state_slice_outer_counts)
+                    else 1
                 )
-                transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
+                for (
+                    src_offset,
+                    dst_offset,
+                    bytes_to_send,
+                ) in compute_mamba_state_slice_byte_blocks(
+                    src_item_len=src_item_len,
+                    dst_item_len=dst_item_len,
+                    src_dim=src_dim,
+                    dst_dim=dst_dim,
+                    outer_count=outer_count,
+                    src_attn_tp_size=self.attn_tp_size,
+                    dst_attn_tp_size=dst_attn_tp_size,
+                    dst_tp_rank_in_group=dst_tp_rank_in_group,
+                    local_tp_rank_in_group=local_tp_rank_in_group,
+                    conv_shard_groups=conv_shard_groups,
+                ):
+                    src_addr = (
+                        src_state_data_ptrs[i]
+                        + src_item_len * int(src_state_index)
+                        + src_offset
+                    )
+                    dst_addr = (
+                        dst_state_ptr
+                        + dst_item_len * int(dst_state_index)
+                        + dst_offset
+                    )
+                    transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
