@@ -121,6 +121,24 @@ def _flux_residual_gate_add(
     return residual + gate * update
 
 
+def _rope_cos_sin_cache(
+    freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None],
+) -> Optional[torch.Tensor]:
+    """Concatenate a ``(cos, sin)`` RoPE tuple into the fp32 cache layout that
+    ``apply_qk_norm_with_optional_rope`` consumes; a prebuilt cache tensor
+    passes through unchanged."""
+    if freqs_cis is None or isinstance(freqs_cis, torch.Tensor):
+        return freqs_cis
+    cos, sin = freqs_cis
+    return torch.cat(
+        [
+            cos.to(dtype=torch.float32).contiguous(),
+            sin.to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
+
+
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
     from nunchaku.models.normalization import (  # type: ignore[import]
@@ -554,16 +572,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (num_heads, -1))
         key = key.unflatten(-1, (num_heads, -1))
         value = value.unflatten(-1, (num_heads, -1))
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        # Raw (cos, sin) tuple, or the cache prebuilt by the transformer forward.
+        cos_sin_cache = _rope_cos_sin_cache(freqs_cis)
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (num_heads, -1))
@@ -765,7 +775,7 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -928,7 +938,7 @@ class FluxTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1232,6 +1242,16 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(cos[:t_loc], cos[t_loc:], pad, dim=0),
                         join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
                     )
+
+        # Build the RoPE cos/sin cache once per step; every attention call
+        # below reuses the same tensor.
+        hoisted_freqs_cis = _rope_cos_sin_cache(freqs_cis)
+        singles_freqs_cis = (
+            hoisted_freqs_cis
+            if singles_freqs_cis is freqs_cis
+            else _rope_cos_sin_cache(singles_freqs_cis)
+        )
+        freqs_cis = hoisted_freqs_cis
 
         if (
             joint_attention_kwargs is not None
