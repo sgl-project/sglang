@@ -54,12 +54,21 @@ on:
         description: 'pytest path to run after the suite (b200 FA4 jit_kernel tests). Empty skips.'
         type: string
         default: ''
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
+        type: string
+        default: ''
+      skip_prebuilt_rust_ext:
+        description: 'Take neither the artifact nor the cache, and compile during install. For a stage no prebuild targets: the cache key is arch-blind, so an aarch64 stage would be handed x86_64 modules.'
+        type: boolean
+        default: false
 
 # Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
 # defines must be redeclared here for the called job to see the same context.
 env:
   SGLANG_IS_IN_CI: true
+  NCCL_NVLS_ENABLE: "0"
   # base-a runs the fwd-occupancy sanity kit; async-assert probes add GPU work
   # and skew the occupancy measurement, so keep them off in that stage.
   SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}
@@ -108,7 +117,7 @@ jobs:
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -116,9 +125,14 @@ jobs:
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
         uses: actions/download-artifact@v6
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
+
+      - uses: ./.github/actions/download-rust-ext
+        if: ${{ !inputs.skip_prebuilt_rust_ext }}
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}

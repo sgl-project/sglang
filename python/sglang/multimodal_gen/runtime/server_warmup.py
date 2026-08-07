@@ -69,7 +69,7 @@ def should_return_warmup_result(req_or_group: Any) -> bool:
 
 
 def should_run_server_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.server_warmup
+    return server_args.warmup_mode == "server"
 
 
 def is_realtime_serving(server_args: ServerArgs) -> bool:
@@ -95,7 +95,7 @@ def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
 
 def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
     return (
-        server_args.warmup
+        server_args.warmup_mode != "off"
         and server_args.warmup_resolutions is not None
         and supports_synthetic_warmup(server_args)
     )
@@ -163,7 +163,7 @@ async def run_async_client_warmup(
             response = await forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
-    except Exception as e:
+    except Exception:
         if fail_open:
             logger.warning(
                 "Synthetic server warmup failed; continuing startup", exc_info=True
@@ -298,10 +298,9 @@ class SchedulerWarmupMixin:
     ) -> list[tuple[bytes, Any]]:
         if (
             self.req_based_warmup_scheduled
-            or not self.server_args.warmup
+            or self.server_args.warmup_mode != "request"
             or not recv_reqs
             or self.server_args.warmup_resolutions is not None
-            or self.server_args.server_warmup
         ):
             return recv_reqs
 

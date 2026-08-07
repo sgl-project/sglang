@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
+    ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
@@ -175,6 +176,10 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
+                # Verify the remapped prefix exists in quant_description.
+                # If not (e.g. json uses fused name as-is), fall back to original.
+                if prefix_in_quant_config + ".weight" not in self.quant_description:
+                    prefix_in_quant_config = prefix
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -234,6 +239,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+            ("W8A8_MXFP8", ModelSlimMXFP8MoEScheme),
         ]
 
         # Try multiple naming conventions:

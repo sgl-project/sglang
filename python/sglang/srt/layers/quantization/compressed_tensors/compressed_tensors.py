@@ -178,6 +178,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            # Detect MXFP4 before the scheme-based path: MXFP4 uses a
+            # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
+            # handles all MoE backends, bypassing the scheme abstraction.
+            if self._is_mxfp4_moe(layer_name=prefix):
+                from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+                logger.info_once(
+                    "Using Mxfp4MoEMethod for MXFP4 compressed-tensors MoE"
+                )
+                return Mxfp4MoEMethod(prefix=prefix)
+
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
@@ -305,7 +316,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
                 target_scheme_map[target]["input_activations"] = None
-                if is_activation_quantization_format(quant_format):
+
+                # A config_group may carry its own format. When several groups
+                # use different formats, compressed-tensors sets the top-level
+                # format to "mixed-precision" and the real format lives on each
+                # group, so the per-group value must win.
+                group_format = quant_config.get("format")
+                target_scheme_map[target]["format"] = group_format
+                act_quant_format = is_activation_quantization_format(
+                    group_format if group_format is not None else quant_format
+                )
+
+                if act_quant_format:
                     input_activations = quant_config.get("input_activations")
                     # When activation quant format is set but no
                     # input_activations provided: valid for w8a16fp8 (FLOAT
@@ -548,6 +570,28 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_mxint4 and input_quant_none and is_symmetric and is_static
 
+    def _is_mxfp4_moe(self, layer_name: str) -> bool:
+        """Detect MXFP4-quantized MoE from global format or target scheme."""
+        if "mxfp4" in (self.quant_format or ""):
+            return True
+        self._add_fused_moe_to_target_scheme_map()
+        for key in ["FusedMoE", "Linear"]:
+            scheme = self.target_scheme_map.get(key)
+            if scheme is None:
+                continue
+            wq = scheme.get("weights")
+            if wq is None:
+                continue
+            if (
+                wq.num_bits == 4
+                and wq.type == QuantizationType.FLOAT
+                and wq.strategy == QuantizationStrategy.GROUP.value
+                and wq.group_size == 32
+                and wq.symmetric
+            ):
+                return True
+        return False
+
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -572,13 +616,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         return is_w4 and weight_quant.symmetric and is_token and is_dynamic
 
     def _get_scheme_from_parts(
-        self, weight_quant: BaseModel, input_quant: BaseModel
+        self,
+        weight_quant: BaseModel,
+        input_quant: BaseModel,
+        format: Optional[str] = None,
     ) -> CompressedTensorsLinearScheme:
+        # The format of the config_group this layer matched, when it declares
+        # one. Falls back to the top-level format, which is "mixed-precision"
+        # (i.e. meaningless on its own) for multi-group checkpoints.
+        quant_format = format if format is not None else self.quant_format
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (
-                self.quant_format == CompressionFormat.pack_quantized.value
+                quant_format == CompressionFormat.pack_quantized.value
                 and weight_quant.num_bits in WNA16_SUPPORTED_BITS
             ):
                 return CompressedTensorsWNA16(
@@ -593,7 +644,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
 
-        if is_activation_quantization_format(self.quant_format):
+        if is_activation_quantization_format(quant_format):
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
@@ -796,9 +847,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         scheme_dict = self.get_scheme_dict(layer, layer_name)
         weight_quant = None
         input_quant = None
+        scheme_format = None
         if scheme_dict:
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
+            scheme_format = scheme_dict.get("format")
 
         # Find the sparsity scheme of the layer
         # assume that fused layers inerhit first component's sparsity scheme
@@ -834,6 +887,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme = self._get_scheme_from_parts(  # type: ignore
                 weight_quant=weight_quant,
                 input_quant=input_quant,
+                format=scheme_format,
             )
 
         # Raise error if device does not support the scheme
@@ -1035,6 +1089,7 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
+        self.load_up_proj_weight_first = layer.scheme.load_up_proj_weight_first
         layer.scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
