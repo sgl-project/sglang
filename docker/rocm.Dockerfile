@@ -70,6 +70,7 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV AITER_USE_SYSTEM_TRITON="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
@@ -107,6 +108,7 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV AITER_USE_SYSTEM_TRITON="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
@@ -307,7 +309,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # Keep the base image's Torch-compatible Triton by default. Override with
 # AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
-ENV AITER_USE_SYSTEM_TRITON=1
+ENV AITER_USE_SYSTEM_TRITON="${AITER_USE_SYSTEM_TRITON:-1}"
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
 # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
