@@ -702,6 +702,32 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    def test_canonical_cp_survives_deepseek_v4_hook_ordering(self):
+        """Regression for #32553: canonical CP flags crashed on DeepSeek V4."""
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            tp_size=8,
+            enable_dp_attention=False,
+            moe_dense_tp_size=None,
+            moe_a2a_backend="none",
+        )
+
+        try:
+            # Same handler ordering as __post_init__.
+            server_args._handle_legacy_cp_arguments()
+            validate_deepseek_v4_cp(server_args)
+            server_args._handle_legacy_cp_arguments()
+            server_args._handle_context_parallelism()
+        finally:
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.clear()
+
+        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+        self.assertFalse(server_args.enable_prefill_context_parallel)
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
         cases = [
             (
