@@ -895,7 +895,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         num_timesteps: int,
     ) -> tuple[torch.Tensor, ...]:
         params = self.block_params[cache_plan_index, :num_timesteps, index]
-        params = params.view(-1, 6, self.hidden_size)
+        params = params.reshape(-1, 6, self.hidden_size)
         return tuple(params.unbind(dim=1))
 
     def final(
@@ -904,7 +904,7 @@ class MiniMaxH3AdalnCache(nn.Module):
         num_timesteps: int,
     ) -> tuple[torch.Tensor, ...]:
         params = self.final_params[cache_plan_index, :num_timesteps]
-        return tuple(params.view(-1, 2, self.hidden_size).unbind(dim=1))
+        return tuple(params.reshape(-1, 2, self.hidden_size).unbind(dim=1))
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
