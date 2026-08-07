@@ -479,14 +479,6 @@ class KimiK3MoE(nn.Module):
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
 
-        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
-        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
-        # which also takes the fp32 front, so the split view can be consumed as
-        # is; other runners (e.g. marlin) require a dense bf16 buffer.
-        self._moe_front_needs_dense_bf16 = (
-            not get_moe_runner_backend().is_flashinfer_mxfp4()
-        )
-
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
@@ -985,6 +977,28 @@ class KimiK3MoE(nn.Module):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
+
+    @cached_property
+    def _moe_front_needs_dense_bf16(self) -> bool:
+        """Whether routed_input must be repaired into a dense bf16 buffer.
+
+        Only the SM100 trtllm-gen mxfp4 runner reads the front slice as it
+        comes: its group quant (route_quant_fused / per_token_group_quant)
+        takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
+        kernels return from apply() before that quant, and precision="bf16"
+        skips it as well, so those keep the bf16 contract even though the
+        runner backend is the same."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = self.experts.quant_method
+        return not (
+            isinstance(method, Mxfp4MoEMethod)
+            and method.use_flashinfer
+            and not method.use_marlin
+            and method._fi_kernel == "trtllm_sm100"
+            and method.flashinfer_mxfp4_moe_precision == "default"
+            and method.hidden_size == self.moe_hidden_size
+        )
 
     @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
