@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -505,6 +506,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Per-request target-verify geometry (ragged verify). Canonical read path:
+    # resolve_ragged_verify_layout(forward_batch).
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA
@@ -837,6 +841,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            ragged_verify_layout=(
+                batch.spec_info.ragged_verify_layout
+                if batch.spec_info is not None
+                else None
+            ),
         )
 
         ret._maybe_init_non_generation_fields(batch)
@@ -1660,6 +1669,7 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
+        ragged_verify_layout=forward_batch.ragged_verify_layout,
     )
 
 
