@@ -55,17 +55,24 @@ class RemoteInstanceWeightTransporter:
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            not self.server_args.remote_instance_weight_loader_use_transfer_engine()
             # ModelExpress owns TransferEngine memory registration and metadata
-            # publishing for backend=modelexpress. Re-registering here would
-            # overlap the same weight buffers.
-            and get_model().remote_instance_weight_loader_backend
-            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
-            and self.engine is not None
-            and self.weight_info is None
+            # publishing. Re-registering here would overlap the same buffers.
+            or get_model().remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            or self.engine is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
+            return
+
+        if self.weight_info is None:
             self.weight_info = register_memory_region(self.model, self.engine)
+
+        if (
+            self.server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+        ):
+            # A remote-instance loader registers its destination buffers before
+            # reading weights. Publish that registration so this instance can
+            # immediately serve as the seed for another instance.
             self._register_to_engine_info_bootstrap()
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
