@@ -181,6 +181,19 @@ class AscendRunnerCore(MoeRunnerCore):
                 pertoken_scale=runner_input.hidden_states_scale,
                 group_list_type=group_list_type,
             )
+        elif (
+            self.config.activation == "silu"
+            and self.config.gemm1_clamp_limit is None
+            and isinstance(w13_kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+        ):
+            hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                group_list_type=group_list_type,
+                swiglu_limit=self.config.swiglu_limit,
+            )
         else:
             # --- w13 (gate & up) projection ---
             hidden_states = w13_kernel.apply(

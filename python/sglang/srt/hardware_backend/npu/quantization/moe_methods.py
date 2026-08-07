@@ -272,6 +272,33 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
 
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type: int,
+        swiglu_limit: Optional[float],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        bias = self._get_bias_args(quant_info, "w13").get("bias", [None])[0]
+        hidden_states, output_scale, _ = (
+            torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz(
+                x=hidden_states,
+                weight=quant_info.w13_weight,
+                weight_scale=quant_info.w13_weight_scale,
+                x_scale=pertoken_scale,
+                group_list=(
+                    expert_tokens.cumsum(0) if group_list_type == 1 else expert_tokens
+                ),
+                bias=bias,
+                swiglu_limit=swiglu_limit or 0.0,
+            )
+        )
+        return hidden_states, output_scale
+
 
 # ---------------------------------------------------------------------------
 #  NPUW4A8MXFP4MoEMethod
