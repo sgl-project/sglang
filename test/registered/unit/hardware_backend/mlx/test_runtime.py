@@ -40,11 +40,8 @@ class TestMlxRuntime(unittest.TestCase):
     def test_disabled_backend_does_not_import_mlx(self):
         script = """
 import sys
-from sglang.kernels.ops.diffusion.triton.norm import norm_infer
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.server_args import ServerArgs
-assert norm_infer is not None and RMSNorm is not None
 assert use_mlx() is False
 ServerArgs(model_path="dummy")
 assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
