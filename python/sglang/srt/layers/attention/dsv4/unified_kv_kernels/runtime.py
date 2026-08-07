@@ -24,6 +24,7 @@ on via ``topk_length``); the per-token compressed count is recovered from the
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -40,6 +41,11 @@ from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode_indices im
 from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
+
+# A/B gate: route decode through aiter's fp8 ASM MLA kernel
+# (``mla_decode_fwd_v4_nm``) instead of the triton bf16 path. Read once at
+# import so it's stable across CUDA-graph capture/replay.
+_USE_AITER_MLA_DECODE = os.environ.get("SGLANG_USE_AITER_MLA_DECODE", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +132,26 @@ def decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
+    kv_fp8: Optional[torch.Tensor] = None,  # [pages,512] fp8 store-time pool
+    kv_rope: Optional[torch.Tensor] = None,  # [pages,64]  bf16 store-time pool
 ) -> torch.Tensor:
+    if _USE_AITER_MLA_DECODE:
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+            aiter_v4nm_paged_decode,
+            is_available,
+        )
+
+        if is_available():
+            return aiter_v4nm_paged_decode(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                kv_fp8=kv_fp8,
+                kv_rope=kv_rope,
+            )
     return sparse_attn_v4_paged_decode(
         q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
     )
