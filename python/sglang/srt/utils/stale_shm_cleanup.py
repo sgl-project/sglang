@@ -4,18 +4,10 @@ SGLang processes are torn down with SIGKILL (kill_process_tree, PDEATHSIG),
 which skips every Python-level unlink path, so /dev/shm segments accumulate
 until the tmpfs is full and the next scheduler init dies with SIGBUS.
 
-Two reclaim rules:
-
-1. Creator-pid names: segments whose filename embeds the creator pid
-   (make_shm_name(), multi_tokenizer_args_<pid>) are unlinked once that pid
-   is gone.
-2. Known pid-less families (_ORPHAN_PREFIXES) are unlinked unconditionally.
-   Only safe because the sweep runs at CI job start right after killall.py:
-   every process that could still reference them is already dead.
-
-The sweep only runs in CI (single-tenant runner containers); on shared dev
-machines a pid check against another user's process is not authoritative, so
-we skip.
+Pid-stamped names (see _creator_pid) are unlinked once their creator is dead;
+pid-less families (_ORPHAN_PREFIXES) are unlinked unconditionally, safe only
+because the sweep runs at CI job start right after killall.py. CI-only
+(SGLANG_IS_IN_CI): both rules assume a single-tenant runner container.
 """
 
 import logging
@@ -76,11 +68,10 @@ def _pid_alive(pid: int) -> bool:
 
 
 def cleanup_stale_shm() -> None:
-    """Unlink leaked shared-memory segments (two reclaim rules above).
+    """Unlink leaked shared-memory segments (rules in module docstring).
 
-    CI-only: gated on SGLANG_IS_IN_CI because both rules are trustworthy only
-    when the container runs one job at a time. Best-effort: never raises,
-    since a failed sweep must not block server startup.
+    Best-effort: never raises, since a failed sweep must not block server
+    startup.
     """
     try:
         _cleanup_stale_shm_impl()
