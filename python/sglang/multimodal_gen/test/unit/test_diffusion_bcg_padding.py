@@ -282,7 +282,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             longer["text_pos_info"]["position_ids"][47:].tolist(),
             list(range(53, 70)),
         )
-        self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
+        self.assertEqual(signature_kwargs(short), signature_kwargs(longer))
 
     def _ideogram_kwargs(self, text_seq: int, *, image_seq: int = 4):
         total_seq = text_seq + image_seq
