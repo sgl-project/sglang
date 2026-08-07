@@ -16,7 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -58,6 +58,9 @@ from sglang.srt.utils.common import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 
 logger = logging.getLogger(__name__)
 
@@ -197,14 +200,10 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
-    # Beam search only: raw logits preserved by the worker pre-sample, since
-    # the sampler rewrites next_token_logits in place. beam_tail_logits is the
-    # member rows' slice; beam_leader_logits a clone of the leader rows (one
-    # per beam_tail entry on decode, per beam_leader_rows entry on extend).
-    # Consumed by the scheduler-side joint selection at the relay point.
-    beam_tail_logits: Optional[torch.Tensor] = None
-    beam_leader_logits: Optional[torch.Tensor] = None
-    beam_leader_rows: Optional[List[int]] = None
+    # Beam search only: raw pre-sample logits preserved for the scheduler-side
+    # joint selection (the sampler rewrites next_token_logits in place); see
+    # beam_search.logits_capture.
+    beam: Optional["BeamLogitsCapture"] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None

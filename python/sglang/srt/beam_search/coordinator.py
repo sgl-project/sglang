@@ -258,8 +258,12 @@ class BeamCoordinator:
         if batch.forward_mode.is_decode():
             self.select_and_relay_decode(batch, logits_output)
         elif batch.forward_mode.is_extend():
+            capture = logits_output.beam
             leader_pos = {
-                row: pos for pos, row in enumerate(logits_output.beam_leader_rows or ())
+                row: pos
+                for pos, row in enumerate(
+                    capture.leader_rows if capture is not None else ()
+                )
             }
             for i, req in enumerate(batch.reqs):
                 group = req.beam_group
@@ -274,7 +278,7 @@ class BeamCoordinator:
                     continue
                 assert i in leader_pos, (
                     "beam leader prefill logits were not captured pre-sample "
-                    "(worker beam_leader_logits wiring)"
+                    "(worker capture_pre_sample_logits wiring)"
                 )
                 self.select_leader_prefill(
                     req, leader_pos[i], logits_output, tick=batch.forward_iter
@@ -290,12 +294,12 @@ class BeamCoordinator:
         tick: int = 0,
     ) -> None:
         """Launch half of the leader's prefill tick: first joint selection off
-        the pre-sample capture of its prefill logits (row `pos` of
-        beam_leader_logits), member-row spawn, and the relay overwrite (the
-        sampled token is void)."""
+        the pre-sample capture of its prefill logits (row `pos` of the beam
+        capture), member-row spawn, and the relay overwrite (the sampled
+        token is void)."""
         group: BeamGroup = req.beam_group
         top_logprobs, top_tokens = _rows_topk_logprobs(
-            [logits_output.beam_leader_logits[pos : pos + 1]], group.num_candidates
+            [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
         )
         final = group.next_step_is_final()
         next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
@@ -357,19 +361,20 @@ class BeamCoordinator:
         device, reparent KV, and overwrite the relayed next tokens.
 
         Group rows come from the batch's beam tail layout: the leader's raw
-        logits are the worker's pre-sample capture (one beam_leader_logits
-        row per tail entry; the sampler overwrites its own view in place),
-        the member rows the tail slice split off before sampling."""
+        logits are the worker's pre-sample capture (one leader_logits row per
+        tail entry; the sampler overwrites its own view in place), the member
+        rows the tail slice split off before sampling."""
         tail = batch.beam_tail
         if tail is None:
             return
+        capture = logits_output.beam
         for gi, (group, leader_idx, start, end) in enumerate(tail.entries):
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
             top_logprobs, top_tokens = _rows_topk_logprobs(
                 [
-                    logits_output.beam_leader_logits[gi : gi + 1],
-                    logits_output.beam_tail_logits[start:end],
+                    capture.leader_logits[gi : gi + 1],
+                    capture.tail_logits[start:end],
                 ],
                 group.num_candidates,
             )

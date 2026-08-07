@@ -7,12 +7,24 @@ raw logits it needs are preserved here, before sampling.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+@dataclass
+class BeamLogitsCapture:
+    """The preserved raw logits, stashed on LogitsProcessorOutput.beam."""
+
+    leader_logits: torch.Tensor  # pre-sample clone of the leader rows
+    tail_logits: Optional[torch.Tensor] = None  # member rows' slice (decode)
+    leader_rows: Optional[List[int]] = None  # leaders' batch indices (extend)
 
 
 def capture_pre_sample_logits(
@@ -38,10 +50,12 @@ def capture_pre_sample_logits(
         # the pre-sample clone.
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
-        logits_output.beam_tail_logits = logits[n:]
         logits_output.next_token_logits = logits[:n]
         leader_rows = [e[1] for e in batch.beam_tail.entries]
-        logits_output.beam_leader_logits = logits[leader_rows].clone()
+        logits_output.beam = BeamLogitsCapture(
+            leader_logits=logits[leader_rows].clone(),
+            tail_logits=logits[n:],
+        )
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[:n]
         forward_batch.positions = forward_batch.positions[:n]
@@ -51,7 +65,7 @@ def capture_pre_sample_logits(
         # writes would have clobbered these logits.
         leader_rows = [i for i, r in enumerate(batch.reqs) if r.beam_group is not None]
         if leader_rows:
-            logits_output.beam_leader_logits = logits_output.next_token_logits[
-                leader_rows
-            ].clone()
-            logits_output.beam_leader_rows = leader_rows
+            logits_output.beam = BeamLogitsCapture(
+                leader_logits=logits_output.next_token_logits[leader_rows].clone(),
+                leader_rows=leader_rows,
+            )
