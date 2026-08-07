@@ -16,6 +16,8 @@ import platform
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -183,11 +185,27 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         req.finished.return_value = False
         batch = MagicMock()
         batch.reqs = [req]
-        fresh_copy = MagicMock()
-        batch.copy.return_value = fresh_copy
-        chained_copy = MagicMock()
-        chained_copy.launch_ts = None
-        fresh_copy.copy.return_value = chained_copy
+        # A real prepare_for_decode() would set this to the newly allocated,
+        # never-zero slot id(s) (see the slot-0 assert in _launch_chained,
+        # #30093); the mocked prepare_for_decode() below does not run the
+        # real allocator, so set it explicitly.
+        batch.out_cache_loc = torch.tensor([1])
+        # _launch_fresh takes the first schedule_batch.copy(); _launch_chained
+        # takes a second one (after prepare_for_decode(), so the copy carries
+        # this step's committed seq_lens / kv_committed_len — see #30093).
+        # A real ScheduleBatch.copy() snapshots the live object's current
+        # attributes; emulate that here instead of a fixed canned mock, since
+        # the whole point under test is that the copy sees a *fresh* stamp.
+        copies = []
+
+        def make_copy():
+            snapshot = MagicMock()
+            snapshot.launch_ts = batch.launch_ts
+            snapshot.forward_iter = batch.forward_iter
+            copies.append(snapshot)
+            return snapshot
+
+        batch.copy.side_effect = make_copy
         plan = MagicMock()
         plan.batch_to_run = batch
         scheduler.get_next_batch_to_run.return_value = plan
@@ -226,11 +244,19 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
         scheduler.tp_worker.async_chained_decode_mlx.assert_called_once()
         self.assertLess(events.index("launch_ts:2.0"), events.index("chained_forward"))
+        self.assertEqual(len(copies), 2)
+        fresh_copy, chained_copy = copies
+        self.assertEqual(fresh_copy.launch_ts, 1.0)
         self.assertEqual(chained_copy.launch_ts, 2.0)
-        # The live batch only needs the iteration for SWA maintenance before
-        # the next fresh launch; per-step timing consumes the batch copy.
+        # The chained step stamps the live schedule_batch directly (not a
+        # copy) before prepare_for_decode(), since maybe_evict_swa() keys its
+        # cadence off batch.forward_iter -- see _launch_chained.
         self.assertEqual(batch.forward_iter, 2)
-        self.assertEqual(batch.launch_ts, 1.0)
+        self.assertEqual(batch.launch_ts, 2.0)
+        # The chained token must get the same allocation/accounting
+        # lifecycle as an ordinary decode token (#30093).
+        batch.prepare_for_decode.assert_called_once()
+        batch.check_decode_mem.assert_called_once()
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
