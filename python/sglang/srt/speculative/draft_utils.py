@@ -52,16 +52,6 @@ class DraftBackendFactory:
         if backend_type is None:
             backend_type = self.server_args.attention_backend
 
-        if backend_type == "dsv4":
-            from sglang.srt.configs.model_config import is_deepseek_v4
-
-            draft_hf_config = self.draft_model_runner.model_config.hf_config
-            if not is_deepseek_v4(draft_hf_config):
-                backend_type = self.server_args._get_default_attn_backend(
-                    use_mla_backend=self.draft_model_runner.use_mla_backend,
-                    model_config=self.draft_model_runner.model_config,
-                )
-
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 

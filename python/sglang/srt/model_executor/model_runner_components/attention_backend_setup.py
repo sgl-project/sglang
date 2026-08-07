@@ -74,9 +74,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         init_cublas()
 
     resolved = _resolve_attention_backend_strs(
-        server_args=server_args,
-        is_draft_worker=model_runner.is_draft_worker,
-        model_config=model_runner.model_config,
+        server_args=server_args, is_draft_worker=model_runner.is_draft_worker
     )
 
     if server_args.enable_pdmux:
@@ -145,7 +143,6 @@ def get_attention_backend(
     resolved = _resolve_attention_backend_strs(
         server_args=model_runner.server_args,
         is_draft_worker=model_runner.is_draft_worker,
-        model_config=model_runner.model_config,
     )
     return _build_resolved_backend(
         model_runner=model_runner,
@@ -155,16 +152,11 @@ def get_attention_backend(
 
 
 def _resolve_attention_backend_strs(
-    *, server_args: ServerArgs, is_draft_worker: bool, model_config
+    *, server_args: ServerArgs, is_draft_worker: bool
 ) -> ResolvedAttentionBackendStr:
     draft_attn_backend = server_args.speculative_draft_attention_backend
     if is_draft_worker and draft_attn_backend:
         logger.warning(f"Overriding draft attention backend to {draft_attn_backend}.")
-        draft_attn_backend = _fallback_dsv4_backend_for_non_dsv4_draft(
-            backend=draft_attn_backend,
-            server_args=server_args,
-            model_config=model_config,
-        )
         # Single backend for all draft modes (no prefill/decode split).
         return ResolvedAttentionBackendStr(
             prefill=draft_attn_backend,
@@ -172,38 +164,7 @@ def _resolve_attention_backend_strs(
             is_draft_override=True,
         )
     prefill, decode = server_args.get_attention_backends()
-    if is_draft_worker:
-        prefill = _fallback_dsv4_backend_for_non_dsv4_draft(
-            backend=prefill, server_args=server_args, model_config=model_config
-        )
-        decode = _fallback_dsv4_backend_for_non_dsv4_draft(
-            backend=decode, server_args=server_args, model_config=model_config
-        )
-
     return ResolvedAttentionBackendStr(prefill=prefill, decode=decode)
-
-
-def _fallback_dsv4_backend_for_non_dsv4_draft(
-    *, backend: str, server_args: ServerArgs, model_config
-) -> str:
-    """Keep DSV4's fixed-shape attention backend away from other draft models."""
-    if backend != "dsv4":
-        return backend
-
-    from sglang.srt.configs.model_config import AttentionArch, is_deepseek_v4
-
-    if is_deepseek_v4(model_config.hf_config):
-        return backend
-
-    fallback = server_args._get_default_attn_backend(
-        use_mla_backend=model_config.attention_arch == AttentionArch.MLA,
-        model_config=model_config,
-    )
-    logger.warning(
-        "Draft model is not DeepSeekV4, falling back attention backend "
-        f"from 'dsv4' to '{fallback}'."
-    )
-    return fallback
 
 
 def _build_resolved_backend(
