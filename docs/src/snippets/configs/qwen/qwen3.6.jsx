@@ -1,11 +1,9 @@
 // Qwen3.6 cookbook config — consumed by /src/snippets/_deployment.jsx and
 // /src/snippets/_playground.jsx. Pure data literal (no spreads/calls/IIFE).
 //
-// Ported verbatim from the legacy Qwen3.6 command generator (now removed in this
-// migration). Two strategies map onto its speculative toggle: low-latency = MTP on
-// (EAGLE + mamba radix cache v2), high-throughput = MTP off.
-// Cells reproduce the generator's output verbatim EXCEPT the reasoning/tool-call parser
-// flags are omitted (a Playground feature, not part of a Deployment/benchmark command —
+// Two strategies map onto the speculative toggle: low-latency = MTP on (EAGLE +
+// mamba radix cache v2), high-throughput = MTP off. Reasoning/tool-call parser flags
+// are omitted (a Playground feature, not part of a Deployment/benchmark command —
 // DSv4/Qwen3.5 convention). All variants tp=1 single-node. nvfp4 is Blackwell-only
 // (B200/B300). Xeon (CPU) is supported via the balanced tier (Intel-vetted recipe,
 // declared in config.hardware with vendor:"intel").
@@ -88,7 +86,8 @@ export const config = {
     h200: "lmsysorg/sglang:latest",
     b200: "lmsysorg/sglang:latest",
     b300: "lmsysorg/sglang:latest",
-    xeon: "lmsysorg/sglang:v0.5.13-xeon",
+    // No rolling `latest-xeon` tag, and `:latest` is CUDA. Needs >= 0.5.15 (#29497).
+    xeon: "lmsysorg/sglang:v0.5.16-xeon",
   },
 
   github: {
@@ -210,10 +209,7 @@ export const config = {
 
   cells: [
     {
-      // OOMs on a single 80GB H100: the mamba state cache can't fit alongside the
-      // ~70GB bf16 weights + EAGLE draft at mem-fraction 0.8 (server crashes on
-      // startup). Benchmark pending — needs a lower mem-fraction or multi-GPU tp
-      // before it can be marked verified.
+      // Pending — needs a lower mem-fraction or multi-GPU tp on a single 80GB H100.
       match: { hw: "h100", variant: "35b-a3b", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
@@ -230,8 +226,7 @@ export const config = {
       ],
     },
     {
-      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
-      // benchmarked/verified (no benchmarks entry). Pending.
+      // Pending — not yet measured.
       match: { hw: "h100", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: [],
@@ -259,8 +254,7 @@ export const config = {
       ],
     },
     {
-      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
-      // benchmarked/verified (no benchmarks entry). Pending.
+      // Pending — not yet measured.
       match: { hw: "h100", variant: "35b-a3b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: [],
@@ -288,8 +282,7 @@ export const config = {
       ],
     },
     {
-      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
-      // benchmarked/verified (no benchmarks entry). Pending.
+      // Pending — not yet measured.
       match: { hw: "h100", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: [],
@@ -317,8 +310,7 @@ export const config = {
       ],
     },
     {
-      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
-      // benchmarked/verified (no benchmarks entry). Pending.
+      // Pending — not yet measured.
       match: { hw: "h100", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: [],
@@ -346,8 +338,7 @@ export const config = {
       ],
     },
     {
-      // mem-fraction-static 0.92 (vs generator default 0.8): +13% throughput on this
-      // KV-bound MoE cell. Re-benched at 0.92 (conc 1024+4096 on 0.5.16) → verified.
+      // mem-fraction-static 0.92 (vs default 0.8): +13% throughput on this KV-bound MoE cell.
       match: { hw: "h200", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -534,8 +525,7 @@ export const config = {
       ],
     },
     {
-      // NVFP4-MoE needs --moe-runner-backend flashinfer_cutlass (default crashes).
-      // Re-benched on 0.5.16 with this flag (conc 1+16) → verified.
+      // NVFP4-MoE requires --moe-runner-backend flashinfer_cutlass.
       match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -554,7 +544,7 @@ export const config = {
       ],
     },
     {
-      // flashinfer_cutlass moe runner (see LL note). Re-benched on 0.5.16 (conc 1024+4096) → verified.
+      // flashinfer_cutlass moe runner (see LL note).
       match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
@@ -773,11 +763,10 @@ export const config = {
       ],
     },
 
-    // ---- Xeon (CPU) — speculative unsupported -> single recipe -> balanced.
-    // Ported verbatim from the legacy generator (--device cpu --disable-overlap-schedule
-    // --tp {3 for 35B-A3B, 6 for 27B}; no spec/mamba/mem-fraction/trtllm_mha). NVFP4 is
-    // Blackwell-only, so Xeon has bf16+fp8 only. verified:true — Intel-provided/vetted
-    // recipe (no perf benchmark on our side, so these render with no speed row).
+    // ---- Xeon (CPU) — speculative unsupported, single recipe, balanced tier.
+    // --device cpu --disable-overlap-schedule --tp {3 for 35B-A3B, 6 for 27B}; no
+    // spec/mamba/mem-fraction/trtllm_mha. NVFP4 is Blackwell-only, so Xeon has bf16+fp8
+    // only. Intel-vetted recipe; renders with no speed row.
     {
       match: { hw: "xeon", variant: "35b-a3b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
