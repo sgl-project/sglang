@@ -867,5 +867,63 @@ class TestNixlFileLayout(CustomTestCase):
         self.assertFalse(os.path.exists(file_path))
 
 
+class TestHiCacheHostMemoryPreflight(unittest.TestCase):
+    """HiCache host pool memory preflight (RAM + optional hugetlb)."""
+
+    def test_memory_available_bytes_uses_max_of_ram_and_hugetlb(self):
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache import mmap_allocator
+        from sglang.srt.mem_cache.mmap_allocator import (
+            HUGEPAGE_BYTES_2MB,
+            memory_available_bytes,
+        )
+
+        normal_ram_100mb = 100 * 1024 * 1024
+        hugetlb_100mb = 100 * HUGEPAGE_BYTES_2MB
+        hugetlb_200mb = 200 * HUGEPAGE_BYTES_2MB
+        low_ram = MagicMock(available=normal_ram_100mb)
+        with patch.object(
+            mmap_allocator.psutil, "virtual_memory", return_value=low_ram
+        ):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                self.assertEqual(memory_available_bytes(), normal_ram_100mb)
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator, "hugepage_available_bytes", return_value=0
+                ):
+                    self.assertEqual(memory_available_bytes(), normal_ram_100mb)
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "hugepage_available_bytes",
+                    return_value=hugetlb_100mb,
+                ):
+                    self.assertEqual(memory_available_bytes(), hugetlb_100mb)
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "hugepage_available_bytes",
+                    return_value=hugetlb_200mb,
+                ):
+                    self.assertEqual(memory_available_bytes(), hugetlb_200mb)
+
+    def test_hugepage_size_requested(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.mmap_allocator import (
+            HUGEPAGE_BYTES_1GB,
+            HUGEPAGE_BYTES_2MB,
+            hugepage_size_requested,
+        )
+
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            self.assertEqual(hugepage_size_requested(), 0)
+        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+            self.assertEqual(hugepage_size_requested(), HUGEPAGE_BYTES_2MB)
+        with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
+            self.assertEqual(hugepage_size_requested(), HUGEPAGE_BYTES_1GB)
+
+
 if __name__ == "__main__":
     unittest.main()
