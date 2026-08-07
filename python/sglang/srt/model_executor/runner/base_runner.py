@@ -81,6 +81,7 @@ def _allocate_decode_buffers(
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
+    pp_proxy_residual_num_blocks: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -115,9 +116,14 @@ def _allocate_decode_buffers(
                 "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
             }
             if not is_mhc:
-                pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_bs, hidden_size), dtype=dtype
+                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
+                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                residual_shape = (
+                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
+                    if pp_proxy_residual_num_blocks is not None
+                    else (max_bs, hidden_size)
                 )
+                pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
@@ -338,6 +344,7 @@ class BaseRunner(ABC):
             ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
         )
 
     def _dummy_run(
@@ -614,7 +621,7 @@ class BaseRunner(ABC):
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
-            with torch.inference_mode(), run_ctx or empty_context():
+            with run_ctx or empty_context():
                 run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
