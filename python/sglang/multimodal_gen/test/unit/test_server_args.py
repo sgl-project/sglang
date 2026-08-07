@@ -54,7 +54,10 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    MAX_SCHEDULER_RPC_TIMEOUT_S,
+    ServerArgs,
+)
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
@@ -2194,6 +2197,40 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
         )
 
         self.assertEqual(args.disagg_role, RoleType.DENOISER)
+
+
+class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
+    def test_scheduler_rpc_timeout_defaults_to_unbounded(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertIsNone(args.scheduler_rpc_timeout)
+
+    def test_scheduler_rpc_timeout_cli_arg_is_parsed_in_seconds(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--scheduler-rpc-timeout",
+            "7200",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.scheduler_rpc_timeout, 7200)
+
+    def test_scheduler_rpc_timeout_rejects_invalid_values(self):
+        invalid_values = (0, -1, MAX_SCHEDULER_RPC_TIMEOUT_S + 1, True, 1.5, "1")
+
+        for invalid_value in invalid_values:
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError, "scheduler_rpc_timeout must be None"
+                ):
+                    _from_dict_without_model_resolution(
+                        {
+                            "model_path": "/fake",
+                            "scheduler_rpc_timeout": invalid_value,
+                        }
+                    )
 
 
 class TestDisaggTransferBackendArgs(unittest.TestCase):
