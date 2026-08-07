@@ -467,6 +467,7 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     assert grid_thws == [[1, 2, 2]]
     assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
     assert callable(run_dp.call_args.kwargs["load_local_pixel_values"])
+    assert run_dp.call_args.kwargs["local_postprocess"] is model.mm_projector
 
 
 def test_kimi_non_dp_keeps_grid_thws_on_the_host():

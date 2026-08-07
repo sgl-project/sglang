@@ -3092,8 +3092,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 load_local_pixel_values=materialize_item_features,
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
+                local_postprocess=self.mm_projector,
             )
-            return self.mm_projector(image_embeds)
+            return image_embeds
 
         pixel_values = materialize_item_features(list(range(len(items))))
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))

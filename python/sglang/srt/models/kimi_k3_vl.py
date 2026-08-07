@@ -930,8 +930,11 @@ class KimiK3MultiModalProjector(nn.Module):
     ) -> torch.Tensor:
         if isinstance(image_features, (list, tuple)):
             x = concat_or_single(
-                [item.reshape(item.shape[0], -1) for item in image_features]
+                [
+                    item.reshape(item.shape[0], self.hidden_size)
+                    for item in image_features
+                ]
             )
         else:
-            x = image_features.reshape(image_features.shape[0], -1)
+            x = image_features.reshape(image_features.shape[0], self.hidden_size)
         return self.post_norm(self.proj(x))

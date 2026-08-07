@@ -550,6 +550,64 @@ def concat_or_single(tensors: Sequence[torch.Tensor], dim: int = 0) -> torch.Ten
     return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=dim)
 
 
+_MROPE_ALL_GATHERV_MIN_PADDING_FACTOR = 4
+_MROPE_LOCAL_PROJECTOR_MAX_IMBALANCE = 3
+_MROPE_LOCAL_PROJECTOR_MIN_RAW_BYTES = 64 * 1024 * 1024
+
+
+def _can_use_mrope_all_gatherv(tensor: torch.Tensor, group: object) -> bool:
+    """Whether the NVIDIA group can gather unequal encoder output lengths."""
+
+    pynccl_comm = getattr(group, "pynccl_comm", None)
+    return (
+        tensor.is_cuda
+        and pynccl_comm is not None
+        and getattr(pynccl_comm, "available", False)
+    )
+
+
+def _should_use_mrope_all_gatherv(
+    tensor: torch.Tensor, group: object, output_lengths: Sequence[int]
+) -> bool:
+    """Use variable gather only when it avoids padding or excessive waste."""
+
+    if not _can_use_mrope_all_gatherv(tensor, group):
+        return False
+    if not output_lengths:
+        return False
+    total_length = sum(output_lengths)
+    if total_length == 0:
+        return False
+    if all(length == output_lengths[0] for length in output_lengths):
+        return True
+    padding_factor = max(output_lengths) * len(output_lengths) / total_length
+    # Unequal NCCL all-gatherv is implemented as grouped broadcasts. For modest
+    # skew, one regular all-gather is faster even though it carries some padding.
+    return padding_factor >= _MROPE_ALL_GATHERV_MIN_PADDING_FACTOR
+
+
+def _should_run_mrope_local_postprocess(
+    tensor: torch.Tensor, output_lengths: Sequence[int]
+) -> bool:
+    """Whether sharding projector work is worth the larger output collective."""
+
+    if not output_lengths:
+        return False
+    total_length = sum(output_lengths)
+    if total_length == 0:
+        return False
+    if all(length == output_lengths[0] for length in output_lengths):
+        return True
+    imbalance = max(output_lengths) * len(output_lengths) / total_length
+    raw_payload_bytes = (
+        total_length * math.prod(tensor.shape[1:]) * tensor.element_size()
+    )
+    return (
+        imbalance <= _MROPE_LOCAL_PROJECTOR_MAX_IMBALANCE
+        and raw_payload_bytes >= _MROPE_LOCAL_PROJECTOR_MIN_RAW_BYTES
+    )
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
@@ -562,6 +620,7 @@ def run_dp_sharded_mrope_vision_model(
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
     pass_grid_thw_list: bool = False,
+    local_postprocess: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -583,6 +642,9 @@ def run_dp_sharded_mrope_vision_model(
                    the spatial merge area instead of t * h * w divided by it.
         pass_grid_thw_list: Forward the existing host grid list to the vision
             model so graph-aware towers do not materialize it from a CUDA tensor.
+        local_postprocess: Optional per-token projection to run on each vision
+            owner before outputs are exchanged. This avoids repeating replicated
+            projectors on every TP rank.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -632,14 +694,23 @@ def run_dp_sharded_mrope_vision_model(
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
             if isinstance(image_embeds, list):
-                return concat_or_single(image_embeds, dim=0)
-            return image_embeds
+                image_embeds = concat_or_single(image_embeds, dim=0)
+            return (
+                local_postprocess(image_embeds)
+                if local_postprocess is not None
+                else image_embeds
+            )
         if rope_type == "rope_2d_packed":
             image_embeds = vision_model(pixel_values, grid_thw)
             if isinstance(image_embeds, list):
-                return concat_or_single(image_embeds, dim=0)
-            return image_embeds
-        return vision_model(pixel_values, grid_thw=grid_thw)
+                image_embeds = concat_or_single(image_embeds, dim=0)
+        else:
+            image_embeds = vision_model(pixel_values, grid_thw=grid_thw)
+        return (
+            local_postprocess(image_embeds)
+            if local_postprocess is not None
+            else image_embeds
+        )
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
@@ -765,6 +836,16 @@ def run_dp_sharded_mrope_vision_model(
                 dtype=input_dtype,
             )
 
+    run_local_postprocess = (
+        local_postprocess is not None
+        and len(grid_thw_list) > 1
+        and _should_run_mrope_local_postprocess(
+            image_embeds_local, grouped_output_lengths
+        )
+    )
+    if run_local_postprocess:
+        image_embeds_local = local_postprocess(image_embeds_local)
+
     # Single-image fast path. Bit-identical to the all-gather below, which for
     # one image just pads the owner's rows and slices them back out.
     if len(grid_thw_list) == 1:
@@ -775,27 +856,45 @@ def run_dp_sharded_mrope_vision_model(
         else:
             out_embeddings = torch.empty(
                 (n_tok, *image_embeds_local.shape[1:]),
-                dtype=input_dtype,
-                device=input_device,
+                dtype=image_embeds_local.dtype,
+                device=image_embeds_local.device,
             )
         get_parallel().attn_tp_group.broadcast(out_embeddings, src=owner_local)
-        return out_embeddings
+        return (
+            local_postprocess(out_embeddings)
+            if local_postprocess is not None
+            else out_embeddings
+        )
 
-    # The TP all-gather needs a common first dimension. Allocate that final
-    # shape directly instead of materializing a padding fragment and catting it.
-    image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
-        image_embeds_local, max_len_per_rank
-    )
-
-    # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_parallel().attn_tp_group.all_gather(
-        image_embeds_local_padded, dim=0
-    )
+    attn_tp_group = get_parallel().attn_tp_group
+    if run_local_postprocess or _should_use_mrope_all_gatherv(
+        image_embeds_local, attn_tp_group, grouped_output_lengths
+    ):
+        gathered_embeds = torch.empty(
+            (sum(grouped_output_lengths), *image_embeds_local.shape[1:]),
+            dtype=image_embeds_local.dtype,
+            device=image_embeds_local.device,
+        )
+        attn_tp_group.all_gatherv(
+            image_embeds_local.contiguous(),
+            sizes=grouped_output_lengths,
+            output=gathered_embeds,
+        )
+        rank_embedding_offsets = [0, *itertools.accumulate(grouped_output_lengths)]
+    else:
+        # Backends without NCCL all_gatherv retain the common-size fallback.
+        image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
+            image_embeds_local, max_len_per_rank
+        )
+        gathered_embeds = attn_tp_group.all_gather(image_embeds_local_padded, dim=0)
+        rank_embedding_offsets = [
+            rank * max_len_per_rank for rank in range(tp_size + 1)
+        ]
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()
     for rank in range(tp_size):
-        start_idx = rank * max_len_per_rank
+        start_idx = rank_embedding_offsets[rank]
         end_idx = start_idx + grouped_output_lengths[rank]
         rank_embeddings.append(gathered_embeds[start_idx:end_idx])
 
@@ -821,4 +920,8 @@ def run_dp_sharded_mrope_vision_model(
                 embed_start += img_patches
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
-    return out_embeddings
+    return (
+        out_embeddings
+        if run_local_postprocess or local_postprocess is None
+        else local_postprocess(out_embeddings)
+    )

@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.models import kimi_k3_vl
 from sglang.srt.models.kimi_k3_vl import (
+    KimiK3MultiModalProjector,
     KimiK3VisionTower,
     MoonViT3dEncoder,
     _resolve_mm_attention_backend,
@@ -25,6 +26,21 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_kimi_k3_projector_accepts_empty_owner_input():
+    config = SimpleNamespace(
+        mm_hidden_size=4,
+        vt_hidden_size=4,
+        merge_kernel_size=(2, 2),
+        text_hidden_size=8,
+        projector_ln_eps=1e-5,
+    )
+    projector = KimiK3MultiModalProjector(config)
+
+    output = projector(torch.empty(0, 4, 4))
+
+    assert output.shape == (0, 8)
 
 
 @pytest.mark.parametrize(
@@ -487,6 +503,7 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     assert run_dp.call_args.kwargs["rope_type"] == "rope_2d"
     assert run_dp.call_args.kwargs["pass_grid_thw_list"] is True
     assert run_dp.call_args.kwargs["pool_temporal_dimension"] is True
+    assert run_dp.call_args.kwargs["local_postprocess"] is model.mm_projector
     loader = run_dp.call_args.kwargs["load_local_pixel_values"]
     assert callable(loader)
 
