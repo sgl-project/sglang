@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sm120_supported,
 )
 from sglang.srt.utils.offloader import get_offloader
 
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_sm120 = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -74,6 +76,11 @@ else:
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+
+
+# Above this the standard path uses the contiguous grouped GEMM; the masked
+# layout's [num_local_experts, capacity, k] transients OOM at prefill sizes.
+_STANDARD_CONTIG_MIN_TOKENS = 1024
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -257,7 +264,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            self.use_swizzle = True
+            # The SM120 DeepGEMM contiguous GEMM consumes standard-layout
+            # activations only; other architectures keep the swizzled layout.
+            self.use_swizzle = not _is_sm120
 
     def run(
         self,
@@ -830,6 +839,92 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.DEEP_GEMM
 
 
+def _pre_permute_standard_contig(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    num_tokens, K = hidden_states.shape
+    num_experts = runner_config.num_local_experts
+    device = hidden_states.device
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_device"] = device
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["contig_mode"] = True
+
+    ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    q, q_scale = sglang_per_token_group_quant_fp8(
+        hidden_states,
+        128,
+        column_major_scales=ue8m0,
+        scale_tma_aligned=ue8m0,
+        scale_ue8m0=ue8m0,
+    )
+    dispose_tensor(hidden_states)
+
+    # ep_scatter fills expert slots in blocks of 128; size from a static upper
+    # bound and accumulate counts on-device to avoid a GPU->CPU sync.
+    flat_ids = topk_ids.flatten().to(torch.int64)
+    counts = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    counts.index_add_(0, flat_ids.clamp_min(0), (flat_ids >= 0).to(torch.int32))
+    counts_aligned = (counts + 127) // 128 * 128
+    all_tokens = ceil_div(num_tokens * runner_config.top_k, 128) * 128 + (
+        num_experts * 128
+    )
+    running_state["all_tokens"] = all_tokens
+
+    # Pad slots (m_indices == -1) are skipped by the grouped GEMM, so the
+    # buffer needs no zero fill.
+    input_tensor = torch.empty((all_tokens, K), device=device, dtype=q.dtype)
+    if ue8m0:
+        input_tensor_scale = torch.zeros(
+            (ceil_div(K // 128, 4), all_tokens), device=device, dtype=torch.int
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.empty(
+            (all_tokens, K // 128), device=device, dtype=torch.float32
+        )
+    m_indices = torch.full((all_tokens,), -1, device=device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+    expert_start_loc = torch.empty_like(counts_aligned)
+
+    ep_scatter(
+        q,
+        q_scale,
+        topk_ids,
+        counts_aligned,
+        counts,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=ue8m0,
+    )
+    dispose_tensor(q)
+    if q_scale is not None:
+        dispose_tensor(q_scale)
+
+    running_state["output_index"] = output_index
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
 @register_pre_permute("standard", "deep_gemm")
 def pre_permute_standard_to_deep_gemm(
     dispatch_output: StandardDispatchOutput,
@@ -848,6 +943,16 @@ def pre_permute_standard_to_deep_gemm(
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
+    if (
+        hidden_states.shape[0] >= _STANDARD_CONTIG_MIN_TOKENS
+        and quant_info.w13_weight.dtype != torch.bfloat16
+        # Under EP the standard dispatcher maps non-local experts to -1,
+        # which the contiguous path does not handle; keep the masked path.
+        and runner_config.num_local_experts == runner_config.num_experts
+    ):
+        return _pre_permute_standard_contig(
+            hidden_states, topk_ids, topk_weights, runner_config, running_state
+        )
 
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
@@ -1030,6 +1135,26 @@ def post_permute_deep_gemm_to_standard(
 ) -> StandardCombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    if running_state.get("contig_mode"):
+        from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
+
+        gather_out = torch.empty(
+            running_state["hidden_states_shape"],
+            device=running_state["hidden_states_device"],
+            dtype=running_state["hidden_states_dtype"],
+        )
+        ep_gather(
+            runner_output.hidden_states,
+            running_state["topk_ids"],
+            running_state["topk_weights"],
+            running_state["output_index"],
+            gather_out,
+        )
+        dispose_tensor(runner_output.hidden_states)
+        if runner_config.routed_scaling_factor is not None:
+            gather_out *= runner_config.routed_scaling_factor
+        return StandardCombineInput(hidden_states=gather_out)
 
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]

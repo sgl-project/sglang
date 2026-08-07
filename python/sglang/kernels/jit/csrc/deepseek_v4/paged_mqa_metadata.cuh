@@ -7,6 +7,8 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <utility>
+
 namespace {
 
 constexpr uint32_t kBlockSize = 1024;
@@ -72,14 +74,32 @@ __global__ __launch_bounds__(kBlockSize, 1)  //
   }
 }
 
+// Opts into kMaxDynamicSMEM capped by the device budget (the per-block opt-in
+// limit less the kernel's static smem) and returns what was granted.
 template <auto* f, size_t kMaxDynamicSMEM>
-void setup_kernel_smem_once(host::DebugInfo where = {}) {
-  [[maybe_unused]]
-  static const auto result = [] {
+size_t setup_kernel_smem_once(host::DebugInfo where = {}) {
+  static const auto granted = [] {
     const auto fptr = std::bit_cast<const void*>(f);
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    int device = 0;
+    int device_max = 0;
+    ::cudaFuncAttributes attr{};
+    auto result = ::cudaGetDevice(&device);
+    if (result == ::cudaSuccess) {
+      result = ::cudaDeviceGetAttribute(&device_max, ::cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    }
+    if (result == ::cudaSuccess) {
+      result = ::cudaFuncGetAttributes(&attr, fptr);
+    }
+    auto smem = kMaxDynamicSMEM;
+    if (result == ::cudaSuccess) {
+      const auto budget = static_cast<size_t>(device_max) - attr.sharedSizeBytes;
+      if (budget < smem) smem = budget;
+      result = ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    }
+    return std::pair{result, smem};
   }();
-  host::RuntimeDeviceCheck(result, where);
+  host::RuntimeDeviceCheck(granted.first, where);
+  return granted.second;
 }
 
 struct IndexerMetadataKernel {
@@ -101,7 +121,10 @@ struct IndexerMetadataKernel {
     const auto batch_size = static_cast<uint32_t>(N.unwrap());
     const auto num_sm = static_cast<uint32_t>(M.unwrap()) - 1;
     RuntimeCheck(num_sm <= 1024);
-    const auto use_smem = batch_size <= kMaxBatchSizeInSmem;
+    constexpr auto kernel = smxx_paged_mqa_logits_metadata;
+    const auto max_smem = setup_kernel_smem_once<kernel, (kMaxBatchSizeInSmem + 1) * sizeof(uint32_t)>();
+    // Batches that no longer fit read context_lens from global memory instead.
+    const auto use_smem = (batch_size + 1) * sizeof(uint32_t) <= max_smem;
     const auto params = MetadataParams{
         .batch_size = batch_size,
         .num_sm = num_sm,
@@ -109,8 +132,6 @@ struct IndexerMetadataKernel {
         .schedule_metadata = static_cast<uint32_t*>(metadata.data_ptr()),
         .use_smem = use_smem,
     };
-    constexpr auto kernel = smxx_paged_mqa_logits_metadata;
-    setup_kernel_smem_once<kernel, (kMaxBatchSizeInSmem + 1) * sizeof(uint32_t)>();
     const auto smem = use_smem ? (batch_size + 1) * sizeof(uint32_t) : 0;
     LaunchKernel(1, kBlockSize, device.unwrap(), smem)(kernel, params);
   }
