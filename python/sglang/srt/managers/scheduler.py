@@ -999,7 +999,7 @@ class Scheduler(
 
         # Get token and memory info from the model worker
         (
-            self.max_total_num_tokens,
+            self.max_total_num_tokens_per_dcp_rank,
             self.max_prefill_tokens,
             self.max_running_requests,
             self.max_queued_requests,
@@ -1059,9 +1059,23 @@ class Scheduler(
         self.startup_available_gpu_memory_gb = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
         )
+        # max_total_num_tokens_per_dcp_rank is the per-rank pool size; DCP
+        # stripes each request across dcp_size ranks, so the token capacity
+        # requests actually see is dcp_size times larger. Reporting surfaces
+        # (startup log, metrics constants, server info) use this logical
+        # capacity, matching the allocator size and the pool-stats usage
+        # denominator.
+        self.logical_max_total_num_tokens = (
+            self.max_total_num_tokens_per_dcp_rank * self.server_args.dcp_size
+        )
         if self.ps.tp_rank == 0:
+            dcp_breakdown = (
+                f" ({self.max_total_num_tokens_per_dcp_rank} per rank * dcp_size {self.server_args.dcp_size})"
+                if self.server_args.dcp_size > 1
+                else ""
+            )
             logger.info(
-                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"max_total_num_tokens={self.logical_max_total_num_tokens}{dcp_breakdown}, "
                 f"chunked_prefill_size={get_schedule().chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
@@ -1075,7 +1089,7 @@ class Scheduler(
             return
 
         self.metrics_collector.emit_constants(
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.logical_max_total_num_tokens,
             max_total_num_tokens_swa=self.swa_tokens_per_layer,
             weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_memory_usage_gb=(
@@ -1092,7 +1106,8 @@ class Scheduler(
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
             page_size=self.page_size,
-            num_pages=self.max_total_num_tokens // self.page_size,
+            # Page count is unchanged by the DCP logical-unit conversion.
+            num_pages=self.max_total_num_tokens_per_dcp_rank // self.page_size,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
@@ -1346,7 +1361,7 @@ class Scheduler(
                 dp_size=get_parallel().dp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
-                max_total_num_tokens=self.max_total_num_tokens,
+                max_total_num_tokens=self.max_total_num_tokens_per_dcp_rank,
                 pp_rank=self.ps.pp_rank,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
@@ -1376,7 +1391,7 @@ class Scheduler(
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
-                max_total_num_tokens=self.max_total_num_tokens,
+                max_total_num_tokens=self.max_total_num_tokens_per_dcp_rank,
                 scheduler=self,
                 pp_rank=self.ps.pp_rank,
                 pp_size=self.ps.pp_size,
@@ -1606,7 +1621,8 @@ class Scheduler(
         """
         result_dict = {
             "status": "ready",
-            "max_total_num_tokens": self.max_total_num_tokens,
+            "max_total_num_tokens": self.logical_max_total_num_tokens,
+            "max_total_num_tokens_per_dcp_rank": self.max_total_num_tokens_per_dcp_rank,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
@@ -1998,7 +2014,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
+            max_total_num_tokens=self.logical_max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2011,7 +2027,7 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens_per_dcp_rank,
             server_args=self.server_args,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2032,7 +2048,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,
             max_running_requests=self.max_running_requests,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens_per_dcp_rank,
             get_stats=lambda: self.metrics_reporter.stats,
         )
 
@@ -2046,7 +2062,9 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # Logical capacity: pool_stats_observer computes num_used_tokens in
+            # DCP-logical units, so the reported max must use the same unit.
+            max_total_num_tokens=self.logical_max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2131,7 +2149,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * self.server_args.dcp_size
+                self.logical_max_total_num_tokens
                 - paged_input_len
                 - self.page_size
                 - 1,
@@ -4190,7 +4208,8 @@ class Scheduler(
             weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
-            token_capacity=self.max_total_num_tokens,
+            token_capacity=self.logical_max_total_num_tokens,
+            token_capacity_per_dcp_rank=self.max_total_num_tokens_per_dcp_rank,
             token_capacity_swa=self.swa_tokens_per_layer,
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,

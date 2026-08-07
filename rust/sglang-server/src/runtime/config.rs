@@ -139,11 +139,13 @@ pub struct ServerArgs {
     #[serde(default)]
     pub num_reserved_tokens: u64,
     /// Launch-time stamps (not `server_args` fields): sglang package version
-    /// and the scheduler-derived KV token capacity, reported by `/server_info`.
+    /// and the scheduler-derived KV token capacities, reported by `/server_info`.
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
     pub max_total_num_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_total_num_tokens_per_dcp_rank: Option<u64>,
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
