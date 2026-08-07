@@ -48,11 +48,8 @@ def _telechat4_mhc_pre_gemm_kernel(
         for k_offset in range(0, split_size, BLOCK_K):
             offs_k_global = split_id * split_size + k_offset + offs_k
             residual = tl.load(
-                residual_ptr
-                + offs_m[:, None] * K
-                + offs_k_global[None, :],
-                mask=(offs_m[:, None] < num_tokens)
-                & (offs_k_global[None, :] < K),
+                residual_ptr + offs_m[:, None] * K + offs_k_global[None, :],
+                mask=(offs_m[:, None] < num_tokens) & (offs_k_global[None, :] < K),
                 other=0.0,
             )
             fn = tl.load(
@@ -123,23 +120,20 @@ def _telechat4_mhc_pre_finalize_kernel(
             + token_id * BLOCK_N
             + stream_offsets[None, :]
         )
-        pre_logits = tl.sum(
-            tl.load(partial_logits_ptr + pre_partial_offsets), axis=0
-        ) * inv_rms
+        pre_logits = (
+            tl.sum(tl.load(partial_logits_ptr + pre_partial_offsets), axis=0) * inv_rms
+        )
         pre_scale = tl.load(hc_scale_ptr)
         pre_base = tl.load(hc_base_ptr + stream_offsets)
         pre_mix = tl.sigmoid(pre_logits * pre_scale + pre_base) + hc_pre_eps
 
         post_partial_offsets = pre_partial_offsets + STREAMS
-        post_logits = tl.sum(
-            tl.load(partial_logits_ptr + post_partial_offsets), axis=0
-        ) * inv_rms
+        post_logits = (
+            tl.sum(tl.load(partial_logits_ptr + post_partial_offsets), axis=0) * inv_rms
+        )
         post_scale = tl.load(hc_scale_ptr + 1)
         post_base = tl.load(hc_base_ptr + STREAMS + stream_offsets)
-        post_mix = (
-            tl.sigmoid(post_logits * post_scale + post_base)
-            * hc_post_mult_value
-        )
+        post_mix = tl.sigmoid(post_logits * post_scale + post_base) * hc_post_mult_value
 
         comb_partial_offsets = (
             split_offsets[:, None] * num_tokens * BLOCK_N
@@ -147,9 +141,9 @@ def _telechat4_mhc_pre_finalize_kernel(
             + 2 * STREAMS
             + comb_offsets[None, :]
         )
-        comb_logits = tl.sum(
-            tl.load(partial_logits_ptr + comb_partial_offsets), axis=0
-        ) * inv_rms
+        comb_logits = (
+            tl.sum(tl.load(partial_logits_ptr + comb_partial_offsets), axis=0) * inv_rms
+        )
         comb_scale = tl.load(hc_scale_ptr + 2)
         comb_base = tl.load(hc_base_ptr + 2 * STREAMS + comb_offsets)
         comb_mix = tl.reshape(
@@ -187,14 +181,12 @@ def _telechat4_mhc_pre_finalize_kernel(
         )
         if POST_LAYOUT:
             comb_output_offsets = (
-                (comb_offsets % STREAMS) * STREAMS + comb_offsets // STREAMS
-            )
+                comb_offsets % STREAMS
+            ) * STREAMS + comb_offsets // STREAMS
         else:
             comb_output_offsets = comb_offsets
         tl.store(
-            comb_mix_ptr
-            + token_id * STREAMS * STREAMS
-            + comb_output_offsets,
+            comb_mix_ptr + token_id * STREAMS * STREAMS + comb_output_offsets,
             tl.reshape(comb_mix, (STREAMS * STREAMS,)),
         )
         tl.store(
@@ -232,9 +224,7 @@ def _telechat4_mhc_post_kernel(
             mask=hidden_mask,
             other=0.0,
         ).to(tl.float32)
-        post_mix = tl.load(
-            post_mix_ptr + token_id * STREAMS + new_stream_id
-        )
+        post_mix = tl.load(post_mix_ptr + token_id * STREAMS + new_stream_id)
         residual_offsets = (
             token_id * FLAT_SIZE
             + old_stream_offsets[:, None] * HIDDEN_SIZE
@@ -246,9 +236,7 @@ def _telechat4_mhc_post_kernel(
             other=0.0,
         ).to(tl.float32)
         comb_offsets = (
-            token_id * STREAMS * STREAMS
-            + old_stream_offsets * STREAMS
-            + new_stream_id
+            token_id * STREAMS * STREAMS + old_stream_offsets * STREAMS + new_stream_id
         )
         comb_mix = tl.load(comb_mix_ptr + comb_offsets)
         output = post_mix * x + tl.sum(residual * comb_mix[:, None], axis=0)
@@ -338,9 +326,9 @@ def _telechat4_mhc_pre_split(
         device=residual.device,
     )
 
-    num_aicore = driver.active.utils.get_device_properties(
-        residual.device.index or 0
-    )["num_aicore"]
+    num_aicore = driver.active.utils.get_device_properties(residual.device.index or 0)[
+        "num_aicore"
+    ]
     block_m = 16
     num_tasks = triton.cdiv(num_tokens, block_m) * split_k
     _telechat4_mhc_pre_gemm_kernel[(min(num_tasks, num_aicore),)](
@@ -386,9 +374,7 @@ def _telechat4_mhc_pre_split(
         num_stages=1,
     )
     comb_mix = (
-        comb_post_layout.transpose(-1, -2)
-        if direct_post_layout
-        else comb_post_layout
+        comb_post_layout.transpose(-1, -2) if direct_post_layout else comb_post_layout
     )
     return post_mix, comb_mix, layer_input
 
@@ -462,9 +448,7 @@ def telechat4_mhc_post(
     if not all(t.is_contiguous() for t in (x, residual, post_mix, comb_mix)):
         raise ValueError("TeleChat4 Triton mHC post inputs must be contiguous")
 
-    output = torch.empty(
-        residual.shape, device=residual.device, dtype=residual.dtype
-    )
+    output = torch.empty(residual.shape, device=residual.device, dtype=residual.dtype)
     num_tokens = x.shape[0]
     num_vectorcore = driver.active.utils.get_device_properties(x.device.index or 0)[
         "num_vectorcore"

@@ -1,6 +1,10 @@
 import pytest
 import torch
 
+from sglang.srt.layers.telechat4_mhc_torch import (
+    telechat4_mhc_post_torch,
+    telechat4_mhc_pre_torch,
+)
 from sglang.srt.layers.telechat4_mhc_triton import (
     MHC_FLAT_SIZE,
     MHC_HIDDEN_SIZE,
@@ -9,19 +13,13 @@ from sglang.srt.layers.telechat4_mhc_triton import (
     telechat4_mhc_post,
     telechat4_mhc_pre,
 )
-from sglang.srt.layers.telechat4_mhc_torch import (
-    telechat4_mhc_post_torch,
-    telechat4_mhc_pre_torch,
-)
 from sglang.srt.runtime_context import get_forward
 
 
 def _torch_pre(residual, fn, hc_scale, hc_base, sinkhorn_repeat=20):
     residual_fp32 = residual.float()
     residual_flat = residual_fp32.reshape(-1, MHC_FLAT_SIZE)
-    inv_rms = torch.rsqrt(
-        residual_flat.square().mean(dim=-1, keepdim=True) + 1e-6
-    )
+    inv_rms = torch.rsqrt(residual_flat.square().mean(dim=-1, keepdim=True) + 1e-6)
     mixes = torch.nn.functional.linear(residual_flat, fn.float()) * inv_rms
     pre_logits, post_logits, comb_logits = torch.split(mixes, [4, 4, 16], dim=-1)
     pre_mix = torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:4]) + 1e-6
@@ -134,9 +132,7 @@ def test_telechat4_mhc_triton_rejects_other_hidden_sizes():
     hc_scale = torch.empty(3, device="npu", dtype=torch.float32)
     hc_base = torch.empty(24, device="npu", dtype=torch.float32)
     with pytest.raises(ValueError, match="3584"):
-        telechat4_mhc_pre(
-            residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20
-        )
+        telechat4_mhc_pre(residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20)
 
 
 def test_telechat4_mhc_auto_layout_only_for_eager_extend():
@@ -173,9 +169,7 @@ def test_telechat4_mhc_ascendc_dispatch_matches_torch(monkeypatch, request):
         import sgl_kernel_npu  # noqa: F401
     except ImportError:
         pytest.skip("sgl-kernel-npu is required")
-    if not hasattr(torch.ops.npu, "hc_pre") or not hasattr(
-        torch.ops.npu, "hc_post"
-    ):
+    if not hasattr(torch.ops.npu, "hc_pre") or not hasattr(torch.ops.npu, "hc_post"):
         pytest.skip("sgl-kernel-npu was built without mHC operators")
 
     from sglang.srt.models import telechat4 as telechat4_model
@@ -232,12 +226,6 @@ def test_telechat4_mhc_ascendc_dispatch_matches_torch(monkeypatch, request):
         dtype=torch.bfloat16,
     )
     comb_for_post = actual_pre[1].transpose(-1, -2).contiguous()
-    actual_post = telechat4_model.mhc_post(
-        x, residual, actual_pre[0], comb_for_post
-    )
-    expected_post = telechat4_mhc_post_torch(
-        x, residual, actual_pre[0], comb_for_post
-    )
-    torch.testing.assert_close(
-        actual_post, expected_post, atol=0.03125, rtol=5e-3
-    )
+    actual_post = telechat4_model.mhc_post(x, residual, actual_pre[0], comb_for_post)
+    expected_post = telechat4_mhc_post_torch(x, residual, actual_pre[0], comb_for_post)
+    torch.testing.assert_close(actual_post, expected_post, atol=0.03125, rtol=5e-3)

@@ -1,6 +1,9 @@
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=5, suite="stage-a-unit-test-npu")
 
 pytestmark = pytest.mark.skipif(
     not hasattr(torch, "npu") or not torch.npu.is_available(),

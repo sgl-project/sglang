@@ -30,11 +30,19 @@ import torch
 from torch import nn
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.srt.configs.telechat4 import TeleChat4Config
+
+# Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
+# so that torch.compile can trace through the mHC module. Without registration,
+# dynamo tries to execute the real kernel with FakeTensors and fails because the
+# TVM/TileLang C-extension calls attempt to access the data pointer of FakeTensors.
+from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
+from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
 from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.telechat4 import TeleChat4Config
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -49,18 +57,9 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
-# Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
-# so that torch.compile can trace through the mHC module. Without registration,
-# dynamo tries to execute the real kernel with FakeTensors and fails because the
-# TVM/TileLang C-extension calls attempt to access the data pointer of FakeTensors.
-from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
-from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
-
 logger = logging.getLogger(__name__)
 
-_NPU_MHC_BACKEND = os.environ.get(
-    "SGLANG_TECHAT4_MHC_BACKEND", "auto"
-).lower()
+_NPU_MHC_BACKEND = os.environ.get("SGLANG_TECHAT4_MHC_BACKEND", "auto").lower()
 if _NPU_MHC_BACKEND not in ("auto", "ascendc", "triton", "torch"):
     raise ValueError(
         "SGLANG_TELECHAT4_MHC_BACKEND must be 'auto', 'ascendc', 'triton', "
@@ -74,9 +73,7 @@ def _load_ascendc_mhc() -> bool:
         import sgl_kernel_npu  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.ops.npu, "hc_pre") and hasattr(
-        torch.ops.npu, "hc_post"
-    )
+    return hasattr(torch.ops.npu, "hc_pre") and hasattr(torch.ops.npu, "hc_post")
 
 
 @lru_cache(maxsize=1)
@@ -239,9 +236,7 @@ def mhc_post(
                 telechat4_mhc_post_torch,
             )
 
-            return telechat4_mhc_post_torch(
-                x, residual, post_layer_mix, comb_res_mix
-            )
+            return telechat4_mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
 
         from sglang.srt.layers.telechat4_mhc_triton import telechat4_mhc_post
 
@@ -293,20 +288,14 @@ class mHCModule(nn.Module):
             persistent=False,
         )
         self.register_buffer("hc_scale", torch.zeros(3), persistent=False)
-        self.register_buffer(
-            "hc_base", torch.zeros(out_features), persistent=False
-        )
+        self.register_buffer("hc_base", torch.zeros(out_features), persistent=False)
         self._finalized = False
 
     @torch.no_grad()
     def finalize(self) -> None:
         """Build the fused-kernel operands from the loaded parameters."""
         npu_backend = _get_npu_mhc_backend() if is_npu() else None
-        fn_dtype = (
-            torch.bfloat16
-            if npu_backend == "triton"
-            else torch.float32
-        )
+        fn_dtype = torch.bfloat16 if npu_backend == "triton" else torch.float32
         self.fn = self.mapping_proj.weight.detach().to(fn_dtype).contiguous()
         self.hc_scale = (
             torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res])
@@ -344,9 +333,7 @@ class mHCModule(nn.Module):
             layer_input = torch.empty(
                 0, C, dtype=torch.bfloat16, device=residual.device
             )
-            post_mix = torch.empty(
-                0, n, dtype=torch.float32, device=residual.device
-            )
+            post_mix = torch.empty(0, n, dtype=torch.float32, device=residual.device)
             comb_mix = torch.empty(
                 0, n * n, dtype=torch.float32, device=residual.device
             )
@@ -438,8 +425,8 @@ class TeleChat4DecoderLayer(nn.Module):
         self,
         config: TeleChat4Config,
         layer_id: int,
-        quant_config: Optional["QuantizationConfig"] = None,
-        moe_quant_config_override: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        moe_quant_config_override: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -478,6 +465,7 @@ class TeleChat4DecoderLayer(nn.Module):
         self.use_mha = use_mha
 
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -590,7 +578,9 @@ class TeleChat4DecoderLayer(nn.Module):
             C = self.hidden_size
 
             origin_hidden_states = hidden_states
-            aggregated_hidden_states, attention_res_weights, attention_post_weights = self.attn_hc(origin_hidden_states)
+            aggregated_hidden_states, attention_res_weights, attention_post_weights = (
+                self.attn_hc(origin_hidden_states)
+            )
 
             hidden_states = aggregated_hidden_states.reshape(-1, C)
 
@@ -618,6 +608,7 @@ class TeleChat4DecoderLayer(nn.Module):
                 topk_indices = None
 
             from sglang.srt.layers.communicator import get_attn_tp_context
+
             get_attn_tp_context().clear_attn_inputs()
 
             hidden_states = hidden_states.reshape(S, B, C)
@@ -636,7 +627,9 @@ class TeleChat4DecoderLayer(nn.Module):
             )
 
             origin_hidden_states = hidden_states
-            aggregated_hidden_states, mlp_res_weights, mlp_post_weights = self.ffn_hc(origin_hidden_states)
+            aggregated_hidden_states, mlp_res_weights, mlp_post_weights = self.ffn_hc(
+                origin_hidden_states
+            )
 
             hidden_states = aggregated_hidden_states.reshape(-1, C)
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -653,7 +646,10 @@ class TeleChat4DecoderLayer(nn.Module):
 
             hidden_states = hidden_states.reshape(S, B, C)
 
-            if isinstance(self.mlp, deepseek_v2.DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+            if (
+                isinstance(self.mlp, deepseek_v2.DeepseekV2MLP)
+                and hidden_states.dtype == torch.float16
+            ):
                 hidden_states *= 1.0 / self.routed_scaling_factor
 
             hidden_states = self.ffn_hc.fused_h_res_h_post_bda_inference(
@@ -692,6 +688,7 @@ class TeleChat4DecoderLayer(nn.Module):
         hidden_states = attn_output
 
         from sglang.srt.layers.communicator import get_attn_tp_context
+
         get_attn_tp_context().clear_attn_inputs()
 
         if (
@@ -736,7 +733,10 @@ class TeleChat4DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        if isinstance(self.mlp, deepseek_v2.DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+        if (
+            isinstance(self.mlp, deepseek_v2.DeepseekV2MLP)
+            and hidden_states.dtype == torch.float16
+        ):
             hidden_states *= 1.0 / self.routed_scaling_factor
 
         return hidden_states, residual, topk_indices
@@ -810,7 +810,7 @@ class TeleChat4Model(nn.Module):
     def __init__(
         self,
         config: TeleChat4Config,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -929,7 +929,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def __init__(
         self,
         config: TeleChat4Config,
-        quant_config: Optional["QuantizationConfig"] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -949,8 +949,6 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "q_a_proj",
                 "kv_a_proj_with_mqa",
             ]
-
-        from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
@@ -1079,9 +1077,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             try:
                 weight_loader(param, loaded_weight)
             except Exception as e:
-                logger.warning(
-                    "Failed to load %s -> %s: %s", name, target_name, e
-                )
+                logger.warning("Failed to load %s -> %s: %s", name, target_name, e)
 
         self.do_load_weights(processed_weights, is_nextn)
 

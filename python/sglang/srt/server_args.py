@@ -5294,15 +5294,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
-        elif model_arch in ["TeleChat4ForCausalLM"]:
-            # The DeepGEMM tf32_hc_prenorm_gemm path is a raw C extension that
-            # torch.compile (fullgraph=True, used by tc_piecewise prefill backend)
-            # cannot trace, raising:
-            #   torch._dynamo.exc.Unsupported: Dynamo does not know how to trace
-            #   method `__call__` of class `Function`
-            # TeleChat4 selects its platform-specific 3584-wide mHC path directly.
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
