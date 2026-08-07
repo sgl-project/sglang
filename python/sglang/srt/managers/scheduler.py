@@ -69,6 +69,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation import role_switch
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -146,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PdRoleSwitchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1107,6 +1109,13 @@ class Scheduler(
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
     def init_running_status(self):
+        # Set by a runtime PD role switch to break out of the current event loop.
+        self._event_loop_should_restart = False
+        # Guards against concurrent/re-entrant PD role switches.
+        self._pd_role_switch_in_progress = False
+        # Set if a role switch tore down the old role but failed to rebuild
+        # either the new or the old role; the instance can no longer serve.
+        self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
@@ -1263,6 +1272,7 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
+        self._sync_disaggregation_mode_to_subcomponents()
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
@@ -1550,6 +1560,7 @@ class Scheduler(
                     self.weight_updater.check_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
+                (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
                     ProfileReq,
                     lambda req: self.profiler_manager._profile(req),
@@ -1860,6 +1871,13 @@ class Scheduler(
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+        # A runtime PD role switch rebuilt the disaggregation structures for a new
+        # role. The response has already been sent above; now break out of the
+        # current (old-role) event loop so the supervisor can re-dispatch.
+        if self._event_loop_should_restart:
+            self._event_loop_should_restart = False
+            raise _PdRoleSwitchRestart()
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -4197,6 +4215,13 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        # PD role switch: expose this instance's role and the decode CUDA graph
+        # batch sizes it has captured (empty on a prefill that has not flipped to
+        # decode). A router can query a live decode server here and pass the value
+        # as PdRoleSwitchReqInput.decode_cuda_graph_bs so the instance being
+        # flipped to decode captures a size-matched graph set.
+        ret["disaggregation_mode"] = self.server_args.disaggregation_mode
+        ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -4718,6 +4743,27 @@ class Scheduler(
         self.forward_sleep_time = t
         return SlowDownReqOutput()
 
+    def handle_pd_role_switch(self, recv_req: PdRoleSwitchReqInput):
+        return role_switch.handle_pd_role_switch(self, recv_req)
+
+    def _teardown_disaggregation(self):
+        role_switch.teardown_disaggregation(self)
+
+    def _sync_disaggregation_mode_to_subcomponents(self):
+        # Push the (possibly flipped) mode into sub-components that cache it.
+        # object.__setattr__ because some are frozen dataclasses.
+        for name in (
+            "invariant_checker",
+            "load_inquirer",
+            "output_streamer",
+            "batch_result_processor",
+        ):
+            comp = getattr(self, name, None)
+            if comp is not None and hasattr(comp, "disaggregation_mode"):
+                object.__setattr__(
+                    comp, "disaggregation_mode", self.disaggregation_mode
+                )
+
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
@@ -4796,7 +4842,27 @@ class Scheduler(
         pass
 
 
+class _PdRoleSwitchRestart(Exception):
+    """Internal signal: break out of the current disaggregation event loop so the
+    supervisor can re-dispatch after a runtime P<->D role switch."""
+
+
 def dispatch_event_loop(scheduler: Scheduler):
+    # Supervisor: a runtime PD role switch breaks out of the active event loop by
+    # raising _PdRoleSwitchRestart; we then re-dispatch to the new role's loop.
+    while True:
+        try:
+            _dispatch_event_loop_once(scheduler)
+            return
+        except _PdRoleSwitchRestart:
+            logger.info(
+                "Re-dispatching event loop after PD role switch -> %s",
+                scheduler.disaggregation_mode.value,
+            )
+            continue
+
+
+def _dispatch_event_loop_once(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode

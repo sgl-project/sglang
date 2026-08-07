@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -48,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PdRoleSwitchReqInput,
+    PdRoleSwitchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -106,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
+    ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -826,6 +830,39 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def pd_role_switch(
+        self: TokenizerManager,
+        obj: PdRoleSwitchReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PdRoleSwitchReqOutput:
+        self.auto_create_handle_loop()
+        if not self.server_args.enable_pd_role_switch:
+            return PdRoleSwitchReqOutput(
+                success=False,
+                message="--enable-pd-role-switch is not set on this server",
+                old_role=self.server_args.disaggregation_mode,
+                new_role=obj.new_role,
+            )
+        results = await self.pd_role_switch_communicator(obj)
+        all_success = all(r.success for r in results)
+        if all_success:
+            # Keep the tokenizer-manager's view of the role in sync so future
+            # control ops and bootstrap routing behave consistently.
+            self.record_config_updates(
+                "tokenizer.pd_role_switch", disaggregation_mode=obj.new_role
+            )
+            self.disaggregation_mode = DisaggregationMode(obj.new_role)
+            msg = "ok"
+        else:
+            # Surface only the failing workers' messages.
+            msg = "; ".join(r.message for r in results if not r.success)
+        return PdRoleSwitchReqOutput(
+            success=all_success,
+            message=msg,
+            old_role=results[0].old_role if results else "",
+            new_role=obj.new_role,
+        )
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

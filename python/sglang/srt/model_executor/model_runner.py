@@ -92,6 +92,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -107,6 +108,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
     replace_graph_time_usage,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
@@ -848,6 +850,11 @@ class ModelRunner:
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+        # Set once real decode CUDA graphs are captured (makes on-flip role-switch
+        # capture idempotent).
+        self.decode_cuda_graph_captured = False
+        # Captured decode bs; exposed via /get_server_info for role-switch queries.
+        self.decode_cuda_graph_capture_bs: list[int] = []
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -1322,6 +1329,51 @@ class ModelRunner:
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
         )
+        # Bookkeeping for the PD role switch: mark the graphs as captured (makes
+        # the on-flip capture idempotent) and record the captured bs so it can be
+        # queried via /get_server_info.
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
+        self.decode_cuda_graph_capture_bs = list(
+            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        )
+
+    def ensure_decode_cuda_graphs(self, capture_bs: Optional[list[int]] = None):
+        """Idempotently capture decode CUDA graphs after startup.
+
+        Used by the PD role switch: an instance launched as prefill runs fully
+        eager (decode CUDA graph disabled). On the first flip to decode we
+        enable the decode CUDA graph and capture it here, so the flipped
+        instance replays decode graphs instead of running eager.
+        """
+        if self.decode_cuda_graph_captured:
+            logger.info("Decode CUDA graphs already captured; skipping re-capture.")
+            return
+
+        cfg = self.server_args.cuda_graph_config
+        was_disabled = cfg is not None and cfg.decode.backend == Backend.DISABLED
+        if was_disabled:
+            # Prefill was launched with the decode CUDA graph disabled; enable it
+            # for the decode role.
+            logger.info(
+                "Enabling decode CUDA graph on role switch (was disabled at startup)."
+            )
+            cfg.decode.backend = Backend.FULL
+            get_context().override(
+                "model_runner.ensure_decode_cuda_graphs", disable_cuda_graph=False
+            )
+
+        if capture_bs:
+            # Capture-to-fit: only the requested (router-sized) batch sizes.
+            filtered_bs = sorted({int(b) for b in capture_bs if int(b) > 0})
+            if filtered_bs:
+                cfg.decode.bs = filtered_bs
+
+        if was_disabled:
+            # graph_shared_output is skipped at startup when decode is disabled,
+            # so build it now (before the decode runner reads its logits buffer).
+            self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
+
+        self.init_decode_cuda_graph()
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
