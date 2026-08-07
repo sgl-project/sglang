@@ -419,6 +419,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_len + swa_reserved,
         )
 
+    def _mamba_slots_per_req(self) -> int:
+        """Number of mamba pool slots required per admitted request."""
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return 0
+        slots = 1  # main running state slot
+        if self.req_to_token_pool.enable_mamba_extra_buffer:
+            slots += self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+        return slots
+
+    def _required_alloc_mamba_states(self, req: Req) -> int:
+        """Number of mamba slots still needed for *req* (not yet allocated)."""
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return 0
+        needed = 0
+        if req.mamba_pool_idx is None:
+            needed += 1
+        if (
+            self.req_to_token_pool.enable_mamba_extra_buffer
+            and req.mamba_ping_pong_track_buffer is None
+        ):
+            needed += self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+        return needed
+
+    def _allocatable_mamba_budgets(self, count_retracted: bool = True) -> int:
+        """Available mamba pool slots, counting evictable tree entries."""
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return 0
+        allocatable = (
+            self.req_to_token_pool.mamba_allocator.available_size()
+            + self.tree_cache.mamba_evictable_size()
+        )
+        if count_retracted:
+            for entry in self.retracted_queue:
+                allocatable -= self._required_alloc_mamba_states(entry.req)
+        return allocatable
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
@@ -558,13 +594,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
+
+        For mamba/SSM models in PD decode mode, the mamba state is transferred
+        from prefill via RDMA rather than copied from the radix tree. We skip
+        mamba-value checks during matching (skip_mamba_match=True) and disable
+        copy-on-write (cow_mamba=False). The radix tree still accumulates mamba
+        state over time via cache_unfinished_req / cache_finished_req.
         """
+        supports_mamba = self.tree_cache.supports_mamba()
         result = match_prefix_for_req(
             self.tree_cache,
             req,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=False,  # state arrives via RDMA, not from radix tree
             include_req=True,
+            skip_mamba_match=supports_mamba,  # ignore mamba presence in tree
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
@@ -1011,6 +1055,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if hisparse_req_budget <= 0:
                 break
 
+            # Mamba slot budget: each admitted request needs mamba pool slots.
+            # Skip admission if the pool (plus evictable tree entries) is full.
+            if self.tree_cache.supports_mamba():
+                required_states = self._mamba_slots_per_req()
+                allocatable_states = self._allocatable_mamba_budgets(
+                    count_retracted=True
+                )
+                if required_states > allocatable_states:
+                    break
+
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
@@ -1129,6 +1183,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # page-aligned requirement directly.
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
+
+            # Seed mamba track state for extra_buffer radix cache inserts.
+            # The mamba state was pre-allocated (but is still empty; RDMA
+            # will fill it). cache_unfinished_req in process_prebuilt reads
+            # mamba_last_track_seqlen to decide the cached prefix length;
+            # seed it now so the first insert correctly records the node.
+            if (
+                use_decode_radix_cache
+                and self.tree_cache.supports_mamba()
+                and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+                and self.req_to_token_pool.enable_mamba_extra_buffer
+                and decode_req.req.mamba_ping_pong_track_buffer is not None
+            ):
+                decode_req.req.mamba_last_track_seqlen = fill_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -1523,6 +1591,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefix_len = 0
         if total_prefix_len is None:
             total_prefix_len = prefix_len
+
+        # Evict mamba states from the radix tree if the mamba pool is low.
+        # The mamba slot is allocated inside req_to_token_pool.alloc() below.
+        if (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and self.tree_cache.supports_mamba()
+            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+        ):
+            mamba_available = self.req_to_token_pool.mamba_allocator.available_size()
+            mamba_needed = 1  # main running state slot
+            if mamba_available < mamba_needed:
+                self.tree_cache.evict(
+                    EvictParams(num_tokens=0, mamba_num=mamba_needed - mamba_available)
+                )
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 

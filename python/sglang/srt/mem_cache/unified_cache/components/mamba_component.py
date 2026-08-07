@@ -128,8 +128,17 @@ class MambaComponent(TreeComponent):
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, skip_mamba_match: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        """Return a validator that decides whether a node is a valid mamba match boundary.
+
+        When skip_mamba_match is True (PD decode mode), mamba state is transferred
+        from prefill via RDMA, so every node is treated as valid — only Full-KV
+        matching matters.
+        """
+        if skip_mamba_match:
+            return lambda node: True
+
         ct = self.component_type
         if match_device_only:
             return lambda node: node.component_data[ct].value is not None
@@ -147,6 +156,11 @@ class MambaComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
+        # PD decode: mamba state comes from prefill via RDMA, not from the radix
+        # tree. Skip mamba boundary / branching seqlen computation.
+        if params.skip_mamba_match:
+            return result
+
         last_node = result.best_match_node
 
         mamba_boundary_len = len(result.device_indices) + result.host_hit_length

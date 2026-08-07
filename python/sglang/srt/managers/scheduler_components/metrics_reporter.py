@@ -744,6 +744,7 @@ class SchedulerMetricsReporter:
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
 
         self.num_generated_tokens = 0
+        num_decode_cached_tokens = 0
         num_running_reqs = len(batch.reqs)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
@@ -760,7 +761,7 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, #cached-token: {num_decode_cached_tokens}, {token_usage_msg}"
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -819,6 +820,18 @@ class SchedulerMetricsReporter:
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         cache_hit_rate = 0.0
+        if (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and batch is not None
+        ):
+            total_tokens = 0
+            num_decode_cached_tokens = 0
+            for req in batch.reqs:
+                cached = getattr(req, "cached_tokens", 0)
+                total_tokens += len(req.origin_input_ids) + len(req.output_ids)
+                num_decode_cached_tokens += cached
+            if total_tokens > 0:
+                cache_hit_rate = num_decode_cached_tokens / total_tokens
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "

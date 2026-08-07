@@ -628,7 +628,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, skip_mamba_match=params.skip_mamba_match)
         return self._match_post_processor(
             params,
             value,
@@ -639,7 +639,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[
+    def _match_prefix_helper(
+        self, key: RadixKey, skip_mamba_match: bool = False
+    ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -662,15 +664,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         separate_device_match = self.enable_hicache
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in self.components
+                comp.create_match_validator(skip_mamba_match=skip_mamba_match)
+                for comp in self.components
             )
             device_validators = tuple(
-                comp.create_match_validator(match_device_only=True)
+                comp.create_match_validator(
+                    match_device_only=True, skip_mamba_match=skip_mamba_match
+                )
                 for comp in self.components
             )
         else:
             validators = tuple(
-                comp.create_match_validator(match_device_only=True)
+                comp.create_match_validator(
+                    match_device_only=True, skip_mamba_match=skip_mamba_match
+                )
                 for comp in self.components
             )
 

@@ -340,7 +340,7 @@ class TreeComponent(ABC):
 
     @abstractmethod
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, skip_mamba_match: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         """Return a per-match stateful predicate that decides whether a node
         is a valid match boundary for this component.
@@ -350,7 +350,8 @@ class TreeComponent(ABC):
         - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.
-        - Mamba: returns True iff the node has mamba component data."""
+        - Mamba: returns True iff the node has mamba component data.
+          When skip_mamba_match is True (PD decode), always returns True."""
         ...
 
     def finalize_match_result_in_tree_core(
