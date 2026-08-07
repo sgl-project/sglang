@@ -30,6 +30,7 @@ def _fake_fp8_block_scale_moe_out(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> None:
     return None
 
@@ -63,6 +64,7 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -100,6 +102,8 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
         from flashinfer.fused_moe import Fp8QuantizationType
 
         kwargs["fp8_quantization_type"] = Fp8QuantizationType(fp8_quantization_type)
+    if num_fused_shared_experts is not None and num_fused_shared_experts > 0:
+        kwargs["num_fused_shared_experts"] = num_fused_shared_experts
 
     if activation_type is not None:
         from flashinfer.fused_moe.core import ActivationType
