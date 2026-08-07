@@ -218,6 +218,11 @@ def plan_text_strategy(txt_len: int) -> str:
     sp_size = get_sp_world_size()
     if sp_size <= 1:
         return "replicate"
+    local_len = (txt_len + sp_size - 1) // sp_size
+    num_pad = local_len * sp_size - txt_len
+    # padding must fit in the final shard to remain one global-tail block
+    if num_pad > local_len:
+        return "replicate"
     if txt_len % sp_size != 0 and get_ring_parallel_world_size() > 1:
         return "replicate"
     if txt_len < _TEXT_SHARD_MIN:
