@@ -440,14 +440,23 @@ def run_jitter_test(
     # --- Cross-check every observation sharing a key ---
     num_cross_checked_positions = 0
     num_mismatches = 0
+    mismatch_details: list[str] = []
     for key in sorted(observations):
         group = observations[key]
         if len(group) >= 2:
             num_cross_checked_positions += 1
         ref_tid, ref_topk = group[0]
-        num_mismatches += sum(
-            tid != ref_tid or not _topk_equal(ref_topk, top) for tid, top in group[1:]
-        )
+        for tid, top in group[1:]:
+            if tid == ref_tid and _topk_equal(ref_topk, top):
+                continue
+            num_mismatches += 1
+            if len(mismatch_details) < 5:
+                shared = ref_topk.keys() & top.keys()
+                mismatch_details.append(
+                    f"prefix={key[0]} pos={key[1]} token {ref_tid} vs {tid} "
+                    f"max|dlogprob|="
+                    f"{max((abs(ref_topk[t] - top[t]) for t in shared), default=0.0):.3e}"
+                )
     print(
         f"checked {len(observations)} positions, "
         f"{num_cross_checked_positions} observed by >=2 requests, "
@@ -460,7 +469,9 @@ def run_jitter_test(
         f"only {num_cross_checked_positions} positions were cross-checked; "
         "the request construction no longer produces overlapping observations"
     )
-    assert num_mismatches == 0, f"{num_mismatches} mismatching observations"
+    assert num_mismatches == 0, "\n".join(
+        [f"{num_mismatches} mismatching observations"] + mismatch_details
+    )
     if min_retracted_requests:
         retractions_during_jitter = (
             _total_retracted_requests() - retractions_before_jitter
