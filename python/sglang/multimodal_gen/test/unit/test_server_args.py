@@ -1538,6 +1538,19 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.enable_torch_compile)
 
+    def test_speed_mode_cuda_graph_does_not_enable_torch_compile(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+                "enable_cuda_graph": True,
+            },
+        )
+
+        self.assertTrue(args.enable_cuda_graph)
+        self.assertFalse(args.enable_torch_compile)
+
     def test_auto_mode_leaves_torch_compile_off(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),

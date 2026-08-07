@@ -73,8 +73,10 @@ class ServerArgsAutoTuner:
 
         if args.performance_mode == "speed":
             logger.info("Applying performance_mode=speed")
-            if not args.enable_torch_compile and not args.is_arg_explicitly_set(
-                "enable_torch_compile"
+            if (
+                not args.enable_cuda_graph
+                and not args.enable_torch_compile
+                and not args.is_arg_explicitly_set("enable_torch_compile")
             ):
                 # speed means fastest: compile by default. An explicit
                 # --enable-torch-compile false still wins (e.g. models where

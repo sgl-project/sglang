@@ -55,6 +55,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     PrimitiveTokenResidualActionEncoder,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_kv_cache import (
+    MinWMCausalAttentionKVPlan,
     MinWMCausalSelfAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanT2VCrossAttention
@@ -78,6 +79,7 @@ _MINWM_PACKED_ATTENTION_DETERMINISTIC = _env_flag(
     "MINWM_PACKED_ATTENTION_DETERMINISTIC", True
 )
 _MINWM_SEGMENT_COMPILE = _env_flag("MINWM_SEGMENT_COMPILE", True)
+_MINWM_CUDA_GRAPH_ACTIVE = False
 _MINWM_CACHE_ROTATED_K = _env_flag("MINWM_CACHE_ROTATED_K", True)
 _MINWM_PRECOMPUTE_CACHE_ROPE = _env_flag("MINWM_PRECOMPUTE_CACHE_ROPE", True)
 _MINWM_CACHE_PACKED_METADATA = _env_flag("MINWM_CACHE_PACKED_METADATA", True)
@@ -192,7 +194,7 @@ class _MinWMSegmentCompile:
 
     @classmethod
     def get(cls, function, use_compile: bool):
-        if not use_compile or not _MINWM_SEGMENT_COMPILE:
+        if not use_compile or not _MINWM_SEGMENT_COMPILE or _MINWM_CUDA_GRAPH_ACTIVE:
             return function
         if function not in cls._compiled:
             kwargs = {}
@@ -204,6 +206,22 @@ class _MinWMSegmentCompile:
                 function, dynamic=True, mode=None, **kwargs
             )
         return cls._compiled[function]
+
+
+def set_minwm_cuda_graph_active(enabled: bool) -> None:
+    """Keep lazily compiled Inductor segments out of manual DiT capture.
+
+    Segment compilation can allocate or compile on its first invocation, which
+    is unsafe inside CUDA Graph capture. It can also change MinWM's BF16 rounding
+    boundaries, so the graph and eager benchmark lanes both use eager segments.
+    """
+    global _MINWM_CUDA_GRAPH_ACTIVE
+    enabled = bool(enabled)
+    if enabled == _MINWM_CUDA_GRAPH_ACTIVE:
+        return
+    _MINWM_CUDA_GRAPH_ACTIVE = enabled
+    if enabled and _MINWM_SEGMENT_COMPILE:
+        logger.info("MinWM CUDA graph disables nested segment torch.compile for parity")
 
 
 def apply_minwm_rotary_embedding(
@@ -1069,40 +1087,16 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         cache_start: int = 0,
         start_frame: int = 0,
         action: torch.Tensor | None = None,
+        precomputed_attention_plan: MinWMCausalAttentionKVPlan | None = None,
     ) -> torch.Tensor:
         if kv_cache is not None:
-            _, _, num_frames, latent_height, latent_width = hidden_states.shape
-            _, patch_height, patch_width = self.patch_size
-            grid_height = latent_height // patch_height
-            grid_width = latent_width // patch_width
-            position_ids = self._compute_cache_position_ids(
-                num_frames,
-                grid_height,
-                grid_width,
-                int(start_frame),
-                hidden_states.device,
-            )
-            metadata_cache = kv_cache[0]
-            if not isinstance(metadata_cache, MinWMCausalSelfAttentionKVCache):
-                raise TypeError(
-                    "MinWM transformer requires position-aware raw-K caches"
-                )
-            attention_plan = metadata_cache.prepare_attention_plan(
-                current_chunk_start=current_start,
-                position_ids=position_ids,
-            )
-            if _MINWM_PRECOMPUTE_CACHE_ROPE and attention_plan.query_cos is None:
-                (
-                    attention_plan.query_cos,
-                    attention_plan.query_sin,
-                ) = self._sequence_shard_rotary_emb.forward_uncached(
-                    attention_plan.query_position_ids
-                )
-                (
-                    attention_plan.key_cos,
-                    attention_plan.key_sin,
-                ) = self._sequence_shard_rotary_emb.forward_uncached(
-                    attention_plan.key_position_ids
+            attention_plan = precomputed_attention_plan
+            if attention_plan is None:
+                attention_plan = self.prepare_causal_attention_plan(
+                    hidden_states,
+                    kv_cache=kv_cache,
+                    current_start=current_start,
+                    start_frame=start_frame,
                 )
             for cache_block in kv_cache:
                 if not isinstance(cache_block, MinWMCausalSelfAttentionKVCache):
@@ -1269,6 +1263,48 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+    def prepare_causal_attention_plan(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        kv_cache,
+        current_start: int,
+        start_frame: int,
+    ) -> MinWMCausalAttentionKVPlan:
+        """Prepare host-side cache metadata before an eager or graphed forward."""
+        _, _, num_frames, latent_height, latent_width = hidden_states.shape
+        _, patch_height, patch_width = self.patch_size
+        grid_height = latent_height // patch_height
+        grid_width = latent_width // patch_width
+        position_ids = self._compute_cache_position_ids(
+            num_frames,
+            grid_height,
+            grid_width,
+            int(start_frame),
+            hidden_states.device,
+        )
+        metadata_cache = kv_cache[0]
+        if not isinstance(metadata_cache, MinWMCausalSelfAttentionKVCache):
+            raise TypeError("MinWM transformer requires position-aware raw-K caches")
+        attention_plan = metadata_cache.prepare_attention_plan(
+            current_chunk_start=current_start,
+            position_ids=position_ids,
+        )
+        if _MINWM_PRECOMPUTE_CACHE_ROPE and attention_plan.query_cos is None:
+            (
+                attention_plan.query_cos,
+                attention_plan.query_sin,
+            ) = self._sequence_shard_rotary_emb.forward_uncached(
+                attention_plan.query_position_ids
+            )
+            (
+                attention_plan.key_cos,
+                attention_plan.key_sin,
+            ) = self._sequence_shard_rotary_emb.forward_uncached(
+                attention_plan.key_position_ids
+            )
+        return attention_plan
 
     def _install_parity_debug_hooks(self) -> None:
         dump_root = os.environ.get("MINWM_PARITY_DUMP_DIR")

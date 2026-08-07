@@ -162,6 +162,27 @@ def test_minwm_action_label_bits_match_wasd_ijkl_order():
 
 
 @pytest.mark.parametrize(
+    "encoder_cls",
+    [PrimitiveTokenResidualActionEncoder, PrimitiveRoPETokenResidualActionEncoder],
+)
+def test_minwm_action_label_table_is_a_nonpersistent_model_buffer(encoder_cls):
+    encoder = encoder_cls(dim=24, embed_dim=8, hidden_dim=16, kernel_size=3)
+    assert "_label_to_bits" in dict(encoder.named_buffers())
+    assert "_label_to_bits" not in encoder.state_dict()
+    assert encoder._label_to_bits.device == encoder.proj.weight.device
+    labels = torch.tensor([[0, 9, 10, 1]])
+    torch.testing.assert_close(
+        action_labels_to_primitive_bits(labels, label_to_bits=encoder._label_to_bits),
+        action_labels_to_primitive_bits(labels),
+    )
+
+    with torch.device("meta"):
+        meta_encoder = encoder_cls(dim=24, embed_dim=8, hidden_dim=16, kernel_size=3)
+    assert meta_encoder.proj.weight.device.type == "meta"
+    assert meta_encoder._label_to_bits.device.type == "cpu"
+
+
+@pytest.mark.parametrize(
     ("key", "expected_label"),
     [
         ("w", 9),
@@ -957,6 +978,58 @@ def test_minwm_unbounded_kv_policy_reaches_cache_allocation():
     assert len(stage.causal_kv_cache) == 2
     assert all(cache.allow_growth for cache in stage.causal_kv_cache)
     assert stage.causal_kv_cache[0].k.shape == (1, 15, 2, 4)
+
+
+def _minwm_cuda_graph_cache_stage(*, allow_growth, rope_position_mode):
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage._minwm_cuda_graph_enabled = True
+    stage._minwm_unbounded_cache = allow_growth
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                rope_position_mode=rope_position_mode,
+                rope_max_frame_gap=1,
+                prompt_first_frame_pin_enabled=False,
+                scene_cut_rope_offset=0,
+                scene_cut_sink_enabled=False,
+            )
+        )
+    )
+    return stage
+
+
+def test_minwm_cuda_graph_accepts_bounded_block_relative_cache():
+    stage = _minwm_cuda_graph_cache_stage(
+        allow_growth=False,
+        rope_position_mode="block_relative",
+    )
+    kwargs = stage._causal_kv_cache_kwargs(
+        SimpleNamespace(sequence_shard_enabled=True, expected_cache_tokens=32)
+    )
+
+    assert kwargs["allow_growth"] is False
+    assert kwargs["rope_position_mode"] == "block_relative"
+
+
+@pytest.mark.parametrize(
+    ("allow_growth", "rope_position_mode", "message"),
+    [
+        (True, "block_relative", "bounded realtime KV window"),
+        (False, "absolute", "block_relative RoPE"),
+    ],
+)
+def test_minwm_cuda_graph_rejects_dynamic_cache_contracts(
+    allow_growth, rope_position_mode, message
+):
+    stage = _minwm_cuda_graph_cache_stage(
+        allow_growth=allow_growth,
+        rope_position_mode=rope_position_mode,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        stage._causal_kv_cache_kwargs(
+            SimpleNamespace(sequence_shard_enabled=False, expected_cache_tokens=32)
+        )
 
 
 def test_minwm_unipc_scheduler_matches_native_shift_contract():
@@ -2109,7 +2182,6 @@ def test_minwm_cache_qk_norm_stays_eager(monkeypatch):
         == 3
     )
     assert compile_calls == []
-
     assert (
         _minwm_apply_qk_op(
             operation,
@@ -2120,6 +2192,22 @@ def test_minwm_cache_qk_norm_stays_eager(monkeypatch):
         == 3
     )
     assert compile_calls == [True]
+
+
+def test_minwm_cuda_graph_disables_segment_compile(monkeypatch):
+    import sglang.multimodal_gen.runtime.models.dits.minwm as minwm_module
+
+    def operation(value):
+        return value
+
+    monkeypatch.setattr(minwm_module, "_MINWM_SEGMENT_COMPILE", True)
+    monkeypatch.setattr(minwm_module, "_MINWM_CUDA_GRAPH_ACTIVE", False)
+    monkeypatch.setattr(minwm_module._MinWMSegmentCompile, "_compiled", {})
+
+    minwm_module.set_minwm_cuda_graph_active(True)
+
+    assert minwm_module._MinWMSegmentCompile.get(operation, True) is operation
+    assert minwm_module._MinWMSegmentCompile._compiled == {}
 
 
 def test_minwm_rotary_embedding_matches_main_explicit_formula():

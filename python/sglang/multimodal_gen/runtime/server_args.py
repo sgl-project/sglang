@@ -229,6 +229,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_cuda_graph: bool = False
 
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
@@ -1336,6 +1337,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cuda_graph,
+            help=(
+                "Capture stable diffusion hot paths with CUDA Graph. Currently "
+                "implemented for bounded, block-relative MinWM realtime DiT "
+                "recompute forwards."
+            ),
         )
         parser.add_argument(
             "--offload-during-compile",

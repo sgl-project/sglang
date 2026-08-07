@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -27,6 +28,10 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.minwm import (
+    set_minwm_cuda_graph_active,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     validate_action_labels,
@@ -52,6 +57,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
@@ -68,6 +74,116 @@ MINWM_INITIAL_NOISE_CURSOR_CACHE = "minwm_initial_noise_cursor"
 MINWM_T2V_FIRST_LATENT_CACHE = "minwm_t2v_first_latent"
 
 logger = init_logger(__name__)
+
+
+def _static_cuda_graph_tensor(value: torch.Tensor) -> torch.Tensor:
+    static = torch.empty_strided(
+        value.shape,
+        value.stride(),
+        dtype=value.dtype,
+        device=value.device,
+    )
+    static.copy_(value)
+    return static
+
+
+def _cuda_graph_tensor_signature(value: torch.Tensor) -> tuple:
+    return (value.shape, value.stride(), value.dtype, value.device)
+
+
+class _MinWMCudaGraphRunner:
+    """One full-DiT graph bound to a saturated MinWM session cache."""
+
+    def __init__(self, key: tuple) -> None:
+        self.key = key
+        self.graph = None
+        self.output = None
+        self.static_latent = None
+        self.static_prompt = None
+        self.static_timestep = None
+        self.static_action = None
+        self.capture_stream = None
+        self.pool = None
+        self.capture_dependencies = None
+        self.replay_count = 0
+
+    def _copy_inputs(
+        self,
+        latent: torch.Tensor,
+        prompt: torch.Tensor,
+        timestep: torch.Tensor,
+        action: torch.Tensor,
+    ) -> None:
+        self.static_latent.copy_(latent)
+        self.static_prompt.copy_(prompt)
+        self.static_timestep.copy_(timestep)
+        self.static_action.copy_(action)
+
+    def run(
+        self,
+        *,
+        latent: torch.Tensor,
+        prompt: torch.Tensor,
+        timestep: torch.Tensor,
+        action: torch.Tensor,
+        capture_forward: (
+            Callable[
+                [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+            ]
+            | None
+        ),
+    ) -> torch.Tensor:
+        if self.graph is not None:
+            self._copy_inputs(latent, prompt, timestep, action)
+            self.graph.replay()
+            self.replay_count += 1
+            if self.replay_count == 1 or self.replay_count % 100 == 0:
+                logger.info(
+                    "MinWM CUDA graph replay rank=%d count=%d",
+                    get_sp_parallel_rank(),
+                    self.replay_count,
+                )
+            return self.output
+
+        self.static_latent = _static_cuda_graph_tensor(latent)
+        self.static_prompt = _static_cuda_graph_tensor(prompt)
+        self.static_timestep = _static_cuda_graph_tensor(timestep)
+        self.static_action = _static_cuda_graph_tensor(action)
+        assert capture_forward is not None
+
+        self.capture_stream = torch.cuda.Stream(device=latent.device)
+        current_stream = torch.cuda.current_stream(latent.device)
+        self.capture_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.capture_stream):
+            for _ in range(2):
+                capture_forward(
+                    self.static_latent,
+                    self.static_prompt,
+                    self.static_timestep,
+                    self.static_action,
+                )
+        current_stream.wait_stream(self.capture_stream)
+        torch.cuda.synchronize(latent.device)
+
+        self.graph = torch.cuda.CUDAGraph()
+        self.pool = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(self.graph, pool=self.pool, stream=self.capture_stream):
+            self.output = capture_forward(
+                self.static_latent,
+                self.static_prompt,
+                self.static_timestep,
+                self.static_action,
+            )
+        current_stream.wait_stream(self.capture_stream)
+        # Do not consume the execution performed while stream capture is active.
+        # Materialize the first user-visible result through the same replay path
+        # as every subsequent denoising step.
+        self.graph.replay()
+        logger.info(
+            "Captured MinWM saturated recompute CUDA graph rank=%d",
+            get_sp_parallel_rank(),
+        )
+        return self.output
 
 
 def _parity_dump(name: str, value) -> None:
@@ -229,6 +345,11 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
 class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     """One clean reference commit followed by four-frame action DMD chunks."""
 
+    def __init__(self, transformer, scheduler) -> None:
+        super().__init__(transformer, scheduler)
+        self._minwm_cuda_graph_enabled = False
+        self._minwm_cuda_graph_runner: _MinWMCudaGraphRunner | None = None
+
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
         return bool(
             getattr(batch, "enable_sequence_shard", False)
@@ -321,7 +442,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         arch_config = getattr(
             getattr(self.transformer, "config", None), "arch_config", None
         )
-        return {
+        cache_kwargs = {
             "sequence_shard_enabled": policy.sequence_shard_enabled,
             "kv_cache_size": policy.expected_cache_tokens,
             "allow_growth": bool(getattr(self, "_minwm_unbounded_cache", True)),
@@ -339,6 +460,18 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 getattr(arch_config, "scene_cut_sink_enabled", False)
             ),
         }
+        if self._minwm_cuda_graph_enabled:
+            if cache_kwargs["allow_growth"]:
+                raise ValueError(
+                    "MinWM CUDA graph requires a bounded realtime KV window. "
+                    "Set realtime_causal_kv_cache_num_frames on the request or model."
+                )
+            if cache_kwargs["rope_position_mode"] != "block_relative":
+                raise ValueError(
+                    "MinWM CUDA graph currently requires block_relative RoPE so "
+                    "one saturated graph remains valid across chunks."
+                )
+        return cache_kwargs
 
     def _initialize_kv_cache(
         self,
@@ -697,7 +830,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )[:, -history_frames:]
 
     def _forward_causal_transformer(self, batch: Req, **kwargs) -> torch.Tensor:
-        output = super()._forward_causal_transformer(batch, **kwargs)
+        output = self._forward_causal_transformer_impl(batch, **kwargs)
         index = getattr(self, "_parity_forward_index", 0)
         prompt = kwargs["prompt_embeds"] if index == 0 else None
         _parity_dump(
@@ -713,6 +846,206 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         )
         self._parity_forward_index = index + 1
         return output
+
+    def _minwm_cuda_graph_key(
+        self,
+        *,
+        latent_model_input: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        timestep: torch.Tensor,
+        kv_cache: list,
+        crossattn_cache: list,
+        pos_cond_kwargs: dict[str, Any],
+        image_kwargs: dict[str, Any],
+        current_timestep: int,
+        attn_metadata,
+    ) -> tuple | None:
+        if (
+            not self._minwm_cuda_graph_enabled
+            or current_timestep == 0
+            or attn_metadata is not None
+            or image_kwargs
+            or set(pos_cond_kwargs) != {"action"}
+            or os.environ.get("MINWM_PARITY_DUMP_DIR")
+            or not latent_model_input.is_cuda
+            or torch.version.hip is not None
+        ):
+            return None
+        if not isinstance(prompt_embeds, torch.Tensor):
+            return None
+        action = pos_cond_kwargs["action"]
+        if not isinstance(action, torch.Tensor):
+            return None
+        if not kv_cache or not crossattn_cache:
+            return None
+
+        first_cache = kv_cache[0]
+        if not isinstance(first_cache, MinWMCausalSelfAttentionKVCache):
+            return None
+        plan = first_cache.last_attention_plan
+        if (
+            first_cache.allow_growth
+            or first_cache.rope_position_mode != "block_relative"
+            or plan is None
+            or plan.selected_len != first_cache.cache_size
+            or plan.current_local_end != first_cache.cache_size
+        ):
+            return None
+        if any(
+            cache.local_end_index_int != cache.cache_size for cache in kv_cache
+        ) or any(not cache.is_init for cache in crossattn_cache):
+            return None
+
+        cache_pointers = tuple(
+            (
+                cache.k.data_ptr(),
+                cache.v.data_ptr(),
+                cache.rotated_k.data_ptr() if cache.rotated_k is not None else 0,
+            )
+            for cache in kv_cache
+        )
+        crossattn_pointers = tuple(
+            (cache.k.data_ptr(), cache.v.data_ptr()) for cache in crossattn_cache
+        )
+        plan_signature = (
+            plan.selected_len,
+            plan.num_new_tokens,
+            plan.current_local_start,
+            plan.current_local_end,
+            plan.rope_temporal_offset,
+            plan.pinned_token_start,
+            plan.pinned_token_end,
+            plan.prompt_pin_frame,
+        )
+        return (
+            cache_pointers,
+            crossattn_pointers,
+            plan_signature,
+            _cuda_graph_tensor_signature(latent_model_input),
+            _cuda_graph_tensor_signature(prompt_embeds),
+            _cuda_graph_tensor_signature(timestep),
+            _cuda_graph_tensor_signature(action),
+        )
+
+    def _forward_causal_transformer_impl(
+        self,
+        batch: Req,
+        *,
+        latent_model_input: torch.Tensor,
+        prompt_embeds,
+        timestep: torch.Tensor,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        current_timestep: int,
+        attn_metadata,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+    ) -> torch.Tensor:
+        graph_key = self._minwm_cuda_graph_key(
+            latent_model_input=latent_model_input,
+            prompt_embeds=prompt_embeds,
+            timestep=timestep,
+            kv_cache=kv_cache,
+            crossattn_cache=crossattn_cache,
+            pos_cond_kwargs=pos_cond_kwargs,
+            image_kwargs=image_kwargs,
+            current_timestep=current_timestep,
+            attn_metadata=attn_metadata,
+        )
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ),
+            set_forward_context(
+                current_timestep=current_timestep,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ),
+        ):
+            if graph_key is None:
+                return self.transformer(
+                    latent_model_input,
+                    prompt_embeds,
+                    timestep,
+                    kv_cache=kv_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start_tokens,
+                    start_frame=start_frame,
+                    **image_kwargs,
+                    **pos_cond_kwargs,
+                )
+
+            if (
+                self._minwm_cuda_graph_runner is None
+                or self._minwm_cuda_graph_runner.key != graph_key
+            ):
+                self._minwm_cuda_graph_runner = _MinWMCudaGraphRunner(graph_key)
+            runner = self._minwm_cuda_graph_runner
+            action = pos_cond_kwargs["action"]
+
+            if runner.graph is None:
+                # Non-checkpoint action buffers start on CPU so meta-device model
+                # loading can materialize successfully. Move them before entering
+                # the capture context; replay then sees a stable GPU pointer.
+                self.transformer.action_in.prepare_label_table(action.device)
+                attention_plan = self.transformer.prepare_causal_attention_plan(
+                    latent_model_input,
+                    kv_cache=kv_cache,
+                    current_start=current_start_tokens,
+                    start_frame=start_frame,
+                )
+                # CUDA Graph records raw addresses for tensors created before
+                # capture. Retain the plan (including its RoPE tables) so the
+                # caching allocator cannot recycle those addresses on a later
+                # realtime chunk.
+                runner.capture_dependencies = attention_plan
+
+                def capture_forward(
+                    static_latent: torch.Tensor,
+                    static_prompt: torch.Tensor,
+                    static_timestep: torch.Tensor,
+                    static_action: torch.Tensor,
+                ) -> torch.Tensor:
+                    return self.transformer(
+                        static_latent,
+                        static_prompt,
+                        static_timestep,
+                        kv_cache=kv_cache,
+                        crossattn_cache=crossattn_cache,
+                        current_start=current_start_tokens,
+                        start_frame=start_frame,
+                        action=static_action,
+                        precomputed_attention_plan=attention_plan,
+                    )
+
+            else:
+                # Replay does not execute Python, so this callable is unused.
+                capture_forward = None
+
+            validate_runtime_action = self.transformer.action_in.validate_runtime_action
+            self.transformer.action_in.validate_runtime_action = False
+            try:
+                graph_output = runner.run(
+                    latent=latent_model_input,
+                    prompt=prompt_embeds,
+                    timestep=timestep,
+                    action=action,
+                    capture_forward=capture_forward,
+                )
+                # The captured graph owns a single static output allocation.
+                # Downstream scheduler work can still consume it when the next
+                # denoising replay starts, so hand out an independent snapshot.
+                return graph_output.clone()
+            finally:
+                self.transformer.action_in.validate_runtime_action = (
+                    validate_runtime_action
+                )
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -736,6 +1069,16 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         return self._forward_impl(batch, server_args)
 
     def _forward_impl(self, batch: Req, server_args: ServerArgs) -> Req:
+        self._minwm_cuda_graph_enabled = bool(
+            getattr(server_args, "enable_cuda_graph", False)
+        )
+        set_minwm_cuda_graph_active(self._minwm_cuda_graph_enabled)
+        if self._minwm_cuda_graph_enabled and bool(
+            getattr(server_args, "enable_torch_compile", False)
+        ):
+            raise ValueError(
+                "MinWM CUDA graph cannot be combined with whole-DiT torch.compile."
+            )
         if batch.block_idx == 0:
             self._parity_forward_index = 0
         ctx = self._prepare_causal_dmd_forward_context(batch, server_args)

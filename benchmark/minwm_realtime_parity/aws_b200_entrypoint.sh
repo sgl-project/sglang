@@ -20,6 +20,7 @@ set -euo pipefail
   || "${MINWM_BENCHMARK_MODE}" == "long720p" \
   || "${MINWM_BENCHMARK_MODE}" == "triptych720p" \
   || "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" \
+  || "${MINWM_BENCHMARK_MODE}" == "cudagraphmatrix" \
   || "${MINWM_BENCHMARK_MODE}" == "bounded5s" \
   || "${MINWM_BENCHMARK_MODE}" == "calibratedfp8" \
   || "${MINWM_BENCHMARK_MODE}" == "nvfp4" \
@@ -288,6 +289,13 @@ if [[ -n "${MINWM_REUSE_MODEL_RUN_ID:-}" ]]; then
   echo "reused-local-model:${MINWM_REUSE_MODEL_RUN_ID}" \
     | tee "${RESULTS}/conversion.log"
 else
+  convert_args=(
+    --rope-position-mode "${MINWM_CONVERT_ROPE_POSITION_MODE:-absolute}"
+    --rope-max-frame-gap "${MINWM_CONVERT_ROPE_MAX_FRAME_GAP:-1}"
+  )
+  if [[ "${MINWM_CONVERT_PROMPT_FIRST_FRAME_PIN_ENABLED:-false}" == "true" ]]; then
+    convert_args+=(--prompt-first-frame-pin-enabled)
+  fi
   python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
     --minwm-checkpoint "${CHECKPOINT}" \
     --donor-diffusers-dir "${PRETRAINED}" \
@@ -299,6 +307,7 @@ else
     --local-attn-size "${MINWM_CONVERT_LOCAL_ATTN_SIZE:--1}" \
     --sink-size "${MINWM_CONVERT_SINK_SIZE:-0}" \
     --sliding-window-num-frames "${MINWM_CONVERT_WINDOW_SIZE:-128}" \
+    "${convert_args[@]}" \
     | tee "${RESULTS}/conversion.log"
 fi
 cp "${MODEL_DIR}/minwm_conversion_manifest.json" "${RESULTS}/"
@@ -707,6 +716,252 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "nvfp4" ]]; then
   cp "${NVFP4_TRANSFORMER}/minwm_nvfp4_manifest.json" "${RESULTS}/"
   export MINWM_PROFILE_TRANSFORMER_PATH="${NVFP4_TRANSFORMER}"
   export MINWM_PROFILE_QUANTIZATION_LABEL="${MINWM_PROFILE_QUANTIZATION_LABEL:-nvfp4}"
+fi
+
+if [[ "${MINWM_BENCHMARK_MODE}" == "cudagraphmatrix" ]]; then
+  CG_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"
+  CG_CASE="${MINWM_CUDA_GRAPH_CASE:-00_forward_080_pottery_720p}"
+  CG_RESULTS="${RESULTS}/cuda-graph-matrix"
+  CG_DEGREES="${MINWM_CUDA_GRAPH_SP_DEGREES:-1 2}"
+  CG_WARMUP_CHUNKS="${MINWM_CUDA_GRAPH_WARMUP_CHUNKS:-10}"
+  CG_MEASURED_CHUNKS="${MINWM_CUDA_GRAPH_MEASURED_CHUNKS:-30}"
+  CG_WINDOW="${MINWM_CUDA_GRAPH_KV_FRAMES:-20}"
+  mkdir -p "${CG_RESULTS}"
+  nvidia-smi -L | tee "${CG_RESULTS}/gpus.txt"
+  nvidia-smi topo -m | tee "${CG_RESULTS}/topology.txt"
+
+  python3 -m pytest -q \
+    /workspace/sglang/python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py \
+    -k 'cuda_graph or cache_plan_is_shared_across_layers_and_reused_for_recompute or accepts_supported_ulysses_sequence_parallelism'
+  python3 -m pytest -q \
+    /workspace/sglang/python/sglang/multimodal_gen/test/unit/test_server_args.py \
+    -k speed_mode_cuda_graph_does_not_enable_torch_compile
+
+  python3 - "${MODEL_DIR}/transformer/config.json" "${CG_WINDOW}" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1]))
+assert config["rope_position_mode"] == "block_relative", config
+assert int(config["local_attn_size"]) == int(sys.argv[2]), config
+assert int(config["sliding_window_num_frames"]) == int(sys.argv[2]), config
+print(json.dumps({
+    key: config[key]
+    for key in (
+        "local_attn_size",
+        "sink_size",
+        "sliding_window_num_frames",
+        "rope_position_mode",
+        "rope_max_frame_gap",
+    )
+}, sort_keys=True))
+PY
+
+  run_cuda_graph_lane() {
+    local degree="$1" enabled="$2"
+    local suffix="eager"
+    if [[ "${enabled}" == "true" ]]; then
+      suffix="cuda-graph"
+    fi
+    local profile="sp${degree}-${suffix}"
+    local profile_dir="${CG_RESULTS}/${profile}"
+    mkdir -p "${profile_dir}"
+    MINWM_ATTENTION_IMPL="${MINWM_ATTENTION_IMPL:-packed}" \
+    MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
+    MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+    MINWM_VAE_LANE=parity \
+    sglang serve \
+      --model-path "${MODEL_DIR}" \
+      --pipeline-class-name MinWMCausalDMDPipeline \
+      --vae-config.use-parallel-decode true \
+      --vae-config.parallel-decode-mode auto \
+      --attention-backend "${MINWM_SERVER_ATTENTION_BACKEND:-fa}" \
+      --performance-mode speed \
+      --num-gpus "${degree}" \
+      --tp-size 1 \
+      --sp-degree "${degree}" \
+      --ulysses-degree "${degree}" \
+      --ring-degree 1 \
+      --enable-cfg-parallel false \
+      --enable-torch-compile false \
+      --enable-cuda-graph "${enabled}" \
+      --warmup-mode off \
+      --port 30000 \
+      > "${profile_dir}/server.log" 2>&1 &
+    local server_pid=$!
+    if ! wait_for_server "${server_pid}" "${profile_dir}/server.log"; then
+      kill "${server_pid}" 2>/dev/null || true
+      wait "${server_pid}" 2>/dev/null || true
+      return 1
+    fi
+    (
+      while kill -0 "${server_pid}" 2>/dev/null; do
+        nvidia-smi \
+          --query-gpu=timestamp,index,memory.used,utilization.gpu,power.draw \
+          --format=csv,noheader,nounits || true
+        sleep 1
+      done
+    ) > "${profile_dir}/gpu.csv" &
+    local monitor_pid=$!
+    set +e
+    python3 "${SCRIPT_DIR}/benchmark_realtime_throughput.py" \
+      --cases "${CG_CASES}" \
+      --case "${CG_CASE}" \
+      --output "${profile_dir}/throughput.json" \
+      --profile-name "${profile}" \
+      --warmup-chunks "${CG_WARMUP_CHUNKS}" \
+      --measured-chunks "${CG_MEASURED_CHUNKS}" \
+      --kv-cache-num-frames "${CG_WINDOW}" \
+      > >(tee "${profile_dir}/client.log") 2>&1
+    local lane_status=$?
+    set -e
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+    kill "${monitor_pid}" 2>/dev/null || true
+    wait "${monitor_pid}" 2>/dev/null || true
+    if (( lane_status != 0 )); then
+      tail -300 "${profile_dir}/server.log" >&2
+    fi
+    return "${lane_status}"
+  }
+
+  read -r -a cg_degrees <<< "${CG_DEGREES}"
+  for degree in "${cg_degrees[@]}"; do
+    if ! [[ "${degree}" =~ ^(1|2)$ ]]; then
+      echo "unsupported CUDA graph SP degree: ${degree}" >&2
+      exit 2
+    fi
+    run_cuda_graph_lane "${degree}" false
+    run_cuda_graph_lane "${degree}" true
+  done
+
+  python3 - "${CG_RESULTS}" <<'PY' | tee "${CG_RESULTS}/summary.log"
+import base64
+import json
+import math
+import statistics
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+profiles = {
+    path.parent.name: json.load(open(path))
+    for path in sorted(root.glob("*/throughput.json"))
+}
+summary = {"profiles": profiles, "comparisons": {}}
+
+
+def denoise_metrics(profile_name, warmup_chunks):
+    values = []
+    log_path = root / profile_name / "server.log"
+    for line in log_path.read_text().splitlines():
+        if "realtime_trace {" not in line:
+            continue
+        try:
+            event = json.loads(line[line.index("{"):])
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if (
+            event.get("event") == "server.model_denoise_complete"
+            and event.get("component") == "minwm_denoising"
+            and "source" not in event
+            and "error" not in event
+            and int(event.get("chunk_index", -1)) >= warmup_chunks
+        ):
+            values.append(float(event["duration_ms"]))
+    if not values:
+        return None
+    return {
+        "count": len(values),
+        "mean_ms": statistics.fmean(values),
+        "p50_ms": statistics.median(values),
+        "latent_fps_ratio_of_sums": 4 * len(values) / (sum(values) / 1000.0),
+        "pixel_fps_ratio_of_sums": 16 * len(values) / (sum(values) / 1000.0),
+    }
+
+
+def sampled_pixel_error(eager, graph):
+    eager_samples = eager["measured_payload_samples_base64"]
+    graph_samples = graph["measured_payload_samples_base64"]
+    if eager_samples.keys() != graph_samples.keys():
+        raise AssertionError("eager/CUDA graph sampled payload keys differ")
+    absolute_error_sum = 0
+    squared_error_sum = 0
+    equal_count = 0
+    max_error = 0
+    count = 0
+    for key in eager_samples:
+        eager_bytes = base64.b64decode(eager_samples[key])
+        graph_bytes = base64.b64decode(graph_samples[key])
+        if len(eager_bytes) != len(graph_bytes):
+            raise AssertionError(f"sampled payload length differs for {key}")
+        for eager_value, graph_value in zip(eager_bytes, graph_bytes):
+            error = abs(eager_value - graph_value)
+            absolute_error_sum += error
+            squared_error_sum += error * error
+            equal_count += int(error == 0)
+            max_error = max(max_error, error)
+            count += 1
+    mse = squared_error_sum / count
+    return {
+        "sample_count": count,
+        "mae_u8": absolute_error_sum / count,
+        "rmse_u8": math.sqrt(mse),
+        "psnr_db": None if mse == 0 else 20 * math.log10(255 / math.sqrt(mse)),
+        "max_abs_u8": max_error,
+        "exact_fraction": equal_count / count,
+    }
+
+
+for profile_name, profile in profiles.items():
+    profile["dit_denoise"] = denoise_metrics(
+        profile_name, int(profile["warmup_chunks"])
+    )
+for degree in (1, 2):
+    eager_name = f"sp{degree}-eager"
+    graph_name = f"sp{degree}-cuda-graph"
+    if eager_name not in profiles or graph_name not in profiles:
+        continue
+    eager = profiles[eager_name]
+    graph = profiles[graph_name]
+    comparison = {}
+    comparison["measured_payload_sha256"] = {
+        "eager": eager["measured_payload_sha256"],
+        "cuda_graph": graph["measured_payload_sha256"],
+        "equal": eager["measured_payload_sha256"]
+        == graph["measured_payload_sha256"],
+    }
+    comparison["sampled_pixel_error"] = sampled_pixel_error(eager, graph)
+    for name, getter in {
+        "scheduler_fps": lambda item: item["server"]["scheduler_forward_fps_ratio_of_sums"],
+        "client_fps": lambda item: item["client"]["steady_received_fps_ratio_of_sums"],
+        "scheduler_p50_ms": lambda item: item["server"]["scheduler_forward_ms"]["p50"],
+        "dit_denoise_pixel_fps": lambda item: item["dit_denoise"]["pixel_fps_ratio_of_sums"],
+        "dit_denoise_p50_ms": lambda item: item["dit_denoise"]["p50_ms"],
+    }.items():
+        baseline = getter(eager)
+        candidate = getter(graph)
+        comparison[name] = {
+            "eager": baseline,
+            "cuda_graph": candidate,
+            "speedup": baseline / candidate if name.endswith("_ms") else candidate / baseline,
+        }
+    summary["comparisons"][f"sp{degree}"] = comparison
+(root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+print(json.dumps(summary["comparisons"], indent=2, sort_keys=True))
+parity_failures = {
+    degree: comparison["sampled_pixel_error"]
+    for degree, comparison in summary["comparisons"].items()
+    if not comparison["measured_payload_sha256"]["equal"]
+    or comparison["sampled_pixel_error"]["max_abs_u8"] != 0
+}
+if parity_failures:
+    raise AssertionError(
+        f"MinWM CUDA graph payload parity failed: {parity_failures}"
+    )
+PY
+  echo "MINWM_CUDA_GRAPH_MATRIX_COMPLETE results=${CG_RESULTS}"
+  exit 0
 fi
 
 if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
