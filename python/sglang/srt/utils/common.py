@@ -2181,14 +2181,6 @@ def configure_logger(server_args, prefix: str = ""):
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    # diffusers probes optional torchao Tensor subclasses at import time and
-    # warns when the installed torchao has moved them. That only affects
-    # loading torchao-serialized diffusers checkpoints, which this path never
-    # does.
-    logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
-        logging.ERROR
-    )
-
     # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
     # hint) are deduplicated per process, so a TP-N launch repeats each one N
     # times. A prefix means this is a worker process; keep those warnings only

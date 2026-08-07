@@ -53,6 +53,8 @@ def apply_all():
         return
     _applied = True
 
+    _mute_diffusers_torchao_probe()
+
     # v5.4 patches
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
@@ -69,6 +71,23 @@ def apply_all():
     patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
+
+
+def _mute_diffusers_torchao_probe():
+    """Silence diffusers' torchao-Tensor-subclass probe warning.
+
+    diffusers lazily imports its torchao quantizer and warns when the installed
+    torchao has moved the optional Tensor subclasses it probes for. It only
+    affects loading torchao-serialized diffusers checkpoints, which no sglang
+    path does. Set here rather than in ``configure_logger`` because the import
+    can land before logging is configured, and the level sticks whenever the
+    lazy import happens.
+    """
+    import logging
+
+    logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
+        logging.ERROR
+    )
 
 
 # ---------------------------------------------------------------------------
