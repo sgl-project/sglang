@@ -134,22 +134,32 @@ cleanup_stale_shm() {
 }
 
 install_apt_packages() {
-    apt-get update || true
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
-    apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-        echo "Warning: apt-get install failed, checking if required packages are available..."
-        for pkg in "${CI_APT_PACKAGES[@]}"; do
-            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-                echo "ERROR: Required package $pkg is not installed and apt-get failed"
-                exit 1
-            fi
-        done
-        echo "All required packages are already installed, continuing..."
-    }
+
+    # The images bake these in, so the usual run pays apt-get update's round
+    # trips to install nothing. Skipping it costs no currency either: apt-get
+    # install only ever considers the packages named above, and a passing run
+    # leaves 100+ others un-upgraded - the image is what pins these versions.
+    local pkg
+    local -a MISSING_APT_PACKAGES=()
+    for pkg in "${CI_APT_PACKAGES[@]}"; do
+        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+    done
+
+    if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
+        echo "All required apt packages are already installed, skipping apt-get"
+    else
+        echo "Installing missing apt packages: ${MISSING_APT_PACKAGES[*]}"
+        apt-get update || true
+        apt-get install -y --no-install-recommends "${MISSING_APT_PACKAGES[@]}" || {
+            echo "ERROR: apt-get failed to install: ${MISSING_APT_PACKAGES[*]}"
+            exit 1
+        }
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -342,6 +352,22 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_pytorch_stack() {
+    PYTORCH_SPECS=()
+    for package in torch torchaudio torchvision torchao torchcodec; do
+        spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
+        if [ -n "$spec" ]; then
+            PYTORCH_SPECS+=("$spec")
+        fi
+    done
+
+    $PIP_CMD install \
+        "${PYTORCH_SPECS[@]}" \
+        --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 require_prebuilt_rust_exts() {
     # Stages whose download succeeded set this to none. Runs before
     # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
@@ -458,43 +484,6 @@ install_sglang_kernel() {
             echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild the kernel."
             exit 1
         fi
-    fi
-
-    # Reinstall torch with matching CUDA version if needed
-    # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    REINSTALL_TORCH=false
-    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
-        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
-    else
-        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
-        TORCH_CUDA_VER=""
-        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
-        printf '%s\n' "${TORCH_IMPORT_ERROR}"
-        REINSTALL_TORCH=true
-    fi
-    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-        REINSTALL_TORCH=true
-    else
-        for cuda_ver in "${TORCHAUDIO_CUDA_VER}" "${TORCHVISION_CUDA_VER}"; do
-            if [ -n "${cuda_ver}" ] && [ "${cuda_ver}" != "${CU_VERSION}" ]; then
-                REINSTALL_TORCH=true
-                break
-            fi
-        done
-    fi
-    if [ "${REINSTALL_TORCH}" = true ]; then
-        TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
-            echo "ERROR: could not determine installed torch package versions before reinstall."
-            pip show torch torchaudio torchvision || true
-            exit 1
-        fi
-        echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
-        $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
@@ -769,6 +758,7 @@ main() {
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
+    install_pytorch_stack
     install_sglang
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
