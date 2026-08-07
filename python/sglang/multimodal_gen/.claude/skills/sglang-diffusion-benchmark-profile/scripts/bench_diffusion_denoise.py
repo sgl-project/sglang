@@ -665,7 +665,7 @@ def _expected_nightly_cli_args(case: dict) -> dict[str, str]:
     serve_args = shlex.split(case["frameworks"]["sglang"].get("serve_args", ""))
     parsed_serve_args = _parse_cli_args(serve_args)
     for flag, value in parsed_serve_args.items():
-        if flag in {"enable-torch-compile", "warmup"}:
+        if flag in {"enable-torch-compile", "warmup-mode"}:
             continue
         expected[flag] = _normalize_cli_value(value)
 
@@ -805,7 +805,7 @@ def build_sglang_cmd(
     if save_output:
         cmd.append("--save-output")
     if warmup:
-        cmd.append("--warmup")
+        cmd.extend(["--warmup-mode", "request"])
     if torch_compile and not cfg.get("force_eager", False):
         cmd.append("--enable-torch-compile")
     if perf_dump_path:

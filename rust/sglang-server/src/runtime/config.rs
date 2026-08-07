@@ -158,6 +158,11 @@ pub struct ModelConfig {
     /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
+    /// in tm-ingress; `false` silently ignores mm fields, as the Python
+    /// `TokenizerManager` does with `mm_processor is None`.
+    #[serde(default)]
+    pub is_multimodal: bool,
     /// Resolved default sampling parameters, stamped by
     /// `RustServer._build_server_args` from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on
@@ -257,6 +262,12 @@ impl ServerArgs {
     /// receives the registrations.
     pub fn enable_pd_bootstrap(&self) -> bool {
         self.disaggregation_mode == "prefill"
+    }
+
+    /// Whether the served model is multimodal, from the scheduler's dump. See
+    /// [`ModelConfig::is_multimodal`].
+    pub fn model_is_multimodal(&self) -> bool {
+        self.model_config.is_multimodal
     }
 
     /// Bind address `host:port`. `host` is expected to be an IP — the result is
