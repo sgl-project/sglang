@@ -4192,6 +4192,11 @@ class ServerArgs:
         if self.device == "mps":
             if not use_mlx():
                 self.disable_overlap_schedule = True
+            elif self.enable_mixed_chunk:
+                logger.warning(
+                    "Mixed chunk is not supported by the MLX overlap scheduler and is disabled."
+                )
+                self.enable_mixed_chunk = False
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":

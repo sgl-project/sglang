@@ -1994,5 +1994,42 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestMlxMixedChunkGuard(CustomTestCase):
+    """The MLX overlap scheduler never publishes decode tokens into
+    future_map.output_tokens_buf, so a mixed batch (prefill arriving while
+    another request decodes) reads a buffer the MLX loop never writes,
+    crashing the scheduler. --enable-mixed-chunk is therefore force-disabled
+    on this backend, mirroring the dual-chunk-flash-attn and diffusion-LLM
+    guards.
+
+    dummy-model short-circuits __post_init__, so the guard handler is invoked
+    directly (same pattern as TestWaterfillArgs)."""
+
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.enable_mixed_chunk = True
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_mlx_disables_mixed_chunk(self):
+        args = self._args(device="mps")
+        with patch("sglang.srt.server_args.use_mlx", return_value=True):
+            args._handle_mps_backends()
+        self.assertFalse(args.enable_mixed_chunk)
+
+    def test_non_mlx_mps_leaves_mixed_chunk_untouched(self):
+        args = self._args(device="mps")
+        with patch("sglang.srt.server_args.use_mlx", return_value=False):
+            args._handle_mps_backends()
+        self.assertTrue(args.enable_mixed_chunk)
+
+    def test_non_mps_device_leaves_mixed_chunk_untouched(self):
+        args = self._args(device="cuda")
+        with patch("sglang.srt.server_args.use_mlx", return_value=True):
+            args._handle_mps_backends()
+        self.assertTrue(args.enable_mixed_chunk)
+
+
 if __name__ == "__main__":
     unittest.main()
