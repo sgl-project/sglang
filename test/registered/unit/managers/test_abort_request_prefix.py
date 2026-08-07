@@ -34,6 +34,7 @@ def _make_tokenizer_manager(rids=(), tokenizer_worker_num=1) -> TokenizerManager
     tm.server_args = MagicMock()
     tm.server_args.tokenizer_worker_num = tokenizer_worker_num
     tm.enable_metrics = False
+    tm.enable_lora = False
     tm.rid_to_state = {rid: Mock() for rid in rids}
     tm.send_to_scheduler = MagicMock()
     tm.tokenizer_ipc_name = None
@@ -104,7 +105,11 @@ class TestAbortRequestPrefix(CustomTestCase):
 
 
 def _make_state(rid: str) -> ReqState:
-    obj = SimpleNamespace(rid=rid, stream=False, return_logprob=False)
+    # lora_path / lora_id model the real input-struct contract: always present,
+    # None = base model (the lease finalizer does plain None checks on them).
+    obj = SimpleNamespace(
+        rid=rid, stream=False, return_logprob=False, lora_path=None, lora_id=None
+    )
     return ReqState([], False, asyncio.Event(), obj, MagicMock())
 
 
@@ -209,10 +214,15 @@ def _make_scheduler(waiting_rids=(), running_rids=(), chunked_rid=None):
     sched.chunked_req = FakeReq(chunked_rid) if chunked_rid is not None else None
     sched.waiting_queue = [FakeReq(rid) for rid in waiting_rids]
     sched.enable_hicache_storage = False
+    sched.dllm_config = None  # abort_request reads it since the dLLM rework (#27877)
     sched.disaggregation_mode = DisaggregationMode.NULL
     sched.grammar_manager = MagicMock()
     sched.running_batch = SimpleNamespace(reqs=[FakeReq(rid) for rid in running_rids])
     sched.cur_batch = None
+    # abort_request collects in-flight reqs from (running_batch, last_batch) on
+    # the pp_size == 1 path since the v0.5.16 rebase.
+    sched.ps = SimpleNamespace(pp_size=1)
+    sched.last_batch = None
     sched.ipc_channels = MagicMock()
     return sched
 

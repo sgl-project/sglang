@@ -735,6 +735,7 @@ class TokenizerControlMixin:
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
+                    reloadable=False,
                 )
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
@@ -811,6 +812,7 @@ class TokenizerControlMixin:
                         lora_name=obj.lora_name,
                         lora_path="__distributed__",
                         pinned=obj.pinned,
+                        reloadable=False,
                     ),
                     upsert=obj.upsert,
                 )
@@ -886,7 +888,14 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                return await self._unload_lora_adapter_locked(obj)
+                result = await self._unload_lora_adapter_locked(obj)
+                # Explicit unload is a DELETE: drop the reload-catalog entry too.
+                # The max_loaded_loras LRU loop calls _unload_lora_adapter_locked
+                # directly — an EVICT — and must keep the entry so disk-backed
+                # adapters can be implicitly reloaded later.
+                if result.success:
+                    self.lora_ref_cache.pop(obj.lora_name, None)
+                return result
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
