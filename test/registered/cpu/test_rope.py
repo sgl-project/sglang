@@ -286,6 +286,75 @@ class TestROPE(CustomTestCase):
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
+    def apply_rotary_embedding_reference(
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        x_fp32 = x.float()
+
+        # cos/sin: [S, D / 2]
+        #
+        # Expand the head dimension:
+        #   3D x [S, H, D]    -> [S, 1, D / 2]
+        #   4D x [B, S, H, D] -> [1, S, 1, D / 2]
+        if x.dim() == 3:
+            cos_fp32 = cos.float().unsqueeze(1)
+            sin_fp32 = sin.float().unsqueeze(1)
+        elif x.dim() == 4:
+            cos_fp32 = cos.float().unsqueeze(0).unsqueeze(2)
+            sin_fp32 = sin.float().unsqueeze(0).unsqueeze(2)
+        else:
+            raise ValueError(f"Unsupported input shape: {x.shape}")
+
+        x_even = x_fp32[..., 0::2]
+        x_odd = x_fp32[..., 1::2]
+
+        out_even = x_even * cos_fp32 - x_odd * sin_fp32
+        out_odd = x_odd * cos_fp32 + x_even * sin_fp32
+
+        return torch.stack((out_even, out_odd), dim=-1).flatten(-2).to(x.dtype)
+
+    def test_apply_rotary_embedding(self):
+        torch.manual_seed(1234)
+        test_config = [
+            ((7, 3, 64), torch.float32, torch.float32),
+            ((7, 3, 64), torch.bfloat16, torch.float32),
+            ((7, 3, 64), torch.bfloat16, torch.bfloat16),
+            ((2, 7, 3, 64), torch.bfloat16, torch.float32),
+            ((2, 5, 4, 66), torch.bfloat16, torch.float32),
+        ]
+
+        for shape, input_dtype, sincos_dtype in test_config:
+            x = torch.randn(shape, dtype=input_dtype)
+            x_before = x.clone()
+
+            num_tokens = shape[0] if len(shape) == 3 else shape[1]
+            head_size = shape[-1]
+
+            angles = torch.randn(num_tokens, head_size // 2, dtype=torch.float32)
+
+            cos = angles.cos().to(sincos_dtype)
+            sin = angles.sin().to(sincos_dtype)
+
+            output_ref = self.apply_rotary_embedding_reference(x, cos, sin)
+
+            output_sgl = torch.ops.sgl_kernel.apply_rotary_embedding_cpu(x, cos, sin)
+
+            torch.testing.assert_close(x, x_before)
+
+            self.assertEqual(output_sgl.shape, x.shape)
+            self.assertEqual(output_sgl.dtype, x.dtype)
+
+            if input_dtype == torch.float32:
+                atol = 1e-5
+                rtol = 1e-5
+            else:
+                atol = 1e-2
+                rtol = 1e-2
+
+            torch.testing.assert_close(output_ref, output_sgl, atol=atol, rtol=rtol)
+
 
 if __name__ == "__main__":
     unittest.main()
