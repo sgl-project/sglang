@@ -1012,11 +1012,6 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        # DCP shards the KV pool across ranks, so a request is bounded by the
-        # aggregate pool rather than this rank's share.
-        self.aggregate_max_total_num_tokens = (
-            self.max_total_num_tokens * get_parallel().attn_dcp_size
-        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2003,7 +1998,8 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.aggregate_max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens
+            * get_parallel().attn_dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2135,7 +2131,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.aggregate_max_total_num_tokens
+                self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,

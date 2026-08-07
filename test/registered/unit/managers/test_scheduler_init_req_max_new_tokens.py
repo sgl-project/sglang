@@ -45,8 +45,6 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
-        # No DCP here, so the aggregate pool is this rank's pool.
-        scheduler.aggregate_max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
