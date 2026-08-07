@@ -219,8 +219,9 @@ class TestInklingCacheConsistency(CustomTestCase):
                 prefix_len_min=384,
                 prefix_len_max=512,
                 new_tokens=256,
-                # Retraction count tracks pool size, hence GPU memory; measured 8.
-                min_retracted_requests=4,
+                # How many requests get retracted tracks pool size, hence GPU
+                # memory, so only assert the path ran at all.
+                min_retracted_requests=1,
             )
 
 

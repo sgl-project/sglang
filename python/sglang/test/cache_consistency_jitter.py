@@ -225,6 +225,12 @@ def get_jitter_engine(
     }
     original_test_env = {name: os.environ.get(name) for name in test_env}
     os.environ.update(test_env)
+    # enable_metrics registers collectors on the process-global prometheus
+    # registry, so a second engine in the same process (a CustomTestCase retry)
+    # would die on re-registration and hide the original failure.
+    from prometheus_client import REGISTRY as _prom_registry
+
+    collectors_before = set(_prom_registry._collector_to_names)
     try:
         engine = JitterEngine(**engine_kwargs)
         yield engine
@@ -234,6 +240,8 @@ def get_jitter_engine(
             del engine
             gc.collect()
             torch.cuda.empty_cache()
+        for collector in set(_prom_registry._collector_to_names) - collectors_before:
+            _prom_registry.unregister(collector)
         for name, value in original_test_env.items():
             if value is None:
                 os.environ.pop(name)
