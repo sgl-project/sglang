@@ -689,15 +689,12 @@ class USPAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         if get_ring_parallel_world_size() > 1:
-            backend_enum = attn_backend.get_enum()
-            if backend_enum not in (
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.SAGE_ATTN,
-            ):
+            if not attn_backend.supports_ring_rotation():
                 raise RuntimeError(
-                    f"Ring Attention is only supported for FlashAttention or SageAttention backends, "
-                    f"but got {backend_enum.name}. "
-                    f"Please ensure your platform supports these backends."
+                    f"Ring Attention requires a backend whose kernel exposes the "
+                    f"softmax LSE for the per-hop merge; "
+                    f"{attn_backend.get_enum().name} does not declare support "
+                    f"(see AttentionBackend.supports_ring_rotation)."
                 )
         impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
