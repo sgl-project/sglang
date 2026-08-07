@@ -285,6 +285,13 @@ class GPTBigCodeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
@@ -302,6 +309,22 @@ class GPTBigCodeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, "v")
             else:
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if "lm_head.weight" in name or ".attn.bias" in name:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if "c_attn.input_scale" in name or "c_attn.weight_scale" in name:
+                for shard_id in ("q", "k", "v"):
+                    weight_loader(param, loaded_weight, shard_id)
+            else:
+                weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
 
 EntryClass = GPTBigCodeForCausalLM

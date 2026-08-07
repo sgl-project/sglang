@@ -190,6 +190,7 @@ class PhiMoE(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.tp_size = get_parallel().tp_size
+        self._ckpt_num_experts = num_experts
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -226,6 +227,26 @@ class PhiMoE(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states.view(orig_shape)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            StackedParamsDispatch,
+            load_moe_sparse_block_weights,
+        )
+
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self._ckpt_num_experts,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+        )
+        return load_moe_sparse_block_weights(
+            self,
+            weights,
+            expert_dispatch=expert_dispatch,
+            dense_stacked=StackedParamsDispatch(),
+        )
 
 
 class PhiMoEAttention(nn.Module):
@@ -322,6 +343,34 @@ class PhiMoEAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        params_dict = dict(self.named_parameters())
+
+        def remapped_weights():
+            for name, weight in weights:
+                if name.endswith("kv_scale"):
+                    remapped_name = name.replace("kv_scale", "attn.k_scale")
+                    if remapped_name in params_dict:
+                        name = remapped_name
+                elif name.endswith("k_proj.k_scale"):
+                    remapped_name = name.replace("k_proj.k_scale", "attn.k_scale")
+                    if remapped_name in params_dict:
+                        name = remapped_name
+                elif name.endswith("v_proj.v_scale"):
+                    remapped_name = name.replace("v_proj.v_scale", "attn.v_scale")
+                    if remapped_name in params_dict:
+                        name = remapped_name
+                yield name, weight
+
+        return load_with_stacked_dispatch(
+            self, remapped_weights(), STANDARD_QKV_MAPPING
+        )
 
 
 class PhiMoEDecoderLayer(nn.Module):
@@ -498,6 +547,13 @@ class PhiMoEForCausalLM(nn.Module):
             return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -553,6 +609,23 @@ class PhiMoEForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["rotary_emb.inv_freq"],
+            ignore_unexpected_suffixes=[".bias", "_bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = PhiMoEForCausalLM

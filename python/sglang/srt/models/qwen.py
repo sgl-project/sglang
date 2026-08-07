@@ -325,6 +325,13 @@ class QWenLMHeadModel(nn.Module):
         return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w2", 0),
@@ -352,6 +359,42 @@ class QWenLMHeadModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import StackedParamsDispatch
+
+        dispatch = StackedParamsDispatch(
+            mappings=(
+                ("gate_up_proj", "w2", 0),
+                ("gate_up_proj", "w1", 1),
+            )
+        )
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if name.endswith(".bias") and name not in params_dict:
+                mapped_bias = any(
+                    source_name in name
+                    and name.replace(source_name, fused_name) in params_dict
+                    for fused_name, source_name, _ in dispatch.mappings
+                )
+                if not mapped_bias:
+                    continue
+            target = dispatch.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target not in params_dict:
+                    if target.endswith(".bias"):
+                        continue
+                    raise ValueError(f"Mapped parameter {target!r} not found")
+                loaded.add(target)
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
 
 EntryClass = QWenLMHeadModel

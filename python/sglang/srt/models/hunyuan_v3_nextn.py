@@ -160,6 +160,13 @@ class HYV3ForCausalLMNextN(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         nextn_layer_id = self.config.num_hidden_layers
         nextn_prefix = f"model.layers.{nextn_layer_id}."
         spec_weight_names = ("enorm", "hnorm", "eh_proj")
@@ -253,6 +260,94 @@ class HYV3ForCausalLMNextN(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            STANDARD_GATE_UP_MAPPING,
+            STANDARD_QKV_MAPPING,
+        )
+
+        nextn_prefix = f"model.layers.{self.config.num_hidden_layers}."
+        spec_weight_names = ("enorm", "hnorm", "eh_proj")
+        params_dict = dict(self.named_parameters())
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_experts
+        )
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if name.startswith(nextn_prefix):
+                    subname = name[len(nextn_prefix) :]
+                    if any(subname.startswith(s) for s in spec_weight_names):
+                        name = f"model.{subname}"
+                    elif subname.startswith("final_layernorm"):
+                        name = "model.shared_head.norm.weight"
+                    else:
+                        name = f"model.decoder.{subname}"
+                elif name != "model.shared_head.norm.weight":
+                    if (
+                        "embed_tokens" in name
+                        or "shared_head.head" in name
+                        or "lm_head" in name
+                    ):
+                        continue
+                    continue
+
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                if "router.gate." in name:
+                    name = name.replace("router.", "")
+                if name.endswith(".bias") and name not in params_dict:
+                    stacked_bias = any(
+                        source_name in name
+                        and name.replace(source_name, fused_name) in params_dict
+                        for dispatch in (
+                            STANDARD_QKV_MAPPING,
+                            STANDARD_GATE_UP_MAPPING,
+                        )
+                        for fused_name, source_name, _ in dispatch.mappings
+                        if "mlp.experts" not in name
+                    )
+                    expert_bias = any(
+                        weight_name in name
+                        and name.replace(weight_name, param_name) in params_dict
+                        for param_name, weight_name, _, _ in expert_dispatch.mappings
+                    )
+                    if not stacked_bias and not expert_bias:
+                        continue
+
+                target = STANDARD_QKV_MAPPING.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if "mlp.experts" not in name:
+                    target = STANDARD_GATE_UP_MAPPING.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+                if name in params_dict:
+                    yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        return loaded | dispatched
 
 
 EntryClass = [HYV3ForCausalLMNextN]

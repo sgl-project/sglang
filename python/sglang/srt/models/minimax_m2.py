@@ -1299,7 +1299,13 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
+        from sglang.srt.environ import envs
 
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1408,6 +1414,69 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        return loaded_params
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            STANDARD_STACKED_MAPPING,
+            try_load_stacked_skip_moe_experts,
+        )
+
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_local_experts,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+        )
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            layer_id = get_layer_id(name)
+            if layer_id is not None and (
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
+            ):
+                continue
+            if get_spec_layer_idx_from_weight_name(self.config, name) is not None:
+                continue
+
+            # KV-cache scales must retain their checkpoint projection name so
+            # maybe_remap_kv_scale_name can map them to the attention scale.
+            is_kv_scale = name.endswith(".k_scale") or name.endswith(".v_scale")
+            target = (
+                None
+                if is_kv_scale
+                else try_load_stacked_skip_moe_experts(
+                    STANDARD_STACKED_MAPPING,
+                    name,
+                    loaded_weight,
+                    params_dict,
+                )
+            )
+            if target is not None:
+                if target in params_dict:
+                    loaded_params.add(target)
+                continue
+
+            target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target in params_dict:
+                    loaded_params.add(target)
+                continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            target = maybe_remap_kv_scale_name(name, params_dict)
+            if target is None or target not in params_dict:
+                continue
+            param = params_dict[target]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(target)
+
         return loaded_params
 
     @classmethod

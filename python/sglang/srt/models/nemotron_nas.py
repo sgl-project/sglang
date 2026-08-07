@@ -372,6 +372,15 @@ class DeciLMForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> None:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -433,6 +442,45 @@ class DeciLMForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        params_dict = dict(self.named_parameters())
+
+        def _prepare(
+            src: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, loaded_weight in src:
+                if self.model.quant_config is not None and (
+                    scale_name := self.model.quant_config.get_cache_scale(name)
+                ):
+                    loaded_weight = (
+                        loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                    )
+                    yield scale_name, loaded_weight
+                    continue
+                if "scale" in name:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                yield name, loaded_weight
+
+        weights = filter_pp_weights(
+            _prepare(weights), self.model.start_layer, self.model.end_layer
+        )
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = [DeciLMForCausalLM]

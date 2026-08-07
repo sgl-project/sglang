@@ -140,10 +140,28 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        for name, loaded_weight in weights:
-            if "lm_head" not in name:
-                name = "model." + name
-                super().load_weights([(name, loaded_weight)])
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            for name, loaded_weight in weights:
+                if "lm_head" not in name:
+                    name = "model." + name
+                    LlamaForCausalLM._legacy_load_weights(
+                        self, [(name, loaded_weight)]
+                    )
+            return
+
+        def prepare_weights():
+            for name, loaded_weight in weights:
+                if "lm_head" not in name:
+                    name = "model." + name
+                    if name.endswith(".activation_scale"):
+                        name = name.replace(".activation_scale", ".input_scale")
+                    elif name.endswith(".weight_scale_inv"):
+                        name = name.replace(".weight_scale_inv", ".weight_scale")
+                    yield name, loaded_weight
+
+        return LlamaForCausalLM._load_weights_v2(self, prepare_weights())
 
 
 EntryClass = [LlamaForCausalLMEagle]

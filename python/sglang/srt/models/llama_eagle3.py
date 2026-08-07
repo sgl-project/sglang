@@ -85,7 +85,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if self.is_input_layer:
             # Input layer consumes target hidden states; no carried residual to fuse.
             residual = hidden_states
@@ -312,6 +311,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
@@ -365,6 +371,44 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        params_dict = dict(self.named_parameters())
+        legacy_name_map = {
+            "midlayer": "layers.0",
+            "aux_norm_low": "fc_norm.0",
+            "aux_norm_mid": "fc_norm.1",
+            "aux_norm_high": "fc_norm.2",
+        }
+
+        def prepare_weights():
+            for name, loaded_weight in weights:
+                for legacy, new in legacy_name_map.items():
+                    if legacy in name:
+                        name = name.replace(legacy, new)
+                if "d2t" in name:
+                    self.hot_token_id = loaded_weight + torch.arange(
+                        loaded_weight.shape[0]
+                    )
+                    continue
+                if "t2d" in name:
+                    continue
+                if name.endswith(".activation_scale"):
+                    name = name.replace(".activation_scale", ".input_scale")
+                elif name.endswith(".weight_scale_inv"):
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
+                if name not in params_dict:
+                    name = f"model.{name}"
+                yield name, loaded_weight
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["rotary_emb.inv_freq"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(prepare_weights())
 
     def get_hot_token_id(self):
         return self.hot_token_id

@@ -1560,7 +1560,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
 
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # Leading "." on ".qkv_proj" prevents it from falsely matching the sparse
             # index_q/k/v_proj weights (remapped separately below).
@@ -1681,6 +1685,92 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         # Run before the loader's process pass: the raw fp8 weight + uint8 scale are
         # final here (mxfp8 post-process only derives the packed scale, not these).
+        build_minimax_fused_qkv_index(self)
+        return loaded_params
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            StackedParamsDispatch,
+            try_load_stacked_skip_moe_experts,
+        )
+
+        stacked_mapping = StackedParamsDispatch(
+            mappings=(
+                (".qkv_proj", ".q_proj", "q"),
+                (".qkv_proj", ".k_proj", "k"),
+                (".qkv_proj", ".v_proj", "v"),
+                (".gate_up_proj", ".gate_proj", 0),
+                (".gate_up_proj", ".up_proj", 1),
+                (".index_qkv_proj", ".index_q_proj", "q"),
+                (".index_qkv_proj", ".index_k_proj", "k"),
+                (".index_qkv_proj", ".index_v_proj", "v"),
+            )
+        )
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_local_experts + self.num_fused_shared_experts,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+        )
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if layer_id is not None and (
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
+            ):
+                continue
+
+            name = name.replace(".block_sparse_moe", ".mlp")
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{self.config.num_local_experts}",
+                )
+                name = name.replace("gate_proj", "w1")
+                name = name.replace("down_proj", "w2")
+                name = name.replace("up_proj", "w3")
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if get_spec_layer_idx_from_weight_name(self.config, name) is not None:
+                continue
+
+            target = try_load_stacked_skip_moe_experts(
+                stacked_mapping,
+                name,
+                loaded_weight,
+                params_dict,
+                skip_substrs=("mlp.experts.",),
+            )
+            if target is not None:
+                if target in params_dict:
+                    loaded_params.add(target)
+                elif not target.endswith(".bias"):
+                    raise KeyError(target)
+                continue
+
+            target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target in params_dict:
+                    loaded_params.add(target)
+                continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            target = maybe_remap_kv_scale_name(name, params_dict)
+            if target is None:
+                continue
+            if target not in params_dict:
+                raise KeyError(target)
+            param = params_dict[target]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(target)
+
+        # Build only after all v2 dispatch and strict name checks have succeeded.
         build_minimax_fused_qkv_index(self)
         return loaded_params
 

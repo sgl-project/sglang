@@ -873,6 +873,15 @@ class BailingMoEForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights, is_nextn=is_nextn)
+        return self._legacy_load_weights(weights, is_nextn=is_nextn)
+
+    def _legacy_load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False
+    ):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1006,6 +1015,126 @@ class BailingMoEForCausalLM(nn.Module):
                 if not isinstance(layer, PPMissingLayer)
                 and isinstance(layer.mlp, BailingMoESparseMoeBlock)
             }
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn: bool = False
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            StackedParamsDispatch,
+            filter_pp_weights,
+        )
+
+        if not is_nextn and hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        if is_nextn:
+            if not hasattr(self.config, "num_nextn_predict_layers"):
+                raise ValueError("num_nextn_predict_layers is not in the config")
+            assert self.config.num_nextn_predict_layers == 1, (
+                "Only 1 nextn layer is supported"
+            )
+            nextn_layer_id = (
+                0
+                if self.config.num_hidden_layers == 1
+                else self.config.num_hidden_layers
+            )
+            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+            nextn_spec_weight_names = (
+                "final_layernorm",
+                "eh_proj",
+                "enorm",
+                "hnorm",
+            )
+
+        params_dict = dict(self.named_parameters())
+        stacked_dispatch = StackedParamsDispatch(
+            mappings=(
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            )
+        )
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_experts
+        )
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if (
+                    "v_head" in name
+                    or "inv_freq" in name
+                    or (self.config.tie_word_embeddings and "lm_head" in name)
+                ):
+                    continue
+                if (
+                    getattr(self.config, "norm_head", False)
+                    and "lm_head.weight" in name
+                ):
+                    loaded_weight = F.normalize(
+                        loaded_weight, dim=0, p=2, eps=1e-7
+                    )
+
+                if is_nextn:
+                    if not name.startswith(nextn_layer_prefix):
+                        continue
+                    if "shared_head.head" in name or "embed_tokens" in name:
+                        continue
+                    if any(
+                        weight_name in name
+                        for weight_name in nextn_spec_weight_names
+                    ):
+                        name = name.replace(nextn_layer_prefix, "model")
+                    else:
+                        name = name.replace(nextn_layer_prefix, "model.decoder")
+
+                if name.endswith(".bias") and name not in params_dict:
+                    stacked_bias = any(
+                        source_name in name
+                        and name.replace(source_name, fused_name) in params_dict
+                        for fused_name, source_name, _ in stacked_dispatch.mappings
+                        if "mlp.experts" not in name
+                    )
+                    expert_bias = any(
+                        weight_name in name
+                        and name.replace(weight_name, param_name) in params_dict
+                        for param_name, weight_name, _, _ in expert_dispatch.mappings
+                    )
+                    if not stacked_bias and not expert_bias:
+                        continue
+
+                if "mlp.experts" not in name:
+                    target = stacked_dispatch.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict:
+                    yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        if not is_nextn:
+            self.routed_experts_weights_of_layer = {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.mlp, BailingMoESparseMoeBlock)
+            }
+        return loaded | dispatched
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

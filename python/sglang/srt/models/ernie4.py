@@ -340,6 +340,13 @@ class Ernie4_5_ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
@@ -362,12 +369,50 @@ class Ernie4_5_ForCausalLM(nn.Module):
                 else:
                     raise KeyError(f"Parameter '{name}' not found in model.")
 
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            StackedParamsDispatch,
+        )
+
+        stacked_dispatch = StackedParamsDispatch(
+            mappings=tuple(self.stacked_params_mapping)
+        )
+        params_dict = dict(self.named_parameters())
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                    continue
+                target = stacked_dispatch.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target not in params_dict:
+                        raise KeyError(f"Parameter '{target}' not found in model.")
+                    dispatched.add(target)
+                    continue
+                yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        return loaded | dispatched
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
 
 class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -428,6 +473,60 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                         weight_loader(param, loaded_weight)
                     else:
                         raise KeyError(f"Parameter '{name}' not found in model.")
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            StackedParamsDispatch,
+        )
+
+        stacked_dispatch = StackedParamsDispatch(
+            mappings=tuple(self.stacked_params_mapping)
+        )
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.moe_num_experts
+        )
+        params_dict = dict(self.named_parameters())
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                    continue
+                if name.startswith("model.mtp_"):
+                    continue
+                if "moe_statics.e_score_correction_bias" in name:
+                    name = name.replace("moe_statics", "gate")
+
+                if not (
+                    "mlp.experts." in name and name not in params_dict
+                ):
+                    target = stacked_dispatch.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target not in params_dict:
+                            raise KeyError(
+                                f"Parameter '{target}' not found in model."
+                            )
+                        dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target not in params_dict:
+                        raise KeyError(
+                            f"Parameter '{target}'(replaced) not found in model."
+                        )
+                    dispatched.add(target)
+                    continue
+                yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        return loaded | dispatched
 
 
 EntryClass = [Ernie4_5_MoeForCausalLM, Ernie4_5_ForCausalLM]

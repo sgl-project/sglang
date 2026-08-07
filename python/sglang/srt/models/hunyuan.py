@@ -629,6 +629,13 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         # return qkv.reshape((num_kv_heads, num_key_value_groups+2 , attention_head_dim, hidden_size)).permute((1,0,2,3)).reshape((-1, hidden_size)),
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         cla_factor = _get_cla_factor(self.config)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -770,6 +777,128 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import ExpertParamsDispatch
+
+        cla_factor = _get_cla_factor(self.config)
+        stacked_params_mapping = (
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        )
+        num_attention_heads = self.config.num_attention_heads
+        num_kv_heads = getattr(
+            self.config, "num_key_value_heads", self.config.num_attention_heads
+        )
+        split_params_mapping = (
+            (".gate_up_proj", ".gate_and_up_proj", 2, ((1, 1), (0, 1)), None),
+            (
+                ".qkv_proj",
+                ".qkv_proj",
+                num_attention_heads + num_kv_heads * 2,
+                (("q", num_attention_heads), ("k", num_kv_heads), ("v", num_kv_heads)),
+                self._split_qkv_weight,
+            ),
+        )
+        expert_dispatch = (
+            ExpertParamsDispatch.from_gate_up_down(
+                num_experts=self.config.num_experts,
+            )
+            if _is_moe(self.config)
+            else None
+        )
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "gate_proj_bias" in name:
+                name = name.replace("gate_proj_bias", "gate_proj.bias")
+            if "up_proj_bias" in name:
+                name = name.replace("up_proj_bias", "up_proj.bias")
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
+            loaded_target = None
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name or "mlp.experts" in name:
+                    continue
+                if weight_name == ".q_proj":
+                    match = re.search(r"layers\.\d+", name)
+                    if match:
+                        layer_id = int(match.group(0).split(".")[-1])
+                        if cla_factor > 1 and layer_id % cla_factor != 0:
+                            continue
+                target = name.replace(weight_name, param_name)
+                if target.endswith(".bias") and target not in params_dict:
+                    loaded_target = target
+                    break
+                param = params_dict[target]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_target = target
+                loaded_params.add(target)
+                break
+            if loaded_target is not None:
+                continue
+
+            for (
+                param_name,
+                weight_name,
+                denominator,
+                split_params,
+                transform,
+            ) in split_params_mapping:
+                if weight_name not in name:
+                    continue
+                target = name.replace(weight_name, param_name)
+                if target.endswith(".bias") and target not in params_dict:
+                    loaded_target = target
+                    break
+                if loaded_weight.shape[0] % denominator != 0:
+                    raise ValueError(
+                        f"Cannot split {name}: dimension 0 is not divisible by "
+                        f"{denominator}"
+                    )
+                units = loaded_weight.shape[0] // denominator
+                source = transform(loaded_weight) if transform else loaded_weight
+                param = params_dict[target]
+                offset = 0
+                for shard_id, count in split_params:
+                    new_offset = offset + count * units
+                    param.weight_loader(param, source[offset:new_offset], shard_id)
+                    offset = new_offset
+                loaded_target = target
+                loaded_params.add(target)
+                break
+            if loaded_target is not None:
+                continue
+
+            if expert_dispatch is not None:
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        loaded_params.add(target)
+                    continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            target = maybe_remap_kv_scale_name(name, params_dict)
+            if target is None:
+                continue
+            if "mlp.gate.wg." in target:
+                target = target.replace("wg.", "")
+            param = params_dict[target]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(target)
+
+        return loaded_params
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should

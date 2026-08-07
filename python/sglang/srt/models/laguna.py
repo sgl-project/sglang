@@ -726,6 +726,13 @@ class LagunaForCausalLM(nn.Module):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -847,6 +854,131 @@ class LagunaForCausalLM(nn.Module):
                 f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
                 f"num_experts={self.config.num_experts}, shards=3)."
             )
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            STANDARD_GATE_UP_MAPPING,
+            STANDARD_QKV_MAPPING,
+        )
+
+        params_dict = dict(self.named_parameters())
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_experts
+        )
+        dispatched: set[str] = set()
+        loaded_expert_shards: set[Tuple[int, int, str]] = set()
+        moe_layer_ids = [
+            layer_id
+            for layer_id, mlp_type in enumerate(self.config.mlp_layer_types)
+            if mlp_type == "sparse"
+            and self.start_layer <= layer_id < self.end_layer
+        ]
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                layer_id = get_layer_id(name)
+                if layer_id is not None and (
+                    layer_id < self.start_layer or layer_id >= self.end_layer
+                ):
+                    continue
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                    continue
+                if name.endswith("mlp.experts.e_score_correction_bias"):
+                    name = name.replace(
+                        "mlp.experts.e_score_correction_bias",
+                        "mlp.gate.e_score_correction_bias",
+                    )
+                if name.endswith(".bias") and name not in params_dict:
+                    stacked_bias = any(
+                        source_name in name
+                        and name.replace(source_name, fused_name) in params_dict
+                        for dispatch in (
+                            STANDARD_QKV_MAPPING,
+                            STANDARD_GATE_UP_MAPPING,
+                        )
+                        for fused_name, source_name, _ in dispatch.mappings
+                        if "mlp.experts." not in name
+                    )
+                    expert_bias = any(
+                        weight_name in name
+                        and name.replace(weight_name, param_name) in params_dict
+                        for param_name, weight_name, _, _ in expert_dispatch.mappings
+                    )
+                    if not stacked_bias and not expert_bias:
+                        continue
+
+                target = STANDARD_QKV_MAPPING.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if "mlp.experts." not in name:
+                    target = STANDARD_GATE_UP_MAPPING.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                        if layer_id is not None:
+                            for (
+                                _,
+                                weight_name,
+                                expert_id,
+                                shard_id,
+                            ) in expert_dispatch.mappings:
+                                if weight_name in name:
+                                    loaded_expert_shards.add(
+                                        (layer_id, expert_id, shard_id)
+                                    )
+                                    break
+                    continue
+
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    if ".g_proj." in name:
+                        raise RuntimeError(
+                            f"Checkpoint provides gate weight {name!r} but the model "
+                            "built no g_proj (gating is disabled in the config). Set "
+                            'gating to True, "per-head", or "per-element" to load '
+                            "this checkpoint."
+                        )
+                    logger.warning("Parameter %s not found in params_dict", name)
+                    continue
+                yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        expected = {
+            (layer_id, expert_id, shard_id)
+            for layer_id in moe_layer_ids
+            for expert_id in range(self.config.num_experts)
+            for shard_id in ("w1", "w2", "w3")
+        }
+        missing = expected - loaded_expert_shards
+        if missing:
+            sample = sorted(missing)[:5]
+            raise RuntimeError(
+                f"{len(missing)} routed-expert tensors were not loaded "
+                f"(sample: {sample}). Expected {len(expected)} "
+                f"(layers={moe_layer_ids}, num_experts={self.config.num_experts}, "
+                "shards=3)."
+            )
+        return loaded | dispatched
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

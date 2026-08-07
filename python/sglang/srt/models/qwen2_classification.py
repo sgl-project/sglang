@@ -1,4 +1,4 @@
-﻿# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -57,9 +57,9 @@ class Qwen2ForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "Qwen2ForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "Qwen2ForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return score_and_pool(
@@ -67,10 +67,14 @@ class Qwen2ForSequenceClassification(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
         # Filter out lm_head weights of Qwen2ForCausalLM
         filtered_weights = [
             (name, w) for name, w in weights if not name.startswith("lm_head")
         ]
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return Qwen2ForCausalLM._load_weights_v2(self, filtered_weights)
         return Qwen2ForCausalLM._legacy_load_weights(self, filtered_weights)
 
 

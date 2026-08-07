@@ -57,7 +57,21 @@ class MistralForCausalLMMistralFormat(MistralForCausalLM):
     # fmt: on
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        return super().load_weights(self._remap_mistral_to_llama(weights))
+        from sglang.srt.environ import envs
+
+        weights = self._remap_mistral_to_llama(weights)
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+
+            def normalize_fp8_suffixes():
+                for name, loaded_weight in weights:
+                    if name.endswith(".activation_scale"):
+                        name = name.replace(".activation_scale", ".input_scale")
+                    elif name.endswith(".weight_scale_inv"):
+                        name = name.replace(".weight_scale_inv", ".weight_scale")
+                    yield name, loaded_weight
+
+            return LlamaForCausalLM._load_weights_v2(self, normalize_fp8_suffixes())
+        return LlamaForCausalLM._legacy_load_weights(self, weights)
 
     def _remap_mistral_to_llama(
         self, weights: Iterable[tuple[str, torch.Tensor]]

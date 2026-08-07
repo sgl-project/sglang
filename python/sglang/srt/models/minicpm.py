@@ -334,6 +334,13 @@ class MiniCPMForCausalLM(nn.Module):
         return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -394,6 +401,63 @@ class MiniCPMForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_STACKED_MAPPING
+
+        expert_mapping = [
+            (
+                "ws" if weight_name in ("w1", "w3") else "w2s",
+                f"experts.{expert_id}.{weight_name}.weight",
+                expert_id,
+            )
+            for expert_id in range(self.num_experts)
+            for weight_name in ("w1", "w2", "w3")
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if (
+                "rotary_emb.inv_freq" in name
+                or "rotary_emb.cos_cached" in name
+                or "rotary_emb.sin_cached" in name
+                or (self.config.tie_word_embeddings and "lm_head.weight" in name)
+            ):
+                continue
+            if name.endswith(".bias") and name not in params_dict:
+                mapped_bias = any(
+                    source_name in name
+                    and name.replace(source_name, fused_name) in params_dict
+                    for fused_name, source_name, _ in STANDARD_STACKED_MAPPING.mappings
+                )
+                if not mapped_bias:
+                    continue
+            target = STANDARD_STACKED_MAPPING.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target not in params_dict:
+                    if target.endswith(".bias"):
+                        continue
+                    raise ValueError(f"Mapped parameter {target!r} not found")
+                loaded.add(target)
+                continue
+            for param_name, weight_name, expert_id in expert_mapping:
+                if weight_name not in name:
+                    continue
+                target = name.replace(weight_name, param_name)
+                param = params_dict.get(target)
+                if param is None:
+                    raise ValueError(f"Mapped parameter {target!r} not found")
+                param.weight_loader(
+                    param, loaded_weight, weight_name, expert_id=expert_id
+                )
+                loaded.add(target)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded.add(name)
+        return loaded
 
 
 EntryClass = MiniCPMForCausalLM

@@ -525,6 +525,13 @@ class Cohere2MoeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -613,6 +620,63 @@ class Cohere2MoeForCausalLM(nn.Module):
             loaded_params.add(name)
 
         return loaded_params
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            ExpertParamsDispatch,
+            STANDARD_GATE_UP_MAPPING,
+            STANDARD_QKV_MAPPING,
+        )
+
+        params_dict = dict(self.named_parameters())
+        expert_dispatch = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self.config.num_experts
+        )
+        dispatched: set[str] = set()
+
+        def remaining_weights():
+            for name, loaded_weight in weights:
+                if "rotary_emb.inv_freq" in name or "lm_head.weight" in name:
+                    continue
+                if (name.endswith(".bias") or name.endswith("_bias")) and (
+                    name not in params_dict
+                    and name.replace("q_proj", "qkv_proj") not in params_dict
+                    and name.replace("gate_proj", "gate_up_proj")
+                    not in params_dict
+                ):
+                    continue
+
+                target = STANDARD_QKV_MAPPING.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if "mlp.experts" not in name:
+                    target = STANDARD_GATE_UP_MAPPING.try_load(
+                        name, loaded_weight, params_dict
+                    )
+                    if target is not None:
+                        if target in params_dict:
+                            dispatched.add(target)
+                        continue
+
+                target = expert_dispatch.try_load(name, loaded_weight, params_dict)
+                if target is not None:
+                    if target in params_dict:
+                        dispatched.add(target)
+                    continue
+
+                if name in params_dict:
+                    yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        return loaded | dispatched
 
 
 EntryClass = Cohere2MoeForCausalLM

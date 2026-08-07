@@ -439,6 +439,13 @@ class IQuestLoopCoderForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -492,6 +499,54 @@ class IQuestLoopCoderForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_STACKED_MAPPING
+
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if name.startswith("gate_projections."):
+                if name.endswith(".weight"):
+                    target = name.replace(".weight", ".gate_proj.weight")
+                elif name.endswith(".bias"):
+                    target = name.replace(".bias", ".gate_proj.bias")
+                else:
+                    continue
+                param = params_dict.get(target)
+                if param is None:
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded.add(target)
+                continue
+            stacked_match = next(
+                (
+                    name.replace(source_name, fused_name)
+                    for fused_name, source_name, _ in STANDARD_STACKED_MAPPING.mappings
+                    if source_name in name
+                ),
+                None,
+            )
+            if stacked_match is not None and stacked_match not in params_dict:
+                continue
+            target = STANDARD_STACKED_MAPPING.try_load(name, loaded_weight, params_dict)
+            if target is not None:
+                if target not in params_dict:
+                    if target.endswith(".bias"):
+                        continue
+                    raise ValueError(f"Mapped parameter {target!r} not found")
+                loaded.add(target)
+                continue
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded.add(name)
+        return loaded
 
 
 # Entry class for model registration

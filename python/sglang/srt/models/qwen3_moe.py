@@ -242,6 +242,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        self._ckpt_num_experts = config.num_experts
+
         from sglang.srt.layers.quantization.gguf import GGUFConfig
 
         norm_topk_prob = getattr(config, "norm_topk_prob", True)
@@ -429,6 +431,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            load_moe_sparse_block_weights,
+        )
+
+        expert = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self._ckpt_num_experts,
+        )
+        return load_moe_sparse_block_weights(self, weights, expert_dispatch=expert)
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -706,6 +719,14 @@ class Qwen3MoeAttention(nn.Module):
             forward_batch=forward_batch,
         )
         return self.forward_core(s)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
@@ -1102,6 +1123,15 @@ class Qwen3MoeForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get() and not is_mtp:
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights, is_mtp=is_mtp)
+
+    def _legacy_load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1230,6 +1260,35 @@ class Qwen3MoeForCausalLM(nn.Module):
                     )
                 }
             )
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["rotary_emb.inv_freq", "mtp"],
+            ignore_unexpected_suffixes=[".bias"],
+        )
+        loaded = loader.load_weights(weights)
+        if not hasattr(self, "routed_experts_weights_of_layer"):
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(self.start_layer, self.end_layer)
+                    if isinstance(
+                        self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock
+                    )
+                }
+            )
+        return loaded
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
