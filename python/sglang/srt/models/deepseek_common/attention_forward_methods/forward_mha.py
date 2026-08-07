@@ -50,6 +50,8 @@ if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
+else:
+    from sglang.srt.layers.attention.merge_state import merge_state as merge_state_v2
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant

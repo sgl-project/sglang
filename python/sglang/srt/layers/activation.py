@@ -208,6 +208,33 @@ class SituAndMul(BaseFusedOp):
 
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        """ROCm cannot build the JIT kernel `forward_cuda` dispatches to.
+
+        `kernels/jit/csrc/kimi_k3/situ_and_mul.cuh` includes `<cuda_fp8.h>` and
+        uses `fp8_e4m3_t`, whose `DTypeTrait` is itself behind `#ifndef USE_ROCM`
+        -- so dropping the include only moves the failure to a missing trait.
+        Without this override `MultiPlatformOp` falls back to `forward_cuda` and
+        the build fails inside CUDA-graph capture, surfacing as
+        `Capture cuda graph failed: ninja exited with status 1` rather than as a
+        missing-kernel error.
+
+        The Triton twin SGLang already ships is arithmetically identical
+        (`_tl_tanh(x) = 2*sigmoid(2x)-1`) and stays a single fused elementwise
+        kernel, which is why it is preferred over `forward_native` -- that path
+        is ~8 separate elementwise kernels on fp32 upcasts, and this op runs once
+        per dense/shared-expert MLP per step.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            situ_and_mul as triton_situ_and_mul,
+        )
+
+        d = x.shape[-1] // 2
+        flat = x.reshape(-1, x.shape[-1])
+        out = torch.empty((flat.shape[0], d), dtype=x.dtype, device=x.device)
+        triton_situ_and_mul(out, flat, self.beta, self.linear_beta)
+        return out.reshape(*x.shape[:-1], d)
+
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
 
