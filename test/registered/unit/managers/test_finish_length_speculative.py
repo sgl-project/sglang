@@ -120,6 +120,17 @@ class TestFinishLengthSpeculative(CustomTestCase):
         self.assertEqual(req.finished_len, 4)
         self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, 20])
 
+    def test_missing_vocab_size_still_finishes_by_length(self):
+        # Prefill-only embedding and scoring requests do not set vocab_size.
+        # They must reach the length check without attempting an upper-bound
+        # comparison against None.
+        req = _make_req([10], max_new_tokens=0, vocab_size=None)
+        req.update_finish_state()
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
+        self.assertEqual(req.finished_len, 0)
+        self.assertEqual(list(req.output_ids_through_stop), [])
+
     def test_eos_at_cap_boundary_reports_stop(self):
         # Tie case (also non-spec: new_accepted_len=1): the EOS is exactly the
         # max_new_tokens-th token. The emitted tokens are identical either way;
