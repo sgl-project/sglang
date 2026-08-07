@@ -757,6 +757,12 @@ class MQALayer(MqaAttentionBase):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
+        if envs.SGLANG_DSV4_BF16_KV.get():
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            attn_backend.store_cache(
+                layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
+            )
+            return
         if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
@@ -854,8 +860,6 @@ class MQALayer(MqaAttentionBase):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -866,6 +870,12 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is produced on the current stream and consumed asynchronously
+        # by stream_kv. Keep the allocation alive until the current stream has
+        # been ordered after stream_kv; otherwise CUDA Graph's memory pool may
+        # reuse it for _compute_q_b while the KV branch is still reading it.
+        del qkv_a
 
         return q
 
@@ -956,6 +966,7 @@ class MQALayer(MqaAttentionBase):
                 swa_page_size=swa_page_size,
                 q_out=q_out,
                 dtype=x.dtype,
+                bf16_store=envs.SGLANG_DSV4_BF16_KV.get(),
             )
         else:
             q_lora = self.q_norm(q_lora)
@@ -1042,7 +1053,7 @@ class MQALayer(MqaAttentionBase):
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
                 swa_page_size, bf16_store = (
                     token_to_kv_pool.swa_kv_pool.page_size,
-                    False,
+                    envs.SGLANG_DSV4_BF16_KV.get(),
                 )
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (

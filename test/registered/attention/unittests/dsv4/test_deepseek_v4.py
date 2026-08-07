@@ -553,6 +553,41 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 )
 
 
+class TestDSV4Bf16SparseDecodeInputs(CustomTestCase):
+    def test_short_extra_region_does_not_create_hole_before_swa(self):
+        from sglang.srt.layers.attention.dsv4.bf16_kv_cache import (
+            build_bf16_sparse_decode_inputs,
+        )
+
+        page_size = 8
+        cache = torch.arange(
+            2 * page_size * 512, dtype=torch.int32
+        ).reshape(2, page_size * 512).to(torch.bfloat16)
+        extra_indices = torch.arange(8, dtype=torch.int32).view(1, 8)
+        swa_indices = torch.arange(8, 12, dtype=torch.int32).view(1, 4)
+
+        workspace, indices, lengths = build_bf16_sparse_decode_inputs(
+            swa_cache=cache,
+            swa_indices=swa_indices,
+            swa_lengths=torch.tensor([3], dtype=torch.int32),
+            swa_page_size=page_size,
+            extra_cache=cache,
+            extra_indices=extra_indices,
+            extra_lengths=torch.tensor([2], dtype=torch.int32),
+            extra_page_size=page_size,
+        )
+
+        self.assertEqual(lengths.tolist(), [5])
+        self.assertEqual(indices[0, 0, :5].tolist(), [0, 1, 2, 3, 4])
+        self.assertTrue((indices[0, 0, 5:] == -1).all())
+        rows = workspace.view(-1, 1, 512)[:, 0]
+        torch.testing.assert_close(rows[0], cache.view(-1, 512)[0])
+        torch.testing.assert_close(rows[1], cache.view(-1, 512)[1])
+        torch.testing.assert_close(rows[2], cache.view(-1, 512)[8])
+        torch.testing.assert_close(rows[3], cache.view(-1, 512)[9])
+        torch.testing.assert_close(rows[4], cache.view(-1, 512)[10])
+
+
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
 

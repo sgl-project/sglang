@@ -46,6 +46,10 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
+from sglang.srt.layers.attention.dsv4.bf16_kv_cache import (
+    build_bf16_sparse_decode_inputs,
+    gather_bf16_kv_cache_paged,
+)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -1591,6 +1595,13 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        if envs.SGLANG_DSV4_BF16_KV.get():
+            self.token_to_kv_pool.set_swa_key_buffer_radix_bf16(
+                layer_id=layer_id,
+                swa_loc=swa_loc,
+                cache_k=swa_k,
+            )
+            return
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
@@ -1643,6 +1654,20 @@ class DeepseekV4AttnBackend(
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+
+            if envs.SGLANG_DSV4_BF16_KV.get() and not (
+                forward_batch.forward_mode.is_extend_without_speculative()
+            ):
+                return self._forward_sparse_bf16(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    token_to_kv_pool=token_to_kv_pool,
+                    core_attn_metadata=core_attn_metadata,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                )
 
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
@@ -1705,6 +1730,7 @@ class DeepseekV4AttnBackend(
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                    or envs.SGLANG_DSV4_BF16_KV.get()
                 )
             ):
                 return self._forward_prefill_sparse(
@@ -1761,6 +1787,53 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_sparse_bf16(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run sparse decode against the plain BF16 SWA/compressed caches."""
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+        if q.ndim == 3:
+            q = q.unsqueeze(1)
+        assert q.ndim == 4
+        assert attn_sink is not None
+
+        extra_cache = None
+        extra_page_size = None
+        if compress_ratio != 0:
+            assert extra_indices is not None and extra_topk_lengths is not None
+            extra_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+
+        workspace, indices, lengths = build_bf16_sparse_decode_inputs(
+            swa_cache=token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            swa_indices=core_attn_metadata.swa_page_indices,
+            swa_lengths=core_attn_metadata.swa_topk_lengths,
+            swa_page_size=token_to_kv_pool.swa_page_size,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            extra_lengths=extra_topk_lengths,
+            extra_page_size=extra_page_size,
+        )
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q.squeeze(1),
+            kv=workspace,
+            indices=indices,
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=lengths,
+        )
+        return o
 
     def _forward_prefill_sparse(
         self,
@@ -1846,19 +1919,34 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+        if envs.SGLANG_DSV4_BF16_KV.get():
+            if compressed_slice is not None:
+                gather_bf16_kv_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            gather_bf16_kv_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(
