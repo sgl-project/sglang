@@ -132,10 +132,8 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-# in_proj_ba is tiny and reads the same activation as in_proj_qkvz, so on its own it is
-# nearly all launch overhead. Merge them into one GEMM.
-_fuse_gdn_qkvzba = get_bool_env_var("SGLANG_GDN_FUSE_QKVZBA", "False")
-# Output-tile granularity the a8w8 GEMMs want from the merged N.
+# in_proj_ba is tiny and shares in_proj_qkvz's input; merging saves a launch. AMD-only.
+_fuse_gdn_qkvzba = get_bool_env_var("SGLANG_GDN_FUSE_QKVZBA", "False") and _is_hip
 _GEMM_N_ALIGN = 128
 _is_amx_available = cpu_has_amx_support()
 
@@ -199,7 +197,6 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 
 
 def _gdn_input_proj_stacked_mapping(model: nn.Module):
-    """Shard mapping for whichever input-projection layout was built."""
     if any("in_proj_qkvzba." in name for name, _ in model.named_parameters()):
         return [
             ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
@@ -285,8 +282,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # projection of the input hidden states, merged into one GEMM when qkvz and ba
-        # share a quantization scheme
+        # projection of the input hidden states
         self.qkvz_width = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
         self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
         self.in_proj_qkvz = None
@@ -568,13 +564,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> Optional[MergedColumnParallelLinear]:
-        """Both input projections as one GEMM, or None to keep them separate.
-
-        Returns None unless all four checkpoint shards share a quantization scheme, which
-        ``_find_matched_config`` enforces by raising. b and a leave N ragged, so it is
-        padded up to ``_GEMM_N_ALIGN``.
-        """
-        if not _fuse_gdn_qkvzba or _is_cpu or _is_npu:
+        """Both input projections as one GEMM, or None to keep them separate."""
+        if not _fuse_gdn_qkvzba:
             return None
         lora = get_lora()
         if bool(lora.lora_paths) or lora.enable_lora:
@@ -614,7 +605,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     @property
     def qkvz_proj(self) -> nn.Module:
-        """The module producing qkvz, merged or not."""
         return (
             self.in_proj_qkvzba
             if self.in_proj_qkvzba is not None
@@ -652,8 +642,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        # Merged, one GEMM serves both projections, taking either a plain tensor or the
-        # tuple the fused AR+RMSNorm+quant path hands over.
         if self.in_proj_qkvzba is not None:
             hs = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvzba)
             projected_states, _ = self.in_proj_qkvzba(hs)

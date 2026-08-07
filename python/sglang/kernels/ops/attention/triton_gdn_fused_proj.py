@@ -264,8 +264,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
 ):
     """Fused split/reshape/cat for CONTIGUOUS input format (Qwen3.5).
 
-    Rows are addressed by the tensors' own strides, so the inputs may be column slices
-    of a wider projection rather than tensors of their own.
+    Rows are addressed by each tensor's own stride, so inputs may be column slices of
+    a wider projection.
 
     Input layout:
         mixed_qkvz: [all_q | all_k | all_v | all_z]

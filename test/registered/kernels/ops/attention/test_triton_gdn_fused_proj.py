@@ -1,8 +1,5 @@
-"""Tests for the Qwen3.5 GDN fused split/reshape/cat kernel.
-
-Covers the contiguous variant with dense inputs and with column slices of a wider
-projection, which is what merging in_proj_ba into in_proj_qkvz produces.
-"""
+"""Tests for the Qwen3.5 GDN fused split/reshape/cat kernel, with dense inputs and with
+column slices of a wider projection."""
 
 import sys
 
@@ -31,11 +28,7 @@ def reference_split_reshape_cat(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v)
 
 
 def build_inputs(seq_len, num_heads_qk, num_heads_v, merged):
-    """The qkvz/ba pair, either as separate tensors or as slices of one projection.
-
-    Merging in_proj_ba into in_proj_qkvz makes both arguments column slices of a
-    single GEMM output, so their rows are strided rather than densely packed.
-    """
+    """The qkvz/ba pair, either as separate tensors or as slices of one projection."""
     qkvz_width = 2 * num_heads_qk * HEAD_K_DIM + 2 * num_heads_v * HEAD_V_DIM
     ba_width = 2 * num_heads_v
     torch.manual_seed(0)
@@ -60,7 +53,6 @@ def test_split_reshape_cat_contiguous(seq_len, num_heads_qk, num_heads_v, merged
     )
 
     mixed_qkvz, mixed_ba = build_inputs(seq_len, num_heads_qk, num_heads_v, merged)
-    # The point of the merged case: row stride no longer equals the row width.
     assert (mixed_qkvz.stride(0) != mixed_qkvz.shape[1]) == merged
 
     out = fused_qkvzba_split_reshape_cat_contiguous(
