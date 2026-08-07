@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
-    MAX_SCHEDULER_RECV_TIMEOUT_MS,
+    MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -53,18 +53,26 @@ _CONTROL_REQ_TYPES = (
 )
 
 
-def _configure_recv_timeout(socket: Any, timeout_ms: int) -> None:
+def _configure_recv_timeout(socket: Any, timeout_ms: int | None) -> None:
+    if timeout_ms is None:
+        return
+    max_timeout_ms = MAX_SCHEDULER_RPC_TIMEOUT_S * 1000
     if (
         not isinstance(timeout_ms, int)
         or isinstance(timeout_ms, bool)
-        or not (timeout_ms == -1 or 0 < timeout_ms <= MAX_SCHEDULER_RECV_TIMEOUT_MS)
+        or not 0 < timeout_ms <= max_timeout_ms
     ):
         raise ValueError(
-            "timeout_ms must be -1 or an integer between "
-            f"1 and {MAX_SCHEDULER_RECV_TIMEOUT_MS}"
+            f"timeout_ms must be None or an integer between 1 and {max_timeout_ms}"
         )
-    if timeout_ms > 0:
-        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+
+
+def _resolve_timeout_ms(server_args: ServerArgs, timeout_ms: int | None) -> int | None:
+    if timeout_ms is not None:
+        return timeout_ms
+    timeout_s = server_args.scheduler_rpc_timeout
+    return None if timeout_s is None else timeout_s * 1000
 
 
 async def run_zeromq_broker(server_args: ServerArgs):
@@ -78,26 +86,32 @@ async def run_zeromq_broker(server_args: ServerArgs):
     socket.bind(broker_endpoint)
     logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
 
-    while True:
-        try:
-            # 1. Receive a request from an offline client
-            payload = await socket.recv()
-            request_batch = pickle.loads(payload)
-            logger.debug("Broker received an offline job from a client.")
-
-            # 2. Forward the request to the main Scheduler via the shared client
-            response_batch = await async_scheduler_client.forward(request_batch)
-
-            # 3. Send the Scheduler's reply back to the offline client
-            await socket.send(pickle.dumps(response_batch))
-
-        except Exception as e:
-            logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
-            # A reply must be sent to prevent the client from hanging
+    try:
+        while True:
             try:
-                await socket.send(pickle.dumps({"status": "error", "message": str(e)}))
-            except Exception:
-                pass
+                # 1. Receive a request from an offline client
+                payload = await socket.recv()
+                request_batch = pickle.loads(payload)
+                logger.debug("Broker received an offline job from a client.")
+
+                # 2. Forward the request to the main Scheduler via the shared client
+                response_batch = await async_scheduler_client.forward(request_batch)
+
+                # 3. Send the Scheduler's reply back to the offline client
+                await socket.send(pickle.dumps(response_batch))
+
+            except Exception as e:
+                logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
+                # A reply must be sent to prevent the client from hanging
+                try:
+                    await socket.send(
+                        pickle.dumps({"status": "error", "message": str(e)})
+                    )
+                except Exception:
+                    pass
+    finally:
+        socket.close(linger=0)
+        ctx.destroy(linger=0)
 
 
 def _session_key(batch: Any) -> str | None:
@@ -157,11 +171,7 @@ class SchedulerClient:
         socket = self.context.socket(zmq.REQ)
         try:
             socket.setsockopt(zmq.LINGER, 0)
-            effective_timeout = (
-                self.server_args.scheduler_recv_timeout_ms
-                if timeout_ms is None
-                else timeout_ms
-            )
+            effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
             socket.send_pyobj(batch)
@@ -273,11 +283,7 @@ class AsyncSchedulerClient:
         socket = self.context.socket(zmq.REQ)
         try:
             socket.setsockopt(zmq.LINGER, 0)
-            effective_timeout = (
-                self.server_args.scheduler_recv_timeout_ms
-                if timeout_ms is None
-                else timeout_ms
-            )
+            effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
             await socket.send(pickle.dumps(batch))

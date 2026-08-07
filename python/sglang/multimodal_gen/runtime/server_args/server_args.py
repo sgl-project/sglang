@@ -71,8 +71,7 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
-DEFAULT_SCHEDULER_RECV_TIMEOUT_MS = 6_000_000
-MAX_SCHEDULER_RECV_TIMEOUT_MS = 2_147_483_647
+MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
@@ -247,7 +246,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
-    scheduler_recv_timeout_ms: int = DEFAULT_SCHEDULER_RECV_TIMEOUT_MS
+    scheduler_rpc_timeout: int | None = None
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -487,7 +486,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
-        self._validate_scheduler_recv_timeout()
+        self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
         if not current_platform.is_cpu():
@@ -497,16 +496,18 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_breakable_cuda_graph()
         self.pipeline_config.validate_server_args(self)
 
-    def _validate_scheduler_recv_timeout(self) -> None:
-        timeout_ms = self.scheduler_recv_timeout_ms
+    def _validate_scheduler_rpc_timeout(self) -> None:
+        timeout = self.scheduler_rpc_timeout
+        if timeout is None:
+            return
         if (
-            not isinstance(timeout_ms, int)
-            or isinstance(timeout_ms, bool)
-            or not (timeout_ms == -1 or 0 < timeout_ms <= MAX_SCHEDULER_RECV_TIMEOUT_MS)
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 0 < timeout <= MAX_SCHEDULER_RPC_TIMEOUT_S
         ):
             raise ValueError(
-                "scheduler_recv_timeout_ms must be -1 or an integer between "
-                f"1 and {MAX_SCHEDULER_RECV_TIMEOUT_MS}"
+                "scheduler_rpc_timeout must be None or an integer between "
+                f"1 and {MAX_SCHEDULER_RPC_TIMEOUT_S} seconds"
             )
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
@@ -1570,13 +1571,13 @@ class ServerArgs(DisaggServerArgsMixin):
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
         parser.add_argument(
-            "--scheduler-recv-timeout-ms",
+            "--scheduler-rpc-timeout",
             type=int,
-            default=ServerArgs.scheduler_recv_timeout_ms,
+            default=ServerArgs.scheduler_rpc_timeout,
             help=(
-                "Timeout in milliseconds for waiting on a scheduler response over ZMQ. "
-                "Set to -1 to block indefinitely. The default is "
-                f"{DEFAULT_SCHEDULER_RECV_TIMEOUT_MS} (100 minutes)."
+                "Optional end-to-end timeout in seconds for a scheduler RPC, including "
+                "time spent in the scheduler queue. By default no transport-level "
+                "deadline is imposed; callers may still cancel their request."
             ),
         )
 

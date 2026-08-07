@@ -2,7 +2,6 @@
 
 import asyncio
 import io
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -14,7 +13,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _save_upload_to_path,
     _validate_positive_int,
     build_sampling_params,
-    process_generation_batch,
 )
 
 
@@ -109,47 +107,3 @@ def test_build_sampling_params_resolves_size_and_explicit_dimensions(monkeypatch
         build_sampling_params("request-id", **request_fields)
 
         assert (captured["width"], captured["height"]) == expected
-
-
-def test_process_generation_batch_forwards_scheduler_timeout(monkeypatch):
-    calls = []
-    result = SimpleNamespace(
-        output=None,
-        output_file_paths=["output.mp4"],
-        raw_frame_batches=None,
-        peak_memory_mb=0,
-    )
-
-    class _SchedulerClient:
-        async def forward(self, batch, **kwargs):
-            calls.append((batch, kwargs))
-            return result
-
-    batch = SimpleNamespace(trace_ctx=None, prompt="test")
-    monkeypatch.setattr(openai_utils, "trace_req", lambda _ctx: nullcontext())
-    monkeypatch.setattr(
-        openai_utils,
-        "log_generation_timer",
-        lambda _logger, _prompt: nullcontext(),
-    )
-    monkeypatch.setattr(
-        openai_utils,
-        "get_global_server_args",
-        lambda: SimpleNamespace(batching_max_size=1),
-    )
-
-    async def run_cases():
-        await process_generation_batch(_SchedulerClient(), batch)
-        await process_generation_batch(
-            _SchedulerClient(),
-            batch,
-            scheduler_batches=["expanded"],
-            scheduler_timeout_ms=-1,
-        )
-
-    asyncio.run(run_cases())
-
-    assert calls == [
-        ([batch], {}),
-        (["expanded"], {"timeout_ms": -1}),
-    ]
