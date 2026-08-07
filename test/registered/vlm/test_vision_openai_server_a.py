@@ -20,7 +20,7 @@ from sglang.test.vlm_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=520, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -43,13 +43,13 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     extra_args = ["--cuda-graph-max-bs-decode=4"]
 
 
-class TestContextLengthServer(CustomTestCase):
-    """The context-length rejection path is model-agnostic, so it rides the
-    cheapest VLM in this file rather than its own 7B launch."""
-
+class TestQwen2VLContextLengthServer(CustomTestCase):
+    # --context-length 300 is calibrated to this model's mm-token expansion:
+    # it must sit above the warmup image's expanded length but below the test
+    # image's. A cheaper VLM needs the bound recalibrated, not just swapped.
     @classmethod
     def setUpClass(cls):
-        cls.model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
