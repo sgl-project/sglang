@@ -227,6 +227,40 @@ class FullComponent(TreeComponent):
         self._evict_device_heap = []
         self._evict_device_last_node = None
 
+    def reclaim_coexisting_host_values(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Reclaim Full host values, preserving imminent demotes first."""
+        ct = self.component_type
+        swept_ids: list[NodeId] = []
+        for spare_imminent_demotes in (True, False):
+            if tracker[ct] >= num_tokens:
+                break
+            for node in self.tree_core.full_host_duplicates.values():
+                if tracker[ct] >= num_tokens:
+                    break
+                cd = node.component_data[ct]
+                if cd.value is None or cd.host_value is None:
+                    swept_ids.append(node.id)
+                    continue
+                if (
+                    spare_imminent_demotes
+                    and node in self.tree_core.evictable_device_leaves
+                ):
+                    continue
+                if not self.tree_core._can_reclaim_host_duplicate(node, ct):
+                    continue
+                self.tree_core._release_host_duplicate(
+                    node, ct, tracker, device_frees, host_frees
+                )
+                swept_ids.append(node.id)
+        for node_id in swept_ids:
+            self.tree_core.full_host_duplicates.pop(node_id, None)
+
     def drive_host_eviction(
         self,
         num_tokens: int,

@@ -2787,7 +2787,7 @@ class UnifiedRadixCacheSuite:
                 if cd.value is not None and cd.host_value is None:
                     cd.host_value = cd.value.clone()
             # A real backup registers duplicate tracking at its ack.
-            cache.tree_core._update_duplicate_tracking(ancestor)
+            cache.tree_core._update_full_host_duplicate_tracking(ancestor)
 
     def _simulate_backup_tree(self, cache):
         """Backup all non-root nodes (simulates write-through)."""
@@ -3542,6 +3542,72 @@ class UnifiedRadixCacheSuite:
                 continue
             # the drain must return every freed host value to the pool
             self.assertGreater(pool.available_size(), available_before)
+
+    def test_write_back_host_eviction_reclaims_device_resident_copies(self):
+        """Reclaim duplicates when normal host eviction has no candidates."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        self._backup_node(cache, chain[-1])
+        self.assertFalse(cache.tree_core.evictable_host_leaves)
+
+        host_pool_attr = {
+            ComponentType.FULL: "full_kv_pool_host",
+            ComponentType.SWA: "swa_kv_pool_host",
+        }
+        for ct in (ComponentType.FULL, ComponentType.SWA):
+            if ct not in cache.tree_components:
+                continue
+            pool = getattr(cache, host_pool_attr[ct])
+            duplicated = [
+                node
+                for node in chain
+                if node.component_data[ct].value is not None
+                and node.component_data[ct].host_value is not None
+            ]
+            if pool is None or not duplicated:
+                continue
+            if ct != ComponentType.FULL:
+                self.assertFalse(cache.tree_core.host_lru_lists[ct].cache)
+            available_before = pool.available_size()
+            self.assertGreater(cache.evict_host(pool.size, ct), 0)
+            self.assertGreater(pool.available_size(), available_before)
+            for node in duplicated:
+                self.assertIsNotNone(node.component_data[ct].value)
+                self.assertIsNone(node.component_data[ct].host_value)
+        cache.sanity_check()
+
+    def test_backup_skips_existing_aux_host_values(self):
+        if not self.cfg.has_swa and not self.cfg.has_mamba:
+            self.skipTest("requires an auxiliary component")
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        self._backup_node(cache, chain[-1])
+
+        for ct in (ComponentType.SWA, ComponentType.MAMBA):
+            if ct not in cache.tree_components:
+                continue
+            coexisting = [
+                node
+                for node in chain
+                if node.component_data[ct].value is not None
+                and node.component_data[ct].host_value is not None
+            ]
+            self.assertTrue(coexisting)
+            component = cache.components[ct]
+            for node in coexisting:
+                self.assertIsNone(
+                    component.build_hicache_transfers(
+                        node, CacheTransferPhase.BACKUP_HOST
+                    )
+                )
 
     def test_hicache_mamba_host_best_match_keeps_device_anchor(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
