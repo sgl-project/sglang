@@ -71,9 +71,6 @@ local_runtime: Optional[EncoderRuntime] = None
 # and ZMQ; HTTP only keeps the dispatcher handle used by route handlers.
 dp_dispatcher: Optional["DPDispatcher"] = None
 
-# Route handlers need the backend in DP mode too, where `encoder` is None.
-encoder_transfer_backend: Optional[str] = None
-
 
 def is_health_check_request(rid: Optional[str]) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
@@ -200,10 +197,8 @@ def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
 
 def launch_server(server_args: ServerArgs):
     global dp_dispatcher, encoder, encoder_scheduler, local_runtime, send_sockets
-    global encoder_transfer_backend
 
     configure_logger(server_args, prefix=" encode_server")
-    encoder_transfer_backend = server_args.encoder_transfer_backend
     if server_args.dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # encoder_runtime initializes multiprocess metrics before spawning;
@@ -272,10 +267,6 @@ async def handle_encode_request(request: dict):
             # Surface MMError.code (503 when all workers dead) instead of
             # FastAPI's default 500.
             logger.error(f"DP dispatch refused req_id={req_id}: {e}")
-            if encoder_transfer_backend == "mooncake":
-                await encode_server_module.meta_registry.publish(
-                    req_id, 0, 0, 0, error=str(e)
-                )
             return ORJSONResponse(
                 status_code=int(e.code),
                 content={"status": "error", "message": str(e), "req_id": req_id},
@@ -289,11 +280,6 @@ async def handle_encode_request(request: dict):
                 else HTTPStatus.INTERNAL_SERVER_ERROR
             )
             logger.error(f"DP worker error for req_id={req_id}: {result['_error']}")
-            # Fail a blocked metadata puller now instead of at its timeout.
-            if encoder_transfer_backend == "mooncake":
-                await encode_server_module.meta_registry.publish(
-                    req_id, 0, 0, 0, error=result["_error"]
-                )
             return ORJSONResponse(
                 status_code=status_code,
                 content={
@@ -308,82 +294,37 @@ async def handle_encode_request(request: dict):
             f"modality={request.get('modality', 'image')}"
         )
         content = result.get("content")
-        # Republish here: this main process is what serves the receiver's pull.
-        if isinstance(content, dict) and "embedding_size" in content:
-            await encode_server_module.meta_registry.publish(
-                req_id,
-                content["embedding_size"],
-                content["embedding_len"],
-                content["embedding_dim"],
-            )
         return ORJSONResponse(content=content)
 
     try:
-        # A pre-pull receiver sends the same req_id once per TP rank; only the
-        # claimer runs the forward and the rest echo its metadata.
-        if (
-            encoder_transfer_backend == "mooncake"
-            and not await encode_server_module.meta_registry.claim(req_id)
-        ):
-            try:
-                meta = await encode_server_module.meta_registry.wait(req_id)
-            except asyncio.TimeoutError:
-                meta = None
-            if meta is None or meta.get("error") is not None:
-                return ORJSONResponse(
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    content={
-                        "status": "error",
-                        "message": (
-                            meta["error"]
-                            if meta
-                            else "Encode failed on the first request"
-                        ),
-                        "req_id": req_id,
-                    },
-                )
-            # Build the same metadata response as the first request
-            resp = dict(request)
-            del resp["mm_items"]
-            resp.update(
-                {
-                    "embedding_size": meta["embedding_size"],
-                    "embedding_len": meta["embedding_len"],
-                    "embedding_dim": meta["embedding_dim"],
-                }
-            )
-            return ORJSONResponse(content=resp)
-
-        try:
-            if time_stats_json:
-                request["time_stats_json"] = time_stats_json
-            content = await execute_encode_pipeline(
-                encoder,
-                encoder_scheduler,
-                request,
-                send_sockets=send_sockets,
-            )
-        except asyncio.TimeoutError:
-            return ORJSONResponse(
-                status_code=HTTPStatus.GATEWAY_TIMEOUT,
-                content={
-                    "status": "error",
-                    "message": "encoder batch timed out",
-                    "req_id": req_id,
-                },
-            )
-        except MMError as e:
-            return ORJSONResponse(
-                status_code=int(e.code),
-                content={"status": "error", "message": str(e), "req_id": req_id},
-            )
-
+        if time_stats_json:
+            request["time_stats_json"] = time_stats_json
+        content = await execute_encode_pipeline(
+            encoder,
+            encoder_scheduler,
+            request,
+            send_sockets=send_sockets,
+        )
         elapsed = time.monotonic() - start_time
         logger.info(
             f"[{req_id}] /encode completed in {elapsed:.3f}s, "
             f"modality={request.get('modality', 'image')}"
         )
         return ORJSONResponse(content=content)
+    except asyncio.TimeoutError:
+        return ORJSONResponse(
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+            content={
+                "status": "error",
+                "message": "encoder batch timed out",
+                "req_id": req_id,
+            },
+        )
+    except MMError as e:
+        return ORJSONResponse(
+            status_code=int(e.code),
+            content={"status": "error", "message": str(e), "req_id": req_id},
+        )
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
@@ -423,11 +364,6 @@ async def handle_send_request(request: dict):
                 content=f"Encoder DP worker send error: {result['_error']}",
                 status_code=status_code,
             )
-        # The worker frees the embedding on its own count; we hold only metadata.
-        if receive_count:
-            await encode_server_module.meta_registry.note_send_done(
-                req_id, receive_count
-            )
         return ORJSONResponse(content=result.get("content"))
     sent = await encoder.send(
         req_id=req_id,
@@ -459,18 +395,38 @@ async def handle_scheduler_receive_meta_data(request: dict):
     """Decoder pull endpoint for the per-part encode metadata. Blocks until the
     encode publishes its sizes, so a pull that beats the encode simply waits."""
     req_id = request["req_id"]
-    try:
-        meta = await encode_server_module.meta_registry.wait(req_id)
-    except asyncio.TimeoutError:
-        logger.error(f"[{req_id}] /scheduler_receive_meta_data timed out")
-        return ORJSONResponse(
-            status_code=HTTPStatus.GATEWAY_TIMEOUT,
-            content={
-                "status": "error",
-                "message": "encode metadata not ready",
-                "req_id": req_id,
-            },
-        )
+    if dp_dispatcher is not None:
+        try:
+            result = await dp_dispatcher.dispatch_wait_metadata(request)
+        except MMError as e:
+            return ORJSONResponse(
+                status_code=int(e.code),
+                content={"status": "error", "message": str(e), "req_id": req_id},
+            )
+        if result.get("_error"):
+            return ORJSONResponse(
+                status_code=result.get("_error_code")
+                or int(HTTPStatus.INTERNAL_SERVER_ERROR),
+                content={
+                    "status": "error",
+                    "message": result["_error"],
+                    "req_id": req_id,
+                },
+            )
+        meta = result.get("content")
+    else:
+        try:
+            meta = await encode_server_module.meta_registry.wait(req_id)
+        except asyncio.TimeoutError:
+            logger.error(f"[{req_id}] /scheduler_receive_meta_data timed out")
+            return ORJSONResponse(
+                status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                content={
+                    "status": "error",
+                    "message": "encode metadata not ready",
+                    "req_id": req_id,
+                },
+            )
     if meta is None or meta.get("error") is not None:
         message = meta["error"] if meta else "encode metadata missing"
         return ORJSONResponse(
