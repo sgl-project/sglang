@@ -3232,6 +3232,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
+            self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -3276,6 +3277,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+            self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
