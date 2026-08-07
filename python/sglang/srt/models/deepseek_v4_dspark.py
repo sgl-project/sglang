@@ -744,10 +744,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        # The runtime draft window can differ from the checkpoint-native
+        # dspark_block_size (self.gamma): --speculative-dspark-block-size
+        # overrides it everywhere on the static verify path, but this
+        # confidence path (compact / cap-accept mode) still viewed by the
+        # NATIVE gamma, so any configured gamma != native fails decode-graph
+        # capture with a shape error. Derive the window from the tensor
+        # instead so compact mode can run at any configured depth.
+        x_post_hc = x_post_hc.view(bs, -1, x_post_hc.shape[-1])
+        runtime_gamma = x_post_hc.shape[1]
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [anchor_tokens.view(-1, 1), sampled_tokens[:, : runtime_gamma - 1]],
+                dim=1,
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
