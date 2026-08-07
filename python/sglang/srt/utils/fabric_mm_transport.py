@@ -435,7 +435,13 @@ class FabricMmFeatureMemoryPool:
         return chunk
 
     def _release_chunk_locked(self, chunk: _PoolChunk) -> None:
-        self._occupied.pop(chunk.slot, None)
+        active_chunk = self._occupied.get(chunk.slot)
+        if active_chunk != chunk:
+            raise RuntimeError(
+                "Cannot release inactive FABRIC pool chunk "
+                f"(slot={chunk.slot}, generation={chunk.generation})"
+            )
+        del self._occupied[chunk.slot]
         self._available_slots.append(chunk.slot)
         self._available_ranges.append((chunk.start, chunk.end))
 

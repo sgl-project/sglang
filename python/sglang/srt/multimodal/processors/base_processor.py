@@ -182,6 +182,8 @@ class BaseMultimodalProcessor(ABC):
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
+    use_cuda_ipc = False
+    use_fabric_transport = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -386,16 +388,7 @@ class BaseMultimodalProcessor(ABC):
 
     @property
     def use_gpu_feature_transport(self) -> bool:
-        """Whether features use either bounded GPU-resident transport.
-
-        Some processor subclasses and tests construct lightweight instances
-        without calling this base initializer, so derive the compatibility
-        predicate instead of storing another required instance field.
-        """
-        return bool(
-            getattr(self, "use_cuda_ipc", False)
-            or getattr(self, "use_fabric_transport", False)
-        )
+        return self.use_cuda_ipc or self.use_fabric_transport
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.

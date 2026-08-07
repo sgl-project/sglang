@@ -337,6 +337,21 @@ class TestFabricTransportMetadata(CustomTestCase):
         self.assertEqual(first.generation, 1)
         self.assertEqual(second.generation, 2)
 
+    def test_pool_rejects_duplicate_release(self):
+        from sglang.srt.utils.fabric_mm_transport import FabricMmFeatureMemoryPool
+
+        pool = object.__new__(FabricMmFeatureMemoryPool)
+        pool._available_ranges = [(256, 4096)]
+        pool._available_slots = [0]
+        pool._slot_generations = [0]
+        pool._occupied = {}
+
+        chunk = pool._allocate_locked(512)
+        pool._release_chunk_locked(chunk)
+
+        with self.assertRaisesRegex(RuntimeError, "inactive FABRIC pool chunk"):
+            pool._release_chunk_locked(chunk)
+
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
     @staticmethod
