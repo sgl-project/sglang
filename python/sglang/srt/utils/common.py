@@ -4066,6 +4066,11 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # GDN linear attention (Qwen3.5 / Qwen3-Next): the two slices the fused in_proj is
+    # served as, and its output projection.
+    "in_proj_qkvz",
+    "in_proj_ba",
+    "out_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
