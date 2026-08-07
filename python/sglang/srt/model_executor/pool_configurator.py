@@ -152,14 +152,30 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            if eagle_draft_num_layers is None and kvc.server_args.dcp_size > 1:
+                # Under DCP the draft pool is widened dcp_size x regardless of
+                # whether the runner exposes the draft depth; skipping the
+                # budget here lets the widened pool eat the transient headroom
+                # and OOM at the first big prefill. Assume the 1-layer
+                # MTP/nextn-style draft as a floor.
+                eagle_draft_num_layers = 1
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                # Under DCP the draft pool covers the full virtual id space
+                # (dcp_size x the target's physical token count), so each
+                # physical target token budgets dcp_size draft tokens. The
+                # DFLASH branch below folds the same factor into its
+                # draft_num_layers term.
+                draft_replicas = max(int(kvc.server_args.dcp_size), 1)
                 self._cell_size = int(
                     self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    * (
+                        1
+                        + draft_replicas * int(eagle_draft_num_layers) / int(num_layers)
+                    )
                 )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache

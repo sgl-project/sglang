@@ -306,8 +306,10 @@ class ModelRunner:
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = ps.tp_rank % self.dcp_size
+        # The draft model's KV pool is replicated, not sharded: under spec x DCP it
+        # must stay unsharded (dcp_size=1) so its KV pool is not scaled/strided.
+        self.dcp_size = 1 if is_draft_worker else server_args.dcp_size
+        self.dcp_rank = 0 if is_draft_worker else (ps.tp_rank % self.dcp_size)
         self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
@@ -1485,9 +1487,14 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        from sglang.srt.layers.dcp import draft_forward_guard
+
         with (
             canary_ctx,
             step_span_ctx,
+            # Draft forwards run unsharded (dcp_size=1): disable DCP for their
+            # duration so the draft's (MLA) attention + KV write stay full.
+            draft_forward_guard(self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
