@@ -630,6 +630,7 @@ class USPAttention(nn.Module):
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
         qkv_pre_all_to_all: bool = False,
+        seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -664,6 +665,24 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        if seq_lens is not None:
+            assert (
+                attn_mask is None
+                and attn_mask_meta is None
+                and not num_replicated_prefix
+                and not num_replicated_suffix
+                and not num_replicated_kv_prefix
+            ), "Varlen USPAttention does not support masks or replicated tokens"
+            if effective_skip_sp or get_sequence_parallel_world_size() == 1:
+                return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            qkv = torch.cat([q, k, v], dim=0)
+            qkv = _usp_input_all_to_all_varlen(qkv, seq_lens, head_dim=2)
+            qkv = self.attn_impl.preprocess_qkv(qkv, ctx_attn_metadata)
+            q, k, v = qkv.chunk(3, dim=0)
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.postprocess_output(out, ctx_attn_metadata)
+            return _usp_output_all_to_all_varlen(out, seq_lens, head_dim=2)
+
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
