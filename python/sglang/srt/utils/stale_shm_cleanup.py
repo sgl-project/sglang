@@ -76,11 +76,11 @@ def _pid_alive(pid: int) -> bool:
 
 
 def cleanup_stale_shm() -> None:
-    """Unlink shared-memory segments whose creator process is dead.
+    """Unlink leaked shared-memory segments (two reclaim rules above).
 
-    CI-only: gated on SGLANG_IS_IN_CI because the pid-liveness check is only
-    trustworthy when the container runs one job at a time. Best-effort: never
-    raises, since a failed sweep must not block server startup.
+    CI-only: gated on SGLANG_IS_IN_CI because both rules are trustworthy only
+    when the container runs one job at a time. Best-effort: never raises,
+    since a failed sweep must not block server startup.
     """
     try:
         _cleanup_stale_shm_impl()
@@ -112,12 +112,13 @@ def _cleanup_stale_shm_impl() -> None:
         return
     for entry in entries:
         pid = _creator_pid(entry.name)
-        if pid is not None and (pid == os.getpid() or _pid_alive(pid)):
+        if pid is not None:
             # A recycled pid reads as alive, so pid-reuse degrades to
             # under-collection (segment leaks), never to deleting a live
             # segment. Keep that bias when changing this check.
-            continue
-        if pid is None and not entry.name.startswith(_ORPHAN_PREFIXES):
+            if pid == os.getpid() or _pid_alive(pid):
+                continue
+        elif not entry.name.startswith(_ORPHAN_PREFIXES):
             continue
         try:
             size = entry.stat().st_size

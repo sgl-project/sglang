@@ -44,13 +44,13 @@ class TestCleanupStaleShm(unittest.TestCase):
     def _make_segment(self, name: str) -> str:
         shm = shared_memory.SharedMemory(create=True, size=4096, name=name)
         shm.close()
-        self.addCleanup(self._unlink_quiet, name)
+        self.addCleanup(self._unlink_quiet, f"/dev/shm/{name}")
         return name
 
     @staticmethod
-    def _unlink_quiet(name: str):
+    def _unlink_quiet(path: str):
         try:
-            shared_memory.SharedMemory(name=name).unlink()
+            os.unlink(path)
         except FileNotFoundError:
             pass
 
@@ -127,15 +127,8 @@ class TestCleanupStaleShm(unittest.TestCase):
         path = f"/dev/shm/{name}"
         with open(path, "wb") as f:
             f.write(b"\0" * 4096)
-        self.addCleanup(self._unlink_path_quiet, path)
+        self.addCleanup(self._unlink_quiet, path)
         return path
-
-    @staticmethod
-    def _unlink_path_quiet(path: str):
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
 
     @unittest.skipUnless(
         os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1"),
