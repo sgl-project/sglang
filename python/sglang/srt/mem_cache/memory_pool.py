@@ -4742,9 +4742,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int],
     ) -> None:
         """In-flight per-request bf16 key/score tail buffers; kept on the pool, not the Indexer, because they are part of the index cache state."""
-        self._kpool_use_compress = index_kpool > 1 and index_kpool_compress
+        self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
 
-        if not self._kpool_use_compress:
+        if not self.kpool_use_compress:
             self._compress_tail_k = None
             self._compress_tail_score = None
             return
@@ -4787,7 +4787,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert (
-            self._kpool_use_compress
+            self.kpool_use_compress
         ), "get_compress_tail_buffers called when kpool compress is disabled"
         idx = layer_id - self.start_layer
         return (
@@ -4797,7 +4797,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_compress_tail_buf_infos(self):
         """Buffer infos for per-request DSA kpool compress-tail rows."""
-        if not self._kpool_use_compress:
+        if not self.kpool_use_compress:
             return [], [], []
         if self.layer_shard_enabled:
             transfer_layer_ids = [
@@ -4835,7 +4835,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
 
         assert (
-            self._kpool_use_compress
+            self.kpool_use_compress
         ), "kpool_decode_update_index_cache called when kpool compress is disabled"
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
@@ -4867,7 +4867,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """Overwrite per-request tail ring rows after a chunk. ``n_remain == 0``
         means the chunk landed on a pool boundary, no tail carries over."""
         assert (
-            self._kpool_use_compress
+            self.kpool_use_compress
         ), "set_compress_tail_for_request called when kpool compress is disabled"
         idx = layer_id - self.start_layer
         if n_remain > 0:
@@ -4933,7 +4933,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):
-        if not self._kpool_use_compress or req_pool_index is None:
+        if not self.kpool_use_compress or req_pool_index is None:
             return None
 
         tail_k_cpu = []
@@ -4951,7 +4951,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def _load_compress_tail_cpu_copy(self, tail_k_cpu, tail_score_cpu, req_pool_index):
         if (
-            not self._kpool_use_compress
+            not self.kpool_use_compress
             or req_pool_index is None
             or tail_k_cpu is None
             or tail_score_cpu is None
