@@ -468,7 +468,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 # page_size * dcp_size, so this gives each rank 32 contiguous
                 # physical slots per virtual page. 32 measured fastest across
                 # shapes; the extend path stages its own copy with its own page
-                # size (_GLUON_PREFILL_PAGE_SIZE).
+                # size (_DCP_PREFILL_PAGE_SIZE).
                 overrides["page_size"] = 32
             return overrides
         if decode_backend == "cutedsl_mla" or decode_backend is None:

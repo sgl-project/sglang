@@ -1,13 +1,13 @@
-"""Numeric validation of the two-stage gluon DCP target-verify decomposition.
+"""Numeric validation of the two-stage DCP target-verify decomposition.
 
-Under DCP the aiter backend drives aiter's *gluon* ``mla_decode_fwd`` over each
-rank's round-robin KV shard: gluon tiles the query heads, so it serves any
-gathered head count (Kimi-K3 has 96 at tp8 dcp8). gluon's own causal mask is
+Under DCP the aiter backend drives aiter's ``mla_decode_fwd`` over each
+rank's round-robin KV shard: it tiles the query heads, so it serves any
+gathered head count (Kimi-K3 has 96 at tp8 dcp8). Its own causal mask is
 ``seq_offset < (seq_len - num_tokens_per_seq) + query_pos + 1`` where
 ``seq_offset`` is the LOCAL shard index, which is wrong under round-robin
 sharding for ``q_len > 1``. Target-verify is therefore split in two:
 
-  stage A  gluon over the committed shard, with the ``bs x q_len`` verify window
+  stage A  mla_decode_fwd over the committed shard, with the ``bs x q_len`` window
            flattened to ``bs*q_len`` single-token rows so ``num_tokens_per_seq
            == 1`` and the mask degenerates to "attend the whole local shard"
            (every committed token precedes every window token, so no masking is
@@ -17,7 +17,7 @@ sharding for ``q_len > 1``. Target-verify is therefore split in two:
   merge    base-2 LSE merge across ranks, i.e. what ``cp_lse_ag_out_rs_mla``
            does in ``forward_mla``
 
-This test runs the REAL gluon kernel and the REAL reduce/combine helpers against
+This test runs the REAL aiter kernel and the REAL reduce/combine helpers against
 an fp32 full-attention reference. What it guards, none of which any other test
 covers:
 
@@ -26,12 +26,12 @@ covers:
   *silently* wrong output -- no crash, just a slow drift in speculative accept
   length that is easy to misread as draft-quality noise.
 * the LSE log base. ``dense_causal_mla_attn_base2`` rebases its natural-log
-  ``logsumexp`` with ``_LOG2E`` because gluon's reduce and sglang's
+  ``logsumexp`` with ``_LOG2E`` because the aiter reduce and sglang's
   ``correct_attn_out`` both work in base-2. Dropping that factor, or swapping
   ``exp2`` for ``exp`` in ``lse_combine_base2``, silently reweights the merge.
 * the empty-shard path (``prefix_len < dcp_size``, so some ranks own nothing and
   must contribute ``lse = -inf`` rather than poisoning the merge with NaN).
-* the gathered head counts K3 actually runs (96 at tp8 dcp8), which gluon
+* the gathered head counts K3 actually runs (96 at tp8 dcp8), which the kernel
   serves by tiling the query heads; 128 is kept alongside as a control.
 
 Error must also not grow with the shard count: a sharding or merge fault shows
@@ -91,7 +91,7 @@ Q_LENS = [2, 8]
 HEAD_COUNTS = [96, 128]
 
 
-def _aiter_gluon_available() -> bool:
+def _aiter_mla_available() -> bool:
     if not is_hip() or not torch.cuda.is_available():
         return False
     try:
@@ -119,22 +119,22 @@ def _reference(q, k_prefix, k_window, bs, q_len, scaling):
 
 
 def _stage_a(q, shard, shard_lens, bs, q_len, num_heads, scaling):
-    """gluon over one rank's committed shard, flattened to bs*q_len rows."""
-    from aiter.ops.triton.attention.mla import mla_decode_fwd as gluon_mla_decode_fwd
+    """mla_decode_fwd over one rank's committed shard, flattened to bs*q_len rows."""
+    from aiter.ops.triton.attention.mla import mla_decode_fwd
 
-    from sglang.kernels.ops.attention.dcp_gluon_mla_reduce import dcp_gluon_mla_reduce
+    from sglang.kernels.ops.attention.dcp_mla_reduce import dcp_mla_reduce
 
     n_rows = bs * q_len
     max_local = int(shard_lens.max().item())
     if max_local == 0:
-        # Every row's shard is empty; this is what dcp_gluon_mla_reduce emits.
+        # Every row's shard is empty; this is what dcp_mla_reduce emits.
         return (
             torch.zeros(n_rows, num_heads, KV_LORA_RANK, dtype=DTYPE, device=DEV),
             torch.full((n_rows, num_heads), float("-inf"), device=DEV),
         )
 
     max_pages = (max_local + PAGE - 1) // PAGE
-    # Per-request paged shard buffer; the tail page is zero-padded because gluon
+    # Per-request paged shard buffer; the tail page is zero-padded because the kernel
     # reads the whole last page and masks it by seqused_k.
     paged = torch.zeros(bs * max_pages, PAGE, 1, D, dtype=DTYPE, device=DEV)
     block_tables = torch.zeros(bs, max_pages, dtype=torch.int32, device=DEV)
@@ -146,7 +146,7 @@ def _stage_a(q, shard, shard_lens, bs, q_len, num_heads, scaling):
 
     seqused = shard_lens.repeat_interleave(q_len).to(torch.int32)
     out = torch.empty(n_rows, num_heads, KV_LORA_RANK, dtype=DTYPE, device=DEV)
-    segm_o, segm_m, segm_e = gluon_mla_decode_fwd(
+    segm_o, segm_m, segm_e = mla_decode_fwd(
         q.view(n_rows, num_heads, D),
         paged,
         out,
@@ -162,7 +162,7 @@ def _stage_a(q, shard, shard_lens, bs, q_len, num_heads, scaling):
         None,
         skip_reduce=True,
     )
-    return dcp_gluon_mla_reduce(segm_o, segm_m, segm_e, seqused, PAGE, DTYPE)
+    return dcp_mla_reduce(segm_o, segm_m, segm_e, seqused, PAGE, DTYPE)
 
 
 def _merge_ranks(outs, lses):
@@ -217,9 +217,9 @@ def _run_config(bs, q_len, num_heads, prefix_len, world_size):
 
 
 @unittest.skipUnless(
-    _aiter_gluon_available(), "requires ROCm + aiter with the gluon MLA kernel"
+    _aiter_mla_available(), "requires ROCm + aiter with the MLA decode kernel"
 )
-class TestGluonDcpVerifyDecomposition(CustomTestCase):
+class TestDcpVerifyDecomposition(CustomTestCase):
     def test_matches_full_attention_reference(self):
         """Two-stage verify == fp32 full attention, across the DCP grid."""
         for prefix_len, world_size, q_len, num_heads in itertools.product(

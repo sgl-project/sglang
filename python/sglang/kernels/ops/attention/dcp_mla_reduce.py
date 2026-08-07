@@ -12,9 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Split-KV reduce for aiter's gluon MLA decode, emitting per-(token, head) LSE.
+"""Split-KV reduce for aiter's MLA decode, emitting per-(token, head) LSE.
 
-aiter's gluon ``mla_decode_fwd(..., skip_reduce=True)`` returns the per-segment
+aiter's ``mla_decode_fwd(..., skip_reduce=True)`` returns the per-segment
 partials ``(segm_output, segm_max, segm_expsum)`` but its own reduce kernel only
 writes the merged ``output`` — no LSE. Decode context parallel (DCP) needs the
 LSE of each rank's KV shard to merge partial attention across ranks
@@ -62,7 +62,7 @@ def build_dcp_block_table(
     max_cols: int,
 ):
     """Scatter a ragged (kv_indptr, kv_indices) shard into a 2D block table
-    ``[bs, max_cols]`` for aiter's gluon ``mla_decode_fwd`` (block_size == 1,
+    ``[bs, max_cols]`` for aiter's ``mla_decode_fwd`` (block_size == 1,
     so each entry is a physical KV slot). Unused tail columns stay 0 and are
     never read (bounded by ``seqused_k``)."""
     block_tables = torch.zeros(
@@ -89,9 +89,9 @@ def build_dcp_page_table(
     dcp_rank: int,
     out: Optional[torch.Tensor] = None,
 ):
-    """Build this rank's PAGE table for aiter's gluon ``mla_decode_fwd``.
+    """Build this rank's PAGE table for aiter's ``mla_decode_fwd``.
 
-    gluon derives its KV tile straight from the paged block size
+    mla_decode_fwd derives its KV tile straight from the paged block size
     (``TILE_SIZE == block_size``; the MLA kernel asserts
     ``NUM_BLOCKS_GATHER_PER_TILE == 1``), so a block size of 1 collapses every
     tile to a single token: measured on gfx950 that is ~19x slower than a block
@@ -106,7 +106,7 @@ def build_dcp_page_table(
     tile match the page.
 
     ``local_kv_lens`` is this rank's shard length per request, in TOKENS
-    (gluon's ``seqused_k``); the table itself is indexed in pages.
+    (the kernel's ``seqused_k``); the table itself is indexed in pages.
     """
     if out is None:
         out = torch.zeros(bs, max_pages, dtype=torch.int32, device=req_to_token.device)
@@ -159,11 +159,11 @@ def pack_dcp_kv_into_pages(
     page_size: int,
 ):
     """Repack the per-forward ``dcp_kv_buffer`` into a paged staging buffer for
-    aiter's gluon ``mla_prefill_fwd``.
+    aiter's ``mla_prefill_fwd``.
 
     The assembled buffer is laid out as [all requests' gathered prefixes | all
     requests' extend tokens], so a request's sequence is split across two
-    regions and cannot be addressed by page (gluon requires every page but the
+    regions and cannot be addressed by page (the kernel requires every page but the
     sequence's last to be full). Repacking into per-request page-aligned regions
     lets the KV tile match the page: the kernel takes TILE_SIZE straight from
     the block size, and at block size 1 a 16384x16384 chunk measured 5156 ms vs
@@ -188,7 +188,7 @@ def pack_dcp_kv_into_pages(
     )
 
     n_pages = int(pages.sum().item())
-    # zeros, not empty: gluon reads the whole last page of a sequence and masks
+    # zeros, not empty: the kernel reads the whole last page of a sequence and masks
     # by seqused_k, so uninitialized tail rows could feed NaNs into the QK GEMM.
     paged = torch.zeros(
         (n_pages * page_size, 1, dim), dtype=kv_buffer.dtype, device=device
@@ -210,7 +210,7 @@ def pack_dcp_kv_into_pages(
 
 
 @triton.jit
-def _dcp_gluon_mla_reduce_kernel(
+def _dcp_mla_reduce_kernel(
     out_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     lse_ptr,  # [num_tokens, num_query_heads] (base-2)
     segm_output_ptr,  # [num_tokens, num_query_heads, NUM_SEGMENTS, KV_LORA_RANK]
@@ -270,7 +270,7 @@ def _dcp_gluon_mla_reduce_kernel(
     tl.store(lse_ptr + tok * lse_stride0 + head, lse)
 
 
-def dcp_gluon_mla_reduce(
+def dcp_mla_reduce(
     segm_output: torch.Tensor,
     segm_max: torch.Tensor,
     segm_expsum: torch.Tensor,
@@ -278,13 +278,13 @@ def dcp_gluon_mla_reduce(
     tile_size: int,
     out_dtype: torch.dtype,
 ):
-    """Reduce gluon skip_reduce partials to (out, lse2).
+    """Reduce mla_decode_fwd skip_reduce partials to (out, lse2).
 
     Args:
         segm_output: [num_tokens, H, NUM_SEGMENTS, KV_LORA_RANK]
         segm_max / segm_expsum: [num_tokens, H, NUM_SEGMENTS]
         seq_lens: [num_tokens] local (this-rank) kv length per token
-        tile_size: gluon TILE_SIZE (== paged block_size passed to mla_decode_fwd)
+        tile_size: kernel TILE_SIZE (== paged block_size passed to mla_decode_fwd)
     Returns:
         out: [num_tokens, H, KV_LORA_RANK] (out_dtype)
         lse: [num_tokens, H] float32, base-2
@@ -296,7 +296,7 @@ def dcp_gluon_mla_reduce(
     lse = torch.empty(
         num_tokens, num_heads, dtype=torch.float32, device=segm_output.device
     )
-    _dcp_gluon_mla_reduce_kernel[(num_tokens, num_heads)](
+    _dcp_mla_reduce_kernel[(num_tokens, num_heads)](
         out,
         lse,
         segm_output,
