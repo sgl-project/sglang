@@ -113,6 +113,20 @@ class WrapperDispatch(Enum):
     CROSS_ATTENTION = auto()
 
 
+def _is_supported_dflash_fast_plan_topology(
+    plan_kind: str, dispatch_reason: Optional[WrapperDispatch]
+) -> bool:
+    """Whether a DFlash worker's FlashInfer wrapper layout is host-rebuildable."""
+    if plan_kind == "draft":
+        return dispatch_reason in (
+            None,
+            WrapperDispatch.SLIDING_WINDOW,
+        )
+    if plan_kind == "target_verify":
+        return dispatch_reason is None
+    return False
+
+
 @dataclass
 class MultiItemScoringParams:
     """Parameters for multi-item scoring in attention computation.
@@ -815,21 +829,15 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_target_verify()
             and self._enable_dflash_sync_free_decode
-            and (
-                (
-                    self._dflash_fast_plan_kind == "draft"
-                    and self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
-                )
-                or (
-                    self._dflash_fast_plan_kind == "target_verify"
-                    and self.dispatch_reason is None
-                )
+            and _is_supported_dflash_fast_plan_topology(
+                self._dflash_fast_plan_kind, self.dispatch_reason
             )
             and self.prefill_backend == "fa2"
         ):
-            # The draft worker uses two sliding-window wrappers, while the
-            # Qwen3.5 target uses one full-attention FlashInfer wrapper. Both
-            # can rebuild scheduling metadata from CPU-known sequence lengths.
+            # A draft worker may use either a single full-attention wrapper or
+            # the two-wrapper sliding-window layout. The target path currently
+            # supports a single full-attention wrapper. All supported layouts
+            # use DFlashVerifyInput and CPU-rebuildable scheduling metadata.
             for w in self.prefill_cuda_graph_metadata[bs]:
                 w._sglang_dflash_fast_prefill_plan_kind = self._dflash_fast_plan_kind
                 w.begin_forward = partial(fast_prefill_plan, w)
