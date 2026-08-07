@@ -377,6 +377,24 @@ class TestFabricTransportMetadata(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "inactive test pool lease"):
             pool._release_locked(lease)
 
+    def test_pool_shutdown_wakes_recycler_before_returning(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        pool._recycler_stop_event = threading.Event()
+        pool._recycle_thread = threading.Thread(
+            target=pool._recycler_stop_event.wait,
+            args=(60,),
+            daemon=True,
+        )
+        pool._recycle_thread.start()
+
+        pool.shutdown()
+
+        self.assertFalse(pool._recycle_thread.is_alive())
+
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
     @staticmethod

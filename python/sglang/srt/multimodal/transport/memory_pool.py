@@ -2,7 +2,6 @@
 
 import logging
 import threading
-import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -222,7 +221,7 @@ class StreamOrderedMmFeaturePool:
         self._occupied: dict[int, PoolLease] = {}
         self._lock = threading.Lock()
         self._recycle_interval = recycle_interval
-        self._stop_recycler = False
+        self._recycler_stop_event = threading.Event()
         self._recycle_thread = threading.Thread(
             target=self._recycle_loop,
             name=f"{transport_name}MmFeaturePoolRecycler",
@@ -317,7 +316,7 @@ class StreamOrderedMmFeaturePool:
 
     def _recycle_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
-        while not self._stop_recycler:
+        while not self._recycler_stop_event.is_set():
             try:
                 with self._lock, torch.cuda.device(self.device_id):
                     self._recycle_ready_leases_locked()
@@ -327,7 +326,7 @@ class StreamOrderedMmFeaturePool:
                     self.transport_name,
                     exc_info=True,
                 )
-            time.sleep(self._recycle_interval)
+            self._recycler_stop_event.wait(self._recycle_interval)
 
     def copy_tensor(
         self, tensor: torch.Tensor
@@ -363,6 +362,6 @@ class StreamOrderedMmFeaturePool:
         return lease, destination
 
     def shutdown(self) -> None:
-        self._stop_recycler = True
+        self._recycler_stop_event.set()
         if self._recycle_thread.is_alive():
-            self._recycle_thread.join(timeout=1.0)
+            self._recycle_thread.join()
