@@ -682,6 +682,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+                layer.weight.is_shuffled = True
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
@@ -1471,6 +1472,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -1509,6 +1512,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
         elif _use_aiter:
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
@@ -1517,6 +1522,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             t = shuffle_weight(layer.w2_weight, (16, 16))
             layer.w2_weight.copy_(t)
             del t
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available

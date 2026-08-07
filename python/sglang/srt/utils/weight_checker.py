@@ -49,6 +49,7 @@ class CheckEntry(NamedTuple):
 class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
+    is_shuffled: bool = False
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
@@ -202,7 +203,12 @@ class WeightChecker:
     def _model_state(self):
         model = self._get_model()
         yield from model.named_parameters()
-        yield from model.named_buffers()
+        for name, buffer in model.named_buffers():
+            module_name, _, buffer_name = name.rpartition(".")
+            owner = model.get_submodule(module_name) if module_name else model
+            if buffer_name in owner._non_persistent_buffers_set:
+                continue
+            yield name, buffer
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
@@ -293,12 +299,14 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
-        own = {name for name, _ in module.named_parameters(recurse=False)}
-        for name in own:
+        own = dict(module.named_parameters(recurse=False))
+        for name, parameter in own.items():
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
                 quantized_set[prefix + name] = QuantizedWeight(
-                    comparable_cls, prefix + scale
+                    comparable_cls,
+                    prefix + scale,
+                    getattr(parameter, "is_shuffled", False),
                 )
     return quantized_set
 
@@ -322,7 +330,9 @@ def _build_check_entries(
             yield CheckEntry(
                 name,
                 name not in skip_compare_names,
-                qw.comparable_cls(tensor, raw[qw.scale_name]),
+                qw.comparable_cls(
+                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                ),
             )
         else:
             should_compare = name not in skip_compare_names and (
