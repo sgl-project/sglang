@@ -1272,8 +1272,59 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
-                # Invert the spec_scale_global_num_tokens scaling.
-                bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
+                tokens_per_req = self.spec_info.num_tokens_per_req
+                bs = self.batch_size = num_tokens // tokens_per_req
+
+                if (
+                    self.forward_mode.is_target_verify()
+                    and self.extend_seq_lens is None
+                ):
+                    dev = self.seq_lens.device
+                    num_token_non_padded_cpu = (
+                        self.num_token_non_padded_cpu
+                        if self.num_token_non_padded_cpu is not None
+                        else num_tokens
+                    )
+                    assert num_token_non_padded_cpu % tokens_per_req == 0
+                    num_reqs_non_padded = num_token_non_padded_cpu // tokens_per_req
+
+                    self.extend_num_tokens = num_token_non_padded_cpu
+                    self.extend_seq_lens = torch.zeros(
+                        (bs,),
+                        dtype=torch.int32,
+                        device=dev,
+                    )
+                    self.extend_seq_lens[:num_reqs_non_padded] = tokens_per_req
+
+                    self.extend_prefix_lens = torch.zeros(
+                        (bs,),
+                        dtype=self.seq_lens.dtype,
+                        device=dev,
+                    )
+                    self.extend_prefix_lens[:num_reqs_non_padded] = (
+                        self.seq_lens[:num_reqs_non_padded] - tokens_per_req
+                    )
+
+                    self.extend_start_loc = torch.zeros(
+                        (bs,),
+                        dtype=torch.int32,
+                        device=dev,
+                    )
+                    self.extend_start_loc[:num_reqs_non_padded] = torch.arange(
+                        0,
+                        num_token_non_padded_cpu,
+                        tokens_per_req,
+                        dtype=torch.int32,
+                        device=dev,
+                    )
+                    if num_reqs_non_padded < bs:
+                        self.extend_start_loc[num_reqs_non_padded:] = (
+                            num_token_non_padded_cpu
+                        )
+
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu().tolist()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu().tolist()
+                    self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
