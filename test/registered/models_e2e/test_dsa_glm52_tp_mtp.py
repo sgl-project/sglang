@@ -10,7 +10,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
 
 register_cuda_ci(
     est_time=400,
-    stage="base-c",
+    stage="extra-b",
     runner_config="8-gpu-h200",
 )
 
@@ -18,6 +18,10 @@ register_cuda_ci(
 class TestGLM52TPMTP(
     DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin, SpecDecodingMixin
 ):
+    """TP-only counterpart of the per-commit DP-attention launch in
+    test_dsa_glm52_dp_mtp.py. Label-gated: the two differ only by
+    --enable-dp-attention, and DSA + MTP is deployed with DP attention on."""
+
     model = "zai-org/GLM-5.2-FP8"
     mem_fraction_static = 0.8
     bs_1_speed_thres = 150
