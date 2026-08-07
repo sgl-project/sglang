@@ -16,6 +16,12 @@ from uuid import uuid4
 WorkerRole = Literal["denoiser", "vae"]
 WorkerLifecycle = Literal["ready", "draining", "failed"]
 logger = logging.getLogger(__name__)
+_IDEMPOTENT_WORKER_RELEASE_REASONS = frozenset(
+    {
+        "RESERVATION_NOT_FOUND",
+        "RESERVATION_OWNER_MISMATCH",
+    }
+)
 
 
 class CoordinatorRejected(RuntimeError):
@@ -161,6 +167,15 @@ class HTTPWorkerReservationClient:
         response = await self._get_client().delete(
             f"{slot.reservation_endpoint.rstrip('/')}/reservations/{token}"
         )
+        if response.status_code == 404:
+            return
+        if response.status_code == 409:
+            try:
+                detail = response.json().get("detail", {})
+            except (ValueError, AttributeError):
+                detail = {}
+            if detail.get("reason") in _IDEMPOTENT_WORKER_RELEASE_REASONS:
+                return
         response.raise_for_status()
 
     async def close(self) -> None:
@@ -1414,7 +1429,13 @@ class RealtimeCoordinator:
         )
         raise RuntimeError(f"coordinator cleanup failed for {label}") from last_error
 
-    async def _compensate_assignment(self, assignment: SessionAssignment) -> None:
+    async def _compensate_assignment(
+        self,
+        assignment: SessionAssignment,
+        *,
+        strict_worker_cleanup: bool = True,
+    ) -> None:
+        worker_failures: list[BaseException] = []
         failures: list[BaseException] = []
         if self.reservation_client is not None:
             results = await asyncio.gather(
@@ -1429,7 +1450,7 @@ class RealtimeCoordinator:
                 ),
                 return_exceptions=True,
             )
-            failures.extend(
+            worker_failures.extend(
                 result for result in results if isinstance(result, BaseException)
             )
         try:
@@ -1439,6 +1460,16 @@ class RealtimeCoordinator:
             )
         except BaseException as exc:
             failures.append(exc)
+        if strict_worker_cleanup:
+            failures.extend(worker_failures)
+        elif worker_failures:
+            logger.warning(
+                "Coordinator ignored %s worker release cleanup failure(s) for "
+                "session_id=%s generation_id=%s",
+                len(worker_failures),
+                assignment.session_id,
+                assignment.generation_id,
+            )
         if failures:
             raise RuntimeError(
                 f"assignment compensation failed ({len(failures)} operation(s))"
@@ -1613,7 +1644,10 @@ class RealtimeCoordinator:
         return await self.store.renew(assignment)
 
     async def release(self, assignment: SessionAssignment) -> None:
-        await self._compensate_assignment(assignment)
+        await self._compensate_assignment(
+            assignment,
+            strict_worker_cleanup=False,
+        )
 
     async def close(self) -> None:
         if self._late_cleanup_tasks:

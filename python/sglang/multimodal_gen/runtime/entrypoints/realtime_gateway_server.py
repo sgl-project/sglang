@@ -55,6 +55,12 @@ from sglang.multimodal_gen.runtime.utils.realtime_trace import (
 
 WEBUI_ROOT = Path(__file__).resolve().parents[2] / "apps" / "realtime_webui"
 logger = logging.getLogger(__name__)
+_IDEMPOTENT_COORDINATOR_RELEASE_REASONS = frozenset(
+    {
+        "LEASE_LOST",
+        "WORKER_LOST",
+    }
+)
 
 
 def _parse_ui_config(raw: str) -> dict[str, Any]:
@@ -142,6 +148,15 @@ class HTTPCoordinatorClient:
         response = await self._client.request(
             "DELETE", "/v1/sessions/release", json=asdict(assignment)
         )
+        if response.status_code == 404:
+            return
+        if response.status_code == 409:
+            try:
+                detail = response.json().get("detail", {})
+            except (ValueError, AttributeError):
+                detail = {}
+            if detail.get("reason") in _IDEMPOTENT_COORDINATOR_RELEASE_REASONS:
+                return
         self._raise_rejection(response)
 
     async def close(self) -> None:

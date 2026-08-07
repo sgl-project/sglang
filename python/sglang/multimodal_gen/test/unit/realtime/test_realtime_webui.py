@@ -63,12 +63,12 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert "const DEFAULT_T2V_NUM_FRAMES = 9;" in app_js
     assert 'configuredNumber("t2vDefaultNumFrames"' not in app_js
     assert "let savedT2VNumFrames = String(DEFAULT_T2V_NUM_FRAMES);" in app_js
-    assert "let savedT2VContinuous = false" in app_js
+    assert "let savedT2VContinuous = true" in app_js
     assert 'savedT2VNumFrames = $("numFrames").value;' in app_js
     assert '$("numFrames").value = savedT2VNumFrames;' in app_js
     assert 'max_chunks: generationMode === "t2v"' in app_js
     assert '$(' + '"continuous"' + ').disabled = false' in app_js
-    assert "let savedT2VContinuous = false" in app_js
+    assert "let savedT2VContinuous = true" in app_js
     assert '$(' + '"continuous"' + ').checked = savedT2VContinuous' in app_js
     assert '"Continuous T2V session"' in app_js
     assert '$("referenceSection").hidden = isT2V' in app_js

@@ -8,6 +8,7 @@ import pytest
 from sglang.multimodal_gen.runtime.realtime.coordinator import (
     CoordinatorRejected,
     DynamoDBCoordinatorStore,
+    HTTPWorkerReservationClient,
     InMemoryCoordinatorStore,
     RealtimeCoordinator,
     SessionAssignment,
@@ -579,6 +580,89 @@ def test_coordinator_renew_and_release_are_fenced_and_idempotent():
         await coordinator.release(renewed)
         await coordinator.release(renewed)
         replacement = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-b",
+            generation_id="generation-b",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        assert replacement.session_id == "session-b"
+
+    asyncio.run(run())
+
+
+def test_worker_reservation_http_release_treats_consumed_slot_as_idempotent():
+    class Response:
+        status_code = 409
+
+        @staticmethod
+        def json():
+            return {"detail": {"reason": "RESERVATION_OWNER_MISMATCH"}}
+
+        @staticmethod
+        def raise_for_status():
+            raise AssertionError("idempotent release should not raise")
+
+    class Client:
+        async def delete(self, url):
+            assert url == "http://worker/v1/realtime_worker/reservations/token-a"
+            return Response()
+
+    async def run():
+        client = HTTPWorkerReservationClient(client=Client())
+        await client.release(
+            WorkerSlot(
+                worker_id="denoiser-a",
+                role="denoiser",
+                endpoint="ws://denoiser/generate",
+                az="us-east-2a",
+                slot_index=0,
+                model_revision="minwm-r1",
+                vae_fingerprint="taew2_2",
+                worker_epoch="epoch-a",
+                reservation_endpoint="http://worker/v1/realtime_worker",
+            ),
+            token="token-a",
+        )
+
+    asyncio.run(run())
+
+
+def test_coordinator_release_frees_store_when_worker_cleanup_is_best_effort():
+    class ReservationClient:
+        def __init__(self):
+            self.release_attempts = 0
+
+        async def reserve(self, slot, **_identity):
+            del slot
+
+        async def release(self, slot, *, token):
+            del slot, token
+            self.release_attempts += 1
+            raise RuntimeError("worker cleanup already owns the reservation")
+
+    async def run():
+        store = InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30)
+        reservations = ReservationClient()
+        coordinator = RealtimeCoordinator(
+            store,
+            wait_timeout_s=0,
+            reservation_client=reservations,
+        )
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+        assignment = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+
+        await coordinator.release(assignment)
+
+        assert reservations.release_attempts == 6
+        replacement = await store.acquire(
             user_id="user-a",
             session_id="session-b",
             generation_id="generation-b",

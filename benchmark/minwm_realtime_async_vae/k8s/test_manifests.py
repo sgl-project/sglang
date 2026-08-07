@@ -128,13 +128,13 @@ def test_vae_deployment_can_land_on_either_l4_or_l40s_pool():
         assert labels["seedleap.ai/vae-worker"] == "true"
 
 
-def test_vae_pipeline_keeps_one_waiting_latent_and_coalesces_small_batches():
+def test_vae_pipeline_keeps_one_waiting_latent_and_sends_low_latency_batches():
     deployment = find(
         load_documents(("l4-vae.yaml",)), "Deployment", "minwm-async-vae"
     )
     args = _container(deployment, "vae")["args"]
     assert "--queue-depth-per-session=1" in args
-    assert "--encoded-frames-per-batch=16" in args
+    assert "--encoded-frames-per-batch=8" in args
 
 
 def test_gpu_workers_publish_epoch_state_and_drain_before_termination():
@@ -759,6 +759,7 @@ def test_gateway_output_queue_absorbs_one_complete_frame_burst():
     gateway = (ROOT / "gateway.yaml").read_text()
 
     assert "--output-queue-depth=32" in gateway
+    assert "--output-drain-timeout-s=30" in gateway
 
 
 def test_coordinator_candidate_window_covers_the_full_gpu_session_pool():

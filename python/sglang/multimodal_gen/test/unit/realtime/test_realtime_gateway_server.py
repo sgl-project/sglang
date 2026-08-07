@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import inspect
 import sys
 
@@ -9,12 +10,17 @@ from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints import realtime_gateway_server
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
+    HTTPCoordinatorClient,
     _parse_args,
     _parse_ui_config,
     create_app,
 )
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import decode_message
-from sglang.multimodal_gen.runtime.realtime.coordinator import CoordinatorRejected
+from sglang.multimodal_gen.runtime.realtime.coordinator import (
+    CoordinatorRejected,
+    SessionAssignment,
+    WorkerSlot,
+)
 
 
 class _Coordinator:
@@ -54,6 +60,48 @@ def test_gateway_trace_events_use_the_independent_otlp_log_plane():
 
     assert "emit_realtime_trace_payload" in source
     assert 'logger.info(\n        "realtime_trace %s"' not in source
+
+
+def test_gateway_coordinator_release_treats_lost_lease_as_idempotent():
+    class Response:
+        status_code = 409
+
+        @staticmethod
+        def json():
+            return {"detail": {"reason": "LEASE_LOST"}}
+
+    class Client:
+        async def request(self, method, path, *, json):
+            assert method == "DELETE"
+            assert path == "/v1/sessions/release"
+            assert json["token"] == "token-a"
+            return Response()
+
+    async def run():
+        client = HTTPCoordinatorClient.__new__(HTTPCoordinatorClient)
+        client._client = Client()
+        slot = WorkerSlot(
+            worker_id="worker-a",
+            role="denoiser",
+            endpoint="ws://worker-a/generate",
+            az="us-east-2a",
+            slot_index=0,
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        await client.release(
+            SessionAssignment(
+                user_id="user-a",
+                session_id="session-a",
+                generation_id="generation-a",
+                token="token-a",
+                expires_at=1,
+                denoiser=slot,
+                vae=slot,
+            )
+        )
+
+    asyncio.run(run())
 
 
 def test_gateway_serves_trace_query_and_accepts_sanitized_client_metrics():

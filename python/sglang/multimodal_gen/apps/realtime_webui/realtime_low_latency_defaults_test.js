@@ -58,8 +58,8 @@ assert.match(
 );
 assert.match(
   appJs,
-  /let savedT2VContinuous\s*=\s*false;/,
-  "T2V should start in finite-frame mode so the Frames input is editable",
+  /let savedT2VContinuous\s*=\s*true;/,
+  "T2V should start in continuous mode so Generate keeps the realtime session open",
 );
 assert.match(
   appJs,
