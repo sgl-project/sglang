@@ -254,7 +254,7 @@ Then, apply the quantization config from yaml. Please also enable torch.compile 
 sglang generate \
   --backend diffusers \
   --model-path Qwen/Qwen-Image \
-  --warmup \
+  --warmup-mode request \
   --cache-dit-config quantize.yaml \
   --enable-torch-compile \
   --dit-cpu-offload false \

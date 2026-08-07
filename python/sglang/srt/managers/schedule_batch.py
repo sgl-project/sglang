@@ -1149,6 +1149,12 @@ class Req(ReqDllmMixin):
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+        # Decode-side cached-prefix length; base of the staging chunk grid
+        # (start_send_idx starts here but advances with every send).
+        self.disagg_decode_prefix_len: int = 0
+        # At-rest device-resident prefix end, snapshotted on the request's
+        # first prefill batch; the cached-prefix early-send never goes past it.
+        self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -3226,6 +3232,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
+            self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -3270,6 +3277,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+            self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
