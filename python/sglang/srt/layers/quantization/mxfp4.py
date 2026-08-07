@@ -1588,6 +1588,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         routed_scaling_factor=None,
                         routing_method_type=RoutingMethodType.TopK.value,
                         activation_type=ActivationType.Situ.value,
+                        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                         output=symm_output,
                         do_finalize=not defer_finalize,
                     )
@@ -1647,6 +1648,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     norm_topk_prob=topk_output.topk_config.renormalize,
                     local_expert_offset=local_expert_offset,
                     local_num_experts=layer.num_local_experts,
+                    tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                     output=symm_output,
                 )
                 return StandardCombineInput(hidden_states=symm_output)

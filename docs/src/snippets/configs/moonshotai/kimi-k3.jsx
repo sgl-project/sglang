@@ -893,10 +893,8 @@ export const config = {
         "--pp-size 2",
         "--dcp-size 8",
         "--ep-size 8",
-        // Both pinned to the brought-up shape rather than left to the auto
-        // resolution the rest of Blackwell uses. The MXFP4 runner needs the SiTU
-        // cubin pool the published image ships; drop it to get the Marlin
-        // fallback on an install without one.
+        // Both backends are pinned to the validated recipe even though automatic
+        // resolution selects them on Blackwell.
         "--moe-runner-backend flashinfer_mxfp4",
         "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
