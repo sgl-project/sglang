@@ -15,7 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
-    get_schedule,
     get_server_args,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
@@ -78,15 +77,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # chunked_prefill_size.
         #
         # Under speculative decoding the captured batch is TARGET_VERIFY with
-        # `num_tokens_per_bs` draft tokens per sequence, so the per-forward row
-        # count is `bs * num_tokens_per_bs`. Without scaling, capture() writes
-        # `bs * num_tokens_per_bs` rows into a buffer sized for `bs` rows --
-        # an out-of-bounds write that also overflows the DeepEP attn-TP
-        # `gather_buffer` (sized `device_cache.shape[0] * attn_tp_size`).
+        # `num_tokens_per_bs` draft tokens per sequence.
         num_tokens_per_bs = max(1, num_tokens_per_bs)
         max_batch_size = max(
-            server_args.chunked_prefill_size * server_args.dp_size,
-            max_running_requests * server_args.dp_size * num_tokens_per_bs,
+            get_exec().schedule.chunked_prefill_size * get_exec().parallel.dp_size,
+            max_running_requests * get_exec().parallel.dp_size * num_tokens_per_bs,
         )
 
         super().__init__(

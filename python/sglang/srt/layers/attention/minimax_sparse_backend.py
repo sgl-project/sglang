@@ -20,7 +20,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 from sglang.srt.utils import is_npu
 
-
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
         topk_index_reduce,
@@ -36,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
 
 def _kv_cache_to_bnsd(
     k_cache: torch.Tensor, v_cache: torch.Tensor, page_size: int
