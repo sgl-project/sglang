@@ -57,7 +57,9 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
             seq_len = input_ids.shape[-1] if input_ids.dim() > 1 else input_ids.shape[0]
         positions = torch.arange(seq_len, dtype=torch.long)
         mrope_positions = positions.unsqueeze(0).expand(3, -1).clone()
-        return mrope_positions, torch.tensor([0], dtype=torch.long)
+        # Shape (1, 1) so speculative mRoPE path keeps per-request deltas as
+        # (B, 1) after stacking (1-D [0] becomes (B,) and breaks draft broadcast).
+        return mrope_positions, torch.zeros((1, 1), dtype=torch.long)
 
     async def process_mm_data_async(
         self,
