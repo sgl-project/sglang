@@ -71,8 +71,10 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.tp_sync_group = get_tp_group().device_group
+        self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
+            self.cp_sync_group = get_parallel().attn_cp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -82,6 +84,7 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
+        self.sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -122,6 +125,7 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
+        sampling_mask_data = None
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -131,10 +135,6 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
-            if return_sampling_mask:
-                self._attach_greedy_sampling_mask_to_output(
-                    logits_output, sampling_info, batch_next_token_ids
-                )
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
@@ -214,12 +214,6 @@ class Sampler(nn.Module):
                     sampling_mask_data = self._compute_sampling_mask_from_probs(
                         probs, sampling_info
                     )
-                    self._attach_sampling_mask_to_output(
-                        logits_output,
-                        sampling_info,
-                        batch_next_token_ids,
-                        sampling_mask_data,
-                    )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
@@ -240,6 +234,20 @@ class Sampler(nn.Module):
             logprob_result.write_output_to(logits_output)
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+
+        if return_sampling_mask:
+            if sampling_info.is_all_greedy:
+                self._attach_greedy_sampling_mask_to_output(
+                    logits_output, sampling_info, batch_next_token_ids
+                )
+            else:
+                assert sampling_mask_data is not None
+                self._attach_sampling_mask_to_output(
+                    logits_output,
+                    sampling_info,
+                    batch_next_token_ids,
+                    sampling_mask_data,
+                )
 
         return batch_next_token_ids
 
@@ -297,32 +305,62 @@ class Sampler(nn.Module):
 
     def _compute_sampling_mask_from_probs(
         self, probs: torch.Tensor, sampling_info: SamplingBatchInfo
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return sorted token ids, sorted probs, keep mask, and raw probs."""
+    ) -> Tuple[List[int], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reconstruct bounded sampling supports for opted-in rows."""
+        request_indices = [
+            i
+            for i, should_return in enumerate(sampling_info.return_sampling_masks or [])
+            if should_return
+        ]
+        if len(request_indices) == probs.shape[0]:
+            requested_probs = probs
+            requested_top_ks = sampling_info.top_ks
+            requested_top_ps = sampling_info.top_ps
+            requested_min_ps = sampling_info.min_ps
+        else:
+            request_indices_device = torch.tensor(
+                request_indices, dtype=torch.long, device=probs.device
+            )
+            requested_probs = probs.index_select(0, request_indices_device)
+            requested_top_ks = sampling_info.top_ks.index_select(
+                0, request_indices_device
+            )
+            requested_top_ps = sampling_info.top_ps.index_select(
+                0, request_indices_device
+            )
+            requested_min_ps = sampling_info.min_ps.index_select(
+                0, request_indices_device
+            )
+
         vocab_size = probs.shape[-1]
-        max_top_k = sampling_info.sampling_mask_max_top_k
-        if 0 < max_top_k < vocab_size:
+        # One extra candidate distinguishes an exact support at the cap from an
+        # oversized support without sorting the full vocabulary.
+        candidate_count = min(
+            sampling_info.sampling_mask_max_top_k,
+            self.sampling_mask_max_tokens + 1,
+            vocab_size,
+        )
+        if candidate_count < vocab_size:
             probs_sort, probs_idx = torch.topk(
-                probs,
-                k=max_top_k,
+                requested_probs,
+                k=candidate_count,
                 dim=-1,
                 largest=True,
                 sorted=True,
             )
-            positions = torch.arange(max_top_k, device=probs.device).view(1, -1)
         else:
-            probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-            positions = torch.arange(vocab_size, device=probs.device).view(1, -1)
+            probs_sort, probs_idx = requested_probs.sort(dim=-1, descending=True)
+        positions = torch.arange(candidate_count, device=probs.device).view(1, -1)
         probs_sum = torch.cumsum(probs_sort, dim=-1)
 
-        keep_mask = positions < sampling_info.top_ks.view(-1, 1)
-        keep_mask &= (probs_sum - probs_sort) <= sampling_info.top_ps.view(-1, 1)
+        keep_mask = positions < requested_top_ks.view(-1, 1)
+        keep_mask &= (probs_sum - probs_sort) <= requested_top_ps.view(-1, 1)
 
         if sampling_info.need_min_p_sampling:
-            min_p_thresholds = probs_sort[:, 0] * sampling_info.min_ps
+            min_p_thresholds = probs_sort[:, 0] * requested_min_ps
             keep_mask &= probs_sort >= min_p_thresholds.view(-1, 1)
 
-        return probs_idx, probs_sort, keep_mask, probs
+        return request_indices, probs_idx, probs_sort, keep_mask, requested_probs
 
     def _attach_greedy_sampling_mask_to_output(
         self,
@@ -330,16 +368,16 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
     ) -> None:
-        tokens = batch_next_token_ids.to(torch.int32).cpu().tolist()
-        masks = []
-        logprobs = []
-        for i, should_return in enumerate(sampling_info.return_sampling_masks or []):
-            if should_return:
-                masks.append([int(tokens[i])])
-                logprobs.append(0.0)
-            else:
-                masks.append(None)
-                logprobs.append(None)
+        return_sampling_masks = sampling_info.return_sampling_masks or []
+        request_indices = [
+            i for i, should_return in enumerate(return_sampling_masks) if should_return
+        ]
+        tokens = batch_next_token_ids[request_indices].to(torch.int32).cpu().tolist()
+        masks = [None] * len(return_sampling_masks)
+        logprobs = [None] * len(return_sampling_masks)
+        for i, token in zip(request_indices, tokens):
+            masks[i] = [int(token)]
+            logprobs[i] = 0.0
         logits_output.next_token_sampling_mask_idx = masks
         logits_output.next_token_sampling_logprobs = logprobs
 
@@ -349,17 +387,13 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
         sampling_mask_data: Tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+            List[int], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
         ],
     ) -> None:
-        probs_idx, probs_sort, keep_mask, probs = sampling_mask_data
+        request_indices, probs_idx, probs_sort, keep_mask, probs = sampling_mask_data
         return_sampling_masks = sampling_info.return_sampling_masks or []
-        if not return_sampling_masks:
-            logits_output.next_token_sampling_mask_idx = []
-            logits_output.next_token_sampling_logprobs = []
-            return
 
-        sampled_tokens = batch_next_token_ids.view(-1, 1)
+        sampled_tokens = batch_next_token_ids[request_indices].view(-1, 1)
         sampled_matches_all = probs_idx == sampled_tokens
         sampled_in_idx = sampled_matches_all.any(dim=-1)
 
@@ -380,31 +414,55 @@ class Sampler(nn.Module):
             / support_mass.float().clamp_min(torch.finfo(torch.float32).tiny)
         )
 
-        flat_rows, flat_cols = effective_keep_mask.nonzero(as_tuple=True)
-        flat_ids = probs_idx[flat_rows, flat_cols].to(torch.int32)
         mask_lengths = effective_keep_mask.sum(dim=-1, dtype=torch.int32)
+        effective_lengths = mask_lengths + (~sampled_in_idx).to(torch.int32)
+        overflow = (effective_lengths > self.sampling_mask_max_tokens).to(torch.int32)
+        # Overflow changes scheduler control flow, so all ranks serving the
+        # request must agree.
+        if dist.is_initialized():
+            if dist.get_world_size(self.tp_sync_group) > 1:
+                dist.all_reduce(
+                    overflow, op=dist.ReduceOp.MAX, group=self.tp_sync_group
+                )
+            if (
+                self.cp_sync_group is not None
+                and dist.get_world_size(self.cp_sync_group) > 1
+            ):
+                dist.all_reduce(
+                    overflow, op=dist.ReduceOp.MAX, group=self.cp_sync_group
+                )
+        overflow = overflow.bool()
+
+        # Overflow rows become request errors, so do not materialize or transfer
+        # their token IDs to the host.
+        bounded_keep_mask = effective_keep_mask & ~overflow.view(-1, 1)
+        flat_rows, flat_cols = bounded_keep_mask.nonzero(as_tuple=True)
+        flat_ids = probs_idx[flat_rows, flat_cols].to(torch.int32)
+        bounded_mask_lengths = torch.where(overflow, 0, mask_lengths)
 
         flat_ids_cpu = flat_ids.cpu().tolist()
-        mask_lengths_cpu = mask_lengths.cpu().tolist()
+        mask_lengths_cpu = bounded_mask_lengths.cpu().tolist()
         sampled_in_idx_cpu = sampled_in_idx.cpu().tolist()
-        sampled_tokens_cpu = batch_next_token_ids.to(torch.int32).cpu().tolist()
+        sampled_tokens_cpu = sampled_tokens.view(-1).to(torch.int32).cpu().tolist()
         selected_logprobs_cpu = selected_logprobs.cpu().tolist()
+        overflow_cpu = overflow.cpu().tolist()
 
-        masks = []
-        logprobs = []
+        masks = [None] * len(return_sampling_masks)
+        logprobs = [None] * len(return_sampling_masks)
         cursor = 0
-        for i, should_return in enumerate(return_sampling_masks):
-            mask_len = int(mask_lengths_cpu[i])
+        for row, i in enumerate(request_indices):
+            if overflow_cpu[row]:
+                # Requested rows left as None are converted to per-request
+                # overflow errors by the scheduler.
+                continue
+
+            mask_len = int(mask_lengths_cpu[row])
             row_ids = flat_ids_cpu[cursor : cursor + mask_len]
             cursor += mask_len
-            if not sampled_in_idx_cpu[i]:
-                row_ids.append(int(sampled_tokens_cpu[i]))
-            if should_return:
-                masks.append(row_ids)
-                logprobs.append(float(selected_logprobs_cpu[i]))
-            else:
-                masks.append(None)
-                logprobs.append(None)
+            if not sampled_in_idx_cpu[row]:
+                row_ids.append(int(sampled_tokens_cpu[row]))
+            masks[i] = row_ids
+            logprobs[i] = float(selected_logprobs_cpu[row])
 
         logits_output.next_token_sampling_mask_idx = masks
         logits_output.next_token_sampling_logprobs = logprobs
