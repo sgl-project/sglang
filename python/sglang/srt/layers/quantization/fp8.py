@@ -380,28 +380,40 @@ class Fp8Config(QuantizationConfig):
                 return NPUMXFP8OnlineMoEMethod(self)
 
             fp8_method = Fp8MoEMethod(self)
+            moe_backend = get_moe_runner_backend()
 
+            # Dedicated MXFP4 quant methods (packed K//2 layout).
+            native_mxfp4_method = (
+                moe_backend.is_marlin()
+                or moe_backend.is_humming()
+                or moe_backend.is_flashinfer_mxfp4()
+            )
+
+            # Dequantize packed MXFP4 experts to block FP8 so generic FP8 MoE
+            # runners (auto/triton/deep_gemm/...) can consume full-K weights.
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert (
-                    get_moe_runner_backend().is_auto()
-                ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                if native_mxfp4_method:
+                    raise ValueError(
+                        f"{moe_backend.value} natively supports MXFP4 experts; "
+                        "do not set SGLANG_DSV4_FP4_DEQUANT=1 with this backend."
+                    )
                 return fp8_method
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+            if self.is_fp4_experts and moe_backend.is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
                 )
 
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_humming():
+            if self.is_fp4_experts and moe_backend.is_humming():
                 from sglang.srt.layers.quantization.mxfp4_humming_moe import (
                     Mxfp4HummingMoEMethod,
                 )
 
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+            if self.is_fp4_experts and moe_backend.is_flashinfer_mxfp4():
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
                 if is_sm90_supported() or is_sm120_supported():
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
@@ -415,6 +427,25 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+
+            # Triton fused MoE expects full-K FP8/BF16 weights. MXFP4 experts
+            # store K packed as K//2, which later fails with a cryptic
+            # "Hidden size mismatch" assert in fused_moe.
+            # Note: deep_gemm (and auto, which may resolve to deep_gemm /
+            # flashinfer_mxfp4) still use Fp8MoEMethod with packed FP4 and
+            # must not be blocked here.
+            if self.is_fp4_experts and (
+                moe_backend.is_triton() or moe_backend.is_triton_kernels()
+            ):
+                raise ValueError(
+                    "DeepSeek-V4 MXFP4 routed experts are not supported with "
+                    f"--moe-runner-backend {moe_backend.value}. "
+                    "Use a native MXFP4 backend "
+                    "(--moe-runner-backend flashinfer_mxfp4, marlin, or humming), "
+                    "leave --moe-runner-backend auto (on SM120 this defaults to "
+                    "flashinfer_mxfp4), or set SGLANG_DSV4_FP4_DEQUANT=1 to "
+                    "dequantize experts to FP8 for generic runners such as triton."
+                )
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
