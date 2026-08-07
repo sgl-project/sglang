@@ -701,7 +701,11 @@ class USPAttention(nn.Module):
             and get_sequence_parallel_world_size() > 1
         )
         if attn_mask is not None or meta_only_pad:
-            if num_replicated_prefix or num_replicated_suffix or num_replicated_kv_prefix:
+            if (
+                num_replicated_prefix
+                or num_replicated_suffix
+                or num_replicated_kv_prefix
+            ):
                 # This path shards every row through the all-to-all; a
                 # replicated prefix/suffix would be duplicated across ranks and
                 # silently corrupt the output, so refuse loudly instead.
