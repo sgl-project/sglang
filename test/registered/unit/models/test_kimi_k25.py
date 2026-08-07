@@ -735,7 +735,7 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
     image_shape, in_patch_limit, expected
 ):
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.use_cuda_ipc = False
+    processor.mm_feature_transport = "cpu"
     processor._processor = SimpleNamespace(
         _patch_size=14,
         _merge_kernel_size=2,
@@ -751,11 +751,22 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
 
 def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.use_cuda_ipc = False
+    processor.mm_feature_transport = "cpu"
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
         assert not processor._should_defer_gpu_preprocessing(
             [torch.zeros((3, 32, 32), dtype=torch.float32)]
+        )
+
+
+@pytest.mark.parametrize("transport", ["cuda_ipc", "fabric"])
+def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = transport
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing(
+            [torch.zeros((3, 32, 32), dtype=torch.uint8)]
         )
 
 

@@ -309,7 +309,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         if (
-            self.use_cuda_ipc
+            self.mm_feature_transport != "cpu"
             or not is_cuda()
             or not all(
                 isinstance(image, Image.Image)
