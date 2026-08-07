@@ -7573,10 +7573,10 @@ class ServerArgs:
     def _handle_multimodal_feature_transport(self):
         """Resolve multimodal feature transport before tokenizer workers start.
 
-        CUDA IPC is deliberately opt-in: its fixed pool lives on ``base_gpu_id``
-        and reduces the memory left for model/KV-cache allocations.  The legacy
-        flag and environment variable remain supported so existing deployments
-        continue to work, but both map to this single policy.
+        GPU transports use a fixed pool on ``base_gpu_id`` and therefore reduce
+        the memory left for model/KV-cache allocations. The legacy CUDA IPC flag
+        and environment variable remain supported so existing deployments map
+        to this single policy.
         """
         requested_transport = self.mm_feature_transport
         legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
@@ -7613,20 +7613,28 @@ class ServerArgs:
             elif (
                 self.get_model_config().is_multimodal
                 and is_cuda()
-                and self.nnodes == 1
                 and self.disaggregation_mode == "null"
             ):
-                # Auto policy: single-node CUDA serving defaults to the bounded
-                # CUDA-IPC pool for multimodal models. Text-only deployments do
-                # not need feature transport. Multi-node (IPC handles are
-                # intra-node) and PD-disaggregated deployments keep CPU transport.
-                # A full pool degrades to CPU transport per tensor.
-                requested_transport = "cuda_ipc"
-                logger.info(
-                    "Multimodal feature transport auto-resolved to cuda_ipc "
-                    "(single-node CUDA). Pass --mm-feature-transport=cpu to "
-                    "opt out."
-                )
+                # A full GPU pool always degrades to CPU transport per tensor.
+                # CUDA IPC is intra-node; multi-node auto-selection is limited
+                # to GB200/GB300 systems where the runtime already enables the
+                # MNNVL/IMEX communication stack.
+                if self.nnodes == 1:
+                    requested_transport = "cuda_ipc"
+                    logger.info(
+                        "Multimodal feature transport auto-resolved to cuda_ipc "
+                        "(single-node CUDA). Pass --mm-feature-transport=cpu to "
+                        "opt out."
+                    )
+                elif is_mnnvl_fabric_device():
+                    requested_transport = "fabric"
+                    logger.info(
+                        "Multimodal feature transport auto-resolved to fabric "
+                        "(multi-node GB200/GB300 MNNVL). Pass "
+                        "--mm-feature-transport=cpu to opt out."
+                    )
+                else:
+                    requested_transport = "cpu"
             else:
                 requested_transport = "cpu"
         elif legacy_ipc_is_set and legacy_ipc_enabled != (
