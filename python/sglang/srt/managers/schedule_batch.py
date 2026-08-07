@@ -1413,18 +1413,23 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
-    def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+    def _stop_match_tail_len(
+        self, new_accepted_len: int, output_len: Optional[int] = None
+    ) -> int:
+        if output_len is None:
+            output_len = len(self.output_ids)
+
         max_len_tail_str = max(
             self.sampling_params.stop_str_max_len + 1,
             self.sampling_params.stop_regex_max_len + 1,
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(
-            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
-        )
+        return min(max_len_tail_str + max(new_accepted_len - 1, 0), output_len)
 
-    def tail_str(self, new_accepted_len: int = 1) -> str:
+    def tail_str(
+        self, new_accepted_len: int = 1, output_len: Optional[int] = None
+    ) -> str:
         # Check stop strings and stop regex patterns together
         if (
             len(self.sampling_params.stop_strs) == 0
@@ -1432,8 +1437,12 @@ class Req(ReqDllmMixin):
         ):
             return ""
 
-        tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        if output_len is None:
+            output_len = len(self.output_ids)
+        tail_len = self._stop_match_tail_len(new_accepted_len, output_len)
+        return self.tokenizer.decode(
+            self.output_ids[output_len - tail_len : output_len]
+        )
 
     def check_match_stop_str_prefix(self) -> bool:
         """
@@ -1464,9 +1473,16 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+    def _check_token_based_finish(
+        self,
+        new_accepted_tokens: List[int],
+        accepted_start: Optional[int] = None,
+    ) -> bool:
         if self.sampling_params.ignore_eos:
             return False
+
+        if accepted_start is None:
+            accepted_start = len(self.output_ids) - len(new_accepted_tokens)
 
         # Check stop token ids
         matched_eos = False
@@ -1482,7 +1498,7 @@ class Req(ReqDllmMixin):
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
-                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                matched_pos = accepted_start + i
                 self.finished_len = matched_pos + 1
                 return True
 
@@ -1494,6 +1510,7 @@ class Req(ReqDllmMixin):
         *,
         stop_str: Optional[str] = None,
         stop_regex: Optional[str] = None,
+        output_len: Optional[int] = None,
     ) -> int:
         """Map a matched stop string/regex to output_ids length (stop included)."""
 
@@ -1502,9 +1519,11 @@ class Req(ReqDllmMixin):
                 return stop_str in text
             return re.search(stop_regex, text) is not None
 
-        tail_len = self._stop_match_tail_len(new_accepted_len)
-        start = len(self.output_ids) - tail_len
-        token_window = self.output_ids[start:]
+        if output_len is None:
+            output_len = len(self.output_ids)
+        tail_len = self._stop_match_tail_len(new_accepted_len, output_len)
+        start = output_len - tail_len
+        token_window = self.output_ids[start:output_len]
 
         # Old prefixes were checked in the previous step.
         for token_count in range(
@@ -1514,14 +1533,16 @@ class Req(ReqDllmMixin):
                 return start + token_count
 
         # The full tail window is already known to match by the caller.
-        return len(self.output_ids)
+        return output_len
 
-    def _check_str_based_finish(self, new_accepted_len: int = 1):
+    def _check_str_based_finish(
+        self, new_accepted_len: int = 1, output_len: Optional[int] = None
+    ):
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
-            tail_str = self.tail_str(new_accepted_len)
+            tail_str = self.tail_str(new_accepted_len, output_len)
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
@@ -1531,7 +1552,9 @@ class Req(ReqDllmMixin):
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                         if stop_str_in_tail:
                             self.finished_len = self._locate_str_stop_finished_len(
-                                new_accepted_len, stop_str=stop_str
+                                new_accepted_len,
+                                stop_str=stop_str,
+                                output_len=output_len,
                             )
                         return True
 
@@ -1564,7 +1587,9 @@ class Req(ReqDllmMixin):
                             matched=stop_regex_str
                         )
                         self.finished_len = self._locate_str_stop_finished_len(
-                            new_accepted_len, stop_regex=stop_regex_str
+                            new_accepted_len,
+                            stop_regex=stop_regex_str,
+                            output_len=output_len,
                         )
                         return True
 
@@ -1595,30 +1620,59 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
-            return
+        output_len = len(self.output_ids)
+        max_new_tokens = self.sampling_params.max_new_tokens
+        reached_length = output_len >= max_new_tokens
 
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        accepted_start = max(0, output_len - new_accepted_len)
+        finish_check_end = min(output_len, max_new_tokens)
+        bounded_accepted_len = max(0, finish_check_end - accepted_start)
+        new_accepted_tokens = self.output_ids[accepted_start:finish_check_end]
+
+        # Preserve the existing length result for invalid tokens at the length
+        # boundary, and never decode an invalid in-budget token as text.
+        invalid_token_at_length = (
+            reached_length
+            and self.vocab_size is not None
+            and any(
+                token_id < 0 or token_id >= self.vocab_size
+                for token_id in new_accepted_tokens
+            )
+        )
 
         # Sanitize out-of-range / NaN token ids before any decode.
-        if self._check_vocab_boundary_finish(new_accepted_tokens):
+        if not reached_length and self._check_vocab_boundary_finish(
+            new_accepted_tokens
+        ):
             return
 
-        # Stop string beats EOS/stop-token matched in the same step (speculative
-        # decoding can accept >1 token): token-based would trim only the last
-        # token and leak the stop string.
-        if self._check_str_based_finish(new_accepted_len):
-            return
+        if bounded_accepted_len > 0 and not invalid_token_at_length:
+            # Stop string beats EOS/stop-token matched in the same step
+            # (speculative decoding can accept >1 token): token-based would trim
+            # only the last token and leak the stop string.
+            if self._check_str_based_finish(
+                bounded_accepted_len, output_len=finish_check_end
+            ):
+                return
 
-        if self._check_token_based_finish(new_accepted_tokens):
-            return
+            if self._check_token_based_finish(
+                new_accepted_tokens, accepted_start=accepted_start
+            ):
+                return
 
-        if self.grammar is not None and self.grammar.is_terminated():
-            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+            # Speculative grammar handling truncates the accepted run at the
+            # terminating token, so an overshoot means termination was out of budget.
+            if (
+                finish_check_end == output_len
+                and self.grammar is not None
+                and self.grammar.is_terminated()
+            ):
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                return
+
+        if reached_length:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
             return
 
     def reset_for_retract(self):
