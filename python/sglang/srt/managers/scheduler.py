@@ -1211,6 +1211,7 @@ class Scheduler(
                     max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     device=self.tp_group.device,
+                    debug_log_enabled=self.ps.attn_tp_rank == 0,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -1834,6 +1835,10 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if self.server_args.mm_feature_transport == "cuda_vmm":
+            for recv_req in recv_reqs:
+                self._materialize_cuda_vmm_inputs(recv_req)
+
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -1860,6 +1865,28 @@ class Scheduler(
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def _materialize_cuda_vmm_inputs(self, recv_req):
+        """Release VMM slices before request handling can reject the request."""
+        if isinstance(
+            recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+        ):
+            tokenized_reqs = (recv_req,)
+        elif isinstance(
+            recv_req,
+            (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+        ):
+            tokenized_reqs = recv_req
+        else:
+            return
+
+        for tokenized_req in tokenized_reqs:
+            if tokenized_req.mm_inputs is not None and not isinstance(
+                tokenized_req.mm_inputs, MultimodalInputs
+            ):
+                tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
+                    tokenized_req.mm_inputs
+                )
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -2210,11 +2237,13 @@ class Scheduler(
 
         return image_inputs
 
-    def _get_multimodal_inputs(self, mm_inputs_dict):
+    def _get_multimodal_inputs(self, mm_inputs):
+        if isinstance(mm_inputs, MultimodalInputs):
+            return mm_inputs
+
         if get_mm().enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
-        else:
-            return MultimodalInputs.from_processor_output(mm_inputs_dict)
+            return self._process_and_broadcast_mm_inputs(mm_inputs)
+        return MultimodalInputs.from_processor_output(mm_inputs)
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:

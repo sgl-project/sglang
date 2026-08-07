@@ -351,6 +351,13 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
             server_args._handle_multimodal_feature_transport()
 
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_vmm_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_fabric_rejects_pd_disaggregation(self, _mock_is_cuda):
         server_args = ServerArgs(
@@ -360,6 +367,25 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "PD-disaggregated"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_rust_server(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
+        ):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_pipeline_parallelism(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_vmm", pp_size=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
             server_args._handle_multimodal_feature_transport()
 
 
