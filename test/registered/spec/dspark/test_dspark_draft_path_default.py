@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -43,15 +42,6 @@ def _make_dspark_server_args(
     return server_args
 
 
-def _handle_dspark_on_cuda(server_args: ServerArgs) -> None:
-    with (
-        mock.patch("sglang.srt.utils.is_cuda", return_value=True),
-        mock.patch("sglang.srt.utils.is_npu") as mock_is_npu,
-    ):
-        _handle_dspark(server_args)
-    mock_is_npu.assert_not_called()
-
-
 class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
     def test_bundled_dsv4_config_is_detected(self):
         server_args = _make_dspark_server_args(
@@ -71,7 +61,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        _handle_dspark_on_cuda(server_args)
+        _handle_dspark(server_args)
         self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
 
@@ -80,40 +70,18 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
         )
         with self.assertRaises(ValueError):
-            _handle_dspark_on_cuda(server_args)
+            _handle_dspark(server_args)
 
     def test_explicit_draft_path_is_not_overwritten(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         server_args.speculative_draft_model_path = "deepseek-ai/some-other-dspark-draft"
-        _handle_dspark_on_cuda(server_args)
+        _handle_dspark(server_args)
         self.assertEqual(
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
-
-    def test_npu_is_supported(self):
-        server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
-        )
-        with (
-            mock.patch("sglang.srt.utils.is_cuda", return_value=False),
-            mock.patch("sglang.srt.utils.is_npu", return_value=True),
-        ):
-            _handle_dspark(server_args)
-        self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
-
-    def test_other_platform_is_rejected(self):
-        server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
-        )
-        with (
-            mock.patch("sglang.srt.utils.is_cuda", return_value=False),
-            mock.patch("sglang.srt.utils.is_npu", return_value=False),
-            self.assertRaisesRegex(ValueError, "only supports CUDA and NPU"),
-        ):
-            _handle_dspark(server_args)
 
 
 if __name__ == "__main__":
