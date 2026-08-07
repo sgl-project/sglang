@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -624,6 +625,43 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         return block_mask
 
+    @lru_cache(maxsize=4)
+    def _get_causal_rotary_pos_embed(
+        self,
+        post_patch_num_frames: int,
+        post_patch_height: int,
+        post_patch_width: int,
+        start_frame: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reuse stable GPU RoPE storage across repeated denoising forwards.
+
+        Manual CUDA Graph capture records tensor addresses, so rebuilding these
+        tensors inside every forward is not only redundant but also makes the
+        captured SP=1 path depend on temporary allocations. Keep only a few
+        recent shapes/start positions to bound GPU memory during long streams.
+        """
+        d = self.hidden_size // self.num_attention_heads
+        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+        freqs_cos, freqs_sin = get_rotary_pos_embed(
+            (
+                post_patch_num_frames * get_sp_world_size(),
+                post_patch_height,
+                post_patch_width,
+            ),
+            self.hidden_size,
+            self.num_attention_heads,
+            rope_dim_list,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+            rope_theta=10000,
+            start_frame=start_frame,
+        )
+        return freqs_cos.to(device), freqs_sin.to(device)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -662,27 +700,13 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         post_patch_width = width // p_w
 
         # Get rotary embeddings
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (
-                post_patch_num_frames * get_sp_world_size(),
-                post_patch_height,
-                post_patch_width,
-            ),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-            rope_theta=10000,
-            start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
+        freqs_cos, freqs_sin = self._get_causal_rotary_pos_embed(
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            start_frame,
+            hidden_states.device,
         )
-        freqs_cos = freqs_cos.to(hidden_states.device)
-        freqs_sin = freqs_sin.to(hidden_states.device)
         freqs_cis = (
             (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
         )
