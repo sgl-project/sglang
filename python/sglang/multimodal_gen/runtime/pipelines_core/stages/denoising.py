@@ -2200,6 +2200,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if runner is not None:
             model_output = self._bcg_run(runner, call_kwargs, current_model)
         elif self._fcg_eligible():
+            # Bucket the prompt-conditioning inputs exactly like BCG: without
+            # this the signature is keyed to one prompt length (the warmup
+            # request's), and the first differently-sized prompt disables the
+            # graph permanently.
+            call_kwargs = self._bcg_pad_prompt_kwargs(
+                call_kwargs, current_model=current_model
+            )
             fcg = self._fcg_runners.get(id(current_model))
             if fcg is None:
                 fcg = _FullGraphRunner(current_model, self._fcg_device(call_kwargs))
