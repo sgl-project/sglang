@@ -1363,6 +1363,11 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                # Only one chunked prefill may be in flight at a time (asserted
+                # downstream). Reject a second one explicitly instead of relying
+                # on the chunk budget to make this branch unreachable.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
