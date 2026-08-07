@@ -494,8 +494,21 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         return min(found) if found else -1
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
-        in_reasoning = self._in_reasoning or self.think_start_token in text
-        if not in_reasoning and self.think_end_token not in text:
+        # The model may skip the think channel entirely: it then answers
+        # directly (bare content, optionally wrapped in a response channel) and
+        # emits no think markers at all. With neither the think open nor the
+        # think close marker present, there is no reasoning to extract and
+        # everything is content. force_reasoning only means the think open may
+        # have been consumed as a generation prefix; it must not turn a
+        # think-free answer into reasoning.
+        if (
+            self.think_start_token not in text
+            and self.think_end_token not in text
+            # Also rule out partial think markers: a truncated think-close must
+            # still take the reasoning path (e.g. recovering a missing <|sep|>).
+            and self.think_start_token.removesuffix("<|sep|>") not in text
+            and self.think_end_token.removesuffix("<|sep|>") not in text
+        ):
             return StreamingParseResult(normal_text=self._clean_content(text))
 
         open_idx = text.find(self.think_start_token)
