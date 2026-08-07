@@ -14,7 +14,7 @@ Backend selection is performed by the shared attention layers (e.g. `LocalAttent
 When using the diffusers backend, `--attention-backend` is passed through to diffusers'
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
 
-- **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA.
+- **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA. On SM100/B200, dense non-causal fp16/bf16 native attention prefers cuDNN SDPA and falls back to FA4 if cuDNN has no compatible kernel.
 - **ROCm**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
 - **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
 - **MUSA**: uses FlashAttention when available; also supports Sage Attention when installed; otherwise falls back to PyTorch SDPA.

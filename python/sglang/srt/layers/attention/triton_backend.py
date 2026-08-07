@@ -205,9 +205,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            # Use start_layer instead of 0 to handle pipeline parallelism.
+            # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+                model_runner.token_to_kv_pool.start_layer
+            ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -300,6 +302,19 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+
+        # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
+        # This is used by the scheduler's tile-budget admission logic to match
+        # the kernel's actual tile size.
+        head_dim = model_runner.model_config.head_dim
+        from sglang.kernels.ops.attention.extend_attention import (
+            _get_block_sizes_for_extend_attention,
+        )
+
+        _, _, _, block_m, _, _ = _get_block_sizes_for_extend_attention(
+            Lq=head_dim, Lv=head_dim
+        )
+        self.extend_attention_block_m = block_m
 
     def get_num_kv_splits(
         self,
@@ -1433,6 +1448,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
 
