@@ -36,7 +36,19 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    supports_mis: bool = False
+
+    @classmethod
+    def validate_mis_support(cls, server_args) -> None:
+        if getattr(server_args, "enable_mis", False) and not cls.supports_mis:
+            raise ValueError(
+                f"{cls.__name__} does not support multi-item scoring. "
+                "Hybrid models require a linear-attention backend that explicitly "
+                "declares MIS support."
+            )
+
     def __init__(self, model_runner: ModelRunner):
+        self.validate_mis_support(model_runner.server_args)
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device

@@ -56,6 +56,8 @@ class GDNAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     linear_attn_prefill_backend: str | None = None
+    mis_delimiter_indices: tuple[tuple[int, ...], ...] = ()
+    conv_history_weight: float = 0.0
 
     @property
     def batch_size(self) -> int:
@@ -251,7 +253,7 @@ class MockGDNModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
-            enable_mis=False,
+            enable_mis=bool(case.mis_delimiter_indices),
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=case.linear_attn_prefill_backend,
@@ -362,6 +364,7 @@ class ProjectedGDNAttention(nn.Module):
         head_v_dim: int,
         dtype: torch.dtype,
         device: str,
+        conv_history_weight: float = 0.0,
     ):
         super().__init__()
         self.num_k_heads = num_k_heads
@@ -370,6 +373,7 @@ class ProjectedGDNAttention(nn.Module):
         self.head_v_dim = head_v_dim
         mixed_qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
         conv_weights = torch.zeros(mixed_qkv_dim, 2, dtype=dtype, device=device)
+        conv_weights[:, 0] = conv_history_weight
         conv_weights[:, 1] = 1
         self.A_log = nn.Parameter(
             torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
@@ -545,6 +549,15 @@ def _make_forward_batch(
         out_cache_loc=torch.tensor(out_cache_locs, dtype=torch.int64, device=device),
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
+        is_prefill_only=bool(case.mis_delimiter_indices),
+        multi_item_delimiter_indices=(
+            [
+                torch.tensor(indices, dtype=torch.int64)
+                for indices in case.mis_delimiter_indices
+            ]
+            if case.mis_delimiter_indices
+            else None
+        ),
     )
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
@@ -622,6 +635,7 @@ def build_gdn_attention_fixture(
         head_v_dim=head_v_dim,
         dtype=dtype,
         device=device,
+        conv_history_weight=case.conv_history_weight,
     )
     reference_module = ReferenceGDNAttention(
         num_k_heads=case.num_k_heads,
@@ -632,6 +646,13 @@ def build_gdn_attention_fixture(
         device=device,
     )
     _copy_gdn_parameters(actual_module, reference_module)
+    if case.mis_delimiter_indices:
+        # Keep recurrent history strong so cross-item state leakage cannot hide
+        # behind the normal random gate decay in short focused test sequences.
+        with torch.no_grad():
+            actual_module.A_log.fill_(-4.0)
+            actual_module.dt_bias.fill_(-4.0)
+        _copy_gdn_parameters(actual_module, reference_module)
     from .dense_attention import make_loc_fn as _dense_make_loc_fn
 
     loc_fn = _dense_make_loc_fn(
@@ -781,7 +802,8 @@ def _pure_torch_gdn_reference(
     initial_ssm_states: torch.Tensor,
 ) -> GDNReferenceOutput:
     module = fixture.reference_module
-    q, k, v = module.split_qkv(fixture.mixed_qkv)
+    mixed_qkv = _pure_torch_mis_conv_reference(fixture)
+    q, k, v = module.split_qkv(mixed_qkv)
     cache_indices = _cache_indices(fixture)
     g, beta = _pure_torch_gdn_gating(module, fixture.a, fixture.b)
     q = q.float()
@@ -804,35 +826,97 @@ def _pure_torch_gdn_reference(
         state_idx = cache_indices[req_idx]
         state = initial_ssm_states[state_idx].float().clone()
 
-        for offset in range(input_len):
-            token_idx = start + offset
-            for v_head in range(fixture.case.num_v_heads):
-                k_head = v_head // q_head_ratio
-                q_vec = q[0, token_idx, k_head]
-                k_vec = k[0, token_idx, k_head]
-                v_vec = v[0, token_idx, v_head]
+        if fixture.case.mis_delimiter_indices:
+            delimiters = fixture.case.mis_delimiter_indices[req_idx]
+            segments = [(0, delimiters[0])]
+            segments.extend(zip(delimiters, tuple(delimiters[1:]) + (input_len,)))
+        else:
+            segments = [(0, input_len)]
 
-                q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
-                k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
-                q_norm = q_norm * (module.head_k_dim**-0.5)
+        query_final_state = state.clone()
+        for segment_idx, (segment_start, segment_end) in enumerate(segments):
+            state = (
+                query_final_state.clone()
+                if segment_idx > 0
+                else initial_ssm_states[state_idx].float().clone()
+            )
+            for offset in range(segment_start, segment_end):
+                token_idx = start + offset
+                for v_head in range(fixture.case.num_v_heads):
+                    k_head = v_head // q_head_ratio
+                    q_vec = q[0, token_idx, k_head]
+                    k_vec = k[0, token_idx, k_head]
+                    v_vec = v[0, token_idx, v_head]
 
-                head_state = state[v_head]
-                head_state = head_state * torch.exp(g[token_idx, v_head])
-                residual_v = v_vec - torch.sum(head_state * k_norm.unsqueeze(0), dim=1)
-                residual_v = residual_v * beta[token_idx, v_head]
-                head_state = head_state + residual_v.unsqueeze(1) * k_norm.unsqueeze(0)
-                state[v_head] = head_state
-                outputs[0, token_idx, v_head] = torch.sum(
-                    head_state * q_norm.unsqueeze(0), dim=1
-                )
+                    q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
+                    k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
+                    q_norm = q_norm * (module.head_k_dim**-0.5)
 
-        final_states[state_idx] = state.to(final_states.dtype)
+                    head_state = state[v_head]
+                    head_state = head_state * torch.exp(g[token_idx, v_head])
+                    residual_v = v_vec - torch.sum(
+                        head_state * k_norm.unsqueeze(0), dim=1
+                    )
+                    residual_v = residual_v * beta[token_idx, v_head]
+                    head_state = head_state + residual_v.unsqueeze(
+                        1
+                    ) * k_norm.unsqueeze(0)
+                    state[v_head] = head_state
+                    outputs[0, token_idx, v_head] = torch.sum(
+                        head_state * q_norm.unsqueeze(0), dim=1
+                    )
+
+            if segment_idx == 0:
+                query_final_state = state.clone()
+
+        final_states[state_idx] = (
+            query_final_state if fixture.case.mis_delimiter_indices else state
+        ).to(final_states.dtype)
         start += input_len
 
     return GDNReferenceOutput(
         output=outputs.to(fixture.mixed_qkv.dtype),
         final_states=final_states,
     )
+
+
+def _pure_torch_mis_conv_reference(fixture: GDNAttentionFixture) -> torch.Tensor:
+    """Token-by-token causal-conv reference with MIS query-state branching."""
+    if fixture.case.conv_history_weight == 0:
+        return fixture.mixed_qkv
+
+    weights = fixture.actual_module.attn.conv_weights.float()
+    width = weights.shape[1]
+    result = torch.empty_like(fixture.mixed_qkv)
+    request_start = 0
+    for request_idx, input_len in enumerate(fixture.case.input_lens):
+        request_input = fixture.mixed_qkv[
+            request_start : request_start + input_len
+        ].float()
+        delimiters = fixture.case.mis_delimiter_indices[request_idx]
+        segments = [(0, delimiters[0])]
+        segments.extend(zip(delimiters, tuple(delimiters[1:]) + (input_len,)))
+
+        query_state = torch.zeros(
+            width - 1,
+            request_input.shape[1],
+            dtype=torch.float32,
+            device=request_input.device,
+        )
+        for segment_idx, (segment_start, segment_end) in enumerate(segments):
+            state = query_state.clone()
+            for token_offset in range(segment_start, segment_end):
+                window = torch.cat(
+                    [state, request_input[token_offset : token_offset + 1]]
+                )
+                result[request_start + token_offset] = torch.sum(
+                    window.transpose(0, 1) * weights, dim=1
+                ).to(result.dtype)
+                state = window[1:]
+            if segment_idx == 0:
+                query_state = state
+        request_start += input_len
+    return result
 
 
 def make_gdn_case_with_prefix_lens(
@@ -860,6 +944,8 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        mis_delimiter_indices=case.mis_delimiter_indices,
+        conv_history_weight=case.conv_history_weight,
     )
 
 
@@ -1113,7 +1199,7 @@ def run_gdn_attention_case(
     expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
 
     torch.testing.assert_close(actual, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL)
-    if case.forward_mode.is_decode():
+    if case.forward_mode.is_decode() or case.mis_delimiter_indices:
         torch.testing.assert_close(
             _ssm_states(fixture)[_cache_indices(fixture)],
             expected.final_states[_cache_indices(fixture)],

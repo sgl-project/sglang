@@ -161,6 +161,85 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
     def test_batch_32(self):
         self._check_shape(B=32, T_per_seq=32, H=16, K=128, V=128, pool_size=256)
 
+    def test_read_only_initial_state_supports_duplicate_indices(self):
+        """MIS item branches may share one query-end state without updating it."""
+        device = get_device()
+        dtype = torch.bfloat16
+        batch_size, tokens_per_item = 3, 65
+        num_heads, key_dim, value_dim = 4, 32, 32
+        total_tokens = batch_size * tokens_per_item
+
+        torch.manual_seed(1234)
+        pool_init = torch.randn(
+            4,
+            num_heads,
+            value_dim,
+            key_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        duplicate_indices = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+        cu_seqlens = torch.arange(
+            0,
+            total_tokens + 1,
+            tokens_per_item,
+            dtype=torch.int32,
+            device=device,
+        )
+        q = torch.randn(1, total_tokens, num_heads, key_dim, dtype=dtype, device=device)
+        k = torch.randn_like(q)
+        v = torch.randn(
+            1, total_tokens, num_heads, value_dim, dtype=dtype, device=device
+        )
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, total_tokens, num_heads, dtype=dtype, device=device)
+        )
+        beta = torch.sigmoid(
+            torch.randn(1, total_tokens, num_heads, dtype=dtype, device=device)
+        )
+
+        expected, _ = self._run_reference(
+            pool_init, duplicate_indices, q, k, v, g, beta
+        )
+        actual_pool = pool_init.clone()
+        actual, _, _ = chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=actual_pool,
+            initial_state_indices=duplicate_indices,
+            cu_seqlens=cu_seqlens,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            inplace_update=False,
+        )
+
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=self.ATOL, rtol=self.RTOL
+        )
+        self.assertTrue(torch.equal(actual_pool, pool_init))
+
+        updating_pool = pool_init.clone()
+        chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=updating_pool,
+            initial_state_indices=torch.arange(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            cu_seqlens=cu_seqlens,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        self.assertFalse(
+            torch.equal(updating_pool[:batch_size], pool_init[:batch_size])
+        )
+
     # ------------------------------------------------------------------
     # Head count sweep
     # ------------------------------------------------------------------

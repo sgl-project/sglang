@@ -221,6 +221,36 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_attention_case(self, case)
 
+    def test_multi_item_scoring_mixed_batch_with_empty_query(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_mixed_batch_empty_query",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0, 0),
+            extend_lens=(9, 7),
+            mis_delimiter_indices=((0, 3, 8), (4, 6)),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case)
+
+    def test_multi_item_scoring_crosses_chunk_boundaries(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_chunk_boundaries",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0,),
+            extend_lens=(198,),
+            mis_delimiter_indices=((5, 68, 132, 197),),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case, max_context_len=256)
+
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # shuffled_pages is the default for all tests; this method opts
     # into the more aggressive interleaved_pages + non_monotonic_extend.

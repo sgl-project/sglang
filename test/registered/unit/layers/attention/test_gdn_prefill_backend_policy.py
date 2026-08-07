@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
     flashinfer_gdn_prefill_default,
+    validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
@@ -38,6 +39,7 @@ def make_runner(
         mamba_radix_cache_strategy="no_buffer",
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
+        enable_mis=False,
     )
     for name, value in arg_overrides.items():
         setattr(args, name, value)
@@ -58,6 +60,24 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
+    def test_mis_requires_triton_prefill_backend(self):
+        runner = make_runner(enable_mis=True)
+        with self.assertRaisesRegex(ValueError, "Triton linear-attention prefill"):
+            validate_gdn_mis_backend(
+                runner.server_args, LinearAttnKernelBackend.FLASHINFER
+            )
+
+    def test_mis_rejects_page_major_layout(self):
+        runner = make_runner(enable_mis=True, enable_page_major_kv_layout=True)
+        with self.assertRaisesRegex(ValueError, "page-major"):
+            validate_gdn_mis_backend(runner.server_args, LinearAttnKernelBackend.TRITON)
+
+    def test_non_gdn_linear_backend_rejects_mis(self):
+        with self.assertRaisesRegex(ValueError, "does not support multi-item scoring"):
+            MambaAttnBackendBase.validate_mis_support(SimpleNamespace(enable_mis=True))
+
+        GDNAttnBackend.validate_mis_support(SimpleNamespace(enable_mis=True))
+
     def apply_policy(
         self,
         runner,
