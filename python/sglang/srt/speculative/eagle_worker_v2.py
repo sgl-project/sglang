@@ -1035,10 +1035,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
-            self.adaptive_controller = AdaptiveController(
-                self,
-                config_path=server_args.speculative_adaptive_config,
-            )
+            strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
+            if strategy == "throughput_aware":
+                from sglang.srt.speculative.throughput_aware_controller import (
+                    ThroughputAwareAdaptiveController,
+                )
+
+                self.adaptive_controller = ThroughputAwareAdaptiveController(
+                    self,
+                    config_path=server_args.speculative_adaptive_config,
+                )
+            else:
+                self.adaptive_controller = AdaptiveController(
+                    self,
+                    config_path=server_args.speculative_adaptive_config,
+                )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -1095,6 +1106,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+    @property
+    def model_config(self):
+        return self._target_worker.model_runner.model_config
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
@@ -1416,6 +1431,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_steps=state.speculative_num_steps,
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
+
+    def run_startup_spec_profiling(self, tree_cache) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.run_profiling(tree_cache)
 
     @contextlib.contextmanager
     def _override_worker_state(

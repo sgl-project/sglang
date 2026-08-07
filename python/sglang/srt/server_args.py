@@ -2194,6 +2194,19 @@ class ServerArgs:
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
         NS("spec"),
     ] = None
+    speculative_adaptive_strategy: A[
+        Literal["ema", "throughput_aware"],
+        Arg(
+            help=(
+                "Adaptive speculative decoding strategy. "
+                "'ema' (default) uses EMA-based hysteresis step selection; "
+                "'throughput_aware' combines per-position sliding-window "
+                "acceptance rates with startup-profiled costs to maximize tokens/ms."
+            ),
+            choices=["ema", "throughput_aware"],
+        ),
+        NS("spec"),
+    ] = "ema"
 
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
@@ -8688,13 +8701,22 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
+        if self.speculative_adaptive_strategy == "throughput_aware":
+            from sglang.srt.speculative.throughput_aware_controller import (
+                resolve_throughput_aware_candidate_steps,
+            )
 
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=self.speculative_adaptive_config,
-        )
+            candidate_steps = resolve_throughput_aware_candidate_steps(
+                self.speculative_adaptive_config,
+            )
+        else:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                resolve_candidate_steps_from_config,
+            )
+
+            candidate_steps = resolve_candidate_steps_from_config(
+                cfg_path=self.speculative_adaptive_config,
+            )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
         # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
         return max(candidate_steps) + 1
