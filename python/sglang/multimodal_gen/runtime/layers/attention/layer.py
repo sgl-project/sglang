@@ -1178,26 +1178,58 @@ class USPAttention(nn.Module):
         num_rep: int,
     ) -> torch.Tensor:
         """Ulysses attention where the last num_rep tokens are replicated
-        across SP ranks and should not be duplicated by the all-to-all."""
+        across SP ranks and should not be duplicated by the all-to-all.
+
+        The suffix stays at the sequence tail so every query scans K/V in the
+        same order as a single rank (bitwise-stable across SP degrees);
+        rotating it to the front reorders the reduction, and few-step models
+        amplify that into visible drift.
+        """
         if num_rep <= 0:
             raise ValueError("num_rep must be positive for replicated suffix.")
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-prefix/suffix path does not support "
+                "ring parallelism yet."
+            )
+        sp_rank = get_sp_parallel_rank()
 
         q_shard, q_rep = q[:, :-num_rep], q[:, -num_rep:]
         k_shard, k_rep = k[:, :-num_rep], k[:, -num_rep:]
         v_shard, v_rep = v[:, :-num_rep], v[:, -num_rep:]
 
-        # dense self-attention is permutation equivariant for non-causal use.
-        # 1. rotate the replicated suffix to the front
-        # 2. reuse the validated replicated-prefix path, then
-        # 3. rotate the output back
-        out = self._forward_with_replicated_prefix(
-            torch.cat([q_rep, q_shard], dim=1),
-            torch.cat([k_rep, k_shard], dim=1),
-            torch.cat([v_rep, v_shard], dim=1),
-            ctx_attn_metadata,
-            num_rep,
+        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
+        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+
+        h_local = q_shard.shape[2]
+        kv_h_local = k_shard.shape[2]
+        h_start = sp_rank * h_local
+        kv_h_start = sp_rank * kv_h_local
+        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
+        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+
+        q = torch.cat([q_shard, q_rep], dim=1)
+        k = torch.cat([k_shard, k_rep], dim=1)
+        v = torch.cat([v_shard, v_rep], dim=1)
+
+        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        out_shard = out[:, :-num_rep]
+        out_rep = out[:, -num_rep:]
+
+        out_shard = _usp_output_all_to_all(out_shard, head_dim=2)
+
+        sp_size = get_ulysses_parallel_world_size()
+        gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
+        torch.distributed.all_gather(
+            gathered,
+            out_rep.contiguous(),
+            group=get_sp_group().ulysses_group,
         )
-        out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
+        out_rep = torch.cat(gathered, dim=2)
+
         return torch.cat([out_shard, out_rep], dim=1)
 
 
