@@ -4,13 +4,8 @@ BeamGroup holds search state and consumes joint_select results. Members are
 not requests: the group tracks them columnarly as req_to_token rows
 (member_rows) that decode in lockstep with the leader row.
 
-Sync discipline (overlap-ready split): advance_frontier/advance_final_frontier
-are the launch-path half -- they evolve the frontier tensor and stage the
-selection result, no D2H. commit_pending is the deferred half -- it reads the
-small fixed-shape result tensors to CPU, builds the DAG, and detects finish.
-Under overlap the commit lags one forward (finish-lag); steps staged behind a
-finish (overshoot) are discarded there. Sync callers use the advance()/
-advance_final() wrappers, which run both halves back-to-back.
+advance_*_frontier / commit_pending are this class's halves of the overlap
+split documented in coordinator.py's relay-hook section.
 """
 
 from __future__ import annotations
@@ -93,10 +88,8 @@ class BeamGroup:
         # (finish / abort / dead-leader); guards double bookkeeping.
         self.retired = False
 
-        # Scheduler wiring (set by BeamCoordinator, not by the search core):
-        # the leader request plus the columnar member state. Members are not
-        # Reqs -- each is one physical req_to_token row that decodes in
-        # lockstep with the leader; all per-member bookkeeping (seq len, KV
+        # Scheduler wiring, set by BeamCoordinator rather than the search
+        # core. Members have no Req, so all their bookkeeping (seq len, KV
         # committed/allocated) is implied by the leader's.
         self.leader = None
         # Device [k-1] member row indices, and the same rows on host (for
@@ -125,7 +118,7 @@ class BeamGroup:
 
     def advance_frontier(self, sel: SelectResult, tick: int = 0) -> None:
         """Launch half of one selection step: evolve the frontier tensor and
-        stage the result for commit, stamped with its forward tick. No D2H."""
+        stage the result for commit, stamped with its forward tick."""
         assert self.state == BeamGroupState.DECODING
         self.frontier_cum_logprobs = sel.new_cum_logprobs
         self.num_generated += 1
@@ -133,7 +126,7 @@ class BeamGroup:
 
     def advance_final_frontier(self, sel: FinalSelect, tick: int = 0) -> None:
         """Launch half of a length-terminated step: stage only (the final step
-        needs no next frontier). No D2H."""
+        needs no next frontier)."""
         assert self.state == BeamGroupState.DECODING
         self.num_generated += 1
         self._pending_steps.append((tick, sel))
@@ -144,10 +137,10 @@ class BeamGroup:
         finishes the group; steps staged behind a finish (overlap overshoot)
         are discarded.
 
-        Only steps staged at forward tick <= up_to_tick are consumed (None =
-        all): the caller's copy_done sync covers exactly the selection
+        Tick gate -- the reason every commit_* on this path takes an
+        up_to_tick: the caller's copy_done sync covers exactly the selection
         kernels enqueued up to that forward, so a later-staged step's device
-        tensors may not be readable yet."""
+        tensors may not be readable yet. None = consume all (teardown)."""
         if self.state == BeamGroupState.FINISHED:
             self._pending_steps.clear()
             return False
@@ -220,7 +213,8 @@ class BeamGroup:
         self.state = BeamGroupState.FINISHED
         return True
 
-    # Sync wrappers: both halves back-to-back (UT / prefill-path interface).
+    # Sync wrappers: both halves back-to-back. UT-only -- the scheduler path
+    # drives the two halves separately so they can straddle a forward.
 
     def advance(self, sel: SelectResult) -> bool:
         """Consume one joint_select result; returns True if the group finished."""

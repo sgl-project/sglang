@@ -1,11 +1,11 @@
-"""Golden and differential tests for the beam search core (S2 layer).
+"""Golden and differential tests for the beam search core.
 
 Covers the pure selection functions (joint_select / select_final_topk), the
 backpointer history DAG, and the BeamGroup lifecycle. The selection semantics
 are pinned two ways:
 - golden cases with hand-computed candidate walks
 - randomized differential testing against a naive reference implementation of
-  the walk-in-order loop (the semantics of the original beam expansion)
+  the walk-in-order loop
 """
 
 import random

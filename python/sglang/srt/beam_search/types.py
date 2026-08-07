@@ -27,12 +27,12 @@ class BeamSearchSequence:
     """One beam candidate sequence; text is filled only when the sequence is
     about to be returned to the user."""
 
-    tokens: List[int]  # Generated tokens (excluding prompt)
-    cum_logprob: float = 0.0  # Cumulative log probability for sorting
+    tokens: List[int]  # generated only, no prompt
+    cum_logprob: float = 0.0
 
-    finish_reason: Optional[object] = None  # Reason for completion (if finished)
-    text: Optional[str] = None  # Decoded text (filled on completion)
-    beam_score: Optional[float] = None  # Beam search score, for return
+    finish_reason: Optional[object] = None
+    text: Optional[str] = None
+    beam_score: Optional[float] = None  # length-normalized; the sort key
 
     def finished(self):
         return self.finish_reason is not None

@@ -1,7 +1,6 @@
 """Beam search parity acceptance test (executable API spec).
 
 - Trigger: sampling_params.beam_width = k (> 1); no server-level beam flag.
-  During the sync transition the server must run --disable-overlap-schedule.
 - Response: one response per rid; meta_info.beam_results holds the top-n
   sequences (n <= beam_width, default = beam_width), best score first.
 - Acceptance: sequence-set overlap vs HF transformers >= 0.8 for k in {2, 10}.
@@ -25,8 +24,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-BEAM_V1_READY = True  # v1 beam path (S4) wired
 
 PROMPT = "Hello SGLang"
 MAX_NEW_TOKENS = 10
@@ -60,7 +57,6 @@ def get_transformers_beam_sequences(
     return sequences
 
 
-@unittest.skipUnless(BEAM_V1_READY, "v1 beam search path not wired yet (S4)")
 class TestBeamParity(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -68,8 +64,8 @@ class TestBeamParity(CustomTestCase):
             "SGLANG_TEST_BEAM_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         )
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # No beam-specific server flag; overlap off is the sync-transition
-        # requirement (lifted for EOS-only requests once S5.5 lands).
+        # No beam-specific server flag. Overlap is pinned off so a parity
+        # mismatch can only come from the search, not from scheduling.
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

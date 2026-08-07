@@ -376,8 +376,8 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            # (Beam rows never reach here: the gate above admits only
-            # finished leaders.)
+            # Beam rows never reach here; the gate above admits only finished
+            # leaders.
             if req.stream:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
@@ -414,7 +414,6 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
-        # Appended unconditionally: to_payload ships it in both server modes.
         beam_output = (
             pack_beam_search_output(req) if req.beam_group is not None else None
         )
@@ -440,8 +439,8 @@ class _GenerationStreamAccumulator:
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
             self.reasoning_tokens.append(req.reasoning_tokens)
-            # A beam group reports the total tokens of its returned sequences,
-            # not the leader row's placeholder output_ids length.
+            # A group reports its returned sequences' total, not the leader
+            # row's placeholder output_ids length.
             self.completion_tokens.append(
                 sum(len(seq.tokens) for seq in beam_output.sequences)
                 if beam_output is not None

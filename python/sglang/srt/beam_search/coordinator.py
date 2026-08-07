@@ -2,21 +2,12 @@
 
 A beam_width=k request runs as one leader Req plus k-1 bare member rows:
 physical req_to_token rows tracked columnarly on the group, with no Req
-object behind them. The leader is a standard scheduler request; the member
-rows are appended to the decode batch's row tensors just before allocation
-(ScheduleBatch._append_beam_tail) and sliced off the logits before sampling
-(tp_worker), so the reqs-aligned world never sees them. This coordinator
-hooks three points:
-
-1. admission -- validate_and_init: validation, neutral row params, the
-   group overlay
-2. selection -- at the forward's relay point: per-group top-2k straight from
-   the raw decode logits (leader row + member tail rows), joint_select on
-   device, overwrite next tokens via the FutureMap relay, reparent by
-   remapping each moved row onto its parent's slots (share-on-fork)
-3. lifecycle -- member-row spawn at the leader's prefill relay (row alloc +
-   prompt alias + first-token stash, no host sync) and group finish
-   (finalize + beam_results on the leader; member rows freed in one shot)
+object behind them. The member rows are appended to the decode batch's row
+tensors just before allocation (ScheduleBatch._append_beam_tail) and sliced
+off the logits before sampling (tp_worker), so the reqs-aligned world never
+sees them. Hooks: admission (validate_and_init), selection at the forward's
+relay point, and lifecycle (member spawn at the leader's prefill relay,
+finalize at group finish).
 
 All rows decode in lockstep over [prompt_len, leader_allocated), but
 share-on-fork lets several of them reference the same slot, so the group --
@@ -228,21 +219,20 @@ class BeamCoordinator:
         return sorted(stop_ids)
 
     # ==================== relay hook ====================
-    # Split for overlap: selection is the launch-path half (all tensor-side,
-    # no D2H) -- it must run before the next forward resolves its inputs, so
-    # the relayed tokens and reparented KV are the selected ones.
-    # commit_decode / commit_prefill are the deferred half (DAG build +
-    # finish/abort); under overlap they lag one forward and discard overshoot
-    # steps, mirroring the standard overlap finish-lag. Sync callers run both
-    # back-to-back within one tick.
+    # Every tick is split in two for overlap, and the whole file follows this
+    # naming: select_* is the LAUNCH half (all tensor-side, no D2H) -- it must
+    # run before the next forward resolves its inputs, so the relayed tokens
+    # and reparented KV are the selected ones. commit_* is the DEFERRED half
+    # (DAG build + finish/abort); under overlap it lags one forward and
+    # discards overshoot steps, mirroring the standard overlap finish-lag.
+    # Sync callers run both back-to-back within one tick. Commits are tick-
+    # gated; BeamGroup.commit_pending documents why.
 
     def maybe_select_and_relay(
         self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
     ) -> None:
-        """Per-forward relay hook (launch path; runs where the sampled tokens
-        are stashed): overwrite beam rows' relayed tokens with joint-selected
-        ones before the next forward resolves its inputs. O(1) when no beam
-        group is live."""
+        """Per-forward relay hook: overwrite beam rows' relayed tokens with
+        joint-selected ones. O(1) when no beam group is live."""
         if self._num_live_groups == 0:
             return
         if not batch.spec_algorithm.is_none():
@@ -285,10 +275,9 @@ class BeamCoordinator:
         tick: int = 0,
     ) -> None:
         """Launch half of the leader's prefill tick: first joint selection off
-        the pre-sample capture of the leader's prefill logits (row `pos` of
-        beam_leader_logits), member-row spawn (row alloc + prompt alias), and
-        the relay overwrite (the sampled token is void). All tensor-side;
-        finish/abort actions stay in commit_prefill."""
+        the pre-sample capture of its prefill logits (row `pos` of
+        beam_leader_logits), member-row spawn, and the relay overwrite (the
+        sampled token is void)."""
         group: BeamGroup = req.beam_group
         top_logprobs, top_tokens = _rows_topk_logprobs(
             [logits_output.beam_leader_logits[pos : pos + 1]], group.num_candidates
@@ -308,9 +297,7 @@ class BeamCoordinator:
     def commit_prefill(self, req: Req, up_to_tick: Optional[int] = None) -> None:
         """Deferred half of the leader's prefill tick: fold the staged
         selection into the DAG (the designated D2H point) and apply
-        finish/abort actions. Only steps staged up to the processed batch's
-        forward tick are consumed (later ticks' selection kernels are not
-        yet covered by this result's copy_done sync)."""
+        finish/abort actions."""
         group: BeamGroup = req.beam_group
         if group.retired:
             return
@@ -324,8 +311,7 @@ class BeamCoordinator:
 
     def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
         """Allocate the k-1 member rows and alias the leader's prompt KV
-        mapping onto them, all batched; the rows enter the next decode batch
-        via ScheduleBatch._append_beam_tail. No Req objects, no host sync."""
+        mapping onto them, batched. No Req objects, no host sync."""
         rows = self.req_to_token_pool.alloc_raw(group.beam_width - 1)
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
@@ -353,8 +339,7 @@ class BeamCoordinator:
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
     ) -> None:
         """Launch half: joint-select every group in this decode batch on
-        device, reparent KV, and overwrite the relayed next tokens. Makes no
-        finish decisions and performs no D2H.
+        device, reparent KV, and overwrite the relayed next tokens.
 
         Group rows come from the batch's beam tail layout: the leader's raw
         logits are the worker's pre-sample capture (one beam_leader_logits
@@ -385,11 +370,7 @@ class BeamCoordinator:
         Returns the ids of groups finished/aborted by THIS call: under overlap
         a finished leader row reappears for one overshoot tick, and the
         caller's per-req loop must run the shared finish machinery (KV
-        release, stream) exactly once -- on the committing tick.
-
-        Commits are gated to steps staged at forward tick <= this batch's:
-        this result's copy_done sync covers exactly those selection kernels;
-        a later tick's staged step is not readable yet."""
+        release, stream) exactly once -- on the committing tick."""
         newly_finished = set()
         for req in batch.reqs:
             group = req.beam_group
@@ -417,10 +398,7 @@ class BeamCoordinator:
     ):
         """One on-device selection step; returns (next_tokens, parent_idx)
         GPU tensors of shape [k]. parent_idx is None on a length-terminated
-        final step (its selections all finish; no row moves onto them, and an
-        overlap overshoot step is discarded at commit). The staged result is
-        stamped with the forward tick so commit only consumes it once that
-        forward's copy_done sync covers its kernels."""
+        final step (its selections all finish, so no row moves onto them)."""
         k = group.beam_width
         if group.next_step_is_final():
             fsel = select_final_topk(
@@ -446,8 +424,7 @@ class BeamCoordinator:
         tick: int,
     ) -> None:
         """Move rows onto surviving paths on-device: reparent by pointing each
-        row at its parent's slots and relay the selected next tokens, no D2H
-        round-trip.
+        row at its parent's slots and relay the selected next tokens.
 
         History authority is the backpointer DAG (built at commit); the
         leader's output_ids carries length only (member rows have no host
@@ -479,7 +456,9 @@ class BeamCoordinator:
     ) -> None:
         """Deferred half: return the slots no surviving row references. Runs
         where the tick's copy_done sync already happened, so the unique/isin
-        set difference costs no extra stall on the launch path."""
+        set difference costs no extra stall on the launch path.
+
+        up_to_tick=None drains everything (group teardown)."""
         if not group.pending_orphans:
             return
         if up_to_tick is None:
@@ -491,11 +470,6 @@ class BeamCoordinator:
             ]
         if not staged:
             return
-        # free() only stages into the allocator's release buffer; the enclosing
-        # group is what merges it back into available. The decode result path
-        # already opens one, but the prefill path (first reclaim under overlap)
-        # does not -- own the pairing here so the slots are always reusable
-        # before the next admission decision.
         # Plain free(), never a nested free_group: free_group_begin wipes the
         # pending list and free_group_end does not clear it, so an inner
         # begin/end pair inside the decode path's group double-frees.
@@ -532,10 +506,9 @@ class BeamCoordinator:
         self._retire_group(group)
 
     def retire_aborted_beam_groups(self, reqs_to_abort: List[Req]) -> None:
-        """Bookkeeping for groups whose leader was aborted outside the commit
-        path (retract_decode OOM abort): the member rows were already freed
-        there while the leader's kv info was alive; here the group only
-        leaves the live set."""
+        """Leader aborted outside the commit path (retract_decode OOM): the
+        member rows were already freed there while the leader's kv info was
+        alive, so the group only leaves the live set here."""
         for req in reqs_to_abort:
             group = req.beam_group
             if group is None or group.retired:
@@ -551,9 +524,9 @@ class BeamCoordinator:
         free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def _retire_group(self, group: BeamGroup) -> None:
-        """Take a group out of the live set exactly once (finish or abort);
-        keeps the O(1) live-group gate accurate and drops any overshoot
-        selections staged after the terminal commit."""
+        """Leave the live set exactly once (finish or abort); keeps the O(1)
+        gate accurate and drops overshoot selections staged after the
+        terminal commit."""
         if not group.retired:
             group.retired = True
             group._pending_steps.clear()

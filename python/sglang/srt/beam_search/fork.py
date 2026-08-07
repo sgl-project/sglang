@@ -55,26 +55,23 @@ def alias_members_prompt_kv(
     leader_row: int,
     prompt_len: int,
 ) -> None:
-    """Alias the leader's prompt KV mapping onto every member row in one
-    batched assignment (dst_rows all share the same leader_row + prompt_len).
+    """Point every member row's prompt window at the leader's slots, in one
+    indexed copy (all members share leader_row + prompt_len, so batching them
+    saves a kernel launch per member).
 
-    The prompt KV indices are aliased read-only from the leader's row; each
-    member owns only its decode suffix, which standard alloc_for_decode extends
-    from here. Any tree lock on a matched prompt prefix is held by the leader
-    for the whole group's lifetime; member rows never touch the tree. Batching
-    all members of a group into one indexed copy avoids a per-member kernel
-    launch.
+    Any tree lock on a matched prompt prefix is the leader's for the group's
+    whole lifetime; member rows never touch the tree.
     """
     req_to_token[dst_rows, :prompt_len] = req_to_token[leader_row, :prompt_len]
 
 
 def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> None:
-    """Release a group's member rows: their decode-suffix KV slots
-    [prompt_len, leader_allocated) plus the row slots themselves. Idempotent.
+    """Release a group's decode-suffix KV [prompt_len, leader_allocated) plus
+    the member row slots. Idempotent.
 
-    Must run while the leader still holds its kv info (leader_allocated is the
-    lockstep allocated length of every member row, including any overlap
-    overshoot slot). The aliased prompt mapping is the leader's to free.
+    Must run while the leader still holds its kv info: leader_allocated is
+    the lockstep allocated length of every member row, overlap overshoot slot
+    included.
     """
     if group.member_rows is None:
         return
@@ -82,12 +79,11 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
     start = group.prompt_len
     end = leader.kv.kv_allocated_len if leader.kv is not None else start
     if end > start:
-        # Share-on-fork lets several rows (incl. the leader's) point at the
-        # same slot, so the decode region is owned by the GROUP and freed once,
-        # deduped, here. Rewinding the leader's kv lengths to the prompt hands
-        # its per-Req release path exactly the region still its own ([0,
-        # prompt_len), the aliased prompt) -- without this it would free the
-        # decode region a second time.
+        # Share-on-fork lets several rows (incl. the leader's) point at one
+        # slot, so the GROUP owns the decode region and frees it once, deduped.
+        # Rewinding the leader's kv lengths then leaves its per-Req release
+        # path exactly the region still its own -- [0, prompt_len), the aliased
+        # prompt. Without the rewind it frees the decode region a second time.
         rows = group.all_rows if group.all_rows is not None else group.member_rows
         slots = req_to_token_pool.req_to_token[rows, start:end]
         token_to_kv_pool_allocator.free(slots.flatten().unique())
@@ -98,9 +94,6 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
     group.member_rows = None
     group.member_rows_cpu = None
     group.all_rows = None
-
-
-# ==================== reparent ====================
 
 
 def remap_kv_mapping(

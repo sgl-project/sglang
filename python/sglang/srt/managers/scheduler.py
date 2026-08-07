@@ -2335,9 +2335,6 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
 
-            # Beam request (sampling_params.beam_width > 1): selection reads
-            # the raw logits at the relay point, so the leader needs no
-            # logprob channel.
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
                 recv_req.rid,
@@ -3098,9 +3095,9 @@ class Scheduler(
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
 
-        # Beam groups: reserve the member rows that admitted-but-not-yet-
-        # spawned groups will claim (beam_width - 1 each, leader included in
-        # its own row), so admission never over-commits the req slot pool.
+        # Reserve the member rows that admitted-but-not-yet-spawned beam
+        # groups will claim (beam_width - 1 each; the leader has its own row),
+        # so admission never over-commits the req slot pool.
         active_batch = running_batch or self.running_batch
         pending_member_rows = sum(
             r.beam_group.beam_width - 1
@@ -3866,13 +3863,11 @@ class Scheduler(
         else:
             return
         if batch.beam_tail is not None:
-            # Sampled tokens only cover the reqs-aligned rows (the worker
-            # sliced the beam member rows off before sampling); the member
-            # rows are relayed by the coordinator's selection below.
+            # The worker sliced the member rows off before sampling, so the
+            # sampled tokens cover only the reqs-aligned rows; the member rows
+            # are relayed by the coordinator's selection below.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
-        # Beam rows: overwrite the relayed sampled tokens with joint-selected
-        # ones (and reparent KV) before the next forward resolves its inputs.
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )

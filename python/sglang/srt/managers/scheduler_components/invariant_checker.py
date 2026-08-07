@@ -266,12 +266,10 @@ class SchedulerInvariantChecker:
                 # Beam member rows carry no Req, and share-on-fork lets several
                 # rows reference one slot, so the group -- not the row -- owns
                 # the decode region. Held = allocated - freed, both host-side
-                # counters: the region grows by exactly one slot per row per
-                # step (k per step over end-start steps) and the reclaim
-                # accumulates what it returned. Counting distinct slots off
-                # req_to_token instead would have to read the launch half's
-                # staged tensors, which under overlap are not yet safe to read
-                # on this stream.
+                # counters (the region grows by exactly k slots per step, and
+                # the reclaim accumulates what it returned). Counting distinct
+                # slots off req_to_token instead would mean reading the launch
+                # half's staged tensors, unsafe on this stream under overlap.
                 group = req.beam_group
                 if group is not None and group.all_rows is not None:
                     end = req.kv.kv_allocated_len

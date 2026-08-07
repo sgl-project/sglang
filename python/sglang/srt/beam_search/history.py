@@ -2,9 +2,8 @@
 
 The authoritative token history of every beam is an append-only tree of
 (parent, token) nodes. Reparenting a beam is attaching its next node under
-another beam's leaf, O(1) per step with zero copying. Sequences are only
-materialized at group finish (or retraction drain); stop-string checks walk
-a bounded tail instead of materializing.
+another beam's leaf, O(1) per step with zero copying; sequences are only
+materialized at group finish.
 """
 
 from __future__ import annotations
@@ -33,7 +32,8 @@ def materialize_tokens(leaf: Optional[BeamNode]) -> List[int]:
 
 
 def tail_tokens(leaf: Optional[BeamNode], num_tokens: int) -> List[int]:
-    """Return up to the last num_tokens tokens ending at leaf, in order."""
+    """Up to the last num_tokens tokens ending at leaf, in order. Currently
+    exercised only by tests; for a future bounded stop-string check."""
     tokens: List[int] = []
     node = leaf
     while node is not None and len(tokens) < num_tokens:

@@ -55,7 +55,6 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
 
 
 def is_beam_search_batch(recv_obj: BatchTokenIDOutput) -> bool:
-    """Check if the batch contains beam search requests."""
     return (
         recv_obj.beam_search_output is not None and len(recv_obj.beam_search_output) > 0
     )
@@ -68,7 +67,7 @@ def decode_beam_search_output(
     disable_batch_decode: bool,
     trim_matched_stop: Callable,
 ) -> None:
-    """Decode beam search candidate sequences to text."""
+    """Fill each candidate sequence's `text` in place."""
     if disable_batch_decode:
         for i, beam_output in enumerate(recv_obj.beam_search_output):
             if beam_output is None:
@@ -114,18 +113,15 @@ def decode_beam_search_output(
 
 
 def build_beam_search_out(out: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert a beam search out dict (containing beam_results) to a regular out dict.
-
-    Takes the first beam's meta_info as the top-level meta_info, and stores
-    the full beam_results list inside meta_info so callers can access all beams.
-    All post-processing (logging, metrics, abort handling, timing, etc.) is handled
-    by the shared _wait_one_response logic after this conversion.
+    """Flatten a beam_results dict into a regular out dict: best beam at the
+    top level, full list under meta_info. Shaping it like a normal response
+    is what lets _wait_one_response reuse its logging / metrics / abort path
+    unchanged.
     """
     beam_results = out.get("beam_results", [])
     if not beam_results:
         return out
     first_beam = beam_results[0]
-    # Use the first beam's fields as the top-level out, put all beams in meta_info.
     converted = {
         "text": first_beam.get("text", ""),
         "output_ids": first_beam.get("output_ids", []),
@@ -144,10 +140,7 @@ def try_build_beam_search_out_dict(
     i: int,
     meta_info: Dict[str, Any],
 ) -> Optional[dict]:
-    """If this item is a beam search result, build and return the out_dict.
-    Returns None if not a beam search item.
-    """
-    # Only support BatchTokenIDOutput or BatchStrOutput for beam search
+    """Build the out_dict if item `i` is a finished beam result, else None."""
     if not isinstance(recv_obj, (BatchTokenIDOutput, BatchStrOutput)):
         return None
 
@@ -172,9 +165,6 @@ def _build_beam_search_out_dict(
     meta_info: Dict[str, Any],
     recv_obj: Union[BatchStrOutput, BatchTokenIDOutput],
 ) -> dict:
-    """Build the out_dict for a beam search result."""
-    # recv_obj is guaranteed to be BatchStrOutput or BatchTokenIDOutput by the
-    # only caller (try_build_beam_search_out_dict); the check is loop-invariant.
     # Only BatchStrOutput carries detokenized text.
     include_text = isinstance(recv_obj, BatchStrOutput)
     beam_results = []

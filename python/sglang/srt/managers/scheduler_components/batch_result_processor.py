@@ -266,10 +266,9 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     if req.beam_group is not None:
-                        # Beam leader: the joint selection already ran at the
-                        # forward's relay point (replacing the sampled-token
-                        # append); commit applies the deferred finish/abort.
-                        # The group owns all finish semantics.
+                        # Beam leader: the joint selection already replaced the
+                        # sampled-token append at the forward's relay point,
+                        # and the group owns all finish semantics.
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
@@ -852,9 +851,8 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Beam groups: the selection already ran at the forward's relay point
-        # (launch path); here the deferred commit folds it into the DAG and
-        # sets group-atomic finish states that the loop below then observes.
+        # Deferred commit: folds the relay point's selection into the DAG and
+        # sets the group-atomic finish states the loop below observes.
         # (Beam + spec is rejected at admission.)
         newly_finished_beam_groups = set()
         if batch.spec_algorithm.is_none() and logits_output is not None:
@@ -864,11 +862,11 @@ class SchedulerBatchResultProcessor:
             req: Req
 
             if req.beam_group is not None:
-                # Beam row: the commit pre-pass owns tokens and finish state;
-                # only the shared finish machinery (KV release, completion
-                # time) runs here. Under overlap a finished row reappears for
-                # one overshoot tick; only the tick whose commit finished the
-                # group handles it (exactly once).
+                # The commit pre-pass owns tokens and finish state; only the
+                # shared finish machinery (KV release, completion time) runs
+                # here. Under overlap a finished row reappears for one
+                # overshoot tick, so gate on the tick that finished the group
+                # to run this exactly once.
                 if req.finished() and (
                     id(req.beam_group) not in newly_finished_beam_groups
                 ):

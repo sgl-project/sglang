@@ -614,14 +614,12 @@ class TpModelWorker(BaseTpWorker):
                 and logits_output.next_token_logits is not None
             ):
                 if batch.beam_tail is not None:
-                    # Beam member rows: split their logits off before sampling
-                    # so the sampler (and every reqs-aligned consumer
-                    # downstream) sees only the reqs-aligned rows; the
-                    # scheduler-side selection consumes the tail at the relay
-                    # point. The tail slice lies outside the sampler's view,
-                    # so its raw logits survive the sampler's in-place
-                    # temperature/softmax writes; the leader rows do not --
-                    # clone them here, pre-sample.
+                    # Split the beam member rows off before sampling so the
+                    # sampler and every reqs-aligned consumer downstream see
+                    # only the reqs-aligned rows. The tail then sits outside
+                    # the sampler's view and keeps its raw logits for the
+                    # scheduler-side selection; the leader rows do not, hence
+                    # the pre-sample clone.
                     n = batch.beam_tail.num_base_rows
                     logits = logits_output.next_token_logits
                     logits_output.beam_tail_logits = logits[n:]
@@ -632,9 +630,9 @@ class TpModelWorker(BaseTpWorker):
                         logits_output.hidden_states = logits_output.hidden_states[:n]
                     forward_batch.positions = forward_batch.positions[:n]
                 elif forward_batch.forward_mode.is_extend():
-                    # Beam leaders' first selection reads their prefill
-                    # logits at the relay point (after sampling); capture
-                    # them before the sampler's in-place writes.
+                    # Same reason, prefill side: the leader's first selection
+                    # runs at the relay point, after the sampler's in-place
+                    # writes would have clobbered these logits.
                     leader_rows = [
                         i for i, r in enumerate(batch.reqs) if r.beam_group is not None
                     ]
