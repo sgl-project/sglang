@@ -1833,12 +1833,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "--ar-dit-overlap-mode",
             type=str,
             default=ServerArgs.ar_dit_overlap_mode,
-            choices=["off", "auto", "on"],
+            choices=["off", "on"],
             help=(
                 "Control AR/DiT overlap for separated GLM-Image deployments. "
-                "'off' disables overlap; 'auto' enables it only for conservative "
-                "single-DiT-device setups; 'on' enables it whenever the pipeline "
-                "supports async AR prefetch."
+                "'off' disables overlap; 'on' enables it whenever the pipeline "
+                "supports async AR prefetch. Defaults to 'off'."
             ),
         )
         parser.add_argument(
@@ -2551,8 +2550,8 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        if self.ar_dit_overlap_mode not in ("off", "auto", "on"):
-            raise ValueError("ar_dit_overlap_mode must be one of: off, auto, on")
+        if self.ar_dit_overlap_mode not in ("off", "on"):
+            raise ValueError("ar_dit_overlap_mode must be one of: off, on")
         if self.encoder_parallel == "dp" and (
             (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
         ):

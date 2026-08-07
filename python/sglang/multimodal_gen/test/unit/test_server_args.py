@@ -142,7 +142,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "--model-path",
                 "/data/model",
                 "--ar-dit-overlap-mode",
-                "auto",
+                "on",
             ]
         )
 
@@ -154,7 +154,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         ):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertEqual(server_args.ar_dit_overlap_mode, "auto")
+        self.assertEqual(server_args.ar_dit_overlap_mode, "on")
 
     def test_invalid_ar_dit_overlap_mode_raises(self):
         with self.assertRaises(ValueError):
