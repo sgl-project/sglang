@@ -404,8 +404,20 @@ class KVCacheConfigurator:
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
             from sglang.srt.mem_cache.multi_ended_allocator import (
                 UnifiedMambaTokenToKVPoolAllocator,
+                UnifiedSWATokenToKVPoolAllocator,
             )
 
+            if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
+                # The SWA composite's full side also issues virtual ids from
+                # the whole virtual space, but the sizing below only handles
+                # the mamba composite and no unified-SWA target has been
+                # validated with a spec draft — fail loudly instead of letting
+                # the draft pool silently write out of bounds at high ids.
+                raise ValueError(
+                    "Speculative decoding with --enable-unified-memory is only "
+                    "supported for hybrid-Mamba targets; the unified hybrid-SWA "
+                    "pool's draft sizing (virtual-id space) is not wired yet."
+                )
             if isinstance(
                 token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
             ):
