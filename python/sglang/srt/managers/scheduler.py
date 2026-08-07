@@ -3203,6 +3203,15 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+
+        prefetch_progress_map = None
+        if self.enable_hicache_storage and hasattr(
+            self.tree_cache, "bulk_check_prefetch_progress"
+        ):
+            prefetch_progress_map = self.tree_cache.bulk_check_prefetch_progress(
+                [req.rid for req in self.waiting_queue]
+            )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3224,7 +3233,16 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if prefetch_progress_map is not None:
+                prefetch_done = prefetch_progress_map.get(req.rid, True)
+                if not prefetch_done:
+                    # skip staging requests that are ongoing prefetch
+                    continue
+                # Pop the number of tokens loaded from storage (L3 hits)
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
+            elif self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch

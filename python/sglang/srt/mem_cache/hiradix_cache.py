@@ -1680,6 +1680,14 @@ class HiRadixCache(RadixCache):
 
         return True
 
+    def bulk_check_prefetch_progress(self, req_ids: list) -> dict:
+        if not self.enable_storage:
+            return {}
+        result = {}
+        for rid in req_ids:
+            result[rid] = self.check_prefetch_progress(rid)
+        return result
+
     def _sync_and_clamp_prefetch_result(
         self,
         operation: PrefetchOperation,
