@@ -1760,6 +1760,107 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
 
 
+class TestKVGatherDegree(unittest.TestCase):
+    def test_sp2_defaults_to_kv_gather(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertTrue(args.sp_split_auto)
+        # gather rows occupy the contiguous inner SP dimension
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.sp_degree, 2)
+
+    def test_higher_sp_defaults_to_ulysses(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertFalse(args.sp_split_auto)
+        self.assertEqual(args.ulysses_degree, 4)
+
+    def test_explicit_ulysses_is_not_overridden(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "ulysses_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 2)
+
+    def test_explicit_degree_is_not_auto(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "kv_gather_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertFalse(args.sp_split_auto)
+
+    def test_kv_gather_supports_tp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "tp_size": 2,
+                "sp_degree": 2,
+                "kv_gather_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.kv_gather_degree, 2)
+
+    def test_kv_gather_supports_fsdp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "sp_degree": 2,
+                "kv_gather_degree": 2,
+                "use_fsdp_inference": True,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertEqual(args.kv_gather_degree, 2)
+
+    def test_kv_gather_does_not_compose_yet(self):
+        for extra in ({"ulysses_degree": 2}, {"ring_degree": 2}):
+            with self.assertRaisesRegex(ValueError, "does not compose"):
+                _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": 4,
+                        "sp_degree": 4,
+                        "kv_gather_degree": 2,
+                        "performance_mode": "manual",
+                        **extra,
+                    }
+                )
+
+
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
         self.assertTrue(
