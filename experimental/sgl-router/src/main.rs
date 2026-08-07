@@ -105,10 +105,22 @@ async fn main() -> Result<()> {
     // subscribers are ever added.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
     let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
+        {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(key) = cfg.proxy.worker_api_key.as_deref() {
+                let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                    .expect(
+                        "worker api key must be a valid HTTP header value (validated at startup)",
+                    );
+                v.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, v);
+            }
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .default_headers(headers)
+                .build()
+                .expect("default http client builds")
+        },
         Arc::clone(&block_size_oracle),
     );
     let policies = Arc::new(
