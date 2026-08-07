@@ -932,14 +932,12 @@ TWO_GPU_CASES = [
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2I_sampling_params.prompt,
