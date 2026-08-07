@@ -689,15 +689,12 @@ class USPAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         if get_ring_parallel_world_size() > 1:
-            backend_enum = attn_backend.get_enum()
-            if backend_enum not in (
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.SAGE_ATTN,
-            ):
+            if not attn_backend.supports_ring_rotation():
                 raise RuntimeError(
-                    f"Ring Attention is only supported for FlashAttention or SageAttention backends, "
-                    f"but got {backend_enum.name}. "
-                    f"Please ensure your platform supports these backends."
+                    f"Ring Attention requires a backend whose kernel exposes the "
+                    f"softmax LSE for the per-hop merge; "
+                    f"{attn_backend.get_enum().name} does not declare support "
+                    f"(see AttentionBackend.supports_ring_rotation)."
                 )
         impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -850,17 +847,24 @@ class USPAttention(nn.Module):
 
         if attn_mask is not None or meta_only_pad:
             if (
-                num_replicated_prefix
-                or num_replicated_suffix
-                or num_replicated_kv_prefix
+                (
+                    num_replicated_prefix
+                    or num_replicated_suffix
+                    or num_replicated_kv_prefix
+                )
+                and not effective_skip_sp
+                and get_sequence_parallel_world_size() > 1
             ):
-                # This path shards every row through the all-to-all; a
-                # replicated prefix/suffix would be duplicated across ranks and
-                # silently corrupt the output, so refuse loudly instead.
+                # Under SP this path shards every row through the all-to-all;
+                # a replicated prefix/suffix would be duplicated across ranks
+                # and silently corrupt the output, so refuse loudly instead.
+                # On a single rank the mask already describes the full
+                # sequence and the replicated counts are meaningless, so the
+                # call is legal.
                 raise NotImplementedError(
                     "USPAttention's masked path does not support replicated "
-                    "prefix/suffix tokens; drop attn_mask/attn_mask_meta or "
-                    "the replicated segment."
+                    "prefix/suffix tokens under sequence parallelism; drop "
+                    "attn_mask/attn_mask_meta or the replicated segment."
                 )
 
             def _prepare_sdpa_mask(

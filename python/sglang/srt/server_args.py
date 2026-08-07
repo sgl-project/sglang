@@ -2746,13 +2746,15 @@ class ServerArgs:
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc"]],
-        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
+        "Transport multimodal features through CPU memory, a bounded CUDA IPC "
+        "pool, or a bounded CUDA VMM pool. CUDA VMM must be selected explicitly "
+        "and is available only to models that opt in. "
         "Unset resolves automatically: multimodal models on single-node CUDA "
         "deployments (without disaggregation) use cuda_ipc, everything else uses "
-        "cpu. CUDA IPC reserves SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on "
-        "the base GPU and falls back to CPU transport per tensor when the pool is "
-        "full.",
+        "cpu. Both CUDA transports reserve SGLANG_MM_FEATURE_CACHE_MB (default "
+        "1024 MiB) on the base GPU across tokenizer workers and fall back to CPU "
+        "transport per tensor when full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -6009,7 +6011,7 @@ class ServerArgs:
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
-        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # MambaRadixCache. The host-offload path (enabled by
         # --enable-hierarchical-cache) and custom radix-cache backends are NOT
         # int8-aware: they would read int8 checkpoint slots as bf16 active slots
         # (wrong pool / out-of-range). Reject the combination up front rather than
@@ -6020,7 +6022,7 @@ class ServerArgs:
             raise ValueError(
                 "--enable-int8-mamba-checkpoint is not supported together with "
                 "--enable-hierarchical-cache: the host-offload path "
-                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+                "is not int8-aware. Disable one of them."
             )
         if self.radix_cache_backend is not None:
             raise ValueError(
@@ -7582,10 +7584,10 @@ class ServerArgs:
         legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
         if self.keep_mm_feature_on_device:
-            if requested_transport == "cpu":
+            if requested_transport not in (None, "cuda_ipc"):
                 raise ValueError(
                     "--keep-mm-feature-on-device conflicts with "
-                    "--mm-feature-transport=cpu. Use only "
+                    f"--mm-feature-transport={requested_transport}. Use only "
                     "--mm-feature-transport=cuda_ipc."
                 )
             requested_transport = "cuda_ipc"
@@ -7638,13 +7640,30 @@ class ServerArgs:
                 int(legacy_ipc_enabled),
             )
 
-        if self.encoder_only and requested_transport == "cuda_ipc":
+        if self.encoder_only and requested_transport in ("cuda_ipc", "cuda_vmm"):
             logger.warning(
-                "--mm-feature-transport=cuda_ipc does not control encoder-only "
+                "--mm-feature-transport=%s does not control encoder-only "
                 "output transfer; using cpu for this inactive transport. Select "
-                "--encoder-transfer-backend for encoder outputs."
+                "--encoder-transfer-backend for encoder outputs.",
+                requested_transport,
             )
             requested_transport = "cpu"
+
+        if requested_transport == "cuda_vmm":
+            if not is_cuda():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm requires NVIDIA CUDA."
+                )
+            if self.pp_size != 1:
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm does not support pipeline "
+                    "parallelism."
+                )
+            if envs.SGLANG_RUST_SERVER.get():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm is not supported with "
+                    "SGLANG_RUST_SERVER."
+                )
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
