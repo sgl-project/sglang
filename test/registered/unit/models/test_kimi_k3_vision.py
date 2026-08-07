@@ -468,14 +468,11 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
         "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
         return_value=sharded_embeddings,
     ) as run_dp, mock_patch(
-        "sglang.srt.models.kimi_k3.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
-    ), mock_patch(
         "sglang.srt.models.kimi_k3.get_parallel",
-        return_value=SimpleNamespace(attn_tp_size=1),
+        return_value=SimpleNamespace(tp_size=1, attn_tp_size=1),
     ):
         output = model.get_image_feature(items)
-        # exercise the loader inside the patch scope: it reads server args
+        # Exercise the loader while the runtime topology is patched.
         loader_in_scope = run_dp.call_args.kwargs["load_local_pixel_values"]
         local = loader_in_scope([1])
         both = loader_in_scope([0, 1])
@@ -552,11 +549,8 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
         "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
         return_value=torch.zeros(1, 2),
     ) as run_dp, mock_patch(
-        "sglang.srt.models.kimi_k3.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
-    ), mock_patch(
         "sglang.srt.models.kimi_k3.get_parallel",
-        return_value=SimpleNamespace(attn_tp_size=1),
+        return_value=SimpleNamespace(tp_size=1, attn_tp_size=1),
     ), mock_patch(
         "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
         side_effect=fake_preprocess,
