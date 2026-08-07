@@ -1,4 +1,4 @@
-"""B200 extra CI: DeepSeek-V4-Flash FP4 with attn-CP (DSA prefill CP).
+"""B200 extra CI: DeepSeek-V4-Flash FP4 with attn-CP.
 
 Balanced recipe (TP=4, DeepEP, EAGLE) plus --attn-cp-size=4 with the
 DSA prefill-CP round-robin-split mode. Split out of
@@ -181,12 +181,13 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--moe-runner-backend",  # for fp4 checkpoint
                 "flashinfer_mxfp4",
             ],
+            env={"SGLANG_ENABLE_CP_V2": "1"},
         )
 
     @classmethod

@@ -371,21 +371,14 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
-        if isinstance(model, DeepseekV4ForCausalLM):
-            stream = torch.cuda.current_stream()
-            hidden_states, pre_hc_head = hidden_states
-            hidden_states = cp_gather_after_forward(
-                hidden_states, forward_batch, stream
-            )
-            pre_hc_head = cp_gather_after_forward(pre_hc_head, forward_batch, stream)
-            logits_kwargs = {"hidden_states_before_norm": pre_hc_head}
-        else:
-            hidden_states = cp_gather_after_forward(
-                hidden_states, forward_batch, torch.cuda.current_stream()
-            )
-            logits_kwargs = {}
+        hidden_states = cp_gather_after_forward(
+            hidden_states, forward_batch, torch.cuda.current_stream()
+        )
+        logits_kwargs = {}
+        # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,

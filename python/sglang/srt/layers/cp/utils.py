@@ -238,14 +238,18 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     assert strategy is not None
 
     if isinstance(x, tuple):
-        hidden_states, *rest = x
-        hidden_states = strategy.gather_hidden_states(
-            hidden_states, forward_batch, stream
+        gathered = tuple(
+            (
+                strategy.gather_hidden_states(item, forward_batch, stream)
+                if item is not None
+                else None
+            )
+            for item in x
         )
         # MiMo's text-only body returns (hidden_states, None); logits expects a tensor.
-        if len(rest) == 1 and rest[0] is None:
-            return hidden_states
-        return (hidden_states, *rest)
+        if len(gathered) == 2 and gathered[1] is None:
+            return gathered[0]
+        return gathered
 
     return strategy.gather_hidden_states(x, forward_batch, stream)
 
@@ -259,6 +263,8 @@ def cp_materialize_global_token_order(
         assert strategy is not None
         return strategy.gather_kv_cache(x, forward_batch, stream)
 
+    # TODO(hzh0425): Keep the legacy gather temporarily for CP-v1 compatibility. Remove it
+    # with the follow-up CP-v1 cleanup.
     from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 
     return cp_all_gather_rerange_output(
