@@ -1608,7 +1608,16 @@ class FlashInferIndicesUpdaterDecode:
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 paged_kernel_lens = seq_lens
-                kv_start_idx = encoder_lens
+                # Decoder self-attn KV starts after the page-aligned encoder
+                # reserve ceil_align(encoder_len, page_size), matching the column
+                # where pad_input_ids / prepare_encoder_info_extend / the
+                # allocator physically write decoder KV. kv_start_idx is a raw
+                # req_to_token column offset (the kv-indices kernel adds it
+                # without dividing by page_size), so it must be the page-aligned
+                # reserve. ceil_align(x, 1) == x, so this is byte-identical for
+                # page_size == 1 (the CUDA flashinfer default).
+                page_size = self.attn_backend.page_size
+                kv_start_idx = ((encoder_lens + page_size - 1) // page_size) * page_size
                 kv_lens_cpu = seq_lens_cpu
             else:
                 # Cross-attention: attend to encoder tokens only
@@ -1998,7 +2007,12 @@ class FlashInferIndicesUpdaterPrefill:
             if wrapper_id == 0:
                 # normal attention
                 paged_kernel_lens = seq_lens
-                kv_start_idx = encoder_lens
+                # Decoder self-attn KV starts after the page-aligned encoder
+                # reserve ceil_align(encoder_len, page_size); see the matching
+                # comment in FlashInferIndicesUpdaterDecode.update_cross_attention.
+                # ceil_align(x, 1) == x, so byte-identical for page_size == 1.
+                page_size = self.attn_backend.page_size
+                kv_start_idx = ((encoder_lens + page_size - 1) // page_size) * page_size
                 paged_kernel_lens_sum = seq_lens_sum
             else:
                 # cross attention

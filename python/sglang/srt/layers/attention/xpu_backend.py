@@ -370,12 +370,20 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
+            # Decoder KV starts after the page-aligned encoder reserve, not after
+            # the true encoder length: pad_input_ids reserves
+            # ceil_align(encoder_len, page_size) slots so the decoder KV region
+            # begins on a page boundary (required by the paged kernel). The
+            # cross-attention (encoder) page table still reads only the true
+            # encoder length above. ceil_align(x, 1) == x, so this equals
+            # encoder_max_seq_len_k for page_size == 1 — a no-op there.
+            encoder_offset = (
+                (metadata.encoder_max_seq_len_k + self.page_size - 1) // self.page_size
+            ) * self.page_size
             # Currently only support forward_batch.encoder_lens.numel() == 1
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
+                encoder_offset : (encoder_offset + metadata.max_seq_len_k),
             ]
 
         # Translate full-pool indices to SWA-pool indices for hybrid models
@@ -424,6 +432,23 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
+
+            # The cross-attention (encoder) page table is token-granular like
+            # page_table; the paged kernel treats its entries as page numbers,
+            # so it must be strided + divided the same way. Without this the
+            # decoder attends to garbage encoder KV (see WhisperEncoder cross
+            # attention). Encoder-decoder only; no-op for other models.
+            if metadata.encoder_page_table is not None:
+                enc_strided_indices = torch.arange(
+                    0,
+                    metadata.encoder_page_table.shape[1],
+                    self.page_size,
+                    device=self.device,
+                )
+                metadata.encoder_page_table = (
+                    metadata.encoder_page_table[:, enc_strided_indices]
+                    // self.page_size
+                )
 
         self.forward_metadata = metadata
 
@@ -1127,20 +1152,62 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
                 torch.cumsum(encoder_lens, dim=0, dtype=torch.int32)
             )
-            metadata.encoder_page_table[:bs, : metadata.encoder_max_seq_len_k].copy_(
-                self.req_to_token[
-                    req_pool_indices, : metadata.encoder_max_seq_len_k
-                ].to(torch.int32)
-            )
-            # Self-attention (text) page_table: decoder tokens start after encoder tokens.
+            # Cross-attention (encoder) page table: read the TRUE encoder length
+            # from column 0. Like the eager path it is token-granular and must be
+            # strided + //page_size below so the paged kernel reads real pages.
+            enc_len = metadata.encoder_max_seq_len_k
+            if self.page_size > 1:
+                enc_pages = (enc_len + self.page_size - 1) // self.page_size
+                enc_cols = torch.arange(
+                    0,
+                    enc_pages * self.page_size,
+                    self.page_size,
+                    device=req_pool_indices.device,
+                )
+                metadata.encoder_page_table[:bs, :enc_pages].copy_(
+                    (
+                        self.req_to_token[req_pool_indices][:, enc_cols]
+                        // self.page_size
+                    ).to(torch.int32)
+                )
+                metadata.encoder_page_table[:bs, enc_pages:].zero_()
+            else:
+                metadata.encoder_page_table[:bs, :enc_len].copy_(
+                    self.req_to_token[req_pool_indices, :enc_len].to(torch.int32)
+                )
+            # Self-attention (text) page_table: decoder tokens start after the
+            # PAGE-ALIGNED encoder reserve ceil_align(encoder_len, page_size),
+            # matching where the allocator writes decoder KV; then stride +
+            # //page_size to page granularity (mirrors the eager path). At
+            # page_size == 1 encoder_offset == encoder_len and the stride is the
+            # identity, so this is byte-identical to the token-granular baseline.
             text_max = metadata.max_seq_len_k
-            arange_text = torch.arange(text_max, device=req_pool_indices.device)
-            text_col = encoder_lens[:bs].long().unsqueeze(1) + arange_text.unsqueeze(0)
-            text_row = req_pool_indices.unsqueeze(1).expand(-1, text_max)
-            metadata.page_table[:bs, :text_max].copy_(
-                self.req_to_token[text_row, text_col].to(torch.int32)
-            )
-            metadata.page_table[:bs, text_max:].zero_()
+            encoder_offset = (
+                (enc_len + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            if self.page_size > 1:
+                text_pages = (text_max + self.page_size - 1) // self.page_size
+                text_cols = encoder_offset + torch.arange(
+                    0,
+                    text_pages * self.page_size,
+                    self.page_size,
+                    device=req_pool_indices.device,
+                )
+                text_row = req_pool_indices.unsqueeze(1).expand(-1, text_cols.numel())
+                metadata.page_table[:bs, :text_pages].copy_(
+                    (self.req_to_token[text_row, text_cols] // self.page_size).to(
+                        torch.int32
+                    )
+                )
+                metadata.page_table[:bs, text_pages:].zero_()
+            else:
+                arange_text = torch.arange(text_max, device=req_pool_indices.device)
+                text_col = encoder_offset + arange_text.unsqueeze(0)
+                text_row = req_pool_indices.unsqueeze(1).expand(-1, text_max)
+                metadata.page_table[:bs, :text_max].copy_(
+                    self.req_to_token[text_row, text_col].to(torch.int32)
+                )
+                metadata.page_table[:bs, text_max:].zero_()
         else:
             raw_page = self.req_to_token[
                 req_pool_indices[:, None],
