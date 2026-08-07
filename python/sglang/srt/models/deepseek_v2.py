@@ -84,6 +84,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dcp import get_dcp_attn_comm
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -1901,10 +1902,12 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
-        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if get_parallel().dcp_enabled:
+        # use the widened head count because q_nope, q_rope is all gathered from dcp ranks
+        dcp_comm = get_dcp_attn_comm()
+        if dcp_comm.enabled:
+            dcp_comm.check_layout()
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                dcp_comm.num_kernel_heads(self.num_local_heads),
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,

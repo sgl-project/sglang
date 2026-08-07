@@ -307,7 +307,6 @@ class ModelRunner:
         self.device = server_args.device
         self.gpu_id = gpu_id
         self.dcp_size = server_args.dcp_size
-        self.dcp_rank = ps.tp_rank % self.dcp_size
         self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
@@ -1232,6 +1231,18 @@ class ModelRunner:
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
+
+    @property
+    def dcp_rank(self) -> int:
+        """This rank's index in the DCP group, 0 when DCP is disabled.
+
+        Read from the process group rather than computed as ``tp_rank %
+        dcp_size``, so the KV ownership rule (``pos % dcp_size == dcp_rank``)
+        follows the group's actual rank layout instead of independently assuming
+        DCP is a contiguous, lowest-order slice of TP. Resolved lazily because
+        the group does not exist yet when the runner is constructed.
+        """
+        return get_parallel().attn_dcp_rank
 
     @property
     def effective_max_total_num_tokens(self):

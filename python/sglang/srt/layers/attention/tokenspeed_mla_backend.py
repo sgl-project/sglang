@@ -54,6 +54,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.dcp.attn_comm import get_dcp_attn_comm
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
@@ -91,7 +92,7 @@ def _get_tokenspeed_workspace(
 
     # DCP target verification gathers Q to the full head count before launching
     # TokenSpeed; size for that launch shape, not the rank-local head count.
-    num_heads *= get_parallel().attn_dcp_size
+    num_heads = get_dcp_attn_comm().num_kernel_heads(num_heads)
     max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (
         tokenspeed_mla.get_num_sm(device)

@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
+    get_dcp_attn_comm,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
@@ -683,10 +684,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
-        self.num_local_heads = (
-            model_runner.model_config.num_attention_heads
-            // get_parallel().attn_tp_size
-            * get_parallel().attn_dcp_size
+        self.num_local_heads = get_dcp_attn_comm().num_kernel_heads(
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim

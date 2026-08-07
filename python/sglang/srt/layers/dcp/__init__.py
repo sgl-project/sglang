@@ -19,6 +19,11 @@ and layers/utils/dcp_utils.py (PR #14194, FlashInfer-MLA).
 The two ``cp_lse_ag_out_rs`` variants are kept distinct (``_mha`` torch/all-reduce,
 ``_mla`` Triton/reduce-scatter) because their bodies are backend-forced.
 
+``get_dcp_attn_comm()`` is the entry point call sites should prefer: it owns the
+widened-head arithmetic, the head-shard mapping ``o_proj`` alignment depends on,
+and the ``ag_rs``/``a2a``/``fi_a2a`` dispatch. The individual collectives below
+remain exported for the paths that need one specific primitive.
+
 Only the symbols imported by code OUTSIDE this subpackage are re-exported here.
 Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
 ``correct_attn_out``, ``create_dcp_kv_indices``, ``update_kv_lens_and_indices``,
@@ -31,6 +36,11 @@ out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
+)
+from sglang.srt.layers.dcp.attn_comm import (
+    DcpAttnComm,
+    get_dcp_attn_comm,
+    is_lse_base_on_e,
 )
 from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_dcp,
@@ -62,9 +72,12 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 # planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
+    "DcpAttnComm",
     "DecodeContextParallelMetadata",
     "dcp_a2a_lse_reduce",
+    "get_dcp_attn_comm",
     "init_fi_a2a_workspace",
+    "is_lse_base_on_e",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",
