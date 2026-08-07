@@ -4,7 +4,10 @@ import os
 import sys
 from typing import Optional
 
-from sglang_simulator.compat import validate_launch_runtime
+from sglang_simulator.compat import (
+    apply_simulator_server_args,
+    validate_launch_runtime,
+)
 from sglang_simulator.simulation.sglang.hook_bootstrap import (
     install_simulator_hooks,
     run_simulator_detokenizer_process,
@@ -87,6 +90,7 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     raw_args = parser.parse_args(argv)
     apply_simulator_defaults(raw_args, argv)
+    apply_simulator_server_args(raw_args)
     server_args = ServerArgs.from_cli_args(raw_args)
     simulation_args = SimulationArgs.from_cli_args(raw_args)
 

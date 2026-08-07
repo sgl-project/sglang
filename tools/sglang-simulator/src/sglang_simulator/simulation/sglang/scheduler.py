@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from sglang_simulator.compat import override_server_args
+from sglang_simulator.compat import validate_simulator_server_args
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
@@ -294,19 +294,13 @@ class C_SchedulerHook(BaseHook):
 
         def wrapped_init(self, *args, **kwargs):
             logger.info(simulation_mode_log_message(C_SchedulerHook.SIM_MODE))
-            # Disable overlap schedule
+            # Supported entry points prepare the final config before publication.
             server_args = get_obj_from_args(
                 "sglang.srt.server_args.ServerArgs", *args, **kwargs
             )
+            validate_simulator_server_args(server_args)
             C_SchedulerHook.OVERLAP_SCHEDULE = not getattr(
                 server_args, "disable_overlap_schedule", False
-            )
-            override_server_args(
-                server_args,
-                disable_overlap_schedule=True,
-                attention_backend="torch_native",
-                prefill_attention_backend="torch_native",
-                decode_attention_backend="torch_native",
             )
             logger.debug(
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."

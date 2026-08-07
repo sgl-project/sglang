@@ -197,7 +197,14 @@ def _transfer_segment_lengths(
 
 
 def _sim_load_to_device_per_layer(
-    self, device_pool, host_indices, device_indices, layer_id, io_backend
+    self,
+    device_pool,
+    host_indices,
+    device_indices,
+    layer_id,
+    io_backend,
+    *,
+    is_draft: bool = False,
 ) -> None:
     segment_lengths = _transfer_segment_lengths(
         self, host_indices, device_indices, count_logical_tokens=True

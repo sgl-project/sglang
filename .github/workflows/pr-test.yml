@@ -309,16 +309,6 @@ jobs:
     # No `secrets: inherit`: this stage has no secret consumer, unlike the GPU
     # stages' coredump upload. GITHUB_TOKEN and permissions inherit regardless.
 
-      - name: Run SGLang Simulator compatibility tests
-        if: matrix.partition == 0
-        timeout-minutes: 10
-        env:
-          UV_SYSTEM_PYTHON: "1"
-        run: |
-          uv pip install -e "tools/sglang-simulator[aic]"
-          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
-          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
-
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]

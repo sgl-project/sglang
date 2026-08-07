@@ -3,6 +3,14 @@
 import inspect
 from importlib import metadata
 
+SIMULATOR_SERVER_ARG_OVERRIDES = {
+    "disable_overlap_schedule": True,
+    "disable_cuda_graph": True,
+    "attention_backend": "torch_native",
+    "prefill_attention_backend": "torch_native",
+    "decode_attention_backend": "torch_native",
+}
+
 
 class SGLangCompatibilityError(RuntimeError):
     pass
@@ -26,14 +34,28 @@ def _require_parameters(function, required: set[str], surface: str) -> None:
         )
 
 
-def override_server_args(server_args, **fields) -> None:
-    """Update ServerArgs across mutable and resolved/read-only revisions."""
-    override = getattr(server_args, "override", None)
-    if callable(override):
-        override(source="sglang-simulator", **fields)
+def apply_simulator_server_args(target) -> None:
+    """Apply simulator-owned values before constructing the final ServerArgs."""
+    if isinstance(target, dict):
+        target.update(SIMULATOR_SERVER_ARG_OVERRIDES)
         return
-    for name, value in fields.items():
-        setattr(server_args, name, value)
+
+    for name, value in SIMULATOR_SERVER_ARG_OVERRIDES.items():
+        setattr(target, name, value)
+
+
+def validate_simulator_server_args(server_args) -> None:
+    """Fail early if a process bypassed a simulator-owned launch entry point."""
+    mismatches = [
+        f"{name}={getattr(server_args, name, None)!r} (expected {expected!r})"
+        for name, expected in SIMULATOR_SERVER_ARG_OVERRIDES.items()
+        if getattr(server_args, name, None) != expected
+    ]
+    if mismatches:
+        raise SGLangCompatibilityError(
+            "SGLang Simulator server arguments were not prepared by a supported "
+            f"entry point: {', '.join(mismatches)}"
+        )
 
 
 def validate_launch_runtime() -> None:
