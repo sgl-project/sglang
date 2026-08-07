@@ -222,7 +222,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
+        current_platform.set_device(current_platform.get_device(self.local_rank))
         intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
         if intra_op_threads is not None:
             torch.set_num_threads(intra_op_threads)
@@ -246,6 +246,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+        if get_context()._server_args is None:
+            get_context().set_server_args(SrtServerArgs(model_path="dummy"))
 
         # set proc title
         if model_parallel_is_initialized():
