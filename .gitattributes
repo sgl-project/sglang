@@ -1,4 +1,0 @@
-scripts/generate_load_reporter_proto.sh text eol=lf
-proto/sglang/router/loadmonitor/v1/load_monitor.proto text eol=lf
-python/sglang/srt/load_reporter/proto/load_monitor_pb2.py text eol=lf
-python/sglang/srt/load_reporter/proto/load_monitor_pb2_grpc.py text eol=lf
