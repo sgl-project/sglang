@@ -27,10 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.ragged_verify import (
-    resolve_ragged_verify_layout,
-    spec_info_ragged_verify_layout,
-)
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
@@ -256,6 +253,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            resolve_ragged_verify_layout(forward_batch),
             forward_batch.seq_lens_cpu if not in_capture else None,
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
@@ -489,13 +487,14 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        ragged_verify_layout=None,
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            ragged_layout = spec_info_ragged_verify_layout(spec_info)
+            ragged_layout = ragged_verify_layout
             if ragged_layout is not None:
                 # Ragged capture: qsl from the runner's synthetic layout.
                 self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
@@ -549,6 +548,7 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        ragged_verify_layout,
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
         in_capture: bool = False,
@@ -669,7 +669,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ragged_layout = spec_info_ragged_verify_layout(spec_info)
+            ragged_layout = ragged_verify_layout
             if ragged_layout is not None:
                 # Mamba kernels index dense [bs, N] scratch, so they need the
                 # capped variant (see padded_to_bucket). Padding rows carry
@@ -854,6 +854,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            resolve_ragged_verify_layout(forward_batch),
             forward_batch.seq_lens_cpu if not in_capture else None,
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)

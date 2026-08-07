@@ -74,6 +74,7 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            ragged_verify_layout=self.ragged_verify_layout,
         )
 
         can_run_cuda_graph = bool(

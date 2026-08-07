@@ -747,6 +747,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -841,11 +842,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
-            ragged_verify_layout=(
-                batch.spec_info.ragged_verify_layout
-                if batch.spec_info is not None
-                else None
-            ),
+            ragged_verify_layout=ragged_verify_layout,
         )
 
         ret._maybe_init_non_generation_fields(batch)
