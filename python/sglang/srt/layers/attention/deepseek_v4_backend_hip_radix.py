@@ -1131,6 +1131,17 @@ class DeepseekV4HipRadixBackend(
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
         unified = pool.get_unified_kv(layer_id)
+        # store-time fp8 mirror (aiter decode); None unless aiter mode is on
+        unified_fp8 = (
+            pool.get_unified_kv_fp8(layer_id)
+            if hasattr(pool, "get_unified_kv_fp8")
+            else None
+        )
+        unified_rope = (
+            pool.get_unified_kv_rope(layer_id)
+            if hasattr(pool, "get_unified_kv_rope")
+            else None
+        )
         win = pool.unified_swa_window
         ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
@@ -1158,6 +1169,8 @@ class DeepseekV4HipRadixBackend(
                     win=win,
                     ring_stride=ring_stride,
                     final_pos=positions,
+                    unified_kv_fp8=unified_fp8,
+                    unified_kv_rope=unified_rope,
                 )
             unified_metadata = core_attn_metadata.unified
             if compress_ratio == 0:
@@ -1186,6 +1199,8 @@ class DeepseekV4HipRadixBackend(
                 kv_indptr=kv_indptr,
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
+                kv_fp8=unified_fp8,
+                kv_rope=unified_rope,
             )
 
         # prefill / extend
@@ -1284,6 +1299,8 @@ class DeepseekV4HipRadixBackend(
                 win=win,
                 ring_stride=ring_stride,
                 final_pos=_ring_final_pos,
+                unified_kv_fp8=unified_fp8,
+                unified_kv_rope=unified_rope,
             )
         return o
 

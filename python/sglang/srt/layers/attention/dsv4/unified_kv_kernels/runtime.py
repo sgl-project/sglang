@@ -90,6 +90,8 @@ def store_swa_into_unified(
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+    unified_kv_fp8: Optional[torch.Tensor] = None,  # [pages, 512] fp8 mirror
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages, 64]  bf16 mirror
 ) -> None:
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -114,6 +116,48 @@ def store_swa_into_unified(
         BLOCK_D=triton.next_power_of_2(D),
         num_warps=8,
     )
+
+    # Mirror the same rows into the store-time fp8 pool so decode can read
+    # fixed-shape fp8 (cuda-graph safe). Reuses the identical scatter kernel
+    # (same loc + final-window mask), so the fp8/rope mirror stays byte-for-byte
+    # consistent with the bf16 SWA ring. fp8 is stored/scattered as raw bytes
+    # (uint8 view) since triton has no float8 store.
+    if unified_kv_fp8 is not None and unified_kv_rope is not None:
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+            pack_native_bf16_to_2buff,
+        )
+
+        buff, rope = pack_native_bf16_to_2buff(kv)  # [T,512] fp8, [T,64] bf16
+        buff_u8 = buff.contiguous().view(torch.uint8)
+        rope = rope.contiguous()
+        _swa_scatter_kernel[(n_rows,)](
+            buff_u8,
+            state_slot,
+            positions,
+            fp_arg,
+            unified_kv_fp8.view(torch.uint8),
+            n_rows,
+            ring_stride,
+            win=win,
+            D=512,
+            HAS_FINAL=has_final,
+            BLOCK_D=triton.next_power_of_2(512),
+            num_warps=8,
+        )
+        _swa_scatter_kernel[(n_rows,)](
+            rope,
+            state_slot,
+            positions,
+            fp_arg,
+            unified_kv_rope,
+            n_rows,
+            ring_stride,
+            win=win,
+            D=64,
+            HAS_FINAL=has_final,
+            BLOCK_D=triton.next_power_of_2(64),
+            num_warps=4,
+        )
 
 
 # ---------------------------------------------------------------------------

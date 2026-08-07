@@ -541,6 +541,24 @@ class CompressorBackendMixin:
                 use_fp4_indexer=use_fp4_indexer,
                 bf16_store=bf16_store,
             )
+            # store-time fp8 mirror: the compressed bf16 rows were just written
+            # into unified_kv at ``out_loc``; pack those same rows into the fp8
+            # mirror (and rope) so aiter decode reads fixed-shape fp8. Only the
+            # unified_kv-triton compressed store (bf16_store, non-indexer) feeds
+            # the mla-decode KV; indexer/extra-key stores are not read by it.
+            if bf16_store and not compressor.is_in_indexer:
+                _get_fp8 = getattr(token_to_kv_pool, "get_unified_kv_fp8", None)
+                fp8_buf = _get_fp8(layer_id) if _get_fp8 is not None else None
+                if fp8_buf is not None:
+                    from sglang.srt.layers.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+                        pack_native_bf16_to_2buff,
+                    )
+
+                    rope_buf = token_to_kv_pool.get_unified_kv_rope(layer_id)
+                    loc = out_loc.long()
+                    buff, rope = pack_native_bf16_to_2buff(kv_cache[loc])
+                    fp8_buf[loc] = buff
+                    rope_buf[loc] = rope
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(
