@@ -222,9 +222,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-# Keep the base image's Torch-compatible Triton by default. Override with
-# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
-ENV AITER_USE_SYSTEM_TRITON=1
+# Test AITER-managed Triton instead of preserving the base image's Triton.
+ENV AITER_USE_SYSTEM_TRITON=0
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
 # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
