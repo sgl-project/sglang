@@ -72,13 +72,17 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 
 
 def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
-    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    """Whether a PD seed should enter the allocator-local fused TopK domain.
+
+    DCP comes from the live topology rather than the passed instance: the
+    allocator's slot domain is widened by the DCP group that is actually up.
+    """
     return (
         is_cuda()
         and envs.SGLANG_DSA_FUSE_TOPK.get()
         and server_args.disaggregation_mode == "decode"
         and not server_args.enable_hisparse
-        and server_args.dcp_size == 1
+        and not get_parallel().dcp_enabled
     )
 
 
