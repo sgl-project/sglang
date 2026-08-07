@@ -206,13 +206,20 @@ class KimiDeltaAttention(nn.Module):
         self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
-        self.local_num_heads = _get_kda_local_num_heads(self.num_heads, self.tp_size)
+        # KDA heads shard over the attention TP group so that CP / DP-attention
+        # ranks holding the same head shard replicate the recurrent state.
+        self.local_num_heads = _get_kda_local_num_heads(
+            self.num_heads, self.attn_tp_size
+        )
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
         # TODO: support fusion with quant
-        self.do_fuse_qkvbfg = quant_config is None
+        # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
+        self.do_fuse_qkvbfg = (
+            quant_config is None and self.attn_tp_size == self.tp_size
+        )
 
         if self.do_fuse_qkvbfg:
             # Fuse: q, k, v, beta (column parallel) + f_a, g_a (replicated)
@@ -268,6 +275,8 @@ class KimiDeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.f_b_proj",
             )
 
@@ -276,6 +285,8 @@ class KimiDeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.b_proj",
             )
 
@@ -291,11 +302,13 @@ class KimiDeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.g_b_proj",
             )
 
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+            torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
@@ -305,6 +318,8 @@ class KimiDeltaAttention(nn.Module):
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
             params_dtype=torch.float32,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_size=self.attn_tp_size,
             prefix=f"{prefix}.qkv_conv1d",
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
@@ -326,6 +341,11 @@ class KimiDeltaAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            # Reduce within the attn-TP group: at attn_tp < tp (CP /
+            # DP-attention) the default full-TP collective is the wrong group.
+            use_dp_attention_reduce=True,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -334,9 +354,9 @@ class KimiDeltaAttention(nn.Module):
 
         self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_q_heads=_get_kda_local_num_heads(self.num_k_heads, self.tp_size),
-            num_k_heads=_get_kda_local_num_heads(self.num_k_heads, self.tp_size),
-            num_v_heads=_get_kda_local_num_heads(self.num_v_heads, self.tp_size),
+            num_q_heads=_get_kda_local_num_heads(self.num_k_heads, self.attn_tp_size),
+            num_k_heads=_get_kda_local_num_heads(self.num_k_heads, self.attn_tp_size),
+            num_v_heads=_get_kda_local_num_heads(self.num_v_heads, self.attn_tp_size),
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,

@@ -1113,8 +1113,8 @@ class ServerArgs:
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode.",
-            choices=("zigzag", "interleave"),
+            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode; 'contiguous' gives each rank one contiguous block per sequence (required by hybrid linear-attention models, e.g. KDA).",
+            choices=("zigzag", "interleave", "contiguous"),
         ),
         NS("parallel"),
     ] = None

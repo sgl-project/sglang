@@ -42,6 +42,7 @@ class ContextParallelStrategyKind(IntEnum):
     NONE = 0
     ZIGZAG = 1
     INTERLEAVE = 2
+    CONTIGUOUS = 3
 
     @classmethod
     def from_string(cls, value: str) -> ContextParallelStrategyKind:
@@ -49,9 +50,11 @@ class ContextParallelStrategyKind(IntEnum):
             return cls.ZIGZAG
         if value == "interleave":
             return cls.INTERLEAVE
+        if value == "contiguous":
+            return cls.CONTIGUOUS
         raise ValueError(
             f"Unknown cp_strategy={value!r}; expected one of "
-            "{'zigzag', 'interleave'}"
+            "{'zigzag', 'interleave', 'contiguous'}"
         )
 
     @property
@@ -60,6 +63,7 @@ class ContextParallelStrategyKind(IntEnum):
             ContextParallelStrategyKind.NONE: "none",
             ContextParallelStrategyKind.ZIGZAG: "zigzag",
             ContextParallelStrategyKind.INTERLEAVE: "interleave",
+            ContextParallelStrategyKind.CONTIGUOUS: "contiguous",
         }[self]
 
 
@@ -267,6 +271,10 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 
         _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
+    elif kind == ContextParallelStrategyKind.CONTIGUOUS:
+        from sglang.srt.layers.cp.contiguous import ContiguousCPStrategy
+
+        _STRATEGY = ContiguousCPStrategy(cp_size=cp_size)
     else:
         raise ValueError(
             f"Unsupported cp_strategy kind {kind} for "

@@ -595,6 +595,52 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
+        # Prefill context parallelism (contiguous strategy): mixed_qkv/a/b are
+        # this rank's contiguous shard and query_start_loc is shard-local. The
+        # conv seeds from halo windows exchanged across CP ranks (scratch conv
+        # states, so the kernel's in-place writeback stays off the pool), the
+        # pool conv slots get the globally-assembled tail on every rank, and
+        # the SSM kernel receives the cp_context for its cross-rank state
+        # merge (which also owns the SSM pool writeback).
+        kda_cp = self.forward_metadata.kda_cp
+        cp_context = None
+        conv_states_pool_writeback = None
+        conv_cache_indices = cache_indices
+        conv_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if kda_cp is not None:
+            from sglang.srt.layers.attention.linear.kda_cp import (
+                exchange_kda_conv_halo,
+            )
+            from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+                TritonKDAKernel,
+            )
+            from sglang.srt.runtime_context import get_parallel
+
+            assert isinstance(
+                self.kernel_dispatcher.extend_kernel, TritonKDAKernel
+            ), "KDA prefill CP requires --linear-attn-prefill-backend triton"
+            cp_group = get_parallel().attn_cp_group.device_group
+            prior_conv_windows = mamba_cache_params.conv[0][
+                cache_indices.to(torch.long)
+            ]
+            halo_windows, has_initial_state, global_tails = exchange_kda_conv_halo(
+                conv_input=mixed_qkv,
+                metadata=kda_cp,
+                prior_conv_windows=prior_conv_windows,
+                has_prior=forward_batch.extend_prefix_lens > 0,
+                group=cp_group,
+            )
+            conv_states = halo_windows.transpose(-1, -2).contiguous()
+            conv_cache_indices = torch.arange(
+                kda_cp.num_local_seqs, dtype=torch.int32, device=self.device
+            )
+            local_cu = kda_cp.query_start_loc.tolist()
+            conv_seq_lens_cpu = [
+                local_cu[i + 1] - local_cu[i] for i in range(len(local_cu) - 1)
+            ]
+            conv_states_pool_writeback = (cache_indices.to(torch.long), global_tails)
+            cp_context = kda_cp.to_cp_context(cp_group)
+
         if self.forward_metadata.has_mamba_track_mask:
             # Snapshot the conv sliding window at the last track-aligned chunk
             # boundary into the ping-pong track slots (the prefix-cache restore
@@ -623,9 +669,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             activation="silu",
             conv_states=q_conv_state,
             has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+            cache_indices=conv_cache_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            seq_lens_cpu=conv_seq_lens_cpu,
         ).transpose(0, 1)
         k = causal_conv1d_fn(
             k,
@@ -634,9 +680,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             activation="silu",
             conv_states=k_conv_state,
             has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+            cache_indices=conv_cache_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            seq_lens_cpu=conv_seq_lens_cpu,
         ).transpose(0, 1)
         v = causal_conv1d_fn(
             v,
@@ -645,10 +691,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             activation="silu",
             conv_states=v_conv_state,
             has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+            cache_indices=conv_cache_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            seq_lens_cpu=conv_seq_lens_cpu,
         ).transpose(0, 1)
+
+        if conv_states_pool_writeback is not None:
+            # Every CP rank writes the identical globally-assembled tail
+            # window into its pool replica (the kernel wrote only scratch).
+            slots, global_tails = conv_states_pool_writeback
+            mamba_cache_params.conv[0][slots] = global_tails
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -667,7 +719,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_seq_lens_cpu=conv_seq_lens_cpu,
+            cp_context=cp_context,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
