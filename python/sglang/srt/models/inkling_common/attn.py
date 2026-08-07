@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_server_args,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
