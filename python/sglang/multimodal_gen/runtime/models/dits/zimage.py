@@ -127,13 +127,6 @@ def zimage_rmsnorm_scale(
     return norm(x) * scale
 
 
-# One-time self-check state for the fused native qk-norm path: on the first
-# fused call we also run the eager reference and require torch.equal. If the
-# comparison ever fails (e.g. an aten kernel dispatch change on a new torch
-# build), the fused path is permanently disabled for the process.
-_ZIMAGE_QK_NORM_FUSION_STATE = {"verified": False, "enabled": True}
-
-
 def zimage_native_qk_rmsnorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -147,9 +140,6 @@ def zimage_native_qk_rmsnorm(
     with one Triton launch per tensor that reads the strided fused-qkv slices
     directly. Returns contiguous (q, k) or None when unsupported.
     """
-    if not _ZIMAGE_QK_NORM_FUSION_STATE["enabled"]:
-        return None
-
     from sglang.kernels.ops.diffusion.triton.zimage_native_norm import (
         can_use_qk_rmsnorm_native,
         zimage_qk_rmsnorm_native,
@@ -166,19 +156,6 @@ def zimage_native_qk_rmsnorm(
     k_out = zimage_qk_rmsnorm_native(k, k_weight, norm_k.variance_epsilon)
     if q_out is None or k_out is None:
         return None
-
-    if not _ZIMAGE_QK_NORM_FUSION_STATE["verified"]:
-        q_ref = norm_q(q.reshape(-1, head_dim)).view(q.shape)
-        k_ref = norm_k(k.reshape(-1, head_dim)).view(k.shape)
-        if torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref):
-            _ZIMAGE_QK_NORM_FUSION_STATE["verified"] = True
-        else:
-            _ZIMAGE_QK_NORM_FUSION_STATE["enabled"] = False
-            logger.warning(
-                "Fused Z-Image qk-norm self-check failed torch.equal against the "
-                "eager path; permanently falling back to the eager qk-norm."
-            )
-            return None
     return q_out, k_out
 
 

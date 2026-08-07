@@ -204,8 +204,7 @@ def _qk_rmsnorm_native_kernel(
     butterfly tree combines the 32 lane partials (halves 16/8/4/2/1). Every
     intermediate below is rounded to bf16 at exactly the same points as the
     aten kernels, so the output satisfies `torch.equal` against the eager path
-    (verified over 9M+ random rows across scales 0.005-200; a first-call
-    runtime self-check in `zimage_native_qk_rmsnorm` guards dispatch changes).
+    (verified over 9M+ random rows across scales 0.005-200).
     """
     prog = tl.program_id(0)
     row_offs = tl.arange(0, rows_per_prog)
