@@ -50,6 +50,33 @@ Base the decision on available memory on the selected GPU(s).
 - For multi-GPU deployment: the least-free selected GPU is the bottleneck. A busy 80GiB GPU can behave like a much smaller GPU.
 - For single-GPU deployment: FSDP shards DiT weights across multiple GPUs. It is not useful for keeping a single-GPU deployment on one GPU; for that case use CPU offload.
 
+## Health Probes
+
+Use `/liveness` to check that the HTTP process is alive and `/health` to check
+that the server is ready for inference. During server-based warmup, `/liveness`
+returns `200` while `/health` returns `503`. Configure the startup probe with a
+failure budget large enough for model loading and compilation:
+
+```yaml
+startupProbe:
+  httpGet:
+    path: /health
+    port: 30010
+  periodSeconds: 10
+  failureThreshold: 180
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 30010
+livenessProbe:
+  httpGet:
+    path: /liveness
+    port: 30010
+```
+
+See [Health endpoints](/docs/sglang-diffusion/api/cli#health-endpoints) for the
+status-code contract and warmup-mode behavior.
+
 ## Performance Modes
 
 `--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `auto` is the default. Use `manual` when you need to keep performance-related server args under explicit user control. `--mode` is a short alias.
