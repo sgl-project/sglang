@@ -53,7 +53,7 @@ class TestKimiK26EvalAMD(CustomTestCase):
             "aiter",
             "--trust-remote-code",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
+            '{"enable_multithread_load": false}',
         ]
         env = os.environ.copy()
         env["SGLANG_USE_AITER"] = "1"

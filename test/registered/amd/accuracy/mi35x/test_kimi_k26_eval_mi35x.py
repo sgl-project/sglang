@@ -55,7 +55,7 @@ class TestKimiK26EvalMI35x(CustomTestCase):
             "aiter",
             "--trust-remote-code",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
+            '{"enable_multithread_load": false}',
             "--watchdog-timeout",
             "1200",
         ]
