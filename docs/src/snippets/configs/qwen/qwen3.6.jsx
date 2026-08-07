@@ -88,6 +88,7 @@ export const config = {
     h200: "lmsysorg/sglang:latest",
     b200: "lmsysorg/sglang:latest",
     b300: "lmsysorg/sglang:latest",
+    xeon: "lmsysorg/sglang:v0.5.13-xeon",
   },
 
   github: {
