@@ -2410,10 +2410,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
-            allowed.append("triton")
+            allowed.extend(["triton", "aiter"])
         mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
+        elif moe_runner_backend == "aiter" and not envs.SGLANG_USE_AITER.get():
+            raise ValueError("--moe-runner-backend aiter requires SGLANG_USE_AITER=1.")
         elif moe_runner_backend not in allowed:
             logger.warning(
                 "mxfp8 quantization supports only %s backends. " "Overriding %r.",

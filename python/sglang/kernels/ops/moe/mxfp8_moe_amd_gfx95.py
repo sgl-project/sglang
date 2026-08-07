@@ -258,6 +258,7 @@ def fused_moe_mxfp8_native(
     limit: Optional[float],
     no_combine: bool = False,
     expert_map: Optional[torch.Tensor] = None,
+    sanitize_topk_ids: bool = True,
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
@@ -279,9 +280,11 @@ def fused_moe_mxfp8_native(
         topk_ids.masked_fill_(
             ~valid_global | (topk_ids < 0) | (topk_ids >= local_num_experts), -1
         )
-    else:
+    elif sanitize_topk_ids:
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
+    else:
+        topk_ids = topk_ids.to(torch.int32)
 
     block_m = 64
     sorted_ids, expert_ids, num_post = moe_align_block_size(
@@ -380,6 +383,7 @@ def fused_experts_mxfp8(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     expert_map: Optional[torch.Tensor] = None,
+    sanitize_topk_ids: bool = True,
 ) -> torch.Tensor:
     """Native MXFP8 MoE entry (CDNA4 ``dot_scaled``).
 
@@ -426,6 +430,7 @@ def fused_experts_mxfp8(
         limit=limit,
         no_combine=no_combine,
         expert_map=expert_map,
+        sanitize_topk_ids=sanitize_topk_ids,
     )
 
     if no_combine:

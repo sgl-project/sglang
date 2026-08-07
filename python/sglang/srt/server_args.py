@@ -293,6 +293,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "bf16",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -1710,7 +1711,7 @@ class ServerArgs:
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'bf16' (dequantize MXFP8 weights once and use BF16 linear on gfx950). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,

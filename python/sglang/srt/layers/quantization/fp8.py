@@ -1996,6 +1996,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if _is_hip and get_moe_runner_backend().is_aiter():
+            from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+            from aiter.utility import fp4_utils
+
+            num_experts = layer.w13_weight.shape[0]
+            layer.w13_weight.data = shuffle_weight_a16w4(
+                layer.w13_weight.data.contiguous(), 16, True
+            )
+            w13_s3d = layer.w13_weight_scale_inv.data
+            layer.w13_weight_scale_inv.data = shuffle_scale_a16w4(
+                w13_s3d.reshape(-1, w13_s3d.shape[-1]).contiguous(),
+                num_experts,
+                True,
+            )
+            layer.w2_weight.data = shuffle_weight_a16w4(
+                layer.w2_weight.data.contiguous(), 16, False
+            )
+            w2_s3d = layer.w2_weight_scale_inv.data
+            layer.w2_weight_scale_inv.data = fp4_utils.e8m0_shuffle(
+                w2_s3d.reshape(-1, w2_s3d.shape[-1]).contiguous()
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -2630,6 +2654,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
+
+        if self.use_mxfp8:
+            gemm1_alpha = self.moe_runner_config.gemm1_alpha
+            if gemm1_alpha is not None and gemm1_alpha != 1.702:
+                raise NotImplementedError(
+                    f"AITER MXFP8 MoE only supports swiglu-oai "
+                    f"alpha=1.702, got {gemm1_alpha=}."
+                )
+            from aiter import ActivationType
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            return AiterMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                quant_type=AiterQuantType.PER_1X32,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+                swiglu_limit=self.moe_runner_config.swiglu_limit
+                or self.moe_runner_config.gemm1_clamp_limit
+                or 0.0,
+                hidden_pad=getattr(layer, "hidden_pad", 0),
+                intermediate_pad=getattr(layer, "intermediate_pad", 0),
+                fused_moe_kwargs={
+                    "activation": ActivationType.Swiglu,
+                    "gate_mode": GateMode.INTERLEAVE.value,
+                },
+            )
 
         if self.block_quant:
             quant_type = (

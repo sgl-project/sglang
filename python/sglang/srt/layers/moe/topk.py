@@ -2177,7 +2177,7 @@ def select_experts(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 scoring_func=scoring_func,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=0 if _use_aiter else num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,

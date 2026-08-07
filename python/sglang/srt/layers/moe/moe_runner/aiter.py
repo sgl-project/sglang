@@ -174,6 +174,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+        elif quant_info.swiglu_limit > 0 and "gate_mode" in extra:
+            extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
@@ -188,12 +190,17 @@ class AiterRunnerCore(MoeRunnerCore):
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                if self.config.gate_up_interleaved
+                and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        activation = extra.pop("activation", None)
+        if activation is None:
+            activation = _aiter_activation(self.config.activation)
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -202,7 +209,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,

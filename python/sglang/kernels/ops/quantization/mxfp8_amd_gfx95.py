@@ -13,6 +13,7 @@ consumed as-is) and the activation is MXFP8-quantized in one fused pass.
 
 from __future__ import annotations
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -258,6 +259,91 @@ def _run_mxfp8_linear_kernel(
     return out
 
 
+def _pad_mx_scale_e8m0(s: torch.Tensor) -> torch.Tensor:
+    m, g = s.shape
+    mp = (m + 127) // 128 * 128
+    if mp == m:
+        return s.contiguous().view(torch.float8_e8m0fnu)
+    out = torch.zeros(mp, g, dtype=s.dtype, device=s.device)
+    out[:m] = s
+    return out.view(torch.float8_e8m0fnu)
+
+
+def _run_scaled_mm_mxfp8_linear(
+    x_q: torch.Tensor,  # [M, K] fp8 e4m3
+    x_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
+    w: torch.Tensor,  # [N, K] fp8 e4m3
+    w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    m = x_q.shape[0]
+    mp = (m + 31) // 32 * 32
+    if mp != m:
+        x_pad = torch.zeros(mp, x_q.shape[1], dtype=x_q.dtype, device=x_q.device)
+        x_pad[:m] = x_q
+        x_q = x_pad
+    out = torch._scaled_mm(
+        x_q,
+        w.t(),
+        scale_a=_pad_mx_scale_e8m0(x_scale),
+        scale_b=_pad_mx_scale_e8m0(w_scale),
+        out_dtype=out_dtype,
+    )
+    return out[:m] if mp != m else out
+
+
+@functools.cache
+def _scaled_mm_mxfp8_available() -> bool:
+    try:
+        dev = torch.device("cuda")
+        x = torch.zeros(32, 256, dtype=torch.float8_e4m3fn, device=dev)
+        w = torch.zeros(128, 256, dtype=torch.float8_e4m3fn, device=dev)
+        xs = torch.full((32, 8), 127, dtype=torch.uint8, device=dev)
+        ws = torch.full((128, 8), 127, dtype=torch.uint8, device=dev)
+        _run_scaled_mm_mxfp8_linear(x, xs, w, ws, torch.bfloat16)
+        return True
+    except Exception:
+        return False
+
+
+def aiter_mxfp8_linear_available() -> bool:
+    return _scaled_mm_mxfp8_available()
+
+
+def _use_scaled_mm_mxfp8_gemm() -> bool:
+    from sglang.srt.layers.quantization.fp8_utils import (
+        get_fp8_gemm_runner_backend,
+    )
+
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_aiter() and not _scaled_mm_mxfp8_available():
+        raise RuntimeError(
+            "--fp8-gemm-backend aiter selected, but torch._scaled_mm "
+            "Blockwise-1x32 MXFP8 is not available on this device."
+        )
+    return (backend.is_auto() or backend.is_aiter()) and _scaled_mm_mxfp8_available()
+
+
+def _use_bf16_emulation_gemm() -> bool:
+    from sglang.srt.layers.quantization.fp8_utils import (
+        get_fp8_gemm_runner_backend,
+    )
+
+    return get_fp8_gemm_runner_backend().is_bf16()
+
+
+def _dispatch_mxfp8_gemm(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if _use_scaled_mm_mxfp8_gemm():
+        return _run_scaled_mm_mxfp8_linear(x_q, x_scale, w, w_scale, out_dtype)
+    return _run_mxfp8_linear_kernel(x_q, x_scale, w, w_scale, out_dtype)
+
+
 def _mxfp8_dot_scaled_linear(
     x: torch.Tensor,  # [M, K] bf16/fp16
     w: torch.Tensor,  # [N, K] fp8 e4m3
@@ -265,7 +351,7 @@ def _mxfp8_dot_scaled_linear(
 ) -> torch.Tensor:
     """bf16/fp16 input -> per-token MXFP8 quant -> dot_scaled GEMM."""
     x_q, x_scale = mxfp8_e4m3_quantize(x)
-    return _run_mxfp8_linear_kernel(x_q, x_scale, w, w_scale, x.dtype)
+    return _dispatch_mxfp8_gemm(x_q, x_scale, w, w_scale, x.dtype)
 
 
 def dot_scaled_mxfp8_blockscaled_linear(
@@ -288,6 +374,14 @@ def dot_scaled_mxfp8_blockscaled_linear(
         "dot_scaled MXFP8 linear expects canonical 2D [N, K//32] weight scales, "
         f"got {weight_scale.dim()}D."
     )
+
+    if _use_bf16_emulation_gemm():
+        w_bf16 = getattr(weight, "_bf16_emul", None)
+        if w_bf16 is None:
+            w_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale)
+            weight._bf16_emul = w_bf16
+        out = F.linear(input.to(torch.bfloat16), w_bf16, bias)
+        return out if output_dtype is None else out.to(output_dtype)
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -318,9 +412,7 @@ def dot_scaled_mxfp8_blockscaled_linear(
             ), "input_scale must be UE8M0 uint8 [M, K//32]."
             x_q, x_scale = input_2d, input_scale
             kernel_out_dtype = output_dtype
-        out = _run_mxfp8_linear_kernel(
-            x_q, x_scale, weight, weight_scale, kernel_out_dtype
-        )
+        out = _dispatch_mxfp8_gemm(x_q, x_scale, weight, weight_scale, kernel_out_dtype)
     else:
         # dot_scaled tiling needs K % 128 == 0; dequantize fallback otherwise.
         w_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale)

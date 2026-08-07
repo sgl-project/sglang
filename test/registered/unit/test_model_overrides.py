@@ -1717,6 +1717,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
+        with (
+            patch.object(overrides_module, "is_hip", return_value=True),
+            patch.object(overrides_module, "is_gfx95_supported", return_value=True),
+            patch("sglang.srt.environ.envs.SGLANG_USE_AITER") as use_aiter,
+        ):
+            use_aiter.get.return_value = False
+            with self.assertRaisesRegex(ValueError, "SGLANG_USE_AITER=1"):
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="mxfp8", moe_runner_backend="aiter")
+                )
+            use_aiter.get.return_value = True
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="mxfp8", moe_runner_backend="aiter")
+                ),
+                {},
+            )
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
@@ -1824,9 +1841,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ns
 
         hf = SimpleNamespace()
-        with patch.object(overrides_module, "is_hip", return_value=False), patch.object(
-            overrides_module, "is_sm100_supported", return_value=True
-        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+        with (
+            patch.object(overrides_module, "is_hip", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(
+                overrides_module, "get_quantization_config", return_value=None
+            ),
+        ):
             # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
             # dense backend with the fp8-q GEMM path); page snaps to 128
             ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
