@@ -7905,6 +7905,29 @@ class ServerArgs:
                 "verify is not audited for the unified pool. Got "
                 f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
             )
+            # Target-side backends must translate spec verify indices to the
+            # dense space. triton translates every graph mode incl.
+            # TARGET_VERIFY; trtllm_mla (and its cutedsl_mla / tokenspeed_mla
+            # subclasses) precompute the capture-stable dense write loc for
+            # verify. flashinfer's SPEC branches consume
+            # spec_info.kv_indices / generate_attn_arg_prefill() raw (VIRTUAL,
+            # no translate_kv_loc_dense), and fa3 has no verify dense-loc fill
+            # — both would silently read/write wrong pages under a spec
+            # verify, so they stay blocked here for BOTH roles (verify routes
+            # to either backend depending on --speculative-attention-mode).
+            # This is also hybrid-Mamba-only end to end: a unified hybrid-SWA
+            # target has no draft-pool virtual-space sizing and fails loudly
+            # at pool construction (kv_cache_configurator).
+            spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+            spec_backends = set(self._resolved_attention_backends())
+            spec_backends.discard(None)
+            assert spec_backends <= spec_allowed, (
+                "--enable-unified-memory + DSPARK requires spec-verify-audited "
+                f"attention backends {sorted(spec_allowed)} for both prefill "
+                f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
+                "not translate speculative verify indices to the unified "
+                "pool's dense space yet."
+            )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "

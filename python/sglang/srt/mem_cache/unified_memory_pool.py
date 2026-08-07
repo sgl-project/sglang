@@ -24,7 +24,6 @@ compaction only mutates those (no reference rewriting).
 from __future__ import annotations
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -35,6 +34,7 @@ from torch.profiler import record_function
 
 from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mla_views,
     build_page_major_mamba_views,
@@ -259,7 +259,7 @@ class UnifiedKVPool:
             self._raw = torch.empty(
                 total_bytes + view_tail_pad_bytes, dtype=torch.uint8, device=device
             )
-        if os.environ.get("SGLANG_DEBUG_POISON_POOL"):
+        if envs.SGLANG_DEBUG_POISON_POOL.get():
             # Debug: fill the pool with bf16-NaN bit patterns (0x7FC1 LE) so
             # every never-written byte reads as NaN. Converts the boot-lottery
             # "does freed GPU heap contain NaN patterns" into a deterministic

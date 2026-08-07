@@ -38,7 +38,10 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedKVPool,
+    UnifiedMLATokenToKVPool,
+)
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -137,13 +140,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # that space. 1 for sub-pools whose kernels take real physical ids.
         self.kernel_page_multiplier = kernel_page_multiplier
         # Zero page envelopes on hand-out — see _maybe_zero_pages. Enabled for
-        # the MLA-dense full pool (the only kvcache defining
-        # zero_physical_pages), whose consumer kernels arithmetically mask
+        # the MLA-dense full pool, whose consumer kernels arithmetically mask
         # (NaN-unsafe) the unwritten tail rows. Keyed on the pool type, NOT on
         # kernel_page_multiplier > 1: a shard owning exactly one full-attention
         # MLA layer has multiplier 1 yet reads the same NaN-unsafe partial
         # pages (same edge unified_mem_hooks documents for its detection).
-        self._zero_pages_on_alloc = hasattr(kvcache, "zero_physical_pages")
+        self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream

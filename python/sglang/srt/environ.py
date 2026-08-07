@@ -330,6 +330,10 @@ class Envs:
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Fill the unified memory pool with bf16-NaN bit patterns at boot instead of
+    # zeros: deterministic repro/regression switch for NaN-unsafe reads of
+    # never-written bytes (masked partial-page tails). Debug only.
+    SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
