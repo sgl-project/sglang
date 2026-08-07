@@ -1089,6 +1089,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with (
             patch.object(overrides_module, "is_sm90_supported", return_value=True),
             patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
         ):
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
@@ -1126,6 +1127,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _view(flashinfer_allreduce_fusion_backend="trtllm")
                 ),
                 {},
+            )
+
+        with (
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view()),
+                {"flashinfer_allreduce_fusion_backend": "auto"},
+            )
+            self.assertEqual(
+                _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
             )
 
         # enforce-disable wins over everything

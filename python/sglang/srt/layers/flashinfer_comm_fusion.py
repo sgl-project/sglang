@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -45,9 +46,10 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    if not (is_sm90_supported() or is_sm100_supported()):
+    if not (is_sm90_supported() or is_sm100_supported() or is_sm120_supported()):
         raise ValueError(
-            "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
+            "FlashInfer allreduce fusion requires SM90, SM10X, or SM12X "
+            "(SM120/SM121) NVIDIA GPUs."
         )
 
     if backend == "auto":
@@ -55,8 +57,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
             if is_sm100_supported():
                 return "mnnvl"
             raise ValueError(
-                "FlashInfer allreduce fusion does not support multi-node on "
-                "non-Blackwell systems."
+                "FlashInfer allreduce fusion does not support multi-node "
+                "outside SM100/SM103 systems."
             )
         if is_sm100_supported():
             return "mnnvl"
@@ -69,8 +71,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
         raise ValueError(
-            "FlashInfer allreduce fusion mnnvl backend requires a Blackwell "
-            "system, or SM90 single-node."
+            "FlashInfer allreduce fusion mnnvl backend requires SM100/SM103, "
+            "or SM90 single-node."
         )
     return backend
 
@@ -198,16 +200,17 @@ if is_flashinfer_available():
 # FlashInfer allreduce fusion backend support matrix for
 # --flashinfer-allreduce-fusion-backend:
 #
-#   Backend   | SM103 | SM100 | SM90        | Single-Node | Multi-Node |
-#   --------- | ----- | ----- | ----------- | ----------- | ---------- |
-#   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
-#   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
+#   Backend   | SM103 | SM100 | SM90        | SM12X | Single-Node | Multi-Node  |
+#   --------- | ----- | ----- | ----------- | ----- | ----------- | ----------- |
+#   trtllm    | Yes   | Yes   | Yes         | Yes   | Yes         | No          |
+#   mnnvl     | Yes   | Yes   | Single-node | No    | Yes         | SM100/SM103 |
 #
-# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to mnnvl
-# on Blackwell (SM100/SM103) systems (single- and multi-node) and to trtllm on
-# SM90 single-node systems. SM90 multi-node and non-SM90/SM10X configurations
-# are rejected. Either mnnvl or trtllm can be requested explicitly on
-# single-node systems, and mnnvl additionally on Blackwell multi-node.
+# FlashInfer allreduce fusion requires SM90, SM10X, or SM12X (SM120/SM121).
+# auto resolves to mnnvl on SM100/SM103 systems (single- and multi-node) and to
+# trtllm on SM90, SM120, and SM121 single-node systems. Multi-node outside
+# SM100/SM103 systems and non-SM90/SM10X/SM12X configurations are rejected.
+# trtllm can be requested explicitly on any supported single-node system, and
+# mnnvl on SM90 single-node plus SM100/SM103 single- or multi-node.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
@@ -240,8 +243,16 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
+    align_multicast: bool = False,
 ) -> list[int]:
-    """Mirror FlashInfer TRTLLM SymmDeviceMemory local allocation sizes."""
+    """Mirror FlashInfer TRTLLM SymmDeviceMemory local allocation sizes.
+
+    TRT-LLM symmetric memory is created with multicast disabled, so its
+    allocations only round to the allocation granularity. The mnnvl backend
+    allocates through McastGPUBuffer, which additionally rounds each
+    allocation to the multicast granularity; pass ``align_multicast=True`` to
+    mirror that so the preflight probes at least the real allocation size.
+    """
     elem_size = 4 if dtype == torch.float32 else 2
     buffer_size = world_size * max_token_num * hidden_dim * 2
     flag_size = world_size * 256 * 4
@@ -275,22 +286,24 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
 
         allocation_size = ceil_align(buffer_size + signal_pad_size, alloc_granularity)
 
-        mc_prop = cuda_driver.CUmulticastObjectProp()
-        mc_prop.numDevices = world_size
-        mc_prop.size = allocation_size
-        mc_prop.handleTypes = prop.requestedHandleTypes
+        if align_multicast:
+            mc_prop = cuda_driver.CUmulticastObjectProp()
+            mc_prop.numDevices = world_size
+            mc_prop.size = allocation_size
+            mc_prop.handleTypes = prop.requestedHandleTypes
 
-        err, mc_granularity = cuda_driver.cuMulticastGetGranularity(
-            mc_prop,
-            cuda_driver.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
-        )
-        if err != cuda_driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(
-                "cuMulticastGetGranularity failed for FlashInfer "
-                f"workspace preflight: {err}"
+            err, mc_granularity = cuda_driver.cuMulticastGetGranularity(
+                mc_prop,
+                cuda_driver.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
             )
+            if err != cuda_driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(
+                    "cuMulticastGetGranularity failed for FlashInfer "
+                    f"workspace preflight: {err}"
+                )
 
-        allocation_size = ceil_align(allocation_size, mc_granularity)
+            allocation_size = ceil_align(allocation_size, mc_granularity)
+
         allocation_sizes.append(allocation_size)
     return allocation_sizes
 
@@ -315,6 +328,7 @@ def _preflight_check_workspace_memory(
     hidden_dim: int,
     dtype: torch.dtype,
     cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
+    backend: str = "trtllm",
 ) -> bool:
     """Collectively decide whether to enter FlashInfer workspace creation.
 
@@ -323,6 +337,11 @@ def _preflight_check_workspace_memory(
     exits while peers enter handle exchange, peers can hang until the watchdog
     aborts. Probe the same handle type and allocation sequence first, then vote
     on a CPU group so all ranks proceed or skip together.
+
+    The mnnvl backend allocates multicast-backed buffers, so its probe sizes
+    are additionally rounded to the multicast granularity; trtllm symmetric
+    memory disables multicast and must not query it (the query fails on
+    devices without multicast support, such as SM120).
     """
     import torch.distributed as dist
 
@@ -344,6 +363,7 @@ def _preflight_check_workspace_memory(
             max_token_num,
             hidden_dim,
             dtype,
+            align_multicast=(backend == "mnnvl"),
         )
         local_ok = _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop)
     except Exception as e:
@@ -465,6 +485,7 @@ class FlashInferWorkspaceManager:
             hidden_dim=hidden_dim,
             dtype=dtype,
             cpu_group=cpu_group,
+            backend=backend,
         ):
             _flashinfer_allreduce_unavailable = True
             self.workspace = None
