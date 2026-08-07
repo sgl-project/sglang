@@ -115,9 +115,15 @@ class PrefillCPBCGInput:
         if not isinstance(strategy, ZigzagCPStrategy) or extend_seq_lens is None:
             return None
 
-        _, _, per_rank_logical_tokens = strategy.build_token_layout(
-            [int(length) for length in extend_seq_lens]
-        )
+        cp_segment_num = strategy.cp_size * 2
+        per_rank_logical_tokens = [0] * strategy.cp_size
+        for raw_length in extend_seq_lens:
+            base, remainder = divmod(int(raw_length), cp_segment_num)
+            for rank in range(strategy.cp_size):
+                opposite_rank = cp_segment_num - 1 - rank
+                per_rank_logical_tokens[rank] += (
+                    base * 2 + int(rank < remainder) + int(opposite_rank < remainder)
+                )
         align_size = get_cp_padding_align_size()
         return (
             (max(per_rank_logical_tokens) + align_size - 1) // align_size * align_size
@@ -145,6 +151,24 @@ class PrefillCPBCGInput:
             ):
                 return bucket
         return None
+
+    def select_replay_bucket_for_batch(
+        self,
+        *,
+        num_tokens: int,
+        extend_seq_lens: Any,
+        capture_num_tokens: list[int],
+        max_padding_factor: int,
+    ) -> Optional[int]:
+        required_local_tokens = self.required_local_tokens(extend_seq_lens)
+        if required_local_tokens is None:
+            return None
+        return self.select_replay_bucket(
+            num_tokens=num_tokens,
+            required_local_tokens=required_local_tokens,
+            capture_num_tokens=capture_num_tokens,
+            max_padding_factor=max_padding_factor,
+        )
 
     def prepare(
         self,
