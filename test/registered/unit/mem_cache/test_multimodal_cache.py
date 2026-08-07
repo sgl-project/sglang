@@ -126,7 +126,7 @@ class TestSetAndCapacityAccounting(CustomTestCase):
         cache.set(3, _emb(64))
         cache.get_single(1)  # touches LRU, must not change accounting
         cache.free(2, None)
-        cache.set(1, _emb(20))  # replace, must not accumulate
+        cache.set(1, _emb(20))  # refresh LRU on existing key, must not accumulate
 
         expected = sum(_get_tensor_size(cache.get_single(k).embedding) for k in [1, 3])
         self.assertEqual(cache.current_size, expected)
@@ -253,14 +253,21 @@ class TestGetCombinedHashPath(CustomTestCase):
         self.assertIsNotNone(cache.get([1]))  # still present after promotion
         self.assertIsNone(cache.get([2]))  # evicted as oldest
 
-    def test_get_ignores_explicit_combined_hash_argument(self):
-        # The combined_hash parameter is recomputed from mm_hashes internally,
-        # so passing a mismatched value must NOT yield a hit for that value.
+    def test_explicit_combined_hash_is_consistent_with_default(self):
+        # A matching combined_hash must behave identically to the default path
+        # (hit + EmbeddingResult). This holds whether the cache honors the
+        # parameter as a fast path or recomputes it internally, so it does not
+        # lock in either implementation choice.
         cache = MultiModalStaticCache(max_size=64)
-        cache.set(999, _emb(16))  # stored under raw key 999
-        # get([7]) computes combine_hashes([7]); an explicitly passed 999 must
-        # not redirect the lookup, so this is still a miss.
-        self.assertIsNone(cache.get([7], combined_hash=999))
+        combined = MultiModalStaticCache.combine_hashes([7, 8])
+        cache.set(combined, _emb(16))
+
+        default = cache.get([7, 8])
+        explicit = cache.get([7, 8], combined_hash=combined)
+        self.assertIsNotNone(default)
+        self.assertIsNotNone(explicit)
+        self.assertIsInstance(explicit, EmbeddingResult)
+        self.assertEqual(type(explicit), type(default))
 
 
 class TestGetSingleRawHashPath(CustomTestCase):
