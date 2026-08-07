@@ -2436,12 +2436,37 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     return {}
 
 
+def _fp4_trtllm_supports_fused_shared() -> bool:
+    """Return True iff the installed FlashInfer exposes num_fused_shared_experts
+    on both trtllm_fp4_block_scale_moe and trtllm_fp4_block_scale_routed_moe."""
+    try:
+        import inspect
+
+        from flashinfer.fused_moe import (
+            trtllm_fp4_block_scale_moe,
+            trtllm_fp4_block_scale_routed_moe,
+        )
+
+        return (
+            "num_fused_shared_experts"
+            in inspect.signature(trtllm_fp4_block_scale_moe).parameters
+        )
+    except Exception:
+        return False
+
+
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
     """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
     shared-experts fusion disabled; declared at the legacy write slots in
     _handle_moe_kernel_config (before the deprecated cutlass env override, so
-    the runner value observed is the pre-override one)."""
+    the runner value observed is the pre-override one).
+
+    Exception: flashinfer_trtllm{,_routed} with modelopt_fp4 may support fused
+    shared experts when the installed FlashInfer exposes num_fused_shared_experts
+    on the FP4 MoE functions.  The runtime guard in
+    fused_experts_none_to_flashinfer_trtllm_fp4 enforces the exact capability
+    check at forward time."""
     runner = view.moe_runner_backend
     if runner == "flashinfer_cutedsl":
         logger.warning(
@@ -2449,11 +2474,15 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
         )
         return {"disable_shared_experts_fusion": True}
     if runner in ("flashinfer_trtllm", "experimental_sgl_trtllm"):
+        if view.quantization == "modelopt_fp4" and _fp4_trtllm_supports_fused_shared():
+            return {}
         logger.warning(
             "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
     if runner == "flashinfer_trtllm_routed":
+        if view.quantization == "modelopt_fp4" and _fp4_trtllm_supports_fused_shared():
+            return {}
         logger.warning(
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )
