@@ -1408,6 +1408,8 @@ class BaseMultimodalProcessor(ABC):
         return tensor.cpu()
 
     def _wrap_tensor_for_mm_transport(self, tensor: torch.Tensor):
+        if not tensor.is_cuda or tensor.numel() == 0:
+            return tensor.cpu()
         if self.use_cuda_ipc:
             return self._wrap_tensor_for_cuda_ipc(tensor)
         if self.use_fabric_transport:

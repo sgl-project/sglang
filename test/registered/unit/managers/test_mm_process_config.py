@@ -257,6 +257,24 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         fabric_pool.assert_called_once()
         self.assertEqual(fabric_pool.call_args.args[3], 8)
 
+    def test_gpu_transport_leaves_cpu_and_empty_tensors_out_of_pool(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "FabricMmFeatureMemoryPool") as fabric_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("fabric"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        for tensor in (torch.ones(4), torch.empty(0)):
+            output = processor._wrap_tensor_for_mm_transport(tensor)
+            self.assertEqual(output.device.type, "cpu")
+        fabric_pool.return_value.wrap_tensor.assert_not_called()
+
     def test_fabric_pool_init_failure_falls_back_to_cpu(self):
         from sglang.srt.multimodal.processors import base_processor
 
