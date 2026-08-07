@@ -245,9 +245,7 @@ async def serve_grpc(server_args, model_info=None):
     if sidecar_supported:
         serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
     elif server_args.load_reporter_port is not None:
-        # Reporter is opt-in and needs the ready hook to attach its snapshot
-        # source and request-lifecycle decorator before requests are served.
-        # Same signature capability check as the sidecar; no version sniffing.
+        # The reporter attaches its source and lifecycle hook at readiness.
         raise RuntimeError(
             "--load-reporter-port requires smg-grpc-servicer ≥ 0.5.3 (the "
             "version that accepts 'on_request_manager_ready'); installed "

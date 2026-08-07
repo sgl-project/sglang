@@ -1,12 +1,4 @@
-"""Single-flight async load sampler for the embedded load reporter.
-
-Owns the background task that calls snapshot_source.get_loads() and forwards
-results into LatestSnapshotStore. Only one in-flight get_loads call is active
-at a time.
-
-Coalescing: idle + trigger → start refresh; inflight + trigger → set pending;
-refresh done + pending → one more refresh; refresh done, no pending → idle.
-"""
+"""Single-flight load sampler with coalesced refreshes."""
 
 from __future__ import annotations
 
@@ -18,20 +10,10 @@ from typing import Any, Callable, Collection, Optional, Protocol, runtime_checka
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Source protocol and adapters
-# ---------------------------------------------------------------------------
-
 
 @runtime_checkable
 class LoadSnapshotSource(Protocol):
-    """Minimal protocol for a load-snapshot data source.
-
-    ``LoadSampler`` depends only on this protocol, not on any concrete
-    manager type. Two adapters are provided: one that wraps a live manager
-    (single-owner path) and one that wraps the router's shared-memory reader
-    (multi-tokenizer path).
-    """
+    """Protocol for a load-snapshot data source."""
 
     async def get_loads(self) -> list:
         """Return the source's latest scheduler load snapshots."""
@@ -43,12 +25,7 @@ class LoadSnapshotSource(Protocol):
 
 
 class ManagerLoadSnapshotSource:
-    """Adapts a manager to the ``LoadSnapshotSource`` protocol.
-
-    The expected DP rank set follows ``manager.elastic_worker_count`` when the
-    manager exposes it, and otherwise falls back to the construction-time set.
-    Used for both TokenizerManager and GrpcRequestManager.
-    """
+    """Adapt a manager to the load-snapshot protocol."""
 
     def __init__(
         self,
@@ -57,14 +34,7 @@ class ManagerLoadSnapshotSource:
         *,
         snapshot_reader: Optional[Any] = None,
     ) -> None:
-        """Wrap a manager with an authoritative rank fallback.
-
-        Args:
-            manager: Manager exposing get_loads(include=["core"]).
-            expected_dp_ranks: DP ranks required for a full snapshot.
-            snapshot_reader: Optional synchronous reader used when the reporter
-                runs on an event loop different from the manager's loop.
-        """
+        """Wrap a manager with an authoritative rank fallback."""
         self._manager = manager
         self._snapshot_reader = snapshot_reader
         self._expected: frozenset[int] = frozenset(expected_dp_ranks)
@@ -88,26 +58,15 @@ class ManagerLoadSnapshotSource:
 
 
 class RouterLoadSnapshotSource:
-    """Adapts a load-snapshot reader to the ``LoadSnapshotSource`` protocol.
-
-    The authoritative DP rank set is maintained separately from the reader
-    so the router can update it (e.g. after a scale event) without
-    replacing the reader object.
-    """
+    """Adapt a load-snapshot reader to the load-snapshot protocol."""
 
     def __init__(self, reader: Any, expected_dp_ranks: Collection[int]) -> None:
-        """Wrap a shared-memory reader with an authoritative rank set.
-
-        Args:
-            reader: Reader exposing a synchronous read_all method.
-            expected_dp_ranks: DP ranks required for a full router snapshot.
-        """
+        """Wrap a shared-memory reader with an authoritative rank set."""
         self._reader = reader
         self._expected: frozenset[int] = frozenset(expected_dp_ranks)
 
     async def get_loads(self) -> list:
         """Read all load snapshots currently published in shared memory."""
-        # read_all() is a fast synchronous SHM read; safe to call on the event loop.
         return self._reader.read_all()
 
     def expected_dp_ranks(self) -> frozenset[int]:
@@ -123,28 +82,9 @@ class RouterLoadSnapshotSource:
         return True
 
 
-# ---------------------------------------------------------------------------
-# Sampler
-# ---------------------------------------------------------------------------
-
 
 class LoadSampler:
-    """Background single-flight sampler.
-
-    Parameters
-    ----------
-    snapshot_source:
-        Object satisfying the ``LoadSnapshotSource`` protocol: exposes
-        ``async get_loads() -> list[LoadSnapshot]`` and
-        ``expected_dp_ranks() -> frozenset[int]``.
-    store:
-        Object with synchronous ``.apply_full_snapshot(...)`` and
-        ``.record_error(exc)`` methods (``LatestSnapshotStore``).
-    interval_provider:
-        Synchronous callable returning the current minimum report interval
-        in milliseconds across all active monitors, or ``None`` when no
-        monitor is active.
-    """
+    """Background sampler that coalesces refresh requests."""
 
     def __init__(
         self,
@@ -153,14 +93,7 @@ class LoadSampler:
         interval_provider: Callable[[], Optional[int]],
         on_sample_completed: Optional[Callable[[], None]] = None,
     ) -> None:
-        """Initialize the coalescing sampler.
-
-        Args:
-            snapshot_source: Source implementing the LoadSnapshotSource protocol.
-            store: Destination receiving validated full snapshots and errors.
-            interval_provider: Callback returning the active sampling interval.
-            on_sample_completed: Optional callback after each sampling attempt.
-        """
+        """Initialize the coalescing sampler."""
         self._snapshot_source = snapshot_source
         self._store = store
         self._interval_provider = interval_provider
@@ -171,16 +104,8 @@ class LoadSampler:
         self._closing: bool = False
         self._task: Optional[asyncio.Task[None]] = None
 
-    # ------------------------------------------------------------------
-    # Public synchronous API (must not raise)
-    # ------------------------------------------------------------------
-
     def activate(self) -> None:
-        """Activate the sampler and start the background task if needed.
-
-        Idempotent once active.  No-op if ``close()`` has already been
-        called.
-        """
+        """Activate the sampler and start its task if needed."""
         if self._closing:
             return
         self._active = True
@@ -189,49 +114,24 @@ class LoadSampler:
         self._wake.set()
 
     def deactivate(self) -> None:
-        """Deactivate sampling while keeping the background task reusable.
-
-        The current in-flight sample, if any, is allowed to finish. Subsequent
-        timer and request notifications remain dormant until ``activate()`` is
-        called again.
-
-        Returns:
-            None.
-        """
+        """Deactivate sampling while leaving the background task reusable."""
         if self._closing:
             return
         self._active = False
         self._wake.set()
 
     def notify_refresh(self) -> None:
-        """Signal that a fresh sample is desired (e.g. request-end hook).
-
-        No-op before activation or after close.  Never raises.
-        """
+        """Request a fresh sample."""
         if self._active and not self._closing:
             self._wake.set()
 
     def notify_schedule_changed(self) -> None:
-        """Signal that the timer interval may have changed.
-
-        Wakes the loop so it recomputes its next deadline from
-        ``interval_provider()``.  Never raises.
-        """
+        """Wake the loop to recompute its timer interval."""
         if self._active and not self._closing:
             self._wake.set()
 
-    # ------------------------------------------------------------------
-    # Async lifecycle
-    # ------------------------------------------------------------------
-
     async def close(self) -> None:
-        """Shut down the background task gracefully.
-
-        Sets the closing flag, wakes the loop, and awaits the task.
-        Idempotent: safe to call more than once. The sampler task is shielded
-        so cancellation of a bounded graceful close does not corrupt its
-        state; the owner can then cancel and join it explicitly.
-        """
+        """Shut down the background task gracefully."""
         self._active = False
         self._closing = True
         self._wake.set()
@@ -271,10 +171,6 @@ class LoadSampler:
             if task.done() and self._task is task:
                 self._task = None
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     async def _refresh_once(self) -> None:
         """Execute one full sample cycle and write the result into the store."""
         try:
@@ -298,22 +194,7 @@ class LoadSampler:
                     logger.exception("Load reporter sample callback failed")
 
     async def _run(self) -> None:
-        """Background loop — exactly one task ever calls ``_refresh_once``.
-
-        State machine:
-        1. On activation the wake event is already set; fall straight into
-           the first refresh.
-        2. Before each refresh, clear the wake event so any notification
-           that arrives *during* the refresh will re-set it and cause
-           exactly one follow-up refresh (coalescing).
-        3. After the refresh, check whether the event was re-set.
-           - If yes: do one more refresh (the coalesced follow-up), then
-             go idle.
-           - If no: wait for either a wake signal or the periodic timer.
-        4. Timer fires -> refresh, then schedule the next deadline from
-           *now* (missed deadlines are not caught up).
-        5. Loop exits when ``_closing`` is set.
-        """
+        """Run the single-flight refresh loop."""
         while not self._closing:
             if not self._active:
                 # Clear a stale deactivation wake before waiting. Re-check the

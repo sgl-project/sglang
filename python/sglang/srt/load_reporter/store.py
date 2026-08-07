@@ -1,8 +1,4 @@
-"""Atomic latest-snapshot store for the embedded load reporter.
-
-Maintains an immutable SnapshotView of the most recent per-DP-rank LoadSnapshot
-values. All mutation goes through apply_full_snapshot or record_error.
-"""
+"""Atomic latest-snapshot store."""
 
 from __future__ import annotations
 
@@ -109,15 +105,7 @@ def _require_finite_float(field: str, value: object) -> float:
 
 
 def _snapshot_time_unix_ms(load: LoadSnapshot, collected_at_unix_ms: int) -> int:
-    """Resolve a scheduler timestamp or fall back to collection time.
-
-    Args:
-        load: Scheduler snapshot containing a seconds-since-epoch timestamp.
-        collected_at_unix_ms: Fallback collection time in milliseconds.
-
-    Returns:
-        A protobuf-safe Unix timestamp in milliseconds.
-    """
+    """Return the scheduler timestamp or the collection-time fallback."""
     timestamp = load.timestamp
     if (
         isinstance(timestamp, (int, float))

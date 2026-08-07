@@ -1,13 +1,4 @@
-"""Composition root for the embedded load reporter.
-
-``start_load_reporter`` is the only public bootstrap symbol. Returns a handle
-with ``close()`` and optionally ``notify_refresh`` / ``update_expected_dp_ranks``.
-
-Path selection:
-* load_reporter_port is None → return None (no overhead).
-* snapshot_source is None → IPC-worker path (refresh notifier only).
-* otherwise → owner path (runtime + gRPC server).
-"""
+"""Load reporter lifecycle management."""
 
 from __future__ import annotations
 
@@ -20,11 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class LoadReporterHandle:
-    """Owns reporter resources for one Worker process.
-
-    Opaque handle with close() and optional delegation methods. All methods are
-    idempotent and safe to call after close().
-    """
+    """Own reporter resources for one worker process."""
 
     def __init__(self) -> None:
         self._runtime: Optional[Any] = None
@@ -33,8 +20,6 @@ class LoadReporterHandle:
         self._unbind: Optional[Callable[[], None]] = None
         self._restore: Optional[Callable[[], None]] = None
         self._close_task: Optional[asyncio.Task[None]] = None
-
-    # -- delegation surface (multi-tokenizer router) -------------------------
 
     def notify_refresh(self) -> None:
         """Wake the sampler once (router IPC refresh).  No-op without runtime."""
@@ -47,14 +32,8 @@ class LoadReporterHandle:
             return False
         return self._runtime.update_expected_dp_ranks(ranks)
 
-    # -- shutdown ------------------------------------------------------------
-
     async def close(self) -> None:
-        """Idempotent, cancellation-safe teardown.
-
-        Runs once on a shared shielded task. Teardown order: stop server, stop
-        runtime, close notifier, unbind registry, restore shadowed method.
-        """
+        """Tear down reporter resources once."""
         if self._close_task is None:
             self._close_task = asyncio.create_task(
                 self._close_impl(), name="load-reporter-handle-close"
@@ -97,10 +76,7 @@ async def start_load_reporter(
     event_owner: Optional[Any] = None,
     request_lifecycle_method: Optional[str] = None,
 ) -> Optional[LoadReporterHandle]:
-    """Start the embedded load reporter for one serving entrypoint.
-
-    Returns a handle when reporting is enabled, else None.
-    """
+    """Start the reporter and return its handle when enabled."""
     if getattr(server_args, "load_reporter_port", None) is None:
         return None
 
@@ -152,8 +128,6 @@ async def _start_owner(
 
         server = grpc.aio.server()
         add_service_to_server(runtime, server)
-        # Explicit bind: grpc.aio raises RuntimeError on failure (never a
-        # silent random-port fallback), which we surface after cleanup.
         server.add_insecure_port(f"{server_args.host}:{server_args.load_reporter_port}")
         await server.start()
         handle._server = server
@@ -173,10 +147,7 @@ async def _start_owner(
 def _install_lifecycle_shadow(
     handle: LoadReporterHandle, owner: Any, method_name: str
 ) -> None:
-    """Wrap owner.<method_name> with the request-lifecycle decorator.
-
-    Installs the wrapper as an instance attribute on this owner only.
-    """
+    """Wrap one owner method with the request-lifecycle decorator."""
     from sglang.srt.load_reporter.event_hooks import enable_load_monitor
 
     had_instance_override = method_name in owner.__dict__

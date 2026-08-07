@@ -1,8 +1,4 @@
-"""gRPC servicer for the inbound Router bidi stream.
-
-LoadMonitorService implements LoadMonitorServiceServicer.Monitor. The Router
-dials into the Worker's reporter port. First frame must be a register request.
-"""
+"""gRPC service for inbound Router load-monitor streams."""
 
 from __future__ import annotations
 
@@ -51,26 +47,18 @@ def add_service_to_server(runtime: Any, server: grpc.aio.Server) -> None:
 
 
 class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
-    """Serving-mode-agnostic implementation of the Monitor bidi stream.
-
-    The Router is the gRPC client; the Worker is the server.
-    """
+    """Serve Router-initiated load-monitor streams."""
 
     def __init__(self, runtime: Any) -> None:
         """Bind to the given runtime."""
         self._runtime = runtime
 
     async def Monitor(self, request_iterator: Any, context: Any) -> Any:
-        """Bidirectional stream handler.
-
-        First frame must be register. Runs read + write loops concurrently until
-        EOF, cancel, lease timeout, or server shutdown.
-        """
+        """Handle a bidirectional stream after its register frame."""
         session = None
         read_task = None
         write_task = None
         try:
-            # --- Read the mandatory first frame ---
             first_frame = await self._read_frame(request_iterator, context)
             if first_frame is None:
                 return  # stream ended before any frame
@@ -100,7 +88,6 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
             )
             await self._send(context, pb.WorkerFrame(registered=ack))
 
-            # --- Run read + write loops concurrently ---
             read_task = asyncio.create_task(
                 self._read_loop(request_iterator, session),
                 name=f"lr-svc-read-{reg.router_id}",
@@ -109,7 +96,6 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
                 self._write_loop(context, session),
                 name=f"lr-svc-write-{reg.router_id}",
             )
-            # Wait for either loop to finish; cancel the other.
             done, pending = await asyncio.wait(
                 {read_task, write_task},
                 return_when=asyncio.FIRST_COMPLETED,
@@ -141,10 +127,6 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
                         await t
                     except (asyncio.CancelledError, Exception):
                         pass
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     async def _read_frame(

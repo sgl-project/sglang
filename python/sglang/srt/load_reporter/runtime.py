@@ -1,8 +1,4 @@
-"""Top-level assembly of the embedded load reporter.
-
-``LoadReporterRuntime`` constructs store, builder, sampler, and session table,
-and exposes: register_session, notify_refresh, notify_source_changed, close.
-"""
+"""Load reporter runtime."""
 
 from __future__ import annotations
 
@@ -38,11 +34,7 @@ def _validate_timing(
 
 
 class _RouterSession:
-    """Per-Router-ID inbound bidi-stream session.
-
-    Owns one asyncio.Queue(maxsize=1) response queue (latest-wins) and a
-    background report loop.
-    """
+    """One inbound Router stream with a latest-wins response queue."""
 
     def __init__(
         self,
@@ -70,9 +62,7 @@ class _RouterSession:
         self._identity = identity
         self._on_close = on_close
         self._on_schedule_changed = on_schedule_changed
-        # Generation barrier: wait for a sample completing *after* this session
-        # registered, so a re-registration never reuses an earlier session's
-        # latched completion (I5).
+        # Require a sample completed after this session registered.
         self._sample_baseline = sample_baseline
         self._sample_generation = sample_generation
         self._sample_event = sample_event
@@ -83,10 +73,6 @@ class _RouterSession:
         self._task: asyncio.Task = asyncio.create_task(
             self._run(), name=f"lr-session-{router_id}"
         )
-
-    # ------------------------------------------------------------------
-    # Public interface used by service.py
-    # ------------------------------------------------------------------
 
     @property
     def queue(self) -> asyncio.Queue:
@@ -143,10 +129,6 @@ class _RouterSession:
                 await self._task
             except (asyncio.CancelledError, Exception):
                 pass
-
-    # ------------------------------------------------------------------
-    # Internal report loop
-    # ------------------------------------------------------------------
 
     def _enqueue(self, item: Any) -> None:
         """Latest-wins enqueue: drop old item if queue is full."""
@@ -268,10 +250,7 @@ class _RouterSession:
 
 
 class LoadReporterRuntime:
-    """Owns the reporter collaborators for any serving mode.
-
-    Manages inbound Router sessions and snapshot sampling.
-    """
+    """Own reporter sessions and snapshot sampling."""
 
     def __init__(
         self,
@@ -286,11 +265,7 @@ class LoadReporterRuntime:
         self._snapshot_source = snapshot_source
 
         self._store = LatestSnapshotStore()
-        # Sampling generation barrier: monotonic counter bumped once per
-        # completed sampling attempt, plus a pulsed event so a waiter can block
-        # for a sample that lands *after* it registered.  A session captures the
-        # current generation at registration and waits until the counter moves
-        # past that baseline, so re-registrations never reuse a stale sample.
+        # Sessions wait for a sample completed after registration.
         self._sample_generation = 0
         self._sample_completed = asyncio.Event()
         self._builder = ReportBuilder(
@@ -320,24 +295,13 @@ class LoadReporterRuntime:
         """Return the event that fires when the next sampling attempt completes."""
         return self._sample_completed
 
-    # ------------------------------------------------------------------
-    # Session management (inbound Router streams)
-    # ------------------------------------------------------------------
-
     def register_session(
         self,
         router_id: str,
         report_interval_ms: int,
         lease_ttl_ms: int,
     ) -> Tuple[pb.RegisterResponse, "_RouterSession"]:
-        """Register or replace the session for router_id.
-
-        Same router_id re-registering (new stream) stops the old session and
-        installs the new one. Different router_ids coexist.
-
-        Returns:
-            ``(RegisterResponse, session)`` — yield the ack, then drain the queue.
-        """
+        """Register or replace a Router session and return its acknowledgement."""
         if self._closing:
             raise RuntimeError("load reporter is shutting down")
         if not router_id or not router_id.strip():
@@ -349,9 +313,7 @@ class LoadReporterRuntime:
         if old is not None:
             old.stop()
 
-        # Capture the sampling baseline before (re)activating the sampler so the
-        # session's initial report waits for a sample completing after this
-        # registration, never an earlier session's latched completion (I5).
+        # Capture the baseline before activation to avoid reusing stale samples.
         sample_baseline = self._sample_generation
 
         session = _RouterSession(
@@ -378,11 +340,7 @@ class LoadReporterRuntime:
         return ack, session
 
     def _on_session_closed(self, router_id: str, session: "_RouterSession") -> None:
-        """Remove session from table only if it still owns the slot (C1 fix).
-
-        The old session's cleanup must not delete the new session when
-        same-router_id replacement occurs: we check identity before popping.
-        """
+        """Remove a session only when it still owns its Router ID."""
         if self._sessions.get(router_id) is session:
             del self._sessions[router_id]
             self._on_schedule_changed()
@@ -402,10 +360,6 @@ class LoadReporterRuntime:
         else:
             self._sampler.deactivate()
 
-    # ------------------------------------------------------------------
-    # Request-end / decorator seams (wake sampler only)
-    # ------------------------------------------------------------------
-
     def notify_refresh(self) -> None:
         """Synchronous, non-throwing refresh signal."""
         try:
@@ -419,20 +373,12 @@ class LoadReporterRuntime:
         self.notify_refresh()
 
     def update_expected_dp_ranks(self, expected_dp_ranks: Iterable[int]) -> bool:
-        """Update a rank-aware snapshot source after elastic scaling.
-
-        Returns:
-            ``True`` when the source accepted a changed rank set.
-        """
+        """Update a rank-aware snapshot source after elastic scaling."""
         update = getattr(self._snapshot_source, "update_expected_dp_ranks", None)
         if update is None or not update(expected_dp_ranks):
             return False
         self.notify_source_changed()
         return True
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
 
     async def close(self) -> None:
         """Bounded, idempotent shutdown."""

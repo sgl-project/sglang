@@ -1,14 +1,4 @@
-"""Load monitor decorator seam.
-
-Exports:
-  enable_load_monitor(kind) — wraps sync functions or async generators to fire
-    load-monitor events.
-  bind_load_monitor(owner, notify) — binds a callback to owner via weak-key
-    registry; returns an unbind closure.
-
-Fast bypass: both wrappers check server_args.load_reporter_port first and
-become transparent passthroughs when absent or None.
-"""
+"""Load-monitor event hooks."""
 
 from __future__ import annotations
 
@@ -21,26 +11,13 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Callback type: (reason, count) -> None
-# reason is a LoadReporterRefreshReason enum value; typed Any here to avoid
-# importing io_struct at module load time (keeps disabled overhead to zero).
 _NotifyFn = Callable[[Any, int], None]
 
-# Weak-key registry: owner instance -> callback.
-# Owner garbage collection automatically removes the entry.
 _REGISTRY: weakref.WeakKeyDictionary[Any, _NotifyFn] = weakref.WeakKeyDictionary()
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 def bind_load_monitor(owner: Any, notify: _NotifyFn) -> Callable[[], None]:
-    """Bind notify callback to owner in the weak-key registry.
-
-    Returns an idempotent unbind closure. Safe to call multiple times.
-    """
+    """Bind a callback and return an idempotent unbind function."""
     _REGISTRY[owner] = notify
 
     def unbind() -> None:
@@ -51,12 +28,7 @@ def bind_load_monitor(owner: Any, notify: _NotifyFn) -> Callable[[], None]:
 
 
 def enable_load_monitor(kind: str) -> Callable[..., Any]:
-    """Decorator factory for load-monitor observation points.
-
-    Args:
-        kind: "scheduler_message" (sync method) or "request_lifecycle"
-            (async generator). Fires events after successful calls.
-    """
+    """Return a decorator for the requested observation point."""
     if kind == "scheduler_message":
         return _make_scheduler_message_decorator
     if kind == "request_lifecycle":
@@ -67,9 +39,6 @@ def enable_load_monitor(kind: str) -> Callable[..., Any]:
     )
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
 
 
 def _get_notify(self: Any) -> Optional[_NotifyFn]:
@@ -125,11 +94,7 @@ def _make_scheduler_message_decorator(fn: Callable[..., Any]) -> Callable[..., A
 
 
 async def _finalize_request_lifecycle(source: Any, notify: _NotifyFn):
-    """Async-generator finalization wrapper.
-
-    Iterates source and fires exactly one COMPLETION event in the finally block,
-    covering normal exhaustion, early aclose(), and cancellation.
-    """
+    """Forward an async generator and notify completion on exit."""
     from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
 
     try:
@@ -145,11 +110,6 @@ async def _finalize_request_lifecycle(source: Any, notify: _NotifyFn):
 
 def _make_request_lifecycle_decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap an async generator to fire COMPLETION on exit."""
-    # The wrappers are plain functions that RETURN the shared finalization
-    # async generator (one layer, not a nested ``async for``).  This keeps
-    # ``aclose()``/cancellation propagating straight into its ``finally`` so
-    # COMPLETION fires exactly once and promptly.  Callers only ever ``async
-    # for`` / ``__anext__`` the result, never ``await`` the call itself.
     if inspect.ismethod(fn):
         owner = fn.__self__
 

@@ -1,8 +1,4 @@
-"""Configuration and metadata structs for the load reporter.
-
-``LoadReporterConfig`` holds timing thresholds. ``WorkerMetadata`` holds stable
-identity fields. Both are built via ``from_server_args`` factory methods.
-"""
+"""Load reporter configuration and worker metadata."""
 
 from __future__ import annotations
 
@@ -14,11 +10,8 @@ from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-# Reporter-internal implementation constants. Not CLI arguments.
 INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
-# Maximum accepted age of the oldest rank snapshot before a report is marked
-# STALE. Reporter-internal; intentionally not surfaced as a CLI argument.
 SNAPSHOT_STALE_AFTER_MS = 3000
 
 
