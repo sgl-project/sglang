@@ -1,0 +1,78 @@
+# MI355X Qwen3.5-397B-A17B (MXFP4) 2-node 1P1D disaggregation recipe -- DP8 + narrow EP8 + MTP.
+#
+# Qwen3.5 uses Qwen3_5ForConditionalGeneration with a HYBRID linear-attention
+# stack: GatedDeltaNet (GDN) linear-attn layers + one full-attention layer every
+# `full_attention_interval` (4). sglang auto-selects the hybrid linear-attn
+# backend for this architecture, so this recipe leaves `attention_backend`
+# unset. 512 experts / top-10, one shared expert. MXFP4 enables the FP4 expert
+# path (PRECISION-driven) same as the GLM/DSV4 FP4 recipes.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime` and `bench`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
+
+# Model-specific docker env + sglang server args (generic launcher path). Hybrid
+# linear-attn is auto-selected for Qwen3_5ForConditionalGeneration, so no
+# --attention-backend is set. Qwen3.5 has a shared expert; shared-experts-fusion
+# is disabled to mirror the GLM/DSV4 path. Qwen3 reasoning/tool parsers.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+  server_args:
+    - --reasoning-parser
+    - qwen3
+    - --tool-call-parser
+    - qwen3_coder
+    - --default-chat-template-kwargs
+    - '{"enable_thinking": true}'
+    - --disable-shared-experts-fusion
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260802
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.85
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 8192
+  swa_full_tokens_ratio: 0.1
+
+# MTP / EAGLE speculative decoding (built-in NextN head from the base model,
+# mtp_num_hidden_layers=1). No external draft checkpoint needed.
+mtp:
+  enabled: true
+  num_steps: 3
+  eagle_topk: 1
+  num_draft_tokens: 4
+
+bench:
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4
+  random_range_ratio: 1.0
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319
+    threshold: 0.91
+    max_new_tokens: 2048
+    method: run_eval
