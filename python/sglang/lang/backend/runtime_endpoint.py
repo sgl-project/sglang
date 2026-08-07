@@ -384,13 +384,15 @@ class Runtime:
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.utils.network import is_port_available
 
-        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
-
-        # Pre-allocate ports
-        for port in range(self.server_args.port, 40000):
+        # Pre-allocate a port before building the config, so the config is born
+        # with the port this runtime will serve on.
+        requested_port = kwargs.pop(
+            "port", ServerArgs.__dataclass_fields__["port"].default
+        )
+        for port in range(requested_port, 40000):
             if is_port_available(port):
                 break
-        self.server_args.override("runtime_endpoint.port_alloc", port=port)
+        self.server_args = ServerArgs(*args, log_level=log_level, port=port, **kwargs)
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"

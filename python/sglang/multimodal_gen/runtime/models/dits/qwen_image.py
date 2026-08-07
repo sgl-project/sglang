@@ -14,6 +14,11 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -737,7 +742,7 @@ class QwenImageCrossAttention(nn.Module):
                 k=img_key,
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
+                head_dim=self.head_dim,
                 cos_sin_cache=img_cache,
                 is_neox=False,
                 allow_inplace=True,
@@ -747,7 +752,7 @@ class QwenImageCrossAttention(nn.Module):
                 k=txt_key,
                 q_norm=self.norm_added_q,
                 k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
+                head_dim=self.head_dim,
                 cos_sin_cache=txt_cache,
                 is_neox=False,
                 allow_inplace=True,
@@ -762,9 +767,29 @@ class QwenImageCrossAttention(nn.Module):
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
-        joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
-        joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
-        joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
+        seg_qkv = None
+        # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
+        # the join_seqs path and exchanges inside the attention instead.
+        if sp_text_sharded and self.attn.sp_attention_mode == "ulysses":
+            from sglang.multimodal_gen.runtime.layers.usp import (
+                _ipc_input_a2a_qkv_segmented,
+            )
+
+            seg_qkv = _ipc_input_a2a_qkv_segmented(
+                txt_query,
+                img_query,
+                txt_key,
+                img_key,
+                txt_value,
+                img_value,
+                sp_txt_pad,
+            )
+        if seg_qkv is not None:
+            joint_query, joint_key, joint_value = seg_qkv
+        else:
+            joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
+            joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
+            joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
         if attn_mask is None and encoder_hidden_states_mask is not None:
             image_mask = torch.ones(
                 (hidden_states.shape[0], img_query.shape[1]),
@@ -784,6 +809,7 @@ class QwenImageCrossAttention(nn.Module):
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
+            qkv_pre_all_to_all=seg_qkv is not None,
         )
 
         # Reshape back
@@ -832,8 +858,17 @@ class QwenImageGELU(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj",
             )
+        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
         hidden_states, _ = self.proj(hidden_states)
         return F.gelu(hidden_states, approximate="tanh")
 
