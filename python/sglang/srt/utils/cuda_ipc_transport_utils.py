@@ -1,16 +1,12 @@
-import fcntl
 import logging
 import threading
 import time
-from multiprocessing import shared_memory
-from typing import Any, Tuple
+from dataclasses import dataclass
+from typing import Any, Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +16,9 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
     envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
 )
 
-SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+_CONTROL_WORD_BYTES = 4
+_DATA_ALIGNMENT = 256
+_DEFAULT_MAX_INFLIGHT_SLICES = 4096
 
 # Processors set this marker only when their encoder consumes each IPC feature
 # on a single TP rank.  The scheduler then keeps the feature lazy until the
@@ -55,11 +53,11 @@ _pool_storage_cache: dict = {}
 _pool_cache_lock = threading.Lock()
 
 
-def _normalize_pool_cache_key(pool_handle, pool_device_index: int) -> tuple[Any, ...]:
+def _normalize_pool_cache_key(pool_handle, device_index: int) -> tuple[Any, ...]:
     normalized_handle = (
         pool_handle if isinstance(pool_handle, tuple) else tuple(pool_handle)
     )
-    return (pool_device_index, normalized_handle)
+    return (device_index, normalized_handle)
 
 
 def _open_pooled_storage_uncached(pool_handle):
@@ -92,75 +90,118 @@ def _pool_handle_cache_clear():
         _pool_storage_cache.clear()
 
 
-class ShmSyncBuffer:
-    def __init__(self, byte_size: int = 4):
-        self.buffer = shared_memory.SharedMemory(
-            create=True, size=byte_size, name=make_shm_name("sync")
-        )
-        self.buffer_wrapper = np.ndarray(1, dtype=np.float32, buffer=self.buffer.buf)
-        self.buffer_wrapper *= 0
-        self.meta_data = {
-            "handle": self.buffer.name,
-            "shape": self.buffer_wrapper.shape,
-            "dtype": str(self.buffer_wrapper.dtype),
-        }
-
-    def __del__(self):
-        if isinstance(self.buffer, shared_memory.SharedMemory):
-            self.buffer.close()
-            self.buffer.unlink()
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
 
-class MmItemMemoryChunk:
-    def __init__(self, area: Tuple, sync_buffer: ShmSyncBuffer):
-        self.area = area
-        self.sync_flag = sync_buffer
+def _driver_modules():
+    from cuda.bindings import driver as cuda
 
-    @property
-    def mem_size(self):
-        return self.area[1] - self.area[0]
+    from sglang.srt.distributed.device_communicators.vmm_utils import check_drv
 
-    @property
-    def start(self):
-        return self.area[0]
+    return cuda, check_drv
 
-    @property
-    def end(self):
-        return self.area[1]
 
-    def try_to_recycle(self) -> bool:
+def _stream_wait_value32(device_id: int, address: int, value: int) -> None:
+    cuda, check_drv = _driver_modules()
+    stream = torch.cuda.current_stream(device_id)
+    check_drv(
+        cuda.cuStreamWaitValue32(stream.cuda_stream, address, value, 0),
+        "cuStreamWaitValue32(mm CUDA IPC)",
+    )
+
+
+def _stream_write_value32(device_id: int, address: int, value: int) -> None:
+    cuda, check_drv = _driver_modules()
+    stream = torch.cuda.current_stream(device_id)
+    check_drv(
+        cuda.cuStreamWriteValue32(stream.cuda_stream, address, value, 0),
+        "cuStreamWriteValue32(mm CUDA IPC)",
+    )
+
+
+def _resolve_consumer_rank(
+    total_consumer_count: int, consumer_rank: Optional[int] = None
+) -> int:
+    if total_consumer_count == 1:
+        return 0
+    if consumer_rank is None:
         try:
-            tp_num = get_server_args().tp_size
-        except Exception:
-            logger.info(
-                "server_args has not been published yet, skip this turn's recycle"
-            )
-            return False
+            from sglang.srt.runtime_context import get_parallel
 
-        val = float(self.sync_flag.buffer_wrapper.item())
-        logger.debug(f"[try_to_recycle] area={self.area}, flag={val}, tp_size={tp_num}")
+            rank = int(get_parallel().tp_rank)
+        except Exception as exc:
+            raise RuntimeError(
+                "Cannot resolve the CUDA IPC consumer rank before parallel state "
+                "initialization"
+            ) from exc
+    else:
+        rank = int(consumer_rank)
+    if not 0 <= rank < total_consumer_count:
+        raise RuntimeError(
+            f"CUDA IPC consumer rank {rank} is outside " f"[0, {total_consumer_count})"
+        )
+    return rank
 
-        if val == float(tp_num):
-            self.sync_flag.buffer_wrapper *= 0.0
-            return True
 
-        return False
+@dataclass(frozen=True)
+class MmItemMemoryChunk:
+    start: int
+    end: int
+    slot: int
+    generation: int
+
+    @property
+    def mem_size(self) -> int:
+        return self.end - self.start
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval, base_gpu_id):
+    def __init__(
+        self,
+        memory_size: int,
+        recycle_interval: float,
+        base_gpu_id: int,
+        consumer_count: int,
+        max_inflight_slices: int = _DEFAULT_MAX_INFLIGHT_SLICES,
+    ):
+        if memory_size <= 0:
+            raise ValueError("memory_size must be positive")
+        if consumer_count <= 0:
+            raise ValueError("consumer_count must be positive")
+
+        self.device_id = base_gpu_id
+        self.consumer_count = consumer_count
+        self.control_words_per_slot = 1 + consumer_count
+        self.max_inflight_slices = max_inflight_slices
+        control_bytes = (
+            max_inflight_slices * self.control_words_per_slot * _CONTROL_WORD_BYTES
+        )
+        self.data_start = _align_up(control_bytes, _DATA_ALIGNMENT)
+        if memory_size <= self.data_start:
+            raise ValueError(
+                "CUDA IPC pool is too small after control metadata: "
+                f"pool={memory_size}, control={self.data_start}"
+            )
+
         self.memory_pool = torch.empty(
-            memory_size, dtype=torch.int8, device=f"cuda:{base_gpu_id}"
+            memory_size, dtype=torch.uint8, device=f"cuda:{base_gpu_id}"
         ).contiguous()
+        control_word_count = max_inflight_slices * self.control_words_per_slot
+        self._control_words = (
+            self.memory_pool[: control_word_count * _CONTROL_WORD_BYTES]
+            .view(torch.int32)
+            .view(max_inflight_slices, self.control_words_per_slot)
+        )
+        self._control_words.zero_()
+        torch.cuda.synchronize(base_gpu_id)
         storage = self.memory_pool.untyped_storage()
         self._pool_ipc_handle = storage._share_cuda_()
-        self._pool_device_index = self.memory_pool.device.index
 
-        self.sync_flag_list = []
-
-        init_chunk = MmItemMemoryChunk((0, memory_size), self.pop_sync_buffer())
-        self.available_chunks = [init_chunk]
-        self.occupied_chunks = []
+        self._available_ranges = [(self.data_start, memory_size)]
+        self._available_slots = list(reversed(range(max_inflight_slices)))
+        self._slot_generations = [0] * max_inflight_slices
+        self._occupied: dict[int, MmItemMemoryChunk] = {}
 
         self._lock = threading.Lock()
         self._pool_full_warned = False
@@ -183,11 +224,11 @@ class MmItemMemoryPool:
             self._recycle_thread.join(timeout=1.0)
 
     def _recycle_loop(self):
+        torch.cuda.set_device(self.device_id)
         while not self._stop_recycler:
             try:
-                with self._lock:
-                    self.recycle_chunks()
-                    self.merge_chunks()
+                with self._lock, torch.cuda.device(self.device_id):
+                    self._recycle_ready_chunks_locked()
             except Exception as e:
                 logger.warning(
                     f"[MmItemMemoryPool] recycle loop error: {e}", exc_info=True
@@ -195,81 +236,120 @@ class MmItemMemoryPool:
 
             time.sleep(self._recycle_interval)
 
-    def clear_sync_flag_list(self):
-        # call each chunk's __del__
-        self.sync_flag_list.clear()
+    def _allocate_locked(self, nbytes: int) -> Optional[MmItemMemoryChunk]:
+        candidates = [
+            (end - start, index, start, end)
+            for index, (start, end) in enumerate(self._available_ranges)
+            if end - start >= nbytes
+        ]
+        if not candidates or not self._available_slots:
+            return None
+        _, index, start, end = min(candidates)
+        self._available_ranges.pop(index)
+        if start + nbytes < end:
+            self._available_ranges.append((start + nbytes, end))
+        slot = self._available_slots.pop()
+        generation = self._slot_generations[slot] + 1
+        if generation > 0x7FFFFFFF:
+            raise RuntimeError("CUDA IPC pool slot generation exhausted")
+        self._slot_generations[slot] = generation
+        chunk = MmItemMemoryChunk(start, start + nbytes, slot, generation)
+        self._occupied[slot] = chunk
+        return chunk
 
-    def pop_sync_buffer(self):
-        if len(self.sync_flag_list) == 0:
-            try:
-                new_sync_buffer = ShmSyncBuffer()
-                return new_sync_buffer
-            except:
-                logger.info("allocate shm buffer failed")
-                raise RuntimeError
-        else:
-            return self.sync_flag_list.pop()
+    def _release_chunk_locked(self, chunk: MmItemMemoryChunk) -> None:
+        self._occupied.pop(chunk.slot, None)
+        self._available_slots.append(chunk.slot)
+        self._available_ranges.append((chunk.start, chunk.end))
 
-    def push_sync_buffer(self, sync_buffer):
-        self.sync_flag_list.append(sync_buffer)
+    def _merge_ranges_locked(self) -> None:
+        merged = []
+        for start, end in sorted(self._available_ranges):
+            if merged and merged[-1][1] == start:
+                merged[-1] = (merged[-1][0], end)
+            else:
+                merged.append((start, end))
+        self._available_ranges = merged
 
-    def get_available_chunk(self, src_tensor: torch.Tensor) -> MmItemMemoryChunk:
-        # find currently available_chunks contain a available chunk or not
-        # if not, return None
-        src_tensor_size = src_tensor.numel() * src_tensor.element_size()
-        min_size = self.memory_pool.numel() * self.memory_pool.element_size() + 1
-        selected_chunk = None
-        for chunk in self.available_chunks:
-            if chunk.mem_size >= src_tensor_size:
-                if chunk.mem_size < min_size:
-                    min_size = chunk.mem_size
-                    selected_chunk = chunk
+    def _recycle_ready_chunks_locked(self) -> None:
+        if not self._occupied:
+            return
+        chunks = list(self._occupied.values())
+        slot_indices = torch.tensor(
+            [chunk.slot for chunk in chunks],
+            dtype=torch.long,
+            device=f"cuda:{self.device_id}",
+        )
+        expected = torch.tensor(
+            [chunk.generation for chunk in chunks],
+            dtype=torch.int32,
+            device=f"cuda:{self.device_id}",
+        ).unsqueeze(1)
+        completed = (
+            (self._control_words.index_select(0, slot_indices) == expected)
+            .all(dim=1)
+            .cpu()
+            .tolist()
+        )
+        for chunk, is_complete in zip(chunks, completed):
+            if is_complete:
+                self._release_chunk_locked(chunk)
+        self._merge_ranges_locked()
 
-        if selected_chunk:
-            occupied_chunk_area = (
-                selected_chunk.start,
-                selected_chunk.start + src_tensor_size,
-            )
-            occupied_chunk_sync_flag = selected_chunk.sync_flag
-            new_occupied_chunk = MmItemMemoryChunk(
-                occupied_chunk_area, occupied_chunk_sync_flag
-            )
-
-            self.occupied_chunks.append(new_occupied_chunk)
-            self.available_chunks.remove(selected_chunk)
-
-            available_split_chunk_area = (new_occupied_chunk.end, selected_chunk.end)
-            # add a new chunk
-            if available_split_chunk_area[0] != available_split_chunk_area[1]:
-                split_available_chunk = MmItemMemoryChunk(
-                    available_split_chunk_area, self.pop_sync_buffer()
-                )
-                self.available_chunks.append(split_available_chunk)
-
-            return new_occupied_chunk
-
-        return None
-
-    def return_a_slice_tensor_with_flag(self, src_tensor: torch.Tensor):
+    def wrap_tensor(
+        self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
+    ) -> Optional["CudaIpcTensorTransportProxy"]:
+        if not tensor.is_cuda:
+            raise ValueError("CUDA IPC transport requires a CUDA tensor")
+        source = tensor.contiguous()
+        nbytes = source.numel() * source.element_size()
+        allocation_bytes = _align_up(nbytes, _DATA_ALIGNMENT)
         with self._lock:
-            available_chunk = self.get_available_chunk(src_tensor)
-            if available_chunk is not None:
-                return (
-                    available_chunk.sync_flag.meta_data,
-                    self.memory_pool[available_chunk.start : available_chunk.end],
-                    available_chunk.start,
-                )
-        self._warn_pool_full_once(src_tensor)
-        return None, None, None
+            chunk = self._allocate_locked(allocation_bytes)
+        if chunk is None:
+            self._warn_pool_full_once(nbytes)
+            return None
 
-    def _warn_pool_full_once(self, src_tensor: torch.Tensor):
+        try:
+            with torch.cuda.device(self.device_id):
+                destination = self.memory_pool[chunk.start : chunk.start + nbytes]
+                destination.copy_(
+                    source.view(torch.uint8).reshape(-1), non_blocking=True
+                )
+                ready_byte_offset = (
+                    chunk.slot * self.control_words_per_slot * _CONTROL_WORD_BYTES
+                )
+                _stream_write_value32(
+                    self.device_id,
+                    self.memory_pool.data_ptr() + ready_byte_offset,
+                    chunk.generation,
+                )
+        except Exception:
+            with self._lock:
+                self._release_chunk_locked(chunk)
+                self._merge_ranges_locked()
+            raise
+
+        return CudaIpcTensorTransportProxy(
+            data=destination,
+            info_data=tensor,
+            pool_ipc_handle=self._pool_ipc_handle,
+            pool_byte_offset=chunk.start,
+            ready_byte_offset=ready_byte_offset,
+            ack_byte_offset=ready_byte_offset + _CONTROL_WORD_BYTES,
+            generation=chunk.generation,
+            total_consumer_count=self.consumer_count,
+            use_pool_handle_cache=use_pool_handle_cache,
+        )
+
+    def _warn_pool_full_once(self, nbytes: int):
         if self._pool_full_warned:
             return
         self._pool_full_warned = True
         pool_mb = (
             self.memory_pool.numel() * self.memory_pool.element_size() / (1024 * 1024)
         )
-        need_mb = src_tensor.numel() * src_tensor.element_size() / (1024 * 1024)
+        need_mb = nbytes / (1024 * 1024)
         logger.warning(
             "MmItemMemoryPool has no free chunk large enough for a %.2f MiB tensor "
             "(pool size: %.2f MiB); falling back to non-IPC transport. "
@@ -278,56 +358,28 @@ class MmItemMemoryPool:
             pool_mb,
         )
 
-    def recycle_chunks(self):
-
-        new_occupied_chunks = []
-        for chunk in self.occupied_chunks:
-            if chunk.try_to_recycle():
-                self.available_chunks.append(chunk)
-            else:
-                new_occupied_chunks.append(chunk)
-        self.occupied_chunks = new_occupied_chunks
-
-    def merge_chunks(self):
-        # merge_all_available_chunks
-        merged_chunks = []
-        for chunk in sorted(self.available_chunks, key=lambda x: x.start):
-            if len(merged_chunks) == 0:
-                merged_chunks.append(chunk)
-            else:
-                if chunk.start == merged_chunks[-1].end:
-                    to_merge_chunk = merged_chunks.pop()
-                    to_merge_chunk_sync = to_merge_chunk.sync_flag
-                    merged_chunk_area = (to_merge_chunk.start, chunk.end)
-                    merged_chunks.append(
-                        MmItemMemoryChunk(merged_chunk_area, to_merge_chunk_sync)
-                    )
-                    self.push_sync_buffer(chunk.sync_flag)
-                else:
-                    merged_chunks.append(chunk)
-
-        self.available_chunks = merged_chunks
-
 
 class CudaIpcTensorTransportProxy:
-    """
-    A torch.tensor's proxy used to do inter-process data-sharing
-    including:
+    """Serializable view of one tensor stored in a CUDA IPC memory pool.
 
-    torch.tensor(on gpu)'s cuda-ipc-hande infos
-    a shm sync buffer's meta data which is used to sync between different process
+    The producer-ready word and one acknowledgement word per consumer live in
+    the same CUDA allocation as the tensor. CUDA stream memory operations order
+    the producer copy, consumer copy, and pool reuse without CPU shared memory
+    or device-wide synchronization.
     """
 
     def __init__(
         self,
         data: torch.Tensor,
         info_data: torch.Tensor,
-        sync_buffer_meta,
-        pool_ipc_handle=None,
-        pool_byte_offset: int = 0,
-        pool_device_index: int = 0,
+        pool_ipc_handle,
+        pool_byte_offset: int,
+        ready_byte_offset: int,
+        ack_byte_offset: int,
+        generation: int,
+        total_consumer_count: int,
+        use_pool_handle_cache: bool,
     ):
-
         if (not isinstance(data, torch.Tensor)) or (
             not isinstance(info_data, torch.Tensor)
         ):
@@ -335,68 +387,33 @@ class CudaIpcTensorTransportProxy:
                 f"Input 'data' must be a torch.Tensor, but got {type(data)}"
             )
 
-        if pool_ipc_handle is not None:
-            self.proxy_state = {
-                "ipc_extra": {
-                    "pool_handle": pool_ipc_handle,
-                    "pool_byte_offset": pool_byte_offset,
-                    "pool_device_index": pool_device_index,
-                    "shape": data.shape,
-                    "dtype": data.dtype,
-                    "stride": data.stride(),
-                    "storage_offset": 0,
-                    "nbytes": data.numel() * data.element_size(),
-                    "recons_shape": info_data.shape,
-                    "recons_dtype": info_data.dtype,
-                },
-                "tensor_data": None,
-            }
-        else:
-            self.proxy_state = self.get_proxy_state(data, info_data)
-        self.reconstruct_tensor = None
-        self.sync_data_meta = sync_buffer_meta
-        self.sync_buffer = None
-        self._consumer_acknowledged = False
+        if total_consumer_count <= 0:
+            raise ValueError("total_consumer_count must be positive")
 
-    @property
-    def get_sync_flag(self):
-        if not self.sync_buffer:
-            shm_name = self.sync_data_meta["handle"]
-            self.sync_buffer = shared_memory.SharedMemory(name=shm_name)
-
-        shape = self.sync_data_meta["shape"]
-        dtype = self.sync_data_meta["dtype"]
-        return np.ndarray(shape, dtype=dtype, buffer=self.sync_buffer.buf)
-
-    def close_shm(self):
-        self.sync_buffer.close()
-        self.sync_buffer = None
-
-    def get_proxy_state(self, data, info_data):
-        # acquire all serialize metadata from _metadata
-        state = {}
-
-        try:
-            storage = data.untyped_storage()
-            handle = storage._share_cuda_()
-
-            state["ipc_extra"] = {
-                "handle": handle,
+        self.proxy_state = {
+            "ipc_extra": {
+                "pool_handle": pool_ipc_handle,
+                "pool_byte_offset": pool_byte_offset,
                 "shape": data.shape,
                 "dtype": data.dtype,
                 "stride": data.stride(),
-                "device_index": data.device.index,
-                "storage_offset": data.storage_offset(),
+                "storage_offset": 0,
+                "nbytes": data.numel() * data.element_size(),
                 "recons_shape": info_data.shape,
                 "recons_dtype": info_data.dtype,
-            }
-            state["tensor_data"] = None
-        except Exception:
-            # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
-            state["ipc_extra"] = None
-            state["tensor_data"] = data
-
-        return state
+                "ready_byte_offset": ready_byte_offset,
+                "ack_byte_offset": ack_byte_offset,
+                "generation": generation,
+                "total_consumer_count": total_consumer_count,
+                "use_pool_handle_cache": use_pool_handle_cache,
+            },
+            "tensor_data": None,
+        }
+        self.reconstruct_tensor = None
+        self._consumer_acknowledged = False
+        # Keep uncached mappings alive until the work enqueued on the consumer
+        # stream has completed.
+        self._pool_storage = None
 
     def _reconstruct_from_ipc_extra(
         self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
@@ -414,10 +431,8 @@ class CudaIpcTensorTransportProxy:
         with torch.cuda.device(target_device):
             if use_cache:
                 storage = _pool_handle_cache_get_or_open(cache_key, redirected_handle)
-                storage_to_cache = None
             else:
                 storage = _open_pooled_storage_uncached(redirected_handle)
-                storage_to_cache = storage
             slice_storage = storage[
                 ipc_extra["pool_byte_offset"] : ipc_extra["pool_byte_offset"]
                 + ipc_extra["nbytes"]
@@ -429,55 +444,102 @@ class CudaIpcTensorTransportProxy:
                 stride=stride,
             )
 
-        return slice_tensor, target_device, cache_key, storage_to_cache
+        return slice_tensor, storage
 
-    def _acknowledge_consumption(self, consumer_count: int = 1):
-        """Mark this IPC feature as consumed without necessarily copying it.
+    def _open_pool_slice(self, rebuild_device_idx: int):
+        ipc_extra = self.proxy_state["ipc_extra"]
+        use_cache = ipc_extra["use_pool_handle_cache"]
+        try:
+            return self._reconstruct_from_ipc_extra(
+                ipc_extra,
+                use_cache=use_cache,
+                rebuild_device_idx=rebuild_device_idx,
+            )
+        except Exception as exc:
+            if not use_cache:
+                raise
+            cache_key = _normalize_pool_cache_key(
+                ipc_extra["pool_handle"], rebuild_device_idx
+            )
+            logger.info(
+                "Failed to deserialize from cached pooled CUDA IPC handle (%s). "
+                "Invalidating cache entry and retrying uncached.",
+                exc,
+            )
+            _pool_handle_cache_invalidate(cache_key)
+            result = self._reconstruct_from_ipc_extra(
+                ipc_extra,
+                use_cache=False,
+                rebuild_device_idx=rebuild_device_idx,
+            )
+            _pool_handle_cache_set(cache_key, result[1])
+            return result
 
-        A normal TP execution reconstructs a feature once per rank, so each
-        consumer contributes one acknowledgement.  Encoder-DP can instead
-        route a feature to exactly one rank; that rank acknowledges all TP
-        consumers after its copy completes.  Keeping this acknowledgement
-        idempotent is important for chunked-prefill cache hits, where the same
-        proxy may be visited more than once.
-        """
-        if getattr(self, "_consumer_acknowledged", False):
+    @staticmethod
+    def _control_address(storage, byte_offset: int) -> int:
+        return storage.data_ptr() + byte_offset
+
+    def _wait_until_ready(self, storage, device_id: int) -> None:
+        ipc_extra = self.proxy_state["ipc_extra"]
+        _stream_wait_value32(
+            device_id,
+            self._control_address(storage, ipc_extra["ready_byte_offset"]),
+            ipc_extra["generation"],
+        )
+
+    def _acknowledge_on_stream(
+        self,
+        storage,
+        device_id: int,
+        consumer_count: int,
+        consumer_rank: Optional[int],
+    ) -> None:
+        if self._consumer_acknowledged:
             return
-        if consumer_count <= 0:
-            raise ValueError("consumer_count must be positive")
-        if self.sync_data_meta is not None:
-            open(SHM_LOCK_FILE, "a").close()
-            # Keep the counter update atomic across scheduler processes.
-            with open(SHM_LOCK_FILE, "w+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                sync_flag = self.get_sync_flag
-                sync_flag += consumer_count
-                fcntl.flock(f, fcntl.LOCK_UN)
-            self.close_shm()
+        ipc_extra = self.proxy_state["ipc_extra"]
+        total_consumer_count = ipc_extra["total_consumer_count"]
+        if consumer_count == total_consumer_count:
+            consumer_ranks = range(total_consumer_count)
+        elif consumer_count == 1:
+            consumer_ranks = (
+                _resolve_consumer_rank(total_consumer_count, consumer_rank),
+            )
+        else:
+            raise ValueError(
+                "consumer_count must be either 1 or total_consumer_count "
+                f"({total_consumer_count}), got {consumer_count}"
+            )
+
+        ack_base = ipc_extra["ack_byte_offset"]
+        for rank in consumer_ranks:
+            _stream_write_value32(
+                device_id,
+                self._control_address(storage, ack_base + rank * _CONTROL_WORD_BYTES),
+                ipc_extra["generation"],
+            )
         self._consumer_acknowledged = True
 
-    def acknowledge_consumption(self, consumer_count: int = 1):
-        """Release an IPC-pool slice when a cache hit needs no tensor copy."""
-        self._acknowledge_consumption(consumer_count)
+    def acknowledge_consumption(
+        self, consumer_count: int = 1, consumer_rank: Optional[int] = None
+    ) -> None:
+        """Stream-order pool release when a cache hit needs no tensor copy."""
+        if self._consumer_acknowledged:
+            return
+        device_id = torch.cuda.current_device()
+        with torch.cuda.device(device_id):
+            _, storage = self._open_pool_slice(device_id)
+            self._wait_until_ready(storage, device_id)
+            self._acknowledge_on_stream(
+                storage, device_id, consumer_count, consumer_rank
+            )
+        self._pool_storage = storage
 
-    def _copy_slice_tensor_to_target(
+    def reconstruct_on_target_device(
         self,
-        slice_tensor: torch.Tensor,
-        rebuild_device: torch.device,
-        recons_shape,
-        recons_dtype,
-        consumer_count: int,
+        rebuild_device_idx,
+        consumer_count: int = 1,
+        consumer_rank: Optional[int] = None,
     ):
-        with torch.cuda.device(rebuild_device):
-            reconstructed_tensor = torch.empty(
-                recons_shape, dtype=recons_dtype, device=rebuild_device
-            ).contiguous()
-            reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
-            self._acknowledge_consumption(consumer_count)
-
-        return reconstructed_tensor
-
-    def reconstruct_on_target_device(self, rebuild_device_idx, consumer_count: int = 1):
         rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
@@ -485,82 +547,23 @@ class CudaIpcTensorTransportProxy:
         ):
             return self.reconstruct_tensor
 
-        if self.proxy_state["ipc_extra"]:
-            ipc_extra = self.proxy_state["ipc_extra"]
-            recons_shape = ipc_extra["recons_shape"]
-            recons_dtype = ipc_extra["recons_dtype"]
-
-            if "pool_handle" in ipc_extra:
-                try:
-                    (
-                        slice_tensor,
-                        _target_device,
-                        cache_key,
-                        storage_to_cache,
-                    ) = self._reconstruct_from_ipc_extra(
-                        ipc_extra,
-                        use_cache=True,
-                        rebuild_device_idx=rebuild_device_idx,
-                    )
-                except Exception as e:
-                    cache_key = _normalize_pool_cache_key(
-                        ipc_extra["pool_handle"], rebuild_device_idx
-                    )
-                    logger.info(
-                        "Failed to deserialize from cached pooled CUDA IPC handle (%s). "
-                        "Invalidating cache entry and retrying uncached.",
-                        e,
-                    )
-                    _pool_handle_cache_invalidate(cache_key)
-                    (
-                        slice_tensor,
-                        _target_device,
-                        _cache_key,
-                        storage_to_cache,
-                    ) = self._reconstruct_from_ipc_extra(
-                        ipc_extra,
-                        use_cache=False,
-                        rebuild_device_idx=rebuild_device_idx,
-                    )
-                    if storage_to_cache is not None:
-                        _pool_handle_cache_set(cache_key, storage_to_cache)
-            else:
-                # Non-pooled path: redirect handle[0] the same way as the pooled path.
-                try:
-                    original_handle = ipc_extra["handle"]
-                    redirected_handle = (rebuild_device_idx,) + tuple(original_handle)[
-                        1:
-                    ]
-                    target_device = torch.device(f"cuda:{rebuild_device_idx}")
-                    with torch.cuda.device(target_device):
-                        storage = torch.UntypedStorage._new_shared_cuda(
-                            *redirected_handle
-                        )
-                        slice_tensor = torch.empty(
-                            0, dtype=ipc_extra["dtype"], device=target_device
-                        ).set_(
-                            storage,
-                            storage_offset=ipc_extra["storage_offset"],
-                            size=ipc_extra["shape"],
-                            stride=ipc_extra["stride"],
-                        )
-                except Exception as e:
-                    logger.info("Failed to deserialize from CUDA IPC handle (%s).", e)
-                    raise
-
-            reconstructed_tensor = self._copy_slice_tensor_to_target(
-                slice_tensor,
-                rebuild_device,
-                recons_shape,
-                recons_dtype,
+        ipc_extra = self.proxy_state["ipc_extra"]
+        with torch.cuda.device(rebuild_device):
+            slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
+            self._wait_until_ready(storage, rebuild_device_idx)
+            reconstructed_tensor = torch.empty(
+                ipc_extra["recons_shape"],
+                dtype=ipc_extra["recons_dtype"],
+                device=rebuild_device,
+            ).contiguous()
+            reconstructed_tensor.view(torch.uint8).reshape(-1).copy_(slice_tensor)
+            self._acknowledge_on_stream(
+                storage,
+                rebuild_device_idx,
                 consumer_count,
+                consumer_rank,
             )
-        elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
-            reconstructed_tensor = self.proxy_state["tensor_data"].to(
-                rebuild_device, non_blocking=True
-            )
-        else:
-            raise TypeError("invalid proxy_state")
 
+        self._pool_storage = storage
         self.reconstruct_tensor = reconstructed_tensor
         return self.reconstruct_tensor
