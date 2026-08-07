@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
     get_model_depths,
     helion_aot_autotune,
 )
+from sglang.srt.utils.common import is_sm121
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
@@ -884,7 +885,10 @@ def grouped_gemm_triton(
             "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 8,
             "num_warps": 4,
-            "num_stages": 4,
+            # sm_121 (GB10 / DGX Spark) caps shared memory at 99 KB per block and
+            # num_stages=4 needs 108 KB. The BLOCK_SIZE_M=128 branch below fits at
+            # its default 3 (96 KB) and needs no gate.
+            "num_stages": 3 if is_sm121() else 4,
         }
     else:
         assert block_size_m == BLOCK_SIZE_M, f"{block_size_m=}"
@@ -896,6 +900,7 @@ def grouped_gemm_triton(
             "num_warps": 8,
             "num_stages": 3,
         }
+
     # Set grid_m to the max number of M blocks and skip padding-only blocks
     # in the kernel based on expert_block_offs[-1]
     grid_m = expert_block_schedule.numel()
