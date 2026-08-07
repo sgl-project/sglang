@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_32B_EAGLE3_WEIGHTS_PATH,
     QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
@@ -103,12 +104,15 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         )
 
         try:
-            metrics = self._run_gsm8k_eval()
-            self.assertGreaterEqual(
-                metrics["score"],
-                0.83,
-                f"GSM8K score {metrics['score']} below threshold 0.83",
-            )
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            else:
+                metrics = self._run_gsm8k_eval()
+                self.assertGreaterEqual(
+                    metrics["score"],
+                    0.83,
+                    f"GSM8K score {metrics['score']} below threshold 0.83",
+                )
         finally:
             kill_process_tree(process.pid)
 
@@ -164,12 +168,15 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         )
 
         try:
-            metrics = self._run_gsm8k_eval()
-            self.assertGreaterEqual(
-                metrics["score"],
-                0.83,
-                f"GSM8K score {metrics['score']} below threshold 0.83",
-            )
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            else:
+                metrics = self._run_gsm8k_eval()
+                self.assertGreaterEqual(
+                    metrics["score"],
+                    0.83,
+                    f"GSM8K score {metrics['score']} below threshold 0.83",
+                )
         finally:
             kill_process_tree(process.pid)
 
