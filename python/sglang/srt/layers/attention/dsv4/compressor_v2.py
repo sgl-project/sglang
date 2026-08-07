@@ -413,6 +413,7 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
+    verify_width: int = 0,
     online_state_slot_offset: int = 0,
 ) -> CompressMetadata:
     """Build the paged compress metadata (= the plan).
@@ -464,6 +465,7 @@ def create_paged_compressor_data(
             swa_page_size=swa_page_size,
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
+            verify_width=verify_width,
             use_cuda_graph=use_prefill_cuda_graph,
         )
     else:
