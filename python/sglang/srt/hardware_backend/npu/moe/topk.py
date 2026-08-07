@@ -42,6 +42,8 @@ def fused_topk_npu(
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+    num_fused_shared_experts = topk_config.num_fused_shared_experts
+    routed_topk = topk_config.top_k - num_fused_shared_experts
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
@@ -53,7 +55,7 @@ def fused_topk_npu(
         )
         topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
             x=router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            k=routed_topk,
             bias=(
                 correction_bias.to(torch.float32)
                 if correction_bias is not None
@@ -70,15 +72,11 @@ def fused_topk_npu(
     elif not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
-            k=topk_config.top_k,
+            k=routed_topk,
         )
 
         if renormalize:
-            topk_weights = l1_norm(
-                topk_weights
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1]
-            )
+            topk_weights = l1_norm(topk_weights)
         topk_weights = topk_weights.to(torch.float32)
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
@@ -89,7 +87,7 @@ def fused_topk_npu(
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            k=routed_topk,
             bias=(
                 correction_bias.to(torch.float32)
                 if correction_bias is not None
@@ -128,5 +126,24 @@ def fused_topk_npu(
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+
+    if num_fused_shared_experts > 0:
+        num_tokens, num_routed_experts = router_logits.shape
+        shared_ids = torch.arange(
+            num_routed_experts,
+            num_routed_experts + num_fused_shared_experts,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(num_tokens, -1)
+        scale = topk_config.routed_scaling_factor or 1.0
+        shared_weights = topk_weights.sum(dim=-1, keepdim=True) / scale
+        if num_fused_shared_experts > 1:
+            shared_weights = shared_weights.expand(-1, num_fused_shared_experts)
+        if topk_config.fused_shared_experts_scaling_factor is not None:
+            shared_weights = (
+                shared_weights * topk_config.fused_shared_experts_scaling_factor
+            )
+        topk_ids = torch.cat((topk_ids, shared_ids), dim=-1)
+        topk_weights = torch.cat((topk_weights, shared_weights), dim=-1)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
