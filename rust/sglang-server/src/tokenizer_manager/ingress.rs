@@ -409,6 +409,7 @@ impl Ingress {
             .send(DetokMsg::Register {
                 rid: req.rid.clone(),
                 sink: req.sink.clone(),
+                created_at: req.created_at,
                 decode_logprob_text,
                 no_stop_trim,
             })
@@ -888,6 +889,7 @@ mod tests {
             rid: id.to_string().into(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
+            created_at: std::time::Instant::now(),
             kind: RequestKind::Generate(Box::new(GenerateRequest {
                 rid: id.to_string().into(),
                 input_ids: Some(vec![1, 2, 3]),
@@ -1135,6 +1137,7 @@ mod tests {
             rid: "41".into(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
+            created_at: std::time::Instant::now(),
             kind: RequestKind::Detokenize {
                 token_ids: vec![7, 8, 9],
             },
@@ -1170,6 +1173,7 @@ mod tests {
             rid: "43".into(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
+            created_at: std::time::Instant::now(),
             kind: RequestKind::Detokenize {
                 token_ids: vec![1, -1],
             },
@@ -1464,6 +1468,7 @@ mod tests {
             rid: rid.to_string().into(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
+            created_at: std::time::Instant::now(),
             kind: RequestKind::Generate(Box::new(GenerateRequest {
                 rid: rid.to_string().into(),
                 text: Some("<image> hi".into()),

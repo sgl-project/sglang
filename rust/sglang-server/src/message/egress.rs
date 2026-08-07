@@ -445,6 +445,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // compiled clean and silently shipped zeros.
             text: String::new(),
             completion_tokens: 0,
+            e2e_latency: 0.0,
         })
     };
 
@@ -546,6 +547,9 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Server-side seconds from request submission through final detokenization.
+    /// Zero on intermediate chunks; populated only on the terminal chunk.
+    pub e2e_latency: f64,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).

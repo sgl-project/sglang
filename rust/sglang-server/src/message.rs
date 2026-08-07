@@ -45,6 +45,8 @@ pub struct Request {
     pub state: RequestState,
     /// Back-channel to the client connection for egress frames.
     pub sink: EgressSink,
+    /// Start of server-side request handling, used for terminal response timing.
+    pub created_at: std::time::Instant,
     /// Discriminant + variant body (generate vs control).
     pub kind: RequestKind,
 }
@@ -70,6 +72,7 @@ pub enum DetokMsg {
         /// emit `TmEvent::Abort(rid)` (the wire needs the string, not the hash).
         rid: Rid,
         sink: EgressSink,
+        created_at: std::time::Instant,
         /// Decode logprob token ids to text here (CPU-bound) not on the api threads.
         decode_logprob_text: bool,
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.

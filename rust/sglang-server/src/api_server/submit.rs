@@ -53,6 +53,7 @@ pub(super) async fn submit(
         rid: rid.clone(),
         state: RequestState::Received,
         sink: EgressSink::Local(tx),
+        created_at: std::time::Instant::now(),
         kind,
     };
     match state.senders.tm.send_async(TmEvent::Ingress(request)).await {

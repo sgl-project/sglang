@@ -267,6 +267,7 @@ mod tests {
                 rid: "1".into(),
                 state: RequestState::Tokenizing,
                 sink: EgressSink::Local(sink_tx),
+                created_at: std::time::Instant::now(),
                 kind: RequestKind::Generate(Box::new(GenerateRequest {
                     rid: "1".into(),
                     text: Some("hello world".into()),
@@ -327,6 +328,7 @@ mod tests {
                     rid: "1".into(),
                     state: RequestState::Tokenizing,
                     sink: EgressSink::Local(tokio::sync::mpsc::channel(4).0),
+                    created_at: std::time::Instant::now(),
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),
                         text: Some("hi".into()),

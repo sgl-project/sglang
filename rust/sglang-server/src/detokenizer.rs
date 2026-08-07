@@ -127,6 +127,9 @@ impl DetokenizerBackend {
 
 struct DetokState {
     sink: EgressSink,
+    /// Request submission time, retained here so completion timing is independent
+    /// of HTTP response polling and client backpressure.
+    created_at: std::time::Instant,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
     decode_logprob_text: bool,
@@ -188,6 +191,7 @@ impl Runnable for DetokenizerWorker {
                 DetokMsg::Register {
                     rid,
                     sink,
+                    created_at,
                     decode_logprob_text,
                     no_stop_trim,
                 } => {
@@ -195,6 +199,7 @@ impl Runnable for DetokenizerWorker {
                         rid.clone(),
                         DetokState {
                             sink,
+                            created_at,
                             decode_logprob_text,
                             no_stop_trim,
                             decoder: self.backend.new_decoder(),
@@ -364,6 +369,7 @@ fn handle_chunk(
     ev.completion_tokens = n_tok;
 
     if finished {
+        ev.e2e_latency = st.created_at.elapsed().as_secs_f64();
         // The Done frame *is* the final frame: Finalizing → Completed.
         let sent = st.sink.try_send(EgressItem::Done(ev)).is_ok();
         let _ = st.fsm.apply(if sent {
@@ -450,6 +456,7 @@ mod tests {
             Rid::from("1"),
             DetokState {
                 sink: EgressSink::Local(tx),
+                created_at: std::time::Instant::now(),
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -523,6 +530,7 @@ mod tests {
             Rid::from("d1"),
             DetokState {
                 sink: EgressSink::Local(tx),
+                created_at: std::time::Instant::now(),
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -567,6 +575,7 @@ mod tests {
         let mut table = HashMap::new();
         let state = |tx| DetokState {
             sink: EgressSink::Local(tx),
+            created_at: std::time::Instant::now(),
             decode_logprob_text: false,
             no_stop_trim: false,
             decoder: None,
@@ -624,6 +633,7 @@ mod tests {
             Rid::from("1"),
             DetokState {
                 sink: EgressSink::Local(tx),
+                created_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
                 decode_logprob_text: false,
                 no_stop_trim,
                 decoder: None, // skip mode → output_ids passthrough
@@ -642,10 +652,15 @@ mod tests {
             ..Default::default()
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
-        match rx.try_recv() {
+        let out = match rx.try_recv() {
             Ok(EgressItem::Done(out)) => out,
             other => panic!("expected Done, got {other:?}"),
-        }
+        };
+        assert!(
+            out.e2e_latency >= 2.0,
+            "terminal timing must cover the full server-side request lifetime"
+        );
+        out
     }
 
     /// Token id 0 is not a match: Python's `trim_matched_stop` guards with

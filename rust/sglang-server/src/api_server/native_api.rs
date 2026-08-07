@@ -435,6 +435,7 @@ mod tests {
             rid: Rid::from(rid.to_string()),
             text: text.into(),
             completion_tokens: 1,
+            e2e_latency: 1.25,
             // Parsed from the wire map Python emits, not a hand-built enum.
             finish_reason: Some(
                 serde_json::from_value(serde_json::json!({"type": "length", "length": 1}))
@@ -475,6 +476,7 @@ mod tests {
         assert_eq!(v["index"], 0);
         assert_eq!(v["text"], "a!", "cumulative per item");
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert_eq!(v["meta_info"]["e2e_latency"], 1.25);
 
         tx1.send(done(11, "?")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
@@ -540,8 +542,23 @@ mod tests {
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert_eq!(v["meta_info"]["e2e_latency"], 1.25);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
+    /// Unary `/generate` returns terminal timing in `meta_info`, matching the
+    /// Python server contract consumed by `sglang.test.send_one`.
+    #[tokio::test]
+    async fn unary_includes_e2e_latency() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(done(10, "hi")).await.unwrap();
+
+        let (status, value, terminal) = drain_unary(&mut rx, "10").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(terminal);
+        assert_eq!(value["meta_info"]["e2e_latency"], 1.25);
     }
 
     /// The single-request shape (`with_index=false`, one receiver) omits the

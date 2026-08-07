@@ -179,6 +179,9 @@ pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
             "finish_reason": out.finish_reason,
         },
     });
+    if out.e2e_latency > 0.0 {
+        v["meta_info"]["e2e_latency"] = serde_json::json!(out.e2e_latency);
+    }
     if !out.token_ids.is_empty() {
         v["output_ids"] = serde_json::json!(out.token_ids);
     }
@@ -264,6 +267,9 @@ pub(super) fn cumulative_frame_json(
     // diff.
     let mut m = String::new();
     let _ = write!(m, "{{\"completion_tokens\":{}", o.completion_tokens);
+    if o.e2e_latency > 0.0 {
+        let _ = write!(m, ",\"e2e_latency\":{}", o.e2e_latency);
+    }
     let _ = write!(m, ",\"finish_reason\":{finish}");
     if let Some(h) = &acc.hidden_json {
         let _ = write!(m, ",\"hidden_states\":{h}");
@@ -437,6 +443,9 @@ impl OutputAccumulator {
         o.text.push_str(&d.text);
         o.token_ids.extend_from_slice(&d.token_ids); // token_ids doubles as output_ids
         o.completion_tokens += d.completion_tokens;
+        if d.e2e_latency > 0.0 {
+            o.e2e_latency = d.e2e_latency;
+        }
         o.prompt_tokens = d.prompt_tokens; // constant across the request
         if d.finish_reason.is_some() {
             o.finish_reason = d.finish_reason.clone();
@@ -805,6 +814,7 @@ mod tests {
                     token_ids: vec![-2, 3],
                     completion_tokens: 2,
                     prompt_tokens: 4,
+                    e2e_latency: 1.25,
                     finish_reason: serde_json::from_value(
                         serde_json::json!({"type": "stop", "matched": 3}),
                     )
