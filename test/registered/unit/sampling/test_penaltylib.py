@@ -29,11 +29,12 @@ DEVICE = "cpu"
 
 
 # Helpers: mock Req and ScheduleBatch
-def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(freq=0.0, presence=0.0, rep=1.0, min_tokens=0, stop_ids=None, eos_id=2):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
     req.sampling_params.presence_penalty = presence
+    req.sampling_params.repetition_penalty = rep
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.tokenizer.additional_stop_token_ids = None
@@ -515,6 +516,129 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+
+class TestActivePenalizerTracking(CustomTestCase):
+
+    def test_init_active_list_excludes_non_required(self):
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            BatchedRepetitionPenalizer,
+        )
+
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch([_make_req(freq=1.0)]),
+            {
+                BatchedFrequencyPenalizer,
+                BatchedPresencePenalizer,
+                BatchedRepetitionPenalizer,
+            },
+        )
+        active_types = {type(p) for p in orch._active_penalizers}
+        self.assertEqual(active_types, {BatchedFrequencyPenalizer})
+
+    def test_init_active_list_empty_when_no_penalties(self):
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch([_make_req()]), {BatchedFrequencyPenalizer}
+        )
+        self.assertEqual(orch._active_penalizers, ())
+        self.assertEqual(orch._active_additive_penalizers, ())
+        self.assertEqual(orch._active_scaling_penalizers, ())
+
+    def test_init_partitions_by_is_multiplicative(self):
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            BatchedRepetitionPenalizer,
+        )
+
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch([_make_req(freq=1.0, rep=1.5)]),
+            {BatchedFrequencyPenalizer, BatchedRepetitionPenalizer},
+        )
+        self.assertEqual(len(orch._active_additive_penalizers), 1)
+        self.assertEqual(len(orch._active_scaling_penalizers), 1)
+        self.assertIsInstance(
+            orch._active_additive_penalizers[0], BatchedFrequencyPenalizer
+        )
+        self.assertIsInstance(
+            orch._active_scaling_penalizers[0], BatchedRepetitionPenalizer
+        )
+
+    def test_filter_teardown_removes_from_active_list(self):
+        reqs = [_make_req(freq=1.0), _make_req()]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
+        batch.reqs = [reqs[1]]
+        orch.filter(torch.tensor([1]))
+        self.assertEqual(orch._active_penalizers, ())
+
+    def test_filter_keeps_required_penalizers_in_active_list(self):
+        reqs = [_make_req(freq=1.0), _make_req(freq=0.5)]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedFrequencyPenalizer}
+        )
+        batch.reqs = [reqs[0]]
+        orch.filter(torch.tensor([0]))
+        self.assertEqual(len(orch._active_penalizers), 1)
+
+    def test_release_clears_active_lists(self):
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            BatchedRepetitionPenalizer,
+        )
+
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch([_make_req(freq=1.0, rep=1.5)]),
+            {BatchedFrequencyPenalizer, BatchedRepetitionPenalizer},
+        )
+        orch.release()
+        self.assertEqual(orch._active_penalizers, ())
+        self.assertEqual(orch._active_additive_penalizers, ())
+        self.assertEqual(orch._active_scaling_penalizers, ())
+
+    def test_merge_promotes_newly_prepared_penalizer(self):
+        self_orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch([_make_req()]), {BatchedFrequencyPenalizer}
+        )
+        their_orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch([_make_req(freq=1.0)]),
+            {BatchedFrequencyPenalizer},
+        )
+        self_orch.merge(their_orch)
+        self.assertEqual(len(self_orch._active_penalizers), 1)
+
+    def test_hot_path_apply_matches_old_behavior(self):
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch([_make_req(freq=1.0)]),
+            {BatchedFrequencyPenalizer},
+        )
+        logits = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32)
+        orch.cumulate_output_tokens(torch.tensor([5], dtype=torch.long))
+        orch.apply(logits)
+        self.assertAlmostEqual(logits[0, 5].item(), -1.0, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
+    def test_apply_with_repeat_skips_additive_when_only_scaling_active(self):
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            BatchedRepetitionPenalizer,
+        )
+
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch([_make_req(rep=1.5)]),
+            {BatchedRepetitionPenalizer},
+        )
+        orch.cumulate_output_tokens(torch.tensor([5], dtype=torch.long))
+        logits = torch.ones((2, VOCAB_SIZE), dtype=torch.float32)
+        orch.apply(logits, repeat=2)
+        self.assertAlmostEqual(logits[0, 5].item(), 1.0 / 1.5, places=5)
+        self.assertAlmostEqual(logits[1, 5].item(), 1.0 / 1.5, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 1.0, places=5)
 
 
 if __name__ == "__main__":
