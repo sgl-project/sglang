@@ -1,8 +1,8 @@
 """TeleChat4 model configuration."""
 
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import ClassVar, Dict, List, Optional
 
 from transformers import PretrainedConfig
 
@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class TeleChat4Config(PretrainedConfig):
+    model_type: ClassVar[str] = "telechat4"
+
     architectures: List[str]
     attention_bias: bool = False
     attention_dropout: float = 0.0
@@ -31,7 +33,6 @@ class TeleChat4Config(PretrainedConfig):
     intermediate_size: int = 9216
     kv_lora_rank: int = 512
     max_position_embeddings: int = 262144
-    model_type: str = "telechat4"
     moe_intermediate_size: int = 1024
     moe_layer_freq: int = 1
     n_group: int = 1
@@ -50,7 +51,7 @@ class TeleChat4Config(PretrainedConfig):
 
     rms_norm_eps: float = 1e-6
 
-    rope_scaling: Dict[str, float] = field(default_factory=dict)
+    rope_parameters: Optional[Dict] = None
     rope_theta: int = 10000
 
     routed_scaling_factor: float = 2.0
