@@ -22,6 +22,7 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.runtime_context import get_context, get_observability, get_spec
+from sglang.srt.speculative.spec_accept_metrics import SpecAcceptMetrics
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -143,6 +144,7 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        self.spec_accept_metrics = SpecAcceptMetrics()
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -360,6 +362,8 @@ class SchedulerMetricsReporter:
         num_correct_drafts: int,
         num_block_accept_tokens: int = 0,
         num_cap_tokens: int = 0,
+        num_correct_drafts_per_req: Optional[List[int]] = None,
+        num_draft_tokens: Optional[int] = None,
     ):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
@@ -368,6 +372,14 @@ class SchedulerMetricsReporter:
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
+
+        if num_correct_drafts_per_req is not None and (
+            self.is_stats_logging_rank or self.current_scheduler_metrics_enabled
+        ):
+            self.spec_accept_metrics.observe(
+                num_correct_drafts_per_req,
+                num_draft_tokens,
+            )
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -526,6 +538,7 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        self.spec_accept_metrics.reset()
 
     def report_prefill_stats(
         self,
@@ -739,6 +752,8 @@ class SchedulerMetricsReporter:
         ):
             return
 
+        spec_position_snapshot = self.spec_accept_metrics.snapshot_and_reset_window()
+
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
@@ -866,6 +881,22 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+            if spec_position_snapshot.window.num_requests > 0:
+                logger.info(
+                    "Decode batch, #window: spec accept rate (per-position): "
+                    "[%s], accept len: %.2f | #lifetime: spec total accept "
+                    "rate (per-position): [%s], accept len: %.2f",
+                    ", ".join(
+                        f"{rate:.2f}"
+                        for rate in spec_position_snapshot.window.accept_rates
+                    ),
+                    spec_position_snapshot.window.mean_accept_length,
+                    ", ".join(
+                        f"{rate:.2f}"
+                        for rate in spec_position_snapshot.lifetime.accept_rates
+                    ),
+                    spec_position_snapshot.lifetime.mean_accept_length,
+                )
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 
@@ -891,6 +922,15 @@ class SchedulerMetricsReporter:
             self.stats.spec_block_accept_length = spec_block_accept_length
             self.stats.spec_num_steps = spec_num_steps
             self.stats.spec_num_draft_tokens = spec_num_draft_tokens
+            self.stats.spec_accept_rate_per_position = list(
+                spec_position_snapshot.window.accept_rates
+            )
+            self.stats.spec_total_accept_rate_per_position = list(
+                spec_position_snapshot.lifetime.accept_rates
+            )
+            self.stats.spec_total_accept_length = (
+                spec_position_snapshot.lifetime.mean_accept_length
+            )
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
