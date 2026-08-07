@@ -25,11 +25,15 @@ export const benchmarks = [
         ttft_ms: 84626, tpot_ms: 30.52, tokens_per_sec_per_gpu: 2266 },
     ],
   },
-      // NOTE: on memory-bound H200 high-throughput is dominated by balanced (2315): the decode batch
-      // saturates ~256 regardless of strategy, and balanced adds EAGLE spec-decode (~2x accept) while HT
-      // has none. Raising HT's batch cap (--cuda-graph-max-bs-decode 256) OOMs at graph capture on 0.5.16
-      // (no memory headroom), so HT can't close the gap here — it only leads on higher-memory GPUs
-      // (B200/B300/GB300 all show HT > balanced). Kept the measured HT number as-is.
+      // NOTE: on H200 the high-throughput number (conc 1024/4096) sits BELOW balanced (conc 64/256).
+      // This is decode SATURATION, not a config bug: GLM-5.2's DSA-MoE decode is HBM-bandwidth-bound
+      // (weight reads dominate) and saturates by ~conc 256; pushing to conc 1024/4096 only deepens the
+      // queue (TTFT 530s / 2380s) with no throughput gain, so the HT operating point measures lower.
+      // Removing EAGLE frees little (the weight-read bottleneck is unchanged), raising the batch cap
+      // OOMs at graph capture, and a pure TP+EP variant (--tp 8 --ep 8, DP-attention off) benched ~4.5x
+      // WORSE (~500 vs ~2266 tok/s/GPU) — so DP-attention is required. Net: on memory-bound H200 the
+      // BALANCED config is throughput-optimal; HT only leads on the higher-memory Blackwell parts
+      // (B200/B300/GB300 all show HT > balanced).
       {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
