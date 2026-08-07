@@ -6,9 +6,10 @@
 // 1024, --random-range-ratio 1.0, --warmup-requests 64, balanced tier @ conc 64 & 256
 // (num_prompts 128 / 512). Runs served with --reasoning-parser/--tool-call-parser auto
 // present (now Playground-only in cells per DSv4 convention; parsers don't affect
-// throughput). STILL PENDING this re-bench: b200 (no 8x-b200 whole-node placeable —
-// needs PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True), gb200 (no box), AMD mi3xx
-// (no AMD devbox). Those rows keep their original "PR #27944" measurement (provenance below).
+// throughput). STILL PENDING this 0.5.16 re-bench (rows keep their original "PR #27944"
+// measurement; provenance below): b200 — on 0.5.16 requires
+// PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (--mem-fraction-static 0.65 OOMs at
+// cuda-graph capture without it) — plus gb200 and the AMD cells (mi300x/mi325x/mi350x/mi355x).
 //
 // SPEED — bench_serving --flush-cache, random isl2048/osl256, max_concurrency 64,
 // CUDA graph on. B200 (tp8, MXFP8, MSA fmha_sm100 path; re-measured 2026-06-15
@@ -44,9 +45,9 @@ export const benchmarks = [
     // #27944 tp4 speed + GSM8K drift were pre-fix; the merged MSA decode fix
     // resolves the drift (stable single-run greedy 96.89% / recommended 96.51%).
     match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-    // Speed PENDING on the new qwen shape (conc 64/256, isl 8192/osl 1024) — no 8x-b200
-    // whole-node placeable this round. Re-bench requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    // (--mem-fraction-static 0.65 OOMs at cuda-graph capture on 0.5.16 without it).
+    // Speed PENDING on the qwen shape (conc 64/256, isl 8192/osl 1024). Serving on 0.5.16
+    // requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — --mem-fraction-static 0.65
+    // OOMs at cuda-graph capture without it.
     accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.5, mmmu_pro_pct: 72.7 }, // 2026-06-15, sgl-eval --thinking, recommended sampling (temp 1.0/top_p 0.95), tp8. GSM8K full 1319 = 96.51% (greedy 96.89%). GPQA Diamond 198, n-repeats 4 = pass@1[avg-of-4] 89.14% +/-1.73% (pass@4 95.45%, majority@4 93.52%). MMMU-Pro 2026-06-18, sgl-eval "standard (10 options)" test split, full 1730, single-shot 72.66% (thinking, temp 1.0/top_p 0.95).
   },
   {
