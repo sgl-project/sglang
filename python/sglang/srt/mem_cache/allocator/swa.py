@@ -369,14 +369,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Fixed-shape counterpart of free_swa(): no output shape depends on
         device data, so the call stays a pure async launch.
 
-        Beyond base's contract: ``start_pos`` is page aligned, and every page the
-        slice touches still holds a live SWA mapping -- the caller owns the range
-        and has not freed it before. Ranges that may already be dead keep using
-        ``free_swa``, which filters them.
-
-        What a free group queues here is owned -- a gather result and an
-        arithmetic result, never the caller's ``req_to_token`` view -- so the row
-        may be rewritten before the group closes.
+        Contract beyond base: ``start_pos`` is page aligned and every page the
+        slice touches still has a live SWA mapping (the caller owns the range and
+        has not freed it) -- ranges that may be dead keep using ``free_swa``. A
+        free group queues owned values, not the caller's view, so the row may be
+        rewritten before the group closes.
         """
         if free_index.numel() == 0:
             return
@@ -399,11 +396,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_segment_group.append((swa_reps, page_starts))
 
     def _clear_mapping_pages(self, page_starts: torch.Tensor) -> None:
-        """Zero the mapping for each whole page.
-
-        index_fill_ rather than ``mapping[idx] = 0``: the scalar setitem form
-        synchronizes on CUDA.
-        """
+        """Zero the mapping for each whole page. index_fill_ rather than
+        ``mapping[idx] = 0``: the scalar setitem form synchronizes on CUDA."""
         ps = self.page_size
         if ps == 1:
             self.full_to_swa_index_mapping.index_fill_(0, page_starts, 0)
@@ -575,13 +569,9 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.free_group.append(free_index)
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """full == swa and the mapping is a constant identity table, so the base
-        path's gather and page clearing are both wrong: a slot is its own SWA rep
-        and the table is never zeroed.
-
-        With no gather there is nothing owned to queue, so a group snapshots
-        instead of holding the caller's ``req_to_token`` view.
-        """
+        """full == swa and the mapping is a constant identity table: a slot is its
+        own SWA rep and the table is never zeroed. With no gather to produce an
+        owned value, a group snapshots rather than hold the caller's view."""
         if free_index.numel() == 0:
             return
         if self.debug_mode:
