@@ -1707,9 +1707,25 @@ class ReasoningParser:
 
         self.detector = detector_class(**kwargs)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
+    def parse_non_stream(
+        self, full_text: str, finish_reason: Optional[dict] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
         ret = self.detector.detect_and_parse(full_text)
+        # If reasoning was truncated by a stop (user stop_sequences or EOS)
+        # before the think_end token appeared, normal_text would be empty and
+        # the whole output would land in reasoning_text — leaving the response
+        # content empty. When the finish reason is a stop (not a length cap),
+        # the reasoning phase had effectively ended, so move the reasoning
+        # content to normal_text to avoid an empty response. Length truncation
+        # keeps reasoning as-is, as the model may still be mid-reasoning.
+        if (
+            finish_reason
+            and finish_reason.get("type") == "stop"
+            and not ret.normal_text
+            and ret.reasoning_text
+        ):
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret.reasoning_text, ret.normal_text
 
     def parse_non_stream_blocks(self, full_text: str) -> list[dict]:
