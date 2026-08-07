@@ -28,6 +28,7 @@ behavior.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from dataclasses import dataclass
@@ -341,6 +342,25 @@ class BaseBreakableCudaGraphRunner:
         """
         return _signature_kwargs(kwargs)
 
+    @contextlib.contextmanager
+    def _tp_graph_capture(self):
+        """Enter the tensor-parallel group's graph-capture context around capture."""
+
+        from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
+            GraphCaptureContext,
+        )
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_tp_group,
+            model_parallel_is_initialized,
+        )
+
+        if not model_parallel_is_initialized() or get_tp_group().world_size <= 1:
+            yield
+            return
+
+        with get_tp_group().graph_capture(GraphCaptureContext(self._capture_stream)):
+            yield
+
     def _empty_cache(self) -> None:
         empty_cache = getattr(self.device_module, "empty_cache", None)
         if callable(empty_cache):
@@ -422,11 +442,12 @@ class BaseBreakableCudaGraphRunner:
         self.device_module.synchronize()
 
         graph = BreakableCUDAGraph()
-        with enable_breakable_cuda_graph():
-            with BreakableCUDAGraphCapture(
-                cuda_graph=graph, pool=self._pool, stream=self._capture_stream
-            ):
-                output = self.transformer(**static_kwargs)
+        with self._tp_graph_capture():
+            with enable_breakable_cuda_graph():
+                with BreakableCUDAGraphCapture(
+                    cuda_graph=graph, pool=self._pool, stream=self._capture_stream
+                ):
+                    output = self.transformer(**static_kwargs)
         self.device_module.synchronize()
 
         logger.info(

@@ -840,6 +840,56 @@ class TestPrefillAdder(CustomTestCase):
         ):
             self.assertIsNone(adder._check_prefill_tile_budget(129))
 
+    # ---- _swa_req_never_fits: the gate on the _swa_chunk_cap escape hatch ----
+    # The hatch shrinks a chunk and admits it instead of waiting; it must fire
+    # ONLY for a request whose SWA budget can never fit the drained pool (true
+    # head-of-line livelock). Admitting transient-pressure requests instead
+    # collapses the SWA evictable cushion and causes a retraction storm.
+
+    def create_swa_adder(
+        self, *, size_swa: int, sliding_window: int, page_size: int = 16
+    ) -> PrefillAdder:
+        self.mock_tree_cache.sliding_window_size = sliding_window
+        self.mock_token_allocator = self.create_token_allocator(size_swa=size_swa)
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=512,
+        )
+
+    def test_swa_never_fits_false_under_transient_pressure(self):
+        # Small request against an ample pool: budget << pool, so it would fit
+        # once running decodes drain -> must wait, not take the hatch.
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        self.assertFalse(
+            adder._swa_req_never_fits(extend_input_len=256, max_new_tokens=64)
+        )
+
+    def test_swa_never_fits_true_when_budget_exceeds_whole_pool(self):
+        # A large host-hit load-back charge pushes the budget past the entire
+        # pool: it can never fit however far the pool drains -> hatch.
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        self.assertTrue(
+            adder._swa_req_never_fits(
+                extend_input_len=256, max_new_tokens=64, swa_host_hit_length=4096
+            )
+        )
+
+    def test_swa_never_fits_is_gated_by_pool_capacity(self):
+        # Same request; only the pool size changes. Proves the check compares
+        # the budget against size_swa (guards against a wrong-accessor bug).
+        req = dict(extend_input_len=256, max_new_tokens=64, swa_host_hit_length=600)
+        self.assertTrue(
+            self.create_swa_adder(size_swa=512, sliding_window=128)._swa_req_never_fits(
+                **req
+            )
+        )
+        self.assertFalse(
+            self.create_swa_adder(
+                size_swa=4096, sliding_window=128
+            )._swa_req_never_fits(**req)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
