@@ -29,6 +29,7 @@ except:
     pass
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -834,6 +835,7 @@ def _static_quant_fp8(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
     REPEAT_SCALE: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
@@ -862,9 +864,9 @@ def _static_quant_fp8(
         tl.extra.cuda.gdc_launch_dependents()
 
     y_s_inv = 1.0 / y_s
-    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
 
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    tl.store(y_q_ptr + cols, y_q.to(tl.uint8, bitcast=True), mask=mask)
     if REPEAT_SCALE:
         tl.store(y_s_repeat_ptr, y_s)
 
@@ -910,7 +912,7 @@ def static_quant_fp8(
     pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _static_quant_fp8[(M,)](
         x,
-        x_q,
+        x_q.view(torch.uint8),
         x_s,
         x_s_repeat,
         N,
@@ -918,6 +920,7 @@ def static_quant_fp8(
         fp8_min=fp8_min,
         fp8_max=fp8_max,
         BLOCK=BLOCK,
+        FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
         REPEAT_SCALE=repeat_scale,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -1706,6 +1709,7 @@ def _per_tensor_quant_mla_fp8_stage2(
     x_stride_s,
     fp8_min,
     fp8_max,
+    FP8_DTYPE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
@@ -1720,8 +1724,8 @@ def _per_tensor_quant_mla_fp8_stage2(
     x_q_ptr += head_id * num_seq * head_size + seq_id * head_size
 
     x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
-    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(x_q_ptr.dtype.element_ty)
-    tl.store(x_q_ptr + offset, x_q, mask=mask)
+    x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
+    tl.store(x_q_ptr + offset, x_q.to(tl.uint8, bitcast=True), mask=mask)
 
 
 def per_tensor_quant_mla_fp8(
@@ -1757,13 +1761,14 @@ def per_tensor_quant_mla_fp8(
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
         x_s_out,
-        x_q,
+        x_q.view(torch.uint8),
         num_seq,
         head_size,
         x.stride(0),
         x.stride(1),
         fp8_min,
         fp8_max,
+        fp8_dtype_to_triton(fp8_dtype),
         BLOCK_SIZE,
     )
 
@@ -1786,6 +1791,7 @@ def _per_token_group_quant_mla_deep_gemm_masked_fp8(
     eps,
     fp8_min,
     fp8_max,
+    FP8_DTYPE: tl.constexpr,
     NUM_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -1814,9 +1820,13 @@ def _per_token_group_quant_mla_deep_gemm_masked_fp8(
         )
         _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
         y_s = _absmax / fp8_max
-        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(FP8_DTYPE)
 
-        tl.store(y_q_ptr + gid * group_size + cols, y_q, mask=mask)
+        tl.store(
+            y_q_ptr + gid * group_size + cols,
+            y_q.to(tl.uint8, bitcast=True),
+            mask=mask,
+        )
         tl.store(y_s_ptr + gid * y_s_stride_g, y_s)
 
 
@@ -1846,7 +1856,7 @@ def per_token_group_quant_mla_deep_gemm_masked_fp8(
 
     _per_token_group_quant_mla_deep_gemm_masked_fp8[grid](
         x,
-        x_q,
+        x_q.view(torch.uint8),
         x_s,
         masked_m,
         group_size,
@@ -1859,6 +1869,7 @@ def per_token_group_quant_mla_deep_gemm_masked_fp8(
         eps,
         -fp8_max,
         fp8_max,
+        fp8_dtype_to_triton(dtype),
         num_tiles_k,
         BLOCK_SIZE,
     )
@@ -2028,6 +2039,7 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     M_ALIGNMENT: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,  # tune
 ):
     k_offset = tl.program_id(0)
@@ -2047,13 +2059,13 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         inp = tl.load(a_ptrs, mask=a_mask).to(tl.float32)  # [BLOCK_M, BLOCK_K]
         inp_amax = tl.max(tl.abs(inp), axis=1)  # [BLOCK_M,]
         inp_amax = tl.clamp(inp_amax, min=1e-4, max=float("inf"))
-        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4nv)
+        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(FP8_DTYPE)
 
         # Store fp8
         a_fp8_ptrs = (
             a_fp8 + current_expert_offset * K + coord_m[:, None] * K + coord_k[None, :]
         )
-        tl.store(a_fp8_ptrs, inp_fp8, mask=a_mask)
+        tl.store(a_fp8_ptrs, inp_fp8.to(tl.uint8, bitcast=True), mask=a_mask)
 
         # Store sfa
         k = tl.cdiv(K, BLOCK_K)
@@ -2092,11 +2104,12 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
         A,
         expert_offsets,
         problem_sizes,
-        a_q,
+        a_q.view(torch.uint8),
         sfa,
         K,
         group_size,
         expert_tokens_alignment,
+        fp8_dtype_to_triton(fp8_dtype),
     )
     return a_q, sfa
 

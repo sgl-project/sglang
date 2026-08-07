@@ -924,6 +924,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
+        # Don't let the MoE runner overwrite hidden_states with its output:
+        # dual-stream forwards (e.g. DeepseekV2MoE.forward_normal_dual_stream)
+        # read hidden_states for the shared experts on the alt stream, and
+        # losing that race corrupts long generations.
+        self.moe_runner_config.inplace = False
         self.dispatcher = base_layer.dispatcher
         self.num_local_experts = base_layer.num_local_experts
         self.should_fuse_routed_scaling_factor_in_topk = (

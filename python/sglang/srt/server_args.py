@@ -82,6 +82,7 @@ from sglang.srt.utils.common import (
     is_npu,
     is_remote_url,
     is_sm90_supported,
+    is_sm100_or_sm110_supported,
     is_sm100_supported,
     is_sm120_supported,
     is_xpu,
@@ -112,6 +113,7 @@ LOAD_FORMAT_CHOICES = [
     "npcache",
     "dummy",
     "sharded_state",
+    "presharded",
     "gguf",
     "bitsandbytes",
     "mistral",
@@ -123,6 +125,10 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+# NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
+# It is an internal dispatch format set automatically by ModelRunner when the
+# weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
+# choice let users create contradictory combos (see _handle_load_format).
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
@@ -265,6 +271,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper+
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -511,14 +518,31 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"presharded" performs a normal first-time load (with quantization), '
+            "then dumps a per-rank/per-tensor sharded checkpoint with content "
+            "deduplication into "
+            "<model_path>/presharded/<parallelism+quant subfolder>/. "
+            "Subsequent runs with the same parallelism+quantization config "
+            "load directly from this presharded checkpoint and skip "
+            "re-quantization. "
+            "The dump directory must be on a shared filesystem across all "
+            "ranks/nodes. Optional model_loader_extra_config roots: "
+            "presharded_path (target) and draft_presharded_path (speculative "
+            "draft); each replaces <model_path>/presharded and still gets a "
+            "config subfolder appended. Use a writable path when model_path "
+            "is read-only (e.g. HF cache mounts).",
             choices=LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
     ] = "auto"
     model_loader_extra_config: A[
         str,
-        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+        "Extra config for model loader. This will be passed to the model loader "
+        "corresponding to the chosen load_format. For load_format=presharded, "
+        "JSON may include presharded_path (target cache root), "
+        "draft_presharded_path (draft cache root), max_file_bytes, "
+        "hash_num_threads, and verify_on_load.",
         NS("model"),
     ] = "{}"
     trust_remote_code: A[
@@ -1038,6 +1062,29 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    dcp_comm_backend: A[
+        str,
+        Arg(
+            help="Communication backend for the decode context-parallel (DCP) "
+            "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
+            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
+            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
+            choices=["ag_rs", "a2a", "fi_a2a"],
+        ),
+        NS("parallel"),
+    ] = "ag_rs"
+    dcp_replicate_q_proj: A[
+        bool,
+        Arg(
+            help="For MLA decode context parallelism with the a2a/fi_a2a "
+            "backend: replicate the Q projection so each DCP rank computes the "
+            "full-head query locally (redundant projection compute), eliminating "
+            "the per-layer head-dim all-gather of Q. Trades a small amount of "
+            "extra GEMM for one fewer collective per layer.",
+        ),
+        NS("parallel"),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -1063,6 +1110,11 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
     prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
+    enable_cp_decode_attn_tp: A[
+        bool,
+        "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
+        NS("parallel"),
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -1705,6 +1757,18 @@ class ServerArgs:
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False
+    flashinfer_autotune_skip_ops: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "FlashInfer custom-op identifiers to skip during autotuning. "
+                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
+                "temporarily skips mxfp8_gemm by default due to an IMA."
+            ),
+            nargs="+",
+        ),
+        NS("exec.kernel"),
+    ] = None
     mamba_backend: A[
         str,
         Arg(
@@ -2389,6 +2453,7 @@ class ServerArgs:
         "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
         "interior states beyond the cap are removed while their full KV remains. "
         "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
+        NS("exec.mamba"),
     ] = -1
     enable_mamba_cache_stochastic_rounding: A[
         bool,
@@ -2519,6 +2584,7 @@ class ServerArgs:
         "(finest reuse granularity, most host memory). Larger N trades reuse "
         "granularity for host memory; the SWA host pool is sized as "
         "ceil(full_host_pages / N) + tail.",
+        NS("memory"),
     ] = 1
     hicache_write_policy: A[
         str,
@@ -2564,6 +2630,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "shm",
             ],
         ),
         NS("memory"),
@@ -3278,6 +3345,36 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
 
+    weight_cache_mode: A[
+        str,
+        Arg(
+            help="Weight cache mode. 'off': normal disk loading. "
+            "'daemon': launch weight cache daemon (holds weights in GPU memory). "
+            "Engine-spawned daemons are co-terminal with the engine and do NOT "
+            "persist across restarts, so this alone does not speed up restart "
+            "(the first start is slower). For fast recovery, run the standalone "
+            "daemon (python -m sglang.srt.weight_cache.daemon) and connect with "
+            "'client'. 'client': connect to existing daemon and load via IPC.",
+            choices=["off", "daemon", "client"],
+        ),
+        NS("model"),
+    ] = "off"
+    weight_cache_socket: A[
+        Optional[str],
+        Arg(
+            help="Unix socket path for weight cache daemon (client mode)."
+            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+        ),
+        NS("model"),
+    ] = None
+    weight_cache_timeout: A[
+        int,
+        Arg(
+            help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
+        ),
+        NS("model"),
+    ] = 1800
+
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
     # -------------------------------------------------------------------------
@@ -3589,6 +3686,30 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
+        if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
+            raise ValueError(
+                f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
+                "decode context-parallel attention reduction and therefore "
+                "requires --dcp-size / --decode-context-parallel-size > 1, but "
+                f"got dcp_size={self.dcp_size}."
+            )
+        if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
+            raise ValueError(
+                "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
+                "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
+                "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
+                "authoritative fabric probe runs at model-runner init; use 'a2a' "
+                "or 'ag_rs' on clusters without MNNVL."
+            )
+        if self.dcp_replicate_q_proj:
+            if self.dcp_size <= 1:
+                raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
+            if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+                raise ValueError(
+                    "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
+                    "communication backend (it removes the head-dim Q all-gather); "
+                    f"got --dcp-comm-backend={self.dcp_comm_backend}."
+                )
         if not self.dcp_size > 1:
             return
         if is_hip():
@@ -4755,6 +4876,19 @@ class ServerArgs:
                 "(DeepSeek Sparse Attention) models."
             )
 
+        if self.enable_cp_decode_attn_tp:
+            from sglang.srt.layers.cp.cp_decode_attn_tp import (
+                CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
+            )
+
+            if model_arch not in CP_DECODE_ATTN_TP_SUPPORTED_ARCHS:
+                raise ValueError(
+                    "--enable-cp-decode-attn-tp is only supported for models "
+                    "whose attention linears are replicated across CP ranks "
+                    f"(attn_tp_size=1). Got {model_arch}; supported: "
+                    f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
+                )
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -4959,9 +5093,13 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
-            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                validate_deepseek_v4_cp,
+                validate_deepseek_v4_mega_moe_token_budget,
+            )
 
             validate_deepseek_v4_cp(self)
+            validate_deepseek_v4_mega_moe_token_budget(self)
 
             # The SM120 marlin fallback moved to the resolution pipeline
             # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
@@ -6331,6 +6469,22 @@ class ServerArgs:
             )
 
         if a2a_backend == "deepep":
+            if self.moe_runner_backend == "flashinfer_cutedsl":
+                if self.deepep_mode == "auto":
+                    self.deepep_mode = "low_latency"
+                    logger.warning(
+                        "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
+                        "FP4 MoE has no DeepEP normal-dispatch handler, so "
+                        "deepep auto mode would crash during prefill. "
+                        "low_latency covers both prefill and decode."
+                    )
+                elif self.deepep_mode == "normal":
+                    raise ValueError(
+                        "flashinfer_cutedsl FP4 MoE only supports DeepEP "
+                        "low_latency dispatch (masked layout). DeepEP normal "
+                        "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
+                        "--deepep-mode low_latency or auto."
+                    )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
@@ -6845,6 +6999,31 @@ class ServerArgs:
                 self.validate_transfer_engine()
             )
 
+        # "ipc_cache" is an internal-only load format: ModelRunner sets it
+        # automatically when the weight cache is enabled, and it is not a public
+        # --load-format choice. Setting it directly is always wrong (no daemon is
+        # launched, and fallback_load_format inherits a nonsensical format), so
+        # reject it and point at the knob (defense-in-depth; the CLI already
+        # rejects it via LOAD_FORMAT_CHOICES).
+        if self.load_format == "ipc_cache":
+            raise ValueError(
+                "load_format='ipc_cache' is an internal-only format and must not "
+                "be set directly. Enable the weight cache via --weight-cache-mode "
+                "client (connect to an existing daemon) or daemon (launch one); "
+                "that selects IPC loading automatically."
+            )
+
+        # Speculative decoding loads an extra draft model whose weights the
+        # daemon does not export, so refuse the combination up front instead of
+        # failing deep inside draft-worker load (draft-model daemon TBD).
+        if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with speculative "
+                "decoding (--speculative-algorithm): the weight cache daemon does "
+                "not export the draft model's weights. Disable one of them "
+                "(--weight-cache-mode off) for this configuration."
+            )
+
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
@@ -7147,16 +7326,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
-        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
-        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
@@ -7170,9 +7339,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+        if self.enable_deepseek_v4_fp4_indexer and not (
+            is_sm100_supported() or is_sm120_supported()
+        ):
             raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
@@ -7288,10 +7459,19 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                deepseek_deterministic_attention_backends = ["fa3", "triton"]
-                if attention_backend not in deepseek_deterministic_attention_backends:
+                if (
+                    attention_backend
+                    not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                ):
                     raise ValueError(
-                        f"Currently only {deepseek_deterministic_attention_backends} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                    )
+                if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
+                    raise ValueError(
+                        "Deterministic inference with DeepSeek models on the fa4 "
+                        "attention backend requires SM100/SM110: it runs "
+                        "absorbed MLA, whose qv argument flash_attn.cute only "
+                        "implements on those archs."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
@@ -8833,7 +9013,7 @@ class PortArgs:
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
             NUM_DERIVED_PORTS = 5
-            if server_args.is_ep_scale_joiner:
+            if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -8853,14 +9033,22 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = server_args.is_ep_scale_joiner
+            is_joiner = server_args.is_ep_joiner
+            # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
+            # dist_init_port / nccl_port (rendezvous uses the externally-managed
+            # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
+            # their prechecks could only false-positive and are skipped.
+            dist_init_overridden = bool(
+                envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+            )
             try:
                 if dp_rank is None:
-                    if not is_joiner:
+                    if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
-                    wait_port_available(nccl_port, "nccl_port")
+                    if not dist_init_overridden:
+                        wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:

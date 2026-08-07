@@ -702,6 +702,9 @@ class TestReuseValidatorStateGate(unittest.TestCase):
             _strict_bit_exact=strict,
             _swa_kv_pool_host=object(),  # not None -> not swa_device_only_hicache
             cache=types.SimpleNamespace(cache_controller=None),
+            tree_core=types.SimpleNamespace(
+                has_swa_host_pool=True, enable_hicache=False
+            ),
             _c4_state_layer_index={0: 0} if wired else None,
             _c4_state_host_pool=hp if wired else None,
             _compress_state_pools=[object()] if wired else None,

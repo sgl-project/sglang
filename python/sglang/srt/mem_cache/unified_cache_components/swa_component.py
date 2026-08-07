@@ -2,16 +2,61 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    IncLockRefResult,
+    InsertParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    BindCapturedSWAHost,
+    FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
+    FreeDeviceKV,
+    RebuildFullToSWAMapping,
+    RecoverSWAWithLockedFull,
+    SWARebuild,
+)
+from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
+    ComponentType,
+    EvictLayer,
+    LRURefreshPhase,
+    PreparePrefetchResult,
+    TreeComponent,
+    next_component_uuid,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        CacheAction,
+        ComponentAction,
+    )
+    from sglang.srt.mem_cache.unified_radix_cache import (
+        NodeId,
+        UnifiedRadixCache,
+        UnifiedTreeNode,
+    )
+
 logger = logging.getLogger(__name__)
 _SWA_DBG_CHECKSUM = os.environ.get("SGLANG_SWA_DBG_CHECKSUM") == "1"
-# Strict reuse state gate: a reuse boundary must have its c4/indexer overlap
-# state durably backed, else restore can't rebuild it bit-exact (§12 dirty
-# read). Intrinsic to strict bit-exact mode (no opt-out); naturally no-ops when
-# state riding is unwired (_state_rides() is then empty).
 
 
 # ----------------------------------------------------------------------
@@ -313,41 +358,6 @@ def _dbg_verify_state_restore(
         )
 
 
-from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
-    EvictParams,
-    IncLockRefResult,
-    InsertParams,
-    InsertResult,
-    MatchPrefixParams,
-    MatchResult,
-)
-from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolHitPolicy,
-    PoolName,
-    PoolTransfer,
-    PoolTransferResult,
-)
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
-    BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
-    ComponentType,
-    EvictLayer,
-    LRURefreshPhase,
-    TreeComponent,
-    next_component_uuid,
-)
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        UnifiedRadixCache,
-        UnifiedTreeNode,
-    )
-
-
 class SWAComponent(TreeComponent):
     """Sliding window attention component.
 
@@ -362,8 +372,8 @@ class SWAComponent(TreeComponent):
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         assert isinstance(
-            cache.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-        ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
+            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size
         # HiCache state: set to host SWA pool when HiCache enabled
@@ -403,42 +413,16 @@ class SWAComponent(TreeComponent):
                 # MATCH_END / INSERT_END instead.
                 return
             case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
-                self.cache.lru_lists[
+                self.tree_core.lru_lists[
                     self.component_type
                 ].reset_node_and_window_ancestors_mru(
                     node,
                     root_node,
-                    self.sliding_window_size + self.cache.page_size,
+                    self.sliding_window_size + self.tree_core.page_size,
                     self.node_has_component_data,
                 )
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
-
-    def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
-        ct = self.component_type
-        node.component_data[ct].value = value
-        # A freshly (re)assigned device SWA value is live for the current
-        # holder; drop any stale deferred owner-release intent from a prior life.
-        if getattr(node, "_swa_release_pending", False):
-            node._swa_release_pending = False
-        host_lru = self.cache.host_lru_lists[ct]
-        if host_lru.in_list(node):
-            host_lru.remove_node(node)
-        self.cache.lru_lists[ct].insert_mru(node)
-        self.cache.component_evictable_size_[ct] += len(value)
-
-    def _restore_device_value_with_locked_full(
-        self,
-        node: UnifiedTreeNode,
-        full_value: torch.Tensor,
-        incoming_full_value: torch.Tensor,
-    ) -> None:
-        allocator = self.cache.token_to_kv_pool_allocator
-        swa_value = self._translate_full_to_swa(incoming_full_value)
-        allocator.set_full_to_swa_mapping(full_value, swa_value)
-        allocator.full_to_swa_index_mapping[incoming_full_value.to(torch.int64)] = 0
-        allocator.full_attn_allocator.free(incoming_full_value)
-        self._restore_device_value(node, swa_value)
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -470,7 +454,7 @@ class SWAComponent(TreeComponent):
         # unified_kv never caches the SWA ring (per-request, not content-stable),
         # so SWA bookkeeping must not gate the match here.
         swa_device_only_hicache = (
-            self._swa_kv_pool_host is None and self.cache.cache_controller is not None
+            not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
         )
 
         def validator(node: UnifiedTreeNode) -> bool:
@@ -525,7 +509,7 @@ class SWAComponent(TreeComponent):
 
         return validator
 
-    def finalize_match_result(
+    def finalize_match_result_in_tree_core(
         self,
         result: MatchResult,
         params: MatchPrefixParams,
@@ -536,7 +520,7 @@ class SWAComponent(TreeComponent):
         n_swa = 0
         swa_host_hit = 0
         node = result.best_match_node
-        root = self.cache.root_node
+        root = self.tree_core.root_node
         # Mine 2 (warm reuse): on the reuse path in strict mode, the per-request
         # device SWA ring is not a durable cross-request truth (I2'), so a node
         # that is BOTH device-resident and host-backed must still be counted as
@@ -579,6 +563,7 @@ class SWAComponent(TreeComponent):
         total_prefix_len: int,
         value_slice: torch.Tensor,
         params: InsertParams,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> int:
         if params.prev_prefix_len >= total_prefix_len + prefix_len:
             return prefix_len
@@ -593,40 +578,38 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].lock_ref == 0
         ), f"tombstone {self.component_type} lock_ref should be 0, node {node.id}"
         assert (
-            swa_evicted_seqlen % self.cache.page_size == 0
+            swa_evicted_seqlen % self.tree_core.page_size == 0
         ), f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
+            old_full = full_cd.value
             if full_cd.lock_ref > 0:
-                self._restore_device_value_with_locked_full(
-                    node, full_cd.value, value_slice
+                cache_actions.append(
+                    RecoverSWAWithLockedFull(node.id, old_full, value_slice)
                 )
                 return 0
-            self.cache.token_to_kv_pool_allocator.free(full_cd.value)
             full_cd.value = value_slice.clone()
-            swa_value = self._translate_full_to_swa(full_cd.value)
-            self._restore_device_value(node, swa_value)
+            cache_actions.append(FreeDeviceKV([old_full]))
+            cache_actions.append(SWARebuild(node.id, value_slice))
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
-            if full_cd.lock_ref > 0:
-                self.cache._split_node(node.key, node, start_idx)
-                full_cd = node.component_data[BASE_COMPONENT_TYPE]
-                self._restore_device_value_with_locked_full(
-                    node, full_cd.value, value_slice[start_idx:]
+            is_locked = full_cd.lock_ref > 0
+            old_full = full_cd.value[start_idx:]
+            _, action = self.tree_core._split_node(node.key, node, start_idx)
+            if action is not None:
+                cache_actions.append(action)
+            new_full = value_slice[start_idx:]
+            if is_locked:
+                cache_actions.append(
+                    RecoverSWAWithLockedFull(node.id, old_full, new_full)
                 )
                 return start_idx
-            self.cache.token_to_kv_pool_allocator.free(full_cd.value[start_idx:])
-            self.cache._split_node(node.key, node, start_idx)
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
-                start_idx:
-            ].clone()
-            swa_value = self._translate_full_to_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            self._restore_device_value(node, swa_value)
+            node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
+            cache_actions.append(FreeDeviceKV([old_full]))
+            cache_actions.append(SWARebuild(node.id, new_full))
             return start_idx
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
@@ -638,6 +621,7 @@ class SWAComponent(TreeComponent):
         prefix_len: int,
         total_prefix_len: int,
         params: InsertParams,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         # _unevict_node_on_insert already wrote the request's fresh KV slice
         # into the base value. We just need to rebuild SWA from that slice for
@@ -650,20 +634,24 @@ class SWAComponent(TreeComponent):
         ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert (
-            swa_evicted_seqlen % self.cache.page_size == 0
+            swa_evicted_seqlen % self.tree_core.page_size == 0
         ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
 
-        full_value = node.component_data[BASE_COMPONENT_TYPE].value
         if swa_evicted_seqlen <= total_prefix_len:
-            swa_value = self._translate_full_to_swa(full_value)
+            pass  # entire node is within the SWA window
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             start_idx = swa_evicted_seqlen - total_prefix_len
-            self.cache._split_node(node.key, node, start_idx)
-            full_value = node.component_data[BASE_COMPONENT_TYPE].value
-            swa_value = self._translate_full_to_swa(full_value)
+            _, action = self.tree_core._split_node(node.key, node, start_idx)
+            if action is not None:
+                cache_actions.append(action)
         else:
             return
-        self._restore_device_value(node, swa_value)
+        cache_actions.append(
+            SWARebuild(
+                node.id,
+                node.component_data[BASE_COMPONENT_TYPE].value,
+            )
+        )
 
     def commit_insert_component_data(
         self,
@@ -671,85 +659,113 @@ class SWAComponent(TreeComponent):
         is_new_leaf: bool,
         params: InsertParams,
         result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         if not is_new_leaf:
             return
 
         node_start = result.prefix_len
         split_pos = params.swa_evicted_seqlen - node_start
-
-        if split_pos <= 0:
-            swa_value = self._translate_full_to_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
+        if split_pos >= len(node.key):
+            # Entire leaf is outside the SWA window — left as a tombstone.
+            return
+        # Absolute end of the leaf. Every split below (straddle, interior stride,
+        # window cap) keeps `node` as the trailing piece, so this boundary — the
+        # key the capture staged its window under — is invariant.
+        leaf_end = node_start + len(node.key)
+        tombstone_parent = None
+        if split_pos > 0:
+            # Node straddles the boundary: split into an out-of-window parent
+            # (tombstone) and an in-window child; `node` becomes the child.
+            tombstone_parent, action = self.tree_core._split_node(
+                node.key, node, split_pos
             )
-            node.component_data[self.component_type].value = swa_value
-            self.cache.lru_lists[self.component_type].insert_mru(node)
-            self.cache.component_evictable_size_[self.component_type] += len(swa_value)
-        elif split_pos < len(node.key):
-            # Node straddles the SWA eviction boundary
-            # Split into parent (tombstone, no SWA) and child (with SWA)
-            # After _split_node, `node` becomes the child
-            tombstone_parent = self.cache._split_node(node.key, node, split_pos)
-            swa_value = self._translate_full_to_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            node.component_data[self.component_type].value = swa_value
-            self.cache.lru_lists[self.component_type].insert_mru(node)
-            self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            assert action is None, "new leaf cannot be write-through-pending"
+        if tombstone_parent is not None:
             # Stride model: the out-of-window tombstone span
             # [node_start, swa_evicted_seqlen) also carries prefill-captured
             # windows at the interior stride page boundaries. Claim them as
             # host-only carrier nodes so cross-request reuse clamps to the
-            # nearest stride page instead of the coarse chunk end.
+            # nearest stride page instead of the coarse chunk end. These carriers
+            # have no device SWA value, so this needs no rebuilt value and can
+            # run inline.
             self._bind_interior_captured_swa_hosts(
                 tombstone_parent, node_start, params.swa_evicted_seqlen
             )
-        else:
-            # Entire leaf is outside the SWA window — left as a tombstone.
-            return
-
-        # Bind the prefill-captured host window to this SWA node. Both branches
-        # above leave `node` covering [swa_start, swa_start + len(value)) with
-        # swa_start == max(node_start, swa_evicted_seqlen).
         swa_start = max(node_start, params.swa_evicted_seqlen)
-        self._bind_captured_swa_host(node, swa_start)
-        if split_pos <= 0:
-            # Stride reuse (in-window leaf): the capture (``capture_swa_windows``)
-            # stages a host window at EVERY stride page boundary of this leaf, but
-            # only the leaf-end window is claimed above; the interior ones are
-            # otherwise freed unused at ``cleanup_after_caching_req`` and
-            # cross-request reuse clamps to the coarse chunk/leaf end. Claim them
-            # here as host carriers: split at each staged stride boundary and stash
-            # the window as ``_swa_pending_host`` (co-lifetime -> host_value at
-            # BACKUP_HOST). The device SWA value is re-sliced by
-            # ``redistribute_on_node_split`` (no ring-slot alloc/accounting change),
-            # so this is purely additive host state that lets the reuse validator
-            # extend to stride granularity. ``node`` (the suffix) keeps the
-            # leaf-end pending window across the splits.
-            node_end = swa_start + len(node.component_data[self.component_type].value)
-            self._bind_interior_captured_swa_hosts(node, swa_start, node_end)
-        self._maybe_split_leaf_for_swa_lock(node)
+        interior_carriers: list[UnifiedTreeNode] = []
+        if self._strict_bit_exact and split_pos <= 0:
+            # Stride reuse (in-window leaf): the capture stages a host window at
+            # EVERY stride page boundary of this leaf, but only the leaf-end one
+            # is claimed by the bind action below; the interior ones would be
+            # freed unused at cleanup_after_caching_req and cross-request reuse
+            # would clamp to the coarse leaf end. Claim them as host carriers.
+            # This runs inline (not as an action) because it keys off tree
+            # geometry only — unlike the leaf-end bind, it needs no SWA value —
+            # and it must precede the window cap, whose split would otherwise
+            # put the earlier stride boundaries outside `node`.
+            interior_carriers = self._bind_interior_captured_swa_hosts(
+                node, swa_start, leaf_end
+            )
+        # Cap the in-window leaf at one window for lock granularity, then rebuild SWA
+        # onto the in-window node(s) at apply time; rebuild the older prefix first so
+        # the in-window tail lands more-MRU. Every piece the splits above carved out
+        # of the in-window span needs its own rebuild: the ring slots it covers are
+        # reachable only through the node that owns them.
+        capped_parent = self._maybe_split_leaf_for_swa_lock(node)
+        for carrier in reversed(interior_carriers):
+            cache_actions.append(
+                SWARebuild(
+                    carrier.id,
+                    carrier.component_data[BASE_COMPONENT_TYPE].value,
+                )
+            )
+        if capped_parent is not None:
+            cache_actions.append(
+                SWARebuild(
+                    capped_parent.id,
+                    capped_parent.component_data[BASE_COMPONENT_TYPE].value,
+                )
+            )
+        cache_actions.append(
+            SWARebuild(
+                node.id,
+                node.component_data[BASE_COMPONENT_TYPE].value,
+            )
+        )
+        # Strict bit-exact: claim the prefill-captured host window ending at this
+        # leaf's boundary. Deferred to an action ordered after the SWARebuild
+        # above, because the bind only applies once the node carries its SWA
+        # device value.
+        if self._strict_bit_exact:
+            cache_actions.append(BindCapturedSWAHost(node.id, leaf_end))
 
-    def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
-        """Cap a fresh SWA leaf at one page-aligned window so locking it pins
-        only one window of SWA pool, not the whole (long chunked-prefill) leaf.
+    def _maybe_split_leaf_for_swa_lock(
+        self, leaf: UnifiedTreeNode
+    ) -> Optional[UnifiedTreeNode]:
+        """Cap a fresh in-window SWA leaf at one page-aligned window so locking it pins
+        only one window of SWA pool, not the whole (long chunked-prefill) leaf; return
+        the split-off parent (older window) or None. The SWA value is stamped later, so
+        this runs on the tombstone leaf.
         """
         ct = self.component_type
         cd = leaf.component_data[ct]
-        if leaf is self.cache.root_node or cd.value is None or cd.lock_ref > 0:
-            return
+        if leaf is self.tree_core.root_node or cd.lock_ref > 0:
+            return None
 
-        page_size = self.cache.page_size
+        page_size = self.tree_core.page_size
         # Smallest page-aligned size that still covers the sliding window.
         tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
         leaf_len = len(leaf.key)
         if leaf_len <= tail_size:
-            return
+            return None
         split_at = leaf_len - tail_size
         if page_size > 1 and (split_at % page_size != 0 or leaf_len % page_size != 0):
-            return
+            return None
 
-        self.cache._split_node(leaf.key, leaf, split_at)
+        new_parent, action = self.tree_core._split_node(leaf.key, leaf, split_at)
+        assert action is None, "fresh SWA leaf cannot be write-through-pending"
+        return new_parent
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -774,7 +790,7 @@ class SWAComponent(TreeComponent):
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
             full_span = split_len + len(child.key)
-            host_lru = self.cache.host_lru_lists[self.component_type]
+            host_lru = self.tree_core.host_lru_lists[self.component_type]
             if len(child_swa_host_value) == full_span:
                 # Common case: host_value spans the whole node; split by key len.
                 new_parent.component_data[self.component_type].host_value = (
@@ -806,27 +822,11 @@ class SWAComponent(TreeComponent):
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
 
-    def free_pending_host_on_remove(self, node: UnifiedTreeNode) -> None:
-        """Free an interior stride carrier's not-yet-promoted capture page at the single
-        node-removal chokepoint.
-
-        Pending's lifetime tracks the Full (base) component, so it is dropped only here
-        (node truly leaves the tree), never on a mere SWA device tombstone. Called from
-        unified_radix_cache._remove_leaf_from_parent, which runs regardless of
-        per-component eviction order, so nothing leaks.
-        """
-        pending = getattr(node, "_swa_pending_host", None)
-        if pending is not None:
-            if self._swa_kv_pool_host is not None:
-                self._swa_kv_pool_host.free(pending)
-            node._swa_pending_host = None
-        # Node truly leaving the tree: release any ridden c4/c4-indexer state
-        # tiles (pending or durable host) so the state host pools don't leak.
-        _free_state_bindings(self, node)
-
     def evict_component(
         self,
         node: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         ct = self.component_type
@@ -839,11 +839,11 @@ class SWAComponent(TreeComponent):
             # Pass full indices to free_swa so slots with no SWA pair are
             # skipped. Freeing swa_value directly would double free those
             # entries since they all map to the same sentinel slot.
-            self.cache.token_to_kv_pool_allocator.free_swa(
+            device_frees[self.component_type].append(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             freed = len(cd.value)
-            self.cache.component_evictable_size_[ct] -= freed
+            self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
             # Co-lifetime: a captured page not yet promoted to host_value must
             # not outlive its device SWA; free it (node degrades to recompute).
@@ -868,11 +868,10 @@ class SWAComponent(TreeComponent):
                 _free_state_bindings(self, node)
 
         # Host layer
-        host_lru = self.cache.host_lru_lists[ct]
+        host_lru = self.tree_core.host_lru_lists[ct]
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
-            if self._swa_kv_pool_host is not None:
-                self._swa_kv_pool_host.free(cd.host_value)
+            host_frees[ct].append(cd.host_value)
             cd.host_value = None
             # Co-lifetime: the durable host state tiles die with the SWA host
             # window on host eviction (L1-only state scope; L3 state persistence
@@ -909,68 +908,59 @@ class SWAComponent(TreeComponent):
 
         return freed, host_freed
 
-    def evict_device_on_owner_release(self, node: UnifiedTreeNode) -> None:
-        """Drop a node's device SWA ring value once its owning request has finished and
-        no one else holds the SWA lock, so cross-request reuse restores the true
-        window from host instead of trusting the device ring.
-
-        The device SWA lives in a per-request ring (req_slot*ring + pos%ring) that the
-        owner overwrites as it decodes and that is recycled when its req_pool_idx is
-        reused, so its bytes are only valid for the owner's live window. Called from
-        cache_finished_req after the owner released its lock: the ring slots still
-        belong to the finished request (safe to free) and the host copy is now the
-        source of truth.
-
-        Requires: strict mode + SWA host pool wired; device value present; host_value
-        committed (a pending-only page is left until its BACKUP_HOST commits); SWA
-        lock_ref == 0.
-        """
-        if not self._strict_bit_exact or self._swa_kv_pool_host is None:
-            return
-        cd = node.component_data[self.component_type]
-        if cd.value is None:
-            return
-        if cd.host_value is None or cd.lock_ref > 0:
-            # Host copy not durable yet (async write_through backup still in
-            # flight) or another request still holds the SWA lock, so we cannot
-            # free the device ring value right now. But once this owner is gone
-            # the per-request ring slot is recycled and its bytes become stale,
-            # so the value MUST NOT be trusted for cross-request reuse. Defer:
-            # mark the node so the coordinated BACKUP_HOST commit drops the
-            # device value the instant the host copy becomes durable and no
-            # holder remains. Without this the device ring is never invalidated
-            # and reuse would keep a stale device slot alive (I1/I2 violation).
-            node._swa_release_pending = True
-            return
-        self.cache._evict_component_and_detach_lru(node, self, target=EvictLayer.DEVICE)
-
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
-    def drive_eviction(
-        self, params: EvictParams, tracker: dict[ComponentType, int]
-    ) -> None:
-        request = params.swa_num_tokens
+    def _evict_device_start(self, request_cnt: int) -> None:
+        """Begin the device-eviction walk from this component's LRU cursor."""
+        self._evict_device_request_cnt = request_cnt
+        self._evict_device_cursor = self.tree_core.lru_lists[
+            self.component_type
+        ].get_lru_no_lock()
+
+    def _evict_device_next_node(
+        self,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> Optional[NodeId]:
+        """Return the next device-leaf node for the driver to evict, or None.
+        Internal nodes are tombstoned inline (no IO); the cursor is re-validated
+        (reset to LRU head) if the previous node's eviction removed it."""
         ct = self.component_type
-        lru = self.cache.lru_lists[ct]
-        x = lru.get_lru_no_lock()
-        while tracker[ct] < request and x is not None and lru.in_list(x):
+        lru = self.tree_core.lru_lists[ct]
+        if self._evict_device_cursor is not None and not lru.in_list(
+            self._evict_device_cursor
+        ):
+            self._evict_device_cursor = lru.get_lru_no_lock()
+        while (
+            tracker[ct] < self._evict_device_request_cnt
+            and self._evict_device_cursor is not None
+            and lru.in_list(self._evict_device_cursor)
+        ):
+            x = self._evict_device_cursor
             assert x.component_data[ct].value is not None
-            if x in self.cache.evictable_device_leaves:
-                # D-leaf: atomic eviction of all components
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_device_leaf(x, tracker)
-                if not lru.in_list(x_next):
-                    x_next = lru.get_lru_no_lock()
-                x = x_next
-            else:
-                # Internal: tombstone SWA + cascade
-                x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_component_and_detach_lru(
-                    x, self, target=EvictLayer.DEVICE, tracker=tracker
-                )
-                self.cache._cascade_evict(x, self, tracker)
-                x = x_next
+            if x in self.tree_core.evictable_device_leaves:
+                self._evict_device_cursor = lru.get_prev_no_lock(x)
+                return x.id
+            x_next = lru.get_prev_no_lock(x)
+            self.tree_core._evict_component_and_detach_lru(
+                x,
+                self,
+                target=EvictLayer.DEVICE,
+                tracker=tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+            )
+            self.tree_core._cascade_evict(
+                x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            )
+            self._evict_device_cursor = x_next
+        return None
+
+    def _evict_device_end(self) -> None:
+        """Clear the device-eviction walk cursor state."""
+        self._evict_device_cursor = None
 
     def acquire_component_lock(
         self,
@@ -979,12 +969,16 @@ class SWAComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
-        root = self.cache.root_node
+        root = self.tree_core.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
         swa_uuid = None
         uuid_key = "host_uuid" if lock_host else "uuid"
-        lru = self.cache.host_lru_lists[ct] if lock_host else self.cache.lru_lists[ct]
+        lru = (
+            self.tree_core.host_lru_lists[ct]
+            if lock_host
+            else self.tree_core.lru_lists[ct]
+        )
 
         # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
         # skip them and keep walking up. This path is hit when HiCache
@@ -1005,8 +999,8 @@ class SWAComponent(TreeComponent):
                         lru.remove_node(cur)
                 else:
                     key_len = len(cur.key)
-                    self.cache.component_evictable_size_[ct] -= key_len
-                    self.cache.component_protected_size_[ct] += key_len
+                    self.tree_core.component_evictable_size_[ct] -= key_len
+                    self.tree_core.component_protected_size_[ct] += key_len
             if lock_host:
                 comp.host_lock_ref = ref + 1
             else:
@@ -1031,7 +1025,7 @@ class SWAComponent(TreeComponent):
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
-        root = self.cache.root_node
+        root = self.tree_core.root_node
         swa_uuid_for_lock = (
             (params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock)
             if params
@@ -1055,13 +1049,13 @@ class SWAComponent(TreeComponent):
             if ref == 1:
                 if lock_host:
                     if comp.value is None and comp.host_value is not None:
-                        host_lru = self.cache.host_lru_lists[ct]
+                        host_lru = self.tree_core.host_lru_lists[ct]
                         if not host_lru.in_list(cur):
                             host_lru.insert_mru(cur)
                 else:
                     key_len = len(comp.value)
-                    self.cache.component_evictable_size_[ct] += key_len
-                    self.cache.component_protected_size_[ct] -= key_len
+                    self.tree_core.component_evictable_size_[ct] += key_len
+                    self.tree_core.component_protected_size_[ct] -= key_len
             if lock_host:
                 comp.host_lock_ref = ref - 1
             else:
@@ -1073,7 +1067,9 @@ class SWAComponent(TreeComponent):
     def release_window_lock(
         self,
         node: UnifiedTreeNode,
-        swa_uuid_for_lock: Optional[int] = None,
+        swa_uuid_for_lock: Optional[int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Early-release the SWA lock along [node, swa_uuid_for_lock] while
         leaving Full and Mamba locks intact.
@@ -1086,7 +1082,7 @@ class SWAComponent(TreeComponent):
         invoked at most once per (node, swa_uuid_for_lock) pair.
         """
         ct = self.component_type
-        root = self.cache.root_node
+        root = self.tree_core.root_node
 
         cur = node
         while cur is not root:
@@ -1102,11 +1098,15 @@ class SWAComponent(TreeComponent):
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
                 key_len = len(cur.key)
-                self.cache.component_protected_size_[ct] -= key_len
-                self.cache.component_evictable_size_[ct] += key_len
-                if self.cache._is_device_leaf(cur):
-                    self.cache._evict_component_and_detach_lru(
-                        cur, self, target=EvictLayer.DEVICE
+                self.tree_core.component_protected_size_[ct] -= key_len
+                self.tree_core.component_evictable_size_[ct] += key_len
+                if self.tree_core._is_device_leaf(cur):
+                    self.tree_core._evict_component_and_detach_lru(
+                        cur,
+                        self,
+                        target=EvictLayer.DEVICE,
+                        device_frees=device_frees,
+                        host_frees=host_frees,
                     )
 
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
@@ -1142,200 +1142,54 @@ class SWAComponent(TreeComponent):
 
     # ---- HiCache Hooks ----
 
-    def _bind_captured_swa_host(self, node: UnifiedTreeNode, swa_start: int) -> None:
-        """Stash the prefill-captured host page as a pending ref on the node.
-
-        We do not set host_value here: the SWA host_value must not exist before the
-        node's Full host_value, so it is attached later by the coordinated BACKUP_HOST
-        commit. Until then the page is held in node._swa_pending_host and freed on
-        device eviction if the node is never backed up.
-
-        The node ends at boundary B with captured window [B-win, B) keyed (rid, B).
-        If it was not captured (pool full / outside this chunk), leave it to the
-        normal backup / recompute path.
-        """
-        if _SWA_DBG_CHECKSUM:
-            logger.warning("[BIND-DBG] enter swa_start=%s", swa_start)
-        hp = self._swa_kv_pool_host
-        if hp is None:
-            if _SWA_DBG_CHECKSUM:
-                logger.warning("[BIND-DBG] early: no swa host pool")
-            return
-        staging = getattr(hp, "_capture_staging", None)
-        rid = self._capture_rid
-        if not staging or rid is None:
-            if _SWA_DBG_CHECKSUM:
-                logger.warning(
-                    "[BIND-DBG] early: staging_empty=%s rid=%s", not staging, rid
-                )
-            return
-        cd = node.component_data[self.component_type]
-        if cd.value is None or cd.host_value is not None:
-            if _SWA_DBG_CHECKSUM:
-                logger.warning(
-                    "[BIND-DBG] early: cd.value_none=%s host_value_set=%s",
-                    cd.value is None,
-                    cd.host_value is not None,
-                )
-            return
-        win = hp.slot_page_size
-        # The node ends at page boundary B = swa_start + len(value); its host
-        # copy is the single captured window keyed (rid, B). The earlier,
-        # out-of-window part of the node is never attended and is not stored.
-        node_end = swa_start + len(cd.value)
-        h = staging.pop((rid, int(node_end)), None)
-        if h is None:
-            if _SWA_DBG_CHECKSUM:
-                logger.warning(
-                    "[BIND-DBG] SWA staging MISS key=(%s,%s) staging_keys=%s",
-                    rid,
-                    int(node_end),
-                    list(staging.keys())[:6],
-                )
-            # Window not captured -> fall back to normal backup / recompute.
-            return
-        host_value = h.to(torch.int64)
-        if len(host_value) != win:
-            hp.free(host_value)
-            return
-        # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
-        node._swa_pending_host = host_value
-        # Decoupled co-lifetime (regression fix): claim the c4/c4-indexer overlap
-        # -state tiles at the same (rid, node_end) IF present, but NEVER drop the
-        # SWA window when they are missing. The window rides on its own; a
-        # boundary that lacks its state is instead excluded from the strict REUSE
-        # boundary by create_match_validator (graceful clamp to the nearest
-        # window+state boundary). This avoids both (a) the hard clamp-to-0 that
-        # dropping every state-less interior window caused (partial-prefix reuse
-        # regression) and (b) the §12 dirty read (a state-less boundary is simply
-        # not crossed on reuse). No-op when strict state offload is unwired.
-        _bind_state_rides(self, node, rid, int(node_end))
-        if _SWA_DBG_CHECKSUM:
-            crc_map = getattr(hp, "_capture_crc", None)
-            if crc_map:
-                keys = [k for k in crc_map if k[0] == rid and k[1] == int(node_end)]
-                if keys:
-                    cd.metadata["dbg_swa_crc"] = {k[2]: crc_map.pop(k) for k in keys}
-
-    def _bind_interior_captured_swa_hosts(
-        self, region_node: UnifiedTreeNode, region_start: int, region_end: int
-    ) -> None:
-        """Claim the prefill-captured windows at the interior stride page boundaries of
-        a chunk's out-of-window tombstone span.
-
-        _bind_captured_swa_host only claims the single window at the chunk end. The
-        finer stride-gated windows the capture also offloaded (keyed (rid, B) for
-        interior boundaries) would otherwise be dropped by cleanup_after_caching_req,
-        clamping the reuse boundary to the coarse chunk end. Here we split region_node
-        at each staged boundary B so a node ends at B, and stash the captured window
-        as that node's _swa_pending_host.
-
-        host_value is not set here: the window rides the same deferred path as the
-        tail (_swa_pending_host -> BACKUP_HOST). These interior carriers have no
-        device SWA value (they are outside the sliding window); the BACKUP_HOST
-        transfer builder adopts the pending page for such device-less nodes.
-        """
-        hp = self._swa_kv_pool_host
-        if hp is None:
-            return
-        staging = getattr(hp, "_capture_staging", None)
-        rid = self._capture_rid
-        if not staging or rid is None:
-            return
-        win = hp.slot_page_size
-        page = self.cache.page_size
-        boundaries = sorted(
-            int(b)
-            for (r, b) in list(staging.keys())
-            if r == rid and region_start < int(b) < region_end
-        )
-        if not boundaries:
-            return
-        # Attach largest boundary first: each split keeps ``region_start`` as the
-        # anchor, and the node object ending at B retains its stashed page across
-        # subsequent splits (redistribute_on_node_split does not move the plain
-        # ``_swa_pending_host`` attribute, which stays with the truncated child).
-        cur = region_node
-        for B in reversed(boundaries):
-            split_len = B - region_start
-            if split_len <= 0 or split_len >= len(cur.key):
-                continue
-            if page > 1 and split_len % page != 0:
-                continue
-            h = staging.get((rid, B))
-            if h is None:
-                continue
-            host_value = h.to(torch.int64)
-            if len(host_value) != win:
-                continue
-            staging.pop((rid, B), None)
-            new_parent = self.cache._split_node(cur.key, cur, split_len)
-            new_parent._swa_pending_host = host_value
-            # Decoupled co-lifetime (regression fix): claim the interior carrier's
-            # state tiles at (rid, B) IF present, but keep the SWA window even on a
-            # miss. A state-less interior boundary is excluded from the strict
-            # reuse boundary by the match validator (graceful clamp), instead of
-            # dropping the window here -- which zeroed partial-prefix reuse because
-            # interior state gets evicted/exhausted far more than the chunk tail.
-            _bind_state_rides(self, new_parent, rid, B)
-            # R1: mark interior stride carrier. Its captured page lifetime tracks
-            # the Full (base) component (dropped only at true node removal), NOT
-            # the SWA device ring (which is always recycled out-of-window before
-            # the finish-time coordinated BACKUP_HOST). See evict_component and
-            # unified_radix_cache._remove_leaf_from_parent.
-            new_parent._swa_interior_carrier = True
-            cur = new_parent
-
-    def cleanup_after_caching_req(
+    def prepare_prefetch(
         self,
-        req: Req,
-        is_finished: bool,
-        insert_result: Optional[InsertResult] = None,
-        insert_params: Optional[InsertParams] = None,
-    ) -> None:
-        # Release any capture staging owned by this request that no node claimed
-        # (interior / out-of-window windows), then drop the stashed rid.
-        # Key off the request's own req_pool_idx (not the stashed _capture_rid):
-        # on the retract/abort path caching runs with is_insert=False, so
-        # prepare_for_caching_req -- and thus _capture_rid -- never ran. Decode
-        # capture (Task B0) stages (req_pool_idx, B) across many steps, so relying
-        # on _capture_rid would leak those windows here and, once req_pool_idx is
-        # recycled, risk mis-binding a stale window to a new request. For the
-        # is_insert=True path req.req_pool_idx == _capture_rid, so behavior is
-        # unchanged. Fall back to the stashed rid only if the slot is already gone.
-        hp = self._swa_kv_pool_host
-        rid = req.req_pool_idx if req.req_pool_idx is not None else self._capture_rid
-        self._capture_rid = None
-        if hp is None or rid is None:
-            return
-        staging = getattr(hp, "_capture_staging", None)
-        if not staging:
-            return
-        leftover = [k for k in staging if k[0] == rid]
-        for k in leftover:
-            hp.free(staging.pop(k))
-        if _SWA_DBG_CHECKSUM:
-            crc_map = getattr(hp, "_capture_crc", None)
-            if crc_map:
-                for k in [k for k in crc_map if k[0] == rid]:
-                    crc_map.pop(k, None)
-
-    def _swa_l3_key(self, node) -> str:
-        """L3 key for a carrier node's captured SWA window.
-
-        I4' couples SWA-L3 to Full-L3: the window is keyed by the carrier's own
-        Full page hash (hash_value[-1]), so it lives and dies with that Full
-        page in the storage backend. Centralized here so a future namespace
-        change touches one place.
-        """
-        return node.hash_value[-1]
+        node_id: NodeId,
+        *,
+        prefetch_tokens: int = 0,
+    ) -> PreparePrefetchResult:
+        # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
+        if self._swa_kv_pool_host is None:
+            return PreparePrefetchResult()
+        if self._strict_bit_exact:
+            # I4' trailing-window prefetch. Window granularity is the host SWA
+            # pool slot_page_size (ring): unified_kv packs one full sliding
+            # window per page (ring == sliding_window -> window_pages == 1),
+            # whereas a per-page ring would need ceil(window / ring) *contiguous*
+            # pages. The ring stride (not page_size) is what forces
+            # window_pages == 1 under unified_kv, which is required because
+            # `_sync_trailing_keys` hands back contiguous Full-page hashes --
+            # only 1 maps cleanly onto a ring-spaced carrier; N contiguous KV
+            # hashes would not.
+            ring = self._swa_kv_pool_host.slot_page_size
+            window_pages = max(1, (self.sliding_window_size + ring - 1) // ring)
+            # Not worth a partial window: need at least one ring of freshly
+            # prefetched Full tokens behind the tail.
+            if prefetch_tokens < ring:
+                return PreparePrefetchResult()
+            num_tokens = window_pages * ring
+        else:
+            sw_pages = (
+                self.cache.sliding_window_size + self.cache.page_size - 1
+            ) // self.cache.page_size
+            if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
+                return PreparePrefetchResult()
+            num_tokens = sw_pages * self.cache.page_size
+        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        if host_indices is None:
+            self.cache.evict_host(num_tokens, ComponentType.SWA)
+            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        if host_indices is None:
+            return PreparePrefetchResult(alloc_failed=True)
+        return PreparePrefetchResult(host_indices=host_indices)
 
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         *,
-        req: Optional[Req] = None,
+        mamba_pool_idx: Optional[torch.Tensor] = None,
+        host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
@@ -1343,7 +1197,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
 
         # unified_kv keeps SWA as a device-only ring.
-        if self._swa_kv_pool_host is None and self.cache.cache_controller is not None:
+        if not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache:
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
@@ -1394,7 +1248,9 @@ class SWAComponent(TreeComponent):
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
-            while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+            while (
+                cur is not self.tree_core.root_node and n_swa < self.sliding_window_size
+            ):
                 cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
                 if self._strict_bit_exact and cd.host_value is not None:
@@ -1426,23 +1282,12 @@ class SWAComponent(TreeComponent):
             backed_up.reverse()
             nodes.reverse()
 
-            if self._unified_positional_swa and req is not None:
-                # unified_kv: the SWA device slot is req_pool_idx*ring + pos%ring,
-                # computable only after prepare_for_extend assigns req_pool_idx.
-                # Do NOT allocate a device slot / issue an H->D transfer here
-                # (the swa_attn_allocator is page_size=256 and unrelated to the
-                # positional ring -> alloc(win) returns empty -> crash). Stash the
-                # window pages (host_value, in token order) on the req; the
-                # scheduler restores them positionally before the first forward.
-                req._swa_restore_windows = list(zip(nodes, backed_up))
-                return None
-
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     host_indices=torch.cat(backed_up),
                     device_indices=None,
-                    nodes_to_load=nodes,
+                    nodes_to_load=[n.id for n in nodes],
                 )
             ]
 
@@ -1469,75 +1314,31 @@ class SWAComponent(TreeComponent):
                         hit_policy=PoolHitPolicy.TRAILING_PAGES,
                     )
                 ]
-            num_pages = len(cd.host_value) // self.cache.page_size
+            num_pages = len(cd.host_value) // self.tree_core.page_size
             if num_pages == 0:
                 return None
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=cd.host_value[-num_pages * self.cache.page_size :],
+                    host_indices=cd.host_value[-num_pages * self.tree_core.page_size :],
                     keys=node.hash_value[-num_pages:],
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            if self._strict_bit_exact:
-                # I4' trailing-window prefetch. Request the sliding window that
-                # ends at the prefetch tail as `window_pages` placeholder keys;
-                # the controller (`_sync_trailing_keys`) rewrites them to the
-                # *actual* trailing Full page hashes of the storage hit range.
-                # Each requested window page is thus keyed by the same Full hash
-                # its carrier stored it under (BACKUP_STORAGE keys=[hash_value
-                # [-1]] == _swa_l3_key), so a window is fetched iff its Full page
-                # also hit -- SWA can never outlive its Full page (re-checked by
-                # the coupling guard in _commit_prefetch). Using `node.hash_value`
-                # here would be wrong twice over: it is the *matched prefix*
-                # (empty after a cache flush, the exact case L3 must serve), and
-                # `_sync_trailing_keys` overwrites the keys regardless.
-                #
-                # Window granularity is the host SWA pool slot_page_size (ring):
-                # unified_kv packs one full sliding window per page (ring ==
-                # sliding_window -> window_pages == 1), a per-page ring needs
-                # ceil(window / ring) *contiguous* pages. The ring stride (not
-                # page_size) is what forces window_pages == 1 under unified_kv,
-                # which is required because `_sync_trailing_keys` hands back
-                # contiguous Full-page hashes -- only 1 maps cleanly onto a
-                # ring-spaced carrier; N contiguous KV hashes would not.
-                ring = self._swa_kv_pool_host.slot_page_size
-                window_pages = max(1, (self.sliding_window_size + ring - 1) // ring)
-                # Not worth a partial window: need at least one ring of freshly
-                # prefetched Full tokens behind the tail.
-                if prefetch_tokens < ring:
-                    return None
-                num_tokens = window_pages * ring
-                host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-                if host_indices is None:
-                    self.cache.evict_host(num_tokens, ComponentType.SWA)
-                    host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-                if host_indices is None:
-                    return []
-                return [
-                    PoolTransfer(
-                        name=PoolName.SWA,
-                        host_indices=host_indices,
-                        keys=["__placeholder__"] * window_pages,
-                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
-                    )
-                ]
-            # non-strict: require a full contiguous sliding window (unchanged).
-            sw_pages = (
-                self.sliding_window_size + self.cache.page_size - 1
-            ) // self.cache.page_size
-            if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
-                return None
-            num_tokens = sw_pages * self.cache.page_size
-            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-            if host_indices is None:
-                self.cache.evict_host(num_tokens, ComponentType.SWA)
-                host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-            if host_indices is None:
-                return []
+            assert host_indices is not None
+            # Strict windows are ring-paged; the placeholder key count must match
+            # the page count `_sync_trailing_keys` will rewrite to Full hashes,
+            # so each requested window page is keyed by the same Full hash its
+            # carrier stored it under (BACKUP_STORAGE keys=[_swa_l3_key]) -- a
+            # window is then fetched iff its Full page also hit.
+            stride = (
+                self._swa_kv_pool_host.slot_page_size
+                if self._strict_bit_exact
+                else self.tree_core.page_size
+            )
+            sw_pages = host_indices.numel() // stride
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
@@ -1555,6 +1356,7 @@ class SWAComponent(TreeComponent):
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
         *,
+        cache_actions: list[CacheAction | ComponentAction],
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
@@ -1593,19 +1395,32 @@ class SWAComponent(TreeComponent):
                     and cd.lock_ref == 0
                 ):
                     node._swa_release_pending = False
-                    self.cache._evict_component_and_detach_lru(
-                        node, self, target=EvictLayer.DEVICE
+                    device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(
+                        list
                     )
+                    host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(
+                        list
+                    )
+                    self.tree_core._evict_component_and_detach_lru(
+                        node,
+                        self,
+                        target=EvictLayer.DEVICE,
+                        device_frees=device_frees,
+                        host_frees=host_frees,
+                    )
+                    self.cache._free_values(device_frees, host_frees)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
             assert transfers and transfers[0].device_indices is not None
             xfer = transfers[0]
             device_indices = xfer.device_indices
-            allocator = self.cache.token_to_kv_pool_allocator
 
+            full_chunks: list[torch.Tensor] = []
+            swa_chunks: list[torch.Tensor] = []
             offset = 0
-            for n in xfer.nodes_to_load or []:
+            for nid in xfer.nodes_to_load or []:
+                n = self.tree_core.node_by_id(nid)
                 cd_n = n.component_data[ct]
                 n_tokens = len(cd_n.host_value)
                 swa_chunk = device_indices[offset : offset + n_tokens].clone()
@@ -1637,23 +1452,337 @@ class SWAComponent(TreeComponent):
                         f"host_total={len(xfer.host_indices)} "
                         f"own_full={None if _fv2 is None else len(_fv2)}"
                     )
-                allocator.set_full_to_swa_mapping(
-                    window_full, swa_chunk[-window_full.numel() :]
-                )
+                full_chunks.append(window_full)
+                swa_chunks.append(swa_chunk[-window_full.numel() :])
                 if _SWA_DBG_CHECKSUM and hasattr(self, "_dbg_verify_restore"):
                     self._dbg_verify_restore(cd_n)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
+            # rebuild the mapping for the loaded SWA chunk, defer to orchestrator level
+            if full_chunks:
+                cache_actions.append(RebuildFullToSWAMapping(full_chunks, swa_chunks))
             return
 
         if phase == CacheTransferPhase.PREFETCH:
             self._commit_prefetch(
                 node,
                 transfers,
+                cache_actions=cache_actions,
                 insert_result=insert_result,
                 pool_storage_result=pool_storage_result,
             )
             return
+
+    def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
+        """Store a (re)assigned SWA device value on the node.
+
+        Wraps the TreeCore store so the strict-mode deferred owner-release intent
+        is cleared: the value is live for the current holder, so a stale
+        ``_swa_release_pending`` from the node's prior life must not survive and
+        drop it at the next BACKUP_HOST commit. The flag is SWA-specific, so it is
+        cleared here rather than in the generic TreeCore setter.
+        """
+        if getattr(node, "_swa_release_pending", False):
+            node._swa_release_pending = False
+        self.tree_core.set_component_device_value(node.id, self.component_type, value)
+
+    # ---- Strict bit-exact SWA: capture / bind ----
+
+    def _bind_captured_swa_host(self, node: UnifiedTreeNode, node_end: int) -> None:
+        """Stash the prefill-captured host page as a pending ref on the node.
+
+        We do not set host_value here: the SWA host_value must not exist before the
+        node's Full host_value, so it is attached later by the coordinated BACKUP_HOST
+        commit. Until then the page is held in node._swa_pending_host and freed on
+        device eviction if the node is never backed up.
+
+        The node ends at boundary ``node_end`` with captured window
+        [node_end-win, node_end) keyed (rid, node_end). The earlier, out-of-window
+        part of the node is never attended and is not stored. If the window was not
+        captured (pool full / outside this chunk), leave it to the normal backup /
+        recompute path.
+
+        The caller passes the boundary rather than a start offset: a leaf can be
+        split after the insert computes its geometry, which changes the value
+        length but not the end boundary the capture keyed on.
+        """
+        if _SWA_DBG_CHECKSUM:
+            logger.warning("[BIND-DBG] enter node_end=%s", node_end)
+        hp = self._swa_kv_pool_host
+        if hp is None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning("[BIND-DBG] early: no swa host pool")
+            return
+        staging = getattr(hp, "_capture_staging", None)
+        rid = self._capture_rid
+        if not staging or rid is None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] early: staging_empty=%s rid=%s", not staging, rid
+                )
+            return
+        cd = node.component_data[self.component_type]
+        if cd.value is None or cd.host_value is not None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] early: cd.value_none=%s host_value_set=%s",
+                    cd.value is None,
+                    cd.host_value is not None,
+                )
+            return
+        win = hp.slot_page_size
+        h = staging.pop((rid, int(node_end)), None)
+        if h is None:
+            if _SWA_DBG_CHECKSUM:
+                logger.warning(
+                    "[BIND-DBG] SWA staging MISS key=(%s,%s) staging_keys=%s",
+                    rid,
+                    int(node_end),
+                    list(staging.keys())[:6],
+                )
+            # Window not captured -> fall back to normal backup / recompute.
+            return
+        host_value = h.to(torch.int64)
+        if len(host_value) != win:
+            hp.free(host_value)
+            return
+        # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
+        node._swa_pending_host = host_value
+        # Decoupled co-lifetime (regression fix): claim the c4/c4-indexer overlap
+        # -state tiles at the same (rid, node_end) IF present, but NEVER drop the
+        # SWA window when they are missing. The window rides on its own; a
+        # boundary that lacks its state is instead excluded from the strict REUSE
+        # boundary by create_match_validator (graceful clamp to the nearest
+        # window+state boundary). This avoids both (a) the hard clamp-to-0 that
+        # dropping every state-less interior window caused (partial-prefix reuse
+        # regression) and (b) the §12 dirty read (a state-less boundary is simply
+        # not crossed on reuse). No-op when strict state offload is unwired.
+        _bind_state_rides(self, node, rid, int(node_end))
+        if _SWA_DBG_CHECKSUM:
+            crc_map = getattr(hp, "_capture_crc", None)
+            if crc_map:
+                keys = [k for k in crc_map if k[0] == rid and k[1] == int(node_end)]
+                if keys:
+                    cd.metadata["dbg_swa_crc"] = {k[2]: crc_map.pop(k) for k in keys}
+
+    def _bind_interior_captured_swa_hosts(
+        self, region_node: UnifiedTreeNode, region_start: int, region_end: int
+    ) -> list[UnifiedTreeNode]:
+        """Claim the prefill-captured windows at the interior stride page boundaries of
+        a chunk's out-of-window tombstone span.
+
+        _bind_captured_swa_host only claims the single window at the chunk end. The
+        finer stride-gated windows the capture also offloaded (keyed (rid, B) for
+        interior boundaries) would otherwise be dropped by cleanup_after_caching_req,
+        clamping the reuse boundary to the coarse chunk end. Here we split region_node
+        at each staged boundary B so a node ends at B, and stash the captured window
+        as that node's _swa_pending_host.
+
+        host_value is not set here: the window rides the same deferred path as the
+        tail (_swa_pending_host -> BACKUP_HOST). On the out-of-window tombstone
+        span the carriers have no device SWA value; the BACKUP_HOST transfer
+        builder adopts the pending page for such device-less nodes.
+
+        Returns the carriers in creation order (newest span first). On the
+        in-window span the caller must stamp each one's slice of the SWA device
+        value, otherwise the ring slots those carriers cover belong to no node
+        and can never be freed.
+        """
+        carriers: list[UnifiedTreeNode] = []
+        hp = self._swa_kv_pool_host
+        if hp is None:
+            return carriers
+        staging = getattr(hp, "_capture_staging", None)
+        rid = self._capture_rid
+        if not staging or rid is None:
+            return carriers
+        win = hp.slot_page_size
+        page = self.tree_core.page_size
+        boundaries = sorted(
+            int(b)
+            for (r, b) in list(staging.keys())
+            if r == rid and region_start < int(b) < region_end
+        )
+        if not boundaries:
+            return carriers
+        # Attach largest boundary first: each split keeps ``region_start`` as the
+        # anchor, and the node object ending at B retains its stashed page across
+        # subsequent splits (redistribute_on_node_split does not move the plain
+        # ``_swa_pending_host`` attribute, which stays with the truncated child).
+        cur = region_node
+        for B in reversed(boundaries):
+            split_len = B - region_start
+            if split_len <= 0 or split_len >= len(cur.key):
+                continue
+            if page > 1 and split_len % page != 0:
+                continue
+            h = staging.get((rid, B))
+            if h is None:
+                continue
+            host_value = h.to(torch.int64)
+            if len(host_value) != win:
+                continue
+            staging.pop((rid, B), None)
+            new_parent, action = self.tree_core._split_node(cur.key, cur, split_len)
+            assert (
+                action is None
+            ), "interior SWA carrier cannot be write-through-pending"
+            new_parent._swa_pending_host = host_value
+            # Decoupled co-lifetime (regression fix): claim the interior carrier's
+            # state tiles at (rid, B) IF present, but keep the SWA window even on a
+            # miss. A state-less interior boundary is excluded from the strict
+            # reuse boundary by the match validator (graceful clamp), instead of
+            # dropping the window here -- which zeroed partial-prefix reuse because
+            # interior state gets evicted/exhausted far more than the chunk tail.
+            _bind_state_rides(self, new_parent, rid, B)
+            # R1: mark interior stride carrier. Its captured page lifetime tracks
+            # the Full (base) component (dropped only at true node removal), NOT
+            # the SWA device ring (which is always recycled out-of-window before
+            # the finish-time coordinated BACKUP_HOST). See evict_component and
+            # unified_tree_core._remove_leaf_from_parent.
+            new_parent._swa_interior_carrier = True
+            carriers.append(new_parent)
+            cur = new_parent
+        return carriers
+
+    def _gather_window_full_indices(
+        self, node: UnifiedTreeNode, n_tokens: int
+    ) -> torch.Tensor:
+        """Collect the last n_tokens FULL indices ending at node boundary, in
+        token order, walking into ancestors when the node own full value is
+        shorter than the sliding window (post-split case). In the common case
+        the node own full value already has >= n_tokens, so this returns
+        full.value[-n_tokens:] without touching any ancestor."""
+        parts = []
+        need = n_tokens
+        cur = node
+        root = self.tree_core.root_node
+        while need > 0 and cur is not None and cur is not root:
+            fv = cur.component_data[BASE_COMPONENT_TYPE].value
+            if fv is None or len(fv) == 0:
+                break
+            take = min(need, len(fv))
+            parts.append(fv[len(fv) - take :])
+            need -= take
+            if need <= 0:
+                break
+            cur = getattr(cur, "parent", None)
+        assert parts, "no FULL indices available to restore SWA window"
+        return torch.cat(list(reversed(parts)))
+
+    def _swa_l3_key(self, node) -> str:
+        """L3 key for a carrier node's captured SWA window.
+
+        I4' couples SWA-L3 to Full-L3: the window is keyed by the carrier's own
+        Full page hash (hash_value[-1]), so it lives and dies with that Full
+        page in the storage backend. Centralized here so a future namespace
+        change touches one place.
+        """
+        return node.hash_value[-1]
+
+    # ---- Strict bit-exact SWA: device-ring invalidation ----
+
+    def evict_device_on_owner_release(self, node: UnifiedTreeNode) -> None:
+        """Drop a node's device SWA ring value once its owning request has finished and
+        no one else holds the SWA lock, so cross-request reuse restores the true
+        window from host instead of trusting the device ring.
+
+        The device SWA lives in a per-request ring (req_slot*ring + pos%ring) that the
+        owner overwrites as it decodes and that is recycled when its req_pool_idx is
+        reused, so its bytes are only valid for the owner's live window. Called from
+        cache_finished_req after the owner released its lock: the ring slots still
+        belong to the finished request (safe to free) and the host copy is now the
+        source of truth.
+
+        Requires: strict mode + SWA host pool wired; device value present; host_value
+        committed (a pending-only page is left until its BACKUP_HOST commits); SWA
+        lock_ref == 0.
+        """
+        if not self._strict_bit_exact or self._swa_kv_pool_host is None:
+            return
+        cd = node.component_data[self.component_type]
+        if cd.value is None:
+            return
+        if cd.host_value is None or cd.lock_ref > 0:
+            # Host copy not durable yet (async write_through backup still in
+            # flight) or another request still holds the SWA lock, so we cannot
+            # free the device ring value right now. But once this owner is gone
+            # the per-request ring slot is recycled and its bytes become stale,
+            # so the value MUST NOT be trusted for cross-request reuse. Defer:
+            # mark the node so the coordinated BACKUP_HOST commit drops the
+            # device value the instant the host copy becomes durable and no
+            # holder remains. Without this the device ring is never invalidated
+            # and reuse would keep a stale device slot alive (I1/I2 violation).
+            node._swa_release_pending = True
+            return
+        # Cache-level entry point (cache_finished_req), so the freed slots are
+        # drained here rather than threaded back through an eviction result.
+        # defaultdict matches the BaseEvictionResult contract evict_component
+        # appends into.
+        device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+        host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+        self.tree_core._evict_component_and_detach_lru(
+            node,
+            self,
+            target=EvictLayer.DEVICE,
+            device_frees=device_frees,
+            host_frees=host_frees,
+        )
+        self.cache._free_values(device_frees, host_frees)
+
+    def free_pending_host_on_remove(self, node: UnifiedTreeNode) -> None:
+        """Free an interior stride carrier's not-yet-promoted capture page at the single
+        node-removal chokepoint.
+
+        Pending's lifetime tracks the Full (base) component, so it is dropped only here
+        (node truly leaves the tree), never on a mere SWA device tombstone. Called from
+        unified_tree_core._remove_leaf_from_parent, which runs regardless of
+        per-component eviction order, so nothing leaks.
+        """
+        pending = getattr(node, "_swa_pending_host", None)
+        if pending is not None:
+            if self._swa_kv_pool_host is not None:
+                self._swa_kv_pool_host.free(pending)
+            node._swa_pending_host = None
+        # Node truly leaving the tree: release any ridden c4/c4-indexer state
+        # tiles (pending or durable host) so the state host pools don't leak.
+        _free_state_bindings(self, node)
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        is_finished: bool,
+        insert_result: Optional[InsertResult] = None,
+        insert_params: Optional[InsertParams] = None,
+    ) -> None:
+        # Release any capture staging owned by this request that no node claimed
+        # (interior / out-of-window windows), then drop the stashed rid.
+        # Key off the request's own req_pool_idx (not the stashed _capture_rid):
+        # on the retract/abort path caching runs with is_insert=False, so
+        # prepare_for_caching_req -- and thus _capture_rid -- never ran. Decode
+        # capture (Task B0) stages (req_pool_idx, B) across many steps, so relying
+        # on _capture_rid would leak those windows here and, once req_pool_idx is
+        # recycled, risk mis-binding a stale window to a new request. For the
+        # is_insert=True path req.req_pool_idx == _capture_rid, so behavior is
+        # unchanged. Fall back to the stashed rid only if the slot is already gone.
+        hp = self._swa_kv_pool_host
+        rid = req.req_pool_idx if req.req_pool_idx is not None else self._capture_rid
+        self._capture_rid = None
+        if hp is None or rid is None:
+            return
+        staging = getattr(hp, "_capture_staging", None)
+        if not staging:
+            return
+        leftover = [k for k in staging if k[0] == rid]
+        for k in leftover:
+            hp.free(staging.pop(k))
+        if _SWA_DBG_CHECKSUM:
+            crc_map = getattr(hp, "_capture_crc", None)
+            if crc_map:
+                for k in [k for k in crc_map if k[0] == rid]:
+                    crc_map.pop(k, None)
+
+    # ---- Strict bit-exact SWA: deferred positional restore ----
 
     def restore_pending_swa_windows(self, req, req_pool_idx, io_backend):
         """Positional SWA restore for unified_kv, deferred from load_back.
@@ -1736,6 +1865,8 @@ class SWAComponent(TreeComponent):
                     self._dbg_verify_restore(node.component_data[self.component_type])
             self._dbg_verify_device_landing(hp, r, int(host_idx[0].item()) // ring)
 
+    # ---- Strict bit-exact SWA: gated acceptance checks ----
+
     def _dbg_verify_device_landing(self, hp, r, host_page_row):
         """Gated acceptance check (SGLANG_SWA_DBG_CHECKSUM, default off): after the positional H2D, read the
         device ring page back and assert it byte-matches the host window page.
@@ -1778,31 +1909,6 @@ class SWAComponent(TreeComponent):
                 r,
             )
 
-    def _gather_window_full_indices(
-        self, node: UnifiedTreeNode, n_tokens: int
-    ) -> torch.Tensor:
-        """Collect the last n_tokens FULL indices ending at node boundary, in
-        token order, walking into ancestors when the node own full value is
-        shorter than the sliding window (post-split case). In the common case
-        the node own full value already has >= n_tokens, so this returns
-        full.value[-n_tokens:] without touching any ancestor."""
-        parts = []
-        need = n_tokens
-        cur = node
-        root = getattr(self.cache, "root_node", None)
-        while need > 0 and cur is not None and cur is not root:
-            fv = cur.component_data[BASE_COMPONENT_TYPE].value
-            if fv is None or len(fv) == 0:
-                break
-            take = min(need, len(fv))
-            parts.append(fv[len(fv) - take :])
-            need -= take
-            if need <= 0:
-                break
-            cur = getattr(cur, "parent", None)
-        assert parts, "no FULL indices available to restore SWA window"
-        return torch.cat(list(reversed(parts)))
-
     def _dbg_verify_restore(self, cd_n) -> None:
         """Gated acceptance check (SGLANG_SWA_DBG_CHECKSUM, default off): assert
         the bound host page still matches the checksum captured at prefill,
@@ -1831,10 +1937,41 @@ class SWAComponent(TreeComponent):
                 len(crcs),
             )
 
-    def _release_swa_host(self, host_indices: torch.Tensor) -> None:
+    def take_positional_restore_windows(
+        self, transfers: list[PoolTransfer]
+    ) -> list[tuple[UnifiedTreeNode, torch.Tensor]]:
+        """The (carrier node, host window) pairs of a LOAD_BACK spec, for the
+        deferred positional restore.
+
+        unified_kv computes the SWA device slot as ``req_pool_idx*ring +
+        pos%ring``, which is only known after prepare_for_extend. So no device
+        slot is allocated and no H->D transfer is issued at load_back time (the
+        swa_attn_allocator is page_size-based and unrelated to the positional
+        ring). The cache stashes these pairs on the Req instead, and
+        ``restore_pending_swa_windows`` copies them positionally before the
+        first forward. Kept here (not in the cache) so the node/host pairing
+        stays with the component that built the transfer.
+        """
+        windows: list[tuple[UnifiedTreeNode, torch.Tensor]] = []
+        for xfer in transfers:
+            if xfer.name is not PoolName.SWA or not xfer.nodes_to_load:
+                continue
+            offset = 0
+            for nid in xfer.nodes_to_load:
+                n = self.tree_core.node_by_id(nid)
+                n_tokens = len(n.component_data[self.component_type].host_value)
+                windows.append((n, xfer.host_indices[offset : offset + n_tokens]))
+                offset += n_tokens
+        return windows
+
+    def _release_swa_host(
+        self,
+        host_indices: torch.Tensor,
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
         if host_indices is not None and host_indices.numel() > 0:
-            self.cache.cache_controller.append_host_mem_release(
-                extra_pools=[PoolTransfer(name=PoolName.SWA, host_indices=host_indices)]
+            cache_actions.append(
+                FreeComponentHostSlot([host_indices], component_type=ComponentType.SWA)
             )
 
     def _attach_swa_host_value(
@@ -1844,18 +1981,19 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         cd.host_value = host_indices.clone()
-        host_lru = self.cache.host_lru_lists[ct]
+        host_lru = self.tree_core.host_lru_lists[ct]
         if cd.value is None and not host_lru.in_list(node):
             host_lru.insert_mru(node)
-        self.cache._update_evictable_leaf_sets(node)
+        self.tree_core._update_evictable_leaf_sets(node)
         if node.parent:
-            self.cache._update_evictable_leaf_sets(node.parent)
+            self.tree_core._update_evictable_leaf_sets(node.parent)
 
     def _commit_prefetch(
         self,
         anchor,
         transfers: list[PoolTransfer],
         *,
+        cache_actions: list[CacheAction | ComponentAction],
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
@@ -1870,7 +2008,7 @@ class SWAComponent(TreeComponent):
         if not transfers:
             return
         ct = self.component_type
-        page_size = self.cache.page_size
+        page_size = self.tree_core.page_size
         host_indices = transfers[0].host_indices
         # strict windows are ring-paged (one item == one window == ring tokens);
         # non-strict prefetch is page_size-paged. Use the right stride so
@@ -1898,7 +2036,7 @@ class SWAComponent(TreeComponent):
             stride_pages = max(1, stride // page_size)
             full_hit = pool_storage_result.kv_hit_pages if pool_storage_result else 0
             if loaded_pages * stride_pages > full_hit:
-                self._release_swa_host(host_indices)
+                self._release_swa_host(host_indices, cache_actions)
                 return
             # Co-lifetime STATE coupling guard (defense-in-depth): the sidecar
             # c4 / indexer state pools ride the SWA window key family, so under
@@ -1917,15 +2055,20 @@ class SWAComponent(TreeComponent):
                 PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
             ):
                 if state_pool in extra_hit and extra_hit[state_pool] < loaded_pages:
-                    self._release_swa_host(host_indices)
+                    self._release_swa_host(host_indices, cache_actions)
                     return
-        target = insert_result.inserted_host_node if insert_result else None
+        target = (
+            self.tree_core.node_by_id(insert_result.inserted_host_node)
+            if insert_result is not None
+            and insert_result.inserted_host_node is not None
+            else None
+        )
         if (
             target is None
             or window_require_pages == 0
             or loaded_pages < window_require_pages
         ):
-            self._release_swa_host(host_indices)
+            self._release_swa_host(host_indices, cache_actions)
             return
 
         if self._strict_bit_exact:
@@ -1947,7 +2090,7 @@ class SWAComponent(TreeComponent):
             else:
                 # Already present, or an unexpected multi-window buffer: fail-safe
                 # (recompute) -- never crash, never attach a desynced window.
-                self._release_swa_host(host_indices)
+                self._release_swa_host(host_indices, cache_actions)
             return
 
         # Buffer covers token range [loaded_start, total_len).
@@ -1967,7 +2110,11 @@ class SWAComponent(TreeComponent):
             if cd.host_value is None and fill_len > 0:
                 # Tombstone: split off the in-buffer tail if needed, then fill.
                 if fill_start > node_start:
-                    self.cache._split_node(cur.key, cur, fill_start - node_start)
+                    _, action = self.tree_core._split_node(
+                        cur.key, cur, fill_start - node_start
+                    )
+                    if action is not None:
+                        cache_actions.append(action)
                 self._attach_swa_host_value(cur, slice_)
                 # Independent-pool sidecar: the c4/indexer state rode this
                 # window's coupled key family into the SAME durable row; point the
@@ -1975,17 +2122,21 @@ class SWAComponent(TreeComponent):
                 _attach_state_durable_row(self, cur, slice_)
             else:
                 # Already has SWA (or empty overlap): drop this slice.
-                self._release_swa_host(slice_)
+                self._release_swa_host(slice_, cache_actions)
 
             pos = node_start
             cur = cur.parent
 
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
-            self._release_swa_host(host_indices[: pos - loaded_start])
+            self._release_swa_host(host_indices[: pos - loaded_start], cache_actions)
 
     def drive_host_eviction(
-        self, num_tokens: int, tracker: dict[ComponentType, int]
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Evict SWA host resources.
         Internal nodes: private tombstone (free SWA host only).
@@ -1997,19 +2148,88 @@ class SWAComponent(TreeComponent):
             # alone. This keeps the invariant "Full-host copy => SWA-host copy",
             # so any Full-host hit can restore its true sliding window instead
             # of reprefilling the tail. Sizing then only affects hit rate.
-            self.cache.drive_host_leaf_eviction(num_tokens, ct, tracker)
+            full_tokens, leaves = self.tree_core.drive_host_leaf_eviction(
+                num_tokens, ct, tracker, device_frees, host_frees
+            )
+            # Telemetry lives cache-side; the TreeCore stays free of cache policy.
+            self.cache._note_binding_full_coevict(full_tokens, leaves)
             return
-        host_lru = self.cache.host_lru_lists[ct]
+        host_lru = self.tree_core.host_lru_lists[ct]
         x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
             x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
-            if x in self.cache.evictable_host_leaves:
-                self.cache._evict_host_leaf(x, tracker)
+            if x in self.tree_core.evictable_host_leaves:
+                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             else:
                 assert cd.host_value is not None
-                self.cache._evict_component_and_detach_lru(
-                    x, self, target=EvictLayer.HOST, tracker=tracker
+                self.tree_core._evict_component_and_detach_lru(
+                    x,
+                    self,
+                    target=EvictLayer.HOST,
+                    tracker=tracker,
+                    device_frees=device_frees,
+                    host_frees=host_frees,
                 )
-                self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
+                self.tree_core._cascade_evict(
+                    x,
+                    self,
+                    tracker,
+                    device_frees=device_frees,
+                    host_frees=host_frees,
+                    target=EvictLayer.HOST,
+                )
             x = x_next
+
+    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+        if self._swa_kv_pool_host is None:
+            return
+        for host_value in host_values:
+            self._swa_kv_pool_host.free(host_value)
+
+    def apply_component_action(self, action: ComponentAction) -> None:
+        alloc = self.cache.token_to_kv_pool_allocator
+        if isinstance(action, FreeComponentDeviceSlot):
+            for indices in action.indices:
+                alloc.free_swa(indices)
+            return
+        if isinstance(action, FreeComponentHostSlot):
+            for host_indices in action.host_indices:
+                if host_indices is not None and host_indices.numel() > 0:
+                    self.cache.cache_controller.append_host_mem_release(
+                        extra_pools=[
+                            PoolTransfer(name=PoolName.SWA, host_indices=host_indices)
+                        ]
+                    )
+            return
+        if isinstance(action, RebuildFullToSWAMapping):
+            assert len(action.full_indices) == len(action.swa_indices)
+            for full, swa in zip(action.full_indices, action.swa_indices):
+                alloc.set_full_to_swa_mapping(full, swa)
+            return
+        if isinstance(action, RecoverSWAWithLockedFull):
+            # Keep the locked full; remap it onto the incoming full's SWA translation,
+            # freeing only the incoming full, then store the swa on the node.
+            swa_value = self._translate_full_to_swa(action.incoming_full)
+            alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
+            alloc.full_to_swa_index_mapping[action.incoming_full.to(torch.int64)] = 0
+            alloc.full_attn_allocator.free(action.incoming_full)
+            self._restore_device_value(
+                self.tree_core.node_by_id(action.node_id), swa_value
+            )
+            return
+        if isinstance(action, SWARebuild):
+            # Translate the node's source full value to SWA and store it on the node.
+            swa_value = self._translate_full_to_swa(action.source_value)
+            self._restore_device_value(
+                self.tree_core.node_by_id(action.node_id), swa_value
+            )
+            return
+        if isinstance(action, BindCapturedSWAHost):
+            self._bind_captured_swa_host(
+                self.tree_core.node_by_id(action.node_id), action.node_end
+            )
+            return
+        raise AssertionError(
+            f"SWAComponent: unhandled ComponentAction {type(action).__name__}"
+        )

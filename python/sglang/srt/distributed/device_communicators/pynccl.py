@@ -303,6 +303,60 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def all_to_all_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ):
+        """All-to-All over the flattened leading dim: each rank sends the i-th
+        equal-sized chunk to rank i and receives rank i's chunk into output
+        position i. Uses ncclGroupStart/End to fuse the sends/recvs into a
+        single NCCL operation, which is CUDA-graph-capturable (used by the DCP
+        a2a communication backend)."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert output_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the output tensor is on {output_tensor.device}"
+        )
+        stream = self._resolve_stream()
+        # Equal-split all-to-all: fail loudly instead of silently truncating the tail.
+        assert input_tensor.numel() == output_tensor.numel(), (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) != output "
+            f"numel ({output_tensor.numel()})"
+        )
+        assert input_tensor.numel() % self.world_size == 0, (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) not "
+            f"divisible by world_size ({self.world_size})"
+        )
+        chunk_size = input_tensor.numel() // self.world_size
+        dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+        self.nccl.ncclGroupStart()
+        for i in range(self.world_size):
+            send_buf = input_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclSend(
+                buffer_type(send_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            recv_buf = output_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclRecv(
+                buffer_type(recv_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+        self.nccl.ncclGroupEnd()
+
     def broadcast(self, tensor: torch.Tensor, src: int):
         if self.disabled:
             return

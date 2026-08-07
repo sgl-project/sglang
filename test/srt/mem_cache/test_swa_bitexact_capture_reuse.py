@@ -17,12 +17,14 @@ Covers:
 import types
 import unittest
 from array import array
+from collections import defaultdict
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache_components.swa_component import (
     SWAComponent,
 )
@@ -32,10 +34,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
-    UnifiedRadixCache,
-    UnifiedTreeNode,
-)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 
 SWA = ComponentType.SWA
 
@@ -108,6 +107,22 @@ def _cd(value=None, host_value=None):
     return types.SimpleNamespace(value=value, host_value=host_value)
 
 
+class _NodeRegistry:
+    """TreeCore only exposes NodeId handles across the component boundary, so a
+    transfer carries ids and the commit side resolves them via node_by_id."""
+
+    def __init__(self):
+        self._by_id = {}
+
+    def add(self, node):
+        node.id = len(self._by_id) + 1
+        self._by_id[node.id] = node
+        return node.id
+
+    def node_by_id(self, nid):
+        return self._by_id[nid]
+
+
 def _fake_fb_decode(seqs, rids):
     return types.SimpleNamespace(
         forward_mode=types.SimpleNamespace(
@@ -145,7 +160,7 @@ class TestSwaBindWindow(unittest.TestCase):
         node = types.SimpleNamespace(
             component_data={SWA: _cd(value=torch.arange(4), host_value=None)}
         )
-        SWAComponent._bind_captured_swa_host(me, node, swa_start=0)
+        SWAComponent._bind_captured_swa_host(me, node, node_end=4)
         # Co-lifetime: bind stashes a PENDING page (attached later, together with
         # Full host_value, via the coordinated BACKUP_HOST), not host_value now.
         pending = getattr(node, "_swa_pending_host", None)
@@ -163,7 +178,7 @@ class TestSwaBindWindow(unittest.TestCase):
         node = types.SimpleNamespace(
             component_data={SWA: _cd(value=torch.arange(4), host_value=None)}
         )
-        SWAComponent._bind_captured_swa_host(me, node, swa_start=0)
+        SWAComponent._bind_captured_swa_host(me, node, node_end=4)
         self.assertEqual(calls, [])  # nothing bound
         self.assertIsNone(getattr(node, "_swa_pending_host", None))
 
@@ -180,9 +195,13 @@ class TestSwaRestoreWindowMapping(unittest.TestCase):
                 (full.clone(), swa.clone())
             )
         )
+        registry = _NodeRegistry()
         me = types.SimpleNamespace(
             component_type=SWA,
             cache=types.SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            tree_core=types.SimpleNamespace(
+                root_node=object(), node_by_id=registry.node_by_id
+            ),
             _restore_device_value=lambda n, v: restore_calls.append(v.clone()),
         )
         me._gather_window_full_indices = (
@@ -201,11 +220,19 @@ class TestSwaRestoreWindowMapping(unittest.TestCase):
             name=PoolName.SWA,
             host_indices=torch.tensor([0, 0]),
             device_indices=device_indices,
-            nodes_to_load=[node],
+            nodes_to_load=[registry.add(node)],
         )
+        actions = []
         SWAComponent.commit_hicache_transfer(
-            me, node, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+            me,
+            node,
+            CacheTransferPhase.LOAD_BACK,
+            transfers=[xfer],
+            cache_actions=actions,
         )
+        # The mapping is emitted as an action and applied by the orchestrator.
+        for a in actions:
+            SWAComponent.apply_component_action(me, a)
         self.assertEqual(len(mapping_calls), 1)
         mapped_full, mapped_swa = mapping_calls[0]
         # only the LAST win (=2) full indices [102,103] are mapped
@@ -231,10 +258,12 @@ class TestSwaRestoreSplitWindow(unittest.TestCase):
             )
         )
         root = types.SimpleNamespace(component_data={}, parent=None)
+        registry = _NodeRegistry()
         me = types.SimpleNamespace(
             component_type=SWA,
-            cache=types.SimpleNamespace(
-                token_to_kv_pool_allocator=allocator, root_node=root
+            cache=types.SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            tree_core=types.SimpleNamespace(
+                root_node=root, node_by_id=registry.node_by_id
             ),
             _restore_device_value=lambda n, v: restore_calls.append(v.clone()),
         )
@@ -263,11 +292,18 @@ class TestSwaRestoreSplitWindow(unittest.TestCase):
             name=PoolName.SWA,
             host_indices=torch.tensor([0, 0, 0, 0]),
             device_indices=device_indices,
-            nodes_to_load=[child],
+            nodes_to_load=[registry.add(child)],
         )
+        actions = []
         SWAComponent.commit_hicache_transfer(
-            me, child, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+            me,
+            child,
+            CacheTransferPhase.LOAD_BACK,
+            transfers=[xfer],
+            cache_actions=actions,
         )
+        for a in actions:
+            SWAComponent.apply_component_action(me, a)
         self.assertEqual(len(mapping_calls), 1)
         mapped_full, mapped_swa = mapping_calls[0]
         # window full indices, token order: parent tail [100,101] ++ child [102,103]
@@ -295,6 +331,9 @@ class TestStrictMatchValidatorI2Prime(unittest.TestCase):
             _swa_kv_pool_host=object(),  # host pool wired => feature on, not device-only
             _strict_bit_exact=strict,
             cache=types.SimpleNamespace(cache_controller=object()),
+            tree_core=types.SimpleNamespace(
+                has_swa_host_pool=True, enable_hicache=True
+            ),
         )
         return SWAComponent.create_match_validator(me)
 
@@ -427,10 +466,10 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
         fake_self = types.SimpleNamespace(
             root_node=root,
             page_size=self.PAGE_SIZE,
-            # Non-None -> triggers the separate device-match validator path
+            # True -> triggers the separate device-match validator path
             # (device_validators distinct from host-gated validators).
-            cache_controller=object(),
-            _components_tuple=(
+            enable_hicache=True,
+            components=(
                 self._make_full_component(),
                 self._make_swa_component(),
             ),
@@ -441,7 +480,9 @@ class TestReuseAnchorHostClamp(unittest.TestCase):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-        ) = UnifiedRadixCache._match_prefix_helper(fake_self, key, for_reuse=for_reuse)
+            _full_kv_hit_length,
+            _action,
+        ) = UnifiedTreeCore._match_prefix_helper(fake_self, key, for_reuse=for_reuse)
         if best_match_device_value_len > 0:
             device_indices = torch.cat(value[:best_match_device_value_len])
         else:
@@ -517,6 +558,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
     def _node_and_root(self, *, value, host_value):
         root = types.SimpleNamespace(component_data={}, parent=None)
         node = types.SimpleNamespace(
+            id=1,  # transfers carry NodeId handles, not node objects
             parent=root,
             component_data={SWA: _cd(value=value, host_value=host_value)},
         )
@@ -530,6 +572,9 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
             _strict_bit_exact=strict,
             _unified_positional_swa=False,
             cache=types.SimpleNamespace(cache_controller=object()),
+            tree_core=types.SimpleNamespace(
+                has_swa_host_pool=True, enable_hicache=True
+            ),
         )
 
     def _device_and_host_backed_node(self):
@@ -544,7 +589,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
         regardless of cd.value."""
         root, node = self._device_and_host_backed_node()
         comp = self._comp(strict=True)
-        comp.cache.root_node = root
+        comp.tree_core.root_node = root
 
         transfers = SWAComponent.build_hicache_transfers(
             comp, node, CacheTransferPhase.LOAD_BACK
@@ -552,7 +597,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
 
         self.assertIsNotNone(transfers)
         xfer = transfers[0]
-        self.assertIn(node, xfer.nodes_to_load)
+        self.assertIn(node.id, xfer.nodes_to_load)
         self.assertTrue(
             torch.equal(xfer.host_indices, node.component_data[SWA].host_value)
         )
@@ -563,7 +608,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
         load_back gate opens, matching the build-side predicate above."""
         root, node = self._device_and_host_backed_node()
         comp = self._comp(strict=True)
-        comp.cache.root_node = root
+        comp.tree_core.root_node = root
         result = MatchResult(
             device_indices=torch.tensor([], dtype=torch.int64),
             last_device_node=node,
@@ -572,7 +617,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
             host_hit_length=0,
         )
 
-        out = SWAComponent.finalize_match_result(
+        out = SWAComponent.finalize_match_result_in_tree_core(
             comp,
             result=result,
             params=MatchPrefixParams(
@@ -591,7 +636,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
         self-match does not falsely open the load_back gate."""
         root, node = self._device_and_host_backed_node()
         comp = self._comp(strict=True)
-        comp.cache.root_node = root
+        comp.tree_core.root_node = root
         result = MatchResult(
             device_indices=torch.tensor([], dtype=torch.int64),
             last_device_node=node,
@@ -600,7 +645,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
             host_hit_length=0,
         )
 
-        out = SWAComponent.finalize_match_result(
+        out = SWAComponent.finalize_match_result_in_tree_core(
             comp,
             result=result,
             params=MatchPrefixParams(
@@ -618,7 +663,7 @@ class TestLoadBackCollectsHostBackedNodes(unittest.TestCase):
         skipped even when also host-backed."""
         root, node = self._device_and_host_backed_node()
         comp = self._comp(strict=False)
-        comp.cache.root_node = root
+        comp.tree_core.root_node = root
 
         transfers = SWAComponent.build_hicache_transfers(
             comp, node, CacheTransferPhase.LOAD_BACK
@@ -638,6 +683,9 @@ class TestLoadBackMappingLengths(unittest.TestCase):
 
     WIN = 128
 
+    def setUp(self):
+        self.registry = _NodeRegistry()
+
     def _me(self, mapping_calls):
         allocator = types.SimpleNamespace(
             set_full_to_swa_mapping=lambda full, swa: mapping_calls.append(
@@ -649,8 +697,9 @@ class TestLoadBackMappingLengths(unittest.TestCase):
             component_type=SWA,
             _capture_rid=5,
             _swa_kv_pool_host=None,
-            cache=types.SimpleNamespace(
-                token_to_kv_pool_allocator=allocator, root_node=root
+            cache=types.SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            tree_core=types.SimpleNamespace(
+                root_node=root, node_by_id=self.registry.node_by_id
             ),
             _restore_device_value=lambda n, v: None,
         )
@@ -678,7 +727,7 @@ class TestLoadBackMappingLengths(unittest.TestCase):
             name=PoolName.SWA,
             host_indices=torch.zeros(total, dtype=torch.int64),
             device_indices=torch.arange(device_len, dtype=torch.int64) + 900,
-            nodes_to_load=nodes,
+            nodes_to_load=[self.registry.add(n) for n in nodes],
         )
 
     def test_correct_alloc_multi_node_maps_equal_lengths(self):
@@ -686,9 +735,16 @@ class TestLoadBackMappingLengths(unittest.TestCase):
         me, root = self._me(mapping_calls)
         nodes = [self._window_node(root, 100), self._window_node(root, 300)]
         xfer = self._xfer(nodes, device_len=self.WIN * len(nodes))
+        actions = []
         SWAComponent.commit_hicache_transfer(
-            me, nodes[-1], CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+            me,
+            nodes[-1],
+            CacheTransferPhase.LOAD_BACK,
+            transfers=[xfer],
+            cache_actions=actions,
         )
+        for a in actions:
+            SWAComponent.apply_component_action(me, a)
         self.assertEqual(len(mapping_calls), 2)
         for full_n, swa_n in mapping_calls:
             self.assertEqual(full_n, swa_n)
@@ -702,7 +758,11 @@ class TestLoadBackMappingLengths(unittest.TestCase):
         xfer = self._xfer(nodes, device_len=self.WIN * len(nodes) - 64)
         with self.assertRaises(AssertionError) as ctx:
             SWAComponent.commit_hicache_transfer(
-                me, nodes[-1], CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+                me,
+                nodes[-1],
+                CacheTransferPhase.LOAD_BACK,
+                transfers=[xfer],
+                cache_actions=[],
             )
         msg = str(ctx.exception)
         self.assertIn("index-length mismatch", msg)
@@ -726,6 +786,9 @@ class TestSparseSwaReuseClamp(unittest.TestCase):
             _swa_kv_pool_host=object(),  # feature on (not device-only hicache)
             _strict_bit_exact=True,
             cache=types.SimpleNamespace(cache_controller=object()),
+            tree_core=types.SimpleNamespace(
+                has_swa_host_pool=True, enable_hicache=True
+            ),
         )
         # reuse match == match_device_only=False (scheduler cross-request reuse).
         return SWAComponent.create_match_validator(me, match_device_only=False)
@@ -824,13 +887,14 @@ class _ICache:
         self.splits = []
 
     def _split_node(self, key, child, split_len):
-        # Mirror UnifiedRadixCache._split_node's shape: return a fresh parent
-        # covering [start, start+split_len); the original object becomes the
-        # tail child (its key shrinks) and keeps any plain attributes it held.
+        # Mirror UnifiedTreeCore._split_node's shape: return a fresh parent
+        # covering [start, start+split_len) plus the write-through action slot;
+        # the original object becomes the tail child (its key shrinks) and keeps
+        # any plain attributes it held.
         parent = _INode(split_len)
         child.key = _IKey(len(child.key) - split_len)
         self.splits.append(split_len)
-        return parent
+        return parent, None
 
 
 class TestSwaBindInteriorWindows(unittest.TestCase):
@@ -842,7 +906,7 @@ class TestSwaBindInteriorWindows(unittest.TestCase):
             _swa_kv_pool_host=host,
             _capture_rid=5,
             component_type=SWA,
-            cache=_ICache(page_size=2),
+            tree_core=_ICache(page_size=2),
         )
 
     def _stage(self, host, rid, B, win):
@@ -866,7 +930,7 @@ class TestSwaBindInteriorWindows(unittest.TestCase):
         SWAComponent._bind_interior_captured_swa_hosts(me, region, 0, 12)
 
         # Two carrier nodes created (at B=8 then B=4), split offsets from anchor.
-        self.assertEqual(me.cache.splits, [8, 4])
+        self.assertEqual(me.tree_core.splits, [8, 4])
         # Interior windows consumed; excluded boundaries left intact.
         self.assertNotIn((5, 4), host._capture_staging)
         self.assertNotIn((5, 8), host._capture_staging)
@@ -881,14 +945,14 @@ class TestSwaBindInteriorWindows(unittest.TestCase):
         me = self._fake_self(host)
 
         created = []
-        orig_split = me.cache._split_node
+        orig_split = me.tree_core._split_node
 
         def _tracking_split(key, child, split_len):
-            parent = orig_split(key, child, split_len)
+            parent, action = orig_split(key, child, split_len)
             created.append((split_len, parent))
-            return parent
+            return parent, action
 
-        me.cache._split_node = _tracking_split
+        me.tree_core._split_node = _tracking_split
         region = _INode(8)
         SWAComponent._bind_interior_captured_swa_hosts(me, region, 0, 8)
 
@@ -906,7 +970,7 @@ class TestSwaBindInteriorWindows(unittest.TestCase):
         me = self._fake_self(host)
         region = _INode(8)
         SWAComponent._bind_interior_captured_swa_hosts(me, region, 0, 8)
-        self.assertEqual(me.cache.splits, [])
+        self.assertEqual(me.tree_core.splits, [])
 
 
 class _FakeHostLRU:
@@ -956,19 +1020,19 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
             _swa_kv_pool_host=host,
             _capture_rid=5,
             component_type=SWA,
-            cache=_ICache(page_size=2),
+            tree_core=_ICache(page_size=2),
         )
         tile = torch.arange(104, 104 + self.WIN, dtype=torch.int64)
         host._capture_staging[(5, 4)] = tile
         created = {}
-        orig_split = me.cache._split_node
+        orig_split = me.tree_core._split_node
 
         def _tracking_split(key, child, split_len):
-            parent = orig_split(key, child, split_len)
+            parent, action = orig_split(key, child, split_len)
             created["node"] = parent
-            return parent
+            return parent, action
 
-        me.cache._split_node = _tracking_split
+        me.tree_core._split_node = _tracking_split
         region = _INode(8)
         SWAComponent._bind_interior_captured_swa_hosts(me, region, 0, 8)
         carrier = created["node"]
@@ -988,6 +1052,8 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
                 token_to_kv_pool_allocator=types.SimpleNamespace(
                     free_swa=lambda v: None, free=lambda v: None
                 ),
+            ),
+            tree_core=types.SimpleNamespace(
                 component_evictable_size_={SWA: 1000},
                 host_lru_lists={SWA: _FakeHostLRU()},
             ),
@@ -1002,7 +1068,9 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
         self.assertIsNone(cd.host_value)
         me = self._evict_self(host)
 
-        SWAComponent.evict_component(me, carrier, target=EvictLayer.DEVICE)
+        SWAComponent.evict_component(
+            me, carrier, defaultdict(list), defaultdict(list), target=EvictLayer.DEVICE
+        )
 
         # R1: pending survives the device tombstone; host pool untouched.
         surviving = getattr(carrier, "_swa_pending_host", None)
@@ -1017,7 +1085,9 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
         carrier._swa_interior_carrier = False  # strip flag -> plain pending page
         me = self._evict_self(host)
 
-        SWAComponent.evict_component(me, carrier, target=EvictLayer.DEVICE)
+        SWAComponent.evict_component(
+            me, carrier, defaultdict(list), defaultdict(list), target=EvictLayer.DEVICE
+        )
 
         # Co-lifetime (I3): a not-yet-promoted plain page must not outlive here.
         self.assertIsNone(getattr(carrier, "_swa_pending_host", None))
@@ -1036,7 +1106,9 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
         )
         me = self._evict_self(host)
 
-        freed, _ = SWAComponent.evict_component(me, carrier, target=EvictLayer.DEVICE)
+        freed, _ = SWAComponent.evict_component(
+            me, carrier, defaultdict(list), defaultdict(list), target=EvictLayer.DEVICE
+        )
 
         self.assertEqual(freed, 2)  # device ring tombstoned
         self.assertIsNone(cd.value)
@@ -1063,6 +1135,9 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
             _swa_kv_pool_host=host,
             _strict_bit_exact=True,
             cache=types.SimpleNamespace(cache_controller=object()),
+            tree_core=types.SimpleNamespace(
+                has_swa_host_pool=True, enable_hicache=True
+            ),
             _attach_swa_host_value=lambda node, hv: attached.append(hv),
         )
 
@@ -1076,7 +1151,11 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
         self.assertTrue(torch.equal(transfers[0].host_indices, tile.to(torch.int64)))
 
         SWAComponent.commit_hicache_transfer(
-            me, carrier, CacheTransferPhase.BACKUP_HOST, transfers=transfers
+            me,
+            carrier,
+            CacheTransferPhase.BACKUP_HOST,
+            transfers=transfers,
+            cache_actions=[],
         )
         # Promoted: host_value adopted (via _attach), pending ownership dropped.
         self.assertEqual(len(attached), 1)
@@ -1112,7 +1191,13 @@ class TestSwaR1InteriorCarrierPendingLifetime(unittest.TestCase):
         carrier, tile = self._make_carrier(host)
         me_evict = self._evict_self(host)
 
-        SWAComponent.evict_component(me_evict, carrier, target=EvictLayer.DEVICE)
+        SWAComponent.evict_component(
+            me_evict,
+            carrier,
+            defaultdict(list),
+            defaultdict(list),
+            target=EvictLayer.DEVICE,
+        )
         self.assertIsNotNone(getattr(carrier, "_swa_pending_host", None))
         self.assertEqual(host.freed, [])  # survived tombstone
 

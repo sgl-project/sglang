@@ -210,6 +210,22 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class InvariantCheckLevel(IntEnum):
+    """Signal level for value/index validity checks (see invariants.py).
+
+    OFF: data layer only (sanitize/containment); no detection, no signal.
+    WARN: detect + throttled log/count; degrade, never crash (prod on-demand).
+    STRICT: detect + crash on GUARD/FATAL violations (CI default).
+
+    The data layer is unconditional and independent of this level; only the
+    detection + signal layer is gated here.
+    """
+
+    OFF = 0
+    WARN = 1
+    STRICT = 2
+
+
 class Envs:
 
     # Raise on bare server_args field assignments after resolution; mutation
@@ -315,6 +331,9 @@ class Envs:
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    # Allocator-history buffer for /start_profile activities=["MEM"]; the
+    # default truncates long windows (each entry is one alloc/free event).
+    SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
@@ -373,6 +392,7 @@ class Envs:
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
@@ -477,7 +497,6 @@ class Envs:
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
-    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
@@ -787,6 +806,12 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Signal level for value/index validity checks (nan/inf/oob/...); see
+    # invariants.py. OFF (prod default) runs only the free data layer, WARN
+    # adds throttled logging, STRICT (CI default) crashes on violations.
+    # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
+    # every callsite migrates.
+    SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
@@ -822,6 +847,8 @@ class Envs:
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+    # Registered TreeCore backend serving the unified radix cache.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
 
     # Strict bit-exact SWA HiCache for unified_kv (DeepSeek-V4): offload the SWA
     # ring to host and restore it on reuse instead of reprefilling a 128-token
@@ -1003,6 +1030,9 @@ class Envs:
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
+    # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
+    SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

@@ -783,6 +783,7 @@ class TboForwardBatchPreparer:
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
                 _original_forward_mode=None,
+                _original_num_tokens=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
@@ -795,6 +796,7 @@ class TboForwardBatchPreparer:
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
+                extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init

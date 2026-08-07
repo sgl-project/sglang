@@ -67,6 +67,18 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_clears_mlp_sync_unpad_fields_on_children(self):
+        # MLP-sync padding records _original_batch_size/_original_num_tokens
+        # before TBO splits the batch (prepare_mlp_sync_batch pads first, then
+        # runs TboForwardBatchPreparer); children carry no restore state — the
+        # parent performs the post-forward unpad.
+        parent = _make_target_verify_batch(8)
+        parent._original_batch_size = 8
+        parent._original_num_tokens = 8
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child._original_batch_size)
+        self.assertIsNone(child._original_num_tokens)
+
     def test_filter_batch_resets_plan_marker_on_children(self):
         child = _filter(_make_target_verify_batch(8), lo=0, hi=4)
         self.assertEqual(child.batch_size, 4)

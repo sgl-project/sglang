@@ -50,6 +50,9 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+    get_total_prefill_uncached_tokens: Callable
+    get_total_prefill_busy_us: Callable
+    get_decode_moment_totals: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -91,6 +94,7 @@ class SchedulerLoadInquirer:
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
+        awaiting_kv_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             prefill_bootstrap_queue = self.get_disagg_prefill_bootstrap_queue().queue
             waiting_queues.append(prefill_bootstrap_queue)
@@ -108,6 +112,12 @@ class SchedulerLoadInquirer:
             # waiting-queue requests have already pre-allocated decode-side KV
             # slots, so they are already included in num_used_tokens.
             pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
+            # KV not yet arrived from the prefill side.
+            awaiting_kv_tokens = sum(
+                req.seqlen
+                for queue in (decode_prealloc_queue, decode_transfer_queue)
+                for req in queue
+            )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (
@@ -116,6 +126,7 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
         try:
@@ -183,6 +194,9 @@ class SchedulerLoadInquirer:
             retracted=stats.num_retracted_reqs,
         )
 
+        totals = self.get_decode_moment_totals()
+        decode_moments = list(totals) if totals[0] > 0 else None
+
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
@@ -191,6 +205,7 @@ class SchedulerLoadInquirer:
             num_waiting_uncached_tokens=self.get_num_waiting_uncached_tokens(),
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
+            num_active_tokens=num_active_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),
@@ -202,4 +217,7 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
+            total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            decode_moments=decode_moments,
         )

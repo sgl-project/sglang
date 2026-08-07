@@ -3,7 +3,7 @@
 Covers the strict bit-exact SWA HiCache logic:
   * sizing: hybrid_pool_assembler._swa_host_num_pages
   * co-eviction observability: UnifiedRadixCache._note_binding_full_coevict
-  * strict atomic leaf eviction: UnifiedRadixCache.drive_host_leaf_eviction
+  * strict atomic leaf eviction: UnifiedTreeCore.drive_host_leaf_eviction
     and SWAComponent.drive_host_eviction routing
   * offload geometry: DeepSeekV4TokenToKVPool.swa_region_buffers page unit
 
@@ -15,6 +15,7 @@ the new logic. Run:
 import math
 import types
 import unittest
+from collections import defaultdict
 
 import torch
 
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as A
+from sglang.srt.mem_cache.unified_cache import unified_tree_core as TC
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
@@ -161,18 +163,17 @@ class _Node:
         return f"_Node({self.name})"
 
 
-class _FakeCacheForLeafEvict:
-    """Minimal stand-in exercising drive_host_leaf_eviction's traversal and
-    accounting. _evict_host_leaf models atomic Full+SWA drop and exposes the
+class _FakeTreeCoreForLeafEvict:
+    """Minimal TreeCore stand-in exercising drive_host_leaf_eviction's traversal
+    and accounting. _evict_host_leaf models atomic Full+SWA drop and exposes the
     parent as a new host leaf (walk-up)."""
 
     def __init__(self, leaves):
         self.evictable_host_leaves = set(leaves)
         self.eviction_strategy = types.SimpleNamespace(get_priority=lambda n: n.prio)
         self.evicted = []
-        self.coevict_calls = []
 
-    def _evict_host_leaf(self, x, tracker):
+    def _evict_host_leaf(self, x, tracker, device_frees, host_frees):
         self.evictable_host_leaves.discard(x)
         tracker[FULL] = tracker.get(FULL, 0) + x.full
         tracker[SWA] = tracker.get(SWA, 0) + x.swa
@@ -181,24 +182,23 @@ class _FakeCacheForLeafEvict:
             # Parent becomes a host leaf now that its child is gone.
             self.evictable_host_leaves.add(x.parent)
 
-    def _note_binding_full_coevict(self, full_tokens, leaves):
-        self.coevict_calls.append((full_tokens, leaves))
-
 
 class TestDriveHostLeafEviction(unittest.TestCase):
-    def _drive(self, cache, num_tokens, key, tracker):
-        R.UnifiedRadixCache.drive_host_leaf_eviction(cache, num_tokens, key, tracker)
+    def _drive(self, core, num_tokens, key, tracker):
+        return TC.UnifiedTreeCore.drive_host_leaf_eviction(
+            core, num_tokens, key, tracker, defaultdict(list), defaultdict(list)
+        )
 
     def test_priority_order_and_stop(self):
         # Two independent leaves; lower priority (LRU) evicted first, stop once
         # the key component target is met -> the colder leaf is spared.
         a = _Node("a", prio=1, full=10, swa=10)  # colder -> evicted first
         b = _Node("b", prio=5, full=10, swa=10)
-        cache = _FakeCacheForLeafEvict([a, b])
+        core = _FakeTreeCoreForLeafEvict([a, b])
         tracker = {FULL: 0, SWA: 0}
-        self._drive(cache, num_tokens=10, key=SWA, tracker=tracker)
-        self.assertEqual(cache.evicted, [a])
-        self.assertIn(b, cache.evictable_host_leaves)
+        self._drive(core, num_tokens=10, key=SWA, tracker=tracker)
+        self.assertEqual(core.evicted, [a])
+        self.assertIn(b, core.evictable_host_leaves)
 
     def test_walk_up_parents(self):
         # Chain c <- b <- a (a is the only initial leaf); freeing pulls up the
@@ -206,10 +206,10 @@ class TestDriveHostLeafEviction(unittest.TestCase):
         c = _Node("c", prio=3, full=5, swa=5)
         b = _Node("b", prio=2, full=5, swa=5, parent=c)
         a = _Node("a", prio=1, full=5, swa=5, parent=b)
-        cache = _FakeCacheForLeafEvict([a])
+        core = _FakeTreeCoreForLeafEvict([a])
         tracker = {FULL: 0, SWA: 0}
-        self._drive(cache, num_tokens=15, key=SWA, tracker=tracker)
-        self.assertEqual(cache.evicted, [a, b, c])
+        self._drive(core, num_tokens=15, key=SWA, tracker=tracker)
+        self.assertEqual(core.evicted, [a, b, c])
         self.assertEqual(tracker[SWA], 15)
 
     def test_stale_entries_skipped(self):
@@ -217,32 +217,27 @@ class TestDriveHostLeafEviction(unittest.TestCase):
         # b is then popped-but-stale and skipped, so it is not counted.
         a = _Node("a", prio=1, full=10, swa=10)
         b = _Node("b", prio=2, full=10, swa=10)
-        cache = _FakeCacheForLeafEvict([a, b])
-        orig = cache._evict_host_leaf
+        core = _FakeTreeCoreForLeafEvict([a, b])
+        orig = core._evict_host_leaf
 
-        def evict_and_collapse(x, tracker):
-            orig(x, tracker)
-            cache.evictable_host_leaves.discard(b)
+        def evict_and_collapse(x, tracker, device_frees, host_frees):
+            orig(x, tracker, device_frees, host_frees)
+            core.evictable_host_leaves.discard(b)
 
-        cache._evict_host_leaf = evict_and_collapse
+        core._evict_host_leaf = evict_and_collapse
         tracker = {FULL: 0, SWA: 0}
-        self._drive(cache, num_tokens=100, key=SWA, tracker=tracker)
-        self.assertEqual(cache.evicted, [a])
+        self._drive(core, num_tokens=100, key=SWA, tracker=tracker)
+        self.assertEqual(core.evicted, [a])
 
-    def test_coevict_recorded_for_aux_component(self):
+    def test_returns_full_tokens_and_leaf_count(self):
+        # TreeCore stays free of cache policy: it only reports the Full-host
+        # tokens it dropped and how many leaves it took, and the SWA component
+        # turns that into the co-eviction telemetry (see TestSwaComponentRouting).
         a = _Node("a", prio=1, full=7, swa=7)
-        cache = _FakeCacheForLeafEvict([a])
+        core = _FakeTreeCoreForLeafEvict([a])
         tracker = {FULL: 0, SWA: 0}
-        self._drive(cache, num_tokens=7, key=SWA, tracker=tracker)
-        self.assertEqual(cache.coevict_calls, [(7, 1)])  # full freed, 1 leaf
-
-    def test_no_coevict_note_for_full_key(self):
-        # When Full itself is the driver there is no auxiliary binding pressure.
-        a = _Node("a", prio=1, full=7, swa=7)
-        cache = _FakeCacheForLeafEvict([a])
-        tracker = {FULL: 0, SWA: 0}
-        self._drive(cache, num_tokens=7, key=FULL, tracker=tracker)
-        self.assertEqual(cache.coevict_calls, [])
+        full_tokens, leaves = self._drive(core, num_tokens=7, key=SWA, tracker=tracker)
+        self.assertEqual((full_tokens, leaves), (7, 1))
 
 
 class TestSwaComponentRouting(unittest.TestCase):
@@ -252,11 +247,14 @@ class TestSwaComponentRouting(unittest.TestCase):
         comp = types.SimpleNamespace()
         comp._strict_bit_exact = strict
         comp.component_type = SWA
-        calls = {"leaf": [], "lru_get": 0}
+        calls = {"leaf": [], "lru_get": 0, "coevict": []}
 
-        class _Cache:
-            def drive_host_leaf_eviction(self, num_tokens, ct, tracker):
+        class _TreeCore:
+            def drive_host_leaf_eviction(
+                self, num_tokens, ct, tracker, device_frees, host_frees
+            ):
                 calls["leaf"].append((num_tokens, ct))
+                return 7, 1
 
             @property
             def host_lru_lists(self):
@@ -268,23 +266,33 @@ class TestSwaComponentRouting(unittest.TestCase):
 
                 return {SWA: _L()}
 
-        comp.cache = _Cache()
+        comp.tree_core = _TreeCore()
+        comp.cache = types.SimpleNamespace(
+            _note_binding_full_coevict=lambda full_tokens, leaves: calls[
+                "coevict"
+            ].append((full_tokens, leaves))
+        )
         return comp, calls
 
     def _drive(self, comp, tracker):
-        SWAComponent.drive_host_eviction(comp, 100, tracker)
+        SWAComponent.drive_host_eviction(
+            comp, 100, tracker, defaultdict(list), defaultdict(list)
+        )
 
     def test_strict_routes_to_leaf_eviction(self):
         comp, calls = self._fake_component(strict=True)
         self._drive(comp, {SWA: 0})
         self.assertEqual(calls["leaf"], [(100, SWA)])
         self.assertEqual(calls["lru_get"], 0)  # never touches the tombstone path
+        # Telemetry is attributed cache-side from what TreeCore reported.
+        self.assertEqual(calls["coevict"], [(7, 1)])
 
     def test_non_strict_uses_lru_path(self):
         comp, calls = self._fake_component(strict=False)
         self._drive(comp, {SWA: 0})
         self.assertEqual(calls["leaf"], [])
         self.assertGreaterEqual(calls["lru_get"], 1)
+        self.assertEqual(calls["coevict"], [])
 
 
 class TestWriteBackGuard(unittest.TestCase):
@@ -488,6 +496,11 @@ class TestStrictL3Coupled(unittest.TestCase):
         comp.cache = types.SimpleNamespace(
             cache_controller=object(), page_size=self.PAGE_SIZE
         )
+        comp.tree_core = types.SimpleNamespace(
+            has_swa_host_pool=True,
+            enable_hicache=True,
+            page_size=self.PAGE_SIZE,
+        )
         # bind the real helper so the test exercises _swa_l3_key (not a mock).
         comp._swa_l3_key = types.MethodType(SWAComponent._swa_l3_key, comp)
         return comp
@@ -531,9 +544,20 @@ class TestStrictL3Coupled(unittest.TestCase):
             page_size=self.PAGE_SIZE,
             evict_host=lambda *a, **k: None,
         )
+        comp.tree_core = types.SimpleNamespace(
+            has_swa_host_pool=True,
+            enable_hicache=True,
+            page_size=self.PAGE_SIZE,
+        )
         return comp
 
     def _build_prefetch(self, comp, prefetch_tokens):
+        # Window sizing/allocation lives in prepare_prefetch; the transfer
+        # builder only wraps the host window it handed back. Drive both so the
+        # ring-paged geometry is exercised end to end.
+        prep = SWAComponent.prepare_prefetch(comp, 1, prefetch_tokens=prefetch_tokens)
+        if prep.host_indices is None:
+            return None
         # `node` is the matched-prefix anchor (empty after a flush); the strict
         # branch must NOT key off it -- it emits placeholders the controller
         # later rewrites to real hit-range hashes.
@@ -545,6 +569,7 @@ class TestStrictL3Coupled(unittest.TestCase):
             comp,
             node,
             CacheTransferPhase.PREFETCH,
+            host_indices=prep.host_indices,
             token_ids=list(range(prefetch_tokens)),
             prefetch_tokens=prefetch_tokens,
         )
@@ -625,10 +650,6 @@ class TestStrictL3Coupled(unittest.TestCase):
         self.assertEqual(transfers[0].keys, ["ph1", "ph2"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestEvictDeviceOnOwnerRelease(unittest.TestCase):
     """SWAComponent.evict_device_on_owner_release: once the owning request has
     finished (SWA lock_ref==0) and the host copy is committed, the per-request
@@ -650,11 +671,15 @@ class TestEvictDeviceOnOwnerRelease(unittest.TestCase):
         comp.component_type = SWA
         calls = []
 
-        class _Cache:
-            def _evict_component_and_detach_lru(_s, node, c, target=None):
+        class _TreeCore:
+            def _evict_component_and_detach_lru(
+                _s, node, c, target=None, device_frees=None, host_frees=None
+            ):
                 calls.append((node, c, target))
 
-        comp.cache = _Cache()
+        comp.tree_core = _TreeCore()
+        # Cache-level entry point: it drains the collected frees itself.
+        comp.cache = types.SimpleNamespace(_free_values=lambda d, h: None)
         return comp, calls
 
     def _run(self, comp, node):
@@ -726,10 +751,13 @@ class TestSwaL3RoundTrip(unittest.TestCase):
         comp._swa_kv_pool_host = types.SimpleNamespace(slot_page_size=self.RING)
         attached = []
         comp._attach_swa_host_value = lambda n, s: attached.append(n)
-        comp._release_swa_host = lambda s: None
-        comp.cache = types.SimpleNamespace(
+        comp._release_swa_host = lambda s, actions: None
+        comp.cache = types.SimpleNamespace(page_size=self.PAGE_SIZE)
+        comp.tree_core = types.SimpleNamespace(
             page_size=self.PAGE_SIZE,
-            _split_node=lambda *a, **k: None,
+            has_swa_host_pool=True,
+            enable_hicache=True,
+            _split_node=lambda *a, **k: (None, None),
         )
         comp._attached = attached
         return comp
@@ -750,8 +778,9 @@ class TestSwaL3RoundTrip(unittest.TestCase):
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
+        comp.tree_core.node_by_id = lambda nid: carrier
         insert_result = types.SimpleNamespace(
-            inserted_host_node=carrier, total_len=self.RING
+            inserted_host_node=1, total_len=self.RING  # NodeId handle
         )
         # one window (RING=512) covers stride//page = 2 Full pages -> the
         # coupling guard needs kv_hit_pages >= 2 for the window to attach.
@@ -764,6 +793,7 @@ class TestSwaL3RoundTrip(unittest.TestCase):
             transfers=transfers,
             insert_result=insert_result,
             pool_storage_result=pool_storage_result,
+            cache_actions=[],
         )
         # SimpleNamespace is unhashable (defines __eq__); check by identity.
         self.assertTrue(any(n is carrier for n in comp._attached))
@@ -787,8 +817,9 @@ class TestSwaL3RoundTrip(unittest.TestCase):
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
+        comp.tree_core.node_by_id = lambda nid: carrier
         insert_result = types.SimpleNamespace(
-            inserted_host_node=carrier, total_len=self.RING
+            inserted_host_node=1, total_len=self.RING  # NodeId handle
         )
         # window needs 2 Full pages but only 1 hit -> guard drops it.
         pool_storage_result = types.SimpleNamespace(
@@ -800,6 +831,7 @@ class TestSwaL3RoundTrip(unittest.TestCase):
             transfers=transfers,
             insert_result=insert_result,
             pool_storage_result=pool_storage_result,
+            cache_actions=[],
         )
         self.assertFalse(any(n is carrier for n in comp._attached))
 
@@ -825,9 +857,13 @@ class TestSwaStateCommitCouplingGuard(unittest.TestCase):
         comp._swa_kv_pool_host = types.SimpleNamespace(slot_page_size=self.RING)
         attached = []
         comp._attach_swa_host_value = lambda n, s: attached.append(n)
-        comp._release_swa_host = lambda s: None
-        comp.cache = types.SimpleNamespace(
-            page_size=self.PAGE_SIZE, _split_node=lambda *a, **k: None
+        comp._release_swa_host = lambda s, actions: None
+        comp.cache = types.SimpleNamespace(page_size=self.PAGE_SIZE)
+        comp.tree_core = types.SimpleNamespace(
+            page_size=self.PAGE_SIZE,
+            has_swa_host_pool=True,
+            enable_hicache=True,
+            _split_node=lambda *a, **k: (None, None),
         )
         comp._attached = attached
         return comp
@@ -845,8 +881,9 @@ class TestSwaStateCommitCouplingGuard(unittest.TestCase):
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
+        comp.tree_core.node_by_id = lambda nid: carrier
         insert_result = types.SimpleNamespace(
-            inserted_host_node=carrier, total_len=self.RING
+            inserted_host_node=1, total_len=self.RING  # NodeId handle
         )
         psr = types.SimpleNamespace(extra_pool_hit_pages=extra, kv_hit_pages=kv_hit)
         SWAComponent._commit_prefetch(
@@ -855,6 +892,7 @@ class TestSwaStateCommitCouplingGuard(unittest.TestCase):
             transfers=transfers,
             insert_result=insert_result,
             pool_storage_result=psr,
+            cache_actions=[],
         )
         return carrier
 

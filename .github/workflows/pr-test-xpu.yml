@@ -103,7 +103,7 @@ jobs:
         timeout-minutes: 60
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu
@@ -179,7 +179,7 @@ jobs:
         timeout-minutes: 60
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           docker exec -w /sglang-checkout/python ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu

@@ -38,6 +38,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+from sglang.kernels.ops.attention.dsv4.gemm import mark_hpc_bf16xfp32_gemm_enabled
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
@@ -220,6 +221,12 @@ class LongcatFlashRouter(nn.Module):
         self.hpc_kernel_min_m = _LONGCAT_FLASH_ROUTER_HPC_GEMM_MIN_M.get(
             (config.hidden_size, self.n_routed_experts)
         )
+        if (
+            self.hpc_kernel_min_m is not None
+            and self.rounter_params_dtype == torch.float32
+            and self.classifier.bias is None
+        ):
+            mark_hpc_bf16xfp32_gemm_enabled()
 
     def forward(self, hidden_states):
         if (

@@ -1,6 +1,6 @@
 import concurrent.futures
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -78,6 +78,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(

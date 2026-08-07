@@ -2095,8 +2095,82 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if get_moe_runner_backend().is_hpc_ops():
+            self._prepare_hpc_ops_weights(layer)
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+
+    def _prepare_hpc_ops_weights(self, layer: Module) -> None:
+        """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
+
+        - Blockwise FP8: the kernel wants [E, N/128, K/128] float32 dequant
+          scales with the K dim padded to a multiple of 4.
+        - Per-tensor FP8: the kernel wants per-expert dequant alphas
+          (weight_scale * input_scale) and a static w2 input scale; this
+          requires the static activation scheme.
+        """
+        from sglang.srt.layers.moe.moe_runner.hpc_ops import pad_hpc_ops_block_scale
+
+        if self.block_quant:
+            layer.hpc_ops_w13_weight_scale = pad_hpc_ops_block_scale(
+                layer.w13_weight_scale_inv.data.float()
+            )
+            layer.hpc_ops_w2_weight_scale = pad_hpc_ops_block_scale(
+                layer.w2_weight_scale_inv.data.float()
+            )
+        else:
+            if layer.w13_input_scale is None or layer.w2_input_scale is None:
+                raise ValueError(
+                    "The hpc_ops MoE runner backend requires static activation "
+                    "scales for per-tensor FP8 models (activation_scheme="
+                    "'static' in the checkpoint quantization config)."
+                )
+            layer.hpc_ops_gate_up_alphas = (
+                layer.w13_weight_scale.data.float() * layer.w13_input_scale.data.float()
+            )
+            layer.hpc_ops_down_alphas = (
+                layer.w2_weight_scale.data.float() * layer.w2_input_scale.data.float()
+            )
+
+    def _get_hpc_ops_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.hpc_ops import HpcOpsMoeQuantInfo
+
+        # The HPC-Ops fused kernels take no per-expert GEMM bias; refuse
+        # instead of silently dropping it.
+        if (
+            getattr(layer, "w13_weight_bias", None) is not None
+            or getattr(layer, "w2_weight_bias", None) is not None
+        ):
+            raise ValueError(
+                "The hpc_ops MoE runner backend does not support MoE GEMM "
+                "biases (w13_weight_bias / w2_weight_bias); use another "
+                "--moe-runner-backend for this model."
+            )
+
+        if self.block_quant:
+            return HpcOpsMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                block_quant=True,
+                global_num_experts=int(layer.num_experts),
+                moe_ep_rank=int(layer.moe_ep_rank),
+                w13_weight_scale_inv=layer.hpc_ops_w13_weight_scale,
+                w2_weight_scale_inv=layer.hpc_ops_w2_weight_scale,
+                block_shape=self.quant_config.weight_block_size,
+            )
+        else:
+            return HpcOpsMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                block_quant=False,
+                global_num_experts=int(layer.num_experts),
+                moe_ep_rank=int(layer.moe_ep_rank),
+                gate_up_alphas=layer.hpc_ops_gate_up_alphas,
+                down_alphas=layer.hpc_ops_down_alphas,
+                w13_input_scale=layer.w13_input_scale,
+                w2_input_scale=layer.w2_input_scale,
+            )
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
@@ -2195,6 +2269,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -2452,6 +2527,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 activation_type=activation_type,
             )
+        elif self.runner.runner_backend.is_hpc_ops():
+            quant_info = self._get_hpc_ops_quant_info(layer)
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
         else:

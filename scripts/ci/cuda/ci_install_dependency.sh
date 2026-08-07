@@ -469,8 +469,14 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.11.post1"
+    MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
+    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
+    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
+    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
+    # re-baseline MODEL_SCORE_THRESHOLDS in
+    # test/registered/eval/test_text_models_gsm8k_eval.py first.
+    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -505,6 +511,8 @@ install_extra_deps() {
         $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
+
+    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

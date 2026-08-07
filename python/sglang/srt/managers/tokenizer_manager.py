@@ -279,6 +279,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        *,
+        start_pd_bootstrap_service: bool = True,
     ):
         # Parse args
         self.server_args = server_args
@@ -318,7 +320,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_lora()
 
         # Init PD disaggregation and encoder disaggregation
-        self.init_disaggregation()
+        self.init_disaggregation(start_pd_bootstrap_service=start_pd_bootstrap_service)
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
@@ -522,13 +524,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
-    def init_disaggregation(self):
+    def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
         # Keep a reference so the bootstrap server is not garbage-collected.
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        self.bootstrap_server = (
+            start_disagg_service(self.server_args)
+            if start_pd_bootstrap_service
+            else None
+        )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -2495,7 +2501,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
-                labels, state.time_stats.get_first_token_latency()
+                labels,
+                state.time_stats.get_first_token_latency(),
+                stream=getattr(state.obj, "stream", False),
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens

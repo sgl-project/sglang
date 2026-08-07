@@ -49,11 +49,16 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported
-from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
 
 
 def apply_rotary_emb(
@@ -120,17 +125,6 @@ class DSparkAttention(MqaAttentionBase):
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
         return kv
-
-    def _local_attn_sink(self) -> torch.Tensor:
-        if self.attn_tp_size == 1:
-            return self.attn_sink
-        if self._attn_sink_local is None:
-            rank = self.attn_tp_rank
-            num_heads = self.n_local_heads
-            sink = self.attn_sink.new_zeros(max(num_heads, _PAD_NUM_HEADS))
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
-        return self._attn_sink_local
 
     def _store_block_kv(
         self,
@@ -536,7 +530,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.input_layernorm(x)
-        x = self.self_attn(positions, x, forward_batch)
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
 
         residual = x
@@ -759,9 +754,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_embed_stack = None
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
         confidence = confidence_head.apply_sts(confidence_raw)
-        maybe_detect_in_closed_range(
-            confidence, 0.0, 1.0, "DSpark confidence must lie in [0, 1]."
-        )
+        expect(_CONFIDENCE, confidence)
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:

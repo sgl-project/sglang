@@ -121,6 +121,7 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
             or b.is_flashinfer_trtllm()
             or b.is_flashinfer_trtllm_routed()
             or b.is_flashinfer_mxfp4()
+            or b.is_hpc_ops()
         )
     except Exception:  # pragma: no cover - backend not initialized
         return False

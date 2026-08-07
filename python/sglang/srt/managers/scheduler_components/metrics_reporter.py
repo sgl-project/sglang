@@ -304,6 +304,8 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
                 prefill_q.add(len(req.origin_input_ids))
+            for req in self.scheduler.waiting_queue:
+                prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             for req in self.scheduler.disagg_decode_prealloc_queue.queue:
                 decode_q.add(req.seqlen)

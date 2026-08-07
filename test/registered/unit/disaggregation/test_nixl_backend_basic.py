@@ -451,8 +451,10 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_staging = False
         mgr._staging_ctx = None
         mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
-        mgr.kv_args = SimpleNamespace(engine_rank=0)
+        mgr.transfer_source_rank = 0
+        mgr.kv_args = SimpleNamespace(engine_rank=0, kv_data_ptrs=[0])
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -493,6 +495,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        mgr.send_aux.assert_called_once()
 
     def test_given_non_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -507,6 +510,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
         self.assertIn(room, mgr.transfer_infos)
         self.assertIn(room, mgr.req_to_decode_prefix_len)
+        mgr.send_kvcache.assert_called_once()
 
 
 class TestNixlNotifications(CustomTestCase):
@@ -699,6 +703,7 @@ class TestNixlStaging(CustomTestCase):
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
+        mgr.transfer_source_rank = 1
         mgr.kv_args = SimpleNamespace(
             gpu_id=1,
             engine_rank=1,
@@ -791,6 +796,7 @@ class TestNixlStaging(CustomTestCase):
 
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
+        mgr._staging_ctx = PrefillStagingContext()
         strategy = MagicMock()
         strategy.check_ready.return_value = (False, 0, -1, 0, -1)
         kv_chunk = TransferKVChunk(

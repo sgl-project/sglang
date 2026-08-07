@@ -11,7 +11,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
+from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -1505,6 +1509,113 @@ def _generate_block_kvcache(
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+@pytest.mark.skipif(
+    not is_sm100_or_sm110_supported(),
+    reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
+)
+@pytest.mark.parametrize("mha_type", ["mqa", "gqa"])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 128),  # plain decode
+        (4, 1024),  # speculative decode (multiple q rows per request)
+        (64, 800),  # chunked extend
+        (16, 20000),  # long context
+    ],
+)
+def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
+    """DeepSeek absorbed-MLA FA4 shape: rope q/k head_dim 64, latent v/qv
+    head_dim 512, varlen q over a paged KV cache, num_splits=1. Mirrors the
+    production calls in flashattention_backend.py, where extend
+    (flash_attn_varlen_func) and decode (flash_attn_with_kvcache) share this
+    qv-threaded path.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.random.manual_seed(seqlen_q + seqlen_k)
+    batch_size = 5
+    nheads = 8
+    nheads_k = 1 if mha_type == "mqa" else 4
+    d, dv = 64, 512
+    page_size = 128
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    qv = torch.randn(batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype)
+    k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, _ = (
+        _generate_block_kvcache(
+            seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype
+        )
+    )
+    cache_seqlens = torch.randint(
+        seqlen_q, seqlen_k + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    cache_seqlens[0] = seqlen_k
+    cu_seqlens_q = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    )
+
+    out_unpad = flash_attn_varlen_func(
+        rearrange(q, "b s h d -> (b s) h d"),
+        k_cache_paged,
+        v_cache_paged,
+        qv=rearrange(qv, "b s h d -> (b s) h d"),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,  # KV comes from the paged cache via seqused_k
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=True,
+        num_splits=1,
+        ver=4,
+    )
+    out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
+
+    # Decode enters through the flash_attn_with_kvcache wrapper; it must
+    # thread qv/num_splits down to the same varlen kernel call bit-for-bit.
+    out_kvcache = flash_attn_with_kvcache(
+        q=rearrange(q, "b s h d -> (b s) h d"),
+        k_cache=k_cache_paged,
+        v_cache=v_cache_paged,
+        qv=rearrange(qv, "b s h d -> (b s) h d"),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        causal=True,
+        num_splits=1,
+        ver=4,
+    )
+    assert torch.equal(out_kvcache, out_unpad)
+
+    key_padding_mask = rearrange(
+        torch.arange(seqlen_k, device=device), "s -> 1 s"
+    ) < rearrange(cache_seqlens, "b -> b 1")
+    k_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    v_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    out_ref, _ = attention_ref(
+        q, k_rep, v_rep, None, key_padding_mask, causal=True, qv=qv
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k_rep,
+        v_rep,
+        None,
+        key_padding_mask,
+        causal=True,
+        qv=qv,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 1.5 * (
+        out_pt - out_ref
+    ).abs().mean().item()
 
 
 if __name__ == "__main__":

@@ -46,14 +46,14 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Coeffs {
         let count = (xmax - xmin) as usize;
         let k = &mut kkf[xx * ksize..(xx + 1) * ksize];
         let mut ww = 0.0f64;
-        for x in 0..count {
+        for (x, kv) in k[..count].iter_mut().enumerate() {
             let w = lanczos((x as f64 + xmin as f64 - center + 0.5) * ss);
-            k[x] = w;
+            *kv = w;
             ww += w;
         }
         if ww != 0.0 {
-            for x in 0..count {
-                k[x] /= ww;
+            for kv in k[..count].iter_mut() {
+                *kv /= ww;
             }
         }
         bounds[xx] = (xmin as usize, count);
@@ -111,35 +111,27 @@ fn resample_horizontal(src: &[u8], h: usize, w: usize, out_w: usize, c: &Coeffs)
 
 fn resample_vertical(src: &[u8], w: usize, out_h: usize, c: &Coeffs) -> Vec<u8> {
     let mut out = vec![0u8; out_h * w * 3];
-    out.par_chunks_mut(w * 3)
-        .enumerate()
-        .for_each(|(yy, row)| {
-            let (ymin, count) = c.bounds[yy];
-            let k = &c.kk[yy * c.ksize..yy * c.ksize + count];
-            for x in 0..w {
-                let mut s = [1i32 << (PRECISION_BITS - 1); 3];
-                for (y, &coef) in k.iter().enumerate() {
-                    let p = ((ymin + y) * w + x) * 3;
-                    s[0] += src[p] as i32 * coef;
-                    s[1] += src[p + 1] as i32 * coef;
-                    s[2] += src[p + 2] as i32 * coef;
-                }
-                let o = x * 3;
-                row[o] = clip8(s[0]);
-                row[o + 1] = clip8(s[1]);
-                row[o + 2] = clip8(s[2]);
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(yy, row)| {
+        let (ymin, count) = c.bounds[yy];
+        let k = &c.kk[yy * c.ksize..yy * c.ksize + count];
+        for x in 0..w {
+            let mut s = [1i32 << (PRECISION_BITS - 1); 3];
+            for (y, &coef) in k.iter().enumerate() {
+                let p = ((ymin + y) * w + x) * 3;
+                s[0] += src[p] as i32 * coef;
+                s[1] += src[p + 1] as i32 * coef;
+                s[2] += src[p + 2] as i32 * coef;
             }
-        });
+            let o = x * 3;
+            row[o] = clip8(s[0]);
+            row[o + 1] = clip8(s[1]);
+            row[o + 2] = clip8(s[2]);
+        }
+    });
     out
 }
 
-pub fn resize_lanczos_rgb(
-    src: &[u8],
-    h: usize,
-    w: usize,
-    out_h: usize,
-    out_w: usize,
-) -> Vec<u8> {
+pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<u8> {
     let need_h = out_w != w;
     let need_v = out_h != h;
     if need_h && need_v {
@@ -158,12 +150,7 @@ pub fn resize_lanczos_rgb(
     }
 }
 
-pub fn scaled_dims(
-    w: usize,
-    h: usize,
-    frac: Option<f64>,
-    cap: Option<i64>,
-) -> (usize, usize) {
+pub fn scaled_dims(w: usize, h: usize, frac: Option<f64>, cap: Option<i64>) -> (usize, usize) {
     let Some(frac) = frac else {
         return (w, h);
     };
