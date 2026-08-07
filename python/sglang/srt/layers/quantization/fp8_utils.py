@@ -277,6 +277,7 @@ class Fp8GemmRunnerBackend(Enum):
     AUTO = "auto"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -291,6 +292,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -499,7 +503,10 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = get_fp8_gemm_runner_backend()
     if backend.is_deep_gemm():
         return _deepgemm_w8a8_mxfp8_linear_with_fallback
-    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
+    elif (backend.is_flashinfer_cutlass()
+          or backend.is_flashinfer_cutedsl()
+          or backend.is_flashinfer_trtllm()
+          ):
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_triton():
         return triton_mxfp8_blockscaled_linear
@@ -1386,6 +1393,17 @@ def flashinfer_mxfp8_blockscaled_linear(
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
             backend="cutlass",
+        )
+    elif get_fp8_gemm_runner_backend().is_flashinfer_cutedsl():
+        weight_scale_t = weight_scale.contiguous().view(-1)
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight_t,
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="cute-dsl",
         )
 
     if bias is not None:
