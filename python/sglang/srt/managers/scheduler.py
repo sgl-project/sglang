@@ -544,6 +544,20 @@ class Scheduler(
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
+        if _is_npu and self.tp_worker.model_runner.model_config.is_deepseek_v4_arch:
+            rank = (
+                self.ps.dp_rank
+                if self.ps.dp_rank is not None
+                else self.tp_group.rank_in_group
+            )
+            logger.info("HCCL DP prewarm start: rank=%s", rank)
+            _prewarm_hccl_group(
+                device=self.tp_group.device,
+                group=self.tp_group.device_group,
+                device_module=self.tp_group.device_module,
+            )
+            logger.info("HCCL DP prewarm done: rank=%s", rank)
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
