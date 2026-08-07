@@ -121,7 +121,7 @@ sequenceDiagram
 | `condition_inputs` | object | 否 | 初始 action、chunk seed 和 prompt schedule |
 | `realtime_output_format` | `raw` / `webp` / `jpeg` | 建议 | 浏览器推荐 `webp` |
 | `realtime_preview_max_width` | int | 否 | 预览缩放最大宽度，例如 560；省略则使用输出尺寸 |
-| `realtime_output_pacing` | bool | 建议 | 低延迟 UI 建议 `false` |
+| `realtime_output_pacing` | bool | 建议 | 公网 WebUI 建议 `true`，让支持 pacing 的后端按目标 FPS 稳定出流；极限低延迟压测可设 `false` |
 | `output_compression` | int | 否 | WebP/JPEG quality；当前低延迟配置使用 55 |
 | `realtime_causal_sink_size` | int | 否 | 因果 KV sink 帧数，通常沿用服务默认值 |
 | `realtime_causal_kv_cache_num_frames` | int | 否 | 因果 KV 窗口，通常沿用服务默认值 |
@@ -146,7 +146,7 @@ const init = {
   guidance_scale: 0,
   realtime_output_format: "webp",
   realtime_preview_max_width: 560,
-  realtime_output_pacing: false,
+  realtime_output_pacing: true,
   output_compression: 55,
   trace_id: traceId,
 };
@@ -495,8 +495,8 @@ ws.onmessage = async ({ data }) => {
 实现播放器时建议：
 
 1. 每个 chunk 内按 `frame_batch_index` 排序，按帧顺序进入有界队列。
-2. 第一批数据到达即可播放，不等待完整 chunk。
-3. 队列积压时丢弃过期帧，优先追上最新 action 对应的 `event_id`。
+2. 第一批数据到达后保留一个很小的 jitter lead 再播放，不等待完整 chunk。
+3. 队列积压时丢弃过期帧，优先追上最新 action 对应的 `event_id`；公网链路建议保留约 360-900ms 的有界播放 lead。
 4. 在主线程之外解码图片，使用 `ImageBitmap` 或 WebCodecs，绘制后及时 `close()`。
 5. 页面失焦时发送空按键状态；Stop 时先清空按键，再关闭 WebSocket。
 6. Trace 页单独调用 REST 查询；Preview/媒体播放热路径不要轮询 CloudWatch。

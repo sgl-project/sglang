@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from sglang.multimodal_gen.runtime.entrypoints import realtime_gateway_server
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
     HTTPCoordinatorClient,
+    _browser_send_trace_fields,
     _parse_args,
     _parse_ui_config,
     create_app,
@@ -59,7 +60,39 @@ def test_gateway_trace_events_use_the_independent_otlp_log_plane():
     source = inspect.getsource(realtime_gateway_server)
 
     assert "emit_realtime_trace_payload" in source
+    assert "gateway.browser_send_complete" in source
     assert 'logger.info(\n        "realtime_trace %s"' not in source
+
+
+def test_gateway_browser_send_trace_fields_keep_media_metadata_without_payload():
+    fields = _browser_send_trace_fields(
+        encode_message(
+            "frame_batch",
+            session_id="session-a",
+            generation_id="generation-a",
+            request_id="request-a",
+            chunk_index=3,
+            frame_batch_index=2,
+            num_frame_batches=4,
+            payload_lengths=[17, 19],
+            payload=b"opaque",
+            content_type="image/webp",
+            width=8,
+            height=8,
+            num_frames=2,
+            is_final_frame_batch=False,
+        )
+    )
+
+    assert fields["message_type"] == "frame_batch"
+    assert fields["chunk_index"] == 3
+    assert fields["frame_batch_index"] == 2
+    assert fields["num_frames"] == 2
+    assert fields["content_type"] == "image/webp"
+    assert fields["payload_bytes"] == 36
+    assert fields["payload_count"] == 2
+    assert fields["wire_bytes"] > fields["payload_bytes"]
+    assert "payload" not in fields
 
 
 def test_gateway_coordinator_release_treats_lost_lease_as_idempotent():

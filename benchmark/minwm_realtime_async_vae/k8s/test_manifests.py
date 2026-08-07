@@ -134,7 +134,7 @@ def test_vae_pipeline_keeps_one_waiting_latent_and_sends_low_latency_batches():
     )
     args = _container(deployment, "vae")["args"]
     assert "--queue-depth-per-session=1" in args
-    assert "--encoded-frames-per-batch=8" in args
+    assert "--encoded-frames-per-batch=4" in args
 
 
 def test_gpu_workers_publish_epoch_state_and_drain_before_termination():

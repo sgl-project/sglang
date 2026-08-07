@@ -104,36 +104,36 @@ assert.match(
 assert.match(
   appJs,
   /lowLatencyPlayback:\s*true/,
-  "webui should render at the requested cadence without accumulating a smoothing queue",
+  "webui should keep low-latency backlog trimming enabled",
 );
 assert.match(
   appJs,
-  /holdForTargetLead:\s*false/,
-  "webui should start from the first decoded frame",
+  /holdForTargetLead:\s*true/,
+  "webui should hold a small jitter lead before rendering public websocket media",
 );
 assert.match(
   appJs,
-  /targetLeadChunkRatio:\s*0\.55/,
+  /targetLeadChunkRatio:\s*0\.75/,
   "24 fps playback should keep enough jitter lead for sub-24fps backend delivery",
 );
 assert.match(
   appJs,
-  /minTargetLeadMs:\s*260/,
+  /minTargetLeadMs:\s*360/,
   "24 fps playback should avoid chasing a too-small buffer when backend delivery is bursty",
 );
 assert.match(
   appJs,
-  /maxTargetLeadMs:\s*640/,
+  /maxTargetLeadMs:\s*900/,
   "24 fps playback should trade a bounded sub-second lead for smoother display",
 );
 assert.match(
   appJs,
-  /maxDeliveryLeadBoostMs:\s*240/,
+  /maxDeliveryLeadBoostMs:\s*360/,
   "webui should bound adaptive jitter buffering",
 );
 assert.match(
   appJs,
-  /lowLatencyMaxLeadFrames:\s*8/,
+  /lowLatencyMaxLeadFrames:\s*12/,
   "live playback should retain a small 24 fps frame cushion before dropping stale frames",
 );
 assert.match(
@@ -141,15 +141,10 @@ assert.match(
   /requestAnimationFrame\(renderLoop\)/,
   "visible playback should render on the browser refresh clock",
 );
-assert.doesNotMatch(
-  appJs,
-  /realtime_output_pacing:\s*true/,
-  "webui should not ask the backend to pace output in low-latency mode",
-);
 assert.match(
   appJs,
-  /realtime_output_pacing:\s*false/,
-  "webui should explicitly request immediate chunk delivery",
+  /realtime_output_pacing:\s*true/,
+  "webui should request backend pacing when available to smooth preview delivery",
 );
 assert.match(
   indexHtml,

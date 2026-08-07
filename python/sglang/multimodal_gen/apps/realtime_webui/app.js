@@ -451,18 +451,18 @@ const playbackController = new RealtimePlaybackController({
   mode: "live",
   targetFps: DEFAULT_TARGET_FPS,
   lowLatencyPlayback: true,
-  holdForTargetLead: false,
-  targetLeadChunkRatio: 0.55,
-  minTargetLeadMs: 260,
-  maxTargetLeadMs: 640,
-  lowLatencyMaxLeadFrames: 8,
-  startLeadChunkRatio: 0.35,
-  minStartLeadMs: 180,
-  resumeLeadChunkRatio: 0.35,
-  minResumeLeadMs: 180,
-  maxResumeLeadMs: 640,
-  maxDeliveryLeadBoostMs: 240,
-  deliveryStallExpectedMultiplier: 1.5,
+  holdForTargetLead: true,
+  targetLeadChunkRatio: 0.75,
+  minTargetLeadMs: 360,
+  maxTargetLeadMs: 900,
+  lowLatencyMaxLeadFrames: 12,
+  startLeadChunkRatio: 0.55,
+  minStartLeadMs: 260,
+  resumeLeadChunkRatio: 0.55,
+  minResumeLeadMs: 260,
+  maxResumeLeadMs: 900,
+  maxDeliveryLeadBoostMs: 360,
+  deliveryStallExpectedMultiplier: 1.8,
 });
 
 function setStatus(text, kind = "") {
@@ -3472,7 +3472,7 @@ async function decodeAndEnqueueFrameBatch(header, data, epoch) {
   }
   frames += chunkFrameCount;
   bytes += payloadBytes;
-  $("payloadMode").textContent = header.encoding || "raw RGB";
+  $("payloadMode").textContent = payloadModeLabelFromHeader(header);
   updateOutputSizeFromHeader(header);
   setStatus("Live", "live");
   updateStats();
@@ -3743,7 +3743,7 @@ function readPreviewTransportParams() {
   if (!outputFormat) return {};
   const params = {
     realtime_output_format: outputFormat,
-    realtime_output_pacing: false,
+    realtime_output_pacing: true,
   };
   const baseSize = parseSizeValue($("size").value);
   params.realtime_preview_max_width = previewMaxWidthForSize(baseSize);
@@ -3878,6 +3878,12 @@ function shortPayloadMode(contentType) {
   if (contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE) return "delta-gzip";
   if (contentType === RAW_RGB_CONTENT_TYPE) return "raw RGB";
   return contentType;
+}
+
+function payloadModeLabelFromHeader(header) {
+  if (header?.encoding) return header.encoding;
+  const label = shortPayloadMode(header?.content_type || "");
+  return label || selectedTransportLabel();
 }
 
 function formatBytes(value) {

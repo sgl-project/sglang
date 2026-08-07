@@ -85,6 +85,55 @@ def _log_gateway_trace(trace_id: str, event: str, **fields: Any) -> None:
     emit_realtime_trace_payload(logger, payload)
 
 
+def _browser_send_trace_fields(wire: bytes) -> dict[str, Any]:
+    fields: dict[str, Any] = {"wire_bytes": len(wire)}
+    try:
+        message = decode_message(wire)
+    except ProtocolViolation:
+        fields["message_type"] = "invalid"
+        return fields
+
+    fields["message_type"] = message.get("type")
+    for name in (
+        "request_id",
+        "chunk_index",
+        "frame_batch_index",
+        "num_frame_batches",
+        "is_final_frame_batch",
+        "event_id",
+        "action_version",
+        "prompt_version",
+        "num_frames",
+        "content_type",
+        "encoding",
+        "width",
+        "height",
+        "source_width",
+        "source_height",
+        "preview_width",
+        "preview_height",
+    ):
+        value = message.get(name)
+        if value is not None:
+            fields[name] = value
+
+    payload = message.get("payload")
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        fields["payload_bytes"] = len(payload)
+    payload_lengths = message.get("payload_lengths")
+    if isinstance(payload_lengths, list):
+        lengths: list[int] = []
+        for item in payload_lengths:
+            try:
+                lengths.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if lengths:
+            fields["payload_bytes"] = sum(lengths)
+            fields["payload_count"] = len(lengths)
+    return fields
+
+
 class CoordinatorClient(Protocol):
     async def health(self) -> dict[str, Any]: ...
 
@@ -464,7 +513,7 @@ def create_app(
                             raise ProtocolViolation(
                                 f"Denoiser emitted forbidden message: {message_type}"
                             )
-                        await sender.send(wire)
+                        await send_browser_with_trace(wire, send_source="denoiser")
                 except ConnectionClosedOK:
                     return
 
@@ -472,9 +521,42 @@ def create_app(
                 while True:
                     wire = await route.get()
                     try:
-                        await sender.send(wire)
+                        await send_browser_with_trace(wire, send_source="vae")
                     finally:
                         route.task_done()
+
+            async def send_browser_with_trace(
+                wire: bytes, *, send_source: str
+            ) -> None:
+                send_started = time.perf_counter()
+                send_fields = _browser_send_trace_fields(wire)
+                try:
+                    await sender.send(wire)
+                except Exception as exc:
+                    _log_gateway_trace(
+                        trace_id,
+                        "gateway.browser_send_complete",
+                        session_id=session_id,
+                        generation_id=generation_id,
+                        send_source=send_source,
+                        send_ok=False,
+                        send_ms=round(
+                            (time.perf_counter() - send_started) * 1000, 3
+                        ),
+                        error_type=type(exc).__name__,
+                        **send_fields,
+                    )
+                    raise
+                _log_gateway_trace(
+                    trace_id,
+                    "gateway.browser_send_complete",
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    send_source=send_source,
+                    send_ok=True,
+                    send_ms=round((time.perf_counter() - send_started) * 1000, 3),
+                    **send_fields,
+                )
 
             async def renew_lease():
                 nonlocal assignment
