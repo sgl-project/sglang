@@ -1217,7 +1217,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
-                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+                # exclude_unset keeps protocol-model defaults (e.g. strict=False)
+                # out of the rendered tool schemas so the prompt matches the
+                # checkpoint's reference encoding exactly.
+                messages[0]["tools"] = [
+                    tool.model_dump(exclude_unset=True, by_alias=True)
+                    for tool in request.tools
+                ]
 
             # Default encoding (dsv4/dsv32)
             if self.chat_encoding_spec == "dsv4":
