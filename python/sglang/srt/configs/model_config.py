@@ -673,6 +673,8 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForCausalLM",
