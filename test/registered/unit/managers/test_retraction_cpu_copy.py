@@ -4,6 +4,13 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
+from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
+)
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -20,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,16 +49,25 @@ def _req(rid: str):
         lora_id=None,
         session=None,
         session_id=None,
+        bootstrap_host="127.0.0.1",
         pd_rebootstrap_forced_output_id=None,
         pd_rebootstrap_in_progress=False,
-        time_stats=SimpleNamespace(set_retract_time=Mock()),
+        time_stats=SimpleNamespace(
+            set_retract_time=Mock(),
+            set_decode_rebootstrap_prealloc_queue_entry_time=Mock(),
+        ),
     )
-    req.supports_pd_rebootstrap = lambda: Req.supports_pd_rebootstrap(req)
+    req.supports_pd_rebootstrap = lambda server_args: Req.supports_pd_rebootstrap(
+        req, server_args
+    )
     return req
 
 
-def _server_args():
-    return SimpleNamespace(disaggregation_mode="decode")
+def _server_args(transfer_backend: str = "mooncake"):
+    return SimpleNamespace(
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend=transfer_backend,
+    )
 
 
 def _batch(cpu_copy_supported: bool, req_count: int = 2):
@@ -137,7 +154,8 @@ class TestKVCacheCPUCopyCapability(CustomTestCase):
 class TestPDDecodeRetractionCPUCopy(CustomTestCase):
     def test_rebootstrap_requires_token_only_base_request(self):
         req = _req("eligibility")
-        self.assertTrue(req.supports_pd_rebootstrap())
+        args = _server_args()
+        self.assertTrue(req.supports_pd_rebootstrap(args))
 
         unsupported_fields = {
             "multimodal_inputs": object(),
@@ -151,8 +169,38 @@ class TestPDDecodeRetractionCPUCopy(CustomTestCase):
         for field, value in unsupported_fields.items():
             with self.subTest(field=field):
                 setattr(req, field, value)
-                self.assertFalse(req.supports_pd_rebootstrap())
+                self.assertFalse(req.supports_pd_rebootstrap(args))
                 setattr(req, field, None)
+
+    @patch(
+        "sglang.srt.managers.schedule_batch."
+        "NewTokenRatioTracker.estimate_new_token_ratio_after_retract",
+        return_value=0.5,
+    )
+    def test_fake_transfer_cannot_rebootstrap(self, _estimate):
+        """Fake transfer has no prefill-recompute dispatch implementation."""
+        cases = (
+            ("fake", None),
+            ("fake", "127.0.0.1"),
+            ("mooncake", FAKE_BOOTSTRAP_HOST),
+        )
+        for transfer_backend, bootstrap_host in cases:
+            with self.subTest(
+                transfer_backend=transfer_backend,
+                bootstrap_host=bootstrap_host,
+            ):
+                batch = _batch(cpu_copy_supported=False)
+                batch.reqs[1].bootstrap_host = bootstrap_host
+                args = _server_args(transfer_backend)
+
+                retracted, rebootstrap, _, aborted = batch.retract_decode(args)
+
+                self.assertEqual(retracted, [])
+                self.assertEqual(rebootstrap, [])
+                self.assertEqual([req.rid for req in aborted], ["1"])
+                self.assertIn(
+                    "cannot be safely recomputed", aborted[0].to_finish.message
+                )
 
     @patch(
         "sglang.srt.managers.schedule_batch."
@@ -298,6 +346,47 @@ class TestSchedulerRetractionAbort(CustomTestCase):
             req, is_rebootstrap=True
         )
 
+    def test_rebootstrap_restarts_timing_at_concrete_prealloc_admission(self):
+        """A second admission must not reuse the first bootstrap timestamps."""
+        req = _req("timing")
+        receiver = Mock()
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+        queue = object.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(server_args=_server_args())
+        queue.retracted_queue = []
+        queue.pending_reqs = []
+        queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
+        queue._create_receiver_and_enqueue = Mock(return_value=decode_req)
+        queue._resolve_prefill_dp_rank = Mock(return_value=0)
+
+        queue.add(req, is_rebootstrap=True)
+
+        req.time_stats.set_decode_rebootstrap_prealloc_queue_entry_time.assert_called_once_with()
+        receiver.init.assert_called_once_with(0)
+
+    def test_fake_rebootstrap_is_stopped_at_concrete_dispatch_boundary(self):
+        """A fake receiver must be aborted before recompute dispatch."""
+        req = _req("fake-dispatch")
+        req.bootstrap_host = None
+        fake_manager = object.__new__(FakeKVManager)
+        receiver = FakeKVReceiver(
+            mgr=fake_manager,
+            bootstrap_addr="2.2.2.2:0",
+            bootstrap_room=1,
+        )
+        decode_req = DecodeRequest(
+            req=req,
+            kv_receiver=receiver,
+            is_rebootstrap=True,
+        )
+        queue = object.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(server_args=_server_args("fake"))
+        queue.kv_manager = fake_manager
+
+        queue._submit_prefill_recompute(decode_req)
+
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+
     def test_abort_finalizes_request_and_async_offload_state(self):
         req = _req("abort")
         abort_reason = FINISH_ABORT(
@@ -330,6 +419,31 @@ class TestSchedulerRetractionAbort(CustomTestCase):
         abort_req, sent_req = send_output.call_args.args
         self.assertIs(sent_req, req)
         self.assertEqual(abort_req.finished_reason, req.finished_reason.to_json())
+
+
+class TestPDRebootstrapTiming(CustomTestCase):
+    def test_second_bootstrap_uses_second_admission_interval(self):
+        """Bootstrap/allocator metrics must describe the rebootstrap cycle."""
+        collector = Mock()
+        stats = SchedulerReqTimeStats(disagg_mode=DisaggregationMode.DECODE)
+        stats.set_metrics_collector(collector)
+        stats.decode_prealloc_queue_entry_time = 10.0
+        stats.decode_transfer_queue_entry_time = 12.0
+        stats.bootstrap_done_time = 11.0
+
+        stats.set_decode_rebootstrap_prealloc_queue_entry_time(ts=20.0)
+        self.assertEqual(stats.decode_transfer_queue_entry_time, 0.0)
+        self.assertEqual(stats.bootstrap_done_time, 0.0)
+
+        stats.set_bootstrap_done_time(ts=21.0)
+        stats.set_decode_transfer_queue_entry_time(ts=22.0)
+
+        self.assertEqual(stats.decode_prealloc_queue_entry_time, 20.0)
+        self.assertEqual(stats.bootstrap_done_time, 21.0)
+        collector.observe_kv_transfer_bootstrap.assert_called_once_with(
+            bootstrap_ms=1000.0,
+            alloc_ms=1000.0,
+        )
 
 
 if __name__ == "__main__":

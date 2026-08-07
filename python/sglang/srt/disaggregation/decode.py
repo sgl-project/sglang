@@ -535,6 +535,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        if is_rebootstrap:
+            req.time_stats.set_decode_rebootstrap_prealloc_queue_entry_time()
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -638,19 +641,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
-        if getattr(req, "pd_rebootstrap_in_progress", False):
+        if req.pd_rebootstrap_in_progress:
             return len(req.origin_input_ids) + len(req.output_ids)
         return len(req.origin_input_ids)
 
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
-        if getattr(req, "pd_rebootstrap_in_progress", False):
-            # pause_generation(retract) already popped the boundary token out of
+        if req.pd_rebootstrap_in_progress:
+            # Rebootstrap preparation already popped the boundary token out of
             # output_ids (it is replayed via the decode-side override at commit
-            # time), so output_ids here is prompt + emitted-tokens-minus-boundary,
-            # i.e. the original seqlen - 1. The prefill recomputes KV for *all* of
-            # these tokens, leaving no just-sampled "pending" token in the list, so
-            # we allocate exactly len(origin)+len(output_ids) with no -1 (unlike
+            # time), so output_ids here is emitted-tokens-minus-boundary, i.e. the
+            # original seqlen - 1. The prefill recomputes KV for *all* of these
+            # tokens, leaving no just-sampled "pending" token in the list, so we
+            # allocate exactly len(origin)+len(output_ids) with no -1 (unlike
             # normal decode, where the last token's KV has not been written yet).
             # This is the same token count as offloading-based retraction, where
             # offload_kv_cache saves seqlen-1 tokens; the boundary token's KV is
@@ -1300,10 +1303,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
-                )
+                self._submit_prefill_recompute(decode_req)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1313,6 +1313,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _submit_prefill_recompute(self, decode_req: DecodeRequest) -> None:
+        """Dispatch rebootstrap only through a real transfer connection."""
+        if (
+            self.scheduler.server_args.disaggregation_transfer_backend == "fake"
+            or _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+        ):
+            logger.error(
+                "PD rebootstrap requires a real transfer backend; aborting "
+                "request %s before prefill recompute dispatch.",
+                decode_req.req.rid,
+            )
+            decode_req.kv_receiver.abort()
+            return
+
+        self.kv_manager.submit_prefill_recompute(
+            decode_req.kv_receiver,
+            decode_req.req.build_rebootstrap_payload(),
+        )
 
     @property
     def num_tokens_pre_allocated(self):

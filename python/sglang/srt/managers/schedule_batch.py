@@ -69,7 +69,11 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
+    _is_fake_transfer,
+)
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -1129,9 +1133,11 @@ class Req(ReqDllmMixin):
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         # Decode-local: the already-emitted boundary token to replay when a
-        # retracted request is rebootstrapped. Set in pause_generation(retract)
-        # and consumed in the decode transfer commit; never plumbed to prefill.
+        # retracted request is rebootstrapped. Set by the generic rebootstrap
+        # preparation step and consumed in the decode transfer commit; never
+        # plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        self.pd_rebootstrap_in_progress: bool = False
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -1733,10 +1739,12 @@ class Req(ReqDllmMixin):
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
-    def supports_pd_rebootstrap(self) -> bool:
+    def supports_pd_rebootstrap(self, server_args: ServerArgs) -> bool:
         """Whether token-only prefill recomputation can reproduce this request."""
         return (
-            self.multimodal_inputs is None
+            server_args.disaggregation_transfer_backend != "fake"
+            and not _is_fake_transfer(self, server_args)
+            and self.multimodal_inputs is None
             and self.input_embeds is None
             and self.positional_embed_overrides is None
             and self.token_type_ids is None
@@ -2791,7 +2799,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             if retracted_reqs_use_cpu_copy:
                 retracted_reqs.append(req)
-            elif req.supports_pd_rebootstrap():
+            elif req.supports_pd_rebootstrap(server_args):
                 rebootstrap_reqs.append(req)
             else:
                 req.to_finish = FINISH_ABORT(

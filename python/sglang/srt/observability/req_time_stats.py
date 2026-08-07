@@ -994,6 +994,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.observe_per_stage_req_latency(stage, ts - self.scheduler_recv_time)
         self.trace_slice(stage, self.scheduler_recv_time, ts)
 
+    def set_decode_rebootstrap_prealloc_queue_entry_time(self, ts=None):
+        """Start a new decode preallocation cycle without replaying admission."""
+        ts = ts or time.perf_counter()
+        self.decode_prealloc_queue_entry_time = ts
+        self.decode_transfer_queue_entry_time = 0.0
+        self.bootstrap_done_time = 0.0
+
     def set_decode_transfer_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.decode_transfer_queue_entry_time = ts
