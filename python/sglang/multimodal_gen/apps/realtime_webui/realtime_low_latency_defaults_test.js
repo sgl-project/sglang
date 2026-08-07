@@ -38,7 +38,7 @@ assert.match(
 
 assert.match(
   appJs,
-  /const DEFAULT_TARGET_FPS\s*=\s*configuredNumber\("targetFps", 16\);/,
+  /const DEFAULT_TARGET_FPS\s*=\s*configuredNumber\("targetFps", 24\);/,
   "webui should preserve its fallback while accepting a deployment target FPS",
 );
 assert.match(
@@ -53,8 +53,23 @@ assert.match(
 );
 assert.match(
   appJs,
-  /const DEFAULT_PREVIEW_MAX_WIDTH\s*=\s*560;/,
-  "8-GPU webui profile should request a clearer preview width without overwhelming public websocket transport",
+  /const DEFAULT_PREVIEW_MAX_WIDTH\s*=\s*configuredNumber\("previewMaxWidth", 832\);/,
+  "8-GPU webui profile should show the model-native 832px preview by default",
+);
+assert.match(
+  appJs,
+  /const MAX_AUTO_PREVIEW_WIDTH\s*=\s*configuredNumber\("maxAutoPreviewWidth", 1280\);/,
+  "720p webui sessions should be able to request a 1280px preview without hard-coding 560px",
+);
+assert.match(
+  appJs,
+  /function previewMaxWidthForSize\(baseSize\)[\s\S]*Math\.min\(baseWidth, MAX_AUTO_PREVIEW_WIDTH\)/,
+  "webui preview width should scale with the requested Size field",
+);
+assert.match(
+  appJs,
+  /params\.realtime_preview_max_width\s*=\s*previewMaxWidthForSize\(baseSize\);[\s\S]*if \(outputFormat === "webp" \|\| outputFormat === "jpeg"\)/,
+  "webui should send the Size-derived preview width for raw and encoded transports",
 );
 assert.match(
   appJs,
@@ -68,23 +83,28 @@ assert.match(
 );
 assert.match(
   appJs,
-  /minTargetLeadMs:\s*0/,
-  "webui should be able to render the first available frame immediately",
+  /targetLeadChunkRatio:\s*0\.55/,
+  "24 fps playback should keep enough jitter lead for sub-24fps backend delivery",
 );
 assert.match(
   appJs,
-  /maxTargetLeadMs:\s*80/,
-  "webui should cap its nominal display lead near one frame",
+  /minTargetLeadMs:\s*260/,
+  "24 fps playback should avoid chasing a too-small buffer when backend delivery is bursty",
 );
 assert.match(
   appJs,
-  /maxDeliveryLeadBoostMs:\s*30/,
+  /maxTargetLeadMs:\s*640/,
+  "24 fps playback should trade a bounded sub-second lead for smoother display",
+);
+assert.match(
+  appJs,
+  /maxDeliveryLeadBoostMs:\s*240/,
   "webui should bound adaptive jitter buffering",
 );
 assert.match(
   appJs,
-  /lowLatencyMaxLeadFrames:\s*1/,
-  "live playback should retain at most one extra source frame",
+  /lowLatencyMaxLeadFrames:\s*8/,
+  "live playback should retain a small 24 fps frame cushion before dropping stale frames",
 );
 assert.match(
   appJs,
@@ -103,7 +123,7 @@ assert.match(
 );
 assert.match(
   indexHtml,
-  /id="fps"[^>]*value="16"/,
+  /id="fps"[^>]*value="24"/,
   "HTML fallback defaults should match app.js target fps",
 );
 assert.match(

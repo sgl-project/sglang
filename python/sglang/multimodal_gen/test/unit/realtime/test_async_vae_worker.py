@@ -352,6 +352,14 @@ def test_worker_emits_first_streaming_frame_before_decode_finishes():
         result = await decode
         assert result.num_frames == 2
         assert [batch.frame_batch_index for batch in batches] == [0, 1]
+        assert [(batch.source_width, batch.source_height) for batch in batches] == [
+            (8, 8),
+            (8, 8),
+        ]
+        assert [(batch.preview_width, batch.preview_height) for batch in batches] == [
+            (8, 8),
+            (8, 8),
+        ]
         await worker.close_all()
 
     asyncio.run(scenario())
@@ -386,6 +394,10 @@ def test_worker_coalesces_streaming_yields_into_configured_transport_batch():
         assert batches[0].num_frames == 2
         assert len(batches[0].payloads) == 2
         assert batches[0].frame_batch_index == 0
+        assert batches[0].source_width == 8
+        assert batches[0].source_height == 8
+        assert batches[0].preview_width == 8
+        assert batches[0].preview_height == 8
         await worker.close_all()
 
     asyncio.run(scenario())

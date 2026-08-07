@@ -39,6 +39,10 @@ class RemoteFrameBatch:
     frame_batch_index: int
     is_final: bool
     encode_ms: float
+    source_width: int
+    source_height: int
+    preview_width: int
+    preview_height: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,6 +453,10 @@ class RealtimeVAEClient:
             frame_batch_index=int(message.get("frame_batch_index") or 0),
             is_final=bool(message.get("is_final_frame_batch")),
             encode_ms=float(message.get("encode_ms") or 0.0),
+            source_width=int(message.get("source_width") or message["width"]),
+            source_height=int(message.get("source_height") or message["height"]),
+            preview_width=int(message.get("preview_width") or message["width"]),
+            preview_height=int(message.get("preview_height") or message["height"]),
         )
 
     async def _finish_pending(self, pending: _PendingDecode, message: dict) -> None:

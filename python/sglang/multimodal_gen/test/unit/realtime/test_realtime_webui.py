@@ -32,7 +32,7 @@ def test_realtime_webui_supports_deployment_runtime_config():
     assert 'os.environ.get("REALTIME_UI_CONFIG_JSON", "{}")' in proxy_server
     assert 'app.router.add_get("/runtime-config.js", _runtime_config)' in proxy_server
     assert '<script src="./runtime-config.js"></script>' in index_html
-    assert 'configuredNumber("targetFps", 16)' in app_js
+    assert 'configuredNumber("targetFps", 24)' in app_js
     assert "UI_CONFIG.targetFps == null ? preset.fps : DEFAULT_TARGET_FPS" in app_js
 
 
@@ -51,7 +51,7 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert 'id="t2vFrameHint"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
     assert "playback_controller.js?v=realtime-playback-v22" in index_html
-    assert "app.js?v=realtime-production-gateway-v4" in index_html
+    assert "app.js?v=realtime-production-gateway-v7" in index_html
     assert "UI_CONFIG.generationModes" in app_js
     assert "UI_CONFIG.generationMode" in app_js
     assert "CONFIGURED_DEFAULT_GENERATION_MODE" in app_js
@@ -86,7 +86,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "ControlStateController" in app_js
     assert 'const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";' in app_js
     assert 'id="transportFormat"' in index_html
-    assert 'id="fps" type="number" value="16"' in index_html
+    assert 'id="fps" type="number" value="24"' in index_html
     assert 'id="superResolution" type="checkbox"' in index_html
     assert 'id="upscalingScale"' in index_html
     assert 'class="workspace"' in index_html
@@ -114,9 +114,12 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-production-gateway-v4" in index_html
+    assert "app.js?v=realtime-production-gateway-v7" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
-    assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 16);' in app_js
+    assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 24);' in app_js
+    assert 'const DEFAULT_PREVIEW_MAX_WIDTH = configuredNumber("previewMaxWidth", 832);' in app_js
+    assert 'const MAX_AUTO_PREVIEW_WIDTH = configuredNumber("maxAutoPreviewWidth", 1280);' in app_js
+    assert "function previewMaxWidthForSize(baseSize)" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;" in app_js
     assert "const DEFAULT_UPSCALING_SCALE = 2;" in app_js

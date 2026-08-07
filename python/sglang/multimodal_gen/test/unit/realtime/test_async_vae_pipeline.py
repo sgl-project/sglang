@@ -147,6 +147,10 @@ def test_remote_frame_batch_preserves_worker_stream_sequence_metadata():
             frame_batch_index=3,
             is_final=True,
             encode_ms=1.0,
+            source_width=16,
+            source_height=16,
+            preview_width=8,
+            preview_height=8,
         )
         await realtime_video_api._send_remote_frame_batch(
             SimpleNamespace(),
@@ -160,6 +164,10 @@ def test_remote_frame_batch_preserves_worker_stream_sequence_metadata():
             {
                 "width": 8,
                 "height": 8,
+                "source_width": 16,
+                "source_height": 16,
+                "preview_width": 8,
+                "preview_height": 8,
                 "channels": 3,
                 "bytes_per_frame": 192,
                 "frame_batch_index": 3,

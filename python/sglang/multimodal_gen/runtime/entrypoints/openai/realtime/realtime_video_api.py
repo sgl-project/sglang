@@ -573,6 +573,10 @@ async def _send_remote_frame_batch(
         raw_frame_metadata={
             "width": frame_batch.width,
             "height": frame_batch.height,
+            "source_width": frame_batch.source_width,
+            "source_height": frame_batch.source_height,
+            "preview_width": frame_batch.preview_width,
+            "preview_height": frame_batch.preview_height,
             "channels": 3,
             "bytes_per_frame": frame_batch.width * frame_batch.height * 3,
             "frame_batch_index": frame_batch.frame_batch_index,

@@ -61,6 +61,10 @@ class EncodedFrameBatch:
     frame_batch_index: int
     is_final: bool
     encode_ms: float
+    source_width: int
+    source_height: int
+    preview_width: int
+    preview_height: int
 
     @property
     def num_frames(self) -> int:
@@ -419,6 +423,10 @@ class AsyncVAEWorker:
                 # chunk_complete is the authoritative end marker for streamed output.
                 is_final=False,
                 encode_ms=batch.encode_ms,
+                source_width=batch.source_width,
+                source_height=batch.source_height,
+                preview_width=batch.preview_width,
+                preview_height=batch.preview_height,
             )
             for offset, batch in enumerate(encoded)
         )
@@ -455,8 +463,10 @@ class AsyncVAEWorker:
             .numpy()
         )
         raw_frames = [frame.tobytes() for frame in array]
-        height = int(array.shape[1]) if len(array) else int(frames.shape[-2])
-        width = int(array.shape[2]) if len(array) else int(frames.shape[-1])
+        source_height = int(array.shape[1]) if len(array) else int(frames.shape[-2])
+        source_width = int(array.shape[2]) if len(array) else int(frames.shape[-1])
+        height = source_height
+        width = source_width
         output_format = opened.output_format.lower()
         content_type = RAW_RGB_CONTENT_TYPE
         encoded_frames = raw_frames
@@ -497,6 +507,10 @@ class AsyncVAEWorker:
                 frame_batch_index=index,
                 is_final=index == len(chunks) - 1,
                 encode_ms=encode_ms if index == len(chunks) - 1 else 0.0,
+                source_width=source_width,
+                source_height=source_height,
+                preview_width=width,
+                preview_height=height,
             )
             for index, payloads in enumerate(chunks)
         ]
