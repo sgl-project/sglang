@@ -40,6 +40,7 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.linear.utils import get_linear_attn_decode_backend
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -371,6 +372,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
+        # Whether decode can consume the projection outputs as views (see
+        # forward()). Resolved on the first forward, not here: the linear-attn
+        # kernel backend is chosen when the attention backend is built, which
+        # happens after the model is constructed.
+        self._decode_takes_projection_views: Optional[bool] = None
+
     @staticmethod
     def _override_weight_loader(param, loader):
         """Robustly override loader for:
@@ -632,7 +639,48 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+        if self._decode_takes_projection_views is None:
+            self._decode_takes_projection_views = (
+                _is_cuda or _is_hip
+            ) and get_linear_attn_decode_backend().is_triton()
+
+        # Qwen3.5 stores in_proj_qkvz contiguously as [q | k | v | z] (Qwen3-Next
+        # interleaves it per head group), so mixed_qkv is exactly the leading
+        # 2 * k_tp + v_tp columns and z the trailing v_tp: take all four tensors as
+        # views instead of the split/reshape/cat round trip that rebuilds the same
+        # bytes. The views are non-contiguous -- one row per token with a gap --
+        # so this is restricted to the consumers that provably handle that:
+        #
+        # * Decode only. forward_extend() reshapes mixed_qkv into (dim, seqlen) for
+        #   causal_conv1d_fn, and the target-verify branch calls
+        #   mixed_qkv.view(batch_size, draft_token_num, -1), which merges the token
+        #   axis and cannot be expressed on a row-strided view.
+        # * Triton GDN kernels only. a and b reach the decode kernel exactly as
+        #   split here. The Triton kernels take a.stride(0)/b.stride(0) explicitly,
+        #   but the CuTe DSL kernel is compiled against contiguous exemplars and
+        #   cached without strides, so it reads a strided a/b as if compact --
+        #   wrong values, no error -- and both it and FlashInfer reject the
+        #   16B-unaligned pointer that projected_states_ba[:, nv_tp:] has whenever
+        #   nv_tp % 8 != 0 (e.g. num_v_heads=48 at TP4/TP8).
+        # * CUDA / ROCm only. The CPU, NPU and XPU causal_conv1d_update bindings
+        #   are out-of-tree, so their stride handling is not verifiable here.
+        #
+        # mixed_qkv itself never reaches the recurrent kernel strided:
+        # causal_conv1d_update writes into torch.empty_like(x), which falls back to
+        # a contiguous layout for a non-dense view.
+        if (
+            self._decode_takes_projection_views
+            and forward_batch.forward_mode.is_decode()
+        ):
+            k_tp = self.key_dim // self.attn_tp_size
+            v_tp = self.value_dim // self.attn_tp_size
+            nv_tp = self.num_v_heads // self.attn_tp_size
+            mixed_qkv, z_flat = projected_states_qkvz.split(
+                [k_tp * 2 + v_tp, v_tp], dim=-1
+            )
+            z = z_flat.reshape(z_flat.shape[0], -1, self.head_v_dim)
+            b, a = projected_states_ba.split([nv_tp, nv_tp], dim=-1)
+        elif self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
