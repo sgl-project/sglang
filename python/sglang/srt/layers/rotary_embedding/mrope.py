@@ -305,6 +305,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.ndim in (1, 2)
         self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
+            self._match_cos_sin_cache_dtype(query)
             multimodal_rotary_embedding(
                 query,
                 key,
