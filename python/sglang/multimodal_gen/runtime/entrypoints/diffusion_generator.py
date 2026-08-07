@@ -67,7 +67,6 @@ except RuntimeError:
 
 def _replace_sampling_params_for_prompt(
     sampling_params_orig: SamplingParams,
-    *,
     prompt: str,
     output_file_name: str | None,
     image_path: str | list[str] | None,

@@ -256,16 +256,8 @@ def _get_response_resize(
             # (for example, for a custom output transport).
             pass
 
-    width = (
-        sampling_params.requested_width
-        if sampling_params.requested_width is not None
-        else sampling_params.width
-    )
-    height = (
-        sampling_params.requested_height
-        if sampling_params.requested_height is not None
-        else sampling_params.height
-    )
+    width = sampling_params.requested_width or sampling_params.width
+    height = sampling_params.requested_height or sampling_params.height
     if width is None or height is None:
         return None
     return f"{width}x{height}"
