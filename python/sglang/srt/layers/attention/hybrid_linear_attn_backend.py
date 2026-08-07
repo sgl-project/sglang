@@ -494,10 +494,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            ragged_layout = ragged_verify_layout
-            if ragged_layout is not None:
+            if ragged_verify_layout is not None:
                 # Ragged capture: qsl from the runner's synthetic layout.
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_verify_layout.qo_indptr_device
+                )
             else:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -669,16 +670,17 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ragged_layout = ragged_verify_layout
-            if ragged_layout is not None:
+            if ragged_verify_layout is not None:
                 # Mamba kernels index dense [bs, N] scratch, so they need the
                 # capped variant (see padded_to_bucket). Padding rows carry
                 # mamba slot -1 and are skipped.
-                if ragged_layout.bs != bs or ragged_layout.cap is None:
-                    ragged_layout = ragged_layout.padded_to_bucket(
+                if ragged_verify_layout.bs != bs or ragged_verify_layout.cap is None:
+                    ragged_verify_layout = ragged_verify_layout.padded_to_bucket(
                         padded_bs=bs, cap=spec_info.draft_token_num
                     )
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_verify_layout.qo_indptr_device
+                )
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]

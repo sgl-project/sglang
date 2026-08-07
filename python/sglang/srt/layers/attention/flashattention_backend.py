@@ -2817,9 +2817,8 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                ragged_layout = ragged_verify_layout
-                if ragged_layout is not None:
-                    padded = ragged_layout.padded_to_bucket(padded_bs=bs)
+                if ragged_verify_layout is not None:
+                    padded = ragged_verify_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(
                         seq_lens=seq_lens, layout=padded
                     )
