@@ -288,25 +288,6 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
-    {
-      // Memory-bound: FP8 weights + KV fill each H200. No max-running cap, but the CUDA-graph
-      // capture is bounded (--cuda-graph-max-bs-decode 128) since uncapping it OOMs. Throughput
-      // saturates at conc 256; higher conc just queues.
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 128",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
 
     // ====================================================================
     // B200 + FP8 (Blackwell) — TP8.  low-latency verified on b200-verda-k8s

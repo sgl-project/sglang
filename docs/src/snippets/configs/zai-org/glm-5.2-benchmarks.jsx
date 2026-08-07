@@ -25,25 +25,11 @@ export const benchmarks = [
         ttft_ms: 84626, tpot_ms: 30.52, tokens_per_sec_per_gpu: 2266 },
     ],
   },
-      // NOTE: on H200 the high-throughput number (conc 1024/4096) sits BELOW balanced (conc 64/256).
-      // This is decode SATURATION, not a config bug: GLM-5.2's DSA-MoE decode is HBM-bandwidth-bound
-      // (weight reads dominate) and saturates by ~conc 256; pushing to conc 1024/4096 only deepens the
-      // queue (TTFT 530s / 2380s) with no throughput gain, so the HT operating point measures lower.
-      // Removing EAGLE frees little (the weight-read bottleneck is unchanged), raising the batch cap
-      // OOMs at graph capture, and a pure TP+EP variant (--tp 8 --ep 8, DP-attention off) benched ~4.5x
-      // WORSE (~500 vs ~2266 tok/s/GPU) — so DP-attention is required. Net: on memory-bound H200 the
-      // BALANCED config is throughput-optimal; HT only leads on the higher-memory Blackwell parts
-      // (B200/B300/GB300 all show HT > balanced).
-      {
-    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15.post1",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 530991, tpot_ms: 62.11, tokens_per_sec_per_gpu: 1711 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 2379560, tpot_ms: 66.4, tokens_per_sec_per_gpu: 1599 },
-    ],
-  },
+  // H200 high-throughput REMOVED: it measured BELOW balanced (HT 1711 < balanced 2315). GLM-5.2's
+  // DSA-MoE decode is HBM-weight-read bound and saturates by ~conc 256, so conc 1024/4096 only queues
+  // (TTFT 530s+) with no gain. Removing EAGLE frees little, and a pure TP+EP variant (--tp 8 --ep 8,
+  // dp-attn off) benched ~4.5x WORSE — so BALANCED is the H200 throughput-optimal config (HT chip
+  // greyed for h200/fp8). HT leads only on B200/B300/GB300.
   // ---- B200 + FP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
       {
     match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
