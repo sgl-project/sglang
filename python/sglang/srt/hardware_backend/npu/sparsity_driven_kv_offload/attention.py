@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+    normalize_batch_topk_indices,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
 if TYPE_CHECKING:
@@ -113,11 +116,33 @@ def forward_sparsity_driven_kv_offload(
         )
     elif forward_batch.forward_mode.is_decode():
         batch_size = forward_batch.batch_size
-        selected_kv_length = 2048
         num_kv_heads = layer.tp_k_head_num
         num_query_heads = layer.tp_q_head_num
         nope_head_dim = backend.kv_lora_rank
         rope_head_dim = backend.qk_rope_head_dim
+
+        topk_2d_input = normalize_batch_topk_indices(topk_indices)
+        effective_topk_length = topk_2d_input.shape[1]
+        selected_kv_length = sparse_kv_manager.sparse_context_len
+        if effective_topk_length <= 0:
+            raise RuntimeError("SFA BSND compact path expects a positive top-k length.")
+        if effective_topk_length > selected_kv_length:
+            raise RuntimeError(
+                "DSA top-k length exceeds sparse KV device cache capacity: "
+                f"topk_len={effective_topk_length}, "
+                f"sparse_context_len={selected_kv_length}."
+            )
+        if effective_topk_length == selected_kv_length:
+            topk_2d = topk_2d_input.contiguous()
+        else:
+            topk_2d = torch.full(
+                (batch_size, selected_kv_length),
+                -1,
+                dtype=topk_2d_input.dtype,
+                device=topk_2d_input.device,
+            )
+            topk_2d[:, :effective_topk_length] = topk_2d_input
+            topk_2d = topk_2d.contiguous()
 
         assert num_kv_heads == 1, (
             "FIA_v2 MLA selected KV path expects KV_N == 1, "
@@ -148,18 +173,6 @@ def forward_sparsity_driven_kv_offload(
             [nope_head_dim, rope_head_dim], dim=-1
         )
 
-        topk_2d = topk_indices
-        if topk_2d.dim() == 3:
-            topk_2d = topk_2d[:, 0, :]
-        elif topk_2d.dim() == 4:
-            topk_2d = topk_2d[:, 0, 0, :]
-        elif topk_2d.dim() != 2:
-            raise RuntimeError(
-                "SFA BSND compact path expects topk rank 2/3/4, " f"got {topk_2d.dim()}"
-            )
-        topk_2d = topk_2d[:, :selected_kv_length].contiguous()
-        topk_length = topk_2d.shape[1]
-
         topk_valid = topk_2d >= 0
         if forward_batch.seq_lens is not None:
             valid_rows = (forward_batch.seq_lens[:batch_size] > 0).view(batch_size, 1)
@@ -167,7 +180,7 @@ def forward_sparsity_driven_kv_offload(
 
         actual_seq_lengths_kv = (
             topk_valid.sum(dim=1)
-            .clamp(min=1, max=topk_length)
+            .clamp(min=1, max=selected_kv_length)
             .to(device=q_nope.device, dtype=torch.int32)
             .contiguous()
         )
@@ -176,13 +189,13 @@ def forward_sparsity_driven_kv_offload(
         ).contiguous()
 
         compact_indices = (
-            torch.arange(topk_length, device=q_nope.device, dtype=torch.int32)
-            .view(1, 1, 1, topk_length)
-            .expand(batch_size, 1, num_kv_heads, topk_length)
+            torch.arange(selected_kv_length, device=q_nope.device, dtype=torch.int32)
+            .view(1, 1, 1, selected_kv_length)
+            .expand(batch_size, 1, num_kv_heads, selected_kv_length)
             .clone()
         )
-        compact_valid = topk_valid.view(batch_size, 1, 1, topk_length).expand(
-            batch_size, 1, num_kv_heads, topk_length
+        compact_valid = topk_valid.view(batch_size, 1, 1, selected_kv_length).expand(
+            batch_size, 1, num_kv_heads, selected_kv_length
         )
         sparse_indices = torch.where(
             compact_valid,
