@@ -190,6 +190,10 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        fuzzy_matched_len:  Number of tokens in `device_indices` that came from a
+                            fuzzy (non-exact) match rather than the radix tree.
+                            Those slots hold donor KV that must be position-corrected
+                            before the forward pass. None/0 for exact-only caches.
     """
 
     device_indices: torch.Tensor
@@ -204,6 +208,7 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    fuzzy_matched_len: Optional[int] = None
 
 
 def zero_match_result(

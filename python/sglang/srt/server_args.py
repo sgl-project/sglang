@@ -2929,6 +2929,51 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # Fuzzy KV match (--radix-cache-backend fuzzy_match)
+    # -------------------------------------------------------------------------
+    fuzzy_match_provider: A[
+        str,
+        (
+            "FuzzyMatchProvider implementation used by the fuzzy_match "
+            "radix-cache backend. 'SemanticEmbedding' finds donor KV by "
+            "semantic similarity (requires the 'semblend' package)."
+        ),
+        NS("memory"),
+    ] = "SemanticEmbedding"
+    fuzzy_min_match_length: A[
+        int,
+        (
+            "Minimum token span a fuzzy match may reuse. Partial exact-prefix "
+            "anchors shorter than this skip the fuzzy lookup."
+        ),
+        NS("memory"),
+    ] = 16
+    fuzzy_semantic_threshold: A[
+        float,
+        (
+            "Cosine-similarity threshold in [0.0, 1.0] for SemanticEmbedding "
+            "matches. Higher is stricter (fewer, higher-precision matches)."
+        ),
+        NS("memory"),
+    ] = 0.60
+    fuzzy_min_reuse_ratio: A[
+        float,
+        (
+            "Minimum fraction of the prompt a donor must cover for a "
+            "SemanticEmbedding hit to be accepted."
+        ),
+        NS("memory"),
+    ] = 0.50
+    fuzzy_model_arch: A[
+        Optional[str],
+        (
+            "Model architecture tag passed to the SemanticEmbedding provider "
+            "to select alignment presets (e.g. 'qwen2.5-7b')."
+        ),
+        NS("memory"),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
     # -------------------------------------------------------------------------
     kt_weight_path: A[
