@@ -271,7 +271,13 @@ class StreamOrderedMmFeaturePool:
         return lease
 
     def _release_locked(self, lease: PoolLease) -> None:
-        self._occupied.pop(lease.slot, None)
+        active_lease = self._occupied.get(lease.slot)
+        if active_lease != lease:
+            raise RuntimeError(
+                f"Cannot release inactive {self.transport_name} pool lease "
+                f"(slot={lease.slot}, generation={lease.generation})"
+            )
+        del self._occupied[lease.slot]
         self._available_slots.append(lease.slot)
         self._available_ranges.append((lease.start, lease.end))
 
