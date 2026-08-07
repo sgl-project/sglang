@@ -167,27 +167,12 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
-def _nvfp4_shared_via_ipc(quant_config: Any) -> bool:
-    """NVFP4 (modelopt_fp4) is shared in raw_client_postprocess mode.
-
-    NVFP4's process_weights_after_loading repacks/swizzles weights, creates
-    derived params, and stamps Python-side layout attributes that raw-tensor IPC
-    cannot carry. Rather than share the post-processed state, the daemon exports
-    the raw pre-post-process quantized tensors and the client re-runs
-    process_weights_after_loading locally (see ipc_export_mode) -- so every
-    serialized NVFP4 variant round-trips by construction. Quantize-on-load
-    (nvfp4_online) reports a different quant_method name and is not in this
-    registry, so it stays excluded.
-    """
-    return True
-
-
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
 # A method absent from this registry is unsupported and hard-errors.
 IPC_QUANT_ALLOWLIST = {
     "": lambda _quant_config: True,  # unquantized
     "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
-    "modelopt_fp4": _nvfp4_shared_via_ipc,  # NVFP4, via raw_client_postprocess
+    "modelopt_fp4": lambda _quant_config: True,  # NVFP4
 }
 
 # quant methods whose process_weights_after_loading is reproduced on the client
@@ -195,7 +180,26 @@ IPC_QUANT_ALLOWLIST = {
 # tensors and the client runs process_weights_after_loading after IPC-mapping
 # them. Everything else is exported already post-processed and the client skips
 # post-processing. See ipc_export_mode.
-IPC_CLIENT_POSTPROCESS_QUANTS = {"modelopt_fp4"}
+#
+# Empty on purpose: a method only belongs here if its post-processing never
+# writes into the params it was handed (they are the daemon's shared memory).
+# NVFP4 was tried and fails that bar -- see _nvfp4_shared_via_ipc. The mode is
+# kept because the mechanism is generic, not because anything uses it today.
+IPC_CLIENT_POSTPROCESS_QUANTS = set()
+
+# quant methods whose post-processing changes tensor shapes (padding for kernel
+# alignment, swizzled scale layouts). Their exported tensors legitimately do not
+# match the shapes the client's create_weights registered, so the client rebinds
+# to the daemon's shape instead of hard-erroring on the mismatch. Correctness
+# still rests on the CacheConfig fingerprint (quant config, resolved backends,
+# device capability, torch version) matching.
+IPC_POSTPROCESS_RESHAPES_QUANTS = {"modelopt_fp4"}
+
+
+def ipc_postprocess_reshapes(quant_method: str) -> bool:
+    """Whether this method's post-processing changes exported tensor shapes."""
+    return quant_method in IPC_POSTPROCESS_RESHAPES_QUANTS
+
 
 EXPORT_MODE_POSTPROCESSED = "postprocessed"
 EXPORT_MODE_RAW_CLIENT_POSTPROCESS = "raw_client_postprocess"
@@ -328,6 +332,88 @@ def compute_env_stamp() -> Dict[str, str]:
         "torch_version": torch_version,
         "fp4_gemm_backend": fp4_gemm_backend,
     }
+
+
+_TRANSFERABLE_ATTR_NAMES = {
+    # Unquantized: post-processing stamps no layout state.
+    "": frozenset(),
+    "fp8": frozenset(),
+    "modelopt_fp4": frozenset(
+        {
+            "weights_padding_cols",
+            "output_size_per_partition",
+            "intermediate_size_per_partition",
+            "_w13_deinterleaved",
+        }
+    ),
+}
+_TRANSFERABLE_ATTR_TYPES = (int, float, bool, str, type(None))
+
+
+def capture_module_attrs(model, quant_method: str) -> Dict[str, Dict[str, Any]]:
+    """Snapshot the layout attributes this quant method stamps (see
+    _TRANSFERABLE_ATTR_NAMES).
+
+    process_weights_after_loading does not only rewrite tensors: it stamps plain
+    Python attributes that the kernels read later. Tensors ride the IPC handles;
+    these do not, and a client left with its pre-post-process values pads
+    activations wrong and serves garbage. So the daemon captures them after
+    post-processing and the client stamps them on.
+
+    Captured by name rather than as a before/after diff: a diff would silently
+    miss an attribute that post-processing sets to the value it already had, and
+    the client applies these onto an identically-configured model, so an
+    unchanged value is a harmless no-op.
+    """
+    names = _TRANSFERABLE_ATTR_NAMES.get(quant_method, frozenset())
+    if not names:
+        return {}
+
+    attrs: Dict[str, Dict[str, Any]] = {}
+    for name, module in model.named_modules():
+        captured = {
+            key: value
+            for key, value in module.__dict__.items()
+            if key in names and isinstance(value, _TRANSFERABLE_ATTR_TYPES)
+        }
+        if captured:
+            attrs[name] = captured
+    return attrs
+
+
+def apply_module_attrs(model, module_attrs: Dict[str, Dict[str, Any]]) -> int:
+    """Stamp daemon-captured plain attributes onto the client's modules.
+
+    Returns the number of attributes whose value actually changed. Raises if the
+    daemon captured a module the client does not have: that means the two
+    processes built structurally different models, and silently skipping the
+    stamp would leave the client reading pre-post-process layout values.
+    """
+    modules = dict(model.named_modules())
+    missing = [name for name in module_attrs if name not in modules]
+    if missing:
+        raise RuntimeError(
+            f"[weight_cache] The daemon captured attributes for "
+            f"{len(missing)} module(s) that do not exist on the client, so the "
+            f"two processes built structurally different models: "
+            f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
+        )
+
+    changed = 0
+    for module_name, captured in module_attrs.items():
+        module = modules[module_name]
+        for key, value in captured.items():
+            previous = getattr(module, key, _ATTR_UNSET)
+            # Only compare like with like: an absent attribute (sentinel) or a
+            # client-side tensor under the same name must count as changed
+            # rather than go through a tensor `!=`, which returns a tensor.
+            if not isinstance(previous, _TRANSFERABLE_ATTR_TYPES) or previous != value:
+                changed += 1
+            setattr(module, key, value)
+    return changed
+
+
+_ATTR_UNSET = object()
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:

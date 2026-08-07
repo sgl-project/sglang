@@ -52,6 +52,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 from .protocol import (
     EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
     CacheConfig,
+    capture_module_attrs,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_env_stamp,
@@ -125,6 +126,13 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        # module qualname -> {attr: scalar}, the Python-side layout state that
+        # post-processing stamps and IPC handles cannot carry (see
+        # capture_module_attrs).
+        self.module_attrs: Dict[str, Dict[str, Any]] = {}
+        # MoE runner backend as resolved during this daemon's model load; the
+        # client compares it once its own model is built.
+        self.moe_runner_backend: str = ""
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -239,6 +247,10 @@ class WeightCacheDaemon:
 
         initialize_fp4_gemm_config(server_args)
 
+        from sglang.srt.layers.moe import get_moe_runner_backend, initialize_moe_config
+
+        initialize_moe_config(server_args)
+
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
@@ -334,6 +346,9 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+
+        self.module_attrs = capture_module_attrs(self.model, quant_method)
+        self.moe_runner_backend = get_moe_runner_backend().value
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -532,6 +547,8 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
+                    "module_attrs": self.module_attrs,
+                    "moe_runner_backend": self.moe_runner_backend,
                     # PID so the client can watch daemon liveness: if this
                     # process dies while clients hold IPC mappings, their
                     # param.data (and any CUDA-graph-captured addresses) dangle.

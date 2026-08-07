@@ -24,8 +24,7 @@ import unittest
 
 from sglang.srt.weight_cache.protocol import (
     EXPORT_MODE_POSTPROCESSED,
-    EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
-    IPC_QUANT_ALLOWLIST,
+    IPC_CLIENT_POSTPROCESS_QUANTS,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -37,6 +36,7 @@ from sglang.srt.weight_cache.protocol import (
     get_socket_path,
     hash_quant_config,
     ipc_export_mode,
+    ipc_postprocess_reshapes,
     is_ipc_quant_supported,
     recv_msg,
     send_msg,
@@ -235,8 +235,9 @@ class TestIpcQuantAllowlist(CustomTestCase):
         self.assertFalse(is_ipc_quant_supported("fp8", None))
 
     def test_nvfp4_supported(self):
-        # NVFP4 is shared in raw_client_postprocess mode: the client re-runs
-        # process_weights_after_loading, so every serialized variant is accepted.
+        # NVFP4 is shared post-processed: the daemon runs
+        # process_weights_after_loading and the client maps the result, so every
+        # serialized variant is accepted.
         self.assertTrue(is_ipc_quant_supported("modelopt_fp4", None))
         self.assertTrue(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4"}))
 
@@ -261,23 +262,27 @@ class TestIpcQuantAllowlist(CustomTestCase):
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
 
-    def test_allowlist_registry_shape(self):
-        # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8", "modelopt_fp4"})
-
     def test_export_mode_dispatch(self):
-        # NVFP4 uses client-side post-processing; everything else is exported
-        # already post-processed. A daemon/client disagreement here is stamped
-        # into the fingerprint and becomes a clean mismatch.
+        # Every supported method is exported already post-processed, NVFP4
+        # included: its post-processing writes in place into the params it is
+        # handed, which under IPC are the daemon's shared memory, so the client
+        # must not re-run it. A daemon/client disagreement on the mode is
+        # stamped into the fingerprint and becomes a clean mismatch.
         self.assertEqual(
-            ipc_export_mode("modelopt_fp4", None),
-            EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
+            ipc_export_mode("modelopt_fp4", None), EXPORT_MODE_POSTPROCESSED
         )
         self.assertEqual(ipc_export_mode("", None), EXPORT_MODE_POSTPROCESSED)
         self.assertEqual(
             ipc_export_mode("fp8", {"weight_block_size": [128, 128]}),
             EXPORT_MODE_POSTPROCESSED,
         )
+        # The client-postprocess mechanism still exists but nothing opts into it.
+        self.assertEqual(IPC_CLIENT_POSTPROCESS_QUANTS, set())
+
+    def test_only_reshaping_methods_relax_the_shape_check(self):
+        self.assertTrue(ipc_postprocess_reshapes("modelopt_fp4"))
+        self.assertFalse(ipc_postprocess_reshapes("fp8"))
+        self.assertFalse(ipc_postprocess_reshapes(""))
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
