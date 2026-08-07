@@ -121,7 +121,7 @@ sequenceDiagram
 | `condition_inputs` | object | 否 | 初始 action、chunk seed 和 prompt schedule |
 | `realtime_output_format` | `raw` / `webp` / `jpeg` | 建议 | 浏览器推荐 `webp` |
 | `realtime_preview_max_width` | int | 否 | 预览缩放最大宽度，例如 560；省略则使用输出尺寸 |
-| `realtime_output_pacing` | bool | 建议 | 公网 WebUI 建议 `true`，让支持 pacing 的后端按目标 FPS 稳定出流；极限低延迟压测可设 `false` |
+| `realtime_output_pacing` | bool | 兼容 | 旧客户端字段；当前后端不再按 `fps` sleep 节流，播放平滑应由前端/Gateway 处理，新 UI 建议省略 |
 | `output_compression` | int | 否 | WebP/JPEG quality；当前低延迟配置使用 55 |
 | `realtime_causal_sink_size` | int | 否 | 因果 KV sink 帧数，通常沿用服务默认值 |
 | `realtime_causal_kv_cache_num_frames` | int | 否 | 因果 KV 窗口，通常沿用服务默认值 |
@@ -146,7 +146,6 @@ const init = {
   guidance_scale: 0,
   realtime_output_format: "webp",
   realtime_preview_max_width: 560,
-  realtime_output_pacing: true,
   output_compression: 55,
   trace_id: traceId,
 };

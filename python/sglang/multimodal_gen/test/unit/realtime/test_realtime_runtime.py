@@ -112,6 +112,25 @@ def test_realtime_session_cleanup_precedes_server_close(monkeypatch):
     assert events == ["cleanup", "close"]
 
 
+def test_realtime_output_pacing_compat_field_is_non_blocking():
+    session = SimpleNamespace(output_pace_next_send_at=time.perf_counter() + 60)
+    batch = SimpleNamespace(
+        realtime_output_pacing=True,
+        fps=1,
+        enable_frame_interpolation=False,
+        realtime_event_id=1,
+    )
+    result = SimpleNamespace(raw_frame_batches=[[object()] * 8])
+
+    start = time.perf_counter()
+    waited_ms = asyncio.run(
+        realtime_video_api._wait_for_realtime_output_slot(session, batch, result)
+    )
+
+    assert waited_ms == 0.0
+    assert time.perf_counter() - start < 0.05
+
+
 class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
     def forward(self, batch, component_manager=None):
         del batch, component_manager

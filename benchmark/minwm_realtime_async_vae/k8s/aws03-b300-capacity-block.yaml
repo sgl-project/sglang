@@ -162,8 +162,9 @@ spec:
               --model-revision=${MODEL_REVISION}
               --vae-fingerprint=${VAE_FINGERPRINT}
               --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output
-              --output-queue-depth=32
+              --output-queue-depth=128
               --output-enqueue-timeout-s=0.5
+              --output-drain-timeout-s=90
               --lease-renew-interval-s=10
               --release-grace-s=0.5
               --trace-log-group=/aws/containerinsights/leap-world-aws03-usw2/application

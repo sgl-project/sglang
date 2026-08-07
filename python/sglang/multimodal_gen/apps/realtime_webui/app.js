@@ -3743,7 +3743,6 @@ function readPreviewTransportParams() {
   if (!outputFormat) return {};
   const params = {
     realtime_output_format: outputFormat,
-    realtime_output_pacing: true,
   };
   const baseSize = parseSizeValue($("size").value);
   params.realtime_preview_max_width = previewMaxWidthForSize(baseSize);
