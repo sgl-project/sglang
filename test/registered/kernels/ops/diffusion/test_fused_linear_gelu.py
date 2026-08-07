@@ -37,6 +37,23 @@ def test_fused_matches_reference(dtype):
     torch.testing.assert_close(site(x), ref, atol=atol, rtol=2e-2)
 
 
+def test_flux_gelu_proj_site():
+    """FLUX.1 shared-FF site: gate off is bit-exact, gate on is close."""
+    from sglang.multimodal_gen.runtime.models.dits.flux import FluxFusedGELUProj
+
+    torch.manual_seed(0)
+    proj = nn.Linear(3072, 12288, device="cuda", dtype=torch.bfloat16)
+    site = FluxFusedGELUProj(proj)
+    x = torch.randn(1, 512, 3072, device="cuda", dtype=torch.bfloat16)
+    ref = F.gelu(proj(x), approximate="tanh")
+
+    assert torch.equal(site(x), ref)  # unmounted default: bit-exact reference
+    assert gelu.mount_fused_linear_gelu(site)
+    torch.testing.assert_close(site(x), ref, atol=2e-2, rtol=2e-2)
+    gelu.unmount_fused_linear_gelu(site)
+    assert torch.equal(site(x), ref)
+
+
 def test_mount_guards_and_lossless_path():
     torch.manual_seed(0)
     good, bad = _Site(), _Site(torch.float32)

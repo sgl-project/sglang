@@ -54,7 +54,7 @@ elif is_hip():
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
 
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+    tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -841,9 +841,6 @@ def build_dflash_verify_target_probs(
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
-
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

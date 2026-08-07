@@ -68,8 +68,8 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
 
-    # default warmup
-    a += " --warmup"
+    # request-based warmup keeps the first measured generation out of the baseline
+    a += " --warmup-mode request"
 
     for extra_arg in server_args.extras:
         a += f" {extra_arg}"
