@@ -861,9 +861,7 @@ def alloc_verify_window(
     # The draft model keeps its fixed gamma-wide shape. Rows trimmed by the
     # per-request verify budget reuse their final legal position in the unused
     # tail, while cache allocation stays gamma-wide for compatibility.
-    final_legal_offsets = (
-        verify_lens.to(torch.int64).sub(1).clamp_min_(0).unsqueeze(1)
-    )
+    final_legal_offsets = verify_lens.to(torch.int64).sub(1).clamp_min_(0).unsqueeze(1)
     safe_offsets = torch.minimum(block_pos_offsets, final_legal_offsets)
     positions_2d = (prefix_lens.unsqueeze(1) + safe_offsets).clamp_max_(
         max_position - 1

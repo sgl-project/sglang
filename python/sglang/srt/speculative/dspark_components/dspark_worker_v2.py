@@ -543,6 +543,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         requested_verify_lens = torch.full_like(
             prefix_lens, self.verify_num_draft_tokens, dtype=torch.int64
         )
+
         # Guard: max_new_tokens is Optional[int]; None means no generation cap,
         # so we treat the budget as verify_num_draft_tokens (no clamp from this
         # dimension).  The scheduler is single-threaded, so this snapshot is
@@ -646,8 +647,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The draft window keeps its fixed gamma-wide shape, but its padded tail
         # positions were already made safe from actual_verify_lens above. A
         # clipped layout still selects compact target verify below.
-        planned_verify_lens = requested_verify_lens if layout is None else layout.verify_lens
-        actual_verify_lens = torch.minimum(planned_verify_lens.to(torch.int64), actual_verify_lens)
+        planned_verify_lens = (
+            requested_verify_lens if layout is None else layout.verify_lens
+        )
+        actual_verify_lens = torch.minimum(
+            planned_verify_lens.to(torch.int64), actual_verify_lens
+        )
         if not torch.equal(actual_verify_lens, planned_verify_lens):
             graph_num_tokens = (
                 int(actual_verify_lens.sum().item())

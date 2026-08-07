@@ -146,7 +146,10 @@ def make_draft_sampler_capture_hook(draft_sampler):
 
 
 def clamp_verify_lens(
-    *, requested_verify_lens, seq_lens, remaining_generation_tokens,
+    *,
+    requested_verify_lens,
+    seq_lens,
+    remaining_generation_tokens,
     max_position_embeddings: int,
 ) -> torch.Tensor:
     """Bound each DSpark verify row to legal generation and context budgets."""

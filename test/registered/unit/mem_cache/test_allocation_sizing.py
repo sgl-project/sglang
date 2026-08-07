@@ -21,18 +21,26 @@ test requires no sglang imports.  The logic under test is:
 On main (without PR 33581) the page_size > 1 gate means page_size=1 never
 gets the reserve-sized headroom, so gamma=16 yields headroom=21 < reserve=34.
 """
+
+import sys
 from types import SimpleNamespace
 
+import pytest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # --------------------------------------------------------------------------
 # Inline the arithmetic (no sglang import needed)
 # --------------------------------------------------------------------------
 
+
 def _alloc_len(args) -> int:
     if args.speculative_algorithm is None:
         return 1
     steps = args.speculative_num_steps or 1
-    topk  = args.speculative_eagle_topk or 1
+    topk = args.speculative_eagle_topk or 1
     tokens = args.max_speculative_num_draft_tokens
     ps = args.page_size
     # DSPARK uses page_size=1 or topk=1 => simple path
@@ -78,32 +86,34 @@ def _args(*, page_size, gamma, spec_algo="DSPARK"):
 # Red-light tests: current code is wrong at page_size=1
 # --------------------------------------------------------------------------
 
+
 def test_current_page1_gamma6_headroom_too_small():
     """Current code: page_size=1 gamma=6 headroom < reserve (Bug B exists)."""
     args = _args(page_size=1, gamma=6)
-    reserve = _reserve(args)    # 2 * max(6,6) = 14
+    reserve = _reserve(args)  # 2 * max(6,6) = 14
     extra = _headroom_current(args)  # 4 + 6 = 10  (gate blocks the reserve path)
     print(f"\n[current] gamma=6  page_size=1: reserve={reserve} headroom={extra}")
     # This is the BUG: headroom is too small
-    assert extra < reserve, (
-        f"Expected headroom {extra} < reserve {reserve} to confirm Bug B exists"
-    )
+    assert (
+        extra < reserve
+    ), f"Expected headroom {extra} < reserve {reserve} to confirm Bug B exists"
 
 
 def test_current_page1_gamma16_headroom_too_small():
     """Current code: page_size=1 gamma=16 headroom=21 < reserve=34 (Bug B exists)."""
     args = _args(page_size=1, gamma=16)
-    reserve = _reserve(args)    # 2 * 17 = 34
+    reserve = _reserve(args)  # 2 * 17 = 34
     extra = _headroom_current(args)  # 4 + 16 = 20 < 34
     print(f"\n[current] gamma=16 page_size=1: reserve={reserve} headroom={extra}")
-    assert extra < reserve, (
-        f"Expected headroom {extra} < reserve {reserve} to confirm Bug B exists"
-    )
+    assert (
+        extra < reserve
+    ), f"Expected headroom {extra} < reserve {reserve} to confirm Bug B exists"
 
 
 # --------------------------------------------------------------------------
 # Green-light tests: fixed code is correct
 # --------------------------------------------------------------------------
+
 
 def test_fixed_page1_headroom_covers_reserve_gamma6():
     """Fixed code: page_size=1, gamma=6 headroom >= reserve."""
@@ -129,7 +139,9 @@ def test_fixed_page256_headroom_covers_aligned_reserve():
     reserve = _reserve(args)
     extra = _headroom_fixed(args)
     needed = reserve + args.page_size - 1
-    print(f"\n[fixed]   gamma=6  page_size=256: reserve={reserve} needed={needed} headroom={extra}")
+    print(
+        f"\n[fixed]   gamma=6  page_size=256: reserve={reserve} needed={needed} headroom={extra}"
+    )
     assert extra >= needed
 
 
@@ -138,3 +150,7 @@ def test_non_spec_headroom_unchanged():
     args = _args(page_size=1, gamma=0, spec_algo=None)
     assert _headroom_current(args) == 4
     assert _headroom_fixed(args) == 4
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

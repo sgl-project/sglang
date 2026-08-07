@@ -1,42 +1,63 @@
 """CPU regression coverage for DSpark context-boundary verify planning."""
 
 import ast
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).parents[4]
 SOURCE = ROOT / "python/sglang/srt/speculative/draft_worker_common.py"
-PLANNER_SOURCE = ROOT / "python/sglang/srt/speculative/dspark_components/dspark_planner.py"
+PLANNER_SOURCE = (
+    ROOT / "python/sglang/srt/speculative/dspark_components/dspark_planner.py"
+)
 
 
 def load_clamp_verify_lens():
     tree = ast.parse(SOURCE.read_text())
     node = next(
-        (item for item in tree.body if getattr(item, "name", None) == "clamp_verify_lens"),
+        (
+            item
+            for item in tree.body
+            if getattr(item, "name", None) == "clamp_verify_lens"
+        ),
         None,
     )
     if node is None:
         pytest.fail("clamp_verify_lens is missing from draft_worker_common.py")
     namespace = {"torch": torch}
 
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"),
+        namespace,
+    )
     return namespace["clamp_verify_lens"]
+
+
 def load_alloc_verify_window():
     """Load the production planner helper with a deterministic cache-loc stub."""
     tree = ast.parse(PLANNER_SOURCE.read_text())
     node = next(
-        (item for item in tree.body if getattr(item, "name", None) == "alloc_verify_window"),
+        (
+            item
+            for item in tree.body
+            if getattr(item, "name", None) == "alloc_verify_window"
+        ),
         None,
     )
     if node is None:
         pytest.fail("alloc_verify_window is missing from dspark_planner.py")
 
     def fake_assign_extend_cache_locs_func(*, batch_size, draft_token_num, device, **_):
-        return torch.arange(batch_size * draft_token_num, dtype=torch.int64, device=device)
+        return torch.arange(
+            batch_size * draft_token_num, dtype=torch.int64, device=device
+        )
 
     namespace = {
         "torch": torch,
@@ -89,7 +110,9 @@ def test_alloc_verify_window_pads_draft_tail_with_last_legal_position_cpu():
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
     )
     model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 128), dtype=torch.int64))
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.empty((2, 128), dtype=torch.int64)
+        )
     )
 
     window = alloc_verify_window(
@@ -102,8 +125,12 @@ def test_alloc_verify_window_pads_draft_tail_with_last_legal_position_cpu():
         verify_lens=verify_lens,
         max_position_embeddings=100,
     )
-    assert window.positions_2d.tolist() == [[98, 99, 99, 99, 99, 99], [97, 98, 98, 98, 98, 98]]
+    assert window.positions_2d.tolist() == [
+        [98, 99, 99, 99, 99, 99],
+        [97, 98, 98, 98, 98, 98],
+    ]
     assert int(window.positions_2d.max()) < 100
+
 
 def test_worker_uses_the_boundary_clamp_before_target_verify():
     source = (
@@ -112,10 +139,13 @@ def test_worker_uses_the_boundary_clamp_before_target_verify():
     assert "clamp_verify_lens(" in source
     assert "verify_lens=actual_verify_lens" in source
 
+
 def test_valid_layout_positions_never_cross_context_boundary():
     tree = ast.parse(SOURCE.read_text())
     offsets_node = next(
-        item for item in tree.body if getattr(item, "name", None) == "build_block_pos_offsets"
+        item
+        for item in tree.body
+        if getattr(item, "name", None) == "build_block_pos_offsets"
     )
     namespace = {"torch": torch}
     exec(
@@ -132,9 +162,7 @@ def test_valid_layout_positions_never_cross_context_boundary():
     positions = torch.cat(
         [
             seq_len + offsets[:verify_len]
-            for seq_len, verify_len in zip(
-                [10, 98, 99, 97], actual.tolist()
-            )
+            for seq_len, verify_len in zip([10, 98, 99, 97], actual.tolist())
         ]
     )
     assert offsets.tolist() == [0, 1, 2, 3, 4, 5]
@@ -145,6 +173,7 @@ def test_valid_layout_positions_never_cross_context_boundary():
 # ---------------------------------------------------------------------------
 # max_new_tokens=None guard (issue #33454 original repro: no explicit limit)
 # ---------------------------------------------------------------------------
+
 
 def _make_remaining(max_new_tokens, output_len, verify_num):
     """Mirrors the dspark_worker_v2 remaining_generation_tokens formula."""
@@ -174,6 +203,12 @@ def test_worker_remaining_generation_none_guard_present():
         ROOT / "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py"
     ).read_text()
     # After the fix, the worker must guard against None before subtracting.
-    assert "max_new_tokens is not None" in source or "if max_tok" in source or "if max_new" in source, (
-        "dspark_worker_v2.py is missing the None guard for max_new_tokens"
-    )
+    assert (
+        "max_new_tokens is not None" in source
+        or "if max_tok" in source
+        or "if max_new" in source
+    ), "dspark_worker_v2.py is missing the None guard for max_new_tokens"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
