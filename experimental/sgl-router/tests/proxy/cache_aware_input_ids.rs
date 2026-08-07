@@ -54,6 +54,7 @@ fn config() -> Config {
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
             sticky: None,
+            segment_cache: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

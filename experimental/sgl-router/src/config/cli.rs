@@ -13,7 +13,7 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
     DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    ProxyConfig, SegmentCacheConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -89,6 +89,21 @@ pub struct Cli {
     /// Defaults to 60.
     #[arg(long)]
     pub sticky_eviction_interval_secs: Option<u64>,
+
+    // ---- segment tokenize-cache (opt-in) ----
+    /// Enable the segment tokenize-cache: split chat prompts at their
+    /// chat-template marker tokens and cache each segment's token ids, so a
+    /// multi-turn conversation only re-tokenizes the newest turn. Applies to
+    /// chat requests on a model with a Jinja chat template. Off by default.
+    #[arg(long)]
+    pub segment_cache: bool,
+    /// Max number of cached segments (store cap). Only with `--segment-cache`.
+    #[arg(long)]
+    pub segment_cache_capacity: Option<u64>,
+    /// Prompts shorter than this many bytes skip the cache and encode whole.
+    /// Only with `--segment-cache`.
+    #[arg(long)]
+    pub segment_cache_min_bytes: Option<usize>,
 
     // ---- discovery: static ----
     /// Static worker URLs (space-separated or repeated). Mutually
@@ -226,6 +241,25 @@ impl Cli {
             None
         };
 
+        // Segment tokenize-cache (opt-in). Sub-knobs require the feature flag,
+        // mirroring the cache-aware / sticky mutual-requirement checks above.
+        let tuned_segment_cache =
+            self.segment_cache_capacity.is_some() || self.segment_cache_min_bytes.is_some();
+        if tuned_segment_cache && !self.segment_cache {
+            return Err(anyhow!(
+                "--segment-cache-capacity / --segment-cache-min-bytes require --segment-cache"
+            ));
+        }
+        let segment_cache = if self.segment_cache {
+            let d = SegmentCacheConfig::default();
+            Some(SegmentCacheConfig {
+                capacity: self.segment_cache_capacity.unwrap_or(d.capacity),
+                min_bytes: self.segment_cache_min_bytes.unwrap_or(d.min_bytes),
+            })
+        } else {
+            None
+        };
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -267,6 +301,7 @@ impl Cli {
                 circuit_breaker,
                 cache_aware,
                 sticky,
+                segment_cache,
             },
             discovery,
             proxy: ProxyConfig {
