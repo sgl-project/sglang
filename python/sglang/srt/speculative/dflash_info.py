@@ -144,10 +144,7 @@ class DFlashVerifyInput(SpecInput):
         )
         mask = self.custom_mask
         if mask is not None:
-            mask_numel = (
-                paged_kernel_lens_sum * self.draft_token_num
-                + (self.draft_token_num**2) * bs
-            )
+            mask_numel = paged_kernel_lens_sum * self.draft_token_num
             if mask.numel() < mask_numel:
                 # FIXME(attn): temporary fix for custom mask padding with cuda graph
                 mask = torch.cat(

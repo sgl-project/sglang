@@ -92,10 +92,7 @@ class NgramVerifyInput(SpecInput):
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
-        mask_numel = (
-            paged_kernel_lens_sum * self.draft_token_num
-            + (self.draft_token_num**2) * bs
-        )
+        mask_numel = paged_kernel_lens_sum * self.draft_token_num
         custom_mask = self.custom_mask
         if custom_mask.numel() < mask_numel:
             custom_mask = torch.cat(
