@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
@@ -80,6 +81,7 @@ def _allocate_decode_buffers(
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
+    pp_proxy_residual_num_blocks: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -114,9 +116,14 @@ def _allocate_decode_buffers(
                 "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
             }
             if not is_mhc:
-                pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_bs, hidden_size), dtype=dtype
+                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
+                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                residual_shape = (
+                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
+                    if pp_proxy_residual_num_blocks is not None
+                    else (max_bs, hidden_size)
                 )
+                pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
@@ -197,12 +204,16 @@ class BaseRunner(ABC):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        # elastic-EP scale-up rewrites dp_size on the published config
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
-        self.enable_return_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
+        self.return_hidden_states_mode = (
+            CaptureHiddenMode.NULL
+            if model_runner.is_draft_worker
+            else get_server_return_hidden_states_mode(model_runner.server_args)
         )
+        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -313,7 +324,7 @@ class BaseRunner(ABC):
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
-            dp_size=mr.server_args.dp_size,
+            dp_size=get_parallel().dp_size,
             pp_size=mr.server_args.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
@@ -333,6 +344,7 @@ class BaseRunner(ABC):
             ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
         )
 
     def _dummy_run(
@@ -367,7 +379,11 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.DECODE
         else:
             capture_forward_mode = ForwardMode.EXTEND
-        capture_hidden_mode = CaptureHiddenMode.NULL
+        capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if mr.is_draft_worker
+            else get_server_return_hidden_states_mode(mr.server_args)
+        )
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             if mr.is_draft_worker:
@@ -376,9 +392,6 @@ class BaseRunner(ABC):
                 ), "This should not happen"
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
-
-        if mr.server_args.enable_return_hidden_states:
-            capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_req
 
@@ -483,7 +496,7 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * mr.server_args.dp_size
+            global_num_tokens_cpu = [num_tokens] * get_parallel().dp_size
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
@@ -608,7 +621,7 @@ class BaseRunner(ABC):
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
-            with torch.inference_mode(), run_ctx or empty_context():
+            with run_ctx or empty_context():
                 run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:

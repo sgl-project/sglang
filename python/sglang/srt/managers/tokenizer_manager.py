@@ -91,13 +91,19 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    get_request_return_hidden_states_mode,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -151,6 +157,23 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
+    """Do not silently turn a failed EPD request into local vision work."""
+    if (
+        mm_inputs is None
+        and server_args.language_only
+        and server_args.encoder_transfer_backend == "zmq_to_tokenizer"
+        and request_obj.need_wait_for_mm_inputs
+    ):
+        raise fastapi.HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=(
+                "The encoder did not return multimodal embeddings. "
+                "The request was not run locally in language-only mode."
+            ),
+        )
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -172,6 +195,10 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
+class RequestAbortedError(ValueError):
+    status_code = 499
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -183,6 +210,9 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    abort_requested: bool = False
+    lifecycle_id: object = dataclasses.field(default_factory=object)
+    dispatched: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -341,6 +371,11 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
+_SERVER_ARGS_FIELDS = frozenset(f.name for f in dataclasses.fields(ServerArgs))
+
+_MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -363,6 +398,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.startup_time: Optional[Dict[str, Any]] = None
+        self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
@@ -432,8 +469,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
-            _processor = _get_processor_wrapper(server_args)
-            transport_mode = _determine_tensor_transport_mode(self.server_args)
+            _processor = get_processor_wrapper(server_args)
+            transport_mode = determine_tensor_transport_mode(self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
@@ -515,6 +552,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Parallel sampling keeps one caller-visible logical RID per original
+        # prompt while the scheduler operates on separate prefix/sample RIDs.
+        self.logical_rid_to_child_rids: Dict[str, set[str]] = {}
+        self.child_rid_to_logical_rid: Dict[str, str] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -672,6 +713,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
 
+    def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
+        self.startup_time = startup_time
+        if self.enable_metrics:
+            self.metrics_collector.emit_startup_time(startup_time)
+
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -705,6 +751,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.max_thinking_tokens is not None
+            and not self.server_args.enable_strict_thinking
+        ):
+            raise ValueError(
+                "max_thinking_tokens requires the server to be launched with "
+                "--enable-strict-thinking"
+            )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.elastic_worker_count
@@ -717,7 +772,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        self._init_req_state(obj, request)
+        request_lifecycles = self._init_req_state(obj, request)
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -727,13 +782,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            self._raise_if_logical_request_aborted(obj)
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
+                self._raise_if_logical_request_aborted(obj)
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    self._raise_if_logical_rid_aborted(obj.rid)
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -743,7 +801,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except Exception:
+        except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -751,7 +809,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop any that
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            self._discard_pending_req_states(obj, request_lifecycles)
             raise
 
     def _detect_input_format(
@@ -977,6 +1035,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._validate_mm_limits(obj)
 
             mm_inputs = None
+            mm_processor_input = (
+                input_ids
+                if self.mm_processor.prefer_tokenized_input and input_ids is not None
+                else (input_text or input_ids)
+            )
 
             if (
                 not self.server_args.language_only
@@ -986,8 +1049,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
+                        prompt=mm_processor_input,
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                    )
+                    _reject_missing_dispatched_encoder_embedding(
+                        self.server_args, obj, mm_inputs
                     )
                 if mm_inputs is None:
                     if self.server_args.language_only:
@@ -998,7 +1064,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
+                        input_text=mm_processor_input,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
@@ -1013,7 +1079,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
+                    input_text=mm_processor_input,
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
                 )
@@ -1048,7 +1114,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if not isinstance(item, MultimodalDataItem):
                             continue
                         try:
-                            item.hash = int(hex_hash, 16)
+                            item.set_hash(int(hex_hash, 16))
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Ignoring malformed mm_hashes entry %r; "
@@ -1137,13 +1203,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
-            if (
+            requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
-                and not self.server_args.enable_return_hidden_states
-            ):
+            )
+            server_hidden_mode = get_server_return_hidden_states_mode(self.server_args)
+            if requested_hidden_mode > server_hidden_mode:
+                if server_hidden_mode.need_capture():
+                    raise ValueError(
+                        "The requested return_hidden_states mode exceeds the "
+                        f"server maximum `{self.server_args.return_hidden_states_mode}`. "
+                        "Please launch with `--return-hidden-states-mode full` "
+                        "to allow return_hidden_states=True."
+                    )
                 raise ValueError(
-                    "The server is not configured to return the hidden states. "
-                    "Please set `--enable-return-hidden-states` to enable this feature."
+                    "The server is not configured to return hidden states. "
+                    "Please set `--return-hidden-states-mode last`, "
+                    "`--return-hidden-states-mode full`, or the legacy "
+                    "`--enable-return-hidden-states` flag."
                 )
             if (
                 obj.custom_logit_processor
@@ -1255,6 +1331,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
+        if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
+            sampling_kwargs = dict(sampling_kwargs)
+            custom_params = dict(sampling_kwargs.get("custom_params") or {})
+            custom_params["thinking_budget"] = obj.max_thinking_tokens
+            sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
@@ -1465,6 +1546,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         time_stats = tokenized_obj.time_stats
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is not None:
+            state.dispatched = True
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1486,6 +1570,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self._dispatch_to_scheduler(batch_req)
+        for tokenized_obj in tokenized_objs:
+            state = self.rid_to_state.get(tokenized_obj.rid)
+            if state is not None:
+                state.dispatched = True
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -1557,7 +1645,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
             if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
+                self._remove_req_state(state.obj.rid)
 
             # Mark ongoing LoRA request as finished.
             if self.enable_lora and state.obj.lora_path:
@@ -1691,6 +1779,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                self._raise_if_logical_request_aborted(obj)
                 self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
@@ -1713,6 +1802,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        self._raise_if_logical_rid_aborted(tmp_obj.rid)
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -1733,9 +1823,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
+            self._raise_if_logical_request_aborted(obj)
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
+                logical_rid = objs[i].rid
+                self._raise_if_logical_rid_aborted(logical_rid)
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1744,17 +1837,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs.mm_items = [
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                tokenized_obj.rid = tmp_obj.regenerate_rid(prefix=logical_rid)
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
+                self._init_child_req_state(logical_rid, tmp_obj)
                 self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
+                self._raise_if_logical_rid_aborted(logical_rid)
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
+                logical_rid = objs[i].rid
                 for _ in range(obj.parallel_sample_num):
+                    self._raise_if_logical_rid_aborted(logical_rid)
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1763,8 +1859,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._init_req_state(tmp_obj)
+                    tokenized_obj.rid = tmp_obj.regenerate_rid(prefix=logical_rid)
+                    self._init_child_req_state(logical_rid, tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
@@ -1773,17 +1869,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                parent_state = self.rid_to_state.get(logical_rid)
+                if parent_state is not None:
+                    parent_state.time_stats.set_finished_time()
+                self._remove_req_state(logical_rid)
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
+            outputs = await self._collect_batch_responses(generators)
             yield outputs
         else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            async for response in self._stream_batch_responses(generators, rids):
+                yield response
+
+    async def _collect_batch_responses(self, generators):
+        tasks = [asyncio.create_task(gen.__anext__()) for gen in generators]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(gen.aclose() for gen in generators),
+                return_exceptions=True,
+            )
+
+    async def _stream_batch_responses(self, generators, rids):
+        rid_to_index = {rid: i for i, rid in enumerate(rids)}
+        task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+        try:
             while task_map:
                 done, _ = await asyncio.wait(
                     task_map.keys(), return_when=asyncio.FIRST_COMPLETED
@@ -1799,20 +1916,55 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
+        finally:
+            pending_tasks = list(task_map)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(gen.aclose() for gen in generators),
+                return_exceptions=True,
+            )
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
+        if abort_all:
+            for state_rid, state in self.rid_to_state.items():
+                if state_rid not in self.child_rid_to_logical_rid:
+                    state.abort_requested = True
+            target_rids = (rid,)
+        elif rid in self.child_rid_to_logical_rid:
+            # Preserve direct child aborts for internal callers.
+            target_rids = (rid,)
+        elif rid in self.rid_to_state:
+            state = self.rid_to_state[rid]
+            state.abort_requested = True
+            parallel_sample_num = getattr(state.obj, "parallel_sample_num", None)
+            if parallel_sample_num is None:
+                sampling_params = getattr(state.obj, "sampling_params", None)
+                parallel_sample_num = (
+                    sampling_params.get("n", 1)
+                    if isinstance(sampling_params, dict)
+                    else 1
+                )
+            if parallel_sample_num > 1:
+                # Snapshot because scheduler abort echoes remove child ownership.
+                target_rids = tuple(sorted(self.logical_rid_to_child_rids.get(rid, ())))
+            else:
+                target_rids = (rid,)
+        elif child_rids := self.logical_rid_to_child_rids.get(rid):
+            target_rids = tuple(sorted(child_rids))
+        elif self.server_args.tokenizer_worker_num == 1:
             return
-        req = AbortReq(rid=rid, abort_all=abort_all)
-        self._dispatch_to_scheduler(req)
+        else:
+            target_rids = (rid,)
+
+        for target_rid in target_rids:
+            self._dispatch_to_scheduler(AbortReq(rid=target_rid, abort_all=abort_all))
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1847,9 +1999,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
-        # default the load format to the server_args
         if obj.load_format is None:
-            obj.load_format = self.server_args.load_format
+            obj.load_format = self.config_value("load_format")
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
         if obj.abort_all_requests:
@@ -1873,11 +2024,57 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return success, message, num_paused_requests
 
+    def record_config_updates(self, source: str, **fields) -> None:
+        """Record a control-plane config change for this engine.
+
+        Per-engine state: several ``Engine``s can share one tokenizer process.
+        The readback endpoints overlay these onto the startup config. The
+        process-global sibling is ``RuntimeContext.override`` /
+        ``resolved_server_args_dict``, which writes the config bags every
+        process shares.
+        """
+        unknown = sorted(f for f in fields if f not in _SERVER_ARGS_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"{unknown} are not ServerArgs fields; the readback endpoints "
+                "overlay these onto a serialized ServerArgs, so an unknown key "
+                "would surface as a phantom config entry."
+            )
+        self._config_updates.append((source, dict(fields)))
+
+    def config_value(self, name: str):
+        """The value in effect for one config field, control-plane updates first."""
+        if name in _MANAGER_OWNED_FIELDS:
+            return getattr(self, name)
+        for _source, fields in reversed(self._config_updates):
+            if name in fields:
+                return fields[name]
+        return getattr(self.server_args, name)
+
+    def _dump_config_snapshot(self) -> Optional[Dict[str, Any]]:
+        """The config in effect, or None when it cannot be serialized.
+
+        A dump is worth having even when the config is not: request data is the
+        part that cannot be reconstructed afterwards.
+        """
+        try:
+            return self.resolved_config_dict(dataclasses.asdict(self.server_args))
+        except Exception as e:
+            logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
+            return None
+
+    def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
+        """``base`` (a serialized ``ServerArgs``) with the control-plane updates on top."""
+        resolved = dict(base)
+        for _source, fields in self._config_updates:
+            resolved.update(fields)
+        for name in _MANAGER_OWNED_FIELDS:
+            resolved[name] = getattr(self, name)
+        return resolved
+
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        self.server_args.override(
-            "tokenizer.update_weights", model_path=model_path, load_format=load_format
-        )
+        self.record_config_updates("tokenizer.update_weights", load_format=load_format)
         self.model_path = model_path
 
     async def _wait_for_model_update_from_disk(
@@ -2019,7 +2216,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
+                "weight_version": self.config_value("weight_version"),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -2254,7 +2451,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                del self.rid_to_state[rid]
+                self._remove_req_state(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
@@ -2691,6 +2888,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._request_has_grammar(state.obj),
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
+                is_streaming=getattr(state.obj, "stream", False),
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -2748,6 +2946,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logger.info(log_message)
         to_dump_with_server_args = {
             "server_args": self.server_args,
+            "config_updates": list(self._config_updates),
+            "resolved_config": self._dump_config_snapshot(),
             "requests": data_list.copy(),
         }
 
@@ -2767,6 +2967,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f.seek(0)
                     f.truncate()
                     to_dump_with_server_args["server_args"] = None
+                    # The snapshot copies the same object field by field.
+                    to_dump_with_server_args["resolved_config"] = None
                     pickle.dump(to_dump_with_server_args, f)
 
         asyncio.create_task(asyncio.to_thread(background_task))
@@ -2829,6 +3031,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Write the data to the file
                 data_to_dump_with_server_args = {
                     "server_args": self.server_args,
+                    "config_updates": list(self._config_updates),
+                    "resolved_config": self._dump_config_snapshot(),
                     "requests": data_to_dump,
                     "launch_command": " ".join(sys.argv),
                 }
@@ -2846,6 +3050,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         f.seek(0)
                         f.truncate()
                         data_to_dump_with_server_args["server_args"] = None
+                        # The snapshot copies the same object field by field.
+                        data_to_dump_with_server_args["resolved_config"] = None
                         pickle.dump(data_to_dump_with_server_args, f)
                 logger.error(
                     f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
@@ -2958,7 +3164,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": self.server_args.weight_version,
+            "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
         is_stream = getattr(state.obj, "stream", False)
@@ -2981,7 +3187,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        del self.rid_to_state[recv_obj.rid]
+        self._remove_req_state(recv_obj.rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3137,11 +3343,80 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+    @staticmethod
+    def _logical_rids(obj) -> List[str]:
+        if not hasattr(obj, "is_single") or obj.is_single:
+            return [obj.rid]
+        return list(obj.rid)
+
+    def _register_child_rid(self, logical_rid: str, child_rid: str) -> None:
+        if child_rid == logical_rid:
+            raise ValueError(
+                "Parallel-sampling child RID must differ from its logical RID"
+            )
+        owner = self.child_rid_to_logical_rid.get(child_rid)
+        if owner is not None and owner != logical_rid:
+            raise ValueError(
+                f"Request ID {child_rid} is already owned by logical request {owner}"
+            )
+        self.child_rid_to_logical_rid[child_rid] = logical_rid
+        self.logical_rid_to_child_rids.setdefault(logical_rid, set()).add(child_rid)
+
+    def _init_child_req_state(
+        self,
+        logical_rid: str,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request] = None,
+    ) -> None:
+        self._raise_if_logical_rid_aborted(logical_rid)
+        logical_state = self.rid_to_state[logical_rid]
+        self._init_req_state(
+            obj,
+            request,
+            lifecycle_id=logical_state.lifecycle_id,
+        )
+        try:
+            self._register_child_rid(logical_rid, obj.rid)
+        except BaseException:
+            self._remove_req_state(obj.rid)
+            raise
+
+    def _remove_req_state(
+        self,
+        rid: str,
+        lifecycle_id: Optional[object] = None,
+    ) -> Optional[ReqState]:
+        """Remove a request state and its parallel-sampling ownership."""
+        state = self.rid_to_state.get(rid)
+        if state is None or (
+            lifecycle_id is not None and state.lifecycle_id is not lifecycle_id
+        ):
+            return None
+        self.rid_to_state.pop(rid)
+        logical_rid = self.child_rid_to_logical_rid.pop(rid, None)
+        if logical_rid is not None:
+            children = self.logical_rid_to_child_rids.get(logical_rid)
+            if children is not None:
+                children.discard(rid)
+                if not children:
+                    self.logical_rid_to_child_rids.pop(logical_rid, None)
+        return state
+
+    def _raise_if_logical_rid_aborted(self, logical_rid: str) -> None:
+        state = self.rid_to_state.get(logical_rid)
+        if state is None or state.abort_requested:
+            raise RequestAbortedError(f"Request {logical_rid} was aborted")
+
+    def _raise_if_logical_request_aborted(self, obj) -> None:
+        for logical_rid in self._logical_rids(obj):
+            self._raise_if_logical_rid_aborted(logical_rid)
+
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
-    ):
+        lifecycle_id: Optional[object] = None,
+    ) -> Dict[str, object]:
         created_time = obj.received_time
 
         external_trace_header = None
@@ -3172,29 +3447,90 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in self.rid_to_state:
+        rids = [rid for rid, _, _ in items]
+        seen_rids = set()
+        for rid in rids:
+            if rid in seen_rids:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            seen_rids.add(rid)
+            if (
+                rid in self.rid_to_state
+                or rid in self.logical_rid_to_child_rids
+                or rid in self.child_rid_to_logical_rid
+            ):
+                raise ValueError(f"Duplicate request ID detected: {rid}")
+
+        # Mutate only after every RID passes duplicate validation so a rejected
+        # batch cannot leave a partial rid_to_state insertion behind.
+        lifecycle_ids = {}
+        for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-            state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            state = ReqState(
+                [],
+                False,
+                asyncio.Event(),
+                sub_obj,
+                time_stats,
+                lifecycle_id=lifecycle_id if lifecycle_id is not None else object(),
+            )
             self.rid_to_state[rid] = state
+            lifecycle_ids[rid] = state.lifecycle_id
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+        return lifecycle_ids
 
-    def _discard_pending_req_states(self, obj):
-        """Drop rid_to_state entries created by _init_req_state for *obj*.
+    def _discard_pending_req_states(
+        self,
+        obj,
+        lifecycle_ids: Optional[Dict[str, object]] = None,
+    ):
+        """Drop all logical and child state owned by *obj*.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Safe to call after a partial/failed dispatch: only requests known to have
+        reached the scheduler are aborted, all owned state is removed, and a later
+        output for a discarded RID is ignored by the scheduler-response path.
         """
-        if not hasattr(obj, "is_single") or obj.is_single:
-            rids = [obj.rid]
-        else:
-            rids = obj.rid
-        for rid in rids:
-            self.rid_to_state.pop(rid, None)
+        if lifecycle_ids is None:
+            lifecycle_ids = {
+                logical_rid: state.lifecycle_id
+                for logical_rid in self._logical_rids(obj)
+                if (state := self.rid_to_state.get(logical_rid)) is not None
+            }
+        for logical_rid in self._logical_rids(obj):
+            lifecycle_id = lifecycle_ids.get(logical_rid)
+            if lifecycle_id is None:
+                continue
+            child_rids = tuple(
+                child_rid
+                for child_rid in self.logical_rid_to_child_rids.get(logical_rid, ())
+                if (
+                    (state := self.rid_to_state.get(child_rid)) is not None
+                    and state.lifecycle_id is lifecycle_id
+                )
+            )
+            logical_state = self.rid_to_state.get(logical_rid)
+            owns_logical_state = (
+                logical_state is not None and logical_state.lifecycle_id is lifecycle_id
+            )
+            target_rids = tuple(
+                rid for rid in child_rids if self.rid_to_state[rid].dispatched
+            )
+            if not child_rids and owns_logical_state and logical_state.dispatched:
+                target_rids = (logical_rid,)
+            for target_rid in target_rids:
+                try:
+                    self._dispatch_to_scheduler(
+                        AbortReq(rid=target_rid, abort_all=False)
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to abort request rid=%s",
+                        target_rid,
+                    )
+            for child_rid in child_rids:
+                self._remove_req_state(child_rid, lifecycle_id)
+            self._remove_req_state(logical_rid, lifecycle_id)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -3363,7 +3699,7 @@ async def print_exception_wrapper(func):
         sys.exit(1)
 
 
-def _get_processor_wrapper(server_args):
+def get_processor_wrapper(server_args):
     try:
         processor = get_processor(
             server_args.tokenizer_path,
@@ -3394,7 +3730,7 @@ def _get_processor_wrapper(server_args):
     return processor
 
 
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:
