@@ -6,31 +6,43 @@
 //! on the data. For every session (identified by the sticky routing key, e.g.
 //! the `x-session-id` header) it stamps three instants per turn —
 //!
-//!   * `t_recv`  — the request was received / dispatched,
-//!   * `t_first` — the first streamed token arrived,
-//!   * `t_end`   — the last decode token / stream end.
+//!   * `t_dispatch` — request successfully dispatched to a worker (prefill
+//!     start), **not** when the router received it, so time spent inside the
+//!     router (queue / route / tokenize) is excluded;
+//!   * `t_first` — the first streamed token arrived;
+//!   * `t_end` — the last decode token / stream end.
+//!
+//! Lifecycle correctness:
+//!   * **Errored / aborted turns are not recorded.** The router's TTFT first-byte
+//!     hook only fires for a 2xx stream that actually produced a token, so a turn
+//!     is recorded only when `t_first` was stamped. Non-2xx responses, and aborts
+//!     before the first token, leave `t_first` unset and are dropped.
+//!   * **Retries refresh the start.** The router does no internal retry — a
+//!     failed request is resent by the client as a fresh dispatch. Since the
+//!     failed attempt recorded nothing, the retry's `on_dispatch` simply
+//!     re-stamps `t_dispatch` (the correct prefill start).
 //!
 //! Two outputs, both opt-in via `SGL_ROUTER_SESSION_STATS_DUMP`:
 //!
 //!   1. **`session_timestamp.json`** — the raw triples per session, written to
 //!      the configured path as a whole-file snapshot (Unix seconds):
 //!
-//!          { "<session-id>": [[t_recv, t_first, t_end], ...], ... }
+//!          { "<session-id>": [[t_dispatch, t_first, t_end], ...], ... }
 //!
 //!      Refreshed by a periodic flush task and once more on shutdown.
 //!
-//!   2. **One log line per received `t_recv`**, carrying the *previous* turn's
-//!      timing `t` — each phase's share of the whole turn cycle, in [0, 1]:
+//!   2. **One log line per dispatch**, carrying the *previous* turn's timing `t`
+//!      — each phase's share of the whole turn cycle, in [0, 1]:
 //!
 //!          prefill_t = prefill_ms / total_ms
 //!          decode_t  = decode_ms  / total_ms
 //!          acting_t  = acting_ms  / total_ms
 //!
-//!      where `prefill_ms = t_first - t_recv`, `decode_ms = t_end - t_first`,
+//!      where `prefill_ms = t_first - t_dispatch`, `decode_ms = t_end - t_first`,
 //!      `acting_ms = total_ms - prefill_ms - decode_ms`, and
-//!      `total_ms = next_t_recv - t_recv` (the full cycle incl. client acting).
-//!      `total_ms` is only knowable once the next turn arrives, so a turn's line
-//!      is emitted at the start of the following turn.
+//!      `total_ms = next_t_dispatch - t_dispatch` (the full cycle incl. client
+//!      acting). `total_ms` is only knowable once the next turn dispatches, so a
+//!      turn's line is emitted at the start of the following turn.
 //!
 //! Config: `SGL_ROUTER_SESSION_STATS_DUMP` = path to `session_timestamp.json`.
 //! When set, the feature (JSON dump + log lines) is enabled; unset → no-op.
@@ -45,8 +57,7 @@ use dashmap::DashMap;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One completed turn's raw timestamps, in Unix seconds:
-/// `[t_recv, t_first, t_end]`. `t_first` falls back to `t_recv` if no token was
-/// streamed (degenerate; streaming turns always have a first token).
+/// `[t_dispatch, t_first, t_end]`.
 type Triple = [f64; 3];
 
 /// Shared session → triples map (behind `Arc` so the periodic flush task can
@@ -56,12 +67,13 @@ type Archive = Arc<DashMap<String, Vec<Triple>>>;
 /// Live per-session log state.
 #[derive(Debug)]
 struct SessionStat {
-    /// Current turn's receive instant.
-    t_recv: Instant,
-    /// Current turn's first-token instant.
+    /// Current turn's dispatch instant (prefill start). Re-stamped on retry.
+    t_dispatch: Instant,
+    /// Current turn's first-token instant. `None` until a token streams — its
+    /// presence is what marks the turn as a real, successful turn.
     t_first: Option<Instant>,
     /// Derived `(prefill_ms, decode_ms)` of a completed turn awaiting its
-    /// `total_ms` (computed when the next turn starts, then logged).
+    /// `total_ms` (computed when the next turn dispatches, then logged).
     pending: Option<(f32, f32)>,
     turns: u64,
 }
@@ -119,10 +131,11 @@ impl SessionStats {
         self.archive.is_some()
     }
 
-    /// A request for `sid` was received. Stamps `t_recv`, and — if the previous
-    /// turn is complete — logs that turn's `t` now that `total_ms` is known.
-    /// One line per received `t_recv`.
-    pub fn on_turn_start(&self, sid: &str, now: Instant) {
+    /// The request for `sid` was dispatched to a worker (prefill start). Called
+    /// at the dispatch site — and again on each retry, re-stamping the start.
+    /// Stamps `t_dispatch`, clears `t_first`, and — if the previous turn is
+    /// complete — logs its `t` now that `total_ms` is known.
+    pub fn on_dispatch(&self, sid: &str, now: Instant) {
         if !self.enabled() {
             return;
         }
@@ -130,17 +143,17 @@ impl SessionStats {
             .map
             .entry(sid.to_string())
             .or_insert_with(|| SessionStat {
-                t_recv: now,
+                t_dispatch: now,
                 t_first: None,
                 pending: None,
                 turns: 0,
             });
 
-        // The completed prior turn's total cycle = this turn's recv minus that
-        // turn's recv (still held in `t_recv` until we overwrite it below). Log
-        // the previous turn's `t` on every received `t_recv`.
+        // The completed prior turn's total cycle = this dispatch minus that
+        // turn's dispatch (still held in `t_dispatch` until we overwrite it
+        // below). Log the previous turn's `t` on every dispatch.
         if let Some((prefill_ms, decode_ms)) = e.pending.take() {
-            let total_ms = dur_ms(now.saturating_duration_since(e.t_recv));
+            let total_ms = dur_ms(now.saturating_duration_since(e.t_dispatch));
             // acting = client thinking / tool time = total - (prefill + decode).
             let acting_ms = (total_ms - prefill_ms - decode_ms).max(0.0);
             // Each `t` is that phase's share of the whole turn cycle, in [0, 1].
@@ -168,11 +181,13 @@ impl SessionStats {
             );
         }
 
-        e.t_recv = now;
+        e.t_dispatch = now;
         e.t_first = None;
     }
 
     /// The first streamed token for `sid` arrived. Idempotent within a turn.
+    /// Only fired for a 2xx stream that produced a token, so its presence marks
+    /// a real, successful turn.
     pub fn on_first_token(&self, sid: &str, now: Instant) {
         if !self.enabled() {
             return;
@@ -184,40 +199,38 @@ impl SessionStats {
         }
     }
 
-    /// The last decode token / stream end for `sid`. Records the raw triple into
-    /// the JSON archive and marks the turn's `(prefill, decode)` pending its
-    /// `total_ms` at the next turn start.
+    /// The last decode token / stream end for `sid`. Records the raw triple and
+    /// marks the turn's `(prefill, decode)` pending its `total_ms` at the next
+    /// dispatch. **Skipped for errored / aborted turns** — if no token ever
+    /// streamed (`t_first` unset), there is no real turn to record.
     pub fn on_turn_end(&self, sid: &str, now: Instant) {
         let Some(archive) = &self.archive else {
             return;
         };
         let mut e = match self.map.get_mut(sid) {
             Some(e) => e,
-            // No matching start (e.g. enabled mid-session) — ignore.
             None => return,
         };
-        let t_first = e.t_first;
-        let prefill_ms = t_first
-            .map(|f| dur_ms(f.saturating_duration_since(e.t_recv)))
-            .unwrap_or(0.0);
-        let decode_ms = t_first
-            .map(|f| dur_ms(now.saturating_duration_since(f)))
-            .unwrap_or(0.0);
+        let Some(t_first) = e.t_first else {
+            // No first token → non-2xx error or abort before any token. Not a
+            // recordable turn; leave state so the client's retry re-stamps.
+            return;
+        };
+        let prefill_ms = dur_ms(t_first.saturating_duration_since(e.t_dispatch));
+        let decode_ms = dur_ms(now.saturating_duration_since(t_first));
         e.pending = Some((prefill_ms, decode_ms));
         e.turns += 1;
 
         // Raw triple in wall-clock Unix seconds. We know `t_end`'s wall clock
-        // and the Instant deltas, so back-compute `t_recv` / `t_first` — no need
-        // to capture SystemTime at all three points.
+        // and the Instant deltas, so back-compute `t_dispatch` / `t_first` — no
+        // need to capture SystemTime at all three points.
         let end_unix = unix_secs();
-        let recv_unix = end_unix - now.saturating_duration_since(e.t_recv).as_secs_f64();
-        let first_unix = t_first
-            .map(|f| end_unix - now.saturating_duration_since(f).as_secs_f64())
-            .unwrap_or(recv_unix);
+        let dispatch_unix = end_unix - now.saturating_duration_since(e.t_dispatch).as_secs_f64();
+        let first_unix = end_unix - now.saturating_duration_since(t_first).as_secs_f64();
         archive
             .entry(sid.to_string())
             .or_default()
-            .push([recv_unix, first_unix, end_unix]);
+            .push([dispatch_unix, first_unix, end_unix]);
     }
 
     /// Number of sessions in the JSON archive.
@@ -320,43 +333,60 @@ mod tests {
         let s = test_stats();
         let t0 = Instant::now();
 
-        // Turn 1: recv@0, first@100, end@600.
-        s.on_turn_start("sid", at(t0, 0));
+        // Turn 1: dispatch@0, first@100, end@600.
+        s.on_dispatch("sid", at(t0, 0));
         s.on_first_token("sid", at(t0, 100));
         s.on_turn_end("sid", at(t0, 600));
 
-        // Turn 2: recv@1600, first@1700, end@1900.
-        s.on_turn_start("sid", at(t0, 1600));
+        // Turn 2: dispatch@1600, first@1700, end@1900.
+        s.on_dispatch("sid", at(t0, 1600));
         s.on_first_token("sid", at(t0, 1700));
         s.on_turn_end("sid", at(t0, 1900));
 
         let ts = triples(&s, "sid");
         assert_eq!(ts.len(), 2, "two turns recorded");
-        // Each triple is [t_recv, t_first, t_end]; assert the internal deltas
-        // (absolute values are wall-clock and not fixed in a test).
+        // Each triple is [t_dispatch, t_first, t_end]; assert the internal deltas.
         let [r0, f0, e0] = ts[0];
         assert!((f0 - r0 - 0.100).abs() < 0.02, "prefill≈100ms: {}", f0 - r0);
         assert!((e0 - f0 - 0.500).abs() < 0.02, "decode≈500ms: {}", e0 - f0);
         let [r1, f1, e1] = ts[1];
         assert!((f1 - r1 - 0.100).abs() < 0.02, "prefill≈100ms: {}", f1 - r1);
         assert!((e1 - f1 - 0.200).abs() < 0.02, "decode≈200ms: {}", e1 - f1);
-        // (Cross-turn cycle is validated via the log/`total_ms` path, not the
-        // triples: each triple's wall clock is anchored at its own `t_end`, so
-        // comparing across turns would mix synthetic test instants with the real
-        // clock. The within-triple deltas above are the meaningful invariant.)
+    }
+
+    #[test]
+    fn errored_turn_without_first_token_is_not_recorded() {
+        let s = test_stats();
+        let t0 = Instant::now();
+        // Dispatch but the stream errors before any token (t_first never set).
+        s.on_dispatch("sid", at(t0, 0));
+        s.on_turn_end("sid", at(t0, 50));
+        assert!(
+            triples(&s, "sid").is_empty(),
+            "no turn recorded on error/abort"
+        );
+
+        // The client retries: fresh dispatch re-stamps the start and a real
+        // (token-producing) turn is recorded.
+        s.on_dispatch("sid", at(t0, 1000));
+        s.on_first_token("sid", at(t0, 1100));
+        s.on_turn_end("sid", at(t0, 1400));
+        let ts = triples(&s, "sid");
+        assert_eq!(ts.len(), 1, "only the successful retry is recorded");
+        let [r, f, e] = ts[0];
+        assert!((f - r - 0.100).abs() < 0.02, "prefill≈100ms: {}", f - r);
+        assert!((e - f - 0.300).abs() < 0.02, "decode≈300ms: {}", e - f);
     }
 
     #[test]
     fn json_shape_is_session_to_triples() {
         let s = test_stats();
         let t0 = Instant::now();
-        s.on_turn_start("a", at(t0, 0));
-        s.on_first_token("a", at(t0, 10));
-        s.on_turn_end("a", at(t0, 50));
-        s.on_turn_start("b", at(t0, 0));
-        s.on_first_token("b", at(t0, 10));
-        s.on_turn_end("b", at(t0, 50));
-
+        for sid in ["a", "b"] {
+            s.on_dispatch(sid, at(t0, 0));
+            s.on_first_token(sid, at(t0, 10));
+            s.on_turn_end(sid, at(t0, 50));
+        }
         let snapshot: BTreeMap<String, Vec<Triple>> = s
             .archive
             .as_ref()
@@ -365,33 +395,27 @@ mod tests {
             .map(|kv| (kv.key().clone(), kv.value().clone()))
             .collect();
         let json = serde_json::to_string(&snapshot).unwrap();
-        // {"a":[[...]],"b":[[...]]}
         assert!(json.starts_with("{\"a\":[["), "shape: {json}");
         assert!(json.contains("\"b\":[["), "shape: {json}");
     }
 
     #[test]
-    fn logs_prev_turn_t_on_each_recv() {
+    fn logs_prev_turn_on_next_dispatch() {
         let s = test_stats();
         let t0 = Instant::now();
-        // Turn 1 completes → its (prefill, decode) is pending, no total yet.
-        s.on_turn_start("sid", at(t0, 0));
+        s.on_dispatch("sid", at(t0, 0));
         s.on_first_token("sid", at(t0, 100));
         s.on_turn_end("sid", at(t0, 600));
         assert!(s.map.get("sid").unwrap().pending.is_some());
-        // Turn 2's t_recv → prior turn's `t` is logged and pending is cleared.
-        s.on_turn_start("sid", at(t0, 1600));
-        assert!(
-            s.map.get("sid").unwrap().pending.is_none(),
-            "pending cleared after logging on the next t_recv"
-        );
+        s.on_dispatch("sid", at(t0, 1600)); // resolves total_ms, logs, clears pending
+        assert!(s.map.get("sid").unwrap().pending.is_none());
     }
 
     #[test]
     fn disabled_is_noop() {
         let s = SessionStats::disabled();
         let t0 = Instant::now();
-        s.on_turn_start("sid", t0);
+        s.on_dispatch("sid", t0);
         s.on_first_token("sid", at(t0, 10));
         s.on_turn_end("sid", at(t0, 50));
         assert!(s.is_empty());
