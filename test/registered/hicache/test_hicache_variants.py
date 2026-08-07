@@ -76,7 +76,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     hicache_args = [
         "--trust-remote-code",
         "--enable-hierarchical-cache",
-    ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
+    ] + (["--hicache-size", 250] if _is_hip else ["--hicache-ratio", 2])
     mmlu_score_threshold = 0.5
     mmlu_num_examples = 64
     mmlu_num_threads = 32
