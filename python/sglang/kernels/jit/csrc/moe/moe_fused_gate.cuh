@@ -10,6 +10,15 @@
 #include <cfloat>
 #include <cstdint>
 
+// gfx1250 needs a 64-bit __shfl_*_sync mask (static_assert sizeof == 8); it's
+// masked to wave32 internally, so 64-bit is fine everywhere. __gfx1250__ is
+// device-pass only, so widen in the host pass too or the launch stub won't build.
+#if defined(__gfx1250__) || (defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_DEVICE_COMPILE__))
+#define SGL_WARP_SYNC_MASK 0xFFFFFFFFFFFFFFFFULL
+#else
+#define SGL_WARP_SYNC_MASK 0xFFFFFFFF
+#endif
+
 namespace {
 
 constexpr uint32_t kWarpSize = 32;
@@ -104,8 +113,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, warp_max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, warp_max_expert, offset);
+      float other_val = __shfl_down_sync(SGL_WARP_SYNC_MASK, warp_max_val, offset);
+      int other_expert = __shfl_down_sync(SGL_WARP_SYNC_MASK, warp_max_expert, offset);
       if (other_val > warp_max_val) {
         warp_max_val = other_val;
         warp_max_expert = other_expert;
@@ -125,8 +134,8 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 
 #pragma unroll
       for (int offset = 16; offset > 0; offset /= 2) {
-        float other_val = __shfl_down_sync(0xFFFFFFFF, final_max, offset);
-        int other_expert = __shfl_down_sync(0xFFFFFFFF, final_expert, offset);
+        float other_val = __shfl_down_sync(SGL_WARP_SYNC_MASK, final_max, offset);
+        int other_expert = __shfl_down_sync(SGL_WARP_SYNC_MASK, final_expert, offset);
         if (other_val > final_max) {
           final_max = other_val;
           final_expert = other_expert;
@@ -219,8 +228,8 @@ __global__ void moe_fused_gate_kernel(const MoEFusedGateParams __grid_constant__
     }
 
     for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-      float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
-      int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
+      float other_val = __shfl_down_sync(SGL_WARP_SYNC_MASK, max_val, offset);
+      int other_expert = __shfl_down_sync(SGL_WARP_SYNC_MASK, max_expert, offset);
 
       if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
         max_val = other_val;

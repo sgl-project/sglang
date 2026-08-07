@@ -26,7 +26,12 @@ from sglang.kernels.ops.attention.prefill_attention import (
 )
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    is_cuda,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    is_hip,
+)
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -34,6 +39,7 @@ if _is_cuda:
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
+_is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -344,7 +350,8 @@ def _fwd_kernel(
     SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
-    USE_COMPACT_TILE_GRID: tl.constexpr,
+    IS_GFX1250: tl.constexpr = False,
+    USE_COMPACT_TILE_GRID: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -505,7 +512,17 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q.to(k.dtype), k)
+            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+            # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
+            # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
+            # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
+            # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
+            # On all other platforms keep the original q.to(k.dtype) downcast.
+            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
+            if IS_GFX1250:
+                qk = tl.dot(q, k.to(q.dtype))
+            else:
+                qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -525,7 +542,10 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                if IS_GFX1250:
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                else:
+                    qk += tl.dot(qpe.to(kpe.dtype), kpe)
             qk *= sm_scale * k_scale
 
             if logit_cap > 0:
@@ -578,8 +598,14 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+            if IS_GFX1250:
+                dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            else:
+                dot = tl.dot(p.to(v.dtype), v)
+            acc = acc * re_scale[:, None] + dot * v_scale
 
             e_max = n_e_max
 
@@ -699,8 +725,14 @@ def _fwd_kernel(
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+            if IS_GFX1250:
+                dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            else:
+                dot = tl.dot(p.to(v.dtype), v)
+            acc = acc * re_scale[:, None] + dot
 
             e_max = n_e_max
 
@@ -894,6 +926,7 @@ def extend_attention_fwd(
         SKIP_PREFIX=skip_prefix,
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
+        IS_GFX1250=_is_gfx1250,
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
         PAGE_SIZE=page_size,
@@ -988,6 +1021,7 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -1156,7 +1190,17 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+            # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
+            # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
+            # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
+            # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
+            # On all other platforms keep the original q.to(k.dtype) downcast.
+            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
+            if IS_GFX1250:
+                qk = tl.dot(q, k.to(q.dtype))
+            else:
+                qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -1176,7 +1220,10 @@ def _fwd_kernel_unified(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                if IS_GFX1250:
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                else:
+                    qk += tl.dot(qpe.to(kpe.dtype), kpe)
 
             qk *= sm_scale_withk
 
@@ -1230,8 +1277,14 @@ def _fwd_kernel_unified(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+            # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+            if IS_GFX1250:
+                dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            else:
+                dot = tl.dot(p.to(v.dtype), v)
+            acc = acc * re_scale[:, None] + dot
 
             e_max = n_e_max
 
@@ -1383,6 +1436,7 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        IS_GFX1250=_is_gfx1250,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
