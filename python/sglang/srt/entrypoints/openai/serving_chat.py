@@ -223,6 +223,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
+        # The dsv4/dsv32 encoders are picked from the model architecture, not
+        # from --tool-call-parser, and they always render tools as DSML, so the
+        # model answers in DSML too. Pick the matching detector when no parser
+        # was configured, otherwise the DSML block is returned verbatim as
+        # content. An explicit --tool-call-parser still wins.
+        if self.tool_call_parser is None:
+            self.tool_call_parser = {
+                "dsv4": "deepseekv4",
+                "dsv32": "deepseekv32",
+            }.get(self.chat_encoding_spec)
+
         # Resolve the env-configured Inkling effort default once: the env var is
         # frozen for the server's lifetime, and a misconfigured value should
         # fail at boot, not 400 every request.
