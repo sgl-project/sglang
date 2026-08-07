@@ -25,7 +25,6 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 # Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
 # so that torch.compile can trace through the mHC module. Without registration,
@@ -101,54 +100,25 @@ def mhc_pre(
     n_splits_pre: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if is_npu():
-        # Native NPU fallback.  The fused Ascend-C kernels currently only
-        # accept D in {4096, 7168}, while TeleChat4 uses D=3584.
-        num_tokens, hc_mult, hidden_size = residual.shape
-        residual_fp32 = residual.float()
-        residual_flat = residual_fp32.reshape(num_tokens, hc_mult * hidden_size)
-
-        inv_rms = torch.rsqrt(
-            residual_flat.square().mean(dim=-1, keepdim=True) + rms_eps
-        )
-        mixes = F.linear(residual_flat, fn.float()) * inv_rms
-        pre_logits, post_logits, comb_logits = torch.split(
-            mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-        )
-
-        pre_mix = (
-            torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:hc_mult])
-            + hc_pre_eps
-        )
-        post_mix = torch.sigmoid(
-            post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-        ) * hc_post_mult_value
-        comb_mix = (
-            comb_logits * hc_scale[2] + hc_base[2 * hc_mult :]
-        ).reshape(num_tokens, hc_mult, hc_mult)
-
-        # Match hc_split_sinkhorn_kernel exactly: stable row softmax with eps,
-        # one column normalization, then alternating row/column normalization.
-        comb_mix = torch.exp(comb_mix - comb_mix.amax(dim=-1, keepdim=True))
-        comb_mix = (
-            comb_mix / comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps
-        )
-        comb_mix = comb_mix / (
-            comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps
-        )
-        for _ in range(sinkhorn_repeat - 1):
-            comb_mix = comb_mix / (
-                comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps
+        hc_mult = residual.shape[1]
+        if hc_sinkhorn_eps != hc_pre_eps:
+            raise ValueError(
+                "The AscendC hc_pre kernel uses one hc_eps for both pre and "
+                "Sinkhorn; hc_pre_eps and hc_sinkhorn_eps must match."
             )
-            comb_mix = comb_mix / (
-                comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps
-            )
-
-        layer_input = (pre_mix.unsqueeze(-1) * residual_fp32).sum(dim=1)
-        return (
-            post_mix.unsqueeze(-1),
-            comb_mix,
-            layer_input.to(residual.dtype),
+        if hc_post_mult_value != 2.0:
+            raise ValueError("The AscendC hc_pre kernel requires post multiplier 2.0.")
+        layer_input, post_mix, comb_mix = torch.ops.npu.hc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=sinkhorn_repeat,
+            norm_eps=rms_eps,
+            hc_eps=hc_pre_eps,
         )
+        return post_mix.unsqueeze(-1), comb_mix, layer_input
 
     return _mhc_pre_orig(
         residual=residual,
@@ -177,13 +147,9 @@ def mhc_post(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     if is_npu():
-        # comb_res_mix is transposed by mHCModule.forward to match the
-        # TileLang kernel's [input_stream, output_stream] convention.
-        output = post_layer_mix.squeeze(-1).unsqueeze(-1) * x.float().unsqueeze(1)
-        output = output + (
-            comb_res_mix.unsqueeze(-1) * residual.float().unsqueeze(2)
-        ).sum(dim=1)
-        return output.to(x.dtype)
+        return torch.ops.npu.hc_post(
+            x, residual, post_layer_mix.squeeze(-1), comb_res_mix
+        )
 
     return _mhc_post_orig(x, residual, post_layer_mix, comb_res_mix)
 
