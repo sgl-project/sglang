@@ -32,6 +32,10 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    # Completion event for the forward that wrote these KV pages. The transfer
+    # worker reads device memory outside the CUDA stream, so it has to wait on
+    # this before the RDMA read or it can observe half-written KV.
+    wait_event: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
