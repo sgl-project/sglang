@@ -1321,6 +1321,13 @@ class Envs:
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
+    # Overlapped image loading: decode each batch's images in a pool of loader
+    # processes off the GPU path so the next batch loads while the current one
+    # encodes. When disabled, IMAGE batches decode inline on the dispatch path.
+    SGLANG_ENCODER_ENABLE_IMAGE_LOADER = EnvBool(True)
+    # Worker processes that load/decode batch images off the GPU path, so the
+    # next batch can be loaded while the current one is encoding on the GPU.
+    SGLANG_ENCODER_IMAGE_LOADER_WORKERS = EnvInt(10)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
