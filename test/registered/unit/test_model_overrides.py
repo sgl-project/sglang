@@ -1589,7 +1589,25 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(
+                overrides_module, "get_device_capability", return_value=(10, 0)
+            ),
+        ):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="modelopt_fp4")
+                ),
+                {"moe_runner_backend": "flashinfer_trtllm_routed"},
+            )
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(
+                overrides_module, "get_device_capability", return_value=(12, 0)
+            ),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="modelopt_fp4")

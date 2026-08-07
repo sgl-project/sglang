@@ -2402,13 +2402,22 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
-        and is_sm120_supported()
+        and is_cuda()
     ):
-        moe_runner_backend = "flashinfer_cutlass"
-        logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM120 for "
-            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-        )
+        capability = get_device_capability()
+        if (10, 0) <= capability < (12, 0):
+            moe_runner_backend = "flashinfer_trtllm_routed"
+            logger.info(
+                "Use flashinfer_trtllm_routed as MoE runner backend for "
+                "modelopt_fp4 on Blackwell capability %s",
+                capability,
+            )
+        elif capability >= (12, 0) and is_sm120_supported():
+            moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as MoE runner backend on SM120+ for "
+                "modelopt_fp4 (routed TRT-LLM is not validated there)"
+            )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}

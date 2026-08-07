@@ -2006,6 +2006,30 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _resolve_nvfp4_moe_runner_backend(
+    moe_runner_backend: MoeRunnerBackend,
+) -> MoeRunnerBackend:
+    """Resolve the NVFP4 MoE backend selected by ``auto``."""
+    if not moe_runner_backend.is_auto():
+        return moe_runner_backend
+
+    if not is_cuda():
+        raise ValueError("NVFP4 MoE backend resolution requires CUDA")
+
+    capability = get_device_capability()
+    if (8, 0) <= capability < (10, 0):
+        return MoeRunnerBackend.MARLIN
+    if (10, 0) <= capability < (12, 0):
+        # The routed TRT-LLM path supports MiniMax-style NVFP4 routing and
+        # avoids the plain TRT-LLM top-k format assertion on Blackwell.
+        return MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+    if capability >= (12, 0):
+        # Keep the existing SM120+ CUTLASS fallback until the routed TRT-LLM
+        # path is validated on that architecture family.
+        return MoeRunnerBackend.FLASHINFER_CUTLASS
+    return MoeRunnerBackend.FLASHINFER_TRTLLM
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2027,18 +2051,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
-        self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        )
         self._cache_permute_indices = {}
+
+    def _get_effective_moe_runner_backend(self) -> MoeRunnerBackend:
+        backend = getattr(self, "_moe_runner_backend", None)
+        if backend is None:
+            backend = _resolve_nvfp4_moe_runner_backend(get_moe_runner_backend())
+        return backend
+
+    @property
+    def enable_flashinfer_trtllm_moe(self) -> bool:
+        backend = self._get_effective_moe_runner_backend()
+        return backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
-
-        """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+        """Whether the effective backend uses the FlashInfer CUTLASS path."""
+        return self._get_effective_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
@@ -2402,7 +2431,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if self.enable_flashinfer_trtllm_moe:
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -2567,15 +2596,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+        moe_runner_backend = _resolve_nvfp4_moe_runner_backend(get_moe_runner_backend())
 
         self._moe_runner_backend = moe_runner_backend
 
