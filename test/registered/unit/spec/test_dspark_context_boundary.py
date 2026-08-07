@@ -62,15 +62,6 @@ def test_clamp_verify_lens_context_boundary_cpu():
         remaining_generation_tokens=remaining,
         max_position_embeddings=100,
     )
-    print("DSpark context-boundary verify trace")
-    rows = zip(seq_lens.tolist(), remaining.tolist(), requested.tolist(), actual.tolist())
-    for row, values in enumerate(rows):
-        seq_len, generation_remaining, old, new = values
-        print(
-            f"request={row} seq_len={seq_len} generation_remaining={generation_remaining} "
-            f"context_remaining={100 - seq_len} requested_verify_len={old} "
-            f"actual_verify_len={new}"
-        )
     assert actual.tolist() == [6, 2, 1, 0, 2]
     assert torch.all(actual <= requested)
     assert torch.all(actual <= remaining)
@@ -100,10 +91,6 @@ def test_alloc_verify_window_pads_draft_tail_with_last_legal_position_cpu():
     model_runner = SimpleNamespace(
         req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 128), dtype=torch.int64))
     )
-    unsafe_positions = (prefix_lens.unsqueeze(1) + offsets).tolist()
-    print("DSpark draft-window trace")
-    print(f"before prefix_lens={prefix_lens.tolist()} verify_lens={verify_lens.tolist()}")
-    print(f"before full_positions={unsafe_positions}")
 
     window = alloc_verify_window(
         batch=batch,
@@ -115,8 +102,6 @@ def test_alloc_verify_window_pads_draft_tail_with_last_legal_position_cpu():
         verify_lens=verify_lens,
         max_position_embeddings=100,
     )
-    print(f"after safe_positions={window.positions_2d.tolist()}")
-    print(f"after cache_locs={window.verify_cache_loc_2d.tolist()}")
     assert window.positions_2d.tolist() == [[98, 99, 99, 99, 99, 99], [97, 98, 98, 98, 98, 98]]
     assert int(window.positions_2d.max()) < 100
 
