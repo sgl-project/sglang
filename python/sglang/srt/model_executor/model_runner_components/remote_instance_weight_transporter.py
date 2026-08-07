@@ -53,9 +53,12 @@ class RemoteInstanceWeightTransporter:
         self.session_id = NetworkAddress(
             local_ip, self.engine.get_rpc_port()
         ).to_host_port_str()
-        self.parallelism_config = RankParallelismConfig.from_parallel_state(
-            self.tp_rank
-        )
+
+    def maybe_init_parallelism_config(self) -> None:
+        if self.server_args.registers_parallelism_config():
+            self.parallelism_config = RankParallelismConfig.from_parallel_state(
+                self.tp_rank
+            )
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
@@ -75,7 +78,7 @@ class RemoteInstanceWeightTransporter:
         # The P2P weight-update client needs each rank's parallelism layout to
         # map training-side parameters onto this rank's shards.
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            self.server_args.registers_parallelism_config()
             and self.parallelism_config is not None
         ):
             self._register_parallelism_config_to_bootstrap()

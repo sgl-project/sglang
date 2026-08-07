@@ -16,9 +16,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import ray
+from ray import ObjectRef
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import PortArgs, ServerArgs
@@ -119,6 +120,25 @@ class SchedulerActor:
     def get_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake."""
         return self.scheduler.get_init_info()
+
+    def pull_weights(
+        self, weights_refs: List[ObjectRef], param_names: List[str]
+    ) -> None:
+        """Pull a pre-sharded weight bucket from the trainer via RDT zero-copy.
+
+        ``weights_refs`` is a list so Ray does not resolve the ref on call.
+        """
+        import torch
+        from ray.experimental import set_target_for_ref
+
+        # Runs on a different thread than run_event_loop, which owns the device binding.
+        torch.cuda.set_device(self.scheduler.ps.gpu_id)
+
+        model = self.scheduler.tp_worker.model_runner.model
+        params_dict = dict(model.named_parameters())
+        target_buffers = [params_dict[name].data for name in param_names]
+        set_target_for_ref(weights_refs[0], target_buffers)
+        ray.get(weights_refs[0])
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop. Blocks until shutdown."""

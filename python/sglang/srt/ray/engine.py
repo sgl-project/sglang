@@ -200,14 +200,27 @@ def _create_scheduler_actor(
         server_args, tp_rank
     )
 
+    rdt = server_args.enable_rdt_weight_sync
+
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
+        # run_event_loop() blocks one thread for the actor's lifetime; leave a spare
+        # for pull_weights, which the trainer calls while generation is paused.
+        max_concurrency=2 if rdt else 1,
+        # The http `port` disambiguates engines co-located on one node, letting the
+        # trainer find these actors via list_named_actors.
         name=(
             f"sglang_scheduler_node{rank0_node_ip}"
             f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-            f"_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
+            f"_port{server_args.port}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
         ),
+        # Non-detached named actors are not listed cross-job, so the trainer (a
+        # separate Ray job) could not discover them. RayEngine.shutdown kills these.
+        lifetime="detached" if rdt else None,
+        # SchedulerActor calls set_device() with the absolute id from
+        # get_accelerator_ids(), which is only valid if Ray leaves the mask alone.
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=bundle_idx,
