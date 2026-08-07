@@ -1,7 +1,6 @@
-"""Label-gated streaming-session variants on a hybrid-SWA model.
+"""Label-gated SWA streaming-session variants.
 
-CUDA-only, like test_streaming_session_swa.py: gpt-oss-20b is not part of the
-AMD streaming-session coverage.
+CUDA-only: gpt-oss-20b is not part of the AMD streaming-session coverage.
 """
 
 import unittest

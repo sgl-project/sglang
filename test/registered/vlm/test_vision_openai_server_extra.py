@@ -1,8 +1,5 @@
-"""Label-gated OpenAI-API vision/omni server launches.
-
-Holds the launches that are too expensive for the per-commit 1-gpu-h100 budget;
-the per-commit set lives in test_vision_openai_server_a.py.
-"""
+"""Label-gated vision/omni server launches too expensive for the per-commit
+budget; the per-commit set lives in test_vision_openai_server_a.py."""
 
 import unittest
 

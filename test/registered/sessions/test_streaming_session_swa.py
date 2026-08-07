@@ -1,8 +1,7 @@
 """Per-commit streaming-session tests on a hybrid-SWA model.
 
-Mirrors the split in test_streaming_session.py: the default config, one retract
-variant, and the abort-leak repro stay per-commit; the mixed-chunk retract
-variant lives in test_streaming_session_extra.py.
+Baseline + large-page retract + abort-leak repro stay per-commit; the
+mixed-chunk retract variant lives in test_streaming_session_swa_extra.py.
 """
 
 import unittest

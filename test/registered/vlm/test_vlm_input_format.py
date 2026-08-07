@@ -87,12 +87,9 @@ class VLMInputTestBase:
 
     @classmethod
     def _start_engine(cls):
-        # Called last in setUpClass, after _init_visual has put the reference
-        # vision tower on the device. Every test only reads through the engine,
-        # so one engine per class is enough. The engine's own event loop backs
-        # the synchronous `generate`, which is why the tests are not async: the
-        # tokenizer manager pins its handle_loop to the loop of the first
-        # request, and a per-test loop would strand it after the first test.
+        # One engine per class: every test only reads through it. The tests are
+        # sync rather than async because the tokenizer manager pins handle_loop
+        # to the loop of the first request, so a per-test loop would strand it.
         cls.engine = Engine(
             model_path=cls.model_path,
             chat_template=cls.chat_template,
@@ -105,8 +102,7 @@ class VLMInputTestBase:
 
     @classmethod
     def tearDownClass(cls):
-        # CustomTestCase calls tearDownClass even when setUpClass raises, so the
-        # engine may not have started yet.
+        # CustomTestCase runs tearDownClass even when setUpClass raised.
         if cls.engine is not None:
             cls.engine.shutdown()
             cls.engine = None

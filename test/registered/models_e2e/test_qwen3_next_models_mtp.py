@@ -11,9 +11,6 @@ register_cuda_ci(est_time=290, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
-# One launch per (eagle-topk, mamba scheduler strategy) axis value: topk > 1 on
-# extra_buffer, topk == 1 on extra_buffer_lazy.
-
 
 def _mtp_args(*, strategy, steps, topk, draft_tokens, track_interval):
     return [
