@@ -54,6 +54,12 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
     return BeamSearchOutput(sequences=sequences)
 
 
+def beam_completion_tokens(beam_output: BeamSearchOutput) -> int:
+    """A group's completion_tokens: the total across its returned sequences
+    (the leader row's output_ids is a length placeholder, not output)."""
+    return sum(len(seq.tokens) for seq in beam_output.sequences)
+
+
 def is_beam_search_batch(recv_obj: BatchTokenIDOutput) -> bool:
     return (
         recv_obj.beam_search_output is not None and len(recv_obj.beam_search_output) > 0

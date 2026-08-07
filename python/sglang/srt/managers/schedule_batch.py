@@ -64,6 +64,14 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.beam_search.batch_tail import (
+    BeamTail,
+    append_beam_tail,
+    beam_retraction_order,
+    num_beam_member_rows,
+    strip_beam_tail,
+)
+from sglang.srt.beam_search.fork import free_member_rows
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -1950,21 +1958,6 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
-class BeamTail:
-    """Layout of the beam member rows appended after the reqs-aligned rows.
-
-    Member rows are physical req_to_token rows without a Req; they exist in
-    the batch row tensors only between prepare_for_decode (append) and the
-    next filter/merge (strip). entries hold, per group in batch order:
-    (group, leader index in reqs, tail-relative start, tail-relative end).
-    """
-
-    num_base_rows: int
-    num_tail_rows: int
-    entries: List[Tuple[Any, int, int, int]]
-
-
-@dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
@@ -2137,8 +2130,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # Beam search: layout of the member rows appended after the reqs-aligned
-    # rows for one forward (set by _append_beam_tail, cleared by
-    # _strip_beam_tail; None whenever reqs and row tensors are 1:1).
+    # rows for one forward (set by append_beam_tail, cleared by
+    # strip_beam_tail; None whenever reqs and row tensors are 1:1).
     beam_tail: Optional[BeamTail] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
@@ -2753,14 +2746,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.spec_algorithm.is_none():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            # Beam member rows decode in lockstep with their leader, one slot
-            # per row per step (beam requires page_size == 1).
-            num_member_rows = sum(
-                r.beam_group.num_member_rows
-                for r in requests
-                if r.beam_group is not None
-            )
-            return new_pages * page_size + num_member_rows
+            return new_pages * page_size + num_beam_member_rows(requests)
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
@@ -2787,15 +2773,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
-
-        # Beam groups are not retractable yet: members alias the leader's
-        # prompt KV, so a partial retract corrupts the group. Prefer keeping
-        # them (retract normal reqs first); under sustained pressure the whole
-        # group is aborted atomically below.
-        if any(self.reqs[i].beam_group is not None for i in sorted_indices):
-            sorted_indices = [
-                i for i in sorted_indices if self.reqs[i].beam_group is not None
-            ] + [i for i in sorted_indices if self.reqs[i].beam_group is None]
+        sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2815,8 +2793,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # member rows are freed here while the leader's kv info still
                 # carries the group's lockstep allocated length). The
                 # scheduler retires the group via retire_aborted_beam_groups.
-                from sglang.srt.beam_search.fork import free_member_rows
-
                 req.to_finish = FINISH_ABORT(
                     "Beam search group aborted: KV cache pool is full.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -2847,8 +2823,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
-                from sglang.srt.beam_search.fork import free_member_rows
-
                 free_member_rows(
                     last_req.beam_group,
                     self.req_to_token_pool,
@@ -3033,86 +3007,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             latest_output_ids
         )
 
-    def _append_beam_tail(self):
-        """Append every live beam group's member rows after the reqs-aligned
-        rows, so the decode forward (allocation, relay resolve, attention)
-        covers them. Member rows decode in lockstep with their leader: their
-        seq lens are the leader's. Reqs-sized host metadata (sampling_info,
-        top_logprobs_nums, rids, ...) is intentionally NOT extended -- the
-        worker slices the member rows off the logits before sampling."""
-        assert self.beam_tail is None
-        entries = []
-        tails = []
-        tails_cpu = []
-        leader_idx = []
-        t = 0
-        for i, req in enumerate(self.reqs):
-            group = req.beam_group
-            if group is None or group.member_rows is None or group.retired:
-                continue
-            m = group.num_member_rows
-            entries.append((group, i, t, t + m))
-            tails.append(group.member_rows)
-            tails_cpu.append(group.member_rows_cpu)
-            leader_idx.append(i)
-            t += m
-        if not entries:
-            return
-
-        leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64)
-        widths_cpu = torch.tensor([e[3] - e[2] for e in entries], dtype=torch.int64)
-        leader_idx_dev = leader_idx_cpu.to(self.device, non_blocking=True)
-        widths_dev = widths_cpu.to(self.device, non_blocking=True)
-
-        self.req_pool_indices = torch.cat([self.req_pool_indices, *tails])
-        self.req_pool_indices_cpu = torch.cat([self.req_pool_indices_cpu, *tails_cpu])
-        self.seq_lens = torch.cat(
-            [
-                self.seq_lens,
-                torch.repeat_interleave(self.seq_lens[leader_idx_dev], widths_dev),
-            ]
-        )
-        if self.seq_lens_cpu is not None:
-            self.seq_lens_cpu = torch.cat(
-                [
-                    self.seq_lens_cpu,
-                    torch.repeat_interleave(
-                        self.seq_lens_cpu[leader_idx_cpu], widths_cpu
-                    ),
-                ]
-            )
-        self.orig_seq_lens = torch.cat(
-            [
-                self.orig_seq_lens,
-                torch.repeat_interleave(self.orig_seq_lens[leader_idx_dev], widths_dev),
-            ]
-        )
-        self.seq_lens_sum = None
-        self.beam_tail = BeamTail(
-            num_base_rows=len(self.reqs), num_tail_rows=t, entries=entries
-        )
-
-    def _strip_beam_tail(self):
-        """Restore the 1:1 reqs<->rows layout by slicing the member rows off.
-        Lazily invoked at the entry of every batch mutation (filter / merge /
-        prepare), so the tail only ever spans one forward."""
-        tail = self.beam_tail
-        if tail is None:
-            return
-        n = tail.num_base_rows
-        assert n == len(self.reqs), "reqs changed while a beam tail was attached"
-        self.beam_tail = None
-        self.req_pool_indices = self.req_pool_indices[:n]
-        self.req_pool_indices_cpu = self.req_pool_indices_cpu[:n]
-        self.seq_lens = self.seq_lens[:n]
-        if self.seq_lens_cpu is not None:
-            self.seq_lens_cpu = self.seq_lens_cpu[:n]
-        self.orig_seq_lens = self.orig_seq_lens[:n]
-        if self.input_ids is not None:
-            self.input_ids = self.input_ids[:n]
-        self.out_cache_loc = None
-        self.seq_lens_sum = None
-
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         server_args = get_server_args()
@@ -3133,8 +3027,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Beam member rows ride this decode batch: append them to the row
         # tensors before allocation so alloc_for_decode covers them too.
-        self._strip_beam_tail()
-        self._append_beam_tail()
+        strip_beam_tail(self)
+        append_beam_tail(self)
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             self.cumulate_penalty_output_tokens()
@@ -3195,7 +3089,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
-        self._strip_beam_tail()
+        strip_beam_tail(self)
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -3274,8 +3168,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
-        self._strip_beam_tail()
-        other._strip_beam_tail()
+        strip_beam_tail(self)
+        strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.

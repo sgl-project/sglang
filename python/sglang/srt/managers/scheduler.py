@@ -3095,19 +3095,10 @@ class Scheduler(
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
 
-        # Reserve the member rows that admitted-but-not-yet-spawned beam
-        # groups will claim (beam_width - 1 each; the leader has its own row),
-        # so admission never over-commits the req slot pool.
         active_batch = running_batch or self.running_batch
-        pending_member_rows = sum(
-            r.beam_group.beam_width - 1
-            for r in active_batch.reqs
-            if r.beam_group is not None
-            and r.beam_group.member_rows is None
-            and not r.beam_group.retired
-            and not r.finished()
+        available = max(
+            available - self.beam_coordinator.pending_member_rows(active_batch), 0
         )
-        available = max(available - pending_member_rows, 0)
         res = min(pp_budget, available)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.

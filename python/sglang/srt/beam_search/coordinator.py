@@ -3,7 +3,7 @@
 A beam_width=k request runs as one leader Req plus k-1 bare member rows:
 physical req_to_token rows tracked columnarly on the group, with no Req
 object behind them. The member rows are appended to the decode batch's row
-tensors just before allocation (ScheduleBatch._append_beam_tail) and sliced
+tensors just before allocation (batch_tail.append_beam_tail) and sliced
 off the logits before sampling (tp_worker), so the reqs-aligned world never
 sees them. Hooks: admission (validate_and_init), selection at the forward's
 relay point, and lifecycle (member spawn at the leader's prefill relay,
@@ -204,6 +204,21 @@ class BeamCoordinator:
         req.skip_radix_cache_insert = True
         self._num_live_groups += 1
         return None
+
+    def pending_member_rows(self, batch: ScheduleBatch) -> int:
+        """Member rows that admitted-but-not-yet-spawned groups will claim
+        (beam_width - 1 each; the leader has its own row). The admission gate
+        subtracts this so it never over-commits the req slot pool."""
+        if self._num_live_groups == 0:
+            return 0
+        return sum(
+            r.beam_group.beam_width - 1
+            for r in batch.reqs
+            if r.beam_group is not None
+            and r.beam_group.member_rows is None
+            and not r.beam_group.retired
+            and not r.finished()
+        )
 
     @staticmethod
     def _collect_stop_token_ids(req: Req, user_params) -> List[int]:

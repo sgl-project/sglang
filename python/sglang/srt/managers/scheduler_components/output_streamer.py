@@ -13,7 +13,10 @@ from typing import (
 import torch
 import zmq
 
-from sglang.srt.beam_search.output import pack_beam_search_output
+from sglang.srt.beam_search.output import (
+    beam_completion_tokens,
+    pack_beam_search_output,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -439,10 +442,8 @@ class _GenerationStreamAccumulator:
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
             self.reasoning_tokens.append(req.reasoning_tokens)
-            # A group reports its returned sequences' total, not the leader
-            # row's placeholder output_ids length.
             self.completion_tokens.append(
-                sum(len(seq.tokens) for seq in beam_output.sequences)
+                beam_completion_tokens(beam_output)
                 if beam_output is not None
                 else len(output_ids_)
             )

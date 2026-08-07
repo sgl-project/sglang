@@ -110,6 +110,22 @@ class BeamGroup:
     def num_member_rows(self) -> int:
         return 0 if self.member_rows is None else self.member_rows.shape[0]
 
+    def extra_uncached_tokens(self) -> int:
+        """Uncached KV the group holds beyond the leader's own window (which
+        the generic per-req sum already counts). Member rows carry no Req, and
+        share-on-fork lets several rows reference one slot, so the group owns
+        the decode region: held = allocated - freed, both host-side counters
+        (the region grows by exactly k slots per step, and the reclaim
+        accumulates what it returned). Counting distinct slots off
+        req_to_token instead would mean reading the launch half's staged
+        tensors, unsafe on the checker's stream under overlap."""
+        if self.all_rows is None:
+            return 0
+        end = self.leader.kv.kv_allocated_len
+        start = self.prompt_len
+        held = self.beam_width * (end - start) - self.slots_freed
+        return held - (end - start)
+
     # ==================== step consumption ====================
 
     def next_step_is_final(self) -> bool:

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
@@ -608,39 +609,7 @@ class TpModelWorker(BaseTpWorker):
                 indexer_topk_output=out.indexer_topk_output,
             )
 
-            if (
-                batch is not None
-                and logits_output is not None
-                and logits_output.next_token_logits is not None
-            ):
-                if batch.beam_tail is not None:
-                    # Split the beam member rows off before sampling so the
-                    # sampler and every reqs-aligned consumer downstream see
-                    # only the reqs-aligned rows. The tail then sits outside
-                    # the sampler's view and keeps its raw logits for the
-                    # scheduler-side selection; the leader rows do not, hence
-                    # the pre-sample clone.
-                    n = batch.beam_tail.num_base_rows
-                    logits = logits_output.next_token_logits
-                    logits_output.beam_tail_logits = logits[n:]
-                    logits_output.next_token_logits = logits[:n]
-                    leader_rows = [e[1] for e in batch.beam_tail.entries]
-                    logits_output.beam_leader_logits = logits[leader_rows].clone()
-                    if logits_output.hidden_states is not None:
-                        logits_output.hidden_states = logits_output.hidden_states[:n]
-                    forward_batch.positions = forward_batch.positions[:n]
-                elif forward_batch.forward_mode.is_extend():
-                    # Same reason, prefill side: the leader's first selection
-                    # runs at the relay point, after the sampler's in-place
-                    # writes would have clobbered these logits.
-                    leader_rows = [
-                        i for i, r in enumerate(batch.reqs) if r.beam_group is not None
-                    ]
-                    if leader_rows:
-                        logits_output.beam_leader_logits = (
-                            logits_output.next_token_logits[leader_rows].clone()
-                        )
-                        logits_output.beam_leader_rows = leader_rows
+            capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
