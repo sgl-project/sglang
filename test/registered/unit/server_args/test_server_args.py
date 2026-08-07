@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import json
 import os
@@ -81,6 +82,17 @@ class TestPrepareServerArgs(CustomTestCase):
                 return_hidden_states_mode="lst",
             )
 
+    def test_draft_quantization_explicitness_survives_asdict_round_trip(self):
+        inherited = ServerArgs(model_path="dummy", quantization="modelopt_fp4")
+        inherited._handle_missing_default_values()
+        self.assertEqual(inherited.speculative_draft_model_quantization, "modelopt_fp4")
+        self.assertFalse(inherited._speculative_draft_quantization_explicitly_set)
+
+        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        reconstructed._handle_missing_default_values()
+
+        self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -131,6 +143,10 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
+    @staticmethod
+    def _set_model_type(server_args, *, is_multimodal):
+        server_args.model_config = SimpleNamespace(is_multimodal=is_multimodal)
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
         server_args = ServerArgs(
@@ -186,6 +202,46 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_text_only_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+        self._set_model_type(server_args, is_multimodal=False)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertNoLogs(server_args_module.logger, level="INFO"):
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cuda_ipc_for_multimodal_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy")
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cuda_ipc_for_language_only_model(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", language_only=True)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
