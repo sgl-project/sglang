@@ -73,12 +73,7 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_mm,
-    get_parallel,
-    get_server_args,
-)
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1389,7 +1384,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             device_index = torch.cuda.current_device()
         if device.type == "cuda":
             parallel = get_parallel()
-            consumer_count = max(get_server_args().tp_size, parallel.attn_tp_size, 1)
+            consumer_count = max(parallel.tp_size, 1)
 
         features = []
         for index in indices:

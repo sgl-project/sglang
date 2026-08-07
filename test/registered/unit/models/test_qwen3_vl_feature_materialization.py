@@ -133,9 +133,6 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
             return_value=local_features,
         ) as materialize, patch(
             "sglang.srt.models.qwen3_vl.get_parallel",
-            return_value=SimpleNamespace(attn_tp_size=8),
-        ), patch(
-            "sglang.srt.models.qwen3_vl.get_server_args",
             return_value=SimpleNamespace(tp_size=8),
         ):
             output = Qwen3VLForConditionalGeneration.get_image_feature(model, items)
