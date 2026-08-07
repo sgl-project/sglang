@@ -118,7 +118,7 @@ async def lifespan(app: FastAPI):
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     warmup_task = None
-    if server_args.server_warmup:
+    if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
             _run_server_warmup_after_http_ready(server_args, warmup_done)
         )
