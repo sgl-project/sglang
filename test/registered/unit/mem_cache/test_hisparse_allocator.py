@@ -88,6 +88,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             origin_input_ids=list(range(fill_len)),
             output_ids=[],
             kv=None,
+            pd_rebootstrap_in_progress=False,
         )
 
         def set_extend_range(start, end):
