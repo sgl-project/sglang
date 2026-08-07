@@ -665,6 +665,7 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
 
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.mm_feature_transport = "cpu"
     processor.use_cuda_ipc = False
     processor._processor = SimpleNamespace(
         _patch_size=2,
