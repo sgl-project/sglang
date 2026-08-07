@@ -791,7 +791,15 @@ class DeepseekSparseAttnBackend(
             # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
             # batches; graph replay uses the static page-table width, so only this
             # eager (e.g. over-capture-bs) fallback needs a length here.
-            max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
+            #
+            # Use the static width rather than seq_lens.max().item(): that is a
+            # device-to-host sync, and this branch is entered per rank (an idle
+            # DP peer keeps its host mirror and takes the arm above), so under
+            # DP attention the ranks stop issuing the same collective sequence
+            # and the group deadlocks. Over-allocating columns is safe -- the
+            # page table is only indexed through top-k, which masks per row by
+            # cache_seqlens, so the extra columns are never selected.
+            max_seqlen_k = self.req_to_token.shape[1]
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -851,19 +859,19 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
-            if forward_batch.extend_prefix_lens_cpu is None:
-                assert forward_batch.extend_prefix_lens is not None
-                forward_batch.extend_prefix_lens_cpu = (
-                    forward_batch.extend_prefix_lens.cpu().tolist()
-                )
-            if forward_batch.seq_lens_cpu is None:
-                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
-                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+            # No host mirrors are materialized here. Both would be D2H syncs on
+            # this same per-rank branch, so with only the max_seqlen_k fix above
+            # the DP group still deadlocks. Neither is read on this path:
+            # extend_prefix_lens_cpu and seq_lens_sum are consumed only inside
+            # the is_extend() arm below, and DRAFT_EXTEND_V2 is not is_extend()
+            # (include_draft_extend_v2 defaults to False). What this branch does
+            # need -- extend_seq_lens_cpu -- is already supplied by
+            # eagle_worker_common.prepare_for_draft_extend, on the same
+            # gpu_only branch and for this same reason.
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
+            ), "extend_seq_lens{,_cpu} must not be None for DRAFT_EXTEND_V2"
 
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
