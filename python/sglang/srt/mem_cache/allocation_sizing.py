@@ -34,15 +34,6 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
 
 
-def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
-    """KV length reserved per request at each decode step.
-
-    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
-    """
-    return 2 * get_alloc_len_per_decode(server_args)
-
-
 def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """req_to_token row headroom beyond the model context length.
 
@@ -57,6 +48,6 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
         # without the headroom the row write silently lands in the neighbor row.
         extra = max(
             extra,
-            get_alloc_reserve_per_decode(server_args) + server_args.page_size - 1,
+            get_alloc_len_per_decode(server_args) + server_args.page_size - 1,
         )
     return extra

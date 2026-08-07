@@ -15,7 +15,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
@@ -887,7 +887,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
-    double_alloc = get_alloc_reserve_per_decode()
+    single_alloc = get_alloc_len_per_decode()
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
@@ -895,14 +895,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for i, r in enumerate(batch.reqs):
         cur = r.kv.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
-        # kv_committed_len is honest (bonus committed in resolve, not here),
-        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
+        # Use batch.seq_lens_cpu which is synchronous with the device sequence
+        # length, removing the need for a 2x double-buffer to absorb the
+        # kv_committed_len verification lag.
         # Whole-page accounting: the paged allocator hands out full pages, so
         # round nxt up to the page boundary or the unaligned tail is allocated
         # but never recorded — a stranded-tail leak at page_size > 1.
         nxt = max(
             cur,
-            (r.kv_committed_len + double_alloc + page_size - 1)
+            (batch.seq_lens_cpu[i].item() + single_alloc + page_size - 1)
             // page_size
             * page_size,
         )
@@ -915,7 +916,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
     # Fail fast if the page>1 + topk>1 draft over-allocation
-    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
+    # outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
 
@@ -925,7 +926,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         assert max_alloc_len <= row_width, (
             f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
             f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
-            f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
+            f"row to hold committed + get_alloc_len_per_decode (PR #26972)."
         )
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR

@@ -83,7 +83,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -2730,10 +2730,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
+        reserve = get_alloc_len_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
+            # Match the seq_lens_cpu logic in eagle_prepare_for_decode:
+            # len(origin_input_ids) + len(output_ids) gives the exact synchronous target length.
+            seq_len = len(r.origin_input_ids) + len(r.output_ids)
+            # Adjust for encoder-decoder models if they have an encoder side.
+            if (
+                self.model_config.is_encoder_decoder
+                and r.multimodal_inputs
+                and r.multimodal_inputs.num_image_tokens
+            ):
+                seq_len -= r.multimodal_inputs.num_image_tokens
+            x = max(0, seq_len + reserve - r.kv.kv_allocated_len)
             cur = r.kv.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
