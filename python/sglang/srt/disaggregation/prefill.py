@@ -874,7 +874,14 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                if not isinstance(req.finished_reason, FINISH_ABORT):
+                if req.to_finish:
+                    # The request was aborted (e.g., input exceeded
+                    # max_req_input_len) while the KV transfer was in flight.
+                    # Promote the pending abort instead of letting the success
+                    # path overwrite it with a spurious FINISH_LENGTH.
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                elif not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
