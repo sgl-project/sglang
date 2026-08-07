@@ -712,8 +712,8 @@ class RustServer:
         model_config["hf_config"] = None  # HF config is not JSON-serializable
         # Resolved default sampling params (generation_config.json when
         # `--sampling-defaults model`, {} otherwise). The rust server consumes
-        # these for omitted temperature/top_p in chat conversions instead of
-        # hard-coding the OpenAI terminal defaults.
+        # these for omitted temperature/top_p in the chat and responses
+        # conversions instead of hard-coding the OpenAI terminal defaults.
         model_config["default_sampling_params"] = (
             scheduler.model_config.get_default_sampling_params()
         )

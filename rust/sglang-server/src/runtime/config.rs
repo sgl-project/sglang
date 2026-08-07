@@ -167,9 +167,9 @@ pub struct ModelConfig {
     /// `RustServer._build_server_args` from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on
     /// `--sampling-defaults`: holds the model's generation_config.json values
-    /// in "model" mode, and is empty in "openai" mode. Consumed when a chat
-    /// request omits `temperature`/`top_p` — the conversion must not skip
-    /// straight to the OpenAI terminal defaults.
+    /// in "model" mode, and is empty in "openai" mode. Consumed when the chat /
+    /// responses request omits `temperature`/`top_p` — the conversion must not
+    /// skip straight to the OpenAI terminal defaults.
     #[serde(default)]
     pub default_sampling_params: DefaultSamplingParams,
 }

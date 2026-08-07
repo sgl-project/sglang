@@ -1,10 +1,10 @@
 //! Shared HTTP test harness and `openai.rs`-level handler tests.
 //!
 //! Submodule tests live next to the code they cover: `chat`, `completions`,
-//! `tools`, and `reasoning` each carry their own
+//! `responses`, `tools`, and `reasoning` each carry their own
 //! `#[cfg(test)] mod tests`. This module keeps the fixtures they all share —
-//! channel fixtures (`senders`, `chunk`, `submitted`, `chat_submitted`) and the
-//! full-router harness (`server_args`, `app_state`,
+//! channel fixtures (`senders`, `chunk`, `submitted`, `chat_submitted`,
+//! `response_request`) and the full-router harness (`server_args`, `app_state`,
 //! `oneshot`, `post_json`, `body_json`) — plus the handler-level tests that
 //! exercise [`routes`] end to end. The helpers are `pub(super)` so sibling
 //! test modules can import them via `super::super::test_utils::*`.
@@ -15,14 +15,17 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use dynamo_protocols::types::responses::{CreateResponse, Status};
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::routes;
+use super::response_stream::response_object;
+use super::responses::{StoredResponse, new_response_store, routes_with_store};
+use super::{routes, unix_seconds};
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem};
 use crate::runtime::ServerArgs;
-use crate::tokenizer_manager::Senders;
+use crate::tokenizer_manager::{AbortSource, Senders};
 
 pub(super) fn senders() -> Senders {
     Senders {
@@ -91,6 +94,19 @@ pub(super) fn chat_submitted(
     ((index, rid.into(), rx), tx)
 }
 
+/// A minimal Responses request, shared by the responses tests and the
+/// handler-level lifecycle test.
+pub(super) fn response_request(stream: bool) -> CreateResponse {
+    serde_json::from_value(serde_json::json!({
+        "model": "model",
+        "input": "The capital of France is",
+        "stream": stream,
+        "temperature": 0.0,
+        "max_output_tokens": 8
+    }))
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------
 // Handler-level tests: full router, real extractors, no scheduler. A
 // request that reaches `submit` with an OPEN tm lane would wait on the
@@ -131,6 +147,29 @@ pub(super) fn senders_closed() -> Senders {
         tok: tok_tx,
         detok: vec![],
     }
+}
+
+pub(super) fn senders_with_abort_rx() -> (Senders, flume::Receiver<AbortSource>) {
+    let (tm_tx, _tm_rx) = flume::unbounded();
+    let (abort_tx, abort_rx) = flume::unbounded();
+    let (tok_tx, _tok_rx) = flume::unbounded();
+    (
+        Senders {
+            tm: tm_tx,
+            abort: abort_tx,
+            tok: tok_tx,
+            detok: vec![],
+        },
+        abort_rx,
+    )
+}
+
+pub(super) fn request(method: &str, path: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Serve one request through the full router (extractors, auth, routing).
@@ -282,10 +321,58 @@ async fn chat_handler_validates_before_submit() {
 }
 
 #[tokio::test]
-async fn basic_openai_router_excludes_responses_api() {
+async fn responses_handler_validates_before_submit() {
     let app = routes().with_state(app_state(senders()));
-    let response = post_json(app, "/v1/responses", json!({"input": "hi"})).await;
+    let cases = [
+        (json!({"model": "other", "input": "hi"}), "unknown model"),
+        (
+            json!({"input": "hi", "max_output_tokens": 0}),
+            "max_output_tokens=0",
+        ),
+        (json!({"input": "hi", "conversation": {}}), "conversation"),
+        (json!({"input": "hi", "prompt": "x"}), "prompt template"),
+        (json!({"input": "hi", "include": ["reasoning"]}), "include"),
+        (
+            json!({"input": "hi", "max_tool_calls": 3}),
+            "max_tool_calls",
+        ),
+        (
+            json!({"input": "hi", "truncation": "auto"}),
+            "truncation auto",
+        ),
+        (
+            json!({"input": "hi", "reasoning": {"summary": "x"}}),
+            "reasoning summary",
+        ),
+        (
+            json!({"input": "hi", "previous_response_id": "nope"}),
+            "bad previous_response_id",
+        ),
+        (
+            json!({"input": [{"type": "item_reference", "item_id": "x"}]}),
+            "item reference",
+        ),
+        (json!({"input": []}), "empty input"),
+        (
+            json!({"input": "hi", "background": true, "stream": true}),
+            "background+stream",
+        ),
+    ];
+    for (body, label) in cases {
+        let response = post_json(app.clone(), "/v1/responses", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    }
+    // Unknown previous_response_id → 404 (store lookup).
+    let response = post_json(
+        app.clone(),
+        "/v1/responses",
+        json!({"input": "hi", "previous_response_id": "resp_missing"}),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // A valid request without a chat template → 400 (template gate).
+    let response = post_json(app.clone(), "/v1/responses", json!({"input": "hi"})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// A closed tm inbox with a *streaming* request must answer inside the
@@ -316,4 +403,68 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
     assert_eq!(frame["error"]["type"], "InternalServerError");
     assert_eq!(frame["error"]["code"], 503);
     assert!(text.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn response_retrieve_and_cancel_lifecycle() {
+    let (senders, abort_rx) = senders_with_abort_rx();
+    let state = app_state(senders);
+    let store = new_response_store();
+    let app = routes_with_store(store.clone()).with_state(state);
+
+    // Unknown / malformed ids.
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_missing")).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/nope")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Seed an in-progress response directly: a background request would
+    // need a real scheduler behind the tm lane. `Rid::from_client` mints a
+    // fresh uniquified rid per call, so capture the one the store holds.
+    let seeded_rid = Rid::from_client("resp_seeded");
+    store.write().await.insert(
+        "resp_seeded".into(),
+        StoredResponse {
+            response: response_object(
+                "resp_seeded",
+                "model",
+                &response_request(false),
+                unix_seconds(),
+                Status::InProgress,
+                vec![],
+                None,
+            ),
+            messages: vec![],
+            rid: Some(seeded_rid.clone()),
+        },
+    );
+
+    // Retrieve returns the stored object.
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_seeded")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["object"], "response");
+    assert_eq!(value["status"], "in_progress");
+
+    // Cancel → Cancelled, and the abort reaches the scheduler lane.
+    let response = oneshot(
+        app.clone(),
+        request("POST", "/v1/responses/resp_seeded/cancel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["status"], "cancelled");
+    assert!(matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == seeded_rid));
+
+    // The store reflects the cancellation; cancelling again is a 400.
+    let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_seeded")).await;
+    let value = body_json(response).await;
+    assert_eq!(value["status"], "cancelled");
+    let response = oneshot(
+        app.clone(),
+        request("POST", "/v1/responses/resp_seeded/cancel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

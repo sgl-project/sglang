@@ -1,15 +1,16 @@
-//! Reasoning-content splitting for Chat Completions (`--reasoning-parser`).
+//! Reasoning-content splitting for Chat Completions and the Responses API
+//! (`--reasoning-parser`).
 //!
 //! Mirrors the Python frontend (`sglang.srt.parser.reasoning_parser` +
-//! `serving_chat._process_reasoning_stream`): when the
+//! `serving_chat._process_reasoning_stream` / `serving_responses`): when the
 //! server was launched with `--reasoning-parser <name>` (and the request keeps
 //! the default `separate_reasoning=true`, which the Dynamo request type cannot
 //! express), the model's `<think>`-style markers are stripped out of `content`
 //! into `reasoning_content` — for unary responses and streaming deltas alike.
 //!
-//! The parser lifecycle (lazy build, per-frame incremental split, terminal
-//! flush of *both* buffered columns) lives here so the endpoint cannot drop
-//! the tail half.
+//! Chat and Responses keep their own wire formatting; the parser lifecycle
+//! (lazy build, per-frame incremental split, terminal flush of *both* buffered
+//! columns) lives here so neither endpoint can drop the tail half.
 
 use dynamo_parsers::reasoning::{
     ReasoningParser as _, ReasoningParserType, ReasoningParserWrapper,
@@ -42,7 +43,8 @@ pub(super) fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrappe
 
 /// Split a completed generation's text into `(reasoning_text, normal_text)`
 /// when `--reasoning-parser` selects a parser; otherwise the text passes
-/// through untouched as normal text. Chat splits before tool-call parsing.
+/// through untouched as normal text. Shared by the chat and Responses unary
+/// paths, which both split before tool-call parsing.
 pub(super) fn split_reasoning_unary(
     name: Option<&str>,
     text: &str,
@@ -80,6 +82,11 @@ impl ReasoningStreamSplitter {
             name: name.map(str::to_owned),
             parser: None,
         }
+    }
+
+    /// Whether the stream is configured to split reasoning at all.
+    pub(super) fn enabled(&self) -> bool {
+        self.name.is_some()
     }
 
     /// Split one frame's text into `(reasoning_text, normal_text)` deltas.
@@ -173,8 +180,8 @@ mod tests {
 
     /// REASONING_P1: MiniMax M3's implicit-tool-start recovery buffers the
     /// answer text until a boundary establishes the mode; with no opener the
-    /// whole buffer is released as normal text only at `finish`. The chat
-    /// terminal flush must emit the normal half of the tail.
+    /// whole buffer is released as normal text only at `finish`. The chat and
+    /// Responses terminal flushes must emit the normal half of the tail.
     #[test]
     fn streaming_tail_releases_normal_text_only_at_finish() {
         let mut splitter = ReasoningStreamSplitter::new(Some("minimax_m3"));
