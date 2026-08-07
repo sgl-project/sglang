@@ -98,7 +98,7 @@ struct l2norm_kernel<at::BFloat16, D, has_scale> {
     __m512bh va[COLS];
     __m512 vrscale;
 
-    constexpr float scale = 1.f / std::sqrt(D);
+    const float scale = 1.f / std::sqrt(D);
     __m512 vscale = _mm512_set1_ps(scale);
 
     // step 1: load input and do reduce with avx512-bf16
