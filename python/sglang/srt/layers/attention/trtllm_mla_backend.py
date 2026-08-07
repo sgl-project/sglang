@@ -241,6 +241,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
         self.num_kv_heads = config.get_num_kv_heads(get_parallel().attn_tp_size)
         self.num_local_heads = config.num_attention_heads // get_parallel().attn_tp_size
+        # A DCP decode attends with the query all-gathered across the DCP group,
+        # so the kernel sees attn_dcp_size x this rank's heads (see the
+        # attn_mqa_for_dcp_decode RadixAttention in deepseek_v2.py). Anything
+        # sized per decode head must use this, not num_q_heads.
+        self.num_decode_q_heads = self.num_q_heads * get_parallel().attn_dcp_size
 
         # MLA-specific dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -285,7 +290,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._multi_ctas_kv_counter_buffer = (
             make_persistent_multi_ctas_kv_counter_buffer(
                 torch.device(self.device),
-                self.num_q_heads,
+                self.num_decode_q_heads,
                 max_batch_size=model_runner.max_running_requests,
             )
         )
