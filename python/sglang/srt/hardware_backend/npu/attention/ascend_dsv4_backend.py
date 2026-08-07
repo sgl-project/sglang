@@ -6,19 +6,19 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 import torch.nn.functional as F
+import torch_npu
 
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
@@ -906,9 +906,7 @@ class C4IndexerAscendBackendMixin:
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
             weights = c4_indexer.weights_proj(x)[0]
-            weights = weights * (
-                c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5
-            )
+            weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
             weights.record_stream(stream_w)
 
         # q (wq_b + rope + hadamard) on stream_q.
@@ -1111,12 +1109,8 @@ class C4IndexerAscendBackendMixin:
                 c4_indexer, x, q_lora, forward_batch, q_lora_ready
             )
         else:
-            q, weights = self._forward_prepare(
-                c4_indexer, x, q_lora, forward_batch
-            )
-        topk_idxs = self._forward_indexer(
-            c4_indexer, x, q, weights, forward_batch
-        )
+            q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
+        topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
 
 
@@ -1160,9 +1154,7 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
-        self._dsv4_graph_tokens_per_req = int(
-            model_runner.decode_num_tokens_per_req()
-        )
+        self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1299,8 +1291,8 @@ class DeepseekV4AscendAttnBackend(
         if self._is_dspark_draft_worker:
             block_size = self._dsv4_graph_tokens_per_req
             sparse_width = (
-                self._dsv4_sliding_window_size + block_size + 127
-            ) // 128 * 128
+                (self._dsv4_sliding_window_size + block_size + 127) // 128 * 128
+            )
             self.graph_metadata["ori_sparse_indices"] = torch.full(
                 (
                     max_bs * block_size,
@@ -1392,14 +1384,10 @@ class DeepseekV4AscendAttnBackend(
         metadata.ori_win_left = self._dsv4_sliding_window_size - 1
         metadata.ori_win_right = 0
         if self._is_dspark_draft_worker and forward_mode.is_target_verify():
-            metadata.ori_sparse_indices = self.graph_metadata[
-                "ori_sparse_indices"
-            ][:T]
+            metadata.ori_sparse_indices = self.graph_metadata["ori_sparse_indices"][:T]
             metadata.ori_sparse_indices.fill_(-1)
             metadata.ori_sparse_indices[:, :, 0] = 0
-            metadata.ori_win_left = (
-                self._dsv4_sliding_window_size + tokens_per_req - 1
-            )
+            metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
 
         self.forward_metadata = metadata
 
@@ -1483,9 +1471,7 @@ class DeepseekV4AscendAttnBackend(
                 # seq_lens_cpu at the committed/live prefix length.
                 live_seq_lens_cpu = raw_seq_lens_cpu
                 final_seq_lens_cpu = live_seq_lens_cpu + int(tokens_per_bs)
-            live_seq_lens = live_seq_lens_cpu.to(
-                device=device, dtype=torch.int32
-            )
+            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
         elif (
             forward_batch.seq_lens is not None
             and forward_batch.seq_lens.device.type != "cpu"
@@ -1496,21 +1482,15 @@ class DeepseekV4AscendAttnBackend(
         else:
             live_seq_lens_cpu = seq_lens_cpu[:bs]
             final_seq_lens_cpu = live_seq_lens_cpu
-            live_seq_lens = live_seq_lens_cpu.to(
-                device=device, dtype=torch.int32
-            )
+            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
         has_compress = self._dsv4_has_c4 or self._dsv4_has_c128
         active_target_verify = (
             graph_mode.is_target_verify() and not is_idle_replay and has_compress
         )
         compress_seq_lens = live_seq_lens
-        compress_seq_lens_max = (
-            int(final_seq_lens_cpu.max()) if bs > 0 else 0
-        )
+        compress_seq_lens_max = int(final_seq_lens_cpu.max()) if bs > 0 else 0
         if active_target_verify:
-            compress_seq_lens = final_seq_lens_cpu.to(
-                device=device, dtype=torch.int32
-            )
+            compress_seq_lens = final_seq_lens_cpu.to(device=device, dtype=torch.int32)
 
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -1676,10 +1656,7 @@ class DeepseekV4AscendAttnBackend(
         self._copy_2d_with_tail(fm.swa_page_table, swa_src, -1)
 
     def _refresh_graph_dspark_sparse_metadata(self, ctx) -> None:
-        if not (
-            self._is_dspark_draft_worker
-            and ctx.graph_mode.is_target_verify()
-        ):
+        if not (self._is_dspark_draft_worker and ctx.graph_mode.is_target_verify()):
             return
 
         dst = getattr(ctx.fm, "ori_sparse_indices", None)
@@ -1910,11 +1887,9 @@ class DeepseekV4AscendAttnBackend(
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
             )
-            c1a_metadata = (
-                torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
-                    device=str(actual_seq_lengths_kv.device),
-                    **c1a_kwargs,
-                )
+            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+                device=str(actual_seq_lengths_kv.device),
+                **c1a_kwargs,
             )
         else:
             c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
@@ -1960,9 +1935,7 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                    **c128a_kwargs
-                )
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
             )
 
         return kernel_metadata
@@ -2033,13 +2006,9 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         if self._is_dspark_draft_worker:
-            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
-                q_arg, **attn_kwargs
-            )
+            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         else:
-            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
-                q_arg, **attn_kwargs
-            )
+            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -2124,9 +2093,9 @@ class DeepseekV4AscendAttnBackend(
             and cached.shape[0] == out_cache_loc.shape[0]
         ):
             return cached
-        return self.token_to_kv_pool.translate_loc_from_full_to_swa(
-            out_cache_loc
-        ).to(torch.int64)
+        return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+            torch.int64
+        )
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
@@ -2186,6 +2155,7 @@ class DeepseekV4AscendAttnBackend(
                         )
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
+
     def _fill_verify_positions_cmp_padding(
         self,
         positions: torch.Tensor,

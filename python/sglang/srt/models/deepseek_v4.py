@@ -1361,23 +1361,18 @@ class MQALayer(MqaAttentionBase):
             )
 
         enable_multi_stream = (
-            (
-                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
-                and self.alt_streams is not None
-                and get_is_capture_mode()
-                and x.shape[0] <= self._multi_stream_bs_limit
-                and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
-                and not (_is_hip and self.compressor is None)
-            )
-            or (
-                _is_npu
-                and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-                and self.alt_streams is not None
-                and x.shape[0] <= self._multi_stream_bs_limit
-                and not (
-                    self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
-                )
-            )
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            and self.alt_streams is not None
+            and get_is_capture_mode()
+            and x.shape[0] <= self._multi_stream_bs_limit
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not (_is_hip and self.compressor is None)
+        ) or (
+            _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and self.alt_streams is not None
+            and x.shape[0] <= self._multi_stream_bs_limit
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None

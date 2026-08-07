@@ -50,9 +50,7 @@ class TorchOpLoader:
             )
         path = Path(explicit).expanduser().resolve()
         if not path.is_file():
-            raise RuntimeError(
-                f"{self._spec.so_env} points to a missing file: {path}"
-            )
+            raise RuntimeError(f"{self._spec.so_env} points to a missing file: {path}")
         return path
 
     def _validate_python_abi(self, library_path: Path) -> None:
@@ -105,9 +103,7 @@ class TorchOpLoader:
             )
 
         self._loaded_library = library_path
-        logger.info(
-            "Registered %s operators from %s", self._spec.name, library_path
-        )
+        logger.info("Registered %s operators from %s", self._spec.name, library_path)
         return library_path
 
 

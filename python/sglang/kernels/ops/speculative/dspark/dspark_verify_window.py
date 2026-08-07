@@ -15,6 +15,7 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 
+
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     positions: torch.Tensor
     verify_cache_loc: torch.Tensor

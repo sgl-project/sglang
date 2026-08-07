@@ -179,9 +179,7 @@ class DSparkAttention(MqaAttentionBase):
                     Dsv4NpuRoPE,
                 )
 
-                q = torch_npu.npu_rms_norm(
-                    q, self._q_post_norm_weight, self.eps
-                )[0]
+                q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
                 cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
                     positions,
                     q.dtype,
@@ -847,7 +845,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         weights = _dequant_fp8_wo_a_streaming(weights)
 
-
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
@@ -934,7 +931,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
-
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
@@ -993,8 +989,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if rest in ("head.weight", "lm_head.weight"):
             return (
                 "lm_head.weight"
-                if self.uses_own_vocab_modules
-                and stage_idx == self.num_stages - 1
+                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
                 else None
             )
         if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
@@ -1014,13 +1009,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         elif mapped_rest.startswith("ffn."):
             mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
         elif mapped_rest.startswith("attn_norm."):
-            mapped_rest = (
-                "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
-            )
+            mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
         elif mapped_rest.startswith("ffn_norm."):
-            mapped_rest = (
-                "post_attention_layernorm."
-                + mapped_rest.removeprefix("ffn_norm.")
+            mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
+                "ffn_norm."
             )
         mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
         mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
@@ -1028,9 +1020,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         if mapped_rest.endswith(".scale"):
-            mapped_rest = (
-                mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
-            )
+            mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"
 
 

@@ -70,7 +70,7 @@ _is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-    
+
     def __init__(
         self,
         server_args: ServerArgs,

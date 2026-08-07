@@ -154,15 +154,12 @@ class ModelSlimConfig(QuantizationConfig):
             else:
                 mapped_rest = rest
                 if mapped_rest.startswith("attn."):
-                    mapped_rest = (
-                        "self_attn." + mapped_rest.removeprefix("attn.")
-                    )
+                    mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
                 elif mapped_rest.startswith("ffn."):
                     mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
                 elif mapped_rest.startswith("attn_norm."):
-                    mapped_rest = (
-                        "input_layernorm."
-                        + mapped_rest.removeprefix("attn_norm.")
+                    mapped_rest = "input_layernorm." + mapped_rest.removeprefix(
+                        "attn_norm."
                     )
                 elif mapped_rest.startswith("ffn_norm."):
                     mapped_rest = (
@@ -172,9 +169,7 @@ class ModelSlimConfig(QuantizationConfig):
                 mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
                 mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
                 mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-                mapped_rest = mapped_rest.replace(
-                    ".gate.tid2eid", ".topk.tid2eid"
-                )
+                mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
                 mapped_rest = mapped_rest.replace(
                     ".gate.bias", ".gate.e_score_correction_bias"
                 )
