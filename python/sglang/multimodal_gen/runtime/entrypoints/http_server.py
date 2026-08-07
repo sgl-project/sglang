@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import torch
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -38,7 +38,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     run_async_client_warmup,
     should_run_synthetic_server_warmup,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    globally_suppress_loggers,
+    init_logger,
+)
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -49,6 +52,7 @@ logger = init_logger(__name__)
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 SERVER_WARMUP_BYPASS_PATHS = (
+    "/liveness",
     "/health",
     "/health_generate",
     "/model_info",
@@ -56,26 +60,26 @@ SERVER_WARMUP_BYPASS_PATHS = (
 )
 
 
-async def _wait_until_http_ready(server_args: ServerArgs) -> None:
+async def _wait_until_http_live(server_args: ServerArgs) -> None:
     """for server warmup"""
-    health_url = f"{server_args.url()}/health"
-    # Probe the local server directly: a loopback readiness check must never be
+    liveness_url = f"{server_args.url()}/liveness"
+    # Probe the local server directly: a loopback liveness check must never be
     # routed through an HTTP proxy. trust_env=False also avoids crashing startup
     # on a malformed proxy env var, since httpx parses *_PROXY/NO_PROXY when the
     # client is constructed (raising httpx.InvalidURL before any request). See #28493.
     async with httpx.AsyncClient(trust_env=False) as client:
         for _ in range(120):
             try:
-                response = await client.get(health_url, timeout=5.0)
+                response = await client.get(liveness_url, timeout=5.0)
                 if response.status_code == 200:
                     return
             except httpx.HTTPError:
                 pass
             await asyncio.sleep(1.0)
-    raise RuntimeError(f"HTTP server did not become ready at {health_url}")
+    raise RuntimeError(f"HTTP server did not become live at {liveness_url}")
 
 
-async def _run_server_warmup_after_http_ready(
+async def _run_server_warmup_after_http_live(
     server_args: ServerArgs, warmup_done: asyncio.Event
 ) -> None:
     try:
@@ -83,7 +87,7 @@ async def _run_server_warmup_after_http_ready(
             warmup_done.set()
             return
 
-        await _wait_until_http_ready(server_args)
+        await _wait_until_http_live(server_args)
 
         await run_async_client_warmup(
             server_args,
@@ -115,9 +119,9 @@ async def lifespan(app: FastAPI):
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     warmup_task = None
-    if server_args.server_warmup:
+    if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_ready(server_args, warmup_done)
+            _run_server_warmup_after_http_live(server_args, warmup_done)
         )
     else:
         warmup_done.set()
@@ -140,8 +144,17 @@ async def lifespan(app: FastAPI):
 health_router = APIRouter()
 
 
+@health_router.get("/liveness")
+async def liveness():
+    """Report that the HTTP server is accepting requests."""
+    return {"status": "ok"}
+
+
 @health_router.get("/health")
-async def health():
+async def health(request: Request):
+    """Report readiness for normal inference traffic."""
+    if not request.app.state.server_warmup_done.is_set():
+        return Response(status_code=503)
     return {"status": "ok"}
 
 
@@ -233,9 +246,9 @@ async def model_info_endpoint(request: Request):
 
 
 @health_router.get("/health_generate")
-async def health_generate():
-    # TODO : health generate endpoint
-    return {"status": "ok"}
+async def health_generate(request: Request):
+    """Compatibility readiness endpoint; no generation is issued."""
+    return await health(request)
 
 
 @health_router.get("/stats")
@@ -374,6 +387,7 @@ def create_app(server_args: ServerArgs):
     """
     Create and configure the FastAPI application instance.
     """
+    globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
