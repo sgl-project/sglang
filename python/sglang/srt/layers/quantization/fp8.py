@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    swizzle_mxfp8_scale_128x4,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -772,6 +773,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
+        elif backend.is_flashinfer_cutedsl():
+            n, k = layer.weight.shape
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_cutedsl",
+                swizzle_mxfp8_scale_128x4(layer.weight_scale_inv.data, m=n, k=k),
+            )
         elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
@@ -962,6 +970,8 @@ class Fp8LinearMethod(LinearMethodBase):
             backend = get_fp8_gemm_runner_backend()
             if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
+            elif backend.is_flashinfer_cutedsl():
+                weight_scale = layer.weight_scale_inv_cutedsl
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             elif get_fp8_gemm_runner_backend().is_deep_gemm():
@@ -2302,6 +2312,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            if (
+                moe_runner_backend.is_flashinfer_trtllm()
+                or moe_runner_backend.is_flashinfer_trtllm_routed()
+            ):
+                num_local_experts = int(getattr(layer, "num_local_experts"))
+                device = layer.w13_weight.device
+
+                def per_expert(value: Optional[float]) -> Optional[torch.Tensor]:
+                    return (
+                        None
+                        if value is None
+                        else torch.full(
+                            (num_local_experts,),
+                            value,
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                    )
+
+                self._gemm1_alpha_tensor = per_expert(moe_runner_config.gemm1_alpha)
+                self._gemm1_beta_tensor = per_expert(
+                    1.0 if moe_runner_config.gemm1_alpha is not None else None
+                )
+                self._gemm1_clamp_limit_tensor = per_expert(
+                    moe_runner_config.gemm1_clamp_limit
+                )
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -2556,6 +2592,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     else None
                 ),
                 activation_type=activation_type,
+                gemm1_alpha=self._gemm1_alpha_tensor,
+                gemm1_beta=self._gemm1_beta_tensor,
+                gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)

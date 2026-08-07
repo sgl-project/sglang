@@ -277,6 +277,7 @@ class Fp8GemmRunnerBackend(Enum):
     AUTO = "auto"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -291,6 +292,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -499,7 +503,11 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = get_fp8_gemm_runner_backend()
     if backend.is_deep_gemm():
         return _deepgemm_w8a8_mxfp8_linear_with_fallback
-    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
+    elif (
+        backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_trtllm()
+    ):
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_triton():
         return triton_mxfp8_blockscaled_linear
@@ -560,6 +568,10 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
+    if backend.is_flashinfer_cutedsl():
+        raise RuntimeError(
+            "--fp8-gemm-backend=flashinfer_cutedsl currently supports MXFP8 only."
+        )
     if backend.is_flashinfer_trtllm():
         if not (is_sm100_supported() and is_flashinfer_available()):
             raise RuntimeError(
@@ -1323,6 +1335,27 @@ def triton_mxfp8_blockscaled_linear(
     )
 
 
+def swizzle_mxfp8_scale_128x4(scale: torch.Tensor, m: int, k: int) -> torch.Tensor:
+    """Swizzle row-major MXFP8 scales into FlashInfer's 128x4 layout."""
+    block_size = 32
+    num_m_tiles = ceil_div(m, 128)
+    num_k_tiles = ceil_div(k, block_size * 4)
+    scale_cols = k // block_size
+
+    padded = torch.zeros(
+        (num_m_tiles * 128, num_k_tiles * 4),
+        dtype=scale.dtype,
+        device=scale.device,
+    )
+    padded[:m, :scale_cols] = scale.reshape(m, scale_cols)
+    return (
+        padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+        .transpose(1, 3)
+        .contiguous()
+        .view(-1)
+    )
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1386,6 +1419,16 @@ def flashinfer_mxfp8_blockscaled_linear(
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
             backend="cutlass",
+        )
+    elif get_fp8_gemm_runner_backend().is_flashinfer_cutedsl():
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight_t,
+            x_scale_u8,
+            weight_scale.contiguous().view(-1),
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="cute-dsl",
         )
 
     if bias is not None:

@@ -36,7 +36,8 @@ FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
-    skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
+    if model_runner.server_args.fp8_gemm_runner_backend != "flashinfer_cutedsl":
+        skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
 
 
@@ -102,8 +103,11 @@ def should_run_flashinfer_autotune(
         "modelopt_fp8",
         "modelopt_mixed",
     )
-    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
-        model_uses_modelopt_fp8 and is_sm100_supported()
+    fp8_gemm_backend = get_fp8_gemm_runner_backend()
+    fp8_gemm_needs_autotune = (
+        fp8_gemm_backend.is_flashinfer_cutlass()
+        or fp8_gemm_backend.is_flashinfer_cutedsl()
+        or (model_uses_modelopt_fp8 and is_sm100_supported())
     )
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
