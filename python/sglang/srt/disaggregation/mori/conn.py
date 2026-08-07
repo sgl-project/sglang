@@ -1515,6 +1515,10 @@ class MoriKVSender(CommonKVSender):
             ):
                 sla_tripped = True
                 self._finalize_failure(f"KV transfer exceeded SLA {sla_ms}ms")
+                # _finalize_failure terminalizes the request, but does not cancel
+                # IOEngine.wait_all. Return so this transfer worker is not leaked
+                # forever after the SLA has already decided the request failed.
+                return StatusCode.ERR_RDMA_OP
 
     def _fail_from_worker(self, reason: str) -> None:
         self._finalize_failure(reason)
