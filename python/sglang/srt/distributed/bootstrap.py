@@ -163,12 +163,7 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
 def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
-    # should_torch_symm_mem_allreduce() takes the symmetric-memory path only
-    # below a byte threshold, so which reduce runs follows the token count.
-    set_torch_symm_mem_all_reduce(
-        server_args.enable_torch_symm_mem
-        and not server_args.enable_deterministic_inference
-    )
+    set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
 
 
 def _init_cpu_threads_env(
