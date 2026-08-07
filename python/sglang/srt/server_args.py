@@ -216,6 +216,8 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
+    "aiter",
+    "moonmath_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
