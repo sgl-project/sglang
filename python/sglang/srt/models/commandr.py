@@ -49,10 +49,6 @@ from torch import nn
 from torch.nn.parameter import Parameter
 from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -69,6 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
 
 
@@ -97,7 +94,7 @@ class LayerNorm(nn.Module):
         return hidden_states, residuals
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         shard_dim = 0 if param.dim() != 1 else None
         param_data = param.data
         if shard_dim is not None:
@@ -152,7 +149,7 @@ class CohereAttention(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.config = config
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size

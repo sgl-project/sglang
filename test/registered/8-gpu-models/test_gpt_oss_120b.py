@@ -26,14 +26,14 @@ class TestGptOss120B(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--trust-remote-code",
-            "--cuda-graph-max-bs=200",
+            "--cuda-graph-max-bs-decode=200",
             "--mem-fraction-static=0.93",
         ]
         # Lower batch size for EAGLE3 variants to avoid OOM
         base_args_eagle3 = [
             "--tp=8",
             "--trust-remote-code",
-            "--cuda-graph-max-bs=100",
+            "--cuda-graph-max-bs-decode=100",
             "--mem-fraction-static=0.85",
         ]
         parser_args = [
@@ -74,7 +74,7 @@ class TestGptOss120B(unittest.TestCase):
             test_name="GPT-OSS-120B",
             accuracy_params=None,
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gpt_oss_120b",
+                result_dir="performance_results_gpt_oss_120b",
             ),
         )
 

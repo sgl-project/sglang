@@ -144,6 +144,13 @@ class PipelineStage(StageDedupMixin, ABC):
         """
         pass
 
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        """Expand one post-stage request into sequential downstream requests."""
+        del server_args
+        return iter((batch,))
+
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 
@@ -271,6 +278,12 @@ class PipelineStage(StageDedupMixin, ABC):
         # if get_global_server_args().enable_cfg_parallel:
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def cfg_parallel_local_batch_fields(
+        self, batch: Req, server_args: ServerArgs
+    ) -> tuple[str, ...]:
+        """the name of fields which already have a local version on each GPU in CFG-Parallel, no need to broadcast"""
+        return ()
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """

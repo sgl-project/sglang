@@ -27,7 +27,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -35,6 +34,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 _INF = float("inf")
@@ -128,7 +128,7 @@ class ClippableQKVParallelLinear(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self.q_size = (total_num_heads // tp_size) * head_size
         self.kv_size = (total_num_kv_heads // tp_size) * head_size
 
@@ -192,7 +192,7 @@ class ClippableGLUParallelLinear(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self.proj_size = hidden_size // tp_size
 
         self.linear = MergedColumnParallelLinear(
@@ -255,7 +255,7 @@ class ClippableGateUpParallelLinear(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         self.proj_size = intermediate_size // tp_size
 
         self.gate_up_proj = MergedColumnParallelLinear(

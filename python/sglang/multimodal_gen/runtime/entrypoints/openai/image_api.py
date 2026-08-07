@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -18,8 +19,13 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
+from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -63,6 +69,18 @@ def _get_extra_field(request, field_name):
     return value
 
 
+def _get_request_field_or_extra(request, field_name):
+    value = getattr(request, field_name, None)
+    if value is not None:
+        return value
+    return _get_extra_field(request, field_name)
+
+
+def _runtime_sampling_quality(quality: str | None) -> str | None:
+    """Keep OpenAI's automatic default out of SGLang's sampling contract."""
+    return None if quality in (None, "auto") else quality
+
+
 def _parse_extra_container(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         try:
@@ -83,6 +101,72 @@ def _read_b64_for_paths(paths: list[str]) -> list[str]:
     return result
 
 
+async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
+    return await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths)
+    )
+
+
+def _fallback_image_urls(
+    request_id: str, num_outputs: int, is_persistent: bool
+) -> list[str] | None:
+    if not is_persistent:
+        return None
+    if num_outputs <= 1:
+        return [f"/v1/images/{request_id}/content"]
+    return [
+        f"/v1/images/{request_id}/content?variant={idx}" for idx in range(num_outputs)
+    ]
+
+
+def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
+    file_paths = item.get("file_paths")
+    if file_paths:
+        variant_idx = _image_variant_index(variant)
+        if variant_idx is None:
+            return None
+        if variant_idx < 0 or variant_idx >= len(file_paths):
+            return None
+        return file_paths[variant_idx]
+
+    if variant not in (None, "0", 0):
+        return None
+    return item.get("file_path")
+
+
+def _image_variant_index(variant: str | None) -> int | None:
+    try:
+        return 0 if variant is None else int(variant)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_image_variant_cloud_url(item: dict, variant: str | None) -> str | None:
+    variant_idx = _image_variant_index(variant)
+    if variant_idx is None:
+        return None
+
+    urls = item.get("urls")
+    if urls and 0 <= variant_idx < len(urls):
+        return urls[variant_idx]
+    if variant_idx == 0:
+        return item.get("url")
+    return None
+
+
+def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
+    file_paths = item.get("file_paths")
+    if not file_paths:
+        return
+
+    variant_idx = _image_variant_index(variant)
+    if variant_idx is None or variant_idx < 0 or variant_idx >= len(file_paths):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Image variant {variant} not found",
+        )
+
+
 def _build_image_response_kwargs(
     save_file_path_list: list[str],
     resp_format: str,
@@ -92,8 +176,11 @@ def _build_image_response_kwargs(
     *,
     b64_list: list[str] | None = None,
     cloud_url: str | None = None,
+    cloud_urls: list[str | None] | None = None,
     fallback_url: str | None = None,
+    fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
+    resize: str | None = None,
 ) -> dict:
     """Build ImageResponse data list.
 
@@ -110,38 +197,73 @@ def _build_image_response_kwargs(
                 b64_json=b64,
                 revised_prompt=prompt,
                 file_path=os.path.abspath(path) if is_persistent else None,
+                resize=resize,
             )
             for b64, path in zip(b64_list, save_file_path_list)
         ]
         ret = {"data": data}
     elif resp_format == "url":
-        url = cloud_url or fallback_url
-        if not url:
+        if cloud_urls is None and cloud_url is not None:
+            cloud_urls = [cloud_url]
+        if fallback_urls is None and fallback_url is not None:
+            fallback_urls = [fallback_url]
+
+        data = []
+        for idx, path in enumerate(save_file_path_list):
+            url = None
+            if cloud_urls is not None and idx < len(cloud_urls):
+                url = cloud_urls[idx]
+            if not url and fallback_urls is not None and idx < len(fallback_urls):
+                url = fallback_urls[idx]
+            if not url:
+                break
+            data.append(
+                ImageResponseData(
+                    url=url,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(path) if is_persistent else None,
+                    resize=resize,
+                )
+            )
+
+        if len(data) != len(save_file_path_list):
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
             )
-        ret = {
-            "data": [
-                ImageResponseData(
-                    url=url,
-                    revised_prompt=prompt,
-                    file_path=(
-                        os.path.abspath(save_file_path_list[0])
-                        if is_persistent
-                        else None
-                    ),
-                )
-            ],
-        }
+        ret = {"data": data}
     else:
         raise HTTPException(
             status_code=400, detail=f"response_format={resp_format} is not supported"
         )
 
     ret = add_common_data_to_response(ret, request_id=request_id, result=result)
+    if ret.get("usage") is not None:
+        ret["usage"]["image_count"] = len(save_file_path_list)
 
     return ret
+
+
+def _get_response_resize(
+    sampling_params: SamplingParams, output_path: str | None = None
+) -> str | None:
+    """Return a generated GLM-Image output's actual size as WIDTHxHEIGHT."""
+    if not isinstance(sampling_params, GlmImageSamplingParams):
+        return None
+
+    if output_path is not None:
+        try:
+            with Image.open(output_path) as output_image:
+                width, height = output_image.size
+            return f"{width}x{height}"
+        except (OSError, ValueError):
+            # Fall back to the aligned sampling canvas if the output cannot be
+            # inspected (for example, for a custom output transport).
+            pass
+
+    if sampling_params.width is None or sampling_params.height is None:
+        return None
+    return sampling_params.output_size_str()
 
 
 @router.post("/generations", response_model=ImageResponse)
@@ -192,6 +314,7 @@ async def generations(
             use_system_prompt=_get_extra_field(request, "use_system_prompt"),
             use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
+            quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
             diffusers_kwargs=request.diffusers_kwargs,
@@ -201,6 +324,11 @@ async def generations(
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
             preset=_get_extra_field(request, "preset"),
+            progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
+            progressive_levels=_get_request_field_or_extra(
+                request, "progressive_levels"
+            ),
+            progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -216,6 +344,7 @@ async def generations(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
+        response_resize = _get_response_resize(sampling, save_file_path)
         resp_format = (request.response_format or "b64_json").lower()
         if (
             is_cosmos3
@@ -231,16 +360,29 @@ async def generations(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
-
         is_persistent = server_args.output_path is not None
+        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_url = cloud_urls[0] if cloud_urls else None
+        fallback_urls = _fallback_image_urls(
+            request_id, len(save_file_path_list), is_persistent
+        )
         await IMAGE_STORE.upsert(
             request_id,
             {
                 "id": request_id,
                 "created_at": int(time.time()),
                 "file_path": None if cloud_url or not is_persistent else save_file_path,
+                "file_paths": (
+                    None
+                    if not is_persistent
+                    else [
+                        None if url else path
+                        for path, url in zip(save_file_path_list, cloud_urls)
+                    ]
+                ),
                 "url": cloud_url,
+                "urls": cloud_urls,
+                "num_outputs": len(save_file_path_list),
             },
         )
 
@@ -251,9 +393,10 @@ async def generations(
             request_id,
             result,
             b64_list=b64_list,
-            cloud_url=cloud_url,
-            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
+            cloud_urls=cloud_urls,
+            fallback_urls=fallback_urls,
             is_persistent=is_persistent,
+            resize=response_resize,
         )
 
     return ImageResponse(**response_kwargs)
@@ -281,6 +424,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
+    quality: Optional[str] = Form(None),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
@@ -341,6 +485,7 @@ async def edits(
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
             num_frames=num_frames,
+            quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,
             output_quality=output_quality,
             enable_upscaling=enable_upscaling,
@@ -357,6 +502,7 @@ async def edits(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
+        response_resize = _get_response_resize(sampling, save_file_path)
         resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
@@ -366,19 +512,32 @@ async def edits(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
-
         is_persistent = server_args.output_path is not None
         is_input_persistent = server_args.input_save_path is not None
+        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_url = cloud_urls[0] if cloud_urls else None
+        fallback_urls = _fallback_image_urls(
+            request_id, len(save_file_path_list), is_persistent
+        )
         await IMAGE_STORE.upsert(
             request_id,
             {
                 "id": request_id,
                 "created_at": int(time.time()),
                 "file_path": None if cloud_url or not is_persistent else save_file_path,
+                "file_paths": (
+                    None
+                    if not is_persistent
+                    else [
+                        None if url else path
+                        for path, url in zip(save_file_path_list, cloud_urls)
+                    ]
+                ),
                 "url": cloud_url,
+                "urls": cloud_urls,
                 "input_image_paths": input_paths if is_input_persistent else None,
                 "num_input_images": len(input_paths),
+                "num_outputs": len(save_file_path_list),
             },
         )
 
@@ -389,9 +548,10 @@ async def edits(
             request_id,
             result,
             b64_list=b64_list,
-            cloud_url=cloud_url,
-            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
+            cloud_urls=cloud_urls,
+            fallback_urls=fallback_urls,
             is_persistent=is_persistent,
+            resize=response_resize,
         )
 
     return ImageResponse(**response_kwargs)
@@ -405,13 +565,18 @@ async def download_image_content(
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    if item.get("url"):
+    _raise_if_image_variant_not_found(item, variant)
+    file_path = _select_image_variant_path(item, variant)
+    if not file_path:
+        cloud_url = _select_image_variant_cloud_url(item, variant)
+    else:
+        cloud_url = None
+    if not file_path and cloud_url:
         raise HTTPException(
             status_code=400,
-            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {item.get('url')}",
+            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
-    file_path = item.get("file_path")
     if not file_path:
         raise HTTPException(
             status_code=404,

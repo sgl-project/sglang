@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
@@ -27,10 +28,30 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
+from sglang.kernels.ops.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
+)
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    join_seqs,
+    shard_like,
+    shard_seq_prefix,
+    should_shard_text,
+    split_seqs,
+    tail_attn_meta,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.fused_linear_act import linear_gelu_tanh
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm_with_optional_rope,
@@ -55,6 +76,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -63,6 +85,41 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+_FLUX_RESIDUAL_GATE_CUDA_DISABLED = False
+
+
+def _flux_residual_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
+
+    Restricted to half dtypes: there the kernel reproduces the eager pair's
+    two-step rounding exactly (verified by ``torch.equal``), while for fp32 it
+    would contract to an fma (one rounding) and stop being bit-exact. The
+    kernel's row-broadcast gate only covers ``[1, ..., 1, D]``; batched
+    ``[B>1, 1, D]`` gates fail ``can_use_residual_gate_add_cuda`` and take the
+    eager fallback below.
+    """
+    global _FLUX_RESIDUAL_GATE_CUDA_DISABLED
+
+    if (
+        not _FLUX_RESIDUAL_GATE_CUDA_DISABLED
+        and residual.dtype in (torch.float16, torch.bfloat16)
+        and can_use_residual_gate_add_cuda(residual, update, gate)
+    ):
+        try:
+            return residual_gate_add_cuda(residual, update, gate)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling FLUX residual-gate CUDA fast path: {exc}")
+            _FLUX_RESIDUAL_GATE_CUDA_DISABLED = True
+
+    return residual + gate * update
+
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -231,11 +288,44 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
+        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Fuse the up-projection GEMM with the tanh-GELU activation via the
-        # cublasLt GELU epilogue (falls back to proj + F.gelu when unsupported).
-        return linear_gelu_tanh(self.proj, hidden_states)
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
+        hidden_states, _ = self.proj(hidden_states)
+        return self.gelu(hidden_states)
+
+
+class FluxFusedGELUProj(nn.Module):
+    """tanh-GELU up-projection site for the shared (diffusers-style) FeedForward.
+
+    Drop-in replacement for ``diffusers.models.activations.GELU`` with
+    ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
+    default path is the bit-exact reference (plain Linear + tanh-GELU); the
+    cublasLt GELU epilogue is mounted per batch by the denoising stage for
+    quality="high" requests only.
+    """
+
+    def __init__(self, proj: nn.Linear):
+        super().__init__()
+        self.proj = proj
+        mark_fused_gelu_site(self, "proj")
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
+        return F.gelu(self.proj(hidden_states), approximate="tanh")
 
 
 class FluxParallelFeedForward(nn.Module):
@@ -448,6 +538,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis=None,
         num_replicated_prefix: int = 0,
+        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[Dict[str, int]] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         (
             query,
@@ -501,12 +593,12 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-            num_replicated_prefix = (
-                num_replicated_prefix or encoder_hidden_states.shape[1]
-            )
+            # join_seqs relocates any SP text tail-pad behind the image (see
+            # sp_shard.join_seqs for why).
+            sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
+            query = join_seqs(encoder_query, query, sp_txt_pad)
+            key = join_seqs(encoder_key, key, sp_txt_pad)
+            value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -519,17 +611,20 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        x = self.attn(query, key, value, num_replicated_prefix=num_replicated_prefix)
+        x = self.attn(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+        )
         x = x.flatten(2, 3)
         x = x.to(query.dtype)
 
         if encoder_hidden_states is not None:
-            encoder_hidden_states, x = x.split_with_sizes(
-                [
-                    encoder_hidden_states.shape[1],
-                    x.shape[1] - encoder_hidden_states.shape[1],
-                ],
-                dim=1,
+            encoder_hidden_states, x = split_seqs(
+                x, encoder_hidden_states.shape[1], sp_txt_pad
             )
             if not self.pre_only:
                 x, _ = self.to_out[0](x)
@@ -608,6 +703,9 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
+            # quality="high" fusion site: proj_mlp GEMM + tanh-GELU in the
+            # cublasLt epilogue (mounted per batch by the denoising stage).
+            mark_fused_gelu_site(self, "proj_mlp")
             proj_out_cls = (
                 RowParallelLinear if shard_single_block else ColumnParallelLinear
             )
@@ -669,14 +767,19 @@ class FluxSingleTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        # join_seqs relocates any SP text tail-pad behind the image; the caller
+        # hands single blocks a RoPE cache reordered the same way.
+        sp_txt_pad = (joint_attention_kwargs.get("attn_mask_meta") or {}).get(
+            "local_pad", 0
+        )
+        hidden_states = join_seqs(encoder_hidden_states, hidden_states, sp_txt_pad)
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        joint_attention_kwargs = joint_attention_kwargs or {}
-        joint_attention_kwargs.setdefault("num_replicated_prefix", text_seq_len or 0)
 
         if self.use_nunchaku_structure:
             if _nunchaku_fused_ops_available:
@@ -691,6 +794,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
             if isinstance(attn_output, tuple):
@@ -701,26 +805,33 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            mlp_hidden_states = linear_gelu_tanh(self.proj_mlp, norm_hidden_states)
+            if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+                self.proj_mlp, norm_hidden_states
+            ):
+                mlp_hidden_states = fused_linear_gelu_tanh(
+                    norm_hidden_states, self.proj_mlp.weight, self.proj_mlp.bias
+                )
+            else:
+                proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
+                mlp_hidden_states = self.act_mlp(proj_hidden_states)
 
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
 
             hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
             gate = gate.unsqueeze(1)
             proj_out, _ = self.proj_out(hidden_states)
-            hidden_states = gate * proj_out
-            hidden_states = residual + hidden_states
+            hidden_states = _flux_residual_gate_add(residual, proj_out, gate)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = (
-            hidden_states[:, :text_seq_len],
-            hidden_states[:, text_seq_len:],
+        encoder_hidden_states, hidden_states = split_seqs(
+            hidden_states, text_seq_len, sp_txt_pad
         )
         return encoder_hidden_states, hidden_states
 
@@ -807,6 +918,10 @@ class FluxTransformerBlock(nn.Module):
                 dim_out=dim,
                 activation_fn="gelu-approximate",
             )
+            # Re-home each FF's tanh-GELU up-projection onto a marked
+            # quality="high" fusion site (bit-exact reference by default).
+            self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
+            self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 
     def forward(
         self,
@@ -815,6 +930,7 @@ class FluxTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
             hidden_states, emb=temb
@@ -834,6 +950,7 @@ class FluxTransformerBlock(nn.Module):
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
 
@@ -843,8 +960,9 @@ class FluxTransformerBlock(nn.Module):
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
+        hidden_states = _flux_residual_gate_add(
+            hidden_states, attn_output, gate_msa.unsqueeze(1)
+        )
         norm_hidden_states = self.norm2(hidden_states)
         if self.use_nunchaku_structure:
             norm_hidden_states = (
@@ -856,15 +974,16 @@ class FluxTransformerBlock(nn.Module):
             )
 
         ff_output = self.ff(norm_hidden_states)
-        ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-        hidden_states = hidden_states + ff_output
+        hidden_states = _flux_residual_gate_add(
+            hidden_states, ff_output, gate_mlp.unsqueeze(1)
+        )
 
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
+        encoder_hidden_states = _flux_residual_gate_add(
+            encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
+        )
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         if self.use_nunchaku_structure:
@@ -878,8 +997,8 @@ class FluxTransformerBlock(nn.Module):
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = (
-            encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        encoder_hidden_states = _flux_residual_gate_add(
+            encoder_hidden_states, context_ff_output, c_gate_mlp.unsqueeze(1)
         )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
@@ -1075,7 +1194,44 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         else:
             temb = self.time_text_embed(timestep, pooled_projections)
 
+        num_txt_tokens = encoder_hidden_states.shape[1]
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
+
+        # Shard the replicated text stream across SP ranks (image latents are
+        # already sharded); non-divisible lengths tail-pad the last rank and the
+        # per-request tail meta lets attention skip the pad for free.
+        num_replicated_prefix = num_txt_tokens
+        singles_freqs_cis = freqs_cis
+        if should_shard_text(num_txt_tokens):
+            txt_shard = build_shard_plan(num_txt_tokens)
+            encoder_hidden_states = shard_like(encoder_hidden_states, txt_shard)
+            if freqs_cis is not None:
+                cos, sin = freqs_cis
+                cos = shard_seq_prefix(cos, num_txt_tokens, txt_shard)
+                sin = shard_seq_prefix(sin, num_txt_tokens, txt_shard)
+                freqs_cis = (cos, sin)
+                singles_freqs_cis = freqs_cis
+            num_replicated_prefix = 0
+            tail_meta = tail_attn_meta(
+                txt_shard,
+                encoder_hidden_states.shape[0],
+                hidden_states.device,
+                image_seq_len=hidden_states.shape[1],
+            )
+            if tail_meta is not None:
+                joint_attention_kwargs = (
+                    joint_attention_kwargs.copy() if joint_attention_kwargs else {}
+                )
+                joint_attention_kwargs["attn_mask_meta"] = tail_meta
+                # Single blocks apply RoPE on the relocated [txt_real, img, pad]
+                # layout, so hand them a cache reordered the same way.
+                if freqs_cis is not None:
+                    t_loc = txt_shard.local_len
+                    pad = txt_shard.local_pad
+                    singles_freqs_cis = (
+                        join_seqs(cos[:t_loc], cos[t_loc:], pad, dim=0),
+                        join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
+                    )
 
         if (
             joint_attention_kwargs is not None
@@ -1087,22 +1243,35 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for block in self.transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        for block in self.single_transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
+        forward_batch = get_forward_context().forward_batch
+        spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
+        run_transformer_blocks = (
+            self.begin_spectrum_step() if spectrum_enabled else True
+        )
+        if run_transformer_blocks:
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    num_replicated_prefix=num_replicated_prefix,
+                )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=singles_freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    num_replicated_prefix=num_replicated_prefix,
+                )
+            if spectrum_enabled:
+                self.spectrum_record_features(hidden_states)
+        else:
+            if spectrum_enabled:
+                hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
 

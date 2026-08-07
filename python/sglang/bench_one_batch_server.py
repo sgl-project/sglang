@@ -1,49 +1,23 @@
-"""
-Benchmark the latency of running a single batch with a server.
+"""Deprecated import path for ``sglang.benchmark.one_batch_server``.
 
-This script launches a server and uses the HTTP interface.
-It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
-
-Usage:
-python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
-
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
+``python -m sglang.bench_one_batch_server`` and
+``from sglang.bench_one_batch_server import ...`` still work, but the
+implementation now lives in ``sglang.benchmark.one_batch_server``.
+Update references to the new path.
 """
 
-import argparse
+import warnings
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.bench_one_batch_server_internal import (
-    BenchArgs,
-    run_benchmark_internal,
+from sglang.benchmark.one_batch_server import *  # noqa: F401,F403
+from sglang.benchmark.one_batch_server import cli_main
+
+warnings.warn(
+    "`sglang.bench_one_batch_server` is deprecated and will be removed in a "
+    "future release; use `sglang.benchmark.one_batch_server` instead "
+    "(e.g. `python -m sglang.benchmark.one_batch_server`).",
+    FutureWarning,
+    stacklevel=1,
 )
-from sglang.test.nightly_bench_utils import save_results_as_pydantic_models
-
-
-def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
-    results, server_info = run_benchmark_internal(server_args, bench_args)
-
-    # Save results as pydantic models in the JSON format
-    if bench_args.pydantic_result_filename:
-        save_results_as_pydantic_models(
-            results,
-            pydantic_result_filename=bench_args.pydantic_result_filename,
-            model_path=server_args.model_path,
-            server_args=bench_args.server_args_for_metrics,
-        )
-
-    return results, server_info
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    BenchArgs.add_cli_args(parser)
-    args = parser.parse_args()
-
-    server_args = ServerArgs.from_cli_args(args)
-    bench_args = BenchArgs.from_cli_args(args)
-
-    run_benchmark(server_args, bench_args)
+    cli_main()

@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 
 from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm as w8a8_block_fp8_matmul,
 )
 
