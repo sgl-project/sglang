@@ -369,6 +369,7 @@ def _verify_combine_stage2(
     V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    INTRA_BLOCK_CAUSAL: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -454,9 +455,12 @@ def _verify_combine_stage2(
 
     # scores[i,j] = q_i . k_j  (i query, j key)  -> [L_EXT, L_EXT]
     qk = tl.sum(q[:, None, :] * ke[None, :, :], 2) * sm_scale
-    # causal among drafts: query i sees key j iff j <= i, and both valid
-    causal = (offs_l[None, :] <= offs_l[:, None]) & mask_l[None, :] & mask_l[:, None]
-    qk = tl.where(causal, qk, float("-inf"))
+    # ENCODER_ONLY draft layers are bidirectional: every valid draft sees every
+    # other. Causal layers additionally require key j <= query i.
+    visible = mask_l[None, :] & mask_l[:, None]
+    if INTRA_BLOCK_CAUSAL:
+        visible = visible & (offs_l[None, :] <= offs_l[:, None])
+    qk = tl.where(visible, qk, float("-inf"))
     m_d = tl.max(qk, 1)  # [L_EXT]
     pd = tl.exp(qk - m_d[:, None])  # [L_EXT, L_EXT]
     denom_d = tl.sum(pd, 1)  # [L_EXT]
@@ -502,7 +506,10 @@ class VerifySplitKV:
         n_splits=DEFAULT_N_SPLITS,
         block_n=DEFAULT_BLOCK_N,
         num_warps=DEFAULT_NUM_WARPS,
+        intra_block_causal=True,
     ):
+        # A stage2 constexpr specialization, so it keys _VK_CACHE.
+        self.intra_block_causal = intra_block_causal
         self.h_q = h_q
         self.h_kv = h_kv
         self.group = h_q // h_kv
@@ -622,6 +629,7 @@ class VerifySplitKV:
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            INTRA_BLOCK_CAUSAL=self.intra_block_causal,
             num_warps=1,
             num_stages=1,
         )
@@ -688,9 +696,26 @@ _VK_CACHE = {}
 
 
 def _get_vk(
-    max_bs, h_q, h_kv, head_dim, v_head_dim, l_ext, device, n_splits=DEFAULT_N_SPLITS
+    max_bs,
+    h_q,
+    h_kv,
+    head_dim,
+    v_head_dim,
+    l_ext,
+    device,
+    n_splits=DEFAULT_N_SPLITS,
+    intra_block_causal=True,
 ):
-    key = (h_q, h_kv, head_dim, v_head_dim, l_ext, str(device), n_splits)
+    key = (
+        h_q,
+        h_kv,
+        head_dim,
+        v_head_dim,
+        l_ext,
+        str(device),
+        n_splits,
+        intra_block_causal,
+    )
     vk = _VK_CACHE.get(key)
     if vk is None:
         block_n, num_warps = block_config(head_dim)
@@ -705,6 +730,7 @@ def _get_vk(
             n_splits=n_splits,
             block_n=block_n,
             num_warps=num_warps,
+            intra_block_causal=intra_block_causal,
         )
         _VK_CACHE[key] = vk
     else:
@@ -749,7 +775,7 @@ def can_handle(
         return False
     if xai_temperature_len is not None and xai_temperature_len > 0:
         return False
-    if not is_causal:
+    if not is_causal and custom_mask is not None:
         return False
     # q layout must be [tokens, H_Q, D]; head dims handled by power-of-2 pad.
     if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
@@ -904,6 +930,7 @@ def verify_splitkv_fwd(
         l_ext,
         q_extend.device,
         n_splits=n_splits,
+        intra_block_causal=bool(is_causal),
     )
     vk(
         q_extend,
