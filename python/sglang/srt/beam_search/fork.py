@@ -1,4 +1,4 @@
-"""Fork primitives for beam member rows (copy-on-fork KV).
+"""Fork primitives for beam member rows (share-on-fork KV).
 
 Members are not requests: each is one physical req_to_token row spawned
 decode-ready after the leader's prefill -- no member prefill; its first
@@ -6,17 +6,16 @@ decode step computes the selected token's KV like normal decode.
 
 - alias: members share the leader's prompt KV mapping read-only; each member
   owns only its decode suffix, which standard alloc_for_decode extends.
-- reparent: all beams in a group share the same length, so reparenting is a
-  pure KV **data** copy onto the destination's own slots: no allocator
-  traffic, no req_to_token remapping, stream-safe and capturable.
-- free: member rows own exactly their decode-suffix slots
-  [prompt_len, leader_allocated); the aliased prompt belongs to the leader's
-  accounting and is never freed here.
+- reparent: a survivor's history IS its parent's, so reparenting only remaps
+  req_to_token onto the parent's slots -- no KV data copy. Slots nobody
+  inherits are reclaimed separately (collect_orphan_slots), off the launch
+  path because that set difference has a data-dependent shape.
+- free: sharing means several rows can name one slot, so the decode region is
+  owned by the GROUP and released once, deduped; the aliased prompt stays the
+  leader's.
 """
 
 from __future__ import annotations
-
-from typing import Sequence
 
 import torch
 
@@ -83,8 +82,18 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
     start = group.prompt_len
     end = leader.kv.kv_allocated_len if leader.kv is not None else start
     if end > start:
-        slots = req_to_token_pool.req_to_token[group.member_rows, start:end]
-        token_to_kv_pool_allocator.free(slots.flatten())
+        # Share-on-fork lets several rows (incl. the leader's) point at the
+        # same slot, so the decode region is owned by the GROUP and freed once,
+        # deduped, here. Rewinding the leader's kv lengths to the prompt hands
+        # its per-Req release path exactly the region still its own ([0,
+        # prompt_len), the aliased prompt) -- without this it would free the
+        # decode region a second time.
+        rows = group.all_rows if group.all_rows is not None else group.member_rows
+        slots = req_to_token_pool.req_to_token[rows, start:end]
+        token_to_kv_pool_allocator.free(slots.flatten().unique())
+        if leader.kv is not None:
+            leader.kv_committed_len = start
+            leader.kv.kv_allocated_len = start
     req_to_token_pool.free_raw(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None
@@ -94,23 +103,35 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
 # ==================== reparent ====================
 
 
-def reparent_kv(
+def remap_kv_mapping(
     req_to_token: torch.Tensor,
-    kv_buffers: Sequence[torch.Tensor],
-    dst_rows: torch.Tensor,
-    src_rows: torch.Tensor,
+    rows: torch.Tensor,
+    parent_idx: torch.Tensor,
     prefix_len: int,
     seq_len: int,
-) -> None:
-    """Copy the decode-suffix KV data of src rows onto dst rows.
+):
+    """Reparent by pointing rows at their parent's slots instead of copying
+    KV data (share-on-fork). Returns (old_mapping, new_mapping) so the caller
+    can reclaim the slots no surviving row references any more.
 
-    Synchronized lengths make this a pure data move: dst keeps its own KV
-    slots and its req_to_token mapping; only buffer contents change. All
-    index math is tensor-side (no host sync), so the whole call can be
-    enqueued in-stream and captured. Rows with parent == self must simply be
-    omitted from dst_rows/src_rows.
+    All rows are length-synchronized, so a survivor's history is exactly its
+    parent's window [prefix_len, seq_len) -- including the token just computed
+    at seq_len-1. The row's own slot there becomes garbage unless some other
+    survivor inherits it.
     """
-    src_slots = req_to_token[src_rows, prefix_len:seq_len].reshape(-1)
-    dst_slots = req_to_token[dst_rows, prefix_len:seq_len].reshape(-1)
-    for buf in kv_buffers:
-        buf[dst_slots] = buf[src_slots]
+    window = req_to_token[rows, prefix_len:seq_len]
+    old_mapping = window.clone()
+    new_mapping = old_mapping[parent_idx]
+    req_to_token[rows, prefix_len:seq_len] = new_mapping
+    return old_mapping, new_mapping
+
+
+def collect_orphan_slots(old_mapping: torch.Tensor, new_mapping: torch.Tensor):
+    """Slots referenced before the remap and by nobody after it.
+
+    Data-dependent output shape (unique/isin), so this synchronizes -- keep it
+    off the launch path; the deferred commit half already syncs.
+    """
+    old_slots = old_mapping.flatten().unique()
+    new_slots = new_mapping.flatten().unique()
+    return old_slots[~torch.isin(old_slots, new_slots)]

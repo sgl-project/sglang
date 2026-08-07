@@ -2754,12 +2754,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_algorithm.is_none():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             # Beam member rows decode in lockstep with their leader, one slot
-            # per row per step (beam requires page_size == 1). getattr:
-            # unit-test fakes may not carry the beam_group field.
+            # per row per step (beam requires page_size == 1).
             num_member_rows = sum(
-                group.num_member_rows
+                r.beam_group.num_member_rows
                 for r in requests
-                if (group := getattr(r, "beam_group", None)) is not None
+                if r.beam_group is not None
             )
             return new_pages * page_size + num_member_rows
 
@@ -3048,8 +3047,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         leader_idx = []
         t = 0
         for i, req in enumerate(self.reqs):
-            # getattr: unit-test fakes may not carry the beam_group field.
-            group = getattr(req, "beam_group", None)
+            group = req.beam_group
             if group is None or group.member_rows is None or group.retired:
                 continue
             m = group.num_member_rows

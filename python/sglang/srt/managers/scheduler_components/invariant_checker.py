@@ -263,15 +263,22 @@ class SchedulerInvariantChecker:
                         req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
-                # Beam member rows carry no Req: each owns its decode suffix
-                # [prompt_len, allocated) in lockstep with the leader (the
-                # aliased prompt belongs to the leader's accounting; beam
-                # requires page_size == 1 and rejects hybrid SWA).
+                # Beam member rows carry no Req, and share-on-fork lets several
+                # rows reference one slot, so the group -- not the row -- owns
+                # the decode region. Held = allocated - freed, both host-side
+                # counters: the region grows by exactly one slot per row per
+                # step (k per step over end-start steps) and the reclaim
+                # accumulates what it returned. Counting distinct slots off
+                # req_to_token instead would have to read the launch half's
+                # staged tensors, which under overlap are not yet safe to read
+                # on this stream.
                 group = req.beam_group
-                if group is not None and group.member_rows is not None:
-                    full_uncached += group.num_member_rows * (
-                        req.kv.kv_allocated_len - group.prompt_len
-                    )
+                if group is not None and group.all_rows is not None:
+                    end = req.kv.kv_allocated_len
+                    start = group.prompt_len
+                    held = group.beam_width * (end - start) - group.slots_freed
+                    # The leader's own window is already in the generic sum.
+                    full_uncached += held - (end - start)
 
         return full_uncached, swa_uncached
 

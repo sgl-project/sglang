@@ -105,6 +105,13 @@ class BeamGroup:
         self.member_rows_cpu: Optional[torch.Tensor] = None
         # Device [k]: leader row first, then member_rows (frontier-row order).
         self.all_rows: Optional[torch.Tensor] = None
+        # (tick, old_mapping, new_mapping) staged by the launch half; the
+        # deferred half turns them into freed slots (share-on-fork GC), gated
+        # on the tick whose copy_done sync already happened.
+        self.pending_orphans: List = []
+        # Running total the GC has returned, so held KV is a host-side
+        # arithmetic (allocated - freed) rather than a tensor read.
+        self.slots_freed = 0
 
     @property
     def num_member_rows(self) -> int:

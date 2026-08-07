@@ -1,4 +1,5 @@
-"""Unit tests for the fork primitives: prompt alias, member-row free, reparent."""
+"""Unit tests for the fork primitives: prompt alias, share-on-fork reparent,
+orphan reclaim, and group-owned member-row release."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,9 +8,10 @@ import torch
 
 from sglang.srt.beam_search.fork import (
     alias_members_prompt_kv,
+    collect_orphan_slots,
     free_member_rows,
     neutral_member_sampling_params,
-    reparent_kv,
+    remap_kv_mapping,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,60 +19,64 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestReparentKV(CustomTestCase):
+class TestRemapKvMapping(CustomTestCase):
     def setUp(self):
-        # 4 rows x 12 positions; every row maps to its own distinct slots.
-        self.req_to_token = torch.arange(48, dtype=torch.int64).reshape(4, 12)
-        # Two fake per-layer buffers whose content encodes (buffer, slot).
-        self.kv_buffers = [
-            torch.arange(100, dtype=torch.float32) * 10,
-            torch.arange(100, dtype=torch.float32) * 100,
-        ]
+        # 3 rows x 10 positions; every row maps to its own distinct slots.
+        self.req_to_token = torch.arange(30, dtype=torch.int64).reshape(3, 10)
+        self.rows = torch.tensor([0, 1, 2], dtype=torch.int64)
 
-    def test_copies_suffix_data_only(self):
-        mapping_before = self.req_to_token.clone()
-        originals = [buf.clone() for buf in self.kv_buffers]
+    def test_rows_adopt_parent_slots(self):
+        # Survivors 0 and 1 both descend from row 2; row 2 from row 0.
+        parent_idx = torch.tensor([2, 2, 0], dtype=torch.int64)
+        before = self.req_to_token.clone()
 
-        # Rows 1 and 2 both reparent onto row 0 over suffix [3, 8).
-        reparent_kv(
-            self.req_to_token,
-            self.kv_buffers,
-            dst_rows=torch.tensor([1, 2]),
-            src_rows=torch.tensor([0, 0]),
-            prefix_len=3,
-            seq_len=8,
+        old_map, new_map = remap_kv_mapping(
+            self.req_to_token, self.rows, parent_idx, prefix_len=4, seq_len=7
         )
 
-        # Mapping is untouched: only buffer contents move.
-        self.assertTrue(torch.equal(self.req_to_token, mapping_before))
+        # Each row's window now names its parent's slots; nothing outside
+        # [4, 7) moved, and no KV data was touched (mapping-only reparent).
+        for j, p in enumerate(parent_idx.tolist()):
+            self.assertTrue(torch.equal(self.req_to_token[j, 4:7], before[p, 4:7]))
+            self.assertTrue(torch.equal(self.req_to_token[j, :4], before[j, :4]))
+            self.assertTrue(torch.equal(self.req_to_token[j, 7:], before[j, 7:]))
+        self.assertTrue(torch.equal(old_map, before[self.rows, 4:7]))
+        self.assertTrue(torch.equal(new_map, before[parent_idx, 4:7]))
 
-        for buf, orig in zip(self.kv_buffers, originals):
-            for dst_row in (1, 2):
-                for pos in range(3, 8):
-                    dst_slot = int(self.req_to_token[dst_row, pos])
-                    src_slot = int(self.req_to_token[0, pos])
-                    self.assertEqual(buf[dst_slot], orig[src_slot])
-                # Prompt region and beyond-suffix region keep their own data.
-                for pos in list(range(0, 3)) + list(range(8, 12)):
-                    slot = int(self.req_to_token[dst_row, pos])
-                    self.assertEqual(buf[slot], orig[slot])
-            # Row 3 (not involved) is fully untouched.
-            for pos in range(12):
-                slot = int(self.req_to_token[3, pos])
-                self.assertEqual(buf[slot], orig[slot])
-
-    def test_empty_suffix_is_noop(self):
-        originals = [buf.clone() for buf in self.kv_buffers]
-        reparent_kv(
-            self.req_to_token,
-            self.kv_buffers,
-            dst_rows=torch.tensor([1]),
-            src_rows=torch.tensor([0]),
-            prefix_len=5,
-            seq_len=5,
+    def test_identity_parents_change_nothing(self):
+        parent_idx = torch.arange(3, dtype=torch.int64)
+        before = self.req_to_token.clone()
+        remap_kv_mapping(
+            self.req_to_token, self.rows, parent_idx, prefix_len=4, seq_len=7
         )
-        for buf, orig in zip(self.kv_buffers, originals):
-            self.assertTrue(torch.equal(buf, orig))
+        self.assertTrue(torch.equal(self.req_to_token, before))
+
+
+class TestCollectOrphanSlots(CustomTestCase):
+    def test_returns_slots_nobody_inherits(self):
+        req_to_token = torch.arange(30, dtype=torch.int64).reshape(3, 10)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+        # Row 1 is nobody's parent, so its window dies.
+        parent_idx = torch.tensor([0, 2, 2], dtype=torch.int64)
+        before = req_to_token.clone()
+
+        old_map, new_map = remap_kv_mapping(
+            req_to_token, rows, parent_idx, prefix_len=4, seq_len=7
+        )
+        orphans = collect_orphan_slots(old_map, new_map)
+
+        self.assertEqual(sorted(orphans.tolist()), sorted(before[1, 4:7].tolist()))
+
+    def test_no_orphans_when_every_row_survives(self):
+        req_to_token = torch.arange(30, dtype=torch.int64).reshape(3, 10)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+        parent_idx = torch.tensor([2, 0, 1], dtype=torch.int64)  # a permutation
+
+        old_map, new_map = remap_kv_mapping(
+            req_to_token, rows, parent_idx, prefix_len=4, seq_len=7
+        )
+
+        self.assertEqual(collect_orphan_slots(old_map, new_map).numel(), 0)
 
 
 class TestAliasMembersPromptKV(CustomTestCase):
@@ -111,7 +117,10 @@ class _FakeAllocator:
 
 class TestFreeMemberRows(CustomTestCase):
     def _make_group(self, req_to_token, allocated_len):
-        leader = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=allocated_len))
+        leader = SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=allocated_len),
+            kv_committed_len=allocated_len,
+        )
         return SimpleNamespace(
             leader=leader,
             prompt_len=5,
@@ -126,12 +135,17 @@ class TestFreeMemberRows(CustomTestCase):
         allocator = _FakeAllocator()
         group = self._make_group(req_to_token, allocated_len=8)
 
+        leader = group.leader
         free_member_rows(group, pool, allocator)
 
-        # Each member row owns its decode suffix [5, 8); the aliased prompt
-        # is the leader's to free.
-        expected = req_to_token[1:3, 5:8].flatten().tolist()
+        # The group owns the whole decode region [5, 8) across all its rows
+        # (leader included) and frees it once.
+        expected = req_to_token[0:3, 5:8].flatten().tolist()
         self.assertEqual(sorted(allocator.freed), sorted(expected))
+        # Leader rewound to the prompt: its own release must not free the
+        # decode region a second time.
+        self.assertEqual(leader.kv.kv_allocated_len, 5)
+        self.assertEqual(leader.kv_committed_len, 5)
         self.assertEqual(sorted(pool.freed), [1, 2])
         self.assertIsNone(group.member_rows)
         self.assertIsNone(group.member_rows_cpu)

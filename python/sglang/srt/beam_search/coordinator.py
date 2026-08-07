@@ -12,15 +12,16 @@ hooks three points:
    group overlay
 2. selection -- at the forward's relay point: per-group top-2k straight from
    the raw decode logits (leader row + member tail rows), joint_select on
-   device, overwrite next tokens via the FutureMap relay, reparent KV
-   (copy-on-fork) where the frontier moved
+   device, overwrite next tokens via the FutureMap relay, reparent by
+   remapping each moved row onto its parent's slots (share-on-fork)
 3. lifecycle -- member-row spawn at the leader's prefill relay (row alloc +
    prompt alias + first-token stash, no host sync) and group finish
    (finalize + beam_results on the leader; member rows freed in one shot)
 
-Member KV bookkeeping is implied by the leader's: all rows decode in
-lockstep, so each member row owns exactly the decode-suffix slots
-[prompt_len, leader_allocated).
+All rows decode in lockstep over [prompt_len, leader_allocated), but
+share-on-fork lets several of them reference the same slot, so the group --
+not the individual row -- owns that region: it is freed once, deduped, at
+group finish.
 """
 
 from __future__ import annotations
@@ -35,9 +36,10 @@ from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
     alias_members_prompt_kv,
+    collect_orphan_slots,
     free_member_rows,
     neutral_member_sampling_params,
-    reparent_kv,
+    remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -316,6 +318,7 @@ class BeamCoordinator:
             # The leader was aborted mid-prefill; the group never starts.
             self._abort_group(group)
             return
+        self._reclaim_orphans(group, up_to_tick)
         if group.commit_pending(up_to_tick):
             self._finish_group(group)
 
@@ -373,7 +376,7 @@ class BeamCoordinator:
             next_tokens, parent_idx = self._select_group(
                 group, top_logprobs, top_tokens, batch.forward_iter
             )
-            self._apply_survivors(group, next_tokens, parent_idx)
+            self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
         """Deferred half: fold staged selections into the DAG (the designated
@@ -392,6 +395,10 @@ class BeamCoordinator:
             group = req.beam_group
             if group is None or group.retired:
                 continue
+            # Orphan slots are reclaimed whether or not the step's DAG commit
+            # survives: the remap already mutated req_to_token on the launch
+            # path, so an overshoot step's orphans are real either way.
+            self._reclaim_orphans(group, batch.forward_iter)
             if req.to_finish is not None:
                 self._abort_group(group)
                 newly_finished.add(id(group))
@@ -436,34 +443,68 @@ class BeamCoordinator:
         group: BeamGroup,
         next_tokens: torch.Tensor,
         parent_idx: Optional[torch.Tensor],
+        tick: int,
     ) -> None:
-        """Move rows onto surviving paths on-device: reparent KV by parent
-        index and relay the selected next tokens, no D2H round-trip.
+        """Move rows onto surviving paths on-device: reparent by pointing each
+        row at its parent's slots and relay the selected next tokens, no D2H
+        round-trip.
 
         History authority is the backpointer DAG (built at commit); the
         leader's output_ids carries length only (member rows have no host
         state at all), so advance it by one placeholder.
         """
-        k = group.beam_width
-        device = self.req_to_token_pool.device
         rows = group.all_rows
         if parent_idx is not None:
-            # Rows whose surviving path came from a different beam must copy
-            # that beam's decode-suffix KV; parent == self is a no-op (dropped
-            # by mask). Final steps skip this: their KV is never read again.
-            moved = parent_idx != torch.arange(k, device=device)
-            reparent_kv(
+            # Share-on-fork: the survivor's history IS its parent's window
+            # (including the token just computed at seq_len-1), so remap the
+            # mapping instead of copying KV. Slots nobody inherits are staged
+            # for the deferred half -- reclaiming them needs a data-dependent
+            # set difference, which must not sit on the launch path.
+            # Final steps skip this: their KV is never read again.
+            old_map, new_map = remap_kv_mapping(
                 self.req_to_token_pool.req_to_token,
-                self._kv_data_buffers(),
-                dst_rows=rows[moved],
-                src_rows=rows[parent_idx[moved]],
+                rows=rows,
+                parent_idx=parent_idx,
                 prefix_len=group.prompt_len,
                 # All rows are synchronized; the leader's committed length
                 # covers the KV computed through this step.
                 seq_len=group.leader.kv_committed_len,
             )
+            group.pending_orphans.append((tick, old_map, new_map))
             group.leader.output_ids.append(0)  # length placeholder
         self._stash_next_tokens(rows, next_tokens)
+
+    def _reclaim_orphans(
+        self, group: BeamGroup, up_to_tick: Optional[int] = None
+    ) -> None:
+        """Deferred half: return the slots no surviving row references. Runs
+        where the tick's copy_done sync already happened, so the unique/isin
+        set difference costs no extra stall on the launch path."""
+        if not group.pending_orphans:
+            return
+        if up_to_tick is None:
+            staged, group.pending_orphans = group.pending_orphans, []
+        else:
+            staged = [e for e in group.pending_orphans if e[0] <= up_to_tick]
+            group.pending_orphans = [
+                e for e in group.pending_orphans if e[0] > up_to_tick
+            ]
+        if not staged:
+            return
+        # free() only stages into the allocator's release buffer; the enclosing
+        # group is what merges it back into available. The decode result path
+        # already opens one, but the prefill path (first reclaim under overlap)
+        # does not -- own the pairing here so the slots are always reusable
+        # before the next admission decision.
+        # Plain free(), never a nested free_group: free_group_begin wipes the
+        # pending list and free_group_end does not clear it, so an inner
+        # begin/end pair inside the decode path's group double-frees.
+        allocator = self.token_to_kv_pool_allocator
+        for _tick, old_map, new_map in staged:
+            orphans = collect_orphan_slots(old_map, new_map)
+            if orphans.numel():
+                group.slots_freed += orphans.numel()
+                allocator.free(orphans)
 
     # ==================== group finish ====================
 
@@ -504,6 +545,9 @@ class BeamCoordinator:
             self._retire_group(group)
 
     def _free_member_rows(self, group: BeamGroup) -> None:
+        # Staged orphans are unreachable from every row, so the group-wide
+        # dedup free below would miss them.
+        self._reclaim_orphans(group)
         free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def _retire_group(self, group: BeamGroup) -> None:
