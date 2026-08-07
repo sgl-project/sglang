@@ -149,7 +149,7 @@ def center_crop_glm_image_output(
     target_height: int | None,
 ) -> torch.Tensor:
     """Center-crop decoded GLM-Image pixels back to the requested canvas."""
-    if target_width is None or target_height is None:
+    if None in (target_width, target_height):
         return frames
 
     decoded_height, decoded_width = frames.shape[-2:]
