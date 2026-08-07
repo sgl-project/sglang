@@ -1,12 +1,23 @@
+"""DCP cuda-graph metadata for the trtllm_mla backend family.
+
+The rank-local KV-length and page-table plumbing is kernel-agnostic and lives on
+:class:`TRTLLMMLABackend`, so the same expectations are asserted for the base
+backend and for both subclasses that inherit it.
+"""
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention import tokenspeed_mla_backend as backend_module
+from sglang.srt.layers.attention import trtllm_mla_backend as backend_module
+from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
-from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLADecodeMetadata
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLABackend,
+    TRTLLMMLADecodeMetadata,
+)
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -19,8 +30,8 @@ DCP_SIZE = 4
 DCP_RANK = 2
 
 
-def _make_backend(bs: int):
-    backend = object.__new__(TokenspeedMLABackend)
+def _make_backend(backend_cls, bs: int):
+    backend = object.__new__(backend_cls)
     backend.num_draft_tokens = NUM_DRAFT_TOKENS
     metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.full((bs, 4), -1, dtype=torch.int32, device="cuda"),
@@ -47,10 +58,12 @@ def _apply(backend, *, bs: int, seq_lens: torch.Tensor, forward_mode):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "DCP metadata buffers live on CUDA")
-class TestTokenspeedMLADCPMetadata(CustomTestCase):
+class _DCPMetadataTests:
+    backend_cls = None
+
     def test_target_verify_splits_global_and_local_lengths(self):
         bs = 3
-        backend, metadata = _make_backend(bs)
+        backend, metadata = _make_backend(self.backend_cls, bs)
         prefix_lens = torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
 
         fill = _apply(
@@ -71,7 +84,7 @@ class TestTokenspeedMLADCPMetadata(CustomTestCase):
 
     def test_decode_does_not_add_draft_tokens(self):
         bs = 3
-        backend, _ = _make_backend(bs)
+        backend, metadata = _make_backend(self.backend_cls, bs)
         seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
 
         fill = _apply(
@@ -81,6 +94,22 @@ class TestTokenspeedMLADCPMetadata(CustomTestCase):
         expected_local = get_dcp_lens(seq_lens, DCP_SIZE, DCP_RANK).to(torch.int32)
         fill.assert_called_once()
         torch.testing.assert_close(fill.call_args.args[2], expected_local)
+        # Plain decode keeps both views in the capture-stable buffers so
+        # forward_decode reads them instead of recomputing per MLA layer.
+        torch.testing.assert_close(metadata.global_seq_lens_k, seq_lens)
+        torch.testing.assert_close(metadata.seq_lens_k, expected_local)
+
+
+class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
+    backend_cls = TRTLLMMLABackend
+
+
+class TestTokenspeedMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
+    backend_cls = TokenspeedMLABackend
+
+
+class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
+    backend_cls = CuteDslMLABackend
 
 
 if __name__ == "__main__":
