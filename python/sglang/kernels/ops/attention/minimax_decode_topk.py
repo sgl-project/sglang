@@ -82,8 +82,7 @@ def minimax_decode_topk(
 def minimax_decode_topk_page_table(
     score: torch.Tensor,  # [num_kv_heads, batch, max_seqblock] fp32
     seq_lens: torch.Tensor,  # [batch] int32/int64
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len] int32
-    slot_ids: torch.Tensor,  # [batch] int64 (req_pool_indices)
+    source_page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     block_size: int,
     topk: int,
     page_size: int,
@@ -105,13 +104,15 @@ def minimax_decode_topk_page_table(
     assert score.is_cuda and score.dtype == torch.float32 and score.dim() == 3
     num_heads, batch, max_seqblock = score.shape
     assert block_size % page_size == 0
-    assert req_to_token.dtype == torch.int32 and slot_ids.dtype == torch.int64
+    assert source_page_table.dtype == torch.int32
+    assert source_page_table.dim() == 2
+    assert source_page_table.shape[0] == batch
     if not score.is_contiguous():
         score = score.contiguous()
     if not seq_lens.is_contiguous():
         seq_lens = seq_lens.contiguous()
-    if not slot_ids.is_contiguous():
-        slot_ids = slot_ids.contiguous()
+    if not source_page_table.is_contiguous():
+        source_page_table = source_page_table.contiguous()
 
     max_sparse_pages = topk * (block_size // page_size)
     page_table = torch.empty(
@@ -125,8 +126,7 @@ def minimax_decode_topk_page_table(
     module.minimax_decode_topk_page_table(
         score,
         seq_lens,
-        req_to_token,
-        slot_ids,
+        source_page_table,
         page_table,
         real_seq_lens,
         int(block_size),

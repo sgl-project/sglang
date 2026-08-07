@@ -12,6 +12,7 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+from ..page_table import load_token_slots
 
 
 @triton.heuristics(
@@ -39,14 +40,12 @@ def _gqa_share_sparse_decode_kernel(
     sink_ptr,  # Sink: qh x d
     k_cache_ptr,  # K paged: max_slots x kh x d
     v_cache_ptr,  # V paged: max_slots x kh x d
-    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    page_table_ptr,  # batch-local physical page ids
     idx_ptr,  # topk index: qh x b x topk
     o_ptr,  # O partial: c x b x qh x d
     lse_ptr,  # lse partial: c x b x qh
     seq_lens,
-    slot_ids,
     # shape
-    max_slots,
     batch_size,
     gqa_group_size,
     head_dim,
@@ -69,7 +68,7 @@ def _gqa_share_sparse_decode_kernel(
     stride_v_s,
     stride_v_h,
     stride_v_d,
-    stride_r2t_b,
+    stride_pt_b,
     stride_ti_h,
     stride_ti_b,
     stride_ti_t,
@@ -89,6 +88,7 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -105,9 +105,6 @@ def _gqa_share_sparse_decode_kernel(
     chunk_end_topk_compiletime = chunk_start_topk + chunk_size_topk
     # get q k start and len after rmpad
     seq_len = tl.minimum(tl.load(seq_lens + pid_b), max_kv_len)
-    sid = (
-        tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
-    ) % max_slots  # to avoid bugs when slot_ids is negative
     # get real topk
     off_t = tl.arange(0, BLOCK_SIZE_T)
     idx_base = idx_ptr + pid_kh * stride_ti_h + pid_b * stride_ti_b
@@ -165,15 +162,17 @@ def _gqa_share_sparse_decode_kernel(
         # load index
         c = tl.load(cur_idx_ptr).to(tl.int32) * BLOCK_SIZE_N
         cur_idx_ptr = cur_idx_ptr + stride_ti_t
-        # resolve slots for this block via req_to_token
+        # Resolve slots from graph-owned page ids during replay.
         pos = c + off_n
         pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        slots = load_token_slots(
+            page_table_ptr,
+            pid_b,
+            pos,
+            stride_pt_b,
+            pos_mask,
+            PAGE_SIZE,
+        )
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -311,9 +310,8 @@ def flash_decode_with_gqa_share_sparse(
     sink: Optional[torch.Tensor],
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
+    page_table: torch.Tensor,  # [batch_size, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch_size, ]
-    slot_ids: torch.Tensor,  # [batch_size, ]
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
@@ -321,6 +319,7 @@ def flash_decode_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
@@ -328,14 +327,14 @@ def flash_decode_with_gqa_share_sparse(
     v_scale = unit_scale(v_scale)
     # shape
     batch_size, num_q_heads, head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
-    assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
+    _, num_kv_heads, _ = k_cache.shape
+    assert page_table.dtype == torch.int32 and page_table.dim() == 2
+    assert page_table.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     assert topk_idx.shape[0] == num_kv_heads
     assert (
         triton.next_power_of_2(block_size) == block_size
     ), f"block_size must be a power of 2, but got {block_size}"
-    # assert slot_ids.max() < max_slots, f"get slot_ids {slot_ids}, but kv_cache shape is {kv_cache.shape}"
-    max_kv_len = req_to_token.shape[1]
+    max_kv_len = page_table.shape[1] * page_size
     # gqa
     assert num_q_heads % num_kv_heads == 0
     gqa_group_size = num_q_heads // num_kv_heads
@@ -380,13 +379,11 @@ def flash_decode_with_gqa_share_sparse(
         sink,
         k_cache,
         v_cache,
-        req_to_token,
+        page_table,
         topk_idx,
         o_partial,
         lse_partial,
         seq_lens,
-        slot_ids,
-        max_slots,
         batch_size,
         gqa_group_size,
         head_dim,
@@ -406,7 +403,7 @@ def flash_decode_with_gqa_share_sparse(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
-        req_to_token.stride(0),
+        page_table.stride(0),
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
@@ -420,6 +417,7 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        PAGE_SIZE=page_size,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)

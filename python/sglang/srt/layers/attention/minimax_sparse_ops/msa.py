@@ -84,38 +84,19 @@ def msa_available() -> bool:
         return False
 
 
-def _build_page_table(
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len], physical slot per logical pos
-    slot_ids: torch.Tensor,  # [batch]
+def _pack_page_table(
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] total K length (prefix + chunk)
     page_size: int,
 ) -> torch.Tensor:
-    """Flattened physical page ids per request (MSA `kv_indices`).
-
-    sglang's paged allocator stores page_size contiguous physical slots per page, so the
-    physical page of logical position p is ``req_to_token[req, p] // page_size`` and is the
-    same for every p within a page. We read one slot per logical page to recover the table.
-
-    Vectorized (no per-request Python loop): pages are packed contiguously by request in the
-    same order MSA's planner expects (``kv_page_indptr = cumsum(ceil(seq_lens/page_size))``).
-    ``searchsorted`` maps each packed page slot back to its request; one ``.item()`` recovers
-    the total page count (this runs eagerly, outside CUDA-graph capture).
-    """
-    P = page_size
-    n_pages = (seq_lens.to(torch.int64) + (P - 1)) // P  # [batch]
-    offsets = (
-        torch.cumsum(n_pages, 0) - n_pages
-    )  # [batch] exclusive page offset per request
+    """Pack the batch-local physical page table into MSA ``kv_indices``."""
+    n_pages = (seq_lens.to(torch.int64) + page_size - 1) // page_size
+    offsets = torch.cumsum(n_pages, 0) - n_pages
     total = int(n_pages.sum().item())
-    idx = torch.arange(
-        total, device=req_to_token.device
-    )  # packed page slot -> (req, page)
-    req = torch.searchsorted(
-        offsets + n_pages, idx, right=True
-    )  # request id per packed slot
-    logical_first = (idx - offsets[req]) * P  # first logical position of that page
-    rows = slot_ids[req].to(torch.int64)
-    return (req_to_token[rows, logical_first] // P).to(torch.int32)
+    idx = torch.arange(total, device=page_table.device)
+    req = torch.searchsorted(offsets + n_pages, idx, right=True)
+    logical_page = idx - offsets[req]
+    return page_table[req, logical_page].to(torch.int32)
 
 
 def msa_sparse_prefill_main(
@@ -123,8 +104,7 @@ def msa_sparse_prefill_main(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (slot-major NHD)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim]
     topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk] (0-based, -1 pad) -- step1/2 output
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     cu_seqlens: torch.Tensor,  # [batch+1] cumulative Q lengths
     seq_lens: torch.Tensor,  # [batch] total K length (prefix + chunk)
     prefix_lens: torch.Tensor,  # [batch]
@@ -165,7 +145,7 @@ def msa_sparse_prefill_main(
 
     # Per-request Q lengths (extend) and physical page table.
     qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-    kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, P)
+    kv_indices = _pack_page_table(page_table, seq_lens, P)
 
     # topk_idx [Hkv, total_q, topk] -> kv_block_indexes [total_q, Hkv, topk].
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)
@@ -199,8 +179,7 @@ def msa_sparse_prefill_main(
 
 def build_msa_decode_meta(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim]
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     num_q_heads: int,
     block_size_k: int,
@@ -222,8 +201,8 @@ def build_msa_decode_meta(
     P = block_size_k
     if max_slots % P != 0:
         raise ValueError(f"max_slots={max_slots} not divisible by page_size={P}")
-    B = slot_ids.shape[0]
-    kv_indices = _build_page_table(req_to_token, slot_ids, seq_lens, P)
+    B = page_table.shape[0]
+    kv_indices = _pack_page_table(page_table, seq_lens, P)
     seq_lens_i32 = seq_lens.to(torch.int32)
     plan = _run_fmha_sm100_plan(
         torch.ones(B, dtype=torch.int32),
@@ -324,8 +303,7 @@ def build_msa_decode_cg_plan(
 def update_msa_decode_cg_meta(
     plan,
     kv_indices_buf: torch.Tensor,  # persistent page-table buffer [batch * max_pages]
-    req_to_token: torch.Tensor,
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     block_size_k: int,
     topk: int,
@@ -376,9 +354,8 @@ def update_msa_decode_cg_meta(
     ends = torch.cumsum(n_pages.to(torch.int64), 0)
     req = torch.searchsorted(ends, idx, right=True).clamp_max_(B - 1)
     starts = ends - n_pages
-    logical_first = ((idx - starts[req]) * P).clamp_(0, req_to_token.shape[1] - 1)
-    rows = slot_ids[req].to(torch.int64)
-    kv_indices_buf.copy_((req_to_token[rows, logical_first] // P).to(torch.int32))
+    logical_page = (idx - starts[req]).clamp_(0, page_table.shape[1] - 1)
+    kv_indices_buf.copy_(page_table[req, logical_page].to(torch.int32))
 
 
 def msa_sparse_decode_main(
@@ -386,8 +363,7 @@ def msa_sparse_decode_main(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (slot-major NHD)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim]
     topk_idx: torch.Tensor,  # [num_kv_heads, batch, topk] (0-based, -1 pad)
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
-    slot_ids: torch.Tensor,  # [batch]
+    page_table: torch.Tensor,  # [batch, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     block_size_k: int,  # == page_size == 128
     sm_scale: Optional[float] = None,
@@ -433,8 +409,7 @@ def msa_sparse_decode_main(
     if kv_indices is None or plan is None:
         kv_indices, plan = build_msa_decode_meta(
             k_cache,
-            req_to_token,
-            slot_ids,
+            page_table,
             seq_lens,
             H,
             P,

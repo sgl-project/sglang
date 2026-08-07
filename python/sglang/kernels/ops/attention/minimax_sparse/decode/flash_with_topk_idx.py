@@ -16,6 +16,7 @@ from ..common.utils import (
     sparse_out_dtype,
     unit_scale,
 )
+from ..page_table import load_token_slots
 
 
 @triton.heuristics(
@@ -46,12 +47,10 @@ from ..common.utils import (
 def _decode_score_kernel(
     q_ptr,  # Q: b x qh x d
     k_cache_ptr,  # K paged: max_slots x kh x d
-    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    page_table_ptr,  # batch-local physical page ids
     score_ptr,  # Score: qh x b x max_seqblock
     seq_lens,
-    slot_ids,
     # shape
-    max_slots,
     batch_size,
     gqa_group_size,
     head_dim,
@@ -72,7 +71,7 @@ def _decode_score_kernel(
     stride_k_s,
     stride_k_h,
     stride_k_d,
-    stride_r2t_b,
+    stride_pt_b,
     stride_s_h,
     stride_s_b,
     stride_s_n,
@@ -85,6 +84,7 @@ def _decode_score_kernel(
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -108,7 +108,6 @@ def _decode_score_kernel(
     chunk_end = tl.minimum(chunk_end_block * block_size, seq_len)
     if chunk_start_block >= chunk_end_block:
         return
-    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
     # init qkv pointer
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
@@ -136,14 +135,16 @@ def _decode_score_kernel(
     # pre-compute local_start outside the loop (constant for entire batch)
     local_start = tl.maximum(0, num_blocks - local_blocks)
     # prefetch first iteration's slots
-    r2t_base = req_to_token_ptr + sid * stride_r2t_b
     prefetch_pos = chunk_start + off_n
     prefetch_mask = prefetch_pos < seq_len
-    prefetched_slots = tl.load(
-        r2t_base + prefetch_pos,
-        mask=prefetch_mask,
-        other=0,
-    ).to(tl.int64)
+    prefetched_slots = load_token_slots(
+        page_table_ptr,
+        pid_b,
+        prefetch_pos,
+        stride_pt_b,
+        prefetch_mask,
+        PAGE_SIZE,
+    )
     # score-only: compute block scores without loading V
     for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
         pos_mask = prefetch_mask
@@ -153,12 +154,14 @@ def _decode_score_kernel(
         if next_i < chunk_end:
             next_pos = next_i + off_n
             prefetch_mask = next_pos < seq_len
-            prefetched_slots = tl.load(
-                r2t_base + next_pos,
-                mask=prefetch_mask,
-                other=0,
-            ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots
+            prefetched_slots = load_token_slots(
+                page_table_ptr,
+                pid_b,
+                next_pos,
+                stride_pt_b,
+                prefetch_mask,
+                PAGE_SIZE,
+            )
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -235,14 +238,12 @@ def _decode_score_attn_kernel(
     sink_ptr,  # Sink: qh x d
     k_cache_ptr,  # K paged: max_slots x kh x d
     v_cache_ptr,  # V paged: max_slots x kh x d
-    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    page_table_ptr,  # batch-local physical page ids
     o_ptr,  # O: c x b x qh x d
     lse_ptr,  # lse: c x b x qh
     score_ptr,  # Score: qh x b x max_seqblock
     seq_lens,
-    slot_ids,
     # shape
-    max_slots,
     batch_size,
     gqa_group_size,
     head_dim,
@@ -269,7 +270,7 @@ def _decode_score_attn_kernel(
     stride_v_s,
     stride_v_h,
     stride_v_d,
-    stride_r2t_b,
+    stride_pt_b,
     stride_o_c,
     stride_o_b,
     stride_o_h,
@@ -289,6 +290,7 @@ def _decode_score_attn_kernel(
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -309,9 +311,6 @@ def _decode_score_attn_kernel(
     chunk_end = tl.minimum(chunk_end_block * block_size, seq_len)
     if chunk_start_block >= chunk_end_block:
         return
-    sid = (
-        tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
-    ) % max_slots  # to avoid bugs when slot_ids is negative
     # init qkv pointer
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
@@ -367,13 +366,14 @@ def _decode_score_attn_kernel(
     for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
         pos = i + off_n
         pos_mask = pos < seq_len
-        # resolve slot per position via req_to_token
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
+        slots = load_token_slots(
+            page_table_ptr,
+            pid_b,
+            pos,
+            stride_pt_b,
+            pos_mask,
+            PAGE_SIZE,
+        )
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -786,10 +786,9 @@ def flash_decode_with_topk_idx(
     sink: Optional[torch.Tensor],
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
     v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
-    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
+    page_table: torch.Tensor,  # [batch_size, max_pages] physical page ids
     seq_lens: torch.Tensor,  # [batch_size, ]
     max_seqlen: int,
-    slot_ids: torch.Tensor,  # [batch_size, ]
     block_size: int,
     topk: int,
     init_blocks: int,
@@ -819,9 +818,10 @@ def flash_decode_with_topk_idx(
         assert v_cache is not None
     # shape
     batch_size, num_q_heads, head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
-    max_kv_len = req_to_token.shape[1]
-    assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
+    _, num_kv_heads, _ = k_cache.shape
+    assert page_table.dtype == torch.int32 and page_table.dim() == 2
+    max_kv_len = page_table.shape[1] * page_size
+    assert page_table.shape[0] == batch_size and seq_lens.shape[0] == batch_size
     # gqa
     assert num_q_heads % num_kv_heads == 0
     gqa_group_size = num_q_heads // num_kv_heads
@@ -876,11 +876,9 @@ def flash_decode_with_topk_idx(
         _decode_score_kernel[grid](
             q,
             k_cache,
-            req_to_token,
+            page_table,
             score,
             seq_lens,
-            slot_ids,
-            max_slots,
             batch_size,
             gqa_group_size,
             head_dim,
@@ -896,7 +894,7 @@ def flash_decode_with_topk_idx(
             k_cache.stride(0),
             k_cache.stride(1),
             k_cache.stride(2),
-            req_to_token.stride(0),
+            page_table.stride(0),
             score.stride(0),
             score.stride(1),
             score.stride(2),
@@ -904,6 +902,7 @@ def flash_decode_with_topk_idx(
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
             IS_FP8=is_fp8,
+            PAGE_SIZE=page_size,
         )
     else:
         assert v_cache is not None
@@ -923,13 +922,11 @@ def flash_decode_with_topk_idx(
             sink,
             k_cache,
             v_cache,
-            req_to_token,
+            page_table,
             o,
             lse,
             score,
             seq_lens,
-            slot_ids,
-            max_slots,
             batch_size,
             gqa_group_size,
             head_dim,
@@ -951,7 +948,7 @@ def flash_decode_with_topk_idx(
             v_cache.stride(0),
             v_cache.stride(1),
             v_cache.stride(2),
-            req_to_token.stride(0),
+            page_table.stride(0),
             o.stride(0),
             o.stride(1),
             o.stride(2),
@@ -966,6 +963,7 @@ def flash_decode_with_topk_idx(
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
             IS_FP8=is_fp8,
+            PAGE_SIZE=page_size,
         )
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
@@ -980,7 +978,7 @@ def flash_decode_with_topk_idx(
         # kernel emits a flattened [batch*num_q_heads] page table + seq_lens with
         # the kv head head-encoded (head-minor) into the page index.
         topk_idx, real_seq_lens = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
+            score, seq_lens, page_table, block_size, topk, page_size
         )
         if disable_index_value:
             return None, topk_idx, real_seq_lens
