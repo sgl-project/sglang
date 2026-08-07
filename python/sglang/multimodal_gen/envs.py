@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    # OmniDreams: path to W8A8 FP8 text encoder (compressed-tensors format).
+    SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH: str | None = None
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
@@ -220,6 +222,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # OmniDreams: W8A8 FP8 text encoder (compressed-tensors format) path.
+    "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH": _lazy_str(
+        "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH"
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
