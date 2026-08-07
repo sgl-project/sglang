@@ -182,10 +182,6 @@ class TestSWAFreeSegment(unittest.TestCase):
             alloc.free_swa_segment(row, start_pos=0)
 
     def test_inside_a_free_group_matches_free_swa(self):
-        # Guards the decision that the fast path stays out of the free group:
-        # deferring would mean reading the caller's req_to_token view after the
-        # call returns. Not swept across the other dimensions -- neither path
-        # reads is_not_in_free_group, so the dimension gates nothing.
         for page_size in (1, 4):
             legacy, fast = _make_allocator(page_size), _make_allocator(page_size)
             legacy_row = _alloc_row(legacy, 2 * page_size)
@@ -207,6 +203,46 @@ class TestSWAFreeSegment(unittest.TestCase):
                     legacy.full_to_swa_index_mapping, fast.full_to_swa_index_mapping
                 ),
                 f"{page_size=}",
+            )
+
+    def test_group_defers_the_page_release(self):
+        for page_size in (1, 4):
+            alloc = _make_allocator(page_size)
+            row = _alloc_row(alloc, 2 * page_size)
+            before = _swa_free_pages(alloc)
+
+            alloc.free_group_begin()
+            alloc.free_swa_segment(row, start_pos=0)
+            self.assertTrue(
+                torch.equal(_swa_free_pages(alloc), before), f"{page_size=}"
+            )
+            alloc.free_group_end()
+            self.assertEqual(
+                len(_swa_free_pages(alloc)), len(before) + 2, f"{page_size=}"
+            )
+
+    def test_group_queues_owned_values_not_the_callers_buffer(self):
+        # The regression: queueing the caller's req_to_token view makes the flush
+        # read whatever got written into that row in between -- which is exactly
+        # what a remap does right after freeing.
+        for page_size in (1, 4):
+            alloc = _make_allocator(page_size)
+            row = _alloc_row(alloc, 2 * page_size)
+            expected_swa_pages, expected_cleared = _oracle(
+                row, 0, row.numel(), page_size, alloc.full_to_swa_index_mapping.clone()
+            )
+            before = set(_swa_free_pages(alloc).tolist())
+
+            alloc.free_group_begin()
+            alloc.free_swa_segment(row, start_pos=0)
+            row.fill_(1)  # stand in for the row being remapped mid-group
+            alloc.free_group_end()
+
+            released = sorted(set(_swa_free_pages(alloc).tolist()) - before)
+            self.assertEqual(released, expected_swa_pages, f"{page_size=}")
+            cleared = alloc.full_to_swa_index_mapping[expected_cleared]
+            self.assertTrue(
+                torch.equal(cleared, torch.zeros_like(cleared)), f"{page_size=}"
             )
 
 
