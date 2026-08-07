@@ -33,6 +33,12 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
+from sglang.kernels.ops.diffusion.fused_ln_modulate import (
+    can_fuse_ln_modulate,
+    fused_ln_modulate,
+    fused_ln_modulate_active,
+    mark_fused_ln_modulate_site,
+)
 from sglang.kernels.ops.diffusion.modulate_scale_shift import (
     can_use_modulate_scale_shift_cuda,
     modulate_scale_shift_cuda,
@@ -153,9 +159,31 @@ def _flux_modulate(
     return x * (1 + scale[:, None]) + shift[:, None]
 
 
+def _flux_norm_modulate(
+    site: nn.Module,
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
+
+    Default: affine-free LayerNorm + the bit-exact fused modulate.  When the
+    site is mounted (``quality="high"``) and the per-call guard passes, the
+    modulate is folded into the LN affine instead (one kernel; not bit-exact).
+    """
+    if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
+        return fused_ln_modulate(x, scale, shift, norm.eps)
+    return _flux_modulate(norm(x), scale, shift)
+
+
 class FluxAdaLayerNormZero(AdaLayerNormZero):
     """diffusers ``AdaLayerNormZero`` with the modulate routed through
-    :func:`_flux_modulate`; parameters match the parent."""
+    :func:`_flux_norm_modulate`; parameters match the parent."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        mark_fused_ln_modulate_site(self)
 
     def forward(
         self,
@@ -171,13 +199,17 @@ class FluxAdaLayerNormZero(AdaLayerNormZero):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
             6, dim=1
         )
-        x = _flux_modulate(self.norm(x), scale_msa, shift_msa)
+        x = _flux_norm_modulate(self, self.norm, x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
 class FluxAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
     """diffusers ``AdaLayerNormZeroSingle`` with the modulate routed through
-    :func:`_flux_modulate`; parameters match the parent."""
+    :func:`_flux_norm_modulate`; parameters match the parent."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        mark_fused_ln_modulate_site(self)
 
     def forward(
         self,
@@ -186,7 +218,7 @@ class FluxAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
-        x = _flux_modulate(self.norm(x), scale_msa, shift_msa)
+        x = _flux_norm_modulate(self, self.norm, x, scale_msa, shift_msa)
         return x, gate_msa
 
 
@@ -946,6 +978,9 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        # quality="high" site: the norm2/norm2_context modulate folds into the
+        # LN affine when mounted.
+        mark_fused_ln_modulate_site(self)
 
         nunchaku_enabled = (
             quant_config is not None
@@ -1042,14 +1077,14 @@ class FluxTransformerBlock(nn.Module):
         hidden_states = _flux_residual_gate_add(
             hidden_states, attn_output, gate_msa.unsqueeze(1)
         )
-        norm_hidden_states = self.norm2(hidden_states)
         if self.use_nunchaku_structure:
+            norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = (
                 norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
             )
         else:
-            norm_hidden_states = _flux_modulate(
-                norm_hidden_states, scale_mlp, shift_mlp
+            norm_hidden_states = _flux_norm_modulate(
+                self, self.norm2, hidden_states, scale_mlp, shift_mlp
             )
 
         ff_output = self.ff(norm_hidden_states)
@@ -1064,14 +1099,18 @@ class FluxTransformerBlock(nn.Module):
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
         )
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         if self.use_nunchaku_structure:
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
             norm_encoder_hidden_states = (
                 norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
             )
         else:
-            norm_encoder_hidden_states = _flux_modulate(
-                norm_encoder_hidden_states, c_scale_mlp, c_shift_mlp
+            norm_encoder_hidden_states = _flux_norm_modulate(
+                self,
+                self.norm2_context,
+                encoder_hidden_states,
+                c_scale_mlp,
+                c_shift_mlp,
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
