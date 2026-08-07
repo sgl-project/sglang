@@ -14,9 +14,6 @@
 
 use crate::error::Error;
 
-// `Failed(Error)` carries the cause for observability even where it isn't read
-// back yet; `EncodeDone` belongs to the deferred Encoder edge.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RequestState {
     Received,
@@ -42,8 +39,8 @@ pub enum RequestState {
 /// Outcome of validation, selecting the ingress branch.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding. Deferred: no encoder yet.
-    #[allow(dead_code)]
+    /// Has multimodal inputs → Encoding, where an MM worker runs the native
+    /// pipeline and returns the final expanded `input_ids`.
     HasMultimodal,
     /// Plain text → Tokenizing.
     NeedsTokenize,
@@ -53,7 +50,6 @@ pub enum ValidationOutcome {
 
 /// Events that drive transitions. Each variant maps 1:1 to an edge in the
 /// design's transition table.
-#[allow(dead_code)] // EncodeDone is the deferred Encoder edge.
 #[derive(Debug)]
 pub enum Event {
     // --- ingress ---
@@ -126,7 +122,11 @@ impl RequestState {
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
             (Normalizing, Validated(AlreadyTokenized)) => PreSendValidating,
-            (Encoding, EncodeDone) => Tokenizing,
+            // The MM worker returns the *final* placeholder-expanded input_ids,
+            // so an encoded request skips the tokenizer pool — but not the
+            // pre-send checks: expanded image tokens count against the same
+            // input + max_new_tokens ceiling as tokenized text.
+            (Encoding, EncodeDone) => PreSendValidating,
             // Every ingress branch funnels through the pre-send checks, so they
             // run exactly once per request no matter how it got its ids.
             (Tokenizing, TokenizeDone) => PreSendValidating,
