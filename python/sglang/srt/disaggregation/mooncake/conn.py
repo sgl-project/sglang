@@ -1947,13 +1947,6 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_aux_ptrs,
                                 )
                             else:
-                                logger.debug(
-                                    "Skipping replicated AUX write for room=%s on "
-                                    "attn_tp_rank=%s attn_cp_rank=%s",
-                                    req.room,
-                                    self.attn_tp_rank,
-                                    self.attn_cp_rank,
-                                )
                                 ret = 0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
