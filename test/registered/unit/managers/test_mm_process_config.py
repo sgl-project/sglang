@@ -174,6 +174,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             mm_io_worker_num=0,
             tokenizer_worker_num=1,
             base_gpu_id=2,
+            tp_size=8,
         )
 
     @staticmethod
@@ -236,6 +237,105 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         self.assertFalse(processor.use_cuda_ipc)
         self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
+
+    def test_fabric_pool_uses_same_bounded_budget(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "FabricMmFeatureMemoryPool") as fabric_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("fabric"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "fabric")
+        self.assertTrue(processor.use_fabric_transport)
+        self.assertTrue(processor.use_gpu_feature_transport)
+        fabric_pool.assert_called_once()
+        self.assertEqual(fabric_pool.call_args.args[3], 8)
+
+    def test_fabric_pool_init_failure_falls_back_to_cpu(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(
+            base_processor,
+            "FabricMmFeatureMemoryPool",
+            side_effect=RuntimeError("IMEX unavailable"),
+        ):
+            with self.assertLogs(base_processor.logger, level="WARNING") as logs:
+                processor = base_processor.BaseMultimodalProcessor(
+                    hf_config=MagicMock(),
+                    server_args=self._server_args("fabric"),
+                    _processor=self._processor(),
+                    transport_mode=None,
+                )
+
+        self.assertEqual(processor.mm_feature_transport, "cpu")
+        self.assertFalse(processor.use_fabric_transport)
+        self.assertFalse(processor.use_gpu_feature_transport)
+        self.assertIn("falling back to CPU", "\n".join(logs.output))
+
+
+class TestFabricTransportMetadata(CustomTestCase):
+    def test_consumer_slot_uses_global_tp_rank(self):
+        from sglang.srt.utils.fabric_mm_transport import _resolve_consumer_rank
+
+        parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
+        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+            self.assertEqual(_resolve_consumer_rank(8), 6)
+
+    def test_complete_group_acknowledges_each_consumer_slot(self):
+        from sglang.srt.utils import fabric_mm_transport
+
+        proxy = fabric_mm_transport.FabricTensorTransportProxy(
+            fabric_handle=b"h" * 64,
+            allocation_size=1 << 20,
+            data_byte_offset=4096,
+            nbytes=128,
+            shape=torch.Size([32]),
+            dtype=torch.float32,
+            ready_byte_offset=64,
+            ack_byte_offset=68,
+            generation=3,
+            total_consumer_count=4,
+        )
+        mapping = SimpleNamespace(va=1000)
+        with patch.object(fabric_mm_transport, "_stream_write_value32") as write:
+            proxy._acknowledge_on_stream(mapping, 0, consumer_count=4)
+
+        self.assertEqual(
+            [call.args[1] for call in write.call_args_list],
+            [1068, 1072, 1076, 1080],
+        )
+        self.assertEqual([call.args[2] for call in write.call_args_list], [3] * 4)
+
+    def test_consumer_rank_must_fit_pool_ack_slots(self):
+        from sglang.srt.utils.fabric_mm_transport import _resolve_consumer_rank
+
+        with self.assertRaisesRegex(RuntimeError, "outside"):
+            _resolve_consumer_rank(4, consumer_rank=4)
+
+    def test_reused_pool_slot_gets_new_generation(self):
+        from sglang.srt.utils.fabric_mm_transport import FabricMmFeatureMemoryPool
+
+        pool = object.__new__(FabricMmFeatureMemoryPool)
+        pool._available_ranges = [(256, 4096)]
+        pool._available_slots = [0]
+        pool._slot_generations = [0]
+        pool._occupied = {}
+
+        first = pool._allocate_locked(512)
+        pool._release_chunk_locked(first)
+        pool._merge_ranges_locked()
+        second = pool._allocate_locked(512)
+
+        self.assertEqual(first.generation, 1)
+        self.assertEqual(second.generation, 2)
 
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):

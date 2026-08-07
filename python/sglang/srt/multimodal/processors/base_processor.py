@@ -37,6 +37,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.utils.fabric_mm_transport import FabricMmFeatureMemoryPool
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -199,10 +200,11 @@ class BaseMultimodalProcessor(ABC):
         )
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc")
+            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "fabric")
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_fabric_transport = self.mm_feature_transport == "fabric"
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
@@ -337,7 +339,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if self.use_cuda_ipc and not skip_mm_pool:
+        if self.use_gpu_feature_transport and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
@@ -347,21 +349,53 @@ class BaseMultimodalProcessor(ABC):
             )
             total_pool_size = per_worker_pool_size * worker_num
             logger.info(
-                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
+                "%s multimodal feature pools reserve %.0f MiB total on "
                 "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
                 "budget %.0f MiB).",
+                "CUDA IPC" if self.use_cuda_ipc else "MNNVL FABRIC",
                 total_pool_size / (1024 * 1024),
                 self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                per_worker_pool_size,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
-                self.server_args.tp_size,
-            )
+            if self.use_cuda_ipc:
+                self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+                    per_worker_pool_size,
+                    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                    self.server_args.base_gpu_id,
+                    self.server_args.tp_size,
+                )
+            else:
+                try:
+                    self.fabric_mmfeature_pool = FabricMmFeatureMemoryPool(
+                        per_worker_pool_size,
+                        MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                        self.server_args.base_gpu_id,
+                        self.server_args.tp_size,
+                    )
+                except Exception:
+                    logger.warning(
+                        "MNNVL FABRIC multimodal transport initialization failed; "
+                        "falling back to CPU transport. Verify that all nodes share "
+                        "an IMEX compute-domain channel.",
+                        exc_info=True,
+                    )
+                    self.mm_feature_transport = "cpu"
+                    self.use_fabric_transport = False
+
+    @property
+    def use_gpu_feature_transport(self) -> bool:
+        """Whether features use either bounded GPU-resident transport.
+
+        Some processor subclasses and tests construct lightweight instances
+        without calling this base initializer, so derive the compatibility
+        predicate instead of storing another required instance field.
+        """
+        return bool(
+            getattr(self, "use_cuda_ipc", False)
+            or getattr(self, "use_fabric_transport", False)
+        )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -588,7 +622,10 @@ class BaseMultimodalProcessor(ABC):
         )
         # Deferred: the hash is computed on the GPU tensor first, and
         # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if not self.use_cuda_ipc and not self.precompute_hash_before_cpu_transfer:
+        if (
+            not self.use_gpu_feature_transport
+            and not self.precompute_hash_before_cpu_transfer
+        ):
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(
@@ -1364,6 +1401,14 @@ class BaseMultimodalProcessor(ABC):
         )
         return proxy if proxy is not None else tensor.cpu()
 
+    def _wrap_tensor_for_mm_transport(self, tensor: torch.Tensor):
+        if self.use_cuda_ipc:
+            return self._wrap_tensor_for_cuda_ipc(tensor)
+        if self.use_fabric_transport:
+            proxy = self.fabric_mmfeature_pool.wrap_tensor(tensor)
+            return proxy if proxy is not None else tensor.cpu()
+        return tensor.cpu()
+
     @staticmethod
     def _move_feature_to_cpu(value):
         if isinstance(value, torch.Tensor):
@@ -1382,7 +1427,7 @@ class BaseMultimodalProcessor(ABC):
 
         for item in mm_items:
             item.set_pad_value()
-            if not self.use_cuda_ipc:
+            if not self.use_gpu_feature_transport:
                 item.feature = self._move_feature_to_cpu(item.feature)
                 item.precomputed_embeddings = self._move_feature_to_cpu(
                     item.precomputed_embeddings
@@ -1611,13 +1656,13 @@ class BaseMultimodalProcessor(ABC):
 
         # Wrap GPU features in the bounded IPC pool; pool misses fall back to a
         # plain CPU tensor. The scheduler copies out and releases each slice.
-        if self.use_cuda_ipc:
-            # post-process, prepare for cuda-ipc transfer
+        if self.use_gpu_feature_transport:
+            # Post-process GPU features into the bounded device-side transport.
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor):
-                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+                    item.feature = self._wrap_tensor_for_mm_transport(item.feature)
                 if isinstance(item.precomputed_embeddings, torch.Tensor):
-                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                    item.precomputed_embeddings = self._wrap_tensor_for_mm_transport(
                         item.precomputed_embeddings
                     )
 

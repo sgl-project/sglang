@@ -231,6 +231,60 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
 
+    @patch("sglang.srt.server_args.os.path.exists", return_value=True)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_fabric_for_multinode_mnnvl(
+        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "fabric")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("auto-resolved to fabric", output)
+        self.assertIn("MNNVL FABRIC", output)
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=False)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_without_imex_channel(
+        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+
+        self.assertIn("no IMEX channel", "\n".join(logs.output))
+
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_for_multinode_non_mnnvl(
+        self, _mock_is_cuda, _mock_is_mnnvl
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_default_transport_is_cuda_ipc_for_language_only_model(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", language_only=True)
@@ -257,6 +311,45 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_fabric_is_explicit_bounded_and_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="fabric",
+            nnodes=2,
+            tokenizer_worker_num=2,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "fabric")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("MNNVL FABRIC", output)
+        self.assertIn("2 tokenizer worker", output)
+        self.assertIn("falls back to CPU", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_fabric_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="fabric")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_fabric_rejects_pd_disaggregation(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="fabric",
+            disaggregation_mode="prefill",
+        )
+
+        with self.assertRaisesRegex(ValueError, "PD-disaggregated"):
             server_args._handle_multimodal_feature_transport()
 
 
