@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     BaseIndexerMetadata,
     rotate_activation,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -310,8 +311,8 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
-        attn_metadata = getattr(metadata, "attn_metadata", None)
-        plan = getattr(attn_metadata, "kpool_extend_plan", None)
+        attn_metadata = metadata.attn_metadata
+        plan = attn_metadata.kpool_extend_plan
         if plan is not None:
             import os
 
@@ -746,8 +747,8 @@ class IndexerKPool(MultiPlatformOp):
             build_pooled_page_table_64,
         )
 
-        attn_metadata = getattr(metadata, "attn_metadata", None)
-        plan = getattr(attn_metadata, "kpool_write_plan", None)
+        attn_metadata = metadata.attn_metadata
+        plan = attn_metadata.kpool_write_plan
         if plan is not None and plan.pool_seqlens_per_q is not None:
             pool_seqlens = plan.pool_seqlens_per_q[: seqlens_32.shape[0]]
             pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
@@ -766,16 +767,14 @@ class IndexerKPool(MultiPlatformOp):
                 pool_schedule_metadata,
             )
 
-        pool_seqlens = getattr(attn_metadata, "pooled_cache_seqlens_int32", None)
-        pool_block_tables = getattr(attn_metadata, "pooled_real_page_table", None)
-        pool_schedule_metadata = getattr(
-            attn_metadata, "pooled_paged_mqa_schedule_metadata", None
-        )
+        pool_seqlens = attn_metadata.pooled_cache_seqlens_int32
+        pool_block_tables = attn_metadata.pooled_real_page_table
+        pool_schedule_metadata = attn_metadata.pooled_paged_mqa_schedule_metadata
 
         if (
             pool_seqlens is None
             or pool_block_tables is None
-            or getattr(attn_metadata, "pooled_index_kpool", 1) != self.index_kpool
+            or attn_metadata.pooled_index_kpool != self.index_kpool
         ):
             pool_seqlens = torch.div(
                 seqlens_32, self.index_kpool, rounding_mode="floor"
@@ -813,21 +812,21 @@ class IndexerKPool(MultiPlatformOp):
         if not envs.SGLANG_DSA_FUSE_TOPK.get():
             return None, None, None
 
-        topk_method = getattr(metadata, "topk_transform_method", None)
-        attn_metadata = getattr(metadata, "attn_metadata", None)
-        if getattr(topk_method, "name", "") == "PAGED":
+        topk_method = metadata.topk_transform_method
+        attn_metadata = metadata.attn_metadata
+        if topk_method == TopkTransformMethod.PAGED:
             page_table_1 = (
                 paged_page_table
                 if paged_page_table is not None
-                else getattr(attn_metadata, "page_table_1", None)
+                else attn_metadata.page_table_1
             )
             assert page_table_1 is not None
             row_index = (
                 paged_page_table_row_index if paged_page_table is not None else None
             )
             return page_table_1, None, row_index
-        if getattr(topk_method, "name", "") == "RAGGED":
-            return None, getattr(attn_metadata, "topk_indices_offset", None), None
+        if topk_method == TopkTransformMethod.RAGGED:
+            return None, attn_metadata.topk_indices_offset, None
         return None, None, None
 
     @staticmethod
@@ -1016,13 +1015,13 @@ class IndexerKPool(MultiPlatformOp):
         else:
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
-        topk_method = getattr(metadata, "topk_transform_method", None)
-        attn_metadata = getattr(metadata, "attn_metadata", None)
+        topk_method = metadata.topk_transform_method
+        attn_metadata = metadata.attn_metadata
         page_table_all = None
         page_table_row_index_all = None
         topk_offsets_all = None
         if envs.SGLANG_DSA_FUSE_TOPK.get():
-            if getattr(topk_method, "name", "") == "PAGED":
+            if topk_method == TopkTransformMethod.PAGED:
                 page_table_all = plan.ragged_paged_page_table
                 page_table_row_index_all = plan.ragged_paged_page_table_row_index
                 if page_table_row_index_all is not None and row_select is not None:
@@ -1031,8 +1030,8 @@ class IndexerKPool(MultiPlatformOp):
                     )
                 elif page_table_all is not None and row_select is not None:
                     page_table_all = page_table_all.index_select(0, row_select)
-            elif getattr(topk_method, "name", "") == "RAGGED":
-                topk_offsets_all = getattr(attn_metadata, "topk_indices_offset", None)
+            elif topk_method == TopkTransformMethod.RAGGED:
+                topk_offsets_all = attn_metadata.topk_indices_offset
                 if topk_offsets_all is not None and row_select is not None:
                     topk_offsets_all = topk_offsets_all.index_select(0, row_select)
 
@@ -1134,11 +1133,8 @@ class IndexerKPool(MultiPlatformOp):
             ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
 
         page_table_local = None
-        topk_method = getattr(metadata, "topk_transform_method", None)
-        if (
-            envs.SGLANG_DSA_FUSE_TOPK.get()
-            and getattr(topk_method, "name", "") == "PAGED"
-        ):
+        topk_method = metadata.topk_transform_method
+        if envs.SGLANG_DSA_FUSE_TOPK.get() and topk_method == TopkTransformMethod.PAGED:
             req_pool_idx = int(forward_batch.req_pool_indices[0].item())
             page_table_local = (
                 get_req_to_token_pool()
@@ -1190,9 +1186,9 @@ class IndexerKPool(MultiPlatformOp):
         )
         block_tables = metadata.get_page_table_64()
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        topk_method = getattr(metadata, "topk_transform_method", None)
-        attn_metadata = getattr(metadata, "attn_metadata", None)
-        topk_offsets = getattr(attn_metadata, "topk_indices_offset", None)
+        topk_method = metadata.topk_transform_method
+        attn_metadata = metadata.attn_metadata
+        topk_offsets = attn_metadata.topk_indices_offset
         pooled_page_tables = getattr(
             attn_metadata, "kpool_extend_pooled_page_tables", None
         )
@@ -1368,7 +1364,7 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets_local = None
             if (
                 envs.SGLANG_DSA_FUSE_TOPK.get()
-                and getattr(topk_method, "name", "") == "PAGED"
+                and topk_method == TopkTransformMethod.PAGED
             ):
                 page_table_local = (
                     get_req_to_token_pool()
@@ -1378,7 +1374,7 @@ class IndexerKPool(MultiPlatformOp):
                 page_table_local = page_table_local.unsqueeze(0).expand(q_len, -1)
             elif (
                 envs.SGLANG_DSA_FUSE_TOPK.get()
-                and getattr(topk_method, "name", "") == "RAGGED"
+                and topk_method == TopkTransformMethod.RAGGED
                 and topk_offsets is not None
             ):
                 topk_offsets_local = topk_offsets[q_slice]
@@ -1429,7 +1425,7 @@ class IndexerKPool(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        if getattr(metadata.attn_metadata, "kpool_extend_plan", None) is not None:
+        if metadata.attn_metadata.kpool_extend_plan is not None:
             return self._get_topk_ragged_kpool_plan(
                 forward_batch,
                 layer_id,
@@ -1670,9 +1666,7 @@ class IndexerKPool(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
         else:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            has_kpool_extend_plan = (
-                getattr(metadata.attn_metadata, "kpool_extend_plan", None) is not None
-            )
+            has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
             defer_kpool_cache_write = (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and return_indices
