@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Optional
 
@@ -8,6 +8,10 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -61,6 +65,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
     prepare_mamba_track_for_verify,
+    record_stream_each,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -299,10 +304,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        with (
+            (
+                draft_tp_context(get_parallel().attn_tp_group)
+                if self._draft_dp_context_enabled
+                else nullcontext()
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
 
     def alloc_memory_pool(
         self,
@@ -532,8 +545,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
+        fwd_stream = torch.get_device_module(self.device).current_stream()
+        record_stream_each(
+            (batch.seq_lens, batch.req_pool_indices),
+            fwd_stream,
         )
         bs = len(batch.seq_lens)
         device = self.device
@@ -675,6 +690,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        online_c128 = getattr(self.model_runner.attn_backend, "online_c128_mtp", None)
+        if online_c128 is not None and online_c128.enabled():
+            online_c128.commit_pending(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=accept.new_seq_lens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -741,6 +762,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            extra_keep_alive_refs=[target_verify.verify_forward_batch],
         )
 
     def _commit_target_mamba_states_after_verify(

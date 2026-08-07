@@ -37,10 +37,14 @@ def get_compress_state_ring_size(
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
     # Online c128 keeps a single (max, sum, kv) state per index instead of a
     # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # speculative decoding requires an algorithm-specific experimental gate.
     if compress_ratio == 128 and ONLINE_C128:
-        if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            raise AssertionError("online c128 does not support MTP")
+        allow_speculative = (
+            envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+            or envs.SGLANG_EXPERIMENTAL_ONLINE_C128_DSPARK.get()
+        )
+        if is_speculative and not allow_speculative:
+            raise AssertionError("online c128 speculative decoding is not enabled")
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
@@ -529,7 +533,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
         self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
-        if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
+        if ONLINE_C128 and self.online_mtp_max_draft_tokens > 0:
             self.online_c128_mtp_pending_seq_lens = torch.empty(
                 self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )
