@@ -33,6 +33,10 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
+from sglang.kernels.ops.diffusion.modulate_scale_shift import (
+    can_use_modulate_scale_shift_cuda,
+    modulate_scale_shift_cuda,
+)
 from sglang.kernels.ops.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
@@ -119,6 +123,71 @@ def _flux_residual_gate_add(
             _FLUX_RESIDUAL_GATE_CUDA_DISABLED = True
 
     return residual + gate * update
+
+
+_FLUX_MODULATE_CUDA_DISABLED = False
+
+
+def _flux_modulate(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """``x * (1 + scale[:, None]) + shift[:, None]`` in one CUDA kernel.
+
+    The kernel keeps the eager chain's per-op fp32-opmath/round-to-storage
+    boundaries, so it is bit-exact vs eager and needs no quality gate.
+    Guarded inputs fall back to the eager expression.
+    """
+    global _FLUX_MODULATE_CUDA_DISABLED
+
+    if not _FLUX_MODULATE_CUDA_DISABLED and can_use_modulate_scale_shift_cuda(
+        x, scale, shift
+    ):
+        try:
+            return modulate_scale_shift_cuda(x, scale, shift)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling FLUX modulate CUDA fast path: {exc}")
+            _FLUX_MODULATE_CUDA_DISABLED = True
+
+    return x * (1 + scale[:, None]) + shift[:, None]
+
+
+class FluxAdaLayerNormZero(AdaLayerNormZero):
+    """diffusers ``AdaLayerNormZero`` with the modulate routed through
+    :func:`_flux_modulate`; parameters match the parent."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        hidden_dtype: Optional[torch.dtype] = None,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
+            6, dim=1
+        )
+        x = _flux_modulate(self.norm(x), scale_msa, shift_msa)
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class FluxAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
+    """diffusers ``AdaLayerNormZeroSingle`` with the modulate routed through
+    :func:`_flux_modulate`; parameters match the parent."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        x = _flux_modulate(self.norm(x), scale_msa, shift_msa)
+        return x, gate_msa
 
 
 def _rope_cos_sin_cache(
@@ -668,7 +737,7 @@ class FluxSingleTransformerBlock(nn.Module):
         self.local_mlp_hidden_dim = divide(self.mlp_hidden_dim, self.tp_size)
         self.local_dim = divide(dim, self.tp_size)
 
-        self.norm = AdaLayerNormZeroSingle(dim)
+        self.norm = FluxAdaLayerNormZeroSingle(dim)
 
         if self.use_nunchaku_structure:
             self.mlp_fc1 = ColumnParallelLinear(
@@ -859,8 +928,8 @@ class FluxTransformerBlock(nn.Module):
     ):
         super().__init__()
 
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = FluxAdaLayerNormZero(dim)
+        self.norm1_context = FluxAdaLayerNormZero(dim)
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -979,8 +1048,8 @@ class FluxTransformerBlock(nn.Module):
                 norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
             )
         else:
-            norm_hidden_states = (
-                norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            norm_hidden_states = _flux_modulate(
+                norm_hidden_states, scale_mlp, shift_mlp
             )
 
         ff_output = self.ff(norm_hidden_states)
@@ -1001,9 +1070,8 @@ class FluxTransformerBlock(nn.Module):
                 norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
             )
         else:
-            norm_encoder_hidden_states = (
-                norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-                + c_shift_mlp[:, None]
+            norm_encoder_hidden_states = _flux_modulate(
+                norm_encoder_hidden_states, c_scale_mlp, c_shift_mlp
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
