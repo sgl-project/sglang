@@ -191,7 +191,6 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
-    get_flags,
     get_forward,
     get_model,
     get_parallel,
@@ -910,12 +909,6 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
-                and not (
-                    get_flags().capture.enable_torch_compile
-                    and hidden_states.shape[0]
-                    <= get_exec().graph.torch_compile_max_bs
-                    * (get_spec().speculative_num_draft_tokens or 1)
-                )
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
