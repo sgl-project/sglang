@@ -9,7 +9,10 @@ import torch
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
-from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
+from sglang.srt.layers.quantization.fp8_utils import (
+    Fp8GemmRunnerBackend,
+    Mxfp8DenseGemmBackend,
+)
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -101,11 +104,7 @@ class TestMxfp8LinearMethod(CustomTestCase):
             ),
         )
 
-        with patch(
-            "sglang.srt.layers.quantization.fp8.get_fp8_gemm_runner_backend",
-            return_value=Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
-        ):
-            method._process_mxfp8_linear_weight_scale(layer)
+        method._process_mxfp8_linear_weight_scale(layer)
 
         self.assertIs(layer.weight, weight)
         self.assertEqual(layer.weight_mxfp8_cutlass.shape, (128, 160))
@@ -123,11 +122,7 @@ class TestMxfp8LinearMethod(CustomTestCase):
         )
         bias = torch.arange(17, dtype=torch.float32)
 
-        with patch(
-            "sglang.srt.layers.quantization.fp8.get_fp8_gemm_runner_backend",
-            return_value=Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
-        ):
-            output = method.apply(layer, torch.zeros((3, 160)), bias=bias)
+        output = method.apply(layer, torch.zeros((3, 160)), bias=bias)
 
         expected = (
             torch.arange(3 * 128, dtype=torch.float32).reshape(3, 128)[:, :17] + bias
@@ -142,6 +137,7 @@ class TestMxfp8LinearMethod(CustomTestCase):
         method.quant_config = Fp8Config.__new__(Fp8Config)
         method.use_mxfp8 = True
         method.use_marlin = False
+        method.mxfp8_dense_backend = Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
         return method
 
 

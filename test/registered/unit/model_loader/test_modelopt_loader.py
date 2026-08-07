@@ -23,7 +23,7 @@ from sglang.srt.layers.quantization.fp8 import (
     Fp8LinearMethod,
     Fp8MoEMethod,
 )
-from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
+from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -975,16 +975,15 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         scale_param.weight_loader(scale_param, loaded_scale)
         torch.testing.assert_close(scale_param, loaded_scale)
 
-        with patch(
-            "sglang.srt.layers.quantization.fp8.get_fp8_gemm_runner_backend",
-            return_value=Fp8GemmRunnerBackend.FLASHINFER_CUTLASS,
-        ):
-            layer.quant_method.process_weights_after_loading(layer)
-            derived_scale = layer.weight_scale_inv_swizzled
+        layer.quant_method.mxfp8_dense_backend = (
+            Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
+        )
+        layer.quant_method.process_weights_after_loading(layer)
+        derived_scale = layer.weight_scale_inv_swizzled
 
-            reloaded_scale = loaded_scale.flip(0)
-            scale_param.weight_loader(scale_param, reloaded_scale)
-            layer.quant_method.process_weights_after_loading(layer)
+        reloaded_scale = loaded_scale.flip(0)
+        scale_param.weight_loader(scale_param, reloaded_scale)
+        layer.quant_method.process_weights_after_loading(layer)
 
         self.assertIs(layer.weight_scale, scale_param)
         self.assertIs(layer.weight_scale_inv_swizzled, derived_scale)
