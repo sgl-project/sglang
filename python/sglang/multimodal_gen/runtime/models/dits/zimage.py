@@ -1578,6 +1578,14 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         use_full_unified_sequence = (
             get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
         )
+        if use_full_unified_sequence:
+            # Ring support for this attention layout is not implemented; the
+            # full-sequence gather is correct but gives up ring's memory and
+            # overlap benefits.
+            logger.warning_once(
+                "zimage under ring_degree > 1 falls back to a full-sequence "
+                "K/V gather"
+            )
         x_local_seq_len = x.shape[1]
         if use_full_unified_sequence:
             x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
