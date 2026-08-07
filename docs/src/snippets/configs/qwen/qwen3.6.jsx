@@ -402,17 +402,6 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h200", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.8",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "h200", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
@@ -423,17 +412,6 @@ export const config = {
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.8",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "h200", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
         "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
