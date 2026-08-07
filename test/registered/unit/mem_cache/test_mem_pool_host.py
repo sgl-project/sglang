@@ -8,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
+    LogicalHostPool,
     MambaPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -127,6 +128,10 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool.clear()
         return pool
 
+    @staticmethod
+    def _make_logical_pool():
+        return LogicalHostPool(size=8, page_size=2)
+
     def _assert_lazy_release(self, pool):
         self.assertEqual(pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(pool.num_release_slots, 0)
@@ -180,6 +185,17 @@ class TestLazyHostPoolRelease(CustomTestCase):
         # Preserve the pool's page-aligned allocation behavior.
         pool.clear()
         self.assertEqual(len(pool.alloc(1)), 2)
+
+    def test_logical_pool_lazy_release(self):
+        pool = self._make_logical_pool()
+        self._assert_lazy_release(pool)
+
+        # Preserve the logical pool's strict page-alignment checks.
+        pool.clear()
+        with self.assertRaises(ValueError):
+            pool.alloc(1)
+        with self.assertRaises(ValueError):
+            pool.free(torch.tensor([0]))
 
 
 if __name__ == "__main__":
