@@ -4,6 +4,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -58,6 +59,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             if _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
+            elif current_platform.is_out_of_tree():
+                PagedTokenToKVPoolAllocatorClass = (
+                    current_platform.get_paged_allocator_cls()
+                    or PagedTokenToKVPoolAllocator
+                )
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
             self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
