@@ -45,6 +45,7 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         )
         self._numa_node = _int_env("SGLANG_HICACHE_HOST_NUMA_NODE", -1)
         self._prefault = _bool_env("SGLANG_HICACHE_HOST_PREFAULT", True)
+        self._standalone_process = bool(os.getenv("UMBP_STANDALONE_ADDRESS"))
         self._handles: Dict[int, Any] = {}
 
     def allocate(
@@ -62,11 +63,21 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         element_size = torch.empty((), dtype=dtype).element_size()
         nbytes = math.prod(int(dim) for dim in dims) * element_size
 
-        requested_backing = (
-            self._mod.UMBPHostBufferBacking.AnonymousHugetlb
-            if self._use_hugepage
-            else self._mod.UMBPHostBufferBacking.Anonymous
-        )
+        if self._standalone_process:
+            # AnonymousShmHugetlb: hugetlbfs-backed AnonymousShm (still
+            # fd-shareable) -- some RDMA NICs need hugepages to register
+            # large regions (small MTT table).
+            requested_backing = (
+                self._mod.UMBPHostBufferBacking.AnonymousShmHugetlb
+                if self._use_hugepage
+                else self._mod.UMBPHostBufferBacking.AnonymousShm
+            )
+        else:
+            requested_backing = (
+                self._mod.UMBPHostBufferBacking.AnonymousHugetlb
+                if self._use_hugepage
+                else self._mod.UMBPHostBufferBacking.Anonymous
+            )
 
         handle = self._allocator.alloc(
             nbytes,
@@ -101,15 +112,25 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
             handle.mapped_size,
             self._numa_node,
         )
-        if (
-            self._use_hugepage
+        demoted_non_standalone = (
+            not self._standalone_process
             and handle.actual_backing == self._mod.UMBPHostBufferBacking.Anonymous
-        ):
+        )
+        demoted_standalone = (
+            self._standalone_process
+            and handle.actual_backing == self._mod.UMBPHostBufferBacking.AnonymousShm
+        )
+        if self._use_hugepage and (demoted_non_standalone or demoted_standalone):
             logger.warning(
-                "UMBPHostTensorAllocator: requested AnonymousHugetlb backing "
-                "but kernel demoted to Anonymous (4 KiB pages). Check "
-                "vm.nr_hugepages and HugePages_Free in /proc/meminfo. "
-                "Performance and AINIC MR-size benefits will not apply."
+                "UMBPHostTensorAllocator: requested %s backing but kernel demoted "
+                "to %s (4 KiB pages). Check vm.nr_hugepages and HugePages_Free in "
+                "/proc/meminfo. Performance and AINIC MR-size benefits will not apply.",
+                (
+                    "AnonymousShmHugetlb"
+                    if self._standalone_process
+                    else "AnonymousHugetlb"
+                ),
+                "AnonymousShm" if self._standalone_process else "Anonymous",
             )
 
         return tensor.view(dims)
