@@ -85,7 +85,7 @@ sgl-eval run mmmu_pro \\
   --temperature 1.0 --top-p 0.95 \\
   --thinking`,
     },
-    numPromptsByConc: { 24: 24, 64: 128 },
+    numPromptsByConc: { 64: 128, 256: 512 },
   },
 
   accuracyLabels: [
