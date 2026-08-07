@@ -68,6 +68,14 @@ on:
         options:
           - mi300
           - mi325
+      rocm_version:
+        description: 'ROCm container variant to test against'
+        required: false
+        type: choice
+        default: rocm720
+        options:
+          - rocm720
+          - rocm700
       run_all_tests:
         description: 'Run all tests (skip change detection). Ignored when target_stage / target_stage_select is set.'
         required: false
@@ -85,6 +93,11 @@ on:
         required: false
         type: string
         default: mi300
+      rocm_version:
+        description: 'ROCm container variant to test against'
+        required: false
+        type: string
+        default: rocm720
       run_all_tests:
         description: "Run all tests (for releasing or testing purpose)"
         required: false
@@ -116,6 +129,11 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  # ROCm container variant every job boots. `inputs` is empty on pull_request /
+  # schedule, so the fallback is what those events actually use; the
+  # workflow_dispatch / workflow_call input exists so a dispatch can pin
+  # `rocm700` without reverting this file.
+  ROCM_VERSION: ${{ inputs.rocm_version || 'rocm720' }}
 
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
@@ -223,6 +241,7 @@ jobs:
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
       runner_arch: ${{ inputs.runner_arch || 'mi300' }}
+      rocm_version: ${{ inputs.rocm_version || 'rocm720' }}
       aiter_ref: ${{ inputs.aiter_ref }}
       continue_on_error: true
     secrets: inherit
@@ -252,7 +271,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -310,7 +329,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -351,7 +370,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -388,7 +407,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -425,7 +444,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -493,7 +512,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -529,7 +548,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -568,7 +587,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -609,7 +628,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -650,7 +669,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -699,7 +718,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -830,7 +849,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -960,7 +979,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1037,7 +1056,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1096,7 +1115,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1142,7 +1161,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1222,7 +1241,7 @@ jobs:
           echo "=== Host RDMA Check Complete ==="
 
       - name: Start Special Container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version "$ROCM_VERSION"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
