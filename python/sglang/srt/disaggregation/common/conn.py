@@ -807,6 +807,10 @@ class CommonKVManager(BaseKVManager):
         ):
             # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
             # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
+            # TODO: this modulo heuristic is still reachable for plain-MHA models
+            # with pp_size > 1 (no layer ids published); when the stage layer
+            # count does not divide the decode total, the floor-division below
+            # mis-computes the V offset. Out of scope for this change.
             multiplier_ratio = dst_num_total_layers // num_kv_layers
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             v_ptr_offset = num_kv_layers * multiplier_ratio

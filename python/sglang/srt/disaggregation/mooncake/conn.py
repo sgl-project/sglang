@@ -658,10 +658,19 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+        # When both peers publish layer ids the pairing is exact, so prefer it
+        # over positional slicing regardless of backend; a plain-MHA model
+        # publishes no ids and is unaffected.
+        has_layer_ids = bool(src_layer_ids or dst_layer_ids)
+        if (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or force_flat
+            or has_layer_ids
+        ):
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
-            if src_layer_ids or dst_layer_ids:
+            if has_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids,
