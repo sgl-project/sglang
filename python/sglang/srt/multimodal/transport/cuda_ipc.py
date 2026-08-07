@@ -283,6 +283,17 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             _pool_handle_cache_set(cache_key, result[1])
             return result
 
+    def _retain_storage_until_stream_completes(self, storage, device_id: int) -> None:
+        if self.proxy_state["ipc_extra"]["use_pool_handle_cache"]:
+            # The process-wide cache owns the mapping after this proxy is
+            # replaced by its reconstructed tensor.
+            self._pool_storage = storage
+        else:
+            # An uncached mapping is owned only by this proxy. The caller
+            # replaces the proxy immediately, so finish the current stream
+            # before allowing the mapping to close.
+            torch.cuda.current_stream(device_id).synchronize()
+
     def acknowledge_consumption(
         self, consumer_count: int = 1, consumer_rank: Optional[int] = None
     ) -> None:
@@ -297,7 +308,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             self._acknowledge_on_stream(
                 base_address, device_id, consumer_count, consumer_rank
             )
-        self._pool_storage = storage
+        self._retain_storage_until_stream_completes(storage, device_id)
 
     def reconstruct_on_target_device(
         self,
@@ -330,6 +341,6 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
                 consumer_rank,
             )
 
-        self._pool_storage = storage
+        self._retain_storage_until_stream_completes(storage, rebuild_device_idx)
         self.reconstruct_tensor = reconstructed_tensor
         return self.reconstruct_tensor
