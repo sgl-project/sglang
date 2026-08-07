@@ -2031,7 +2031,8 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
+            max_total_num_tokens=self.max_total_num_tokens
+            * get_parallel().attn_dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2045,7 +2046,6 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=self.max_total_num_tokens,
-            server_args=self.server_args,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2164,7 +2164,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * self.server_args.dcp_size
+                self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,

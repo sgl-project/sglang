@@ -78,7 +78,7 @@ def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
         and envs.SGLANG_DSA_FUSE_TOPK.get()
         and server_args.disaggregation_mode == "decode"
         and not server_args.enable_hisparse
-        and server_args.dcp_size == 1
+        and not get_parallel().dcp_enabled
     )
 
 
