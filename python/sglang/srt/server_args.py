@@ -2746,9 +2746,9 @@ class ServerArgs:
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc", "fabric"]],
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm", "fabric"]],
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
-        "pool, or a bounded MNNVL FABRIC pool. "
+        "pool, a bounded CUDA VMM pool, or a bounded MNNVL FABRIC pool. "
         "Unset resolves automatically: multimodal models on single-node CUDA "
         "deployments (without disaggregation) use cuda_ipc; multi-node GB200/GB300 "
         "MNNVL deployments use fabric when an IMEX channel is available; all other "
@@ -7657,7 +7657,11 @@ class ServerArgs:
                 int(legacy_ipc_enabled),
             )
 
-        if self.encoder_only and requested_transport in ("cuda_ipc", "fabric"):
+        if self.encoder_only and requested_transport in (
+            "cuda_ipc",
+            "cuda_vmm",
+            "fabric",
+        ):
             logger.warning(
                 "--mm-feature-transport=%s does not control encoder-only "
                 "output transfer; using cpu for this inactive transport. Select "
@@ -7665,6 +7669,22 @@ class ServerArgs:
                 requested_transport,
             )
             requested_transport = "cpu"
+
+        if requested_transport == "cuda_vmm":
+            if not is_cuda():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm requires NVIDIA CUDA."
+                )
+            if self.pp_size != 1:
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm does not support pipeline "
+                    "parallelism."
+                )
+            if envs.SGLANG_RUST_SERVER.get():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm is not supported with "
+                    "SGLANG_RUST_SERVER."
+                )
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():

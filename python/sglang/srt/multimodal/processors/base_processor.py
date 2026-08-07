@@ -202,7 +202,8 @@ class BaseMultimodalProcessor(ABC):
         )
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "fabric")
+            if configured_mm_feature_transport
+            in ("cpu", "cuda_ipc", "cuda_vmm", "fabric")
             else "cpu"
         )
         self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
@@ -292,8 +293,11 @@ class BaseMultimodalProcessor(ABC):
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
+        cpu_worker_start_method = (
+            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("fork"),
+            mp_context=mp.get_context(cpu_worker_start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 
@@ -389,6 +393,10 @@ class BaseMultimodalProcessor(ABC):
     @property
     def use_gpu_feature_transport(self) -> bool:
         return self.use_cuda_ipc or self.use_fabric_transport
+
+    @property
+    def keep_mm_features_on_device(self) -> bool:
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm", "fabric")
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -616,7 +624,7 @@ class BaseMultimodalProcessor(ABC):
         # Deferred: the hash is computed on the GPU tensor first, and
         # _precompute_hashes_before_cpu_transfer moves it down afterwards.
         if (
-            not self.use_gpu_feature_transport
+            not self.keep_mm_features_on_device
             and not self.precompute_hash_before_cpu_transfer
         ):
             # move feature tensors to cpu
@@ -1422,7 +1430,7 @@ class BaseMultimodalProcessor(ABC):
 
         for item in mm_items:
             item.set_pad_value()
-            if not self.use_gpu_feature_transport:
+            if not self.keep_mm_features_on_device:
                 item.feature = self._move_feature_to_cpu(item.feature)
                 item.precomputed_embeddings = self._move_feature_to_cpu(
                     item.precomputed_embeddings
