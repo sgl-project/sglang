@@ -196,6 +196,7 @@ the cache stores the BF16 outputs of the original AdaLN linears.
 python -m sglang.multimodal_gen.tools.build_minimax_h3_adaln_cache \
   --transformer-path "$TRANSFORMER_PATH" \
   --model-variant fl2va \
+  --mode t2va \
   --num-inference-steps 50 \
   --flow-shift 12 \
   --audio-flow-shift 3 \
@@ -214,9 +215,10 @@ sglang serve \
 `$TRANSFORMER_PATH` is the `FL2VA/transformer` or `Ref2VA/transformer`
 directory in the normal SGLang/Hugging Face snapshot; the builder never
 downloads a second copy. A cache only covers the scheduler settings used to
-create it, including its step count, flow shifts, and condition noise values.
-SGLang rejects a request outside that coverage instead of silently changing
-conditioning. Cache mode supports the matching unquantized checkpoint only.
+create it, including its mode, step count, flow shifts, and condition noise
+values. SGLang rejects a request outside that coverage instead of silently
+changing conditioning. Cache mode supports the matching unquantized checkpoint
+only.
 
 ## 4. Generate video and audio
 

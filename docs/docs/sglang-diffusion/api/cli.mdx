@@ -77,7 +77,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
 - `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
-- `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose BF16 timestep embeddings are included in the cache. It requires unquantized weights and the matching model variant.
+- `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
 - `--model-subfolder {PATH}`: advanced direct override for a component subfolder inside the model repository. Prefer `--model-variant` when the pipeline exposes semantic routing. If both are supplied, they must resolve to the same weight partition.
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
 - `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.

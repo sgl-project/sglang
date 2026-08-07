@@ -805,10 +805,11 @@ class MiniMaxH3AdalnProj(nn.Module):
 
 
 class MiniMaxH3AdalnCache(nn.Module):
-    """Precomputed AdaLN outputs for a fixed set of BF16 timestep embeddings."""
+    """Precomputed AdaLN outputs for fixed FP32 timestep plans."""
 
-    _FORMAT_VERSION = "1"
-    adaln_inputs: torch.Tensor
+    _FORMAT_VERSION = "2"
+    plan_timesteps: torch.Tensor
+    plan_lengths: torch.Tensor
     block_params: torch.Tensor
     final_params: torch.Tensor
 
@@ -824,7 +825,6 @@ class MiniMaxH3AdalnCache(nn.Module):
         self.model_variant = model_variant
         self.num_layers = arch.num_layers
         self.hidden_size = arch.hidden_size
-        self.time_embed_dim = arch.time_embed_dim
 
     def load(self, device: torch.device) -> None:
         if not os.path.isfile(self.path):
@@ -842,53 +842,68 @@ class MiniMaxH3AdalnCache(nn.Module):
                     "MiniMax H3 AdaLN cache model_variant does not match the loaded "
                     f"variant ({cache_variant!r} != {self.model_variant!r})"
                 )
-            adaln_inputs = cache_file.get_tensor("adaln_inputs")
+            plan_timesteps = cache_file.get_tensor("plan_timesteps")
+            plan_lengths = cache_file.get_tensor("plan_lengths")
             block_params = cache_file.get_tensor("block_params")
             final_params = cache_file.get_tensor("final_params")
 
         expected_block_width = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * self.hidden_size
         expected_final_width = 2 * self.hidden_size
         if (
-            adaln_inputs.dtype != _BF16_DTYPE
-            or adaln_inputs.ndim != 2
-            or adaln_inputs.shape[1] != self.time_embed_dim
+            plan_timesteps.dtype != _FP32_DTYPE
+            or plan_timesteps.ndim != 2
+            or plan_lengths.dtype != torch.int64
+            or plan_lengths.shape != (plan_timesteps.shape[0],)
+            or (plan_lengths < 1).any()
+            or (plan_lengths > plan_timesteps.shape[1]).any()
         ):
-            raise ValueError("MiniMax H3 AdaLN cache has invalid adaln_inputs")
+            raise ValueError("MiniMax H3 AdaLN cache has invalid timestep plans")
         if block_params.dtype != _BF16_DTYPE or block_params.shape != (
-            adaln_inputs.shape[0],
+            plan_timesteps.shape[0],
+            plan_timesteps.shape[1],
             self.num_layers,
             expected_block_width,
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid block_params")
         if final_params.dtype != _BF16_DTYPE or final_params.shape != (
-            adaln_inputs.shape[0],
+            plan_timesteps.shape[0],
+            plan_timesteps.shape[1],
             expected_final_width,
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid final_params")
 
-        self.register_buffer("adaln_inputs", adaln_inputs.to(device))
+        self.register_buffer("plan_timesteps", plan_timesteps.to(device))
+        self.register_buffer("plan_lengths", plan_lengths.to(device))
         self.register_buffer("block_params", block_params.to(device))
         self.register_buffer("final_params", final_params.to(device))
 
-    def lookup(self, adaln_input: torch.Tensor) -> torch.Tensor:
-        matches = (
-            self.adaln_inputs.unsqueeze(0).eq(adaln_input.unsqueeze(1)).all(dim=-1)
-        )
-        if not bool(matches.any(dim=1).all()):
+    def lookup(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
+        num_timesteps = unique_timesteps.shape[0]
+        matches = self.plan_lengths.eq(num_timesteps) & self.plan_timesteps[
+            :, :num_timesteps
+        ].eq(unique_timesteps).all(dim=-1)
+        if not bool(matches.any()):
             raise ValueError(
-                "MiniMax H3 AdaLN cache does not cover the request timestep embedding"
+                "MiniMax H3 AdaLN cache does not cover the request timestep plan"
             )
-        return matches.to(torch.int64).argmax(dim=1)
+        return matches.to(torch.int64).argmax()
 
     def block(
-        self, index: int, cache_indices: torch.Tensor
+        self,
+        index: int,
+        cache_plan_index: torch.Tensor,
+        num_timesteps: int,
     ) -> tuple[torch.Tensor, ...]:
-        params = self.block_params.index_select(0, cache_indices)[:, index]
+        params = self.block_params[cache_plan_index, :num_timesteps, index]
         params = params.view(-1, 6, self.hidden_size)
         return tuple(params.unbind(dim=1))
 
-    def final(self, cache_indices: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        params = self.final_params.index_select(0, cache_indices)
+    def final(
+        self,
+        cache_plan_index: torch.Tensor,
+        num_timesteps: int,
+    ) -> tuple[torch.Tensor, ...]:
+        params = self.final_params[cache_plan_index, :num_timesteps]
         return tuple(params.view(-1, 2, self.hidden_size).unbind(dim=1))
 
 
@@ -1812,11 +1827,17 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         block_adaln_params = None
-        adaln_cache_indices = None
+        adaln_cache_plan_index = None
         if self.adaln_cache is not None:
-            adaln_cache_indices = self.adaln_cache.lookup(adaln_input)
+            adaln_cache_plan_index = self.adaln_cache.lookup(
+                unique_timesteps.view(-1).to(device)
+            )
             block_adaln_params = tuple(
-                self.adaln_cache.block(index, adaln_cache_indices)
+                self.adaln_cache.block(
+                    index,
+                    adaln_cache_plan_index,
+                    adaln_input.shape[0],
+                )
                 for index in range(len(self.blocks))
             )
         elif self._can_batch_block_adaln():
@@ -1854,8 +1875,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             inverse_indices=block_inverse,
             adaln_params=(
                 None
-                if adaln_cache_indices is None
-                else self.adaln_cache.final(adaln_cache_indices)
+                if adaln_cache_plan_index is None
+                else self.adaln_cache.final(
+                    adaln_cache_plan_index,
+                    adaln_input.shape[0],
+                )
             ),
         )
         if sp_ws > 1:
