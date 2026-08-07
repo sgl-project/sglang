@@ -364,13 +364,6 @@ class ShmLoadSnapshotWriter:
     def close(self) -> None:
         self.mmap.close()
         os.close(self.fd)
-        # Best-effort: dp ranks share this file, so a sibling's unlink may win
-        # the race; SIGKILLed servers skip close() entirely and rely on the CI
-        # sweep in utils/stale_shm_cleanup.py.
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
 
 
 class ZmqLoadSnapshotWriter:

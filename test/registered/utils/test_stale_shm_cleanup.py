@@ -1,16 +1,12 @@
-import mmap
 import os
 import subprocess
 import sys
-import time
 import unittest
 from multiprocessing import shared_memory
 from unittest.mock import patch
 
 from sglang.srt.utils.stale_shm_cleanup import (
-    _ORPHAN_MIN_AGE_S,
     _creator_pid,
-    _live_shm_paths,
     cleanup_stale_shm,
     make_shm_name,
 )
@@ -35,12 +31,9 @@ class TestMakeShmName(unittest.TestCase):
     def test_creator_pid_parsing(self):
         self.assertEqual(_creator_pid("sgl_shm_mq_1234_abcd1234"), 1234)
         self.assertEqual(_creator_pid("multi_tokenizer_args_5678"), 5678)
-        self.assertEqual(_creator_pid("torch_2952_1126906123"), 2952)
         self.assertIsNone(_creator_pid("psm_deadbeef"))
         self.assertIsNone(_creator_pid("sgl_shm_garbage"))
         self.assertIsNone(_creator_pid("multi_tokenizer_args_notanint"))
-        self.assertIsNone(_creator_pid("torch_notanint_1"))
-        self.assertIsNone(_creator_pid("torch_1234"))
         # Non-positive pids would make os.kill probe process groups.
         self.assertIsNone(_creator_pid("sgl_shm_mm_-1_abcd1234"))
         self.assertIsNone(_creator_pid("sgl_shm_mm_0_abcd1234"))
@@ -128,15 +121,12 @@ class TestCleanupStaleShm(unittest.TestCase):
 
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
 
-    def _make_raw_file(self, name: str, age_s: int = 0) -> str:
+    def _make_raw_file(self, name: str) -> str:
         """Create a plain /dev/shm file (orphan families are not created via
-        shared_memory), optionally backdating its mtime."""
+        shared_memory)."""
         path = f"/dev/shm/{name}"
         with open(path, "wb") as f:
             f.write(b"\0" * 4096)
-        if age_s:
-            old = time.time() - age_s
-            os.utime(path, (old, old))
         self.addCleanup(self._unlink_path_quiet, path)
         return path
 
@@ -147,38 +137,24 @@ class TestCleanupStaleShm(unittest.TestCase):
         except FileNotFoundError:
             pass
 
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1"),
+        "sweeps orphan families unconditionally; only safe on a CI runner",
+    )
     def test_orphan_family_sweep(self):
-        """One sweep must remove aged unreferenced orphan-family files while
-        keeping recent, still-mapped, and unknown-prefix ones."""
-        if _live_shm_paths() is None:
-            self.skipTest("cannot inspect every same-uid process")
-        old = _ORPHAN_MIN_AGE_S + 60
         stale = [
-            self._make_raw_file("sglang_loads_test_deadbeef.shm", age_s=old),
-            self._make_raw_file("cuda.shm.0.deadbeef.1", age_s=old),
-            self._make_raw_file("nccl-testonly", age_s=old),
-            self._make_raw_file("sem.loky-0-testonly", age_s=old),
+            self._make_raw_file("sglang_loads_test_deadbeef.shm"),
+            self._make_raw_file("cuda.shm.0.deadbeef.1"),
+            self._make_raw_file("nccl-testonly"),
+            self._make_raw_file("sem.loky-0-testonly"),
         ]
-        recent = self._make_raw_file("sglang_loads_test_cafecafe.shm")
-        unknown = self._make_raw_file("unknown_family_file", age_s=old)
-        # Held via mmap only (fd closed) so the /proc/*/maps scan is what
-        # must protect it.
-        mapped = self._make_raw_file("sglang_loads_test_beefbeef.shm", age_s=old)
-        fd = os.open(mapped, os.O_RDWR)
-        try:
-            held = mmap.mmap(fd, 4096)
-        finally:
-            os.close(fd)
+        unknown = self._make_raw_file("unknown_family_file")
 
-        try:
-            with patch.dict(os.environ, {"SGLANG_IS_IN_CI": "true"}):
-                cleanup_stale_shm()
-            for path in stale:
-                self.assertFalse(os.path.exists(path), path)
-            for path in (recent, unknown, mapped):
-                self.assertTrue(os.path.exists(path), path)
-        finally:
-            held.close()
+        cleanup_stale_shm()
+
+        for path in stale:
+            self.assertFalse(os.path.exists(path), path)
+        self.assertTrue(os.path.exists(unknown))
 
 
 if __name__ == "__main__":

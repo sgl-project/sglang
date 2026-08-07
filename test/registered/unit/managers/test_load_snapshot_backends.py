@@ -127,13 +127,6 @@ class TestShmRoundTrip(CustomTestCase):
         self.assertIsNone(reader.read(0))
         reader.close()
 
-    def test_writer_close_unlinks_file(self):
-        path = _temp_path()
-        writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
-        self.assertTrue(os.path.exists(path))
-        writer.close()
-        self.assertFalse(os.path.exists(path))
-
 
 class TestZmqRoundTrip(CustomTestCase):
     def test_single_rank_zmq_to_shm(self):
