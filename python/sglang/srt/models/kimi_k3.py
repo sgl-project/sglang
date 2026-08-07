@@ -3044,22 +3044,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
         grid_thw_list = grid_thws_host.tolist()
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
-            """Materialize features for the images assigned to this rank.
-
-            K3 vision is image-wise data-parallel, so each image is consumed
-            by exactly one TP rank. Deferred CUDA-IPC proxies are
-            reconstructed here, after the assignment is known, so an image
-            crosses the tokenizer/scheduler boundary once instead of once
-            per rank; CPU-transport features likewise only pay their H2D
-            copy on the owner rank. The consumer count matches
-            MmItemMemoryPool.try_to_recycle(), which waits for the server TP
-            size rather than the attention subgroup size.
-            """
-            parallel = get_parallel()
+            """Materialize only the images assigned to this vision-DP rank."""
             server_args = get_server_args()
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            ipc_consumer_count = max(server_args.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
