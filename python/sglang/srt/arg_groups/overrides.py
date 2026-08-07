@@ -2505,6 +2505,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer",
         "mori",
         "pplx",
+        "shared_ep",
     }
 )
 

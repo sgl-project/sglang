@@ -114,7 +114,13 @@ def make_rw_access_desc(device_id: int):
 
 def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    backend = dist.get_backend(group)
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend == dist.Backend.NCCL
+        else torch.device("cpu")
+    )
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
     return flag.item() == 1
 
@@ -258,10 +264,9 @@ def exchange_posix_fds(
     import threading
 
     sock_kind = getattr(socket, "SOCK_SEQPACKET", socket.SOCK_STREAM)
-    sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
-    sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
-    server = socket.socket(socket.AF_UNIX, sock_kind)
-    server.settimeout(_FD_SEND_TIMEOUT_S)
+    sock_dir = None
+    sock_path = None
+    server = None
     received_fds = {}
     errors = []
 
@@ -285,13 +290,37 @@ def exchange_posix_fds(
             errors.append(e)
 
     try:
-        server.bind(sock_path)
-        server.listen(world_size)
+        setup_error = None
+        try:
+            sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
+            sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
+            server = socket.socket(socket.AF_UNIX, sock_kind)
+            server.settimeout(_FD_SEND_TIMEOUT_S)
+            server.bind(sock_path)
+            server.listen(world_size)
+        except BaseException as e:
+            setup_error = e
+
+        setup_errors = [None] * world_size
+        setup_error_text = (
+            None
+            if setup_error is None
+            else f"{type(setup_error).__name__}: {setup_error}"
+        )
+        dist.all_gather_object(setup_errors, setup_error_text, group=group)
+        for failed_rank, error_text in enumerate(setup_errors):
+            if error_text is not None:
+                raise RuntimeError(
+                    "POSIX fd listener setup failed on "
+                    f"rank {failed_rank}: {error_text}"
+                ) from setup_error
+
         paths = [None] * world_size
         dist.all_gather_object(paths, sock_path, group=group)
 
         thread = threading.Thread(target=recv_loop, daemon=True)
         thread.start()
+        exchange_error = None
         try:
             for peer_rank, peer_path in enumerate(paths):
                 if peer_rank == rank:
@@ -301,13 +330,33 @@ def exchange_posix_fds(
                     sock.connect(peer_path)
                     for base_idx, fd in enumerate(local_fds):
                         _send_fd(sock, fd, rank, base_idx)
+        except BaseException as e:
+            exchange_error = e
         finally:
             thread.join(_FD_SEND_TIMEOUT_S)
 
-        if thread.is_alive():
-            raise RuntimeError("timed out waiting for POSIX fd exchange")
-        if errors:
-            raise RuntimeError("POSIX fd exchange receive failed") from errors[0]
+        if exchange_error is None and thread.is_alive():
+            exchange_error = RuntimeError("timed out waiting for POSIX fd exchange")
+        if exchange_error is None and errors:
+            exchange_error = RuntimeError(
+                f"POSIX fd exchange receive failed: {errors[0]}"
+            )
+
+        exchange_errors = [None] * world_size
+        exchange_error_text = (
+            None
+            if exchange_error is None
+            else f"{type(exchange_error).__name__}: {exchange_error}"
+        )
+        dist.all_gather_object(exchange_errors, exchange_error_text, group=group)
+        for failed_rank, error_text in enumerate(exchange_errors):
+            if error_text is not None:
+                for fd in received_fds.values():
+                    os.close(fd)
+                received_fds.clear()
+                raise RuntimeError(
+                    f"POSIX fd exchange failed on rank {failed_rank}: {error_text}"
+                ) from exchange_error
 
         expected = {
             (src_rank, base_idx)
@@ -317,24 +366,39 @@ def exchange_posix_fds(
         }
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
-        if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
-            raise RuntimeError(
-                "POSIX fd exchange mismatch: "
-                f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
-            )
+        validation_error = (
+            f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
+            if missing or extra
+            else None
+        )
+        validation_errors = [None] * world_size
+        dist.all_gather_object(
+            validation_errors,
+            validation_error,
+            group=group,
+        )
+        for failed_rank, error_text in enumerate(validation_errors):
+            if error_text is not None:
+                for fd in received_fds.values():
+                    os.close(fd)
+                received_fds.clear()
+                raise RuntimeError(
+                    f"POSIX fd validation failed on rank {failed_rank}: {error_text}"
+                )
         return received_fds
     finally:
-        server.close()
-        try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(sock_dir)
-        except OSError:
-            pass
+        if server is not None:
+            server.close()
+        if sock_path is not None:
+            try:
+                os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+        if sock_dir is not None:
+            try:
+                os.rmdir(sock_dir)
+            except OSError:
+                pass
 
 
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):

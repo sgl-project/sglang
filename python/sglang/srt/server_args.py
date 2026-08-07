@@ -275,6 +275,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "megamoe",
     "pplx",
     "ascend_tp",
+    "shared_ep",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -2291,9 +2292,15 @@ class ServerArgs:
             "flashinfer",
             "megamoe",
             "pplx",
+            "ascend_tp",
+            "shared_ep",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help=(
+                "Choose the backend for MoE A2A. shared_ep uses a direct "
+                "shared-object consumer for decode, a pull-cache consumer for "
+                "admitted prefill shapes, and the Triton FusedMoE runner."
+            ),
             choices=MOE_A2A_BACKEND_CHOICES,
             resolvable=True,
         ),
@@ -8906,6 +8913,12 @@ class ServerArgs:
             )
 
         # Check two batch overlap backend requirement.
+        if self.moe_a2a_backend == "shared_ep":
+            from sglang.srt.layers.moe.shared_ep.admission import (
+                validate_shared_ep_server_args,
+            )
+
+            validate_shared_ep_server_args(self)
         self._check_two_batch_overlap()
 
         # Check communications compression

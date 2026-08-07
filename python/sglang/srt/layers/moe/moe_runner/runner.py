@@ -114,7 +114,13 @@ class MoeRunner:
 
         # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
         if not lora_enabled:
-            a2a_backend_name = get_moe_a2a_backend().value
+            a2a_backend = get_moe_a2a_backend()
+            if a2a_backend.is_shared_ep():
+                # SharedEP owns a composite dispatch/GEMM/combine path. Import it
+                # before the one-time fused-op lookup in this runner instance.
+                from sglang.srt.layers.moe import shared_ep  # noqa: F401
+
+            a2a_backend_name = a2a_backend.value
             runner_backend_name = runner_backend.value
 
             # TODO(cwan): add a server argument to disable fused func
@@ -139,6 +145,11 @@ class MoeRunner:
                 "SGLANG_CI_DISABLE_MOE_FUSED_FUNC is set to 1, disabling fused func"
             )
             self.fused_func = None
+        if get_moe_a2a_backend().is_shared_ep() and self.fused_func is None:
+            raise RuntimeError(
+                "SharedEP requires its registered fused execution path; "
+                "the generic runner cannot consume SharedEP objects."
+            )
 
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None

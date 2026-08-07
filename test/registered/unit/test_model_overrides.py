@@ -2152,6 +2152,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(SimpleNamespace(moe_a2a_backend="shared_ep", tp_size=8))
+            ),
+            {"ep_size": 8},
+        )
 
     def test_deepseek_family_order_safe_declarations(self):
         from sglang.srt.arg_groups.overrides import _deepseek_family_overrides

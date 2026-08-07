@@ -138,7 +138,13 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
-    elif (
+
+    if a2a_backend.is_shared_ep():
+        from sglang.srt.layers.moe.shared_ep import create_shared_ep_dispatcher
+
+        return create_shared_ep_dispatcher(moe_runner_config)
+
+    if (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_ascend_fuseep()

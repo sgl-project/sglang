@@ -367,6 +367,7 @@ struct SiluMulQuantContigParams {
   const bf16_t* __restrict__ input;
   fp8_e4m3_t* __restrict__ output;
   float* __restrict__ output_scale;
+  const int32_t* __restrict__ valid_rows;
   float swiglu_limit;  // only read when kApplySwigluLimit=true
   int64_t hidden_dim;
   uint32_t num_tokens;
@@ -386,6 +387,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto token_id = blockIdx.x;
+  if (params.valid_rows != nullptr && token_id >= static_cast<uint32_t>(*params.valid_rows)) return;
   const auto work_id = threadIdx.x / kWorkThreads;
 
   const auto input = params.input + token_id * params.hidden_dim * 2;
@@ -473,6 +475,27 @@ struct SiluAndMulContigPostQuantKernel {
       const tvm::ffi::TensorView output_scale,
       const bool transposed,
       const double swiglu_limit) {
+    run_impl(input, output, output_scale, nullptr, transposed, swiglu_limit);
+  }
+
+  static void run_valid(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView valid_rows,
+      const bool transposed,
+      const double swiglu_limit) {
+    run_impl(input, output, output_scale, &valid_rows, transposed, swiglu_limit);
+  }
+
+ private:
+  static void run_impl(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView* valid_rows,
+      const bool transposed,
+      const double swiglu_limit) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -490,6 +513,12 @@ struct SiluAndMulContigPostQuantKernel {
         .with_dtype<fp8_e4m3_t>()
         .with_device(device)
         .verify(output);
+    if (valid_rows != nullptr) {
+      TensorMatcher({1})  //
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(*valid_rows);
+    }
 
     const auto hidden_dim = N.unwrap();
     RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
@@ -523,6 +552,7 @@ struct SiluAndMulContigPostQuantKernel {
         .input = static_cast<const bf16_t*>(input.data_ptr()),
         .output = static_cast<fp8_e4m3_t*>(output.data_ptr()),
         .output_scale = static_cast<float*>(output_scale.data_ptr()),
+        .valid_rows = valid_rows == nullptr ? nullptr : static_cast<const int32_t*>(valid_rows->data_ptr()),
         .swiglu_limit = static_cast<float>(swiglu_limit),
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,

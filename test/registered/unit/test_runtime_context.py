@@ -670,6 +670,26 @@ class TestEpBufferState(_IsolatedServerArgs):
         reset_context()
         self.assertIsNone(DeepEPBuffer._state().buffer)
 
+    def test_deepep_mode_transition_before_lazy_buffer_allocation(self):
+        try:
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPBuffer,
+                DeepEPDispatchMode,
+            )
+        except ImportError:
+            self.skipTest("deep_ep not installed")
+
+        reset_context()
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+
+        # CUDA Graph adapters publish the phase before the dispatcher's first
+        # lazy buffer allocation. NORMAL -> LOW_LATENCY has nothing to clean.
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+
+        state = DeepEPBuffer._state()
+        self.assertIsNone(state.buffer)
+        self.assertEqual(state.dispatch_mode, DeepEPDispatchMode.LOW_LATENCY)
+
 
 class TestForwardFlags(_IsolatedServerArgs):
     """ctx.forward: contextvar-backed per-forward flags; scoped() restores,

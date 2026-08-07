@@ -37,6 +37,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     PPLX = "pplx"
+    SHARED_EP = "shared_ep"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -77,6 +78,9 @@ class MoeA2ABackend(Enum):
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
+
+    def is_shared_ep(self):
+        return self == MoeA2ABackend.SHARED_EP
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -388,9 +392,15 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Check whether the backend uses the EP-sharded model contract."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+        or b.is_shared_ep()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:

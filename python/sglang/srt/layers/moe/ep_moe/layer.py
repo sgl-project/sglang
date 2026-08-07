@@ -103,7 +103,9 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        if is_humming:
+        if get_moe_a2a_backend().is_shared_ep():
+            self.deprecate_flag = True
+        elif is_humming:
             self.deprecate_flag = True
         elif _use_aiter:
             self.deprecate_flag = True
@@ -357,6 +359,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
         or get_moe_a2a_backend().is_pplx()
+        or get_moe_a2a_backend().is_shared_ep()
     ):
         return DeepEPMoE
     return FusedMoE
