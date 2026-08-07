@@ -34,7 +34,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
     _apply_rotary_emb_complex,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -64,6 +63,26 @@ def sinusoidal_embedding_1d(dim, position):
     )
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x.to(position.dtype)
+
+
+def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
+    # 3d rope precompute
+    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta)
+    h_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
+    w_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
+    return f_freqs_cis, h_freqs_cis, w_freqs_cis
+
+
+def precompute_freqs_cis(
+    dim: int, end: int = 1024, theta: float = 10000.0, s: float = 1.0
+):
+    # 1d rope precompute
+    # Note: s parameter is used for audio-specific scaling (e.g., tps adjustment)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].double() / dim))
+    pos = torch.arange(end, dtype=torch.float64, device=freqs.device) * s
+    freqs = torch.outer(pos, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
 
 
 class SelfAttention(nn.Module):
@@ -458,19 +477,14 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
-        self.num_attention_heads = num_heads
-        self.hidden_size = dim
+        self.freqs = None
 
-        d = self.hidden_size // self.num_attention_heads
-        self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        self.rotary_emb = NDRotaryEmbedding(
-            rope_dim_list=self.rope_dim_list, rope_theta=10000, dtype=torch.float64
-        )
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
-
+        self.hidden_size = dim
+        self.num_attention_heads = num_heads
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
         self.cnt = 0
@@ -489,6 +503,12 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.accumulated_rel_l1_distance_even = 0
         self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
+
+    def _init_freqs(self):
+        if self.freqs is not None:
+            return
+        head_dim = self.dim // self.num_heads
+        self.freqs = precompute_freqs_cis_3d(head_dim)
 
     def patchify(
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
@@ -536,11 +556,18 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         x, (f, h, w) = self.patchify(x)
 
-        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
-            grid_size=(f, h, w),
-            device=x.device,
+        freqs = (
+            torch.cat(
+                [
+                    self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                    self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                    self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+                ],
+                dim=-1,
+            )
+            .reshape(f * h * w, 1, -1)
+            .to(x.device)
         )
-        freqs = torch.complex(freqs_cos, freqs_sin).unsqueeze(-2)
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)
