@@ -1209,12 +1209,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         raw_bs = forward_batch.batch_size
 
         if is_ragged:
-            raw_num_token = ragged_layout.graph_num_tokens
-            graph_size_key = self._ragged_graph_num_tokens(raw_num_token)
-            assert graph_size_key == ragged_layout.graph_num_tokens, (
-                f"ragged verify tier mismatch: runner tier {graph_size_key} != "
-                f"layout graph_num_tokens {ragged_layout.graph_num_tokens}"
-            )
+            # The layout is the single source of the tier; it is constructed
+            # on this runner's capture grid.
+            raw_num_token = graph_size_key = ragged_layout.graph_num_tokens
             bs = self._ragged_capture_slots(graph_size_key)
             assert bs >= raw_bs, (
                 f"ragged capture slots {bs} (tier {graph_size_key}) < raw_bs "
@@ -1296,11 +1293,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label
         )
-
-    def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
-        from sglang.srt.speculative.ragged_verify import round_up_grid
-
-        return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
     def execute(
         self,

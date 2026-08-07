@@ -67,6 +67,14 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     verify_cache_loc_2d: torch.Tensor
 
 
+class VerifyTierResolution(msgspec.Struct, frozen=True):
+    tier_num_reqs: int
+    tier_num_tokens: Optional[int]
+    graph_num_tokens_floor: int
+    # None when the floor is empty or no ragged capture grid exists.
+    graph_num_tokens: Optional[int]
+
+
 class DSparkVerifyPlanner:
     def __init__(
         self,
@@ -471,41 +479,23 @@ class DSparkVerifyPlanner:
                 )
             return None
         bs = int(verify_lens.shape[0])
-        tier_num_reqs = bs if global_num_reqs is None else global_num_reqs
-        if dp_tier_num_tokens is not None:
-            assert global_num_reqs is not None, (
-                "dp tier agreement requires the dp-global request count; "
-                "keying the tier off the local bs diverges across ranks"
-            )
-            tier_num_tokens = dp_tier_num_tokens
-        elif self._dynamic_graph_tier and budget is not None:
-            tier_num_tokens = local_verify_tier_num_tokens(
-                bs=tier_num_reqs,
-                verify_token_budget=budget,
-                verify_num_draft_tokens=self.verify_num_draft_tokens,
-                min_verify_len=self._schedule_cfg.min_verify_len,
-            )
-        else:
-            tier_num_tokens = None
+        tier = self._resolve_verify_tier(
+            num_reqs=bs,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+            budget=budget,
+        )
         if ragged_layout_exceeds_captured_grid(
-            num_reqs=tier_num_reqs,
+            num_reqs=tier.tier_num_reqs,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
-            tier_tokens_hint=tier_num_tokens,
+            tier_tokens_hint=tier.tier_num_tokens,
         ):
             return None
-        graph_num_tokens_floor = verify_layout_graph_num_tokens_floor(
-            num_reqs=tier_num_reqs,
-            ragged_verify_mode=self._ragged_verify_mode,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            tier_num_tokens=tier_num_tokens,
-        )
-        capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
-            graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+        graph_num_tokens_floor = tier.graph_num_tokens_floor
+        if tier.graph_num_tokens is not None:
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens, graph_num_tokens=tier.graph_num_tokens
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
@@ -539,14 +529,40 @@ class DSparkVerifyPlanner:
         # it does not touch the layout's own tier computation.
         if not self._align_verify_tokens_to_graph_tier or budget is None:
             return budget
-        tier_num_reqs = (
-            int(req_pool_indices.shape[0])
-            if global_num_reqs is None
-            else global_num_reqs
+        tier = self._resolve_verify_tier(
+            num_reqs=int(req_pool_indices.shape[0]),
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+            budget=budget,
         )
+        if tier.graph_num_tokens is None:
+            return budget
+        return graph_tier_fill_budget(
+            graph_num_tokens=tier.graph_num_tokens,
+            bs=int(req_pool_indices.shape[0]),
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            min_verify_len=self._schedule_cfg.min_verify_len,
+        )
+
+    def _resolve_verify_tier(
+        self,
+        *,
+        num_reqs: int,
+        global_num_reqs: Optional[int],
+        dp_tier_num_tokens: Optional[int],
+        budget: Optional[int],
+    ) -> VerifyTierResolution:
+        """Single source for the ragged verify graph tier. Token sources, in
+        priority order: the DP-gathered cross-rank tier, the local
+        budget-derived tier (dynamic), or the full-block floor (None)."""
+        tier_num_reqs = num_reqs if global_num_reqs is None else global_num_reqs
         if dp_tier_num_tokens is not None:
+            assert global_num_reqs is not None, (
+                "dp tier agreement requires the dp-global request count; "
+                "keying the tier off the local bs diverges across ranks"
+            )
             tier_num_tokens = dp_tier_num_tokens
-        elif self._dynamic_graph_tier:
+        elif self._dynamic_graph_tier and budget is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
                 verify_token_budget=budget,
@@ -563,14 +579,16 @@ class DSparkVerifyPlanner:
             tier_num_tokens=tier_num_tokens,
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        if graph_num_tokens_floor <= 0 or capture_num_tokens is None:
-            return budget
-        graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
-        return graph_tier_fill_budget(
+        graph_num_tokens = (
+            round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            if graph_num_tokens_floor > 0 and capture_num_tokens is not None
+            else None
+        )
+        return VerifyTierResolution(
+            tier_num_reqs=tier_num_reqs,
+            tier_num_tokens=tier_num_tokens,
+            graph_num_tokens_floor=graph_num_tokens_floor,
             graph_num_tokens=graph_num_tokens,
-            bs=int(req_pool_indices.shape[0]),
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            min_verify_len=self._schedule_cfg.min_verify_len,
         )
 
     def _schedule_verify_lens(
