@@ -170,7 +170,18 @@ class _FullGraphRunner:
         sig = signature_kwargs(kwargs)
         if self.sig is not None and sig != self.sig:
             self.disabled = True
-            logger.warning("DiT full CUDA graph: signature changed, eager fallback")
+            if len(sig) == len(self.sig):
+                changed = [
+                    f"{prev} != {cur}"
+                    for prev, cur in zip(self.sig, sig)
+                    if prev != cur
+                ]
+            else:
+                changed = ["kwarg set changed"]
+            logger.warning(
+                "DiT full CUDA graph: signature changed, eager fallback: %s",
+                "; ".join(changed[:4]) or "?",
+            )
             return self.model(**kwargs)
         if self.eager_left > 0:
             self.eager_left -= 1
