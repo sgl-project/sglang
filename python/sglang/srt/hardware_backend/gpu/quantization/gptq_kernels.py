@@ -10,7 +10,6 @@ from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.parameter import BasevLLMParameter, permute_param_layout_
 from sglang.srt.layers.quantization.marlin_utils import (
     apply_gptq_marlin_linear,
-    check_marlin_supports_shape,
     marlin_is_k_full,
     marlin_make_empty_g_idx,
     marlin_make_workspace,
@@ -18,6 +17,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
     marlin_sort_g_idx,
     marlin_zero_points,
+    verify_marlin_supports_shape,
 )
 from sglang.srt.layers.quantization.utils import (
     get_scalar_types,
@@ -136,7 +136,7 @@ class GPTQMarlinLinearKernel:
         device = getattr(layer, "qweight").device
         c = self.kernel_config
 
-        check_marlin_supports_shape(
+        verify_marlin_supports_shape(
             c.partition_weight_shape[1],  # out_features
             c.partition_weight_shape[0],  # in_features
             c.full_weight_shape[0],  # in_features
