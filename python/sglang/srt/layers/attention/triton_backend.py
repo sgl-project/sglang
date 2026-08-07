@@ -179,8 +179,23 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # The DSPARK draft's KV never passes through _set_kv_buffer: dspark_kv_inject
+        # writes it with draft_model.write_target_hidden_kv() at the RAW cache_loc,
+        # so it is skipped by both the `loc // dcp_size` shard transform and the
+        # dcp_kv_mask owner filter and every rank ends up with a FULL copy. Running
+        # the DCP attention paths over a replicated pool is not just wasteful, it is
+        # wrong: _forward_extend_dcp merges the per-rank partials as if they covered
+        # disjoint keys, which inflates the prefix LSE by log(W) and over-weights the
+        # committed prefix against the in-hand window by a factor of W. A replicated
+        # pool is exactly the non-DCP case, so drive these paths with dcp_size = 1.
+        spec_alg = model_runner.spec_algorithm
+        self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        if self.is_dspark_draft:
+            self.dcp_size = 1
+            self.dcp_rank = 0
+        else:
+            self.dcp_size = get_parallel().attn_dcp_size
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -1243,6 +1258,22 @@ class TritonAttnBackend(AttentionBackend):
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
+            if self.use_mla:
+                # The MLA pool's set_kv_buffer owner-filters by `loc % dcp_size`
+                # but never divides, and the hybrid pool drops `dcp_kv_mask` on
+                # its MLA branch, so the pre-divided loc below would have the
+                # owner filter applied twice. The set_mla_kv_buffer kernel is
+                # DCP-aware end to end (owner filter AND `loc // dcp_size`), so
+                # hand it the RAW virtual loc and the latent split into
+                # nope/rope.
+                kv_lora_rank = v.shape[-1]
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k[..., :kv_lora_rank],
+                    k[..., kv_lora_rank:],
+                )
+                return
             loc = forward_batch.out_cache_loc // self.dcp_size
             if (
                 forward_batch.positions is not None

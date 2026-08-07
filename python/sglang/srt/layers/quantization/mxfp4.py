@@ -872,11 +872,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .view(-1, n)
                     )
 
-            k3_situ_a8w4 = (
-                os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
-                and getattr(layer.moe_runner_config, "activation", None) == "situ"
-            )
-            use_aiter_gu_interleave = k3_situ_a8w4 or (
+            # aiter serves SiTUv2 from the preshuffled guinterleaved layout for
+            # EVERY activation dtype -- a8w4, a16w4 and a4w4 all reach the same
+            # mixed_moe / a16wmix kernels, which the a16w4 numeric test exercises
+            # through shuffle_weight_a16w4. The activation dtype is chosen inside
+            # aiter (AITER_SITUV2_A8W4), so it is the wrong key to select the
+            # layout with: keying off it hands a16w4 the non-guinterleaved
+            # weights. K3 sets gate_up_interleaved=False, so the second clause
+            # below cannot rescue it either. Key on the activation instead.
+            k3_situ = getattr(layer.moe_runner_config, "activation", None) == "situ"
+            use_aiter_gu_interleave = k3_situ or (
                 envs.SGLANG_USE_AITER_MOE_GU_ITLV.get() and gate_up_interleaved
             )
             if use_aiter_gu_interleave:
