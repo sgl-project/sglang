@@ -101,6 +101,13 @@ _MM_GEN_FILE_BACKENDS = {
     "unit/sana_wm/test_streaming_cached.py": ("AMD",),
     "unit/sana_wm/test_streaming_stage.py": ("AMD",),
     "unit/sana_wm/test_streaming_vae.py": ("AMD",),
+    # Enabled with small test-harness stub fixes.
+    "unit/progressive_resolution/test_progressive.py": ("AMD",),
+    "unit/realtime/test_lingbot_causal_denoising.py": ("AMD",),
+    "unit/sana_wm/test_streaming_realtime_path.py": ("AMD",),
+    # Enabled with a LAPACK-availability skip (ROCm 7.2.0/CUDA run; 7.0.0 skips).
+    "unit/sana_wm/test_pipeline_config.py": ("AMD",),
+    "unit/sana_wm/test_realtime_chain.py": ("AMD",),
 }
 
 # Filenames that match `test_*.py` by convention but contain no real tests
