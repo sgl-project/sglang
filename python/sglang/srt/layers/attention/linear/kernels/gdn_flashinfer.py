@@ -38,6 +38,15 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
 
+def _ensure_32_byte_aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """Meet the BF16-state CuTe kernel's ``assumed_align=32`` contract.
+
+    A logically contiguous view may retain a non-zero storage offset, so
+    ``contiguous()`` alone does not guarantee an aligned data pointer.
+    """
+    return tensor if tensor.data_ptr() % 32 == 0 else tensor.clone()
+
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
@@ -232,6 +241,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         value_fi = v.view(batch_size, 1, num_v_heads, head_v_dim)
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
+        if self.use_state_pool:
+            a_fi = _ensure_32_byte_aligned(a_fi)
+            b_fi = _ensure_32_byte_aligned(b_fi)
 
         if self.use_state_pool:
             output_fi, _ = self._decode_fn(
@@ -406,6 +418,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
+        if self.use_state_pool:
+            a_mtp = _ensure_32_byte_aligned(a_mtp)
+            b_mtp = _ensure_32_byte_aligned(b_mtp)
 
         intermediate_states_buffer_mtp = intermediate_states_buffer
         if self.use_state_pool and intermediate_states_buffer is not None:
