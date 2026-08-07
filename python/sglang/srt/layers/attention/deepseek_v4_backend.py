@@ -502,6 +502,10 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        if envs.SGLANG_OPT_USE_CP_COMPRESS.get():
+            self.initialize_cp_compressor_states(
+                self.device, int(model_runner.server_args.chunked_prefill_size)
+            )
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
@@ -1604,6 +1608,30 @@ class DeepseekV4AttnBackend(
                 swa_loc=swa_loc,
                 cache_nope_fp8_rope_bf16_pack=swa_k_pack,
             )
+
+    def can_store_cache_cp_direct(self) -> bool:
+        return self.token_to_kv_pool.has_direct_cp_swa_store()
+
+    def store_cache_cp_direct(
+        self, layer_id: int, local_swa_k: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Store this rank's round-robin token rows into all replicated caches."""
+        if not self.can_store_cache_cp_direct():
+            raise RuntimeError("direct CP cache store is not enabled")
+        parallel = get_parallel()
+        swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        local_swa_loc = swa_loc[parallel.attn_cp_rank :: parallel.attn_cp_size]
+        local_rows = local_swa_loc.numel()
+        if local_swa_k.shape[0] < local_rows:
+            raise RuntimeError(
+                f"rank-local KV has {local_swa_k.shape[0]} rows, expected at "
+                f"least {local_rows}"
+            )
+        self.token_to_kv_pool.set_swa_key_buffer_radix_cp_direct(
+            layer_id=layer_id,
+            swa_loc=local_swa_loc.to(torch.int32).contiguous(),
+            cache_k=local_swa_k[:local_rows].contiguous(),
+        )
 
     def forward(
         self,

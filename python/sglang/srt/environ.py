@@ -1206,6 +1206,13 @@ class Envs:
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    # Let each DSV4 CP rank publish its local BF16 KV rows directly into the
+    # replicated packed FlashMLA cache through a multicast mapping. This removes
+    # the BF16 KV all-gather and rerange materialization.
+    SGLANG_OPT_DSV4_CP_DIRECT_KV_STORE = EnvBool(False)
+    # CP4 prefill: publish per-window compressor states through symmetric
+    # memory instead of all-gathering token-level FP32 projections.
+    SGLANG_OPT_USE_CP_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # Deprecated: DSV4 compressor V2 is always used.

@@ -21,7 +21,12 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_server_args, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        direct_cp_store: bool = False,
     ):
         super().__init__(
             size,
@@ -79,10 +85,70 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
+        self.direct_cp_store = bool(direct_cp_store)
+        self.direct_cp_handle = None
+        self._direct_cp_root = None
         self._create_buffers()
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            if self.direct_cp_store:
+                if self.custom_mem_pool is not None:
+                    raise RuntimeError(
+                        "DSV4 direct CP KV store is incompatible with a custom KV "
+                        "memory pool"
+                    )
+                import torch.distributed._symmetric_memory as symm_mem
+
+                parallel = get_parallel()
+                group = parallel.attn_cp_group.device_group
+                world_size = parallel.attn_cp_size
+                if world_size != 4:
+                    raise RuntimeError(
+                        "DSV4 direct CP KV store currently requires attn CP size 4, "
+                        f"got {world_size}"
+                    )
+                num_pages = (self.size + self.page_size + 1) // self.page_size
+                bytes_per_token = self.get_bytes_per_token()
+                if bytes_per_token != 584 or self.store_dtype != torch.uint8:
+                    raise RuntimeError(
+                        "DSV4 direct CP KV store requires the 584-byte packed "
+                        "FlashMLA uint8 cache layout"
+                    )
+                self.kv_cache_total_dim = bytes_per_token
+                self.bytes_per_page_padded = (
+                    ceil_div(self.page_size * bytes_per_token, 576) * 576
+                )
+                symm_mem.set_signal_pad_size(
+                    max(symm_mem.get_signal_pad_size(), world_size * 4)
+                )
+                with torch.inference_mode(False), torch.no_grad():
+                    root = symm_mem.empty(
+                        (self.layer_num, num_pages, self.bytes_per_page_padded),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                root.zero_()
+                handle = symm_mem.rendezvous(root, group=group)
+                if handle.multicast_ptr == 0:
+                    raise RuntimeError(
+                        "DSV4 direct CP KV store requires an NVLink multicast mapping"
+                    )
+                if handle.rank != parallel.attn_cp_rank:
+                    raise RuntimeError(
+                        f"symmetric-memory rank {handle.rank} != attn CP rank "
+                        f"{parallel.attn_cp_rank}"
+                    )
+                self._direct_cp_root = root
+                self.direct_cp_handle = handle
+                self.kv_buffer = list(root.unbind(0))
+                logger.info(
+                    "Using direct CP publication into the packed DSV4 SWA cache "
+                    "(%d layers, %.2f GiB)",
+                    self.layer_num,
+                    root.nbytes / (1024**3),
+                )
+                return
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
@@ -570,6 +636,31 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
+        direct_cp_store = envs.SGLANG_OPT_DSV4_CP_DIRECT_KV_STORE.get()
+        if direct_cp_store:
+            server_args = get_server_args()
+            if _is_hip:
+                raise RuntimeError("DSV4 direct CP KV store is CUDA-only")
+            if self._unified_kv:
+                raise RuntimeError(
+                    "DSV4 direct CP KV store does not support unified KV layout"
+                )
+            if enable_memory_saver:
+                raise RuntimeError(
+                    "DSV4 direct CP KV store does not support KV cache "
+                    "pause/resume"
+                )
+            if (
+                not server_args.enable_dsa_prefill_context_parallel
+                or server_args.dsa_prefill_cp_mode != "round-robin-split"
+                or get_parallel().attn_cp_size != 4
+                or server_args.nnodes != 1
+                or swa_page_size != 256
+            ):
+                raise RuntimeError(
+                    "DSV4 direct CP KV store requires single-node CP4, DSA prefill "
+                    "round-robin split, and SWA page size 256"
+                )
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -607,6 +698,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
+                direct_cp_store=direct_cp_store,
             )
 
             c4_kv_pool_type = DeepSeekV4SingleKVPool
@@ -832,6 +924,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_memory_saver: bool,
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
+        direct_cp_store: bool = False,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
         is the model-wide page_size (== ``page_size`` for the SWA pool, larger
@@ -848,6 +941,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            direct_cp_store=direct_cp_store,
         )
 
     def _make_indexer_pool(
@@ -1169,6 +1263,40 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         return self.swa_kv_pool.set_key_buffer_fused(
             self._swa_local_layer_id(layer_id), swa_loc, cache_k
+        )
+
+    def has_direct_cp_swa_store(self) -> bool:
+        return bool(self.swa_kv_pool is not None and self.swa_kv_pool.direct_cp_store)
+
+    def set_swa_key_buffer_radix_cp_direct(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        """Publish rank-local BF16 rows into every rank's packed SWA cache."""
+        pool = self.swa_kv_pool
+        if pool is None or not pool.direct_cp_store:
+            raise RuntimeError("direct CP SWA store was not initialized")
+        if pool.direct_cp_handle is None or pool._direct_cp_root is None:
+            raise RuntimeError("direct CP SWA symmetric-memory handle is missing")
+
+        from sglang.kernels.ops.attention.dsv4.direct_cp_kv_store import (
+            direct_cp_kv_store,
+        )
+
+        parallel = get_parallel()
+        cache = pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+        cache_offset = cache.data_ptr() - pool._direct_cp_root.data_ptr()
+        direct_cp_kv_store(
+            cache=cache,
+            handle=pool.direct_cp_handle,
+            cache_multicast=pool.direct_cp_handle.multicast_ptr + cache_offset,
+            local_kv=cache_k,
+            local_indices=swa_loc,
+            rank=parallel.attn_cp_rank,
+            world_size=parallel.attn_cp_size,
+            page_size=pool.page_size,
         )
 
     def set_swa_key_buffer_radix_fused_norm_rope(

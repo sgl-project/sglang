@@ -422,7 +422,7 @@ class Compressor(BaseFusedOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self.compute_kv_score_local(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -433,6 +433,10 @@ class Compressor(BaseFusedOp):
                 torch.cuda.current_stream(),
             )
         return kv_score
+
+    def compute_kv_score_local(self, x: torch.Tensor) -> torch.Tensor:
+        """Project this rank's local CP token shard without materializing peers."""
+        return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def forward_native(
         self,

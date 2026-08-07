@@ -1138,15 +1138,23 @@ class MQALayer(MqaAttentionBase):
             kv = None
 
             if not unified and use_cp:
-                # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
+                # DSA CP: either publish each rank's local rows directly into all
+                # packed FlashMLA caches, or materialize the legacy full BF16 KV.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                if attn_backend.can_store_cache_cp_direct():
+                    attn_backend.store_cache_cp_direct(
+                        layer_id=self.layer_id,
+                        local_swa_k=kv,
+                        forward_batch=forward_batch,
+                    )
+                    kv = None
+                else:
+                    kv = cp_all_gather_rerange_output(
+                        kv.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -1199,20 +1207,28 @@ class MQALayer(MqaAttentionBase):
                         torch.cuda.current_stream(),
                     )
             elif use_cp:
-                # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-                # write to the FlashMLA cache after gather.
+                # NSA CP: publish rank-local rows directly into the replicated
+                # packed cache when enabled; otherwise retain the BF16 gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+                if attn_backend.can_store_cache_cp_direct():
+                    attn_backend.store_cache_cp_direct(
+                        layer_id=self.layer_id,
+                        local_swa_k=kv,
+                        forward_batch=forward_batch,
+                    )
+                    kv = None
+                else:
+                    kv = cp_all_gather_rerange_output(
+                        kv.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    attn_backend.store_cache(
+                        layer_id=self.layer_id,
+                        swa_k=kv,
+                        forward_batch=forward_batch,
+                    )
             else:
                 self._compute_kv_to_cache(
                     x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
