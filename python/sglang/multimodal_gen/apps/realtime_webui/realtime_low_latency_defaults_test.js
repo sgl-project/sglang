@@ -77,6 +77,16 @@ assert.match(
   "webui should load the deployment profile before app.js",
 );
 assert.match(
+  indexHtml,
+  /<option value="adaptive" selected>Adaptive \(smooth, bounded lag\)<\/option>/,
+  "webui should expose adaptive playback as the default smooth low-lag mode",
+);
+assert.match(
+  appJs,
+  /playbackParam === "live" \|\| playbackParam === "timeline" \|\| playbackParam === "adaptive"/,
+  "webui should accept playback=adaptive from the URL",
+);
+assert.match(
   appJs,
   /const DEFAULT_PREVIEW_OUTPUT_QUALITY\s*=\s*55;/,
   "8-GPU webui profile should favor steady public websocket playback",

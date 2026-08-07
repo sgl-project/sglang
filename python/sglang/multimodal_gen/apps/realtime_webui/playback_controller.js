@@ -169,7 +169,7 @@
 
       if (this.pendingEventId && eventId >= this.pendingEventId) {
         const oldEventFrameCount = this.#oldEventFrameCount(eventId);
-        if (this.mode === "live") {
+        if (this.mode !== "timeline") {
           const graceFrames = this.#eventGraceFrames();
           const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
           if (dropCount > 0) {
@@ -209,8 +209,7 @@
 
       const bufferMs = this.bufferDurationMs;
       if (
-        this.mode === "live" &&
-        !this.config.lowLatencyPlayback &&
+        this.#usesTargetLeadHold() &&
         this.config.holdForTargetLead &&
         hasPendingInput &&
         this.receiveStalled &&
@@ -223,7 +222,7 @@
       }
 
       if (
-        !this.config.lowLatencyPlayback &&
+        this.#usesTargetLeadHold() &&
         this.config.holdForTargetLead &&
         hasPendingInput &&
         this.buffering &&
@@ -278,7 +277,7 @@
     }
 
     get maxLeadMs() {
-      if (this.config.lowLatencyPlayback) {
+      if (this.#isLowLatencyMode()) {
         return this.targetLeadMs +
           this.config.lowLatencyMaxLeadFrames * 1000 / Math.max(1, this.sourceFps);
       }
@@ -467,7 +466,7 @@
       const droppedFrames = [];
       if (this.mode === "timeline") return droppedFrames;
       droppedFrames.push(...this.#trimStaleBacklog(now));
-      if (this.config.lowLatencyPlayback) {
+      if (this.#isLowLatencyMode()) {
         const backlogDropStart = droppedFrames.length;
         if (this.queue.length > 1 && this.bufferDurationMs > this.maxLeadMs) {
           const newestChunk = this.queue.at(-1).chunkIndex;
@@ -505,7 +504,9 @@
     }
 
     #normalizeMode(mode) {
-      return mode === "timeline" ? "timeline" : "live";
+      if (mode === "timeline") return "timeline";
+      if (mode === "adaptive") return "adaptive";
+      return "live";
     }
 
     #trimStaleBacklog(now) {
@@ -549,7 +550,7 @@
     }
 
     #eventGraceFrames() {
-      if (this.config.lowLatencyPlayback) return 0;
+      if (this.#isLowLatencyMode()) return 0;
       const byTime = Math.max(
         1,
         Math.round(this.sourceFps * this.#eventCutoverMaxMs() / 1000),
@@ -569,6 +570,14 @@
       return this.pendingEventCutoverMode === "settle"
         ? this.config.settleEventCutoverMaxFrames
         : this.config.eventCutoverMaxFrames;
+    }
+
+    #isLowLatencyMode() {
+      return this.mode === "live" && this.config.lowLatencyPlayback;
+    }
+
+    #usesTargetLeadHold() {
+      return this.mode !== "timeline" && !this.#isLowLatencyMode();
     }
 
     #startLeadMs() {

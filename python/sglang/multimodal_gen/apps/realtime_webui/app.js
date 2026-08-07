@@ -448,7 +448,7 @@ const scratchCtx = scratchCanvas.getContext("2d", { alpha: false });
 const recordingCanvas = document.createElement("canvas");
 const recordingCtx = recordingCanvas.getContext("2d", { alpha: false });
 const playbackController = new RealtimePlaybackController({
-  mode: "live",
+  mode: "adaptive",
   targetFps: DEFAULT_TARGET_FPS,
   lowLatencyPlayback: true,
   holdForTargetLead: true,
@@ -958,8 +958,14 @@ function isWorkerDecodableRawContentType(contentType) {
 
 function updateStats() {
   const playback = playbackController.snapshot();
+  const playbackLabel =
+    playback.mode === "timeline"
+      ? "full timeline"
+      : playback.mode === "adaptive"
+      ? "adaptive"
+      : "low latency";
   const queueParts = [
-    playback.mode === "timeline" ? "full timeline" : "low latency",
+    playbackLabel,
     `buffer ${formatMs(playback.bufferMs)}`,
   ];
   queueParts.push(`q ${playback.queueFrames}`);
@@ -1000,18 +1006,22 @@ function syncPlaybackTargetFps() {
 }
 
 function selectedPlaybackMode() {
-  return $("playbackMode")?.value === "timeline" ? "timeline" : "live";
+  const value = $("playbackMode")?.value;
+  if (value === "timeline" || value === "adaptive") return value;
+  return "live";
 }
 
 function syncPlaybackMode({ addToHistory = true } = {}) {
   const mode = selectedPlaybackMode();
   playbackController.setMode(mode);
   if (addToHistory) {
-    addHistory(
+    const historyText =
       mode === "timeline"
         ? "playback · full timeline (no frame skipping)"
-        : "playback · low latency (may skip old frames)",
-    );
+        : mode === "adaptive"
+        ? "playback · adaptive (smooth, bounded lag)"
+        : "playback · low latency (may skip old frames)";
+    addHistory(historyText);
   }
   trimDecodeQueue();
   updateStats();
@@ -3946,7 +3956,7 @@ async function applyQueryParams() {
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
   const playbackParam = params.get("playback");
-  if (playbackParam === "live" || playbackParam === "timeline") {
+  if (playbackParam === "live" || playbackParam === "timeline" || playbackParam === "adaptive") {
     $("playbackMode").value = playbackParam;
   }
   const srParam = params.get("sr");

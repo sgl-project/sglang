@@ -301,6 +301,48 @@ function timelineModePreservesFramesAcrossEventCutover() {
   assert.equal(controller.queue[24].eventId, 5);
 }
 
+function adaptiveModeKeepsBoundedBacklogWithoutLowLatencyJump() {
+  const controller = new RealtimePlaybackController({
+    mode: "adaptive",
+    targetFps: 25,
+    lowLatencyPlayback: true,
+    holdForTargetLead: true,
+    minTargetLeadMs: 220,
+    maxTargetLeadMs: 420,
+    lowLatencyMaxLeadFrames: 1,
+  });
+  let now = 100;
+  for (let chunk = 0; chunk < 13; chunk += 1) {
+    enqueueChunk(controller, { chunk, now, durationMs: 480 });
+    now += 20;
+  }
+  const snapshot = controller.snapshot();
+  assert.equal(snapshot.mode, "adaptive");
+  assert.ok(snapshot.droppedFrames > 0);
+  assert.equal(snapshot.lastDropReason, "backlog");
+}
+
+function adaptiveModePreservesSmallGraceAcrossEventCutover() {
+  const controller = new RealtimePlaybackController({
+    mode: "adaptive",
+    targetFps: 25,
+    lowLatencyPlayback: true,
+  });
+  enqueueChunk(controller, { chunk: 1, frameCount: 24, durationMs: 960, now: 1000 });
+  controller.noteInputEvent(5, 1050);
+  const result = enqueueChunk(controller, {
+    chunk: 2,
+    eventId: 5,
+    frameCount: 12,
+    durationMs: 480,
+    now: 1150,
+  });
+  assert.ok(result.cutover);
+  assert.equal(result.droppedFrames.length, 21);
+  assert.equal(controller.queue[0].chunk, 1);
+  assert.equal(controller.queue[3].eventId, 5);
+}
+
 function switchingBackToLiveTrimsTimelineBacklog() {
   const controller = new RealtimePlaybackController({
     mode: "timeline",
@@ -383,6 +425,8 @@ settleEventCutoverKeepsOnlySmallOldFrameGrace();
 staleFramesAfterWallClockPauseResumeAtFreshestChunk();
 timelineModeNeverDropsBacklog();
 timelineModePreservesFramesAcrossEventCutover();
+adaptiveModeKeepsBoundedBacklogWithoutLowLatencyJump();
+adaptiveModePreservesSmallGraceAcrossEventCutover();
 switchingBackToLiveTrimsTimelineBacklog();
 lowLatencyModeFollowsMeasuredSourceInsteadOfDrainingAtTargetFps();
 lowLatencyModePreservesNewestChunkAndCutsOldActionImmediately();

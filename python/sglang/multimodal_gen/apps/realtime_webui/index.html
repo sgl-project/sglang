@@ -64,7 +64,8 @@
         </div>
         <label>Playback
           <select id="playbackMode">
-            <option value="live" selected>Low latency (may skip)</option>
+            <option value="adaptive" selected>Adaptive (smooth, bounded lag)</option>
+            <option value="live">Low latency (may skip)</option>
             <option value="timeline">Full timeline (no frame skipping)</option>
           </select>
         </label>
@@ -237,9 +238,9 @@
       </section>
     </main>
   <script src="./runtime-config.js"></script>
-  <script src="./playback_controller.js?v=realtime-playback-v22"></script>
+  <script src="./playback_controller.js?v=realtime-playback-v23"></script>
   <script src="./trace_topology.js?v=realtime-trace-topology-v6"></script>
   <script src="./trace_transport.js?v=realtime-trace-http-v2"></script>
-  <script src="./app.js?v=realtime-production-gateway-v10"></script>
+  <script src="./app.js?v=realtime-production-gateway-v11"></script>
 </body>
 </html>
