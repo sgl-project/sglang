@@ -435,6 +435,20 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _apply_sm120_fp8_wo_a_gemm_default() -> None:
+    """Gate the SM120 FP8 W_o_A GEMM override on the DeepGEMM ue8m0 capability.
+
+    Builds that cannot run the GEMM (DEEPGEMM_SCALE_UE8M0 false) get
+    SGLANG_OPT_FP8_WO_A_GEMM forced off. Capable builds are left untouched, so
+    they keep the global default or an explicit setting. The capability check in
+    `_handle_environment_variables` stays authoritative.
+    """
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+
+    if not DEEPGEMM_SCALE_UE8M0:
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -5310,9 +5324,10 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
-                # SM120 lacks tcgen05/TMEM: disable features that depend on
-                # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                # Keep the W_o_A DeepGEMM default only when the installed build
+                # supports SM120; disable features that require >99KB SMEM
+                # (topk_v2).
+                _apply_sm120_fp8_wo_a_gemm_default()
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
