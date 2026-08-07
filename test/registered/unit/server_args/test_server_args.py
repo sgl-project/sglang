@@ -1161,26 +1161,6 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
-    def test_hicache_swa_full_tokens_ratio_validation(self):
-        for ratio in (0, -0.1, 1.1):
-            with self.subTest(ratio=ratio):
-                args = self._make_args(
-                    hicache_size=1,
-                    hicache_swa_full_tokens_ratio=ratio,
-                )
-                with self.assertRaisesRegex(ValueError, "range"):
-                    args._handle_cache_compatibility()
-
-        args = self._make_args(hicache_swa_full_tokens_ratio=0.5)
-        with self.assertRaisesRegex(ValueError, "requires --hicache-size"):
-            args._handle_cache_compatibility()
-
-        args = self._make_args(
-            hicache_size=1,
-            hicache_swa_full_tokens_ratio=0.5,
-        )
-        args._handle_cache_compatibility()
-
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

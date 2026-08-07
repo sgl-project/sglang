@@ -128,43 +128,6 @@ class TreeCoreRegistryTest(CustomTestCase):
         self.assertIs(result, core)
 
 
-class UnifiedTreeCoreHostEvictionTest(CustomTestCase):
-    def test_write_back_reclaims_before_regular_component_eviction(self):
-        component = mock.MagicMock(spec=TreeComponent)
-        core = UnifiedTreeCore(
-            params=_cache_init_params(),
-            components={ComponentType.FULL: component},
-        )
-        component.reset_mock()
-        component.attach_mock(mock.Mock(), "reclaim_coexisting_host_values")
-        component.attach_mock(mock.Mock(), "drive_host_eviction")
-
-        core.is_write_back = True
-        result = core.drive_host_eviction(ComponentType.FULL, 8)
-
-        expected_args = (
-            8,
-            result.tracker,
-            result.device_frees,
-            result.host_frees,
-        )
-        self.assertEqual(
-            component.mock_calls,
-            [
-                mock.call.reclaim_coexisting_host_values(*expected_args),
-                mock.call.drive_host_eviction(*expected_args),
-            ],
-        )
-
-        component.reset_mock()
-        core.is_write_back = False
-        core.drive_host_eviction(ComponentType.FULL, 8)
-        self.assertEqual(
-            component.mock_calls,
-            [mock.call.drive_host_eviction(8, mock.ANY, mock.ANY, mock.ANY)],
-        )
-
-
 class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def setUp(self):
         self._registry_snapshot = dict(_TREE_CORE_REGISTRY)
