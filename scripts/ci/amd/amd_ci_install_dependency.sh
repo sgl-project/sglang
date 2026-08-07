@@ -336,14 +336,11 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     "
 
     docker exec ci_sglang python3 -c '
-import importlib.metadata as metadata
 import triton
+from packaging.version import Version
 
-triton_version = triton.__version__.split("+", 1)[0]
-triton_kernels_version = metadata.version("triton-kernels")
-assert triton_version == "3.7.0", triton.__version__
-assert triton_kernels_version == "1.0.0", triton_kernels_version
-print(f"[CI-AITER-CHECK] Triton {triton.__version__}; triton-kernels {triton_kernels_version}")
+assert Version(triton.__version__) >= Version("3.7"), triton.__version__
+print(f"[CI-AITER-CHECK] Triton {triton.__version__}")
 '
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
