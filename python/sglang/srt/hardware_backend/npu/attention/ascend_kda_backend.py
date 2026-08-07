@@ -491,3 +491,144 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             token_value, dense_token_indices, num_dense_tokens
         )
         return dense.unsqueeze(0) if has_leading_singleton else dense
+
+
+class AscendKDAHybridLinearAttnBackend:
+    """KDA-specific hybrid backend with strided destination state mover.
+
+    ``AscendHybridLinearAttnBackend`` uses ``move_intermediate_cache`` which
+    assumes a contiguous destination layout. KDA's temporal SSM state on NPU
+    is transposed (-1, -2) and requires the strided variant
+    ``move_intermediate_cache_kda`` to preserve correct (V, K) indexing.
+
+    This class overrides only ``update_mamba_state_after_mtp_verify`` to
+    substitute the KDA-aware mover; the rest of the hybrid behaviour is
+    inherited unchanged.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        # Delay importing AscendHybridLinearAttnBackend to avoid circular deps.
+        from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+            AscendHybridLinearAttnBackend as _Base,
+        )
+
+        # Dynamically create a subclass of _Base with our override.
+        class _AscendKDAHybrid(_Base):
+            def update_mamba_state_after_mtp_verify(
+                self,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                model,
+                req_pool_indices=None,
+            ):
+                from sgl_kernel_npu.mamba.mamba_state_update_triton import (
+                    conv_state_rollback,
+                    move_intermediate_cache_kda,
+                )
+                from sgl_kernel_npu.mamba.speculative_state_scatter import (
+                    speculative_state_scatter_npu,
+                )
+
+                del req_pool_indices
+                request_number = last_correct_step_indices.shape[0]
+
+                state_indices_tensor = (
+                    self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                        :request_number
+                    ]
+                )
+
+                mamba_caches = (
+                    self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+                )
+
+                conv_states = mamba_caches.conv[0]
+                ssm_states = mamba_caches.temporal
+                intermediate_state_cache = mamba_caches.intermediate_ssm
+                dst_indices_tensor = state_indices_tensor.to(torch.int32)
+                src_indices_tensor = torch.arange(
+                    dst_indices_tensor.shape[0],
+                    device=dst_indices_tensor.device,
+                    dtype=torch.int32,
+                )
+                last_steps = last_correct_step_indices.to(torch.int32)
+
+                move_intermediate_cache_kda(
+                    ssm_states,
+                    intermediate_state_cache,
+                    dst_indices_tensor,
+                    src_indices_tensor,
+                    last_steps,
+                    h_block_size=1,
+                )
+                draft_token_num = intermediate_state_cache.shape[2]
+                has_conv_snapshots = getattr(
+                    self.linear_attn_backend,
+                    "supports_speculative_conv_state_snapshots",
+                    False,
+                )
+                if has_conv_snapshots:
+                    intermediate_conv_window_cache = (
+                        mamba_caches.intermediate_conv_window[0]
+                    )
+                    speculative_state_scatter_npu(
+                        conv_states,
+                        intermediate_conv_window_cache,
+                        dst_indices_tensor,
+                        src_indices_tensor,
+                        last_steps,
+                    )
+                if mamba_track_indices is not None:
+                    assert mamba_steps_to_track is not None
+                    mamba_track_indices = mamba_track_indices.to(torch.int32)
+                    mamba_steps_to_track = mamba_steps_to_track.to(torch.int32)
+
+                    move_intermediate_cache_kda(
+                        ssm_states,
+                        intermediate_state_cache,
+                        mamba_track_indices,
+                        src_indices_tensor,
+                        mamba_steps_to_track,
+                        h_block_size=1,
+                    )
+
+                    if has_conv_snapshots:
+                        speculative_state_scatter_npu(
+                            conv_states,
+                            intermediate_conv_window_cache,
+                            mamba_track_indices,
+                            src_indices_tensor,
+                            mamba_steps_to_track,
+                        )
+                    else:
+                        track_mask = mamba_steps_to_track >= 0
+                        track_indices = mamba_track_indices[track_mask]
+                        if track_indices.numel() > 0:
+                            conv_states[:, track_indices] = conv_states[
+                                :, dst_indices_tensor[track_mask]
+                            ]
+
+                if not has_conv_snapshots:
+                    if dst_indices_tensor.numel() > 0:
+                        conv_state_rollback(
+                            conv_states,
+                            dst_indices_tensor,
+                            last_steps,
+                            draft_token_num,
+                        )
+
+                    if (
+                        mamba_track_indices is not None
+                        and mamba_track_indices.numel() > 0
+                    ):
+                        conv_state_rollback(
+                            conv_states,
+                            mamba_track_indices,
+                            mamba_steps_to_track,
+                            draft_token_num,
+                        )
+
+                return
+
+        return _AscendKDAHybrid(*args, **kwargs)
