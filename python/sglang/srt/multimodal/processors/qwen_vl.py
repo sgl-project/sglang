@@ -886,7 +886,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
         if not (
-            self.use_gpu_feature_transport
+            self.keep_mm_features_on_device
             and self.server_args.mm_enable_dp_encoder
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")

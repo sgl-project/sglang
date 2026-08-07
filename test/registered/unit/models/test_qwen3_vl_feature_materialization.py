@@ -41,29 +41,48 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
         model.use_data_parallel = use_data_parallel
         return model
 
-    def test_processor_defers_image_and_video_transport_for_encoder_dp(self):
+    def test_processor_defers_gpu_transport_for_encoder_dp(self):
+        for transport in ("cuda_ipc", "cuda_vmm"):
+            with self.subTest(transport=transport):
+                processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+                processor.mm_feature_transport = transport
+                processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
+                processor.model_type = "qwen3_vl"
+                items = [
+                    MultimodalDataItem(modality=Modality.IMAGE),
+                    MultimodalDataItem(modality=Modality.VIDEO),
+                    MultimodalDataItem(modality=Modality.AUDIO),
+                ]
+
+                processor._mark_dp_encoder_features_for_deferred_reconstruction(items)
+
+                self.assertTrue(
+                    items[0].model_specific_data[
+                        DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                    ]
+                )
+                self.assertTrue(
+                    items[1].model_specific_data[
+                        DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY
+                    ]
+                )
+                self.assertNotIn(
+                    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+                    items[2].model_specific_data,
+                )
+
+    def test_processor_does_not_defer_cpu_transport(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-        processor.use_cuda_ipc = False
-        processor.use_fabric_transport = True
+        processor.mm_feature_transport = "cpu"
         processor.server_args = SimpleNamespace(mm_enable_dp_encoder=True)
         processor.model_type = "qwen3_vl"
-        items = [
-            MultimodalDataItem(modality=Modality.IMAGE),
-            MultimodalDataItem(modality=Modality.VIDEO),
-            MultimodalDataItem(modality=Modality.AUDIO),
-        ]
+        item = MultimodalDataItem(modality=Modality.IMAGE)
 
-        processor._mark_dp_encoder_features_for_deferred_reconstruction(items)
+        processor._mark_dp_encoder_features_for_deferred_reconstruction([item])
 
-        self.assertTrue(
-            items[0].model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY]
-        )
-        self.assertTrue(
-            items[1].model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY]
-        )
         self.assertNotIn(
             DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
-            items[2].model_specific_data,
+            item.model_specific_data,
         )
 
     def test_image_features_are_packed_on_the_visual_device(self):
