@@ -776,7 +776,13 @@ class HybridCacheController(BaseHiCacheController):
         if not self.backup_skip:
             super()._page_backup(operation)
         else:
-            sidecar_ok = bool(backup_transfers)
+            # Vacuously successful: when there are no rank-sharded sidecars
+            # (e.g. pure-MLA DSV4 where every pool is replicated), the
+            # follower rank has nothing to write — TP0 already persisted all
+            # replicated pools. Reporting failure here (completed_tokens=0)
+            # would prevent restore from ever triggering on follower ranks,
+            # causing NaN on DSpark speculative hits.
+            sidecar_ok = True
             if sidecar_ok:
                 for transfer in backup_transfers:
                     result = results.get(transfer.name)
