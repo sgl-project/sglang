@@ -1578,9 +1578,7 @@ class HiRadixCache(RadixCache):
         )
 
         self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
-        n_storage_hit, n_ack_prefetch, n_backup, n_release = map(
-            int, qsizes.tolist()
-        )
+        n_storage_hit, n_ack_prefetch, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_storage_hit=n_storage_hit,
             n_ack_prefetch=n_ack_prefetch,
