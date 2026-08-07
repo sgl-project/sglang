@@ -329,6 +329,23 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if cfg := mambaish_config(runner.model_config):
+        from sglang.srt.layers.utils.cp_utils import (
+            is_prefill_context_parallel_enabled,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        if is_prefill_context_parallel_enabled() or get_parallel().attn_cp_size > 1:
+            # The CP-v2 runner shards prefill tokens across ranks, but the
+            # linear layers' recurrent state has no position axis to shard —
+            # without a state hand-off (pre-scan + all-gather + merge, see
+            # kernels/ops/attention/fla/chunk_delta_h_cp.py) the state would be
+            # silently corrupted. Fail loudly until the backend integration
+            # lands.
+            raise NotImplementedError(
+                "Prefill context parallelism is not yet supported for hybrid "
+                "linear-attention models (Mamba / GDN / KDA). Remove "
+                "--enable-prefill-cp / --attention-context-parallel-size."
+            )
         from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
 
         if isinstance(
