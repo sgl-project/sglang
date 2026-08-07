@@ -312,7 +312,9 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             self.use_cuda_ipc
             or not is_cuda()
             or not all(
-                isinstance(image, (torch.Tensor, Image.Image)) for image in images
+                isinstance(image, Image.Image)
+                or (isinstance(image, torch.Tensor) and image.dtype == torch.uint8)
+                for image in images
             )
         ):
             return False

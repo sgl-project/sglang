@@ -749,6 +749,16 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
         assert processor._should_defer_gpu_preprocessing([image]) is expected
 
 
+def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.use_cuda_ipc = False
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing(
+            [torch.zeros((3, 32, 32), dtype=torch.float32)]
+        )
+
+
 def test_kimi_k3_rejects_silently_dropped_images():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = Mock()
