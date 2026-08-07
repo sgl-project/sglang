@@ -1027,6 +1027,38 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
+    def select_replay_num_tokens(
+        self,
+        *,
+        num_tokens: int,
+        extend_seq_lens=None,
+    ) -> Optional[int]:
+        """Return the capture token bucket that can replay this batch."""
+        if num_tokens > self.max_num_tokens:
+            return None
+
+        if not getattr(self, "enable_cp_v2_bcg_capture", False):
+            padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+            return (
+                padded_num_tokens
+                if padded_num_tokens
+                <= num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
+                else None
+            )
+
+        assert self.prefill_cp_bcg_input is not None
+        required_cp_local_tokens = self.prefill_cp_bcg_input.required_local_tokens(
+            extend_seq_lens
+        )
+        if required_cp_local_tokens is None:
+            return None
+        return self.prefill_cp_bcg_input.select_replay_bucket(
+            num_tokens=num_tokens,
+            required_local_tokens=required_cp_local_tokens,
+            capture_num_tokens=self.capture_num_tokens,
+            max_padding_factor=_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+        )
+
     def can_replay_locally(
         self,
         *,
@@ -1091,21 +1123,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if num_tokens is None:
             return True
-        if num_tokens > self.max_num_tokens:
-            return False
-        # No exact-shape check: load_batch bucket-pads; only reject
-        # disproportionate padding waste.
-        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
-        if getattr(self, "enable_cp_v2_bcg_capture", False):
-            assert self.prefill_cp_bcg_input is not None
-            if not self.prefill_cp_bcg_input.can_replay(
-                static_num_tokens=padded_num_tokens,
+        return (
+            self.select_replay_num_tokens(
+                num_tokens=num_tokens,
                 extend_seq_lens=extend_seq_lens,
-            ):
-                return False
-        return True
+            )
+            is not None
+        )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # DP check: group verdict from the schedule-time all-gather
@@ -1426,7 +1450,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         the model code reads during replay.
         """
         num_tokens = len(forward_batch.input_ids)
-        static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        static_num_tokens = self.select_replay_num_tokens(
+            num_tokens=num_tokens,
+            extend_seq_lens=getattr(forward_batch, "extend_seq_lens_cpu", None),
+        )
+        if static_num_tokens is None:
+            raise RuntimeError(
+                "Prefill CUDA graph replay was admitted without a fitting bucket"
+            )
         self.raw_num_tokens = num_tokens
 
         bs = forward_batch.batch_size

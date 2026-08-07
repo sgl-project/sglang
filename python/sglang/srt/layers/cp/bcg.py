@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
@@ -109,30 +109,42 @@ class PrefillCPBCGInput:
                 ),
             )
 
-    def can_replay(
-        self,
-        *,
-        static_num_tokens: int,
-        extend_seq_lens: Any,
-    ) -> bool:
-        """Return whether a live zigzag layout fits the captured local rows."""
-        captured_local_tokens = self.bucket_local_tokens.get(static_num_tokens)
+    def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
+        """Return the aligned CP-local rows required by a live zigzag layout."""
         strategy = get_cp_strategy()
-        if (
-            captured_local_tokens is None
-            or not isinstance(strategy, ZigzagCPStrategy)
-            or extend_seq_lens is None
-        ):
-            return False
+        if not isinstance(strategy, ZigzagCPStrategy) or extend_seq_lens is None:
+            return None
 
         _, _, per_rank_logical_tokens = strategy.build_token_layout(
             [int(length) for length in extend_seq_lens]
         )
         align_size = get_cp_padding_align_size()
-        live_local_tokens = (
+        return (
             (max(per_rank_logical_tokens) + align_size - 1) // align_size * align_size
         )
-        return live_local_tokens <= captured_local_tokens
+
+    def select_replay_bucket(
+        self,
+        *,
+        num_tokens: int,
+        required_local_tokens: int,
+        capture_num_tokens: list[int],
+        max_padding_factor: int,
+    ) -> Optional[int]:
+        """Return the smallest global capture whose CP-local rows fit."""
+        max_num_tokens = num_tokens * max_padding_factor
+        for bucket in capture_num_tokens:
+            if bucket < num_tokens:
+                continue
+            if bucket > max_num_tokens:
+                break
+            captured_local_tokens = self.bucket_local_tokens.get(bucket)
+            if (
+                captured_local_tokens is not None
+                and required_local_tokens <= captured_local_tokens
+            ):
+                return bucket
+        return None
 
     def prepare(
         self,
