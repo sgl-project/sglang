@@ -428,11 +428,28 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-            # Verify-all: the uniform layout (or None, past the captured grid)
-            # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+        bs = int(req_pool_indices.shape[0])
+        aligned_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
+        if (
+            self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and (self._is_verify_all or self._align_verify_tokens_to_graph_tier)
+            and verify_budget_covers_full_window(
+                budget=aligned_budget,
+                bs=bs,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                min_verify_len=self._schedule_cfg.min_verify_len,
+            )
+        ):
+            # A full verify window has a uniform layout (or None, past the
+            # captured grid) that is constant per (bs, tier). Serve it from
+            # cache instead of paying the per-step top-k schedule and its
+            # host<->device round-trips.
+            key = (bs, global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
                     bs=key[0],
@@ -448,12 +465,7 @@ class DSparkVerifyPlanner:
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=aligned_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -677,6 +689,21 @@ def graph_tier_fill_budget(
     fill_total = min(graph_num_tokens, bs * verify_num_draft_tokens)
     floor_tokens = bs * max(min_verify_len, 1)
     return max(0, fill_total - floor_tokens)
+
+
+def verify_budget_covers_full_window(
+    *,
+    budget: Optional[int],
+    bs: int,
+    verify_num_draft_tokens: int,
+    min_verify_len: int,
+) -> bool:
+    """Whether the extra-token budget schedules every request's full window."""
+    if budget is None:
+        return False
+    floor_tokens = bs * max(min_verify_len, 1)
+    full_window_tokens = bs * verify_num_draft_tokens
+    return floor_tokens + budget >= full_window_tokens
 
 
 def dp_global_verify_tier_num_tokens(
