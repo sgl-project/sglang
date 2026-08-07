@@ -1923,7 +1923,7 @@
     {
       "type": "timeseries",
       "title": "Cache-aware lookup health (all replicas)",
-      "description": "Traffic-weighted fleet lookup health, summed across router replicas and kept per model because ratios are not additive across models. Match is the matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level. Split to \"Cache-aware lookup health by replica\" only to test whether a single replica is responsible.",
+      "description": "Traffic-weighted fleet lookup health, summed across router replicas and kept per model because ratios are not additive across models. Match is the matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level. Split to \"Cache-aware lookup health by replica\" only to test whether a single replica is responsible. Match (ceiling) is the best overlap ANY worker held; selected is what the worker actually picked held, and is the only one of the two comparable to the engine's sglang:cached_tokens_total / sglang:prompt_tokens_total. The gap between them is locality the load gate gave up; break it down with sgl_router_matched_overlap_blocks_total minus sgl_router_selected_overlap_blocks_total by decision. What remains below selected is cache state that changed between selection and prefill.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1980,7 +1980,19 @@
           "expr": "sum by (model_id) (rate(sgl_router_overlap_blocks_sum{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{model_id}} match",
+          "legendFormat": "{{model_id}} match (ceiling)",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_selected_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "S",
+          "legendFormat": "{{model_id}} selected (vs engine)",
           "format": "time_series"
         },
         {
@@ -2115,7 +2127,7 @@
     {
       "type": "timeseries",
       "title": "Cache-aware lookup health by replica",
-      "description": "Per-replica lookup health; use \"Cache-aware lookup health (all replicas)\" for the fleet ratio. Match is the weighted matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level.",
+      "description": "Per-replica lookup health; use \"Cache-aware lookup health (all replicas)\" for the fleet ratio. Match is the weighted matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level. Match (ceiling) is the best overlap ANY worker held; selected is what the worker actually picked held, and is the only one of the two comparable to the engine's sglang:cached_tokens_total / sglang:prompt_tokens_total. The gap between them is locality the load gate gave up; break it down with sgl_router_matched_overlap_blocks_total minus sgl_router_selected_overlap_blocks_total by decision. What remains below selected is cache state that changed between selection and prefill.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2165,7 +2177,19 @@
           "expr": "sum by (instance, model_id) (rate(sgl_router_overlap_blocks_sum{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{instance}} {{model_id}} match",
+          "legendFormat": "{{instance}} {{model_id}} match (ceiling)",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance, model_id) (rate(sgl_router_selected_overlap_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "S",
+          "legendFormat": "{{instance}} {{model_id}} selected (vs engine)",
           "format": "time_series"
         },
         {
