@@ -109,8 +109,10 @@ class TestAiterFp8Layout(CustomTestCase):
     def _logical_and_shuffled():
         shape = (32, 64)
         n, k = shape[-2:]
-        logical = torch.arange(n * k, dtype=torch.float32).remainder(7).to(
-            torch.float8_e4m3fn
+        logical = (
+            torch.arange(n * k, dtype=torch.float32)
+            .remainder(7)
+            .to(torch.float8_e4m3fn)
         )
         logical = logical.reshape(shape)
         shuffled = (
@@ -123,9 +125,7 @@ class TestAiterFp8Layout(CustomTestCase):
 
     def test_unshuffle_round_trip(self):
         logical, shuffled = self._logical_and_shuffled()
-        torch.testing.assert_close(
-            _unshuffle_aiter_fp8_weight(shuffled), logical
-        )
+        torch.testing.assert_close(_unshuffle_aiter_fp8_weight(shuffled), logical)
 
     def test_iter_chunks_unshuffles_before_dequantization(self):
         logical, shuffled = self._logical_and_shuffled()
@@ -173,9 +173,7 @@ class _TinyModel(nn.Module):
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
-        self.register_buffer(
-            "derived_cache", torch.full((8,), 0.42), persistent=False
-        )
+        self.register_buffer("derived_cache", torch.full((8,), 0.42), persistent=False)
 
 
 class _FakeModelRunner:
