@@ -21,6 +21,7 @@ _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFusedMOE(CustomTestCase):
     NUM_EXPERTS = [8, 64]
     TOP_KS = [2, 6]

@@ -5,6 +5,8 @@ VLM Performance tests that work on 5090 (32GB) - VLM offline throughput and onli
 import os
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
@@ -37,6 +39,7 @@ def _local_tokenizer_path():
     return None
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestVLMPerf5090(CustomTestCase):
     def test_vlm_perf(self):
         common = dict(

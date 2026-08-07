@@ -12,6 +12,10 @@ register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=55, stage="jit-kernel-unit", runner_config="amd")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 BS_LIST = [2**n for n in range(0, 15)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]

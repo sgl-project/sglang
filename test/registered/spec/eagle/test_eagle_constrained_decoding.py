@@ -1,5 +1,6 @@
 import unittest
 
+import torch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -17,6 +18,7 @@ register_cuda_ci(est_time=116, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=165, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagleConstrainedDecoding(
     CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
@@ -74,6 +76,7 @@ class TestEagleConstrainedDecoding(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
     disable_overlap = False
 

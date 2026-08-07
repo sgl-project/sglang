@@ -1,3 +1,4 @@
+import torch
 import unittest
 
 from sglang.test.ascend.test_ascend_utils import (
@@ -9,6 +10,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLlama3211BVisionInstruct(TestVLMModels):
     """Testcase: Verify that the inference accuracy of the LLM-Research/Llama-3.2-11B-Vision-Instruct model on the MMMU dataset is no less than 0.2.
 

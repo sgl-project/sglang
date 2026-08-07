@@ -2,6 +2,7 @@ import os
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
@@ -16,6 +17,7 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLogLevel(CustomTestCase):
     """Testcase：Verify set log-level parameter, the printed log level is the same as the configured log level and the inference request is successfully processed.
 

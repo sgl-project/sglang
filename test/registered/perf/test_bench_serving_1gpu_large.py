@@ -4,6 +4,8 @@ Performance tests for single GPU that need H200 (80GB) - FP8 and EAGLE tests.
 
 import unittest
 
+import torch
+
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -21,6 +23,7 @@ register_cuda_ci(est_time=286, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBenchServing1GPULarge(CustomTestCase):
     def test_offline_throughput_default_fp8(self):
         res = run_bench_serving(

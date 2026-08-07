@@ -4,6 +4,8 @@ import re
 import unittest
 from typing import Any, List, Optional, Tuple
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -21,6 +23,7 @@ register_cuda_ci(est_time=149, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPriorityScheduling(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -230,6 +233,7 @@ class TestPriorityScheduling(CustomTestCase):
         assert e2e_latencies[0] < e2e_latencies[1]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
     @classmethod
     def setUpClass(cls):

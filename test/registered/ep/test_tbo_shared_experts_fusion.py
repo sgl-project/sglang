@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -17,6 +19,7 @@ register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-8-gpu-h200
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTBOWithSharedExpertsFusion(CustomTestCase):
     @classmethod
     def setUpClass(cls):

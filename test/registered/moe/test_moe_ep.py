@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -17,6 +19,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=279, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEp(CustomTestCase):
     @classmethod
     def setUpClass(cls):

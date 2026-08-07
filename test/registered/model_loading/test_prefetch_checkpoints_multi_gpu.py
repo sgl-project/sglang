@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -14,6 +16,7 @@ PROMPTS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
     """Verify that --weight-loader-prefetch-checkpoints works with DP attention."""
 

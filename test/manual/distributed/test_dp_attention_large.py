@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
@@ -21,6 +22,7 @@ from sglang.test.test_utils import (
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_amd_ci(),
     "DeepSeek MLA forward_mla NameError on AMD (batched_gemm not defined)",
@@ -65,6 +67,7 @@ class TestDPAttentionDP2TP4(
         self.assertGreater(metrics["score"], 0.8)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_amd_ci(),
     "DeepSeek MTP forward_mla NameError on AMD + needs 8 GPUs",
@@ -134,6 +137,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_amd_ci(),
     "Qwen3-VL-30B-A3B-Instruct OOMs at TP=4 DP=2 on MI325 4-GPU runners",

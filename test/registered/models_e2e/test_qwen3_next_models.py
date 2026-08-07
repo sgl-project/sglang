@@ -1,6 +1,8 @@
 import os
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
@@ -34,6 +36,7 @@ def _make_args(*, page_size=1, track_interval=2):
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen3NextLazyExtraBuffer(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
@@ -44,6 +47,7 @@ class TestQwen3NextLazyExtraBuffer(
     other_args = _make_args(page_size=1, track_interval=2)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen3NextLazyExtraBufferLargePage(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):

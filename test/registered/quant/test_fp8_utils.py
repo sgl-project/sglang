@@ -13,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestInverseTransformScaleUe8m0(CustomTestCase):
     def test_round_trip(self):
         for _ in range(100):

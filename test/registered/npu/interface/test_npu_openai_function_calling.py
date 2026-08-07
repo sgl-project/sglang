@@ -2,6 +2,7 @@ import json
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -21,6 +22,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOpenAIServerFunctionCalling(CustomTestCase):
     """Testcase：Verify the correctness of full-scenario OpenAI-style function calling with llama3 parser for Llama-3.2-1B-Instruct model.
         Cover: Single/multi-turn calls, streaming/non-streaming returns, multi-parameter verification of tool_choice, and JSON parsing validity of function parameters.
@@ -790,6 +792,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
     """Testcase：Verify the functionality of Python-style list-format function calling with pythonic parser for Llama-3.2-1B-Instruct model on Ascend NPU backend.
     Cover: Explicit format prompt verification, streaming call index integrity, and return validity of parallel tool calls.

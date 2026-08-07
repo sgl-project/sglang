@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -41,6 +43,7 @@ DP_EAGLE_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiK25Nvfp4(unittest.TestCase):
     """Kimi-K2.5 NVFP4 + EAGLE3 on GB300 (4x GB300 NVL4, tp=4)."""
 

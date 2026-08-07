@@ -5,12 +5,15 @@ EAGLE3 lives in the sibling file test_pcg_with_speculative_decoding.py.
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=531, suite="nightly-4-gpu", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
     """PCG + MTP (NEXTN) on Qwen3.5-35B-A3B with FP8."""
 
@@ -34,6 +37,7 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
     accuracy_threshold = 0.75
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPCGWithSTANDALONE(PCGSpecBase, unittest.TestCase):
     """PCG + STANDALONE on Llama-3.1-8B-Instruct + Llama-3.2-1B-Instruct."""
 
@@ -57,6 +61,7 @@ class TestPCGWithSTANDALONE(PCGSpecBase, unittest.TestCase):
     accuracy_threshold = 0.50
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPCGWithNGRAM(PCGSpecBase, unittest.TestCase):
     """PCG + NGRAM on Qwen2.5-Coder-7B-Instruct."""
 

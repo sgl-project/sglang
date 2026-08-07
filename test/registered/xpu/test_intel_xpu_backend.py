@@ -3,6 +3,7 @@ Usage:
 python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
+import torch
 import unittest
 from functools import wraps
 
@@ -56,6 +57,7 @@ def intel_xpu_benchmark(
     return decorator
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestIntelXPUBackend(CustomTestCase):
 
     @intel_xpu_benchmark(min_throughput=10, mem_fraction_static="0.3")

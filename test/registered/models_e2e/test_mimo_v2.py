@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -42,6 +44,7 @@ MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiMoV2(GSM8KMixin, MMMUServerBase):
     gsm8k_accuracy_thres = 0.75
     gsm8k_accept_length_thres = 2.5
