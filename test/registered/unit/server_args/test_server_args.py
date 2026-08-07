@@ -231,10 +231,11 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
 
+    @patch("sglang.srt.server_args.os.path.exists", return_value=True)
     @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_default_transport_is_fabric_for_multinode_mnnvl(
-        self, _mock_is_cuda, _mock_is_mnnvl
+        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
     ):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
@@ -250,6 +251,24 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         output = "\n".join(logs.output)
         self.assertIn("auto-resolved to fabric", output)
         self.assertIn("MNNVL FABRIC", output)
+
+    @patch("sglang.srt.server_args.os.path.exists", return_value=False)
+    @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_default_transport_is_cpu_without_imex_channel(
+        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
+    ):
+        server_args = ServerArgs(model_path="dummy", nnodes=2)
+        self._set_model_type(server_args, is_multimodal=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+
+        self.assertIn("no IMEX channel", "\n".join(logs.output))
 
     @patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=False)
     @patch("sglang.srt.server_args.is_cuda", return_value=True)

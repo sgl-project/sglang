@@ -7626,7 +7626,9 @@ class ServerArgs:
                         "(single-node CUDA). Pass --mm-feature-transport=cpu to "
                         "opt out."
                     )
-                elif is_mnnvl_fabric_device():
+                elif is_mnnvl_fabric_device() and os.path.exists(
+                    "/dev/nvidia-caps-imex-channels/channel0"
+                ):
                     requested_transport = "fabric"
                     logger.info(
                         "Multimodal feature transport auto-resolved to fabric "
@@ -7635,6 +7637,13 @@ class ServerArgs:
                     )
                 else:
                     requested_transport = "cpu"
+                    if is_mnnvl_fabric_device():
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to cpu: "
+                            "GB200/GB300 was detected but no IMEX channel is "
+                            "mounted. Configure the MNNVL compute domain or pass "
+                            "--mm-feature-transport=fabric after doing so."
+                        )
             else:
                 requested_transport = "cpu"
         elif legacy_ipc_is_set and legacy_ipc_enabled != (
