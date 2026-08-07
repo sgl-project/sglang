@@ -1709,6 +1709,7 @@ class MMReceiverBase(ABC):
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
+        encode_task = None
         try:
             # ``self.encode_urls`` is shared by reference with the bootstrap
             # server (when running) so it always reflects the current set.
@@ -1729,7 +1730,7 @@ class MMReceiverBase(ABC):
                 f"modalities={modalities}, num_items={len(mm_data)}"
             )
             send_time = time.monotonic()
-            asyncio.create_task(
+            encode_task = asyncio.create_task(
                 self.encode(
                     req_id,
                     mm_data,
@@ -1749,9 +1750,21 @@ class MMReceiverBase(ABC):
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - send_time
             logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
-            if req_id is not None:
-                self._cleanup_mooncake_buffer(req_id)
+            await self._abort_encode_and_cleanup(encode_task, req_id)
             return None
+        except asyncio.CancelledError:
+            await self._abort_encode_and_cleanup(encode_task, req_id)
+            raise
+
+    async def _abort_encode_and_cleanup(self, encode_task, req_id):
+        if encode_task is not None and not encode_task.done():
+            encode_task.cancel()
+            try:
+                await encode_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if req_id is not None:
+            self._cleanup_mooncake_buffer(req_id)
 
     def _cleanup_mooncake_buffer(self, req_id):
         if self.encoder_transfer_backend != "mooncake":

@@ -827,6 +827,7 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+        self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

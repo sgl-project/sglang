@@ -8059,6 +8059,16 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
+            if (
+                "SGLANG_DSA_FUSE_TOPK" not in os.environ
+                and "SGLANG_NSA_FUSE_TOPK" not in os.environ
+            ):
+                os.environ["SGLANG_DSA_FUSE_TOPK"] = "0"
+                logger.warning(
+                    "SGLANG_DSA_FUSE_TOPK=0 forced for deterministic inference "
+                    "(avoids _append_kpool_tail_to_topk_kernel crash)."
+                )
+
             # Moved to the resolution pipeline (arg_groups/overrides.py:
             # _deterministic_allreduce_fusion_disable), invoked here at its
             # legacy slot.

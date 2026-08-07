@@ -4002,7 +4002,7 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        while self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.

@@ -382,7 +382,12 @@ class MMEncoder:
         self.mm_cache_lock = asyncio.Lock()
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
+            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4)),
+            initializer=(
+                lambda device=self.device, gid=self.gpu_id: torch.get_device_module(
+                    device
+                ).set_device(gid)
+            ),
         )
         self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
 
