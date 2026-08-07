@@ -45,8 +45,8 @@ class HybridAttnBackend(AttentionBackend):
         )
         self.max_context_len = model_runner.model_config.context_len
         # _select_backend routes EXTEND to prefill_backend unconditionally.
-        self.extend_dummy_seqs_capped_by_req_pool = (
-            prefill_backend.extend_dummy_seqs_capped_by_req_pool
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
 
     @property
