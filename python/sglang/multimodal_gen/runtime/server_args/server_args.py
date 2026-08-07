@@ -71,6 +71,9 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+# Mirrors AttentionBackend.supports_ring_rotation; the name-level check
+# runs before backend classes are importable on every platform.
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -756,18 +759,21 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend not in (
-                "fa",
-                "sage_attn",
+            if (
+                self.attention_backend is not None
+                and self.attention_backend not in RING_CAPABLE_ATTENTION_BACKENDS
             ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention or sage attention backend for now"
+                    "Ring Attention requires one of the ring-capable backends "
+                    f"({', '.join(RING_CAPABLE_ATTENTION_BACKENDS)}), got "
+                    f"{self.attention_backend!r}"
                 )
             if self.attention_backend is None:
-                self.attention_backend = "fa"
+                self.attention_backend = RING_CAPABLE_ATTENTION_BACKENDS[0]
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention or sage attention; "
-                    "attention_backend has been automatically set to flash attention"
+                    "Ring Attention requires a ring-capable backend; "
+                    "attention_backend has been automatically set to %s",
+                    self.attention_backend,
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
