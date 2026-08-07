@@ -2746,15 +2746,15 @@ class ServerArgs:
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm", "fabric"]],
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
-        "pool, a bounded CUDA VMM pool, or a bounded MNNVL FABRIC pool. "
+        "pool, or a bounded CUDA VMM pool. "
         "Unset resolves automatically: multimodal models on single-node CUDA "
-        "deployments (without disaggregation) use cuda_ipc; multi-node GB200/GB300 "
-        "MNNVL deployments use fabric when an IMEX channel is available; all other "
-        "deployments use cpu. GPU transports reserve SGLANG_MM_FEATURE_CACHE_MB "
-        "(default 1024 MiB) on the base GPU and fall back to CPU transport per "
-        "tensor when the pool is full.",
+        "deployments (without disaggregation) use cuda_ipc; validated multi-node "
+        "GB200/GB300 MNNVL models use cuda_vmm when an IMEX channel is available; "
+        "all other deployments use cpu. GPU transports reserve "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
+        "back to CPU transport when the pool is full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -7630,12 +7630,23 @@ class ServerArgs:
                 elif is_mnnvl_fabric_device() and os.path.exists(
                     "/dev/nvidia-caps-imex-channels/channel0"
                 ):
-                    requested_transport = "fabric"
-                    logger.info(
-                        "Multimodal feature transport auto-resolved to fabric "
-                        "(multi-node GB200/GB300 MNNVL). Pass "
-                        "--mm-feature-transport=cpu to opt out."
+                    from sglang.srt.model_loader.utils import (
+                        supports_cuda_vmm_feature_transport,
                     )
+
+                    if supports_cuda_vmm_feature_transport(self.get_model_config()):
+                        requested_transport = "cuda_vmm"
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to "
+                            "cuda_vmm (multi-node GB200/GB300 MNNVL). Pass "
+                            "--mm-feature-transport=cpu to opt out."
+                        )
+                    else:
+                        requested_transport = "cpu"
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to cpu: "
+                            "the model has not opted into CUDA VMM transport."
+                        )
                 else:
                     requested_transport = "cpu"
                     if is_mnnvl_fabric_device():
@@ -7643,7 +7654,7 @@ class ServerArgs:
                             "Multimodal feature transport auto-resolved to cpu: "
                             "GB200/GB300 was detected but no IMEX channel is "
                             "mounted. Configure the MNNVL compute domain or pass "
-                            "--mm-feature-transport=fabric after doing so."
+                            "--mm-feature-transport=cuda_vmm after doing so."
                         )
             else:
                 requested_transport = "cpu"
@@ -7657,11 +7668,7 @@ class ServerArgs:
                 int(legacy_ipc_enabled),
             )
 
-        if self.encoder_only and requested_transport in (
-            "cuda_ipc",
-            "cuda_vmm",
-            "fabric",
-        ):
+        if self.encoder_only and requested_transport in ("cuda_ipc", "cuda_vmm"):
             logger.warning(
                 "--mm-feature-transport=%s does not control encoder-only "
                 "output transfer; using cpu for this inactive transport. Select "
@@ -7685,6 +7692,18 @@ class ServerArgs:
                     "--mm-feature-transport=cuda_vmm is not supported with "
                     "SGLANG_RUST_SERVER."
                 )
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            handle_kind = "CUDA FABRIC" if self.nnodes > 1 else "POSIX FD"
+            logger.info(
+                "Using CUDA VMM for multimodal features with %s sharing: "
+                "reserving up to %d MiB on base GPU %d across %d tokenizer "
+                "worker(s). This reduces KV cache headroom; a full pool falls "
+                "back to inline CPU transport.",
+                handle_kind,
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
+            )
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
@@ -7714,25 +7733,6 @@ class ServerArgs:
                     if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
                     else "disabled"
                 ),
-            )
-
-        if requested_transport == "fabric":
-            if not is_cuda():
-                raise ValueError("--mm-feature-transport=fabric requires NVIDIA CUDA.")
-            if self.disaggregation_mode != "null":
-                raise ValueError(
-                    "--mm-feature-transport=fabric does not yet support "
-                    "PD-disaggregated serving."
-                )
-            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
-            logger.info(
-                "Using MNNVL FABRIC for multimodal features: reserving up to "
-                "%d MiB on base GPU %d across %d tokenizer worker(s). The pool "
-                "uses one fabric handle and GPU-resident lease metadata; a full "
-                "pool falls back to CPU transport per tensor.",
-                pool_budget_mb,
-                self.base_gpu_id,
-                self.tokenizer_worker_num,
             )
 
         self.mm_feature_transport = requested_transport
