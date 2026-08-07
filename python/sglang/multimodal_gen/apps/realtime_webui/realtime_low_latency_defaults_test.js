@@ -42,6 +42,36 @@ assert.match(
   "webui should preserve its fallback while accepting a deployment target FPS",
 );
 assert.match(
+  appJs,
+  /const DEFAULT_T2V_NUM_FRAMES\s*=\s*9;/,
+  "T2V should default to a short user-editable 9-frame request",
+);
+assert.doesNotMatch(
+  appJs,
+  /configuredNumber\("t2vDefaultNumFrames"/,
+  "deployment runtime config should not override the user-visible T2V Frames default",
+);
+assert.match(
+  appJs,
+  /let savedT2VNumFrames\s*=\s*String\(DEFAULT_T2V_NUM_FRAMES\);/,
+  "T2V should remember the user's Frames value across mode switches",
+);
+assert.match(
+  appJs,
+  /let savedT2VContinuous\s*=\s*false;/,
+  "T2V should start in finite-frame mode so the Frames input is editable",
+);
+assert.match(
+  appJs,
+  /savedT2VNumFrames\s*=\s*\$\("numFrames"\)\.value;/,
+  "leaving T2V should save the user-edited Frames value",
+);
+assert.match(
+  appJs,
+  /\$\("numFrames"\)\.value\s*=\s*savedT2VNumFrames;/,
+  "entering T2V should restore the user-edited Frames value instead of resetting it",
+);
+assert.match(
   indexHtml,
   /<script src="\.\/runtime-config\.js"><\/script>/,
   "webui should load the deployment profile before app.js",

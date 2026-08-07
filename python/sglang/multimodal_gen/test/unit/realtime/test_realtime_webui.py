@@ -51,7 +51,7 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert 'id="t2vFrameHint"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
     assert "playback_controller.js?v=realtime-playback-v22" in index_html
-    assert "app.js?v=realtime-production-gateway-v7" in index_html
+    assert "app.js?v=realtime-production-gateway-v8" in index_html
     assert "UI_CONFIG.generationModes" in app_js
     assert "UI_CONFIG.generationMode" in app_js
     assert "CONFIGURED_DEFAULT_GENERATION_MODE" in app_js
@@ -60,9 +60,15 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert 'const continuousT2V = generationMode === "t2v"' in app_js
     assert "numFrames = continuousT2V ? undefined : readT2VNumFrames()" in app_js
     assert "num_frames: continuousT2V ? undefined : numFrames" in app_js
+    assert "const DEFAULT_T2V_NUM_FRAMES = 9;" in app_js
+    assert 'configuredNumber("t2vDefaultNumFrames"' not in app_js
+    assert "let savedT2VNumFrames = String(DEFAULT_T2V_NUM_FRAMES);" in app_js
+    assert "let savedT2VContinuous = false" in app_js
+    assert 'savedT2VNumFrames = $("numFrames").value;' in app_js
+    assert '$("numFrames").value = savedT2VNumFrames;' in app_js
     assert 'max_chunks: generationMode === "t2v"' in app_js
     assert '$(' + '"continuous"' + ').disabled = false' in app_js
-    assert "let savedT2VContinuous = true" in app_js
+    assert "let savedT2VContinuous = false" in app_js
     assert '$(' + '"continuous"' + ').checked = savedT2VContinuous' in app_js
     assert '"Continuous T2V session"' in app_js
     assert '$("referenceSection").hidden = isT2V' in app_js
@@ -114,7 +120,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-production-gateway-v7" in index_html
+    assert "app.js?v=realtime-production-gateway-v8" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
     assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 24);' in app_js
     assert 'const DEFAULT_PREVIEW_MAX_WIDTH = configuredNumber("previewMaxWidth", 832);' in app_js

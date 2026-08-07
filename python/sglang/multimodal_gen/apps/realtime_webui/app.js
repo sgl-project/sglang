@@ -57,10 +57,7 @@ const T2V_FRAME_STEP = Math.max(
   1,
   Math.trunc(configuredNumber("t2vFrameStep", 4)),
 );
-const DEFAULT_T2V_NUM_FRAMES = Math.max(
-  1,
-  Math.trunc(configuredNumber("t2vDefaultNumFrames", 121)),
-);
+const DEFAULT_T2V_NUM_FRAMES = 9;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
 const DECODE_QUEUE_SECONDS = 0.5;
 const STARTUP_DECODE_QUEUE_SECONDS = 0.75;
@@ -183,9 +180,10 @@ function updateGenerationModeUi() {
     if (isT2V) {
       savedI2VNumFrames = $("numFrames").value;
       savedI2VContinuous = $("continuous").checked;
-      $("numFrames").value = String(DEFAULT_T2V_NUM_FRAMES);
+      $("numFrames").value = savedT2VNumFrames;
       $("continuous").checked = savedT2VContinuous;
     } else if (lastGenerationMode === "t2v") {
+      savedT2VNumFrames = $("numFrames").value;
       savedT2VContinuous = $("continuous").checked;
       $("numFrames").value = savedI2VNumFrames;
       $("continuous").checked = savedI2VContinuous;
@@ -365,8 +363,9 @@ let selectedReferenceUrl = "";
 let selectedReferenceLabel = "";
 let lastGenerationMode = null;
 let savedI2VNumFrames = "9";
+let savedT2VNumFrames = String(DEFAULT_T2V_NUM_FRAMES);
 let savedI2VContinuous = true;
-let savedT2VContinuous = true;
+let savedT2VContinuous = false;
 let pendingHeader = null;
 let frames = 0;
 let bytes = 0;
