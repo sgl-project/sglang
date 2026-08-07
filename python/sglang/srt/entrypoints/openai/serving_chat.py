@@ -1561,6 +1561,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         ):
                             output_ids.setdefault(index, []).extend(chunk_output_ids)
                         else:
+                            # Intermediate chunks deliberately share one live
+                            # list (the tokenizer manager's state.output_ids);
+                            # only the final chunk is a stable copy. The
+                            # reference is read once, after the stream ends.
                             output_ids[index] = chunk_output_ids
 
                 # Handle logprobs
@@ -1800,7 +1804,7 @@ class OpenAIServingChat(OpenAIServingBase):
             first_ret, request
         )
         input_ids = None
-        if self._should_return_input_ids(request):
+        if self._should_return_input_ids(request) and "prompt_token_ids" in ret[0]:
             input_ids = list(ret[0]["prompt_token_ids"])
         output_ids = None
         if self._should_return_output_ids(request):
