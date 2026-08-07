@@ -27,11 +27,11 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_rank,
     get_ring_parallel_world_size,
-    get_ulysses_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
