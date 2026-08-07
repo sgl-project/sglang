@@ -113,7 +113,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 gpu_id=gpu_id,
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
-                target_model_config=target_worker.model_runner.model_config,
+                target_model_runner=target_worker.model_runner,
                 algo_label="DSPARK",
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None

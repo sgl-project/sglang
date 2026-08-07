@@ -174,10 +174,35 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_geometry = (
+                    kvc.spec_aux_config.dflash_draft_total_num_kv_heads,
+                    kvc.spec_aux_config.dflash_draft_head_dim,
+                    kvc.spec_aux_config.dflash_draft_v_head_dim,
+                    kvc.spec_aux_config.dflash_draft_kv_element_size,
+                )
+                if any(value is None for value in draft_geometry):
+                    raise ValueError("DFLASH draft KV geometry or dtype is missing.")
+
+                total_num_kv_heads, head_dim, v_head_dim, kv_element_size = (
+                    draft_geometry
+                )
+                local_num_kv_heads = max(
+                    1,
+                    int(total_num_kv_heads) // get_parallel().attn_tp_size,
+                )
+                draft_cell_size_per_token = (
+                    int(draft_num_layers)
+                    * local_num_kv_heads
+                    * (int(head_dim) + int(v_head_dim))
+                    * int(kv_element_size)
+                    * kvc.server_args.dcp_size
+                )
+
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
+                    draft_cell_size_per_token=draft_cell_size_per_token,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:

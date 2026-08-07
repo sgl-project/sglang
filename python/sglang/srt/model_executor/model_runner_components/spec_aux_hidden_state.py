@@ -20,6 +20,10 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
+    dflash_draft_total_num_kv_heads: Optional[int] = None
+    dflash_draft_head_dim: Optional[int] = None
+    dflash_draft_v_head_dim: Optional[int] = None
+    dflash_draft_kv_element_size: Optional[int] = None
     dflash_target_layer_ids: Any = None
 
 
