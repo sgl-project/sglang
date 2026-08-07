@@ -88,7 +88,12 @@ def _forward_dsa_indexer_for_mha(
     if seed_buf is None:
         return
     if topk_indices is None:
-        raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
+        # The attention backend exposes no indexer metadata (any non-DSA
+        # backend, e.g. an explicit --attention-backend flashinfer), so the
+        # indexer computes no top-k and attention runs dense. Publish the -1
+        # "no seed" sentinel instead of leaving the previous batch's seed.
+        seed_buf.fill_(-1)
+        return
 
     select = spec_info.dsa_seed_topk_select
     src = topk_indices if select is None else topk_indices[select]
