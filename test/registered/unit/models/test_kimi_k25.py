@@ -697,6 +697,7 @@ def test_kimi_k3_rejects_silently_dropped_images():
 
 def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
     processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.fast_load_mm_data = AsyncMock(
         return_value=SimpleNamespace(
