@@ -11,12 +11,22 @@ from typing import List, Optional, Tuple
 
 import torch
 
+try:
+    from sgl_kernel.kvcacheio import transfer_embedding_ranges_direct
+except ImportError:
+    transfer_embedding_ranges_direct = None
+
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
     MooncakeEmbeddingStore,
 )
 
 logger = logging.getLogger(__name__)
+
+if transfer_embedding_ranges_direct is not None and not hasattr(
+    torch.ops.sgl_kernel, "transfer_embedding_ranges_direct"
+):
+    transfer_embedding_ranges_direct = None
 
 TARGET_PAGE_BYTES = 256 * 1024
 VISION_POOL_RATIO = 0.8
@@ -228,10 +238,10 @@ class EmbeddingCacheEntry:
         return self.state == EntryState.READY and self.ref_count == 0
 
 
-def build_transfer_buffers(
+def _build_storage_transfer_buffers(
     entry: EmbeddingCacheEntry, pool: EmbeddingPool
 ) -> Tuple[List[int], List[int]]:
-    """Build one pointer/size pair per physical page run."""
+    """Build host page-run buffers for storage GET and PUT operations."""
     if not entry.page_runs:
         return [], []
 
@@ -250,6 +260,36 @@ def build_transfer_buffers(
         sizes.append(size_bytes)
         remaining_tokens -= valid_tokens
     return ptrs, sizes
+
+
+def _build_host_device_transfer_plan(
+    entry: EmbeddingCacheEntry,
+    pool: EmbeddingPool,
+    src_is_pool: bool,
+    dst_token_offset: int = 0,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Build token ranges for transferring between the host pool and device."""
+    src_starts: List[int] = []
+    dst_starts: List[int] = []
+    lengths: List[int] = []
+    copied = 0
+
+    for run in entry.page_runs:
+        valid_tokens = min(pool.page_size * run.length, entry.num_tokens - copied)
+        if valid_tokens <= 0:
+            break
+
+        pool_start = run.start * pool.page_size
+        if src_is_pool:
+            src_starts.append(pool_start)
+            dst_starts.append(dst_token_offset + copied)
+        else:
+            src_starts.append(copied)
+            dst_starts.append(pool_start)
+        lengths.append(valid_tokens)
+        copied += valid_tokens
+
+    return src_starts, dst_starts, lengths
 
 
 @dataclass
@@ -566,7 +606,7 @@ class EmbeddingCacheController:
                 )
                 self.entries[mm_hash] = entry
                 keys.append(mm_hash)
-                entry_ptrs, entry_sizes = build_transfer_buffers(entry, pool)
+                entry_ptrs, entry_sizes = _build_storage_transfer_buffers(entry, pool)
                 all_ptrs.append(entry_ptrs)
                 all_sizes.append(entry_sizes)
 
@@ -610,7 +650,7 @@ class EmbeddingCacheController:
 
                 self._pin_read(entry)
                 keys.append(mm_hash)
-                entry_ptrs, entry_sizes = build_transfer_buffers(entry, pool)
+                entry_ptrs, entry_sizes = _build_storage_transfer_buffers(entry, pool)
                 all_ptrs.append(entry_ptrs)
                 all_sizes.append(entry_sizes)
 
@@ -750,21 +790,15 @@ class EmbeddingCacheController:
             device = dst_tensor.device
             copy_stream = self._get_copy_stream(device)
             event = torch.cuda.Event()
-            copied = 0
             with torch.cuda.stream(copy_stream):
-                for run in entry.page_runs:
-                    valid_tokens = min(
-                        pool.page_size * run.length, entry.num_tokens - copied
-                    )
-                    if valid_tokens <= 0:
-                        break
-                    src_start = run.start * pool.page_size
-                    dst_start = dst_token_offset + copied
-                    dst_tensor[dst_start : dst_start + valid_tokens].copy_(
-                        pool.tensor[src_start : src_start + valid_tokens],
-                        non_blocking=True,
-                    )
-                    copied += valid_tokens
+                self._copy_embedding_page_runs(
+                    src=pool.tensor,
+                    dst=dst_tensor,
+                    entry=entry,
+                    pool=pool,
+                    src_is_pool=True,
+                    dst_token_offset=dst_token_offset,
+                )
                 event.record(copy_stream)
             return AsyncCopyHandle(event, mm_hash, device=torch.device(device))
         except Exception:
@@ -828,6 +862,39 @@ class EmbeddingCacheController:
             stream = torch.cuda.Stream(device=device)
             self._copy_streams[key] = stream
         return stream
+
+    def _copy_embedding_page_runs(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        entry: EmbeddingCacheEntry,
+        pool: EmbeddingPool,
+        src_is_pool: bool,
+        dst_token_offset: int = 0,
+    ) -> None:
+        """Copy one embedding entry between its host pool and a CUDA tensor."""
+        src_starts, dst_starts, lengths = _build_host_device_transfer_plan(
+            entry, pool, src_is_pool, dst_token_offset
+        )
+        if not lengths:
+            return
+
+        has_cuda_side = src.device.type == "cuda" or dst.device.type == "cuda"
+        if has_cuda_side and transfer_embedding_ranges_direct is not None:
+            transfer_embedding_ranges_direct(
+                src,
+                dst,
+                src_starts,
+                dst_starts,
+                lengths,
+            )
+            return
+
+        for src_start, dst_start, valid_tokens in zip(src_starts, dst_starts, lengths):
+            dst[dst_start : dst_start + valid_tokens].copy_(
+                src[src_start : src_start + valid_tokens],
+                non_blocking=True,
+            )
 
     def has_local_embedding(self, mm_hash: str) -> bool:
         with self.lock:
@@ -937,20 +1004,14 @@ class EmbeddingCacheController:
         copy_stream.wait_stream(producer_stream)
         src.record_stream(copy_stream)
         event = torch.cuda.Event()
-        copied = 0
         with torch.cuda.stream(copy_stream):
-            for run in entry.page_runs:
-                valid_tokens = min(
-                    pool.page_size * run.length, entry.num_tokens - copied
-                )
-                if valid_tokens <= 0:
-                    break
-                start = run.start * pool.page_size
-                pool.tensor[start : start + valid_tokens].copy_(
-                    src[copied : copied + valid_tokens],
-                    non_blocking=True,
-                )
-                copied += valid_tokens
+            self._copy_embedding_page_runs(
+                src=src,
+                dst=pool.tensor,
+                entry=entry,
+                pool=pool,
+                src_is_pool=False,
+            )
             event.record(copy_stream)
         return AsyncCopyHandle(
             event=event,
