@@ -9,6 +9,7 @@ from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     NPUFinalizeRouting,
 )
 from sglang.srt.hardware_backend.npu.moe.init_routing import (
+    MXFP8_QUANT_MODE,
     NPUMoEInitRouting_v2,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -82,6 +83,10 @@ class AscendTPDispatcher(BaseDispatcher):
             self.group_list_type = 1
         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
             self.init = NPUMoEInitRouting_v2(quant_mode=1)
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type = 1
+        elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP8:
+            self.init = NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
         else:

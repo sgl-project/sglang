@@ -38,7 +38,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     run_async_client_warmup,
     should_run_synthetic_server_warmup,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    globally_suppress_loggers,
+    init_logger,
+)
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -115,7 +118,7 @@ async def lifespan(app: FastAPI):
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     warmup_task = None
-    if server_args.server_warmup:
+    if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
             _run_server_warmup_after_http_ready(server_args, warmup_done)
         )
@@ -165,6 +168,7 @@ async def get_models(request: Request):
         "task_type": server_args.pipeline_config.task_type.name,
         "dit_precision": server_args.pipeline_config.dit_precision,
         "vae_precision": server_args.pipeline_config.vae_precision,
+        "vae_decode_precision": server_args.pipeline_config.vae_decode_precision,
     }
 
     if model_info:
@@ -373,6 +377,7 @@ def create_app(server_args: ServerArgs):
     """
     Create and configure the FastAPI application instance.
     """
+    globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,

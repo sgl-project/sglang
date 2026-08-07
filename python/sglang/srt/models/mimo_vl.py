@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_mm, get_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -258,7 +258,7 @@ class MiMoVisionTransformer(nn.Module):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
-        self.use_data_parallel = self.server_args.mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         mlp_hidden_size: int = vision_config.intermediate_size
         self.patch_embed = MiMoVisionPatchEmbed(
             patch_size=patch_size,

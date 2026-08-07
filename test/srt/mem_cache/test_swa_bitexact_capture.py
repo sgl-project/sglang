@@ -27,7 +27,7 @@ from sglang.srt.layers.attention.dsv4.compress_hip import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     BASE_COMPONENT_TYPE,
     ComponentType,
 )

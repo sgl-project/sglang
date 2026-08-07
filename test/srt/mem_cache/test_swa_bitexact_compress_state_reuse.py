@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.dsv4.compress_hip import (
 )
 from sglang.srt.mem_cache import memory_pool_host as MPH
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
-from sglang.srt.mem_cache.unified_cache_components import swa_component as SC
+from sglang.srt.mem_cache.unified_cache.components import swa_component as SC
 
 
 def _capture_via_unified(
@@ -550,7 +550,7 @@ class TestStateRestoreChecksum(unittest.TestCase):
 
     def test_corrupted_host_tile_raises(self):
         s = self._capture_bind_promote()
-        node, hp, ring_size, ratio = s["node"], s["hp"], s["ring_size"], s["ratio"]
+        node, hp, ring_size = s["node"], s["hp"], s["ring_size"]
         page_row = int(node._c4_state_host_value[0].item()) // ring_size
         off0 = 0  # off0=0 contract: window packed at tile start
         slot_bytes = hp.item_bytes // ring_size

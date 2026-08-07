@@ -42,6 +42,7 @@ from typing import (
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -60,7 +61,9 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -250,6 +253,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
     set_global_state(
         _GlobalState(
@@ -426,10 +430,33 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -448,10 +475,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+# route_class is per-router, so included routers need it set too.
+v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
+elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
 
@@ -709,14 +739,22 @@ async def model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "weight_version": _global_state.tokenizer_manager.config_value(
+            "weight_version"
+        ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
+    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+    if embedding_model_spec is not None:
+        result["embedding"] = resolved_embedding_plan(
+            embedding_model_spec,
+            server_args=_global_state.tokenizer_manager.server_args,
+            model_config=model_config,
+        )
     return result
 
 
@@ -753,8 +791,11 @@ async def server_info():
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **_global_state.tokenizer_manager.resolved_config_dict(
+                dataclasses.asdict(server_args)
+            ),
             **_global_state.scheduler_info,
+            "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
@@ -854,7 +895,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     "error": {
                         "message": str(e),
                         "type": "invalid_request_error",
-                        "code": 400,
+                        "code": getattr(e, "status_code", 400),
                         "retryable": False,
                     }
                 }
@@ -1083,10 +1124,13 @@ async def hicache_storage_backend_status():
         return _admin_api_key_missing_response()
 
     return {
-        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
-        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
-        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
-        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+        name: _global_state.tokenizer_manager.config_value(name)
+        for name in (
+            "hicache_storage_backend",
+            "hicache_storage_backend_extra_config",
+            "hicache_storage_prefetch_policy",
+            "hicache_write_policy",
+        )
     }
 
 
@@ -1377,8 +1421,7 @@ async def update_weight_version(
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.override(
+        _global_state.tokenizer_manager.record_config_updates(
             "http.update_weight_version", weight_version=obj.new_version
         )
 
@@ -1998,14 +2041,17 @@ async def vertex_generate(
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
-    if isinstance(ret, Response):
-        return ret
+    if isinstance(ret, Response) and ret.status_code == 200 and hasattr(ret, "body"):
+        return ORJSONResponse({"predictions": orjson.loads(ret.body)})
+    return ret
+
     return ORJSONResponse({"predictions": ret})
 
 
 def _create_error_response(e):
     return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        {"error": {"message": str(e)}},
+        status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
 
 
@@ -2176,10 +2222,20 @@ def _execute_server_warmup(server_args: ServerArgs):
         and server_args.disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
+        served_model_name = ""
+        if not envs.SGLANG_RUST_SERVER.get():
+            served_model_name = _global_state.tokenizer_manager.served_model_name
+        else:
+            # _global_state.tokenizer_manager is not initialized in the rust server,
+            # so we need to get the model name from the model_info
+            served_model_name = model_info.get(
+                "model_path", server_args.served_model_name
+            )
+            served_model_name = served_model_name or server_args.model_path
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {
-            "model": _global_state.tokenizer_manager.served_model_name,
+            "model": served_model_name,
             "messages": [
                 {
                     "role": "user",
@@ -2228,7 +2284,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            # Skip server_status update for Rust server
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2248,14 +2306,20 @@ def _execute_server_warmup(server_args: ServerArgs):
                     server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
                     "Disaggregation warmup failed (mode=%s), status codes: %s",
                     server_args.disaggregation_mode,
                     failed_status_codes,
                 )
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            # In rust-server mode there is no TokenizerManager (readiness is
+            # the Rust server's own /health), so skip the status update.
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = (
+                    ServerStatus.Up
+                    if not failed_status_codes
+                    else ServerStatus.UnHealthy
+                )
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2462,7 +2526,12 @@ def _setup_and_run_http_server(
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
+            port_args,
+            server_args,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
         )
 
     try:
@@ -2683,13 +2752,27 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
-        execute_warmup_func=execute_warmup_func,
-        launch_callback=launch_callback,
-    )
+    if envs.SGLANG_RUST_SERVER.get():
+        # The Rust server serves api-server, tokenizer, and detokenizer, so the
+        # main process has no Python HTTP server / tokenizer manager to run.
+        # Run a warmup /generate before advertising readiness: the Rust /health
+        # and /get_model_info endpoints are static (200 as soon as the server
+        # binds, before any forward pass), so without this the first real request
+        # pays the cold-start cost (observed as a >60s first generation).
+        if not server_args.skip_server_warmup:
+            _execute_server_warmup(server_args)
+        logger.info("The server is fired up and ready to roll!")
+        if launch_callback is not None:
+            launch_callback()
+        scheduler_init_result.block_until_scheduler_exits()
+    else:
+        _setup_and_run_http_server(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result.scheduler_infos,
+            subprocess_watchdog,
+            execute_warmup_func=execute_warmup_func,
+            launch_callback=launch_callback,
+        )

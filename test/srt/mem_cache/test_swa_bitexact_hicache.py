@@ -27,9 +27,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as A
 from sglang.srt.mem_cache.unified_cache import unified_tree_core as TC
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     EvictLayer,
 )
@@ -250,6 +250,10 @@ class TestSwaComponentRouting(unittest.TestCase):
         calls = {"leaf": [], "lru_get": 0, "coevict": []}
 
         class _TreeCore:
+            # Routing is what is under test; keep the non-strict arm on the
+            # plain-LRU branch rather than the session cursor walk.
+            enable_session_radix_cache = False
+
             def drive_host_leaf_eviction(
                 self, num_tokens, ct, tracker, device_frees, host_frees
             ):

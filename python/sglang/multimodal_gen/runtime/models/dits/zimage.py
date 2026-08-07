@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
-    UlyssesAttention,
     USPAttention,
     build_varlen_mask_meta_from_lengths,
     build_varlen_mask_meta_from_ranges,
@@ -125,14 +124,6 @@ def zimage_rmsnorm_scale(
         if y is not None:
             return y
     return norm(x) * scale
-
-
-class SelectFirstElement(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x[0]
 
 
 class TimestepEmbedder(nn.Module):
@@ -312,13 +303,6 @@ class ZImageAttention(nn.Module):
             softmax_scale=None,
             causal=False,
         )
-        self.ulysses_attn = UlyssesAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            num_kv_heads=self.local_num_kv_heads,
-            softmax_scale=None,
-            causal=False,
-        )
 
     def forward(
         self,
@@ -449,45 +433,16 @@ class ZImageAttention(nn.Module):
                 allow_inplace=self.enable_zimage_qk_fusion,
             )
 
-        if (
-            num_replicated_suffix > 0
-            and get_sp_world_size() > 1
-            and get_ring_parallel_world_size() == 1
-        ):
-            # the cap (last num_replicated_suffix tokens), as condition, should be replicated
-            q_shard, q_rep = (
-                q[:, :-num_replicated_suffix],
-                q[:, -num_replicated_suffix:],
-            )
-            k_shard, k_rep = (
-                k[:, :-num_replicated_suffix],
-                k[:, -num_replicated_suffix:],
-            )
-            v_shard, v_rep = (
-                v[:, :-num_replicated_suffix],
-                v[:, -num_replicated_suffix:],
-            )
-            hidden_states, hidden_states_rep = self.ulysses_attn(
-                q_shard,
-                k_shard,
-                v_shard,
-                replicated_q=q_rep,
-                replicated_k=k_rep,
-                replicated_v=v_rep,
-            )
-            assert hidden_states_rep is not None
-            hidden_states = torch.cat([hidden_states, hidden_states_rep], dim=1)
-        else:
-            hidden_states = self.attn(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                attn_mask_meta=attn_mask_meta,
-                num_replicated_prefix=num_replicated_prefix,
-                num_replicated_suffix=num_replicated_suffix,
-                skip_sequence_parallel_override=skip_sequence_parallel_override,
-            )
+        hidden_states = self.attn(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=skip_sequence_parallel_override,
+        )
         hidden_states = hidden_states.flatten(2)
 
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -754,8 +709,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
-    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping
