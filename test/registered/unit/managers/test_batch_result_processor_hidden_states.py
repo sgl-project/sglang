@@ -41,6 +41,7 @@ def _make_processor(server_mode: str = "full") -> SchedulerBatchResultProcessor:
         model_worker=Mock(),
         logprob_result_processor=None,
         output_streamer=Mock(),
+        beam_coordinator=Mock(),
         abort_request=lambda *args, **kwargs: None,
     )
 
@@ -59,6 +60,7 @@ class _PrefillReq:
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
+        self.beam_group = None
 
     def finished(self):
         return False
@@ -77,6 +79,7 @@ class _DecodeReq:
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
+        self.beam_group = None
         self.time_stats = Mock()
 
     def finished(self):
