@@ -292,7 +292,7 @@ sglang generate \
   --prompt="At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out." \
   --seed=1101 --num-gpus=4 --tp-size=2 --ulysses-degree=2 \
   --performance-mode=speed --enable-torch-compile=false \
-  --save-output --warmup \
+  --save-output --warmup-mode request \
   --perf-dump-path="${BENCH_DIR}/minimax-h3-t2va-baseline.json"
 ```
 
@@ -344,7 +344,7 @@ sglang generate \
   --width=768 --height=512 \
   --num-frames=121 \
   --seed=42 --num-gpus=2 --enable-cfg-parallel \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 `LTX2TwoStagePipeline` is a native path. The spatial upsampler and distilled
@@ -361,7 +361,7 @@ sglang generate \
   --width=768 --height=512 \
   --num-frames=121 \
   --seed=42 --num-gpus=2 --cfg-parallel-size=2 \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 This matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`.
@@ -377,7 +377,7 @@ sglang generate \
   --num-frames=121 --fps=24 \
   --num-inference-steps=30 --guidance-scale=3.0 \
   --seed=1234 --num-gpus=2 \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 Use this when you want the native `LTX2Pipeline` baseline for `LTX-2.3` at the
@@ -395,7 +395,7 @@ sglang generate \
   --num-frames=121 --fps=24 \
   --num-inference-steps=30 --guidance-scale=3.0 \
   --seed=1234 --num-gpus=2 \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 This matches the skill-only `ltx23-two-stage` preset. Use it as a
@@ -413,7 +413,7 @@ sglang generate \
   --num-inference-steps=40 --guidance-scale=4.0 \
   --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 ### Manual command example: FireRed Image Edit
@@ -428,7 +428,7 @@ sglang generate \
   --num-inference-steps=40 --guidance-scale=4.0 \
   --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing the
@@ -453,7 +453,7 @@ sglang generate \
   --config="${CONFIG_DIR}/hunyuan3d-shape.json" \
   --num-inference-steps=50 --guidance-scale=5.0 \
   --dit-layerwise-offload false --dit-cpu-offload false \
-  --save-output --enable-torch-compile --warmup
+  --save-output --enable-torch-compile --warmup-mode request
 ```
 
 For Hunyuan3D, compare the denoise stage separately from mesh export and paint
@@ -473,7 +473,7 @@ sglang generate \
   --seed=42 --save-output \
   --num-gpus=4 --enable-cfg-parallel --ulysses-degree=2 \
   --text-encoder-cpu-offload --pin-cpu-memory \
-  --warmup --enable-torch-compile
+  --warmup-mode request --enable-torch-compile
 ```
 
 `Wan2.2-I2V-A14B` uses the 720p max-area config by default, and explicit
@@ -485,7 +485,7 @@ reference-image aspect ratio.
 For every benchmark run, write a perf dump JSON:
 
 ```bash
-sglang generate ... --warmup --perf-dump-path "${BENCH_DIR}/<result>.json"
+sglang generate ... --warmup-mode request --perf-dump-path "${BENCH_DIR}/<result>.json"
 ```
 
 Before/after comparison:
@@ -542,7 +542,7 @@ sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \
   --prompt="A futuristic cyberpunk city at night" \
   --width=1024 --height=1024 --num-inference-steps=50 \
-  --seed=42 --enable-torch-compile --warmup \
+  --seed=42 --enable-torch-compile --warmup-mode request \
   --profile
 ```
 
