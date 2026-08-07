@@ -27,6 +27,28 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Scheduled runs need no approval. Manual runs are gated by the mi355x-ci
+  # environment so an individual cannot queue arbitrary work onto the shared
+  # 4-node amd-sglang partition, which CI and people use at the same time.
+  # Mirrors the gb200-ci gate in nightly-72-gpu-gb200.yml.
+  #
+  # This is a separate job rather than `environment:` on the benchmark stages
+  # because gating a matrix would demand one approval per leg instead of one
+  # per run. setup stays ungated so the available config names are still listed
+  # while approval is pending.
+  #
+  # Until an admin adds required reviewers to the mi355x-ci environment this
+  # job just passes, so merging it changes nothing on its own.
+  # ---------------------------------------------------------------------------
+  gate-dispatch:
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: mi355x-ci
+    steps:
+      - name: Approved
+        run: echo "Manual dispatch approved for the shared amd-sglang partition."
+
+  # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
   # per recipe YAML for runner=mi355x. To add/remove configs, edit
   # nightly-configs.yaml only.
@@ -110,10 +132,13 @@ jobs:
           PY
 
   nightly-mi355x-2n:
-    needs: setup
+    needs: [setup, gate-dispatch]
+    # gate-dispatch is skipped on schedule, so accept skipped as well as success
+    # -- otherwise the nightly would never reach the cluster.
     if: |
       always() && github.repository == 'sgl-project/sglang'
       && needs.setup.result == 'success'
+      && (needs.gate-dispatch.result == 'success' || needs.gate-dispatch.result == 'skipped')
       && needs.setup.outputs.matrix-2n != '{"include":[]}'
     runs-on: linux-sglang-mi35x-di
     strategy:
@@ -164,7 +189,16 @@ jobs:
           fi
 
       - name: Launch MI355X benchmark
-        timeout-minutes: 180
+        # Covers the salloc wait plus the recipe's TIME_LIMIT of run time, so
+        # this budget minus the leg's own runtime is how long it may sit in the
+        # Slurm queue. Staging means CI never queues behind itself; the headroom
+        # is for the people who share the partition. Measured legs run 15-90
+        # minutes, so 180 left as little as 90 minutes of headroom on the
+        # longest leg -- and when it runs out the leg reports a benchmark
+        # failure for a benchmark that never ran. A genuinely stuck leg is still
+        # bounded by TIME_LIMIT, which salloc enforces, so raising this does not
+        # let a hung benchmark run longer.
+        timeout-minutes: 300
         env:
           # Manual dispatch input wins; otherwise use the latest image resolved
           # by the setup job; otherwise the launcher falls back to the recipe default.
@@ -253,10 +287,12 @@ jobs:
   nightly-mi355x-4n:
     needs:
       - setup
+      - gate-dispatch
       - nightly-mi355x-2n
     if: |
       !cancelled() && github.repository == 'sgl-project/sglang'
       && needs.setup.result == 'success'
+      && (needs.gate-dispatch.result == 'success' || needs.gate-dispatch.result == 'skipped')
       && needs.setup.outputs.matrix-4n != '{"include":[]}'
     runs-on: linux-sglang-mi35x-di
     strategy:
