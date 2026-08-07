@@ -80,6 +80,21 @@ class RouterArgs:
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
+    # Optional label-based per-pod bootstrap port derivation (prefill only).
+    # When both are set, the router computes
+    #   bootstrap_port = bootstrap_port_label_base + int(pod.labels[bootstrap_port_label_key])
+    # Empty key or zero base disables the fallback.
+    bootstrap_port_label_key: str = ""
+    bootstrap_port_label_base: int = 0
+    # Per-pod HTTP serving port override. When a discovered pod carries this
+    # annotation, the router uses its value in place of --service-discovery-port.
+    http_port_annotation: str = "sglang.ai/http-port"
+    # Optional label-based per-pod HTTP port derivation. Analogue of
+    # bootstrap_port_label_* for the HTTP serving port. Useful for controllers
+    # such as LeaderWorkerSet that inject per-pod index labels but not per-pod
+    # annotations.
+    http_port_label_key: str = ""
+    http_port_label_base: int = 0
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -474,6 +489,59 @@ class RouterArgs:
             type=str,
             default=RouterArgs.bootstrap_port_annotation,
             help="Kubernetes annotation key for bootstrap port (PD mode)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}bootstrap-port-label-key",
+            type=str,
+            default=RouterArgs.bootstrap_port_label_key,
+            help=(
+                "Optional label key to derive a per-pod mooncake bootstrap port "
+                "for prefill pods. When set together with "
+                "--bootstrap-port-label-base, the router computes each prefill "
+                "pod's bootstrap port as base + int(label value). Empty disables it."
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}bootstrap-port-label-base",
+            type=int,
+            default=RouterArgs.bootstrap_port_label_base,
+            help=(
+                "Base bootstrap port to add to the label-derived pod index "
+                "(used with --bootstrap-port-label-key). Zero disables it."
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}http-port-annotation",
+            type=str,
+            default=RouterArgs.http_port_annotation,
+            help=(
+                "Annotation key for a per-pod HTTP serving port override. When "
+                "set on a discovered pod, its value replaces "
+                "--service-discovery-port for that pod. Enables co-locating "
+                "multiple hostNetwork pods on one node with distinct ports."
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}http-port-label-key",
+            type=str,
+            default=RouterArgs.http_port_label_key,
+            help=(
+                "Optional label key to derive a per-pod HTTP serving port. "
+                "When set together with --http-port-label-base, the router "
+                "computes each pod's port as base + int(label value). Useful "
+                "for controllers such as LeaderWorkerSet that inject per-pod "
+                "index labels (e.g. leaderworkerset.sigs.k8s.io/group-index) "
+                "but not per-pod annotations. Empty disables it."
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}http-port-label-base",
+            type=int,
+            default=RouterArgs.http_port_label_base,
+            help=(
+                "Base HTTP port to add to the label-derived pod index "
+                "(used with --http-port-label-key). Zero disables it."
+            ),
         )
         # Prometheus configuration
         prometheus_group.add_argument(

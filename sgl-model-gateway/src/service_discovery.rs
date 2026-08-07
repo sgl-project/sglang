@@ -40,8 +40,25 @@ pub struct ServiceDiscoveryConfig {
     pub pd_mode: bool,
     pub prefill_selector: HashMap<String, String>,
     pub decode_selector: HashMap<String, String>,
-    // Bootstrap port annotation specific to mooncake implementation
+    // Annotation key for the mooncake bootstrap port on prefill pods.
     pub bootstrap_port_annotation: String,
+    // Optional label-based fallback for the bootstrap port (prefill pods only):
+    // when the annotation is absent, the router computes
+    //   bootstrap_port = bootstrap_port_label_base + int(pod.labels[bootstrap_port_label_key])
+    // Empty key or zero base disables the fallback.
+    pub bootstrap_port_label_key: String,
+    pub bootstrap_port_label_base: u16,
+    // Annotation key for a per-pod HTTP serving port override. Lets multiple
+    // pods share one host network namespace (hostNetwork: true) by binding
+    // distinct ports.
+    pub http_port_annotation: String,
+    // Optional label-based fallback for the HTTP port: when the annotation is
+    // absent, the router computes
+    //   http_port = http_port_label_base + int(pod.labels[http_port_label_key])
+    // Useful for controllers such as LeaderWorkerSet that inject per-pod index
+    // labels but not per-pod annotations. Empty key or zero base disables it.
+    pub http_port_label_key: String,
+    pub http_port_label_base: u16,
     // Router node discovery for mesh
     pub router_selector: HashMap<String, String>,
     pub router_mesh_port_annotation: String,
@@ -61,6 +78,11 @@ impl Default for ServiceDiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            bootstrap_port_label_key: String::new(),
+            bootstrap_port_label_base: 0,
+            http_port_annotation: "sglang.ai/http-port".to_string(),
+            http_port_label_key: String::new(),
+            http_port_label_base: 0,
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             igw_mode: false,
@@ -95,8 +117,46 @@ pub struct PodInfo {
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
     pub bootstrap_port: Option<u16>,
+    // Per-pod HTTP serving port override, resolved at discovery time from
+    // ServiceDiscoveryConfig.http_port_annotation or http_port_label_*. When
+    // None, worker_url() falls back to the caller-supplied port.
+    pub http_port: Option<u16>,
     pub is_router: bool,
     pub mesh_port: Option<u16>,
+}
+
+/// Resolve a per-pod port override, preferring an annotation over a
+/// label-plus-base derivation. Returns None when neither source yields a
+/// valid u16.
+///
+/// * `annotation_key` — exact port when present.
+/// * `label_key` / `label_base` — the pod's label value is parsed as a u16
+///   index and added to `label_base`. Disabled when the key is empty or the
+///   base is zero. Overflow returns None.
+fn resolve_pod_port_override(
+    pod: &Pod,
+    annotation_key: &str,
+    label_key: &str,
+    label_base: u16,
+) -> Option<u16> {
+    let from_annotation = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(annotation_key))
+        .and_then(|port_str| port_str.parse::<u16>().ok());
+    if from_annotation.is_some() {
+        return from_annotation;
+    }
+    if label_key.is_empty() || label_base == 0 {
+        return None;
+    }
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(label_key))
+        .and_then(|idx_str| idx_str.parse::<u16>().ok())
+        .and_then(|idx| label_base.checked_add(idx))
 }
 
 impl PodInfo {
@@ -168,18 +228,26 @@ impl PodInfo {
         };
 
         let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
-            if let Some(config) = config {
-                pod.metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.get(&config.bootstrap_port_annotation))
-                    .and_then(|port_str| port_str.parse::<u16>().ok())
-            } else {
-                None
-            }
+            config.and_then(|config| {
+                resolve_pod_port_override(
+                    pod,
+                    &config.bootstrap_port_annotation,
+                    &config.bootstrap_port_label_key,
+                    config.bootstrap_port_label_base,
+                )
+            })
         } else {
             None
         };
+
+        let http_port = config.and_then(|config| {
+            resolve_pod_port_override(
+                pod,
+                &config.http_port_annotation,
+                &config.http_port_label_key,
+                config.http_port_label_base,
+            )
+        });
 
         // Check if this is a router pod
         let is_router = if let Some(config) = config {
@@ -211,6 +279,7 @@ impl PodInfo {
             is_ready,
             pod_type,
             bootstrap_port,
+            http_port,
             is_router,
             mesh_port,
         })
@@ -221,8 +290,12 @@ impl PodInfo {
     }
 
     pub fn worker_url(&self, port: u16) -> String {
-        // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
-        format!("http://{}:{}", self.ip, port)
+        // Prefer the pod-level HTTP port override when present (see
+        // ServiceDiscoveryConfig.http_port_annotation / http_port_label_*).
+        // Default to http:// prefix; workflow will detect the actual protocol
+        // (HTTP vs gRPC).
+        let effective_port = self.http_port.unwrap_or(port);
+        format!("http://{}:{}", self.ip, effective_port)
     }
 }
 
@@ -905,6 +978,11 @@ mod tests {
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            bootstrap_port_label_key: String::new(),
+            bootstrap_port_label_base: 0,
+            http_port_annotation: "sglang.ai/http-port".to_string(),
+            http_port_label_key: String::new(),
+            http_port_label_base: 0,
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             igw_mode: false,
@@ -1103,6 +1181,133 @@ mod tests {
         assert!(pod_info.bootstrap_port.is_none());
     }
 
+    // ---- Per-pod HTTP / bootstrap port override tests ----
+
+    const LWS_GROUP_INDEX: &str = "leaderworkerset.sigs.k8s.io/group-index";
+
+    fn insert_label(pod: &mut Pod, key: &str, value: &str) {
+        pod.metadata
+            .labels
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert(key.to_string(), value.to_string());
+    }
+
+    fn insert_annotation(pod: &mut Pod, key: &str, value: &str) {
+        pod.metadata
+            .annotations
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert(key.to_string(), value.to_string());
+    }
+
+    #[test]
+    fn test_http_port_from_annotation() {
+        let mut pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        insert_annotation(&mut pod, "sglang.ai/http-port", "30001");
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&create_pd_config())).unwrap();
+        assert_eq!(pod_info.http_port, Some(30001));
+        // worker_url() must honor the override.
+        assert_eq!(pod_info.worker_url(30000), "http://10.0.0.1:30001");
+    }
+
+    #[test]
+    fn test_http_port_from_label_base_plus_index() {
+        // Two co-located decode pods (index 0 and 1) get 30000 and 30001.
+        let mut config = create_pd_config();
+        config.http_port_label_key = LWS_GROUP_INDEX.to_string();
+        config.http_port_label_base = 30000;
+
+        for (idx, expected) in [("0", 30000u16), ("1", 30001u16)] {
+            let mut pod =
+                create_pd_k8s_pod(&format!("decode-{idx}"), "10.0.0.1", "decode", None);
+            insert_label(&mut pod, LWS_GROUP_INDEX, idx);
+            let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+            assert_eq!(pod_info.http_port, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_http_port_annotation_takes_precedence_over_label() {
+        let mut pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        insert_annotation(&mut pod, "sglang.ai/http-port", "40000");
+        insert_label(&mut pod, LWS_GROUP_INDEX, "5");
+
+        let mut config = create_pd_config();
+        config.http_port_label_key = LWS_GROUP_INDEX.to_string();
+        config.http_port_label_base = 30000;
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.http_port, Some(40000));
+    }
+
+    #[test]
+    fn test_http_port_falls_back_to_config_port() {
+        // No annotation, label-derivation disabled: worker_url() uses the
+        // caller-supplied port.
+        let pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        let pod_info = PodInfo::from_pod(&pod, Some(&create_pd_config())).unwrap();
+        assert!(pod_info.http_port.is_none());
+        assert_eq!(pod_info.worker_url(8080), "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_bootstrap_port_from_label_base_plus_index() {
+        // Two co-located prefill pods get distinct bootstrap ports.
+        let mut config = create_pd_config();
+        config.bootstrap_port_label_key = LWS_GROUP_INDEX.to_string();
+        config.bootstrap_port_label_base = 9001;
+
+        for (idx, expected) in [("0", 9001u16), ("1", 9002u16)] {
+            let mut pod =
+                create_pd_k8s_pod(&format!("prefill-{idx}"), "10.0.0.1", "prefill", None);
+            insert_label(&mut pod, LWS_GROUP_INDEX, idx);
+            let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+            assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
+            assert_eq!(pod_info.bootstrap_port, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_port_annotation_takes_precedence_over_label() {
+        let mut pod = create_pd_k8s_pod("prefill-0", "10.0.0.1", "prefill", Some(8081));
+        insert_label(&mut pod, LWS_GROUP_INDEX, "5");
+
+        let mut config = create_pd_config();
+        config.bootstrap_port_label_key = LWS_GROUP_INDEX.to_string();
+        config.bootstrap_port_label_base = 9001;
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.bootstrap_port, Some(8081));
+    }
+
+    #[test]
+    fn test_bootstrap_port_label_disabled_when_base_zero() {
+        let mut pod = create_pd_k8s_pod("prefill-0", "10.0.0.1", "prefill", None);
+        insert_label(&mut pod, LWS_GROUP_INDEX, "0");
+
+        let mut config = create_pd_config();
+        config.bootstrap_port_label_key = LWS_GROUP_INDEX.to_string();
+        config.bootstrap_port_label_base = 0;
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert!(pod_info.bootstrap_port.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_port_label_ignored_for_decode() {
+        // Bootstrap port derivation only applies to prefill pods.
+        let mut pod = create_pd_k8s_pod("decode-0", "10.0.0.1", "decode", None);
+        insert_label(&mut pod, LWS_GROUP_INDEX, "0");
+
+        let mut config = create_pd_config();
+        config.bootstrap_port_label_key = LWS_GROUP_INDEX.to_string();
+        config.bootstrap_port_label_base = 9001;
+
+        let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Decode));
+        assert!(pod_info.bootstrap_port.is_none());
+    }
+
     #[test]
     fn test_pod_info_from_pod_not_ready() {
         let k8s_pod = create_k8s_pod(
@@ -1164,6 +1369,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1176,6 +1382,7 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1188,6 +1395,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1203,6 +1411,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1214,6 +1423,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1225,6 +1435,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1244,6 +1455,7 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1272,6 +1484,7 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1299,6 +1512,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1332,6 +1546,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1365,6 +1580,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1400,6 +1616,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1430,6 +1647,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Regular),
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1464,6 +1682,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1497,6 +1716,7 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            http_port: None,
             is_router: false,
             mesh_port: None,
         };
@@ -1544,6 +1764,11 @@ mod tests {
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            bootstrap_port_label_key: String::new(),
+            bootstrap_port_label_base: 0,
+            http_port_annotation: "sglang.ai/http-port".to_string(),
+            http_port_label_key: String::new(),
+            http_port_label_base: 0,
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             igw_mode: true,
@@ -1579,6 +1804,11 @@ mod tests {
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            bootstrap_port_label_key: String::new(),
+            bootstrap_port_label_base: 0,
+            http_port_annotation: "sglang.ai/http-port".to_string(),
+            http_port_label_key: String::new(),
+            http_port_label_base: 0,
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
             igw_mode: false,
