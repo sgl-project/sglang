@@ -1,0 +1,287 @@
+---
+title: Nemotron3.5-Lightning
+description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 (W4A4) hybrid Mamba + MoE serving on a single H100, with reasoning, tool calling, and a tunable thinking budget."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:nightly-dev-20260719-99f5a6f4
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. One operating point is published today — **Balanced**, a single-H100 NVFP4 recipe suitable for typical multi-user serving. Use the Playground below to explore knobs beyond it.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/nvidia/nemotron-3.5-lightning.jsx";
+import { benchmarks } from "/src/snippets/configs/nvidia/nemotron-3.5-lightning-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**NVIDIA Nemotron 3.5 Lightning** is a hybrid reasoning LLM that interleaves Mamba sequence-modeling layers with Mixture-of-Experts feed-forward layers and standard self-attention, rather than a uniform "attention + MLP" transformer stack. It ships a post-training-quantized **NVFP4 (W4A4)** checkpoint that serves on a **single H100 80GB** at TP=1, and supports thinking-on / thinking-off modes plus structured tool calling.
+
+The model is published as two checkpoints:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723">nemotron-nano-3.5-ea2-W4A4-PTQ-20260723</a></strong></td>
+      <td style={{padding: "9px 12px"}}>NVFP4 (W4A4)</td>
+      <td style={{padding: "9px 12px"}}>Serving — the checkpoint this page deploys</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/nemotron-nano-3.5-ea2">nemotron-nano-3.5-ea2</a></strong></td>
+      <td style={{padding: "9px 12px"}}>BF16</td>
+      <td style={{padding: "9px 12px"}}>Full-precision accuracy reference</td>
+    </tr>
+  </tbody>
+</table>
+
+**Resources:** [HuggingFace](https://huggingface.co/nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723).
+
+## 2. Configuration Tips
+
+- **Parser names are backend-specific and not interchangeable.** SGLang uses `--reasoning-parser nemotron_3` and `--tool-call-parser qwen3_coder`. vLLM uses `--reasoning-parser nemotron_v3`, and TensorRT-LLM uses `--reasoning_parser nemotron-v3` — different identifiers for the same logical capability.
+
+- **Reasoning tokens count toward `max_tokens`.** If `content` comes back as `None` with `finish_reason: "length"`, the thinking trace consumed the whole budget before an answer was produced — raise `max_tokens`.
+
+- **Hybrid Mamba memory pool.** This is a Mamba + attention hybrid, so GPU memory is split between the KV cache and the Mamba state pool. If concurrency is clamped lower than expected, or you hit a "not enough space for mamba cache" error, tune `--mamba-full-memory-ratio` (or pin `--max-mamba-cache-size`).
+
+- **Tool calling with reasoning on** requires `"force_nonempty_content": true` inside `chat_template_kwargs`. Without it, the server may not correctly surface both the reasoning trace and the tool-call output in the same response.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+Enable the `nemotron_3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer. The parser is separate-field: the thinking trace lands in `message.reasoning_content` and the answer in `message.content`.
+
+The model supports two modes — Reasoning ON (default) and Reasoning OFF, toggled with `enable_thinking` in `chat_template_kwargs`.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+MODEL = "nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723"
+
+# Reasoning on (default)
+resp = client.chat.completions.create(
+    model=MODEL,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a haiku about GPUs."},
+    ],
+    max_tokens=1024,
+)
+print("Reasoning:", resp.choices[0].message.reasoning_content)
+print("Content:", resp.choices[0].message.content)
+
+# Reasoning off
+resp = client.chat.completions.create(
+    model=MODEL,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Give me 3 interesting facts about SGLang."},
+    ],
+    max_tokens=256,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False,
+                                         "force_nonempty_content": True}},
+)
+print("Content:", resp.choices[0].message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.2 Tool Calling
+
+Enable the `qwen3_coder` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+MODEL = "nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723"
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_tip",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bill_total": {"type": "integer", "description": "The total amount of the bill"},
+                    "tip_percentage": {"type": "integer", "description": "The percentage of tip to be applied"},
+                },
+                "required": ["bill_total", "tip_percentage"],
+            },
+        },
+    }
+]
+
+completion = client.chat.completions.create(
+    model=MODEL,
+    messages=[{"role": "user", "content": "My bill is $50. What will be the amount for 15% tip?"}],
+    tools=TOOLS,
+    max_tokens=1024,
+    extra_body={"chat_template_kwargs": {"enable_thinking": True,
+                                         "force_nonempty_content": True}},
+)
+
+choice = completion.choices[0]
+print("Reasoning:", choice.message.reasoning_content)
+print("Content:", choice.message.content)
+print("Tool calls:", choice.message.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.3 Controlling the Reasoning Budget
+
+To cap how long the model thinks before answering, run the thinking phase with a bounded `max_tokens`, close the trace yourself, then continue the turn through the completions endpoint with the remaining budget.
+
+<Accordion title="Reasoning Budget Example (Python)">
+
+```python Example
+from typing import Any, Dict, List
+
+import openai
+from transformers import AutoTokenizer
+
+MODEL = "nvidia/nemotron-nano-3.5-ea2-W4A4-PTQ-20260723"
+
+
+class ThinkingBudgetClient:
+    def __init__(self, base_url: str, api_key: str, tokenizer_name_or_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+        self.client = openai.OpenAI(base_url=base_url, api_key=api_key)
+
+    def chat_completion(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        reasoning_budget: int = 512,
+        max_tokens: int = 1024,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        assert max_tokens > reasoning_budget, "reasoning_budget must be smaller than max_tokens"
+
+        response = self.client.chat.completions.create(
+            model=model, messages=messages, max_tokens=reasoning_budget, **kwargs
+        )
+        reasoning_content = response.choices[0].message.reasoning_content or ""
+        if "</think>" not in reasoning_content:
+            reasoning_content = f"{reasoning_content}.\n</think>\n\n"
+
+        reasoning_tokens_used = len(
+            self.tokenizer.encode(reasoning_content, add_special_tokens=False)
+        )
+        remaining_tokens = max_tokens - reasoning_tokens_used
+        assert remaining_tokens > 0, "Increase max_tokens or lower reasoning_budget"
+
+        messages.append({"role": "assistant", "content": reasoning_content})
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, continue_final_message=True
+        )
+        response = self.client.completions.create(
+            model=model, prompt=prompt, max_tokens=remaining_tokens, **kwargs
+        )
+        return {
+            "reasoning_content": reasoning_content.strip().strip("</think>").strip(),
+            "content": response.choices[0].text,
+            "finish_reason": response.choices[0].finish_reason,
+        }
+
+
+budget_client = ThinkingBudgetClient(
+    base_url="http://localhost:30000/v1", api_key="EMPTY", tokenizer_name_or_path=MODEL
+)
+
+resp = budget_client.chat_completion(
+    model=MODEL,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Write a haiku about GPUs."},
+    ],
+    max_tokens=1024,
+    reasoning_budget=128,
+)
+print("Reasoning:", resp["reasoning_content"])
+print("Content:", resp["content"])
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
