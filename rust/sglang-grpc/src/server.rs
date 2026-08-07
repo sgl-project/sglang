@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
-use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
+use crate::bridge::{PyBridge, RequestKey, ResponseChunk, SubmittedRequest, TerminalError};
 use crate::proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
@@ -87,15 +87,15 @@ async fn recv_chunk_with_timeout(
 
 struct RequestAbortGuard {
     bridge: Arc<PyBridge>,
-    rid: String,
+    key: RequestKey,
     armed: bool,
 }
 
 impl RequestAbortGuard {
-    fn new(bridge: Arc<PyBridge>, rid: impl Into<String>) -> Self {
+    fn new(bridge: Arc<PyBridge>, key: RequestKey) -> Self {
         Self {
             bridge,
-            rid: rid.into(),
+            key,
             armed: true,
         }
     }
@@ -107,7 +107,7 @@ impl RequestAbortGuard {
     fn abort_now(&mut self) {
         if self.armed {
             self.armed = false;
-            spawn_abort(self.bridge.clone(), self.rid.clone());
+            spawn_abort(self.bridge.clone(), self.key.clone());
         }
     }
 }
@@ -117,22 +117,22 @@ impl Drop for RequestAbortGuard {
         if self.armed {
             // Dropping a response stream means the client stopped consuming; propagate
             // cancellation to Python without blocking the Tokio worker.
-            spawn_abort(self.bridge.clone(), self.rid.clone());
+            spawn_abort(self.bridge.clone(), self.key.clone());
         }
     }
 }
 
-fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
+fn spawn_abort(bridge: Arc<PyBridge>, key: RequestKey) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // Fire-and-forget: dropping the JoinHandle detaches the task.
             drop(handle.spawn_blocking(move || {
-                let _ = bridge.abort(&rid, false);
+                let _ = bridge.abort_request(&key);
             }));
         }
         Err(_) => {
             tracing::warn!(
-                rid,
+                rid = key.rid(),
                 "Skipping gRPC request abort because no Tokio runtime is available"
             );
         }
@@ -141,11 +141,11 @@ fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
 
 async fn recv_terminal_chunk_for_request(
     bridge: &Arc<PyBridge>,
-    rid: &str,
+    key: &RequestKey,
     receiver: &mut Receiver<ResponseChunk>,
     response_timeout: Duration,
 ) -> Result<ResponseChunk, Status> {
-    let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid.to_string());
+    let mut abort_guard = RequestAbortGuard::new(bridge.clone(), key.clone());
 
     match recv_chunk_with_timeout(receiver, response_timeout, || {
         format!("Request timed out after {}s", response_timeout.as_secs())
@@ -154,7 +154,7 @@ async fn recv_terminal_chunk_for_request(
     {
         Ok(Some(ResponseChunk::Data(_))) => {
             tracing::warn!(
-                rid,
+                rid = key.rid(),
                 "Unary gRPC response received non-terminal Data chunk; expected Finished"
             );
             abort_guard.abort_now();
@@ -167,7 +167,7 @@ async fn recv_terminal_chunk_for_request(
             Ok(chunk)
         }
         Ok(None) => {
-            let (status, should_abort) = closed_stream_status(bridge, rid);
+            let (status, should_abort) = closed_stream_status(bridge, key);
             if should_abort {
                 abort_guard.abort_now();
             } else {
@@ -186,8 +186,8 @@ async fn recv_terminal_chunk_for_request(
     }
 }
 
-fn closed_stream_status(bridge: &Arc<PyBridge>, rid: &str) -> (Status, bool) {
-    if let Some(error) = bridge.take_terminal_error(rid) {
+fn closed_stream_status(bridge: &Arc<PyBridge>, key: &RequestKey) -> (Status, bool) {
+    if let Some(error) = bridge.take_terminal_error(key) {
         (terminal_error_status(error), false)
     } else {
         (
@@ -214,6 +214,142 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
         .unwrap_or(default)
 }
 
+const MAX_GENERATION_CHOICES: i32 = 1024;
+
+fn expected_generation_choices(request: &proto::GenerateRequest) -> Result<usize, Box<Status>> {
+    let choices = request
+        .sampling_params
+        .as_ref()
+        .and_then(|params| params.n)
+        .unwrap_or(1);
+    if !(1..=MAX_GENERATION_CHOICES).contains(&choices) {
+        return Err(Box::new(Status::invalid_argument(format!(
+            "sampling_params.n must be between 1 and {MAX_GENERATION_CHOICES}, got {choices}"
+        ))));
+    }
+    Ok(choices as usize)
+}
+
+fn finish_reason_value(
+    meta_info: &HashMap<String, String>,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(encoded) = meta_info.get("finish_reason") else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(encoded)
+        .map_err(|error| format!("SGLang returned malformed finish_reason: {error}"))?;
+    Ok((!value.is_null()).then_some(value))
+}
+
+struct ChoiceTracker {
+    expected: usize,
+    terminal: HashSet<i32>,
+}
+
+impl ChoiceTracker {
+    fn new(expected: usize) -> Self {
+        Self {
+            expected,
+            terminal: HashSet::new(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        choice_index: i32,
+        choice_terminal: bool,
+        request_finished: bool,
+    ) -> Result<bool, String> {
+        if choice_index < 0 || choice_index as usize >= self.expected {
+            return Err(format!(
+                "SGLang returned choice index {choice_index} outside 0..{}",
+                self.expected
+            ));
+        }
+        if self.terminal.contains(&choice_index) {
+            return Err(format!(
+                "SGLang returned data after terminal for choice {choice_index}"
+            ));
+        }
+        if choice_terminal {
+            self.terminal.insert(choice_index);
+        }
+        if request_finished && self.terminal.len() != self.expected {
+            return Err(format!(
+                "SGLang closed Generate after {}/{} terminal choices",
+                self.terminal.len(),
+                self.expected
+            ));
+        }
+        Ok(self.terminal.len() == self.expected)
+    }
+}
+
+enum GenerationTerminal {
+    Finish(proto::GenerationFinish),
+    Error(proto::GenerationError),
+}
+
+fn generation_terminal(finish_reason: Option<&serde_json::Value>) -> GenerationTerminal {
+    let Some(value) = finish_reason else {
+        return GenerationTerminal::Error(proto::GenerationError {
+            code: proto::GenerationErrorCode::Internal as i32,
+            message: "SGLang stream ended without finish_reason".into(),
+            retryable: false,
+        });
+    };
+    let finish_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.as_str())
+        .unwrap_or("error");
+    if matches!(finish_type, "abort" | "error") {
+        let status_code = value.get("status_code").and_then(serde_json::Value::as_i64);
+        let (code, retryable) = match status_code {
+            Some(408 | 504) => (proto::GenerationErrorCode::DeadlineExceeded, true),
+            Some(499) => (proto::GenerationErrorCode::Cancelled, false),
+            Some(400..=499) => (proto::GenerationErrorCode::InvalidArgument, false),
+            Some(503) => (proto::GenerationErrorCode::Unavailable, true),
+            None if finish_type == "abort" => (proto::GenerationErrorCode::Cancelled, false),
+            _ => (proto::GenerationErrorCode::Internal, false),
+        };
+        return GenerationTerminal::Error(proto::GenerationError {
+            code: code as i32,
+            message: value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("SGLang generation failed")
+                .to_string(),
+            retryable,
+        });
+    }
+
+    let reason = match finish_type {
+        "stop" => proto::FinishReason::Stop,
+        "length" => proto::FinishReason::Length,
+        "cancelled" => proto::FinishReason::Cancelled,
+        _ => proto::FinishReason::Unspecified,
+    };
+    let stop_reason = value.get("matched").and_then(|matched| {
+        use proto::stop_reason::Reason;
+        let reason = if let Some(value) = matched.as_str() {
+            Some(Reason::MatchedString(value.to_string()))
+        } else {
+            matched
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .map(Reason::MatchedTokenId)
+        }?;
+        Some(proto::StopReason {
+            reason: Some(reason),
+        })
+    });
+    GenerationTerminal::Finish(proto::GenerationFinish {
+        reason: reason as i32,
+        stop_reason,
+    })
+}
+
 #[tonic::async_trait]
 impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     // --- SGLang-native RPCs: TextGenerate / Generate ---
@@ -231,17 +367,16 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(&rid, "generate", req_dict)
+            .submit_request(&rid, "generate", req_dict, false)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
-        let rid_clone = rid.clone();
         let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
-            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), key.clone());
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
                     Ok(Some(ResponseChunk::Data(data))) => {
@@ -266,7 +401,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         break;
                     }
                     Ok(None) => {
-                        let (status, should_abort) = closed_stream_status(&bridge, &rid_clone);
+                        let (status, should_abort) = closed_stream_status(&bridge, &key);
                         if should_abort {
                             abort_guard.abort_now();
                         } else {
@@ -299,35 +434,75 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let expected_choices = expected_generation_choices(&req).map_err(|status| *status)?;
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(&rid, "generate", req_dict)
+            .submit_request(&rid, "generate", req_dict, expected_choices > 1)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
-        let rid_clone = rid.clone();
+        let public_rid = rid.clone();
         let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
-            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), key.clone());
+            let mut choices = ChoiceTracker::new(expected_choices);
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
-                    Ok(Some(ResponseChunk::Data(data))) => {
-                        yield Ok(proto::GenerateResponse {
-                            output_ids: data.output_ids.unwrap_or_default(),
-                            meta_info: data.meta_info,
-                            finished: false,
+                    Ok(Some(chunk @ (ResponseChunk::Data(_) | ResponseChunk::Finished(_)))) => {
+                        let request_finished = matches!(&chunk, ResponseChunk::Finished(_));
+                        let data = match chunk {
+                            ResponseChunk::Data(data) | ResponseChunk::Finished(data) => data,
+                            ResponseChunk::Error(_) => unreachable!(),
+                        };
+                        let finish_reason = match finish_reason_value(&data.meta_info) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(error));
+                                break;
+                            }
+                        };
+                        let choice_terminal = request_finished || finish_reason.is_some();
+                        let all_terminal = match choices.observe(
+                            data.choice_index,
+                            choice_terminal,
+                            request_finished,
+                        ) {
+                            Ok(all_terminal) => all_terminal,
+                            Err(error) => {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(error));
+                                break;
+                            }
+                        };
+                        let output_ids = data.output_ids.unwrap_or_default();
+                        let terminal = choice_terminal.then(|| match generation_terminal(finish_reason.as_ref()) {
+                            GenerationTerminal::Finish(finish) => {
+                                proto::generate_response::Terminal::Finish(finish)
+                            }
+                            GenerationTerminal::Error(error) => {
+                                proto::generate_response::Terminal::Error(error)
+                            }
                         });
-                    }
-                    Ok(Some(ResponseChunk::Finished(data))) => {
-                        abort_guard.disarm();
+                        if all_terminal {
+                            abort_guard.disarm();
+                        }
                         yield Ok(proto::GenerateResponse {
-                            output_ids: data.output_ids.unwrap_or_default(),
+                            delta_output_ids: data
+                                .delta_output_ids
+                                .unwrap_or_else(|| output_ids.clone()),
+                            output_ids,
                             meta_info: data.meta_info,
-                            finished: true,
+                            finished: request_finished,
+                            request_id: public_rid.clone(),
+                            choice_index: data.choice_index,
+                            terminal,
                         });
-                        break;
+                        if all_terminal {
+                            break;
+                        }
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
@@ -335,7 +510,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         break;
                     }
                     Ok(None) => {
-                        let (status, should_abort) = closed_stream_status(&bridge, &rid_clone);
+                        let (status, should_abort) = closed_stream_status(&bridge, &key);
                         if should_abort {
                             abort_guard.abort_now();
                         } else {
@@ -369,14 +544,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_text_embed_dict(&rid, &req);
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(&rid, "embed", req_dict)
+            .submit_request(&rid, "embed", req_dict, false)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
-            &rid,
+            &key,
             &mut receiver,
             self.response_timeout,
         )
@@ -404,14 +579,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_embed_dict(&rid, &req);
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(&rid, "embed", req_dict)
+            .submit_request(&rid, "embed", req_dict, false)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
-            &rid,
+            &key,
             &mut receiver,
             self.response_timeout,
         )
@@ -446,14 +621,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_classify_dict(&rid, &req);
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(&rid, "embed", req_dict)
+            .submit_request(&rid, "embed", req_dict, false)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
-            &rid,
+            &key,
             &mut receiver,
             self.response_timeout,
         )
@@ -642,13 +817,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     ) -> Result<Response<proto::GetLoadResponse>, Status> {
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_get_load(&rid, req.dp_rank)
             .map_err(|e| pyerr_to_status(e, "Failed to get load"))?;
 
-        let json_info =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_info = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         Ok(Response::new(proto::GetLoadResponse { json_info }))
     }
 
@@ -679,13 +853,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         _request: Request<proto::FlushCacheRequest>,
     ) -> Result<Response<proto::FlushCacheResponse>, Status> {
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_flush_cache(&rid)
             .map_err(|e| pyerr_to_status(e, "Failed to flush cache"))?;
 
-        let json_str =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_str = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::FlushCacheResponse {
@@ -700,13 +873,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     ) -> Result<Response<proto::PauseGenerationResponse>, Status> {
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_pause_generation(&rid, &req.mode)
             .map_err(|e| pyerr_to_status(e, "Failed to pause generation"))?;
 
-        let json_str =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_str = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::PauseGenerationResponse {
@@ -719,13 +891,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         _request: Request<proto::ContinueGenerationRequest>,
     ) -> Result<Response<proto::ContinueGenerationResponse>, Status> {
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_continue_generation(&rid)
             .map_err(|e| pyerr_to_status(e, "Failed to continue generation"))?;
 
-        let json_str =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_str = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::ContinueGenerationResponse {
@@ -792,13 +963,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     ) -> Result<Response<proto::StartProfileResponse>, Status> {
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_start_profile(&rid, req.output_dir.as_deref())
             .map_err(|e| pyerr_to_status(e, "Failed to start profile"))?;
 
-        let json_str =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_str = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::StartProfileResponse {
@@ -811,13 +981,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         _request: Request<proto::StopProfileRequest>,
     ) -> Result<Response<proto::StopProfileResponse>, Status> {
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_stop_profile(&rid)
             .map_err(|e| pyerr_to_status(e, "Failed to stop profile"))?;
 
-        let json_str =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_str = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::StopProfileResponse {
@@ -831,13 +1000,12 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     ) -> Result<Response<proto::UpdateWeightsResponse>, Status> {
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
-        let receiver = self
+        let submitted = self
             .bridge
             .submit_update_weights(&rid, &req.model_path, req.load_format.as_deref())
             .map_err(|e| pyerr_to_status(e, "Failed to update weights"))?;
 
-        let json_str =
-            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
+        let json_str = recv_json_response(&self.bridge, submitted, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::UpdateWeightsResponse {
@@ -857,17 +1025,16 @@ impl SglangServiceImpl {
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
             .submit_openai(&rid, method_name, &req.json_body, &req.trace_headers)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
-        let rid_clone = rid.clone();
         let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
-            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), key.clone());
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
                     Ok(Some(ResponseChunk::Data(data))) => {
@@ -891,7 +1058,7 @@ impl SglangServiceImpl {
                         break;
                     }
                     Ok(None) => {
-                        let (status, should_abort) = closed_stream_status(&bridge, &rid_clone);
+                        let (status, should_abort) = closed_stream_status(&bridge, &key);
                         if should_abort {
                             abort_guard.abort_now();
                         } else {
@@ -920,14 +1087,14 @@ impl SglangServiceImpl {
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
 
-        let mut receiver = self
+        let SubmittedRequest { key, mut receiver } = self
             .bridge
             .submit_openai(&rid, method_name, &req.json_body, &req.trace_headers)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let chunk = recv_terminal_chunk_for_request(
             &self.bridge,
-            &rid,
+            &key,
             &mut receiver,
             self.response_timeout,
         )
@@ -954,12 +1121,12 @@ impl SglangServiceImpl {
 /// Receive a single JSON response from the bridge channel.
 async fn recv_json_response(
     bridge: &Arc<PyBridge>,
-    rid: &str,
-    mut receiver: Receiver<ResponseChunk>,
+    submitted: SubmittedRequest,
     response_timeout: Duration,
 ) -> Result<String, Status> {
+    let SubmittedRequest { key, mut receiver } = submitted;
     let chunk =
-        recv_terminal_chunk_for_request(bridge, rid, &mut receiver, response_timeout).await?;
+        recv_terminal_chunk_for_request(bridge, &key, &mut receiver, response_timeout).await?;
 
     match chunk {
         ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {

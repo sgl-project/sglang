@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from pydantic import ValidationError
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.entrypoints.grpc_native_generation import NativeGenerationAdapter
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ class _GrpcRequest:
         return bool(self._is_disconnected_fn())
 
 
-class RuntimeHandle:
+class RuntimeHandle(NativeGenerationAdapter):
     """Thin Python handle that the Rust gRPC server calls into.
 
     Provides synchronous ``submit_*``, ``abort``, and info methods.
@@ -75,7 +76,6 @@ class RuntimeHandle:
         self.scheduler_info = scheduler_info or {}
 
         self._openai_serving_classes = None
-
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
 
@@ -106,12 +106,18 @@ class RuntimeHandle:
     def _is_closed_status(status) -> bool:
         return status is not None and status == type(status).Closed
 
-    def _abort_request_id(self, rid) -> None:
+    def _abort_request_id(self, rid, lifecycle_id=None) -> None:
         if isinstance(rid, list):
             for single_rid in rid:
-                self.tokenizer_manager.abort_request(rid=single_rid)
+                self.tokenizer_manager.abort_request(
+                    rid=single_rid,
+                    lifecycle_id=lifecycle_id,
+                )
         else:
-            self.tokenizer_manager.abort_request(rid=rid)
+            self.tokenizer_manager.abort_request(
+                rid=rid,
+                lifecycle_id=lifecycle_id,
+            )
 
     async def _send_with_backpressure(
         self,
@@ -120,6 +126,7 @@ class RuntimeHandle:
         payload,
         *,
         timeout_abort_rid=None,
+        timeout_abort_lifecycle_id=None,
         **kwargs,
     ) -> bool:
         status = self._safe_callback(chunk_callback, payload, **kwargs)
@@ -139,7 +146,10 @@ class RuntimeHandle:
             )
         except asyncio.TimeoutError:
             if timeout_abort_rid is not None:
-                self._abort_request_id(timeout_abort_rid)
+                self._abort_request_id(
+                    timeout_abort_rid,
+                    timeout_abort_lifecycle_id,
+                )
                 logger.warning(
                     "gRPC chunk backpressure wait timed out after %ss; aborted request",
                     self._BACKPRESSURE_TIMEOUT_S,
@@ -180,12 +190,15 @@ class RuntimeHandle:
         except Exception as e:
             logger.warning("gRPC clear_on_ready failed: %s", e)
 
-    def _submit_on_tm_loop(self, coro: Awaitable) -> None:
+    def _submit_on_tm_loop(self, coro: Awaitable):
         future = asyncio.run_coroutine_threadsafe(coro, self._tm_loop)
         future.add_done_callback(self._log_unhandled_future_exception)
+        return future
 
     @staticmethod
     def _log_unhandled_future_exception(future) -> None:
+        if future.cancelled():
+            return
         try:
             future.result()
         except Exception as e:
@@ -266,6 +279,8 @@ class RuntimeHandle:
         req_type: str,
         req_dict: dict,
         chunk_callback,
+        choice_aware: bool = False,
+        lifecycle_id=None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         mock_request = (
@@ -279,89 +294,43 @@ class RuntimeHandle:
             obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
             self._submit_on_tm_loop(
-                self._run_generate(obj, chunk_callback, stream, mock_request)
+                self._run_generate(
+                    obj,
+                    chunk_callback,
+                    stream,
+                    mock_request,
+                    choice_aware=choice_aware,
+                    lifecycle_id=lifecycle_id,
+                )
             )
         elif req_type == "embed":
             from sglang.srt.managers.io_struct import EmbeddingReqInput
 
             obj = EmbeddingReqInput(**req_dict)
-            self._submit_on_tm_loop(self._run_embed(obj, chunk_callback, mock_request))
+            self._submit_on_tm_loop(
+                self._run_embed(
+                    obj,
+                    chunk_callback,
+                    mock_request,
+                    lifecycle_id=lifecycle_id,
+                )
+            )
         else:
             raise ValueError(
                 f"Unknown req_type: {req_type!r} (expected 'generate' or 'embed')"
             )
 
-    async def _run_generate(self, obj, chunk_callback, stream: bool, request):
-        ready_event = None
-        gen = None
-        try:
-            ready_event = self._install_on_ready(chunk_callback)
-            gen = self.tokenizer_manager.generate_request(obj, request=request)
-            if stream:
-                completed_choices = set()
-                expected_choices = obj.batch_size * obj.parallel_sample_num
-                async for chunk in gen:
-                    choice_finished = (
-                        chunk.get("meta_info", {}).get("finish_reason") is not None
-                    )
-                    if choice_finished:
-                        choice_id = chunk.get(
-                            "index", chunk.get("meta_info", {}).get("id")
-                        )
-                        completed_choices.add(choice_id)
-                    finished = len(completed_choices) >= expected_choices
-                    keep_going = await self._send_with_backpressure(
-                        chunk_callback,
-                        ready_event,
-                        chunk,
-                        finished=finished,
-                        timeout_abort_rid=obj.rid,
-                    )
-                    if finished or not keep_going:
-                        return
-                # Defensive: generator exited without a finish_reason chunk.
-                self._safe_callback(chunk_callback, {}, finished=True)
-            else:
-                result = await gen.__anext__()
-                chunks = result if isinstance(result, list) else [result]
-                for index, chunk in enumerate(chunks):
-                    keep_going = await self._send_with_backpressure(
-                        chunk_callback,
-                        ready_event,
-                        chunk,
-                        finished=index == len(chunks) - 1,
-                        timeout_abort_rid=obj.rid,
-                    )
-                    if not keep_going:
-                        return
-        except StopAsyncIteration:
-            self._safe_callback(chunk_callback, {}, finished=True)
-        except Exception as e:
-            logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
-        finally:
-            if gen is not None:
-                await gen.aclose()
-            self._uninstall_on_ready(chunk_callback)
-
-    async def _run_embed(self, obj, chunk_callback, request):
-        try:
-            gen = self.tokenizer_manager.generate_request(obj, request=request)
-            result = await gen.__anext__()
-            self._safe_callback(chunk_callback, result, finished=True)
-        except StopAsyncIteration:
-            self._safe_callback(chunk_callback, {}, finished=True)
-        except Exception as e:
-            logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
-
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
-    # called abort. abort_request only enqueues a message on the ZMQ socket,
-    # so a few seconds is generous; if we time out, log and drop — the client
-    # will retry or give up.
+    # called abort. A timeout is propagated so the gRPC Abort RPC cannot report
+    # success without knowing whether the scheduler saw the request.
     _ABORT_TIMEOUT_S = 5.0
 
-    def abort(self, rid: str = "", abort_all: bool = False):
+    def abort(
+        self,
+        rid: str = "",
+        lifecycle_id=None,
+        abort_all: bool = False,
+    ):
         """Abort a request by request ID or abort all active requests."""
         loop = self._tm_loop
 
@@ -371,17 +340,19 @@ class RuntimeHandle:
             running_loop = None
 
         if running_loop is loop:
-            self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
-            return
+            return self.tokenizer_manager.abort_request(
+                rid=rid,
+                abort_all=abort_all,
+                lifecycle_id=lifecycle_id,
+            )
 
         future = asyncio.run_coroutine_threadsafe(
-            self._abort_async(rid, abort_all),
+            self._abort_async(rid, lifecycle_id, abort_all),
             loop,
         )
         try:
-            future.result(timeout=self._ABORT_TIMEOUT_S)
+            return future.result(timeout=self._ABORT_TIMEOUT_S)
         except TimeoutError:
-            future.cancel()
             logger.error(
                 "gRPC abort timed out after %ss (rid=%r, abort_all=%s); "
                 "tokenizer_manager loop appears stuck",
@@ -389,9 +360,14 @@ class RuntimeHandle:
                 rid,
                 abort_all,
             )
+            raise
 
-    async def _abort_async(self, rid: str, abort_all: bool) -> None:
-        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+    async def _abort_async(self, rid: str, lifecycle_id, abort_all: bool) -> bool:
+        return self.tokenizer_manager.abort_request(
+            rid=rid,
+            abort_all=abort_all,
+            lifecycle_id=lifecycle_id,
+        )
 
     def get_model_info(self) -> str:
         model_config = self.tokenizer_manager.model_config
@@ -535,9 +511,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,
