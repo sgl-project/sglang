@@ -834,10 +834,7 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
-        # Elastic-EP offset joiners (scale-append or recover-into-retired-slot)
-        # always route through the DPC even when their own dp_size == 1: the
-        # primary owns tokenizer / router state for the merged cohort and
-        # the joiner reconnects to a pre-bound PUSH socket on the primary.
+        # Elastic-EP offset joiners always route through DPC (primary owns tokenizer/router).
         use_dp_controller = (
             server_args.dp_size > 1 or server_args.is_ep_offset_joiner
         )

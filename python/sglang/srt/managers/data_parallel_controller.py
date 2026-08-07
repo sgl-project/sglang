@@ -293,56 +293,28 @@ class DataParallelController:
         )
 
     def remove_elastic_workers(self, slot_offset: int, slot_count: int):
-        """Deactivate a range of retired worker slots.
-
-        Symmetric to :func:`add_elastic_workers`. Called on the primary
-        DPC after :func:`ModelRunner._finalize_scale_down` reports the
-        completion. Marks the retired slots as inactive so the router
-        skips them; keeps the ZMQ socket bound (``self.workers[slot]``
-        stays as-is) so a subsequent grow-into-retired-slot can
-        reactivate the same slot via :func:`add_elastic_workers`.
-        """
+        """Deactivate retired slots (keeps ZMQ sockets bound for future grow-into-slot)."""
         end = slot_offset + slot_count
         if end > self.max_dp_size:
-            raise ValueError(
-                f"[Elastic EP] remove_elastic_workers: slot_offset={slot_offset} + "
-                f"slot_count={slot_count} exceeds max_dp_size={self.max_dp_size}."
-            )
-
+            raise ValueError(f"remove_elastic_workers: {slot_offset}+{slot_count} > {self.max_dp_size}")
         for slot in range(slot_offset, end):
             if not self.dp_active[slot]:
-                logger.debug(
-                    "[Elastic EP] remove_elastic_workers: slot %d already inactive; "
-                    "skipping",
-                    slot,
-                )
                 continue
             self.dp_active[slot] = False
             self.status[slot] = False
-
         self._refresh_active_workers()
-        logger.debug(
-            "[Elastic EP] DataParallelController deactivated slots %s "
-            "(active=%d / max=%d)",
-            list(range(slot_offset, end)),
-            self._active_count_cache,
-            self.max_dp_size,
-        )
+        logger.debug("[Elastic EP] DPC deactivated %s (active=%d/%d)",
+                     list(range(slot_offset, end)), self._active_count_cache, self.max_dp_size)
 
     def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
-        """Route grow vs. shrink completion into the right slot mutator."""
         if not msg.success:
             return
-        direction = msg.direction
-        if direction == "shrink":
+        if msg.direction == "shrink":
             self.remove_elastic_workers(msg.slot_offset, msg.slot_count)
-        elif direction == "grow":
+        elif msg.direction == "grow":
             self.add_elastic_workers(msg.slot_offset, msg.slot_count)
         else:
-            raise ValueError(
-                "ElasticScaleUpdateReq.direction must be 'grow' or "
-                f"'shrink'; got {direction!r}"
-            )
+            raise ValueError(f"direction must be grow/shrink; got {msg.direction!r}")
 
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
@@ -600,8 +572,7 @@ class DataParallelController:
 
         worker_ports = []
         if server_args.is_ep_offset_joiner:
-            # Offset joiners (scale or recover-into-retired-slot) connect
-            # to their pre-bound primary worker sockets.
+            # Offset joiners connect to their pre-bound primary worker sockets.
             primary = NetworkAddress.parse(server_args.dist_init_addr)
             primary_endpoint = NetworkAddress(
                 primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA

@@ -2269,10 +2269,6 @@ class ServerArgs:
     ep_size: A[
         int,
         Arg(
-            # Runtime-mutable via override("elastic_ep.scale"). Reflects
-            # the CURRENT effective EP size; callers wanting the
-            # launch-time layout should read elastic_ep_initial_size or
-            # max_ep_size instead.
             help="The expert parallelism size.",
             aliases=["--expert-parallel-size", "--ep"],
             resolvable=True,
@@ -2424,10 +2420,6 @@ class ServerArgs:
     ] = 0
     elastic_ep_initial_size: A[
         Optional[int],
-        # NOTE: this is the storage-layout EP size (fixed at launch),
-        # not the initial serving size. Scale/recover joiners must
-        # pass the primary's launch-time value.
-        # TODO: rename to ep_storage_layout_size with a deprecation shim.
         "EP size used to define the immutable per-rank expert storage layout. "
         "Scale joiners must use the primary deployment's launch-time EP size.",
         NS("parallel"),
@@ -6833,11 +6825,7 @@ class ServerArgs:
                 "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
             )
 
-        if (
-            self.enable_eplb
-            and self.ep_join_mode != "scale"
-            and not self.is_ep_offset_joiner
-        ):
+        if self.enable_eplb and self.ep_join_mode != "scale" and not self.is_ep_offset_joiner:
             assert self._resolved().ep_size > 1
 
     def _handle_elastic_ep(self):
@@ -6867,41 +6855,15 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
-                # Per-PG safety audit: refuse boot under raw-NCCL
-                # fast-paths (attention_tp pynccl, symm-mem) that
-                # bypass Mooncake's active_ranks mask.
+                # Reject raw-NCCL fast paths that bypass active_ranks.
                 if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get():
-                    raise ValueError(
-                        "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP is incompatible with "
-                        "--elastic-ep-backend mooncake. This flag enables the "
-                        "attention_tp pynccl fast-path, which is raw NCCL and "
-                        "does not honor Mooncake's active_ranks mask -- a "
-                        "retiring rank would deadlock any post-flip collective. "
-                        "Unset the env var, or use --elastic-ep-backend nixl."
-                    )
+                    raise ValueError("SGLANG_SYNC_TOKEN_IDS_ACROSS_TP + mooncake bypasses active_ranks.")
                 if self.enable_symm_mem:
-                    raise ValueError(
-                        "--enable-symm-mem is incompatible with "
-                        "--elastic-ep-backend mooncake. Symmetric memory "
-                        "enables raw NCCL / MSCCL++ fast-paths on the "
-                        "attention_tp group that bypass Mooncake's "
-                        "active_ranks mask -- a retiring rank would deadlock "
-                        "any post-flip collective. Drop --enable-symm-mem, "
-                        "or use --elastic-ep-backend nixl."
-                    )
-                # Force off: shm broadcaster is fixed-size and has no
-                # remove_reader; a retiree exit deadlocks the writer.
-                # Fallback via broadcast_object_list on cpu_group is
-                # mask-aware.
+                    raise ValueError("--enable-symm-mem + mooncake bypasses active_ranks.")
+                # shm broadcaster deadlocks on retiree exit (fixed-size, no remove_reader).
                 if envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
                     envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.set(False)
-                    logger.warning(
-                        "[Elastic EP] --elastic-ep-backend mooncake forces "
-                        "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=False. The shm "
-                        "broadcaster is fixed at cohort launch and deadlocks "
-                        "when a retiree exits; the torch broadcast_object_list "
-                        "fallback on cpu_group is mask-aware and safe."
-                    )
+                    logger.warning("[Elastic EP] mooncake: force SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=False")
         if self.ep_join_mode is not None:
             assert (
                 self.elastic_ep_backend is not None
@@ -6917,8 +6879,7 @@ class ServerArgs:
                     "effective EP size."
                 )
         if self.ep_join_rank_offset != 0:
-            # Only scale + recover-mode joiners use a non-zero offset;
-            # implicit fault recovery uses offset=0.
+            # Only scale + recover-with-offset joiners use non-zero (fault recovery is offset=0).
             assert self.ep_join_mode in ("scale", "recover"), (
                 "--elastic-ep-join-rank-offset is only valid with "
                 "--elastic-ep-join-mode scale or recover."
@@ -6980,22 +6941,14 @@ class ServerArgs:
                         "--moe-dense-tp-size 1."
                     )
             elif self.is_ep_offset_joiner:
-                # Recover-into-retired-slot: slot inside the launch cohort.
-                assert self.elastic_ep_initial_size is not None, (
-                    "Elastic EP recover joiners require --elastic-ep-initial-size "
-                    "set to the primary deployment's launch-time EP size."
-                )
+                # Recover-into-retired-slot: slot must lie inside launch cohort.
+                assert self.elastic_ep_initial_size is not None, "recover joiner needs --elastic-ep-initial-size"
                 join_target = self.ep_join_rank_offset + self.tp_size
                 assert join_target <= self.elastic_ep_initial_size, (
-                    "Elastic EP recover joiner target rank exceeds the launch "
-                    f"cohort size (join_target={join_target}, "
-                    f"initial={self.elastic_ep_initial_size})."
+                    f"recover joiner target {join_target} > launch cohort {self.elastic_ep_initial_size}"
                 )
                 if self.tp_size == 1:
-                    assert self.moe_dense_tp_size == 1, (
-                        "A single-rank Elastic EP recover joiner requires "
-                        "--moe-dense-tp-size 1."
-                    )
+                    assert self.moe_dense_tp_size == 1, "single-rank recover joiner needs --moe-dense-tp-size 1"
             else:
                 if self.elastic_ep_initial_size is None:
                     self.elastic_ep_initial_size = self.tp_size
@@ -8571,9 +8524,7 @@ class ServerArgs:
 
     @property
     def is_ep_offset_joiner(self) -> bool:
-        """True if this joiner slots into a specific global rank
-        (scale append OR recover with offset>0). Offset=0 recover is
-        implicit fault recovery inside the current cohort."""
+        """Joiner slotting into a specific global rank (scale append OR recover with offset>0)."""
         return self.ep_join_mode == "scale" or (
             self.ep_join_mode == "recover" and self.ep_join_rank_offset > 0
         )
@@ -8776,9 +8727,7 @@ class ServerArgs:
             )
 
     def check_server_args(self):
-        # Offset joiners run with per-cohort tp_size < deployment and
-        # under --nnodes 2 --node-rank 1; tp_size % nnodes isn't
-        # meaningful for them.
+        # Check parallel size constraints (offset joiners run per-cohort tp_size).
         if not self.is_ep_offset_joiner:
             assert (
                 self.tp_size * self.pp_size
@@ -9573,12 +9522,7 @@ class PortArgs:
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
             if server_args.is_ep_offset_joiner:
-                # Offset joiners (scale-append OR recover-into-retired-slot)
-                # co-locate with the primary and would collide on the
-                # primary's dist_init_port+1 port_base; derive from
-                # server_args.port instead. Fault-recovery joiners
-                # (recover with offset=0) replace a dead primary so its
-                # port is free -- fall through to the standard derivation.
+                # Offset joiners co-locate with primary; derive from server_args.port to avoid collision.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA

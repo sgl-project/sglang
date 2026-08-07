@@ -2296,10 +2296,7 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    # Elastic-EP joiners (scale-append or recover-into-retired-slot) run
-    # with dp_size=1 in their own subprocess, but must keep the primary's
-    # ``enable_dp_attention`` / ``enable_dp_lm_head`` settings so their
-    # collective path matches the survivor cohort's.
+    # Elastic-EP joiners run dp_size=1 but must keep primary's dp_attention settings.
     if view.dp_size == 1 and view.ep_join_mode not in ("scale", "recover"):
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}

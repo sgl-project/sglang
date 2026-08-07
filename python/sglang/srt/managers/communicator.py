@@ -85,18 +85,12 @@ class FanOutCommunicator(Generic[T]):
             return await self.watching_call(obj)
 
     def set_fan_out(self, fan_out: int):
-        # A shrink while a call is in-flight must also lower the
-        # already-snapshotted expected reply count, otherwise the
-        # awaiter blocks forever waiting on replies from workers that
-        # have exited (elastic-EP scale-down).
+        # Shrink mid-call: lower in-flight expected replies (retirees already exited).
         self._fan_out = fan_out
         if self._result_fan_out is not None and fan_out < self._result_fan_out:
             self._result_fan_out = fan_out
-            if (
-                self._result_values is not None
-                and self._result_event is not None
-                and len(self._result_values) >= fan_out
-            ):
+            if (self._result_values is not None and self._result_event is not None
+                    and len(self._result_values) >= fan_out):
                 self._result_event.set()
 
     def handle_recv(self, recv_obj: T):

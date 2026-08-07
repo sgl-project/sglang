@@ -34,17 +34,14 @@ logger = logging.getLogger(__name__)
 
 def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
-    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.runtime_context import get_exec, get_server_args
 
-    # Offset joiners have local ep_size / nnodes == 0 in the single-rank
-    # joiner subprocess view, which crashes _find_nearest_expert.
-    moe = get_exec().moe
-    is_offset_joiner = moe.ep_join_mode == "scale" or (
-        moe.ep_join_mode == "recover" and get_parallel().ep_join_rank_offset > 0
-    )
-    if is_offset_joiner:
+    # Offset joiners: single-rank subprocess -> divide-by-zero in _find_nearest_expert.
+    if get_server_args().is_ep_offset_joiner:
         return False
-    return not elastic_expanded_world_enabled()
+    return (
+        get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
+    )
 
 
 def _compute_elastic_expert_layout(
@@ -249,11 +246,7 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            # Offset joiners must size EPLB against the post-join cohort
-            # (rank_offset + tp_size), NOT initial_ep_size: partial regrows
-            # have rank_offset + tp_size < initial_ep_size, and a shape
-            # mismatch on the WORLD broadcast of physical_to_logical_map
-            # would corrupt memory.
+            # Offset joiners size EPLB against post-join cohort (rank_offset + tp_size).
             if server_args.is_ep_offset_joiner:
                 ep_size = max(
                     ep_size,
@@ -537,16 +530,13 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
-    # NCCL/Mooncake broadcast on a non-contiguous tensor is unsafe.
+    # Broadcast requires contiguous tensor.
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group
     )
 
-    # src rank already rebuilt before broadcast; skip its rebuild to
-    # avoid a redundant O(layers*experts*ep_size) recomputation.
-    # Non-src ranks always rebuild since their map was just overwritten.
-    # Group-relative rank works for both WORLD and elastic-EP subgroups.
+    # Src already rebuilt: skip redundant O(layers*experts*ep_size) recomputation.
     try:
         local_rank = torch.distributed.get_rank(group=group)
     except Exception:
@@ -587,17 +577,9 @@ def _compute_logical_to_all_physical_map(
                 layer_id, physical_expert_id
             ].item()
             if not (0 <= logical_expert_id < num_logical_experts):
-                # Actionable trace for corrupt / shape-mismatched
-                # broadcast (elastic_ep_initial_size drift or NIXL
-                # scratch corruption).
                 raise IndexError(
-                    f"physical_to_logical_map[{layer_id}, "
-                    f"{physical_expert_id}] = {logical_expert_id}, "
-                    f"expected 0 <= x < {num_logical_experts}. "
-                    f"num_physical_experts={num_physical_experts}, "
-                    f"ep_size={ep_size}, moe_ep_rank={moe_ep_rank}. "
-                    f"Broadcast-received p2l map is corrupt or shape-"
-                    f"mismatched vs. joiner's expected layout."
+                    f"p2l[{layer_id},{physical_expert_id}]={logical_expert_id} "
+                    f"not in [0,{num_logical_experts}); ep_size={ep_size} rank={moe_ep_rank}"
                 )
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id

@@ -86,16 +86,12 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
-# Python-side handle to Mooncake C++'s WORLD active_ranks mask tensor.
-# Sub-groups stash their own copy on GroupCoordinator; WORLD has no
-# wrapper, so we stash it here for elastic-EP mask flips.
+# WORLD active_ranks handle (WORLD PG has no GroupCoordinator wrapper).
 _WORLD_BACKEND_ACTIVE_RANKS: Optional[torch.Tensor] = None
 _WORLD_BACKEND_RANKS: List[int] = []
 
 
-def _register_world_backend_active_ranks(
-    active_ranks: torch.Tensor, ranks: List[int]
-) -> None:
+def _register_world_backend_active_ranks(active_ranks: torch.Tensor, ranks: List[int]) -> None:
     global _WORLD_BACKEND_ACTIVE_RANKS, _WORLD_BACKEND_RANKS
     _WORLD_BACKEND_ACTIVE_RANKS = active_ranks
     _WORLD_BACKEND_RANKS = list(ranks)
@@ -336,23 +332,19 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.pg import MooncakeBackendOptions
 
-                # Primaries reserve max_world_size only when >
-                # current group; recovered joiners use >= so they
-                # attach to the pre-reserved peer pool.
-                if recovered_rank:
-                    pass_max_ws = (
-                        max_world_size is not None and max_world_size >= len(ranks)
-                    )
-                else:
-                    pass_max_ws = (
-                        max_world_size is not None and max_world_size > len(ranks)
-                    )
-                pg_active_size = max_world_size if pass_max_ws else len(ranks)
+                pg_active_size = len(ranks)
                 if not recovered_rank and max_world_size is not None:
                     assert max_world_size >= len(ranks), (
                         f"max_world_size ({max_world_size}) must be >= "
                         f"group size ({len(ranks)})"
                     )
+                    # Only reserve headroom when max_world_size > len(ranks).
+                    if max_world_size > len(ranks):
+                        pg_active_size = max_world_size
+                elif recovered_rank and max_world_size is not None and max_world_size >= len(ranks):
+                    # Recover path: attach to existing pool with full max_ws mask.
+                    pg_active_size = max_world_size
+                pass_max_ws = pg_active_size == max_world_size
 
                 pg_active_ranks = torch.zeros(
                     pg_active_size, dtype=torch.int32, device=self.device
@@ -2164,16 +2156,10 @@ def init_distributed_environment(
         if backend == "mooncake":
             from mooncake.pg import MooncakeBackendOptions
 
-            # max_world_size > world_size reserves growth slots for
-            # later recover_ranks. Joiners use >= to fill the last slot.
-            if recovered_rank:
-                use_max_ws = (
-                    max_world_size is not None and max_world_size >= world_size
-                )
-            else:
-                use_max_ws = (
-                    max_world_size is not None and max_world_size > world_size
-                )
+            use_max_ws = max_world_size and max_world_size > world_size
+            # Recover path also uses max_ws when equal to world_size (attach to pool).
+            if not use_max_ws and recovered_rank and max_world_size == world_size:
+                use_max_ws = True
             ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
@@ -2196,14 +2182,9 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Publish the WORLD active_ranks tensor for elastic-EP mask
-        # flips. WORLD has no coordinator wrapper, so without this
-        # handle try_retire_ranks / try_recover_ranks cannot re-mask
-        # any WORLD-scope collective (mlp_sync, barrier).
+        # Publish WORLD active_ranks handle for elastic-EP mask flips (WORLD has no wrapper).
         if backend == "mooncake":
-            _register_world_backend_active_ranks(
-                active_ranks, list(range(ar_size))
-            )
+            _register_world_backend_active_ranks(active_ranks, list(range(ar_size)))
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":

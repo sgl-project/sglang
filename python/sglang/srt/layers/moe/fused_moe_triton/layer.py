@@ -288,16 +288,10 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        # Offset joiners run as single-rank subprocesses; use the
-        # launch-cohort size for storage sizing instead of the local
-        # moe_ep_size=1 so DeepGEMM JIT hits the primary cache and MoE
-        # dispatch tensors have matching shapes.
+        # Offset joiners: use launch-cohort size (DeepGEMM cache + MoE shape match).
         if get_exec().moe.ep_join_mode in ("scale", "recover"):
             storage_ep_size = get_parallel().elastic_ep_initial_size
-            assert storage_ep_size is not None, (
-                f"elastic_ep_initial_size must be set when "
-                f"ep_join_mode={get_exec().moe.ep_join_mode!r}"
-            )
+            assert storage_ep_size is not None
             self._expert_storage_rank = (
                 get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )

@@ -1923,11 +1923,7 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     """Report asynchronous Elastic EP scale completion or failure.
 
-    ``direction`` is "grow" (default, matching the append-only scale-up
-    flow) or "shrink" for Mooncake-native retirement. For "grow",
-    ``slot_offset..slot_offset+slot_count`` is the range of newly-active
-    slots the DPC should ADD to its routing table. For "shrink", the same
-    range describes the retired slots the DPC should REMOVE.
+    ``direction`` is "grow" (add slots to DPC routing) or "shrink" (remove).
     """
 
     success: bool

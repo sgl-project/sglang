@@ -367,8 +367,7 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Elastic joiners cannot enter the launch-time WORLD broadcast;
-        # they inherit the seed from server_args.random_seed directly.
+        # Elastic joiners cannot enter the launch-time WORLD broadcast.
         if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:

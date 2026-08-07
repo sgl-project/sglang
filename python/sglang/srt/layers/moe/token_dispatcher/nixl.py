@@ -67,16 +67,7 @@ class NixlEPBuffer:
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
-        """Schedule NIXL peer-set update for the pending scale operation.
-
-        Grow direction: newly admitted ranks are connected on the next
-        :meth:`get_nixl_buffer` call so we synchronize with the joiner
-        after it has finished Mooncake-side admission. Shrink direction:
-        retired ranks are disconnected on the next
-        :meth:`get_nixl_buffer` call, before that call issues any
-        dispatch/combine, so the FINISHED_SUM_TAG completion protocol
-        never waits for a retiree.
-        """
+        """Schedule connections for newly admitted ranks."""
         state = cls._state()
         state.scale_to = to_ep_size
         state.dispatch_ep_size = to_ep_size
@@ -89,37 +80,7 @@ class NixlEPBuffer:
 
     @classmethod
     def on_retire(cls, retiree_ranks: list) -> None:
-        """Retire-time NIXL handshake, called by survivors from
-        :func:`elastic_ep._pre_nixl_retire`.
-
-        Drops the NIXL C++ Buffer's per-peer QP state for every retiree so
-        the retiree can safely proceed to LOCAL_CLEANUP / ``sys.exit(0)``
-        without a survivor's in-flight combine leaving the retiree's
-        ``torch.cuda.synchronize()`` waiting on a FINISHED_SUM_TAG
-        contribution that never arrives (the survivor is in
-        ``_finalize_scale_down`` and won't touch NIXL again until it
-        exits ``commit_scale``, ~7-8s later on this workload).
-
-        Analog of Mooncake's ``EPBuffer.update_ep_member``: runs at the
-        NIXL_RETIRE FSM state (see
-        :class:`sglang.srt.elastic_ep.scale_down_state.ScaleDownSurvivorState`),
-        not lazily on the first post-shrink dispatch (which is what
-        :meth:`_update_connections` used to do via the ``on_scale``
-        stub).
-
-        Assumes contiguous tail retirement (``retiree_ranks == [K, K+1,
-        ..., N-1]`` where ``K == new size``), which is the invariant
-        enforced by the scale-down request path -- retiree computation
-        picks the last k slots of the current effective size.
-
-        Only survivors call this; the retiree is exiting and its
-        ``buffer`` is reclaimed by process teardown. The async
-        :func:`elastic_ep.nixl_retire_barrier_post` /
-        :func:`elastic_ep.nixl_retire_barrier_check` /
-        :func:`elastic_ep.nixl_retire_barrier_consume` family in the
-        FSM's NIXL_RETIRE state ensures every survivor has completed
-        its disconnect before any retiree advances to LOCAL_CLEANUP.
-        """
+        """Survivor NIXL disconnect (drops peer QPs; contiguous tail assumed)."""
         state = cls._state()
         if state.buffer is None:
             return
@@ -129,12 +90,8 @@ class NixlEPBuffer:
         state.connected_ep_size = new_size
         state.scale_to = new_size
         state.dispatch_ep_size = new_size
-        logger.info(
-            "[Elastic EP][nixl] on_retire retiree=%s new_size=%d took=%.3fs",
-            list(retiree_ranks),
-            new_size,
-            time.monotonic() - t0,
-        )
+        logger.info("[Elastic EP][nixl] on_retire retiree=%s new=%d took=%.3fs",
+                    list(retiree_ranks), new_size, time.monotonic() - t0)
 
     @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
@@ -143,7 +100,7 @@ class NixlEPBuffer:
             state.buffer.set_tcp_store_group(current_store)
 
         state.buffer.connect_ranks(ranks)
-        logger.info(
+        logger.debug(
             "[Elastic EP][nixl] connect (%s) ranks=%s group_size=%s",
             tag,
             ranks,
@@ -152,47 +109,19 @@ class NixlEPBuffer:
 
     @classmethod
     def _disconnect_ranks(cls, state, ranks: list, *, tag: str) -> None:
-        """Symmetric counterpart to :meth:`_connect_ranks`.
-
-        Drops ``ranks`` from NIXL's connected peer set so subsequent
-        dispatch / combine collectives no longer wait for their
-        FINISHED_SUM_TAG contributions. Called from
-        :meth:`_update_connections` on shrink.
-        """
         current_store = get_global_tcp_store()
         if current_store is not None:
             state.buffer.set_tcp_store_group(current_store)
-
         state.buffer.disconnect_ranks(ranks)
-        logger.info(
-            "[Elastic EP][nixl] disconnect (%s) ranks=%s group_size=%s",
-            tag,
-            ranks,
-            state.buffer.group_size,
-        )
+        logger.info("[Elastic EP][nixl] disconnect (%s) ranks=%s group_size=%s",
+                    tag, ranks, state.buffer.group_size)
 
     @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
-        """Bring NIXL's connected peer set to ``scale_to``.
-
-        Grow direction (``scale_to > connected_ep_size``): connect the
-        newly admitted tail ranks so subsequent dispatch / combine can
-        route to them. Shrink direction (``scale_to < connected_ep_
-        size``): disconnect the retired tail ranks so NIXL's
-        FINISHED_SUM_TAG completion protocol no longer waits for a
-        peer that has exited. Symmetric with Mooncake's
-        ``active_ranks`` mask flip on the elastic-EP control plane --
-        without the shrink half every survivor's first post-retire
-        dispatch stalls a full ``SGLANG_NIXL_EP_NUM_MAX_DISPATCH_
-        TIMEOUT`` window per local expert slot before NIXL rediscovers
-        the retire on its own via query_mask_buffer.
-        """
         if scale_to > state.connected_ep_size:
-            new_ranks = list(range(state.connected_ep_size, scale_to))
-            cls._connect_ranks(state, new_ranks, tag="update")
+            cls._connect_ranks(state, list(range(state.connected_ep_size, scale_to)), tag="update")
         elif scale_to < state.connected_ep_size:
-            retired_ranks = list(range(scale_to, state.connected_ep_size))
-            cls._disconnect_ranks(state, retired_ranks, tag="update")
+            cls._disconnect_ranks(state, list(range(scale_to, state.connected_ep_size)), tag="update")
         state.connected_ep_size = scale_to
 
     @classmethod
@@ -506,10 +435,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
-        # Lazy peer-state discovery: only when NIXL connected size
-        # disagrees with effective EP size (uncontrolled peer death).
-        # Gating avoids a CUDA sync that would piggyback on a stalled
-        # post-shrink combine and wedge the scheduler.
+        # Peer-state discovery only when connected set drifted (avoids stalled-combine sync).
         if self._mask_buffer is not None:
             connected = NixlEPBuffer._state().connected_ep_size
             n = ElasticEPStateManager.get_effective_ep_size()
