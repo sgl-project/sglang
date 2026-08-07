@@ -27,7 +27,7 @@ axis with their own knob), and the [CLI reference](./api/cli).
 | Tensor parallel (TP) | weights and attention heads | all-reduce per transformer block | `--tp-size` |
 | Ulysses SP | sequence outside attention ↔ heads inside it | two all-to-alls per attention | `--ulysses-degree` |
 | Ring SP | sequence rows inside attention | neighbor-only K/V rotation, overlapped with compute | `--ring-degree` |
-| K/V-gather CP | sequence rows inside attention | one K/V all-gather per attention | not yet available |
+| K/V-gather CP | sequence rows inside attention | one K/V all-gather per attention | `--kv-gather-degree` |
 | Data parallel | requests | none between replicas | `--dp-size` |
 
 Two strategies compose when they split different dimensions. TP and Ulysses
@@ -60,7 +60,9 @@ The ring merge (online softmax) requires every rank in a ring group to hold the
 K/V-gather (CP-style) variant fills the same slot differently: instead of R−1
 overlapped hops it all-gathers K/V once and computes the local Q rows against
 the full sequence in one shot — fewer, larger transfers, paid for by holding the
-whole K/V per rank. Like ring it splits rows, so it adds no head constraint.
+whole K/V per rank. Like ring it splits rows, so it adds no head constraint. When no SP degree is
+set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` — its
+measured-win zone — and higher degrees default to Ulysses.
 Ulysses groups are laid out on contiguous ranks and ring groups on strided
 ranks, so with a node-major rank mapping, Ulysses traffic stays on intra-node
 NVLink (all-to-all needs full-bisection bandwidth) while ring hops cross the
@@ -119,7 +121,7 @@ to least cross-node friendly:
 | --- | --- | --- | --- |
 | Data parallel | none between replicas | zero on the request path | **Best.** Replicas only share startup init and control-op fan-out; no fast interconnect needed at all. |
 | CFG parallel | one branch-combine | one latent-sized exchange, once | **Good candidate.** Once per step, small payload, naturally deadline-tolerant. Unmeasured across nodes so far. |
-| K/V-gather CP | one K/V all-gather per attention | (R−1)/R of K/V, one unoverlapped burst | **Between Ulysses and ring** once available: only K/V moves (queries never do), but the burst cannot hide behind compute — prefer ring across nodes, gather at small degrees within one. |
+| K/V-gather CP | one K/V all-gather per attention | (R−1)/R of K/V, one unoverlapped burst | **Between Ulysses and ring:** only K/V moves (queries never do), but the burst cannot hide behind compute — prefer ring across nodes, gather at small degrees within one. |
 | Ring SP | neighbor-only K/V rotation | K/V ÷ ring_degree, (R−1) hops, overlapped with attention tiles | **Designed for it.** Validated cross-node for MiniMax H3 (Ulysses intra-node × ring across, net positive and growing with sequence length). |
 | Ulysses SP | all-to-all | full q/k/v activations, twice per attention, every layer | **Keep intra-node.** All-to-all needs full-bisection bandwidth; across nodes it becomes R² flows with receiver incast. |
 | Tensor parallel | all-reduce | hidden-sized reduction per transformer block (×60 blocks for qwen-class DiTs) | **Worst.** Highest frequency, no overlap, already ~70% of sharded kernel time on NVLink. |
@@ -149,7 +151,8 @@ mean profitable:
   count where Ulysses alone cannot.
 - **When Ulysses's head divisibility blocks the degree you need** (`H/T` not
   divisible by the target `U`): the row-splitting slot sidesteps it — ring
-  today, K/V-gather once it lands.
+  today, or `--kv-gather-degree` (it splits rows, so it adds no head
+  constraint either).
 - **TP beyond 2 ranks** rarely improves image-DiT latency: the per-block
   all-reduce grows with rank count faster than the GEMM savings.
 
@@ -163,7 +166,3 @@ replicas exchange nothing on the request path. Monolithic serving only, and the
 ingress currently binds on the local host — one replica per node needs
 per-replica host addressing first.
 
-## Not yet available
-
-- **K/V-gather (CP-style) attention** — the all-gather alternative for ring's
-  slot described above; under development.
