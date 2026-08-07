@@ -15,7 +15,7 @@ class DotsNoteOmniTokenizerProxy:
 
 @register_customized_processor(DotsNoteOmniTokenizerProxy)
 class Dots3Config(PretrainedConfig):
-    model_type = "dots3_note"
+    model_type = "dots3_note_omni"
     keys_to_ignore_at_inference = ["past_key_values"]
     is_hybrid_swa = True
 

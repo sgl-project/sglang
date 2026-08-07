@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import re
 import time
@@ -14,11 +13,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.dots3 import Dot3NoteForCausalLM
+from sglang.srt.models.dots3 import Dots3NoteOmniForCausalLM
 from sglang.srt.models.dots_omni_towers import (
     DotsNoteOmniImagePreprocessor,
     OmniAudioConfig,
     get_audio_token_string,
+    load_omni_component_config,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     """Native image/audio processor for dots.note.omni."""
 
-    models = [Dot3NoteForCausalLM]
+    models = [Dots3NoteOmniForCausalLM]
     gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, processor, transport_mode, **kwargs):
@@ -74,11 +74,10 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         }
 
         model_dir = Path(hf_config._name_or_path)
-        self.image_preprocessor = DotsNoteOmniImagePreprocessor(
-            str(model_dir / "new_ve")
+        self.image_preprocessor = DotsNoteOmniImagePreprocessor(str(model_dir))
+        self.audio_processor_config = OmniAudioConfig(
+            **load_omni_component_config(model_dir, "audio")
         )
-        with (model_dir / "new_ae" / "config.json").open() as file:
-            self.audio_processor_config = OmniAudioConfig(**json.load(file))
         super().__init__(hf_config, server_args, processor, transport_mode, **kwargs)
 
     @staticmethod
