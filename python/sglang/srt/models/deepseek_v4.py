@@ -219,6 +219,74 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     )
 
 
+# FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
+_FLASHINFER_MHC_PRE_SPLITS = (1, 2, 4, 8, 16)
+
+
+@functools.cache
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _flashinfer_mhc_pre_num_splits(num_tokens: int, hc_hidden_size: int) -> int:
+    block_m = block_k = 64
+    grid_m = (num_tokens + block_m - 1) // block_m
+    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    raw = max(1, min(_cuda_sm_count() // max(grid_m, 1), num_block_k // 4))
+    best = 1
+    for split in _FLASHINFER_MHC_PRE_SPLITS:
+        if split <= raw:
+            best = split
+    return best
+
+
+def _flashinfer_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from flashinfer.mhc import mhc_pre_big_fuse
+
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+    num_tokens, hc_mult, hidden_size = x.shape
+    hc_hidden_size = hc_mult * hidden_size
+    mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
+    n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+
+    dot_mix = torch.empty(
+        (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
+    )
+    sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=x.device)
+    tf32_hc_prenorm_gemm(
+        x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
+    )
+    if n_splits == 1:
+        dot_mix = dot_mix.squeeze(0)
+        sqrsum = sqrsum.squeeze(0)
+
+    post, comb, layer_input = mhc_pre_big_fuse(
+        dot_mix,
+        sqrsum,
+        x,
+        hc_scale,
+        hc_base,
+        hc_hidden_size,
+        rms_eps=rms_eps,
+        mhc_pre_eps=hc_eps,
+        mhc_sinkhorn_eps=hc_eps,
+        mhc_post_mult_value=_MHC_POST_MULT_VALUE,
+        sinkhorn_repeat=sinkhorn_iters,
+        num_splits=n_splits,
+    )
+    return layer_input, post.squeeze(-1), comb
+
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
@@ -1513,6 +1581,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+            y, post, comb = _flashinfer_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
+            return y, post, comb, False
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
@@ -1605,6 +1685,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+            from flashinfer.mhc import mhc_post
+
+            return mhc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_post
@@ -2752,8 +2837,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
-    def _prewarm_mhc_pre_kernels(self) -> None:
-        """One-shot mhc_pre() JIT prewarm at load time, synced across ranks.
+    def _prewarm_mhc_kernels(self) -> None:
+        """One-shot MHC JIT prewarm at load time, synced across ranks.
 
         Runs before any forward so the compile burst stays off the serving
         path; the barrier keeps ranks from proceeding while a peer is still
@@ -2774,16 +2859,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import mhc_post, prewarm_mhc_pre
 
         tic = time.perf_counter()
+        residual = torch.zeros(
+            (1, layer.hc_mult, layer.hidden_size),
+            dtype=torch.bfloat16,
+            device=layer.hc_attn_fn.device,
+        )
         prewarm_mhc_pre(
             # Template carrying dtype/device; buckets allocate their own sizes.
-            residual=torch.zeros(
-                (1, layer.hc_mult, layer.hidden_size),
-                dtype=torch.bfloat16,
-                device=layer.hc_attn_fn.device,
-            ),
+            residual=residual,
             fn=layer.hc_attn_fn,
             hc_scale=layer.hc_attn_scale,
             hc_base=layer.hc_attn_base,
@@ -2797,13 +2883,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
+        mhc_post(
+            x=residual.new_zeros((1, layer.hidden_size)),
+            residual=residual,
+            post_layer_mix=torch.zeros(
+                (1, layer.hc_mult, 1),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+            comb_res_mix=torch.zeros(
+                (1, layer.hc_mult, layer.hc_mult),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+        )
         torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
         torch.cuda.empty_cache()
         get_tp_group().barrier()
         logger.info(
-            "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
+            "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
             compile_secs,
             time.perf_counter() - tic - compile_secs,
         )
@@ -3153,7 +3253,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
-            self._prewarm_mhc_pre_kernels()
+            self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

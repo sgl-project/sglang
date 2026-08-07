@@ -3,6 +3,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    _cached_get_attn_backend,
+)
 from sglang.multimodal_gen.runtime.platforms.cuda import CudaPlatformBase
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 
@@ -38,6 +41,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         FakeCudaPlatform.is_sm120_device = False
         FakeCudaPlatform.is_blackwell_device = False
         FakeCudaPlatform.supports_flash_attention = True
+        _cached_get_attn_backend.cache_clear()
 
     def resolve(
         self,
@@ -91,9 +95,33 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
         prepare_flash_attention.assert_called_once_with()
 
+    def test_default_backend_prefers_dynamic_cudnn_sdpa_on_blackwell(self):
+        FakeCudaPlatform.is_blackwell_device = True
+
+        with patch.object(
+            FakeCudaPlatform,
+            "_prepare_flash_attention_for_blackwell",
+            return_value=True,
+        ):
+            self.assertEqual(
+                self.resolve(None),
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
+            )
+
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
+
+    def test_explicit_backend_rejected_by_a_model_fails_closed(self):
+        with self.assertRaisesRegex(
+            ValueError, "not supported by this attention layer"
+        ):
+            _cached_get_attn_backend(
+                128,
+                torch.float16,
+                (AttentionBackendEnum.FA,),
+                AttentionBackendEnum.SAGE_ATTN,
+            )
 
 
 if __name__ == "__main__":
