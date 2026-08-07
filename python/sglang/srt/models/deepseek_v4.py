@@ -184,9 +184,9 @@ def _get_mhc_ops() -> MhcOps:
     their communication workspaces.  DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
-        from sgl_kernel import hc_split_sinkhorn
+        from sgl_kernel import hc_split_sinkhorn, mhc_fused_post_pre
 
-        return MhcOps(hc_split_sinkhorn, None, None)
+        return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, None)
 
     from sglang.kernels.ops.layernorm.mhc import (
         hc_split_sinkhorn,
@@ -199,7 +199,7 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not _is_xpu
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -209,6 +209,11 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
+    # CUDA/HIP fused path reuses TileLang mhc_post/mhc_pre kernels and their
+    # tensor layout assumptions. XPU uses the sgl-kernel SYCL fused interface.
+    if _is_xpu:
+        return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
     # not read that flag and dispatches independently for both small and large
     # token batches, so the standalone pre flag must not veto the fused opt-in.
@@ -1513,6 +1518,28 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if _is_xpu or x.device.type == "xpu":
+            from sgl_kernel import mhc_pre
+
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
+            )
+            return y, post, comb, norm is not None
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
@@ -1605,6 +1632,16 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+
+        if _is_xpu or x.device.type == "xpu":
+            from sgl_kernel import hc_post as mhc_post
+
+            return mhc_post(
+                x=x,
+                residual=residual,
+                post_layer_mix=post,
+                comb_res_mix=comb,
+            )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_post
@@ -2213,6 +2250,17 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
+            if _is_xpu or x.device.type == "xpu":
+                from sgl_kernel import fused_hc_head
+
+                return fused_hc_head(
+                    x.contiguous(),
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_eps=self.norm_eps,
+                    hc_eps=self.hc_eps,
+                )
             from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
             return fused_hc_head(
@@ -2798,24 +2846,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
-        mhc_post(
-            x=residual.new_zeros((1, layer.hidden_size)),
-            residual=residual,
-            post_layer_mix=torch.zeros(
-                (1, layer.hc_mult, 1),
-                dtype=torch.float32,
-                device=residual.device,
-            ),
-            comb_res_mix=torch.zeros(
-                (1, layer.hc_mult, layer.hc_mult),
-                dtype=torch.float32,
-                device=residual.device,
-            ),
-        )
-        torch.cuda.synchronize()
+        if torch.xpu.is_available():
+            torch.xpu.synchronize()
+        else:
+            mhc_post(
+                x=residual.new_zeros((1, layer.hidden_size)),
+                residual=residual,
+                post_layer_mix=torch.zeros(
+                    (1, layer.hc_mult, 1),
+                    dtype=torch.float32,
+                    device=residual.device,
+                ),
+                comb_res_mix=torch.zeros(
+                    (1, layer.hc_mult, layer.hc_mult),
+                    dtype=torch.float32,
+                    device=residual.device,
+                ),
+            )
+            torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
-        torch.cuda.empty_cache()
+        if not torch.xpu.is_available():
+            torch.cuda.empty_cache()
         get_tp_group().barrier()
         logger.info(
             "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
@@ -2839,7 +2891,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if not _FP8_WO_A_GEMM:
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
