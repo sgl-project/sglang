@@ -166,13 +166,10 @@ class TestUpdateAssertEnabled(CustomTestCase):
             text=True,
             timeout=180,
         )
-        # The kernel-side check firing is the whole assertion, and its FAIL line in
-        # stdout is the evidence. How the process then dies is not: a device-side
-        # assert poisons the CUDA context, so the next CUDA call reports either
-        # cudaErrorAssert ("device-side assert triggered") or the generic
-        # cudaErrorLaunchFailure ("unspecified launch failure") depending on timing,
-        # and the process may also be killed by the assert before sync can raise.
-        # Asserting on the exit code made this test flaky under GPU load.
+        # The FAIL line is the evidence that the kernel-side check fired. How the
+        # process then dies is not: the CUDA coredump handler may abort it, and sync
+        # otherwise raises cudaErrorAssert or a generic cudaErrorLaunchFailure
+        # depending on whether generation ran. Only exit 1 means it never fired.
         self.assertIn(
             "SimplePhaseChecker FAIL",
             result.stdout,
