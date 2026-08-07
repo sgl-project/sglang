@@ -95,10 +95,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
-from sglang.srt.speculative.ragged_verify import (
-    resolve_ragged_verify_layout,
-    spec_info_ragged_verify_layout,
-)
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -915,7 +912,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            ragged_verify_layout=spec_info_ragged_verify_layout(spec_info),
+            # Algorithm-private field; only the dflash-family capture inputs
+            # carry a synthetic layout.
+            ragged_verify_layout=getattr(spec_info, "ragged_verify_layout", None),
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,

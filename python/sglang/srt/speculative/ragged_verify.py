@@ -223,14 +223,6 @@ def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     return getattr(forward_batch, "ragged_verify_layout", None)
 
 
-def spec_info_ragged_verify_layout(spec_info) -> Optional[RaggedVerifyLayout]:
-    """Layout carried by a spec input, or None. For the cuda-graph init paths,
-    which receive spec_info directly rather than a ForwardBatch."""
-    if spec_info is None:
-        return None
-    return spec_info.ragged_verify_layout
-
-
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor
