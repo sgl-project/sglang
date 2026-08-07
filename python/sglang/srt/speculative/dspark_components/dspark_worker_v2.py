@@ -387,6 +387,11 @@ class DSparkWorkerV2(BaseSpecWorker):
     def is_lifecycle_only_pp_prefill_rank(self) -> bool:
         return self._is_lifecycle_only_pp_prefill_rank
 
+    def _draft_model_runners(self) -> tuple:
+        if self._is_lifecycle_only_pp_prefill_rank:
+            return ()
+        return super()._draft_model_runners()
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         if self._is_context_only_pp_prefill_rank:
