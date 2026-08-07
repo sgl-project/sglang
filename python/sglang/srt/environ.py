@@ -1028,6 +1028,10 @@ class Envs:
     SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
     )
+    # Compute input logprobs from logits via per-row logsumexp instead of
+    # materializing the full-vocab log-softmax. Escape hatch only; the two
+    # paths are mathematically identical.
+    SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
@@ -1338,6 +1342,10 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
+    # warmup. Opt-in: the extra forward needs transient activation headroom
+    # that small-VRAM or tightly-packed configs may not have.
+    SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # Plugin system
