@@ -29,7 +29,6 @@ import os
 import random
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -644,12 +643,6 @@ class Engine(EngineScoreMixin, EngineBase):
         (``python -m sglang.srt.weight_cache.daemon``) plus
         ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
-        if server_args.dp_size > 1:
-            raise ValueError(
-                "Weight cache daemon mode does not support dp_size > 1. "
-                "Please set --dp-size 1 when using --weight-cache-mode daemon."
-            )
-
         # Multi-node needs an explicit rendezvous address; otherwise each node
         # picks its own local 127.0.0.1 port (below) and the per-node daemons
         # can never form the joint process group.
@@ -693,6 +686,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
+        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
         from sglang.srt.weight_cache.protocol import (
             cleanup_stale_daemon_files,
             compute_global_rank,
@@ -715,47 +709,13 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=server_args.base_gpu_id,
                     gpu_id_step=server_args.gpu_id_step,
                 )
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "sglang.srt.weight_cache.daemon",
-                    "--model-path",
-                    server_args.model_path,
-                    "--gpu-id",
-                    str(gpu_id),
-                    "--tp-size",
-                    str(tp_size),
-                    "--tp-rank",
-                    str(tp_rank),
-                    "--pp-size",
-                    str(server_args.pp_size),
-                    "--pp-rank",
-                    str(pp_rank),
-                    "--dp-size",
-                    "1",
-                    "--ep-size",
-                    str(server_args.ep_size),
-                    "--load-format",
-                    server_args.load_format,
-                    "--dtype",
-                    server_args.dtype,
-                    "--dist-init-method",
-                    dist_init_method,
-                ]
-                if server_args.quantization:
-                    cmd += ["--quantization", server_args.quantization]
-                if (
-                    server_args.model_loader_extra_config
-                    and server_args.model_loader_extra_config != "{}"
-                ):
-                    cmd += [
-                        "--model-loader-extra-config",
-                        server_args.model_loader_extra_config,
-                    ]
-                if server_args.trust_remote_code:
-                    cmd += ["--trust-remote-code"]
-                if server_args.revision:
-                    cmd += ["--revision", server_args.revision]
+                cmd = build_weight_cache_daemon_command(
+                    server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    dist_init_method=dist_init_method,
+                )
 
                 proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)

@@ -34,19 +34,21 @@ Usage:
         --dist-init-method tcp://127.0.0.1:29500
 """
 
+import argparse
+import dataclasses
 import logging
 import os
 import signal
 import socket
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
@@ -66,11 +68,133 @@ from .protocol import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 # Per-connection timeout for the serial serve loop. A client exchange is tiny
 # (a config dict + IPC handle metadata), so this generous bound never trips a
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+
+@dataclasses.dataclass
+class WeightCacheDaemonArgs:
+    """Daemon-private worker identity and standalone launcher controls.
+
+    ``gpu_id``, ``tp_rank``, ``pp_rank``, and ``dist_init_method`` identify a
+    worker after the shared server configuration has been resolved. ``timeout``
+    and ``force`` apply only when this entrypoint launches and monitors a local
+    daemon group. None has a corresponding ServerArgs field with these
+    per-worker semantics.
+    """
+
+    gpu_id: Optional[int] = None
+    tp_rank: Optional[int] = None
+    pp_rank: int = 0
+    dist_init_method: Optional[str] = None
+    timeout: int = 1800
+    force: bool = False
+
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--gpu-id",
+            type=int,
+            default=None,
+            help="GPU device ID for a single daemon. If omitted, launches all local ranks.",
+        )
+        parser.add_argument(
+            "--tp-rank",
+            type=int,
+            default=None,
+            help="TP rank for a single daemon. If omitted, launches all local ranks.",
+        )
+        parser.add_argument("--pp-rank", type=int, default=0)
+        parser.add_argument(
+            "--dist-init-method",
+            default=None,
+            help="Daemon distributed init method (for example tcp://host:29500).",
+        )
+        parser.add_argument("--timeout", type=int, default=1800)
+        parser.add_argument("--force", action="store_true")
+
+    @classmethod
+    def from_cli_args(cls, args: argparse.Namespace) -> "WeightCacheDaemonArgs":
+        return cls(
+            gpu_id=args.gpu_id,
+            tp_rank=args.tp_rank,
+            pp_rank=args.pp_rank,
+            dist_init_method=args.dist_init_method,
+            timeout=args.timeout,
+            force=args.force,
+        )
+
+
+def build_weight_cache_daemon_command(
+    server_args: "ServerArgs",
+    *,
+    gpu_id: int,
+    tp_rank: int,
+    pp_rank: int,
+    dist_init_method: str,
+) -> list[str]:
+    """Build the sole subprocess command used by Engine and the standalone launcher."""
+    import sys
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.srt.weight_cache.daemon",
+        "--model-path",
+        server_args.model_path,
+        "--gpu-id",
+        str(gpu_id),
+        "--tp-size",
+        str(server_args.tp_size),
+        "--tp-rank",
+        str(tp_rank),
+        "--pp-size",
+        str(server_args.pp_size),
+        "--pp-rank",
+        str(pp_rank),
+        "--dp-size",
+        str(server_args.dp_size),
+        "--ep-size",
+        str(server_args.ep_size),
+        "--moe-dp-size",
+        str(server_args.moe_dp_size),
+        "--attn-cp-size",
+        str(server_args.attn_cp_size),
+        "--load-format",
+        server_args.load_format,
+        "--dtype",
+        server_args.dtype,
+        "--dist-init-method",
+        dist_init_method,
+    ]
+    if server_args.enable_dp_attention:
+        cmd.append("--enable-dp-attention")
+    if server_args.enable_dp_lm_head:
+        cmd.append("--enable-dp-lm-head")
+    if server_args.moe_dense_tp_size is not None:
+        cmd += ["--moe-dense-tp-size", str(server_args.moe_dense_tp_size)]
+    if server_args.moe_a2a_backend != "none":
+        cmd += ["--moe-a2a-backend", server_args.moe_a2a_backend]
+    if server_args.deepep_mode != "auto":
+        cmd += ["--deepep-mode", server_args.deepep_mode]
+    if server_args.quantization:
+        cmd += ["--quantization", server_args.quantization]
+    if (
+        server_args.model_loader_extra_config
+        and server_args.model_loader_extra_config != "{}"
+    ):
+        cmd += ["--model-loader-extra-config", server_args.model_loader_extra_config]
+    if server_args.trust_remote_code:
+        cmd += ["--trust-remote-code"]
+    if server_args.revision:
+        cmd += ["--revision", server_args.revision]
+    return cmd
 
 
 class WeightCacheDaemon:
@@ -82,42 +206,42 @@ class WeightCacheDaemon:
 
     def __init__(
         self,
-        model_path: str,
+        server_args: "ServerArgs",
         gpu_id: int,
-        tp_size: int = 1,
-        tp_rank: int = 0,
-        pp_size: int = 1,
-        pp_rank: int = 0,
-        dp_size: int = 1,
-        ep_size: int = 1,
-        load_format: str = "auto",
-        dtype: str = "auto",
-        quantization: Optional[str] = None,
-        model_loader_extra_config: str = "{}",
-        trust_remote_code: bool = False,
-        revision: Optional[str] = None,
+        tp_rank: int,
+        pp_rank: int,
         dist_init_method: Optional[str] = None,
     ):
-        self.model_path = model_path
+        self.server_args = server_args
+        self.model_path = server_args.model_path
         self.gpu_id = gpu_id
-        self.tp_size = tp_size
+        self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
-        self.pp_size = pp_size
+        self.pp_size = server_args.pp_size
         self.pp_rank = pp_rank
-        self.dp_size = dp_size
-        self.ep_size = ep_size
-        self.load_format = load_format
-        self.dtype = dtype
-        self.quantization = quantization
-        self.model_loader_extra_config = model_loader_extra_config
-        self.trust_remote_code = trust_remote_code
-        self.revision = revision
+        self.dp_size = server_args.dp_size
+        self.ep_size = server_args.ep_size
+        self.moe_dp_size = server_args.moe_dp_size
+        self.enable_dp_attention = server_args.enable_dp_attention
+        self.enable_dp_lm_head = server_args.enable_dp_lm_head
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_dense_tp_size = server_args.moe_dense_tp_size
+        self.moe_a2a_backend = server_args.moe_a2a_backend
+        self.deepep_mode = server_args.deepep_mode
+        self.load_format = server_args.load_format
+        self.dtype = server_args.dtype
+        self.quantization = server_args.quantization
+        self.model_loader_extra_config = server_args.model_loader_extra_config
+        self.trust_remote_code = server_args.trust_remote_code
+        self.revision = server_args.revision
         self.dist_init_method = dist_init_method
 
         self.socket_path = get_socket_path(
-            compute_global_rank(tp_size, pp_rank, tp_rank)
+            compute_global_rank(self.tp_size, pp_rank, tp_rank)
         )
-        self.ready_path = get_ready_path(compute_global_rank(tp_size, pp_rank, tp_rank))
+        self.ready_path = get_ready_path(
+            compute_global_rank(self.tp_size, pp_rank, tp_rank)
+        )
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -163,12 +287,18 @@ class WeightCacheDaemon:
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend=current_platform.get_torch_distributed_backend_str(),
+                moe_a2a_backend=server_args.moe_a2a_backend,
             )
 
         initialize_model_parallel(
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
             expert_model_parallel_size=self.ep_size,
+            attention_data_parallel_size=(
+                self.dp_size if self.enable_dp_attention else 1
+            ),
+            attention_context_model_parallel_size=self.attn_cp_size,
+            moe_data_model_parallel_size=self.moe_dp_size,
         )
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
@@ -209,21 +339,13 @@ class WeightCacheDaemon:
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
         from sglang.srt.model_loader.loader import get_model_loader
-        from sglang.srt.server_args import ServerArgs
 
-        server_args = ServerArgs(
-            model_path=self.model_path,
-            dtype=self.dtype,
-            quantization=self.quantization,
-            trust_remote_code=self.trust_remote_code,
-            tp_size=self.tp_size,
-            pp_size=self.pp_size,
-            dp_size=self.dp_size,
-            ep_size=self.ep_size,
-            load_format=self.load_format,
-            model_loader_extra_config=self.model_loader_extra_config,
-        )
+        server_args = self.server_args
         publish(server_args, role="weight_cache_daemon")
+
+        from sglang.srt.layers.moe import initialize_moe_config
+
+        initialize_moe_config(server_args)
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -236,7 +358,7 @@ class WeightCacheDaemon:
             quantization=self.quantization,
         )
 
-        # Build cache config fingerprint BEFORE loading the model.
+        # Build cache config fingerprint before loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via
         # process_weights_after_loading), which would produce a different
         # hash than what the engine computes from the original config.
@@ -249,6 +371,15 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
+        # Refuse unsupported quant methods before creating distributed groups
+        # or touching model weights.
+        check_ipc_quant_support(quant_method, quant_config, where="daemon")
+
+        # The initialized groups are the authority for rank identity. This
+        # avoids maintaining a second copy of the model-parallel hierarchy.
+        self._init_distributed(server_args, model_config)
+        moe_dp_rank = get_parallel().moe_dp_rank
+        moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
             model_path=self.model_path,
             model_arch=(
@@ -262,20 +393,20 @@ class WeightCacheDaemon:
             pp_rank=self.pp_rank,
             dp_size=self.dp_size,
             ep_size=self.ep_size,
+            moe_dp_size=self.moe_dp_size,
+            moe_dp_rank=moe_dp_rank,
+            moe_ep_rank=moe_ep_rank,
+            enable_dp_attention=self.enable_dp_attention,
+            enable_dp_lm_head=self.enable_dp_lm_head,
+            attn_cp_size=self.attn_cp_size,
+            moe_dense_tp_size=self.moe_dense_tp_size,
+            moe_a2a_backend=self.moe_a2a_backend,
             quant_method=quant_method,
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
             **compute_env_stamp(),
         )
-
-        # Refuse to serve quant methods not verified to round-trip through pure
-        # IPC tensor export. Checked before loading so an unsupported model
-        # fails fast instead of after minutes of disk I/O.
-        check_ipc_quant_support(quant_method, quant_config, where="daemon")
-
-        # Initialize distributed backend (requires server_args + model_config)
-        self._init_distributed(server_args, model_config)
 
         # Build load config
         load_config = LoadConfig(
@@ -537,20 +668,10 @@ class WeightCacheDaemon:
 
 
 def run_weight_cache_daemon(
-    model_path: str,
+    server_args: "ServerArgs",
     gpu_id: int,
-    tp_size: int = 1,
-    tp_rank: int = 0,
-    pp_size: int = 1,
-    pp_rank: int = 0,
-    dp_size: int = 1,
-    ep_size: int = 1,
-    load_format: str = "auto",
-    dtype: str = "auto",
-    quantization: Optional[str] = None,
-    model_loader_extra_config: str = "{}",
-    trust_remote_code: bool = False,
-    revision: Optional[str] = None,
+    tp_rank: int,
+    pp_rank: int,
     dist_init_method: Optional[str] = None,
 ):
     """Entry point for running a weight cache daemon process."""
@@ -568,20 +689,10 @@ def run_weight_cache_daemon(
     kill_itself_when_parent_died()
 
     daemon = WeightCacheDaemon(
-        model_path=model_path,
+        server_args=server_args,
         gpu_id=gpu_id,
-        tp_size=tp_size,
         tp_rank=tp_rank,
-        pp_size=pp_size,
         pp_rank=pp_rank,
-        dp_size=dp_size,
-        ep_size=ep_size,
-        load_format=load_format,
-        dtype=dtype,
-        quantization=quantization,
-        model_loader_extra_config=model_loader_extra_config,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
         dist_init_method=dist_init_method,
     )
 
@@ -590,21 +701,7 @@ def run_weight_cache_daemon(
 
 
 def launch_weight_cache_daemons(
-    model_path: str,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    dp_size: int = 1,
-    ep_size: int = 1,
-    nnodes: int = 1,
-    node_rank: int = 0,
-    base_gpu_id: int = 0,
-    gpu_id_step: int = 1,
-    load_format: str = "auto",
-    dtype: str = "auto",
-    quantization: Optional[str] = None,
-    model_loader_extra_config: str = "{}",
-    trust_remote_code: bool = False,
-    revision: Optional[str] = None,
+    server_args: "ServerArgs",
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
     force: bool = False,
@@ -638,23 +735,22 @@ def launch_weight_cache_daemons(
     """
     import socket as sock_mod
     import subprocess
-    import sys
 
     # Replicate _calculate_rank_ranges logic from engine.py
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
     pp_rank_range = range(
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
     )
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
     tp_rank_range = range(
-        tp_size_per_node * (node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
     )
 
-    if nnodes > 1 and dist_init_method is None:
+    if server_args.nnodes > 1 and dist_init_method is None:
         raise ValueError(
             "dist_init_method is required for multi-node weight cache daemons. "
             "Use --dist-init-method tcp://<node0-ip>:<port> to specify the "
@@ -668,13 +764,10 @@ def launch_weight_cache_daemons(
             free_port = s.getsockname()[1]
         dist_init_method = f"tcp://127.0.0.1:{free_port}"
 
-    python_path = sys.executable
-    daemon_module = "sglang.srt.weight_cache.daemon"
-
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
             cleanup_stale_daemon_files(global_rank, force=force)
 
     procs = []
@@ -685,44 +778,16 @@ def launch_weight_cache_daemons(
                 tp_rank,
                 pp_size_per_node,
                 tp_size_per_node,
-                base_gpu_id=base_gpu_id,
-                gpu_id_step=gpu_id_step,
+                base_gpu_id=server_args.base_gpu_id,
+                gpu_id_step=server_args.gpu_id_step,
             )
-            cmd = [
-                python_path,
-                "-m",
-                daemon_module,
-                "--model-path",
-                model_path,
-                "--gpu-id",
-                str(gpu_id),
-                "--tp-size",
-                str(tp_size),
-                "--tp-rank",
-                str(tp_rank),
-                "--dp-size",
-                str(dp_size),
-                "--ep-size",
-                str(ep_size),
-                "--pp-size",
-                str(pp_size),
-                "--pp-rank",
-                str(pp_rank),
-                "--load-format",
-                load_format,
-                "--dtype",
-                dtype,
-                "--dist-init-method",
-                dist_init_method,
-            ]
-            if quantization:
-                cmd += ["--quantization", quantization]
-            if model_loader_extra_config and model_loader_extra_config != "{}":
-                cmd += ["--model-loader-extra-config", model_loader_extra_config]
-            if trust_remote_code:
-                cmd += ["--trust-remote-code"]
-            if revision:
-                cmd += ["--revision", revision]
+            cmd = build_weight_cache_daemon_command(
+                server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                pp_rank=pp_rank,
+                dist_init_method=dist_init_method,
+            )
 
             proc = subprocess.Popen(cmd)
             procs.append(proc)
@@ -737,7 +802,7 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
             ready_path = get_ready_path(global_rank)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
@@ -772,7 +837,7 @@ def launch_weight_cache_daemons(
             )
 
     logger.info(
-        f"All {num_daemons} weight cache daemons on node {node_rank} are ready "
+        f"All {num_daemons} weight cache daemons on node {server_args.node_rank} are ready "
         f"(pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
         f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
         f"dist_init_method={dist_init_method})"
@@ -813,132 +878,40 @@ def launch_weight_cache_daemons(
 
 
 if __name__ == "__main__":
-    import argparse
+    worker_parser = argparse.ArgumentParser(add_help=False)
+    WeightCacheDaemonArgs.add_cli_args(worker_parser)
+    worker_ns, server_argv = worker_parser.parse_known_args()
 
-    parser = argparse.ArgumentParser(description="SGLang Weight Cache Daemon")
-    parser.add_argument("--model-path", required=True, help="Path to model weights")
-    parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument(
-        "--gpu-id",
-        type=int,
-        default=None,
-        help="GPU device ID for a single daemon. "
-        "If omitted, launches daemons for all TP ranks (0..tp_size-1).",
-    )
-    parser.add_argument(
-        "--tp-rank",
-        type=int,
-        default=None,
-        help="TP rank for a single daemon. "
-        "If omitted, launches daemons for all TP ranks.",
-    )
-    parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
-    parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size")
-    parser.add_argument("--pp-size", type=int, default=1, help="Pipeline parallel size")
-    parser.add_argument("--pp-rank", type=int, default=0, help="Pipeline parallel rank")
-    parser.add_argument("--nnodes", type=int, default=1, help="Total number of nodes")
-    parser.add_argument(
-        "--base-gpu-id",
-        type=int,
-        default=0,
-        help="GPU id of this node's first rank (mirrors the engine's "
-        "--base-gpu-id). Used to place daemons on the same GPUs the engine "
-        "ranks will use.",
-    )
-    parser.add_argument(
-        "--gpu-id-step",
-        type=int,
-        default=1,
-        help="Stride between consecutive ranks' GPU ids (mirrors the engine's "
-        "--gpu-id-step).",
-    )
-    parser.add_argument(
-        "--node-rank",
-        type=int,
-        default=0,
-        help="Rank of this node (0-indexed). Required for multi-node.",
-    )
-    parser.add_argument("--load-format", default="auto", help="Weight load format")
-    parser.add_argument("--dtype", default="auto", help="Model dtype")
-    parser.add_argument("--quantization", default=None, help="Quantization method")
-    parser.add_argument(
-        "--model-loader-extra-config",
-        default="{}",
-        help="Extra config for model loader (JSON string)",
-    )
-    parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--revision", default=None, help="Model revision")
-    parser.add_argument(
-        "--dist-init-method",
-        default=None,
-        help="Distributed init method (e.g. tcp://node0-ip:29500). "
-        "Auto-assigned for single-node when launching all ranks. "
-        "Required for multi-node (nnodes > 1) and must be accessible "
-        "from all nodes. Also required for tp_size > 1 when launching "
-        "a single rank.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=1800,
-        help="Timeout in seconds to wait for all daemons to become ready (default: 1800)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Take over a rank whose .ready file still points at a live PID by "
-        "killing that daemon (use to reclaim a wedged/orphaned daemon).",
-    )
+    from sglang.srt.server_args import prepare_server_args
 
-    args = parser.parse_args()
-
-    if args.gpu_id is not None or args.tp_rank is not None:
-        # Single-rank mode: launch one daemon for the specified rank
-        gpu_id = args.gpu_id if args.gpu_id is not None else args.tp_rank
-        tp_rank = args.tp_rank if args.tp_rank is not None else args.gpu_id
-        # Refuse to clobber a live daemon already holding this rank (mirrors the
-        # multi-rank launcher and the engine path, which the multi-rank spawns
-        # of this same entrypoint rely on). --force kills and takes over.
+    server_args = prepare_server_args(server_argv)
+    daemon_args = WeightCacheDaemonArgs.from_cli_args(worker_ns)
+    if daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
+        gpu_id = (
+            daemon_args.gpu_id
+            if daemon_args.gpu_id is not None
+            else daemon_args.tp_rank
+        )
+        tp_rank = (
+            daemon_args.tp_rank
+            if daemon_args.tp_rank is not None
+            else daemon_args.gpu_id
+        )
         cleanup_stale_daemon_files(
-            compute_global_rank(args.tp_size, args.pp_rank, tp_rank),
-            force=args.force,
+            compute_global_rank(server_args.tp_size, daemon_args.pp_rank, tp_rank),
+            force=daemon_args.force,
         )
         run_weight_cache_daemon(
-            model_path=args.model_path,
+            server_args,
             gpu_id=gpu_id,
-            tp_size=args.tp_size,
             tp_rank=tp_rank,
-            pp_size=args.pp_size,
-            pp_rank=args.pp_rank,
-            dp_size=args.dp_size,
-            ep_size=args.ep_size,
-            load_format=args.load_format,
-            dtype=args.dtype,
-            quantization=args.quantization,
-            model_loader_extra_config=args.model_loader_extra_config,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-            dist_init_method=args.dist_init_method,
+            pp_rank=daemon_args.pp_rank,
+            dist_init_method=daemon_args.dist_init_method,
         )
     else:
-        # Multi-rank mode: launch daemons for this node's TP ranks
         launch_weight_cache_daemons(
-            model_path=args.model_path,
-            tp_size=args.tp_size,
-            pp_size=args.pp_size,
-            dp_size=args.dp_size,
-            ep_size=args.ep_size,
-            nnodes=args.nnodes,
-            node_rank=args.node_rank,
-            base_gpu_id=args.base_gpu_id,
-            gpu_id_step=args.gpu_id_step,
-            load_format=args.load_format,
-            dtype=args.dtype,
-            quantization=args.quantization,
-            model_loader_extra_config=args.model_loader_extra_config,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-            dist_init_method=args.dist_init_method,
-            timeout=args.timeout,
-            force=args.force,
+            server_args,
+            dist_init_method=daemon_args.dist_init_method,
+            timeout=daemon_args.timeout,
+            force=daemon_args.force,
         )

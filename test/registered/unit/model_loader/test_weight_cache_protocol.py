@@ -7,7 +7,7 @@ These cover the pure-Python logic that the GPU end-to-end test
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
   - CacheConfig fingerprint matching / (de)serialization
   - quant-config hashing and method-name extraction
-  - the daemon rank formula and socket/ready path derivation
+  - daemon command construction and socket/ready path derivation
   - the IPC quantization allowlist (the gate that keeps silently-wrong
     quant methods off the zero-copy path)
   - stale-vs-live daemon file cleanup
@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
@@ -54,6 +55,14 @@ def _make_cache_config(**overrides) -> CacheConfig:
         pp_rank=0,
         dp_size=1,
         ep_size=1,
+        moe_dp_size=1,
+        moe_dp_rank=0,
+        moe_ep_rank=0,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        attn_cp_size=1,
+        moe_dense_tp_size=None,
+        moe_a2a_backend="none",
         quant_method="",
         quant_config_hash="",
         dtype="torch.float16",
@@ -120,6 +129,11 @@ class TestCacheConfig(CustomTestCase):
         base = _make_cache_config()
         for field, value in (
             ("tp_rank", 1),
+            ("moe_dp_rank", 1),
+            ("moe_ep_rank", 1),
+            ("enable_dp_attention", True),
+            ("moe_dense_tp_size", 1),
+            ("moe_a2a_backend", "mooncake"),
             ("dtype", "torch.bfloat16"),
             ("quant_method", "fp8"),
             ("model_path", "/models/other"),
@@ -209,6 +223,57 @@ class TestGlobalRankAndPaths(CustomTestCase):
             ),
             4,
         )
+
+
+class TestDaemonLaunchConfiguration(CustomTestCase):
+    def test_builder_projects_complex_server_layout(self):
+        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
+
+        # The builder consumes Engine's already-resolved ServerArgs. A minimal
+        # namespace keeps this projection test CPU-only and model-independent.
+        server_args = SimpleNamespace(
+            model_path="/models/demo",
+            tp_size=8,
+            pp_size=1,
+            dp_size=8,
+            ep_size=8,
+            moe_dp_size=2,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            attn_cp_size=2,
+            moe_dense_tp_size=1,
+            moe_a2a_backend="mooncake",
+            deepep_mode="low_latency",
+            load_format="safetensors",
+            dtype="bfloat16",
+            quantization="fp8",
+            model_loader_extra_config='{"key": "value"}',
+            trust_remote_code=True,
+            revision="test-revision",
+        )
+        command = build_weight_cache_daemon_command(
+            server_args,
+            gpu_id=3,
+            tp_rank=3,
+            pp_rank=0,
+            dist_init_method="tcp://127.0.0.1:29500",
+        )
+
+        def value_after(flag):
+            return command[command.index(flag) + 1]
+
+        self.assertEqual(value_after("--gpu-id"), "3")
+        self.assertEqual(value_after("--tp-rank"), "3")
+        self.assertEqual(value_after("--dp-size"), "8")
+        self.assertEqual(value_after("--ep-size"), "8")
+        self.assertEqual(value_after("--moe-dp-size"), "2")
+        self.assertEqual(value_after("--attn-cp-size"), "2")
+        self.assertEqual(value_after("--moe-dense-tp-size"), "1")
+        self.assertEqual(value_after("--moe-a2a-backend"), "mooncake")
+        self.assertEqual(value_after("--deepep-mode"), "low_latency")
+        self.assertIn("--enable-dp-attention", command)
+        self.assertIn("--enable-dp-lm-head", command)
+        self.assertIn("--trust-remote-code", command)
 
 
 class TestIpcQuantAllowlist(CustomTestCase):

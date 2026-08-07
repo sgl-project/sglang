@@ -483,8 +483,14 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = ps.pp_rank
 
             ep_size = ps.moe_ep_size
+            moe_dp_size = ps.moe_dp_size
+            moe_dp_rank = ps.moe_dp_rank
+            moe_ep_rank = ps.moe_ep_rank
 
-            dp_size = get_parallel().dp_size
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+            dp_size = ps.dp_size
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
@@ -501,6 +507,14 @@ class IpcModelLoader(BaseModelLoader):
                 pp_rank=pp_rank,
                 dp_size=dp_size,
                 ep_size=ep_size,
+                moe_dp_size=moe_dp_size,
+                moe_dp_rank=moe_dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                enable_dp_attention=server_args.enable_dp_attention,
+                enable_dp_lm_head=server_args.enable_dp_lm_head,
+                attn_cp_size=server_args.attn_cp_size,
+                moe_dense_tp_size=server_args.moe_dense_tp_size,
+                moe_a2a_backend=server_args.moe_a2a_backend,
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
