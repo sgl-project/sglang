@@ -33,6 +33,14 @@ class _RecordingVisual:
 
 
 class TestQwen3VLFeatureMaterialization(CustomTestCase):
+    @staticmethod
+    def _model(visual, *, use_data_parallel):
+        model = Qwen3VLForConditionalGeneration.__new__(Qwen3VLForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.visual = visual
+        model.use_data_parallel = use_data_parallel
+        return model
+
     def test_processor_defers_image_and_video_transport_for_encoder_dp(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
         processor.use_cuda_ipc = False
@@ -60,7 +68,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
     def test_image_features_are_packed_on_the_visual_device(self):
         visual = _RecordingVisual()
-        model = SimpleNamespace(visual=visual, use_data_parallel=False)
+        model = self._model(visual, use_data_parallel=False)
         items = [
             SimpleNamespace(
                 feature=torch.ones(2, 3),
@@ -71,7 +79,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 image_grid_thw=torch.tensor([[1, 1, 1]]),
             ),
         ]
-        output = Qwen3VLForConditionalGeneration.get_image_feature(model, items)
+        output = model.get_image_feature(items)
 
         self.assertIs(visual.pixel_values, output)
         self.assertEqual(output.shape, (3, 3))
@@ -80,7 +88,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
     def test_video_features_are_packed_on_the_visual_device(self):
         visual = _RecordingVisual()
-        model = SimpleNamespace(visual=visual, use_data_parallel=False)
+        model = self._model(visual, use_data_parallel=False)
         items = [
             SimpleNamespace(
                 feature=torch.ones(3, 4),
@@ -91,7 +99,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                 video_grid_thw=torch.tensor([[1, 1, 2]]),
             ),
         ]
-        output = Qwen3VLForConditionalGeneration.get_video_feature(model, items)
+        output = model.get_video_feature(items)
 
         self.assertIs(visual.pixel_values, output)
         self.assertEqual(output.shape, (5, 4))
@@ -101,48 +109,56 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
             torch.equal(visual.grid_thw, torch.tensor([[1, 1, 3], [1, 1, 2]]))
         )
 
-    def test_encoder_dp_materializes_only_locally_assigned_images(self):
+    def test_encoder_dp_materializes_only_locally_assigned_visual_items(self):
         visual = SimpleNamespace(device=torch.device("cuda:0"), dtype=torch.bfloat16)
-        model = SimpleNamespace(visual=visual, use_data_parallel=True)
-        items = [
-            SimpleNamespace(
-                feature=torch.ones(2, 3),
-                image_grid_thw=torch.tensor([[1, 1, 2]]),
-                reconstruct=Mock(),
-            ),
-            SimpleNamespace(
-                feature=torch.ones(1, 3),
-                image_grid_thw=torch.tensor([[1, 1, 1]]),
-                reconstruct=Mock(),
-            ),
-        ]
-        local_features = object()
-        encoded = object()
+        model = self._model(visual, use_data_parallel=True)
 
-        def run_dp(_visual, pixel_values, grid_thw, **kwargs):
-            self.assertIsNone(pixel_values)
-            self.assertEqual(grid_thw, [[1, 1, 2], [1, 1, 1]])
-            self.assertIs(kwargs["load_local_pixel_values"]([1]), local_features)
-            return encoded
-
-        with patch(
-            "sglang.srt.models.qwen3_vl.run_dp_sharded_mrope_vision_model",
-            side_effect=run_dp,
-        ), patch(
-            "sglang.srt.models.qwen3_vl.materialize_multimodal_features",
-            return_value=local_features,
-        ) as materialize, patch(
-            "sglang.srt.models.qwen3_vl.get_parallel",
-            return_value=SimpleNamespace(tp_size=8),
+        for modality, feature_method, grid_attribute in (
+            ("image", model.get_image_feature, "image_grid_thw"),
+            ("video", model.get_video_feature, "video_grid_thw"),
         ):
-            output = Qwen3VLForConditionalGeneration.get_image_feature(model, items)
+            with self.subTest(modality=modality):
+                items = [
+                    SimpleNamespace(
+                        feature=torch.ones(2, 3),
+                        reconstruct=Mock(),
+                        **{grid_attribute: torch.tensor([[1, 1, 2]])},
+                    ),
+                    SimpleNamespace(
+                        feature=torch.ones(1, 3),
+                        reconstruct=Mock(),
+                        **{grid_attribute: torch.tensor([[1, 1, 1]])},
+                    ),
+                ]
+                local_features = object()
+                encoded = object()
 
-        self.assertIs(output, encoded)
-        items[0].reconstruct.assert_not_called()
-        items[1].reconstruct.assert_called_once_with(0, ipc_consumer_count=8)
-        materialize.assert_called_once_with(
-            [items[1].feature], device=visual.device, dtype=visual.dtype
-        )
+                def run_dp(_visual, pixel_values, grid_thw, **kwargs):
+                    self.assertIsNone(pixel_values)
+                    self.assertEqual(grid_thw, [[1, 1, 2], [1, 1, 1]])
+                    self.assertIs(
+                        kwargs["load_local_pixel_values"]([1]), local_features
+                    )
+                    return encoded
+
+                with patch(
+                    "sglang.srt.models.qwen3_vl.run_dp_sharded_mrope_vision_model",
+                    side_effect=run_dp,
+                ), patch(
+                    "sglang.srt.models.qwen3_vl.materialize_multimodal_features",
+                    return_value=local_features,
+                ) as materialize, patch(
+                    "sglang.srt.models.qwen3_vl.get_parallel",
+                    return_value=SimpleNamespace(tp_size=8),
+                ):
+                    output = feature_method(items)
+
+                self.assertIs(output, encoded)
+                items[0].reconstruct.assert_not_called()
+                items[1].reconstruct.assert_called_once_with(0, ipc_consumer_count=8)
+                materialize.assert_called_once_with(
+                    [items[1].feature], device=visual.device, dtype=visual.dtype
+                )
 
 
 if __name__ == "__main__":
