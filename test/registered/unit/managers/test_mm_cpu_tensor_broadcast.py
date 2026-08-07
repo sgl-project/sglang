@@ -10,6 +10,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import (  # noqa: E402
+    BatchTokenizedGenerateReqInput,
     TokenizedGenerateReqInput,
     wrap_as_pickle,
 )
@@ -120,6 +121,33 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
 
         self.assertIs(result[0].mm_inputs.mm_items[0].feature, feature)
         broadcast.assert_not_called()
+
+    def test_batch_request_preserves_tensor_list_order(self):
+        features = [
+            torch.full((300_000,), value, dtype=torch.float32) for value in (1, 2)
+        ]
+        req = _make_req(features)
+        batch = BatchTokenizedGenerateReqInput(batch=[req])
+        sent = []
+
+        def fake_broadcast(tensor, **kwargs):
+            sent.append(tensor.clone())
+            return SimpleNamespace(wait=lambda: None)
+
+        with (
+            patch(
+                "sglang.srt.managers.mm_transport.broadcast_pyobj",
+                side_effect=lambda data, *args, **kwargs: data,
+            ),
+            patch(
+                "sglang.srt.managers.mm_transport.dist.broadcast",
+                side_effect=fake_broadcast,
+            ),
+        ):
+            result = broadcast_mm_cpu_tensors([batch], rank=0, src=0)
+
+        self.assertIs(result[0].batch[0].mm_inputs.mm_items[0].feature, features)
+        self.assertEqual([tensor[0].item() for tensor in sent], [1, 2])
 
 
 if __name__ == "__main__":
