@@ -357,6 +357,7 @@ struct Router {
     worker_urls: Vec<String>,
     policy: PolicyType,
     max_load_skew: f64,
+    min_load_gap: usize,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -502,6 +503,7 @@ impl Router {
                 PolicyType::BoundedConsistentHashing => {
                     ConfigPolicyConfig::BoundedConsistentHashing {
                         max_load_skew: self.max_load_skew,
+                        min_load_gap: self.min_load_gap,
                     }
                 }
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
@@ -769,6 +771,7 @@ impl Router {
         tcp_keepalive_secs = 30,
         enable_wasm = false,
         max_load_skew = 1.5,
+        min_load_gap = 2,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -862,6 +865,7 @@ impl Router {
         tcp_keepalive_secs: u64,
         enable_wasm: bool,
         max_load_skew: f64,
+        min_load_gap: usize,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -883,6 +887,7 @@ impl Router {
             worker_urls,
             policy,
             max_load_skew,
+            min_load_gap,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,

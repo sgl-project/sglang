@@ -159,6 +159,7 @@ class Router:
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
             - PolicyType.BoundedConsistentHashing: Keep explicit routing-key affinity within a bounded worker load skew
         max_load_skew: Active-load bound for bounded consistent hashing. Default: 1.5
+        min_load_gap: Minimum preferred-to-least-loaded worker gap, in active requests, before spillover is allowed.
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup and registration. Large models can take significant time to load into GPU memory. Default: 1800 (30 minutes)

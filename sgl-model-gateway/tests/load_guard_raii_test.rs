@@ -210,3 +210,50 @@ async fn test_guard_with_empty_body() {
 
     assert_eq!(worker.load(), 0);
 }
+
+#[tokio::test]
+async fn test_non_streaming_guard_covers_upstream_body_read_lifetime() {
+    let worker = create_test_worker();
+    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+    let response = create_sse_response(rx);
+    let guard = WorkerLoadGuard::new(worker.clone(), None);
+
+    assert_eq!(worker.load(), 1);
+    tx.send(Bytes::from_static(b"complete response")).unwrap();
+    drop(tx);
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes, Bytes::from_static(b"complete response"));
+    assert_eq!(worker.load(), 1);
+
+    drop(guard);
+    assert_eq!(worker.load(), 0);
+}
+
+#[tokio::test]
+async fn test_streaming_explicit_key_guard_covers_full_body_lifetime() {
+    let worker = create_test_worker();
+    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+    let response = create_sse_response(rx);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-smg-routing-key", "concurrent-key".parse().unwrap());
+
+    let guard = WorkerLoadGuard::new(worker.clone(), Some(&headers));
+    let guarded_response = AttachedBody::wrap_response(response, guard);
+    let mut body = guarded_response.into_body();
+
+    assert_eq!(worker.load(), 1);
+    assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+    tx.send(Bytes::from_static(b"data: first\n\n")).unwrap();
+    assert!(body.frame().await.is_some());
+    assert_eq!(worker.load(), 1);
+    assert_eq!(worker.worker_routing_key_load().value(), 1);
+
+    drop(tx);
+    while body.frame().await.is_some() {}
+    drop(body);
+
+    assert_eq!(worker.load(), 0);
+    assert_eq!(worker.worker_routing_key_load().value(), 0);
+}
