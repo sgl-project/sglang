@@ -667,6 +667,38 @@ class USPAttention(nn.Module):
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
+        if (
+            isinstance(attn_mask_meta, dict)
+            and attn_mask_meta.get("static_no_pack_cu") is not None
+        ):
+            # Fixed-shape varlen: the sequence is [valid rows..., tail pad] and
+            # the pad is excluded by cu_seqlens VALUES, not by packing — no
+            # gather/scatter, no nonzero, capturable into a CUDA graph. Padding
+            # rows receive garbage output; callers must drop them.
+            assert attn_mask is None, "static_no_pack_cu excludes attn_mask"
+            assert (
+                get_sequence_parallel_world_size() == 1 or effective_skip_sp
+            ), "static_no_pack_cu is a single-rank path"
+            assert self.backend == AttentionBackendEnum.FA
+            cu = attn_mask_meta["static_no_pack_cu"]
+            bs, seq = q.shape[0], q.shape[1]
+            assert bs == 1, "static_no_pack_cu supports batch size 1"
+            out = flash_attn_varlen_func(
+                q=q.reshape(bs * seq, *q.shape[2:]),
+                k=k.reshape(bs * seq, *k.shape[2:]),
+                v=v.reshape(bs * seq, *v.shape[2:]),
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                max_seqlen_q=bs * seq,
+                max_seqlen_k=bs * seq,
+                softmax_scale=self.softmax_scale,
+                causal=False,
+                ver=_fa_backend.fa_ver,
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            return out.view(bs, seq, *out.shape[1:])
+
         # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
         # pad span) also opts into the masked SP branch. gap_* = legacy alias.
         meta_pad_start = meta_pad_end = None

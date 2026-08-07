@@ -2204,9 +2204,25 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             # this the signature is keyed to one prompt length (the warmup
             # request's), and the first differently-sized prompt disables the
             # graph permanently.
+            raw_txt_lens = call_kwargs.get("txt_seq_lens")
             call_kwargs = self._bcg_pad_prompt_kwargs(
                 call_kwargs, current_model=current_model
             )
+            mask = call_kwargs.get("encoder_hidden_states_mask")
+            if (
+                mask is not None
+                and raw_txt_lens is not None
+                and len(raw_txt_lens) == 1
+            ):
+                # The bucketed mask marks a contiguous text tail pad; hand the
+                # model the valid length as a device value instead so the whole
+                # forward stays shape-static and free of nonzero() (a mask-based
+                # varlen path cannot be captured into one graph).
+                call_kwargs = dict(call_kwargs)
+                call_kwargs["encoder_hidden_states_mask"] = None
+                call_kwargs["txt_bucket_tail_cu"] = torch.tensor(
+                    [raw_txt_lens[0]], dtype=torch.int32, device=mask.device
+                )
             fcg = self._fcg_runners.get(id(current_model))
             if fcg is None:
                 fcg = _FullGraphRunner(current_model, self._fcg_device(call_kwargs))

@@ -782,8 +782,16 @@ class QwenImageCrossAttention(nn.Module):
                 img_value,
                 sp_txt_pad,
             )
+        txt_tail_join = cross_attention_kwargs.get("txt_tail_join", False)
         if seg_qkv is not None:
             joint_query, joint_key, joint_value = seg_qkv
+        elif txt_tail_join:
+            # [image, text-bucket]: the bucket's tail padding becomes a joint
+            # suffix without any pad-relocation slicing (shape-static, see the
+            # static_no_pack_cu path in USPAttention).
+            joint_query = torch.cat([img_query, txt_query], dim=1)
+            joint_key = torch.cat([img_key, txt_key], dim=1)
+            joint_value = torch.cat([img_value, txt_value], dim=1)
         else:
             joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
             joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
@@ -815,9 +823,14 @@ class QwenImageCrossAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
         # Split attention outputs back
-        txt_attn_output, img_attn_output = split_seqs(
-            joint_hidden_states, seq_len_txt, sp_txt_pad
-        )
+        if txt_tail_join:
+            img_len = joint_hidden_states.shape[1] - seq_len_txt
+            img_attn_output = joint_hidden_states[:, :img_len]
+            txt_attn_output = joint_hidden_states[:, img_len:]
+        else:
+            txt_attn_output, img_attn_output = split_seqs(
+                joint_hidden_states, seq_len_txt, sp_txt_pad
+            )
 
         # Apply output projections
         img_attn_output, _ = self.to_out[0](img_attn_output)
@@ -1488,6 +1501,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         additional_t_cond: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,
+        txt_bucket_tail_cu: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
         return_dict: bool = True,
@@ -1545,7 +1559,19 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
         sp_text_sharded = False
-        if encoder_hidden_states_mask is not None:
+        if txt_bucket_tail_cu is not None:
+            # Bucketed single-request path for whole-forward CUDA graphs: the
+            # text buffer is padded to a fixed bucket, blocks join the sequence
+            # as [image, text] so the pad is a joint-tail suffix, and attention
+            # clamps it via cu_seqlens VALUES — every shape stays static, so
+            # the forward is capturable and needs no nonzero()-based metadata.
+            joint_len = txt_bucket_tail_cu.to(torch.int32) + hidden_states.shape[1]
+            joint_cu = torch.cat(
+                [torch.zeros_like(joint_len), joint_len]
+            ).contiguous()
+            block_attention_kwargs["attn_mask_meta"] = {"static_no_pack_cu": joint_cu}
+            block_attention_kwargs["txt_tail_join"] = True
+        elif encoder_hidden_states_mask is not None:
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(
                 device=hidden_states.device, dtype=torch.bool
             )
