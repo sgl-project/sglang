@@ -280,6 +280,21 @@ struct MatchOutcome {
     any_above_threshold: bool,
     /// "bigram" | "unigram" | "dual", for the debug log.
     label: &'static str,
+    /// The block-hash chain of each mode that PRODUCED BLOCKS, in the order
+    /// hashed. Retained past the match so
+    /// [`CacheAwareZmqPolicy::selected_overlap`] can re-query the tree for the
+    /// worker the policy actually picked, which is not knowable at match time.
+    ///
+    /// At most one entry per hashed mode, so at most two. Not one-to-one with
+    /// fleet bimodality: a bimodal fleet still yields a single entry for a
+    /// one-token request, because the bigram hasher needs two tokens to make a
+    /// logical unit and returns nothing. Test the length, never the oracle's
+    /// bimodality, when deciding whether a single mode is in play.
+    ///
+    /// Populated in the same loop iteration as `owner_urls` and gated by the
+    /// same emptiness check, which is what lets [`Self::selected_overlap`]
+    /// treat "one entry" as "`owner_urls` describes this chain".
+    mode_hashes: Vec<Vec<i64>>,
 }
 
 impl CacheAwareZmqPolicy {
@@ -481,11 +496,24 @@ impl CacheAwareZmqPolicy {
         };
 
         let mut owner_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut mode_hashes: Vec<Vec<i64>> = Vec::with_capacity(modes.len());
         let mut had_blocks = false;
         let mut any_above_threshold = false;
         // (rate, matched_blocks, query_blocks) of the best-matching mode, for
         // logging + metrics. Seeded by the first hashed mode so a zero-match
         // request still reports a real query-block denominator.
+        //
+        // Ordered by rate THEN matched blocks. The tiebreak is not cosmetic: it
+        // is what makes `best.matched_blocks` the maximum over modes, which
+        // `selected_overlap` relies on to stay within the ceiling it reports.
+        // The two modes hash a request into different block counts — unigram
+        // `ceil(n/block)`, bigram `ceil((n-1)/block)` — so on a fully-warm
+        // prefix both rate 1.0 while one holds a block more. Strict `>` alone
+        // keeps the primary mode on that tie and can then report a `selected`
+        // drawn from the other mode's longer chain, i.e. a per-request hit rate
+        // above 100%. Rate ties are the ONLY way the orderings disagree: a
+        // strictly higher matched count on the shorter-or-equal chain implies a
+        // strictly higher rate, given the two counts differ by at most one.
         let mut best: Option<(f32, usize, usize)> = None;
 
         for &mode_bigram in modes {
@@ -501,7 +529,7 @@ impl CacheAwareZmqPolicy {
             let matched = self.tree.match_prefix(None, &hashes);
             debug_assert!(matched.matched_blocks <= hashes.len());
             let rate = matched.matched_blocks as f32 / hashes.len() as f32;
-            if best.is_none_or(|(r, _, _)| rate > r) {
+            if best.is_none_or(|(r, m, _)| (rate, matched.matched_blocks) > (r, m)) {
                 best = Some((rate, matched.matched_blocks, hashes.len()));
             }
             // Per-mode threshold BEFORE unioning: a mode contributes owners only
@@ -513,6 +541,7 @@ impl CacheAwareZmqPolicy {
                     owner_urls.insert(w.url);
                 }
             }
+            mode_hashes.push(hashes);
         }
 
         let (match_rate, matched_blocks, query_blocks) = best.unwrap_or((0.0, 0, 0));
@@ -529,7 +558,76 @@ impl CacheAwareZmqPolicy {
             had_blocks,
             any_above_threshold,
             label,
+            mode_hashes,
         }
+    }
+
+    /// How many blocks of this request the worker at `url` holds itself.
+    ///
+    /// Short-circuits when only one mode produced blocks and `url` is one of
+    /// its owners: `owner_urls` is then exactly the worker set of the node at
+    /// depth `matched_blocks` on that single chain, so the answer is
+    /// `matched_blocks` without walking the tree again. That covers every
+    /// `cache_hit` selection on a uniform fleet — the dominant path — for no
+    /// added cost. With two chains in play the membership no longer says
+    /// *which* chain the worker owns, so the shortcut would be guessing.
+    ///
+    /// Otherwise re-descends per mode and takes the deepest: the request goes
+    /// to one worker, whose engine hashes with its own family, so a worker warm
+    /// under either family can serve it from cache. This stays within
+    /// `matched_blocks` only because [`Self::match_request`] breaks rate ties by
+    /// matched blocks, making that the per-mode maximum — see the ordering note
+    /// there before changing either side.
+    fn selected_overlap(&self, outcome: &MatchOutcome, url: &str) -> usize {
+        let single_chain = outcome.mode_hashes.len() < 2;
+        if single_chain && outcome.owner_urls.contains(url) {
+            return outcome.matched_blocks;
+        }
+        outcome
+            .mode_hashes
+            .iter()
+            .map(|hashes| self.tree.match_prefix_for_url(None, hashes, url))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Book the terminal outcome of one selection that reached the hash
+    /// lookup: the decision, the overlap distribution sample, and the
+    /// per-decision block attribution.
+    ///
+    /// Single chokepoint on purpose. The three block counters and the decision
+    /// counter only mean anything together — a numerator filed under a
+    /// different decision than its denominator silently corrupts every ratio
+    /// built on them — and every terminal path past the match has to book one
+    /// of each.
+    ///
+    /// `chosen` is the worker the caller is about to return. A path that
+    /// returns no worker at all books nothing: it placed nothing, so it is not
+    /// a locality sample, and letting its query blocks into the denominator
+    /// would compare against an engine population that never saw the request.
+    fn record_match_outcome(
+        &self,
+        model_id: &str,
+        decision: CacheAwareDecision,
+        outcome: &MatchOutcome,
+        chosen: &Worker,
+    ) {
+        // Bail on a missing sink before any work: `selected_overlap` can
+        // re-walk the tree, and with no sink attached that walk has no
+        // consumer.
+        let Some(m) = self.metrics.get() else {
+            return;
+        };
+        let selected = self.selected_overlap(outcome, chosen.url.as_str()) as u64;
+        m.record_cache_aware_decision(model_id, decision);
+        m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
+        m.add_cache_aware_blocks(
+            model_id,
+            decision,
+            outcome.query_blocks as u64,
+            outcome.matched_blocks as u64,
+            selected,
+        );
     }
 }
 
@@ -737,14 +835,12 @@ impl Policy for CacheAwareZmqPolicy {
             cache_threshold = self.config.cache_threshold,
             "cache-aware-zmq match_prefix",
         );
-        // Record overlap + query-block count before the affinity branch so the
-        // histogram captures the full distribution, including below-threshold
-        // selections. In a bimodal fleet these are the best-matching mode's
-        // numbers, keeping one sample per request.
-        if let Some(m) = self.metrics.get() {
-            m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
-            m.add_cache_aware_query_blocks(model_id, outcome.query_blocks as u64);
-        }
+        // Every terminal path below books through `record_match_outcome`, so
+        // the overlap histogram still captures the full distribution
+        // (including below-threshold selections) while the block counters
+        // additionally attribute it to the decision that consumed it. In a
+        // bimodal fleet the matched/query numbers are the best-matching mode's,
+        // keeping one sample per request.
         if outcome.owner_urls.is_empty() {
             // Same taxonomy as the single-mode path: a cleared-threshold match
             // whose node has no live owner is distinct from no match at all.
@@ -753,7 +849,6 @@ impl Policy for CacheAwareZmqPolicy {
             } else {
                 CacheAwareDecision::BelowThreshold
             };
-            self.record_decision(model_id, decision);
             tracing::debug!(
                 model = %ctx.model(),
                 n_blocks = outcome.query_blocks,
@@ -762,12 +857,20 @@ impl Policy for CacheAwareZmqPolicy {
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: no eligible cache owner, falling back to sampled min-load",
             );
-            return Self::pick_min_load(
+            let fallback = Self::pick_min_load(
                 workers,
                 &loads,
                 &self.config.load_gate,
                 self.config.min_load_choices,
             );
+            // The min-load draw can still be warm by luck, and on the
+            // below-threshold path — the highest-volume fallback — that luck is
+            // the difference between "the router forfeited a prefix" and "there
+            // was no prefix to forfeit". Measure it rather than assume zero.
+            if let Some(w) = &fallback {
+                self.record_match_outcome(model_id, decision, &outcome, w);
+            }
+            return fallback;
         }
         // Among the matched owners (either family, in a bimodal fleet), pick the
         // lowest-load one that is not already queueing. The gate and the tiebreak
@@ -806,7 +909,12 @@ impl Policy for CacheAwareZmqPolicy {
                             .min_by_key(|w| loads.load_of(w))
                             .map(Arc::clone);
                         if let Some(w) = pinned {
-                            self.record_decision(model_id, CacheAwareDecision::CacheHitAllQueued);
+                            self.record_match_outcome(
+                                model_id,
+                                CacheAwareDecision::CacheHitAllQueued,
+                                &outcome,
+                                &w,
+                            );
                             if should_log(&SATURATION_PIN_LOG_COUNTER) {
                                 tracing::info!(
                                     model = %ctx.model(),
@@ -875,7 +983,9 @@ impl Policy for CacheAwareZmqPolicy {
                 // the tree match and this selection).
                 CacheAwareDecision::MatchedWorkersIneligible
             };
-            self.record_decision(model_id, decision);
+            if let Some(w) = &fallback {
+                self.record_match_outcome(model_id, decision, &outcome, w);
+            }
             // Record what the diversion cost, but only when one happened: the
             // gate tests queue length alone and is blind to how much prefix is
             // at stake, so the distribution of what it throws away is the
@@ -883,6 +993,10 @@ impl Policy for CacheAwareZmqPolicy {
             // `sgl_router_overlap_blocks` over all selections — a diverted curve
             // that skews high means the gate is trading large cached prefixes
             // for small waits.
+            //
+            // This is the distribution; the blocks-weighted total, and what the
+            // diverted-to worker turned out to hold anyway, come from the
+            // matched/selected counters under `decision="cache_worker_queued"`.
             if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
                 if let Some(m) = self.metrics.get() {
                     m.observe_diverted_overlap_blocks(model_id, outcome.matched_blocks as u64);
@@ -912,7 +1026,7 @@ impl Policy for CacheAwareZmqPolicy {
             }
             return fallback;
         };
-        self.record_decision(model_id, CacheAwareDecision::CacheHit);
+        self.record_match_outcome(model_id, CacheAwareDecision::CacheHit, &outcome, &chosen);
         tracing::debug!(
             model = %ctx.model(),
             worker = %chosen.url,
@@ -1002,6 +1116,19 @@ mod tests {
         engine_load: Arc<EngineLoadTable>,
     ) -> CacheAwareZmqPolicy {
         CacheAwareZmqPolicy::new(config, tree, tokenizers, oracle, engine_load)
+    }
+
+    /// Read one `(metric, decision)` block counter out of a rendered
+    /// exposition, for assertions whose expected value depends on a fixture
+    /// too large to restate inline. Absent series read 0 — the same thing a
+    /// PromQL `sum` would see.
+    fn block_counter(rendered: &str, metric: &str, decision: &str) -> u64 {
+        let prefix = format!("sgl_router_{metric}{{model_id=\"tiny\",decision=\"{decision}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     fn load_stat(running: u64, waiting: u64) -> LoadStat {
@@ -1130,6 +1257,133 @@ mod tests {
         o.set_bigram(!primary_bigram); // opposite mode -> bimodal
         assert!(o.is_bimodal(), "two opposite modes must latch bimodal");
         o
+    }
+
+    /// Regression: bimodal fleets hash a request into two DIFFERENT block
+    /// counts — unigram `ceil(n/block)`, bigram `ceil((n-1)/block)` — so on a
+    /// prefix fully warm under both families the two modes tie at rate 1.0
+    /// while one chain is a block longer. Before `match_request` broke that tie
+    /// by matched blocks, `best` kept the shorter primary chain while
+    /// `selected_overlap` maxed the depth across modes and returned the longer
+    /// one, booking query=2 matched=2 selected=3 — a 150% per-request hit rate
+    /// on the exact metric that exists to be compared against the engine.
+    #[test]
+    fn bimodal_selected_overlap_stays_within_the_matched_ceiling() {
+        let tokens: Vec<u32> = (1..=9).collect();
+        let uni = compute_block_hashes(&tokens, 4);
+        let bi = compute_block_hashes_bigram(&tokens, 4);
+        assert_eq!(uni.len(), 3, "unigram hashes ceil(9/4)");
+        assert_eq!(bi.len(), 2, "bigram hashes ceil(8/4) — one block shorter");
+
+        let tree = Arc::new(HashTree::new());
+        tree.insert(
+            &KvWorkerId::new("http://unigram:30000".into(), 0),
+            None,
+            &uni,
+        );
+        tree.insert(&KvWorkerId::new("http://eagle:30000".into(), 0), None, &bi);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                min_load_choices: usize::MAX,
+                ..Default::default()
+            },
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            bimodal_oracle(4, /* primary_bigram= */ true),
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_unigram = worker("http://unigram:30000", "tiny");
+        // Push the pick onto the unigram owner — the secondary mode, whose
+        // chain is the longer one.
+        let _g1 = w_eagle.load_guard();
+        let _g2 = w_eagle.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_unigram)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://unigram:30000");
+
+        // The tie now resolves to the mode with more matched blocks, so all
+        // three terms describe the same 3-block chain.
+        let rendered = metrics.render();
+        for (metric, value) in [
+            ("cache_aware_query_blocks_total", 3),
+            ("matched_overlap_blocks_total", 3),
+            ("selected_overlap_blocks_total", 3),
+        ] {
+            let want =
+                format!("sgl_router_{metric}{{model_id=\"tiny\",decision=\"cache_hit\"}} {value}");
+            assert!(
+                rendered.contains(&want),
+                "missing `{want}`; got:\n{rendered}"
+            );
+        }
+    }
+
+    /// The positive case for maxing across modes: the chosen worker is warm
+    /// under the OTHER hashing family than the one `best` came from, and must
+    /// still be credited — its engine hashes with its own family, so the prefix
+    /// is genuinely reusable. Distinguishes max-over-modes from
+    /// only-the-best-mode, which would report 0 here.
+    #[test]
+    fn bimodal_credits_a_worker_warm_under_the_other_hashing_family() {
+        let tokens: Vec<u32> = (1..=12).collect();
+        let uni = compute_block_hashes(&tokens, 4);
+        let bi = compute_block_hashes_bigram(&tokens, 4);
+        assert_eq!(uni.len(), 3);
+        assert_eq!(bi.len(), 3, "12 tokens -> 11 bigrams -> ceil(11/4) = 3");
+
+        let tree = Arc::new(HashTree::new());
+        // EAGLE owns the full bigram chain; the unigram worker owns only the first two
+        // unigram blocks. `best` is the bigram mode (rate 1.0 beats 2/3).
+        tree.insert(&KvWorkerId::new("http://eagle:30000".into(), 0), None, &bi);
+        tree.insert(
+            &KvWorkerId::new("http://unigram:30000".into(), 0),
+            None,
+            &uni[..2],
+        );
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                min_load_choices: usize::MAX,
+                ..Default::default()
+            },
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            bimodal_oracle(4, /* primary_bigram= */ true),
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_unigram = worker("http://unigram:30000", "tiny");
+        let _g1 = w_eagle.load_guard();
+        let _g2 = w_eagle.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_unigram)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://unigram:30000");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_matched_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_hit\"} 3"
+            ),
+            "the bigram owner holds all 3; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_hit\"} 2"
+            ),
+            "the chosen unigram owner holds 2 of 3 — credited, not zeroed; got:\n{rendered}"
+        );
     }
 
     /// Bimodal fleet, primary = bigram (EAGLE). A prefix cached ONLY on the
@@ -1320,7 +1574,7 @@ mod tests {
         );
         assert!(
             rendered.contains(&format!(
-                "sgl_router_cache_aware_query_blocks_total{{model_id=\"tiny\"}} {}",
+                "sgl_router_cache_aware_query_blocks_total{{model_id=\"tiny\",decision=\"cache_hit\"}} {}",
                 hashes.len()
             )),
             "query-block denominator must be recorded; got:\n{rendered}"
@@ -1331,6 +1585,15 @@ mod tests {
                 hashes.len()
             )),
             "matched-block numerator must use overlap_blocks_sum; got:\n{rendered}"
+        );
+        // w0 is the sole owner and holds the whole chain, so the router
+        // predicts the engine can reuse all of it.
+        assert!(
+            rendered.contains(&format!(
+                "sgl_router_selected_overlap_blocks_total{{model_id=\"tiny\",decision=\"cache_hit\"}} {}",
+                hashes.len()
+            )),
+            "selected overlap must equal the matched prefix when routing to its owner; got:\n{rendered}"
         );
         assert!(
             rendered.contains(
@@ -1389,8 +1652,16 @@ mod tests {
             "PolicyRegistry::attach_metrics must wire overlap recording through the trait; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("sgl_router_cache_aware_query_blocks_total{model_id=\"tiny\"}"),
+            rendered.contains(
+                "sgl_router_cache_aware_query_blocks_total{model_id=\"tiny\",decision=\"cache_hit\"}"
+            ),
             "production metrics injection must wire the lookup denominator; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_hit\"}"
+            ),
+            "production metrics injection must wire the selected-overlap numerator; got:\n{rendered}"
         );
         assert!(
             rendered.contains(
@@ -1457,6 +1728,158 @@ mod tests {
             ),
             "below-threshold fallback reason must be visible; got:\n{rendered}"
         );
+        // The point of the selected/matched split: w0 holds the whole chain,
+        // the fallback went to w1 which holds none of it. `matched` still
+        // reports the full prefix (it existed), `selected` reports 0 (this
+        // request will not get it). Charting `matched` alone reads as a hit.
+        assert!(
+            rendered.contains(&format!(
+                "sgl_router_matched_overlap_blocks_total{{model_id=\"tiny\",decision=\"below_threshold\"}} {}",
+                hashes.len()
+            )),
+            "the prefix that existed must still be counted; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"below_threshold\"} 0"
+            ),
+            "a fallback onto a worker holding nothing must report zero selected overlap; got:\n{rendered}"
+        );
+    }
+
+    /// The queue gate's cost, in the units the engine reports it in. w0 owns
+    /// the whole prefix but is over `worker_queue_limit`, so the request is
+    /// diverted to w1, which holds nothing. `matched - selected` is exactly
+    /// the locality the gate traded away, attributable to
+    /// `decision="cache_worker_queued"`.
+    #[test]
+    fn diverted_selection_separates_forfeited_prefix_from_available_one() {
+        let tree = Arc::new(HashTree::new());
+        let toks = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = toks.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty());
+        let owner = KvWorkerId::new("http://w0:30000".into(), 0);
+        tree.insert(&owner, None, &hashes);
+
+        let metrics = MetricsRegistry::new();
+        // w0: over the limit and thus gated off its own prefix. w1: idle, so an
+        // unqueued alternative exists and this is a real diversion rather than
+        // fleet-wide saturation.
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(0, 8), now);
+        engine_load.set("http://w1:30000", 0, load_stat(0, 0), now);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(2).unwrap()),
+                min_load_choices: usize::MAX,
+                saturation_queue_floor: None,
+            },
+            Arc::clone(&tree),
+            toks,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "the queue gate must divert off the queueing prefix owner",
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 1"
+            ),
+            "diversion must book under cache_worker_queued; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "sgl_router_matched_overlap_blocks_total{{model_id=\"tiny\",decision=\"cache_worker_queued\"}} {}",
+                hashes.len()
+            )),
+            "the forfeited prefix must be counted; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 0"
+            ),
+            "the diverted-to worker holds nothing, so selected overlap is 0; got:\n{rendered}"
+        );
+    }
+
+    /// A diversion that happens to land somewhere warm is not a full loss, and
+    /// the metric must say so rather than assuming the worst. w0 (gated) holds
+    /// 3 blocks, w1 (the diversion target) holds the first 2 of them.
+    #[test]
+    fn diverted_selection_credits_prefix_the_target_already_holds() {
+        let tree = Arc::new(HashTree::new());
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4);
+        assert_eq!(hashes.len(), 3);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(
+            &KvWorkerId::new("http://w1:30000".into(), 0),
+            None,
+            &hashes[..2],
+        );
+
+        let metrics = MetricsRegistry::new();
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(0, 8), now);
+        engine_load.set("http://w1:30000", 0, load_stat(0, 0), now);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(2).unwrap()),
+                min_load_choices: usize::MAX,
+                saturation_queue_floor: None,
+            },
+            Arc::clone(&tree),
+            tokenizer_registry_with_tiny(),
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w1:30000");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_matched_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 3"
+            ),
+            "fleet-best overlap is w0's full 3 blocks; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "sgl_router_selected_overlap_blocks_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 2"
+            ),
+            "w1 holds 2 of the 3 blocks, so only 1 block of locality was lost; got:\n{rendered}"
+        );
     }
 
     /// A full hash match can land on an intermediate tree node whose worker
@@ -1499,6 +1922,23 @@ mod tests {
             ),
             "a full hash match with no owner is not a below-threshold parity miss; got:\n{rendered}",
         );
+        // w0 still owns depth 1 (only the depth-2 node was vacated), so the
+        // fallback onto it recovers one block of the two-block query. The only
+        // end-to-end exercise of `match_prefix_for_url` resuming past a depth
+        // the worker no longer owns.
+        for (metric, value) in [
+            ("cache_aware_query_blocks_total", 2),
+            ("matched_overlap_blocks_total", 2),
+            ("selected_overlap_blocks_total", 1),
+        ] {
+            let want = format!(
+                "sgl_router_{metric}{{model_id=\"tiny\",decision=\"matched_node_unowned\"}} {value}"
+            );
+            assert!(
+                rendered.contains(&want),
+                "missing `{want}`; got:\n{rendered}"
+            );
+        }
     }
 
     /// A matched tree owner can be absent from the eligible worker slice
@@ -1528,9 +1968,26 @@ mod tests {
             .expect("min-load fallback");
 
         assert_eq!(chosen.url, "http://w1:30000");
-        assert!(metrics.render().contains(
+        let rendered = metrics.render();
+        assert!(rendered.contains(
             "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"matched_workers_ineligible\"} 1"
         ));
+        // Quantifies the admission-driven locality loss this bucket absorbs:
+        // the whole 2-block prefix existed, on a worker that was never a
+        // candidate, and w1 holds none of it.
+        for (metric, value) in [
+            ("cache_aware_query_blocks_total", 2),
+            ("matched_overlap_blocks_total", 2),
+            ("selected_overlap_blocks_total", 0),
+        ] {
+            let want = format!(
+                "sgl_router_{metric}{{model_id=\"tiny\",decision=\"matched_workers_ineligible\"}} {value}"
+            );
+            assert!(
+                rendered.contains(&want),
+                "missing `{want}`; got:\n{rendered}"
+            );
+        }
     }
 
     /// Each policy evaluation emits exactly one terminal decision even though
@@ -3210,6 +3667,89 @@ mod tests {
             "must NOT be indistinguishable from an unqueued hit — that is the \
              whole point of the separate label; got:\n{rendered}"
         );
+        // Landing on the cache home keeps the prefix, so this booking looks
+        // like a hit. Contrast the sibling below, where the same label books
+        // selected=0 — within one bucket `selected` is the only thing that
+        // separates "affinity kept anyway" from "affinity lost to saturation".
+        let matched = block_counter(
+            &rendered,
+            "matched_overlap_blocks_total",
+            "cache_hit_all_queued",
+        );
+        let selected = block_counter(
+            &rendered,
+            "selected_overlap_blocks_total",
+            "cache_hit_all_queued",
+        );
+        assert!(
+            matched > 0,
+            "the fixture must match a prefix; got:\n{rendered}"
+        );
+        assert_eq!(
+            selected, matched,
+            "the draw landed on the owner, so nothing was forfeited; got:\n{rendered}"
+        );
+    }
+
+    /// The other half of `cache_hit_all_queued`: the sampled draw lands OFF the
+    /// cache home. Same label, opposite numerator — the request forfeits the
+    /// whole prefix. Charted together the bucket reads as a broken cache; the
+    /// actual reading is "saturated fleet with no `--saturation-queue-floor`
+    /// configured to pin it", which is why the HELP text says so.
+    #[test]
+    fn all_queued_draw_off_the_cache_home_forfeits_the_whole_prefix() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // Both queueing (no floor configured, so no pin); the NON-owner is the
+        // fleet minimum by depth, so the deterministic draw lands off-home.
+        engine_load.set("http://w0:30000", 0, load_stat(30, 8), now); // depth 38
+        engine_load.set("http://w1:30000", 0, load_stat(2, 5), now); // depth 7
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg(4),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "the draw must land off the cache home for this to be the off-owner arm",
+        );
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 1"
+            ),
+            "saturation is the label regardless of the draw; got:\n{rendered}"
+        );
+        let matched = block_counter(
+            &rendered,
+            "matched_overlap_blocks_total",
+            "cache_hit_all_queued",
+        );
+        let selected = block_counter(
+            &rendered,
+            "selected_overlap_blocks_total",
+            "cache_hit_all_queued",
+        );
+        assert!(matched > 0, "a prefix existed; got:\n{rendered}");
+        assert_eq!(
+            selected, 0,
+            "the draw holds none of it — a label reading `cache_hit` with zero reuse; got:\n{rendered}"
+        );
     }
 
     /// The saturation pin: when every fresh queue reading is at or above the
@@ -3267,6 +3807,27 @@ mod tests {
         assert!(
             !rendered.contains("sgl_router_diverted_overlap_blocks_count{model_id=\"tiny\"}"),
             "a kept prefix must not appear in the diverted histogram; got:\n{rendered}"
+        );
+        // The pin's whole claim is that affinity was KEPT, so `selected` must
+        // equal `matched`. A future refactor that pinned to a non-owner would
+        // otherwise stay silent — the decision label alone cannot tell.
+        let matched = block_counter(
+            &rendered,
+            "matched_overlap_blocks_total",
+            "cache_hit_all_queued",
+        );
+        let selected = block_counter(
+            &rendered,
+            "selected_overlap_blocks_total",
+            "cache_hit_all_queued",
+        );
+        assert!(
+            matched > 0,
+            "the pin must have a prefix to keep; got:\n{rendered}"
+        );
+        assert_eq!(
+            selected, matched,
+            "pinning to the owner forfeits nothing; got:\n{rendered}"
         );
     }
 

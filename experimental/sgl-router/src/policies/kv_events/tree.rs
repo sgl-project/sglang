@@ -501,7 +501,56 @@ impl TreeState {
         }
     }
 
-    /// Approximate count of *non-root* nodes in the tree.
+    /// Read-only per-URL match path. See
+    /// [`HashTree::match_prefix_for_url`] for the semantics.
+    ///
+    /// Deliberately does NOT touch `last_used`. This runs only to fill a
+    /// metric, and an observation should not move eviction state: whether the
+    /// router happens to be metering must not decide which node
+    /// [`Self::lru_leaf`] drops next. The touch would also be redundant —
+    /// [`Self::match_prefix`] has just walked this same path and stamped it.
+    /// (Redundant, not harmful: recency is a timestamp, so a second stamp
+    /// microseconds later is the same value. The reason to skip it is the
+    /// separation, not an arithmetic effect.)
+    fn match_prefix_for_url(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        url: &str,
+    ) -> usize {
+        let start = match parent_hash {
+            None => ROOT_ID,
+            Some(p) => match self.by_hash.get(&p) {
+                Some(set) if set.len() == 1 => *set.iter().next().unwrap(),
+                _ => ROOT_ID,
+            },
+        };
+
+        let mut current = start;
+        let mut depth = 0usize;
+        let mut owned_depth = 0usize;
+        for &h in block_hashes {
+            let Some(child_id) = self
+                .nodes
+                .get(&current)
+                .and_then(|n| n.children.get(&h).copied())
+            else {
+                break;
+            };
+            current = child_id;
+            depth += 1;
+            if self
+                .nodes
+                .get(&child_id)
+                .is_some_and(|n| n.workers.iter().any(|w| w.url == url))
+            {
+                owned_depth = depth;
+            }
+        }
+        owned_depth
+    }
+
+    /// Count of *non-root* nodes in the tree.
     fn node_count(&self) -> usize {
         // Subtract one for the root sentinel.
         self.nodes.len().saturating_sub(1)
@@ -652,6 +701,50 @@ impl HashTree {
         state.match_prefix(parent_hash, block_hashes)
     }
 
+    /// How many leading blocks of `block_hashes` the worker at `url` holds
+    /// *itself*, as opposed to the fleet-wide depth [`Self::match_prefix`]
+    /// reports.
+    ///
+    /// `match_prefix` answers "how deep does this chain go in the tree at
+    /// all", which is the best prefix any worker could serve. This answers it
+    /// for one destination. The two diverge exactly when the policy does not
+    /// route to an owner of the deepest node — the queue gate diverting off a
+    /// prefix owner, or a below-threshold match falling back to min-load — so
+    /// the difference is the locality the routing decision gave up, separated
+    /// from the locality that was never there.
+    ///
+    /// Keyed by URL rather than [`KvWorkerId`] because a URL carrying several
+    /// `dp_rank`s is a single routing destination: any rank holding the prefix
+    /// means a request sent to that URL can hit it. This matches how
+    /// `match_prefix`'s callers collapse [`MatchResult::workers`] to URLs.
+    ///
+    /// Returns 0 for an empty `block_hashes`, a chain the worker does not
+    /// hold, AND a URL the tree has never seen. That last one is not the same
+    /// thing but is reported as though it were: a worker whose KV-event
+    /// subscription never started serves traffic while owning nothing here, so
+    /// a caller metering cache locality will book real zeros for it. Callers
+    /// that need to tell "holds none of this" from "publishes nothing" must
+    /// get that from registration state, not from this return value.
+    ///
+    /// Unlike [`Self::match_prefix`], this does NOT touch `last_used` — a
+    /// metering read must not perturb eviction order.
+    ///
+    /// Ambiguous `parent_hash` falls back to matching from the root, exactly
+    /// as in [`Self::match_prefix`].
+    pub fn match_prefix_for_url(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        url: &str,
+    ) -> usize {
+        if block_hashes.is_empty() {
+            return 0;
+        }
+        self.state
+            .read()
+            .match_prefix_for_url(parent_hash, block_hashes, url)
+    }
+
     /// Approximate number of non-root nodes in the tree (the root sentinel
     /// is not counted). Useful for metrics and to decide when to call
     /// [`HashTree::evict_lru`].
@@ -737,6 +830,77 @@ mod tests {
         let m = tree.match_prefix(None, &[9, 9]);
         assert_eq!(m.matched_blocks, 0);
         assert!(m.workers.is_empty());
+    }
+
+    /// The per-URL depth is a *different question* from the tree depth: it
+    /// must report what one worker holds, not what the deepest node holds.
+    /// Getting these confused is what makes a router's own hit-rate metric
+    /// read above the engine's.
+    #[test]
+    fn match_prefix_for_url_reports_that_worker_not_the_deepest_node() {
+        let tree = HashTree::new();
+        let deep = worker("http://deep", 0);
+        let shallow = worker("http://shallow", 0);
+        tree.insert(&deep, None, &[1, 2, 3, 4]);
+        tree.insert(&shallow, None, &[1, 2]);
+
+        assert_eq!(tree.match_prefix(None, &[1, 2, 3, 4]).matched_blocks, 4);
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[1, 2, 3, 4], "http://deep"),
+            4,
+        );
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[1, 2, 3, 4], "http://shallow"),
+            2,
+            "a worker holding only a prefix of the chain must report its own depth",
+        );
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[1, 2, 3, 4], "http://absent"),
+            0,
+            "an unknown URL holds nothing",
+        );
+        assert_eq!(tree.match_prefix_for_url(None, &[], "http://deep"), 0);
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[9, 9], "http://deep"),
+            0,
+            "a chain that does not exist in the tree holds nothing",
+        );
+    }
+
+    /// One URL with several `dp_rank`s is a single routing destination, so the
+    /// deepest rank's holding is what a request sent to that URL can hit.
+    #[test]
+    fn match_prefix_for_url_takes_the_deepest_dp_rank() {
+        let tree = HashTree::new();
+        tree.insert(&worker("http://a", 0), None, &[1, 2]);
+        tree.insert(&worker("http://a", 1), None, &[1, 2, 3, 4]);
+
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[1, 2, 3, 4], "http://a"),
+            4,
+        );
+    }
+
+    /// A node kept alive by a descendant after its owner was removed is not
+    /// owned by anyone at that depth. The per-URL walk must resume from the
+    /// last depth the worker actually owns rather than stopping at the hole.
+    #[test]
+    fn match_prefix_for_url_ignores_depths_the_worker_no_longer_owns() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        tree.insert(&a, None, &[1, 2, 3]);
+        tree.remove(&a, &[2]);
+
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[1, 2, 3], "http://a"),
+            3,
+            "ownership at depth 3 stands even with depth 2 vacated",
+        );
+        assert_eq!(
+            tree.match_prefix_for_url(None, &[1, 2], "http://a"),
+            1,
+            "asked only for the first two blocks, the deepest owned is depth 1",
+        );
     }
 
     #[test]
