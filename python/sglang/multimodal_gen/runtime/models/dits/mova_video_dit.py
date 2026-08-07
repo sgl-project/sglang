@@ -464,7 +464,7 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
         self.rotary_emb = NDRotaryEmbedding(
-            rope_dim_list=self.rope_dim_list, rope_theta=10000, dtype=torch.float32
+            rope_dim_list=self.rope_dim_list, rope_theta=10000, dtype=torch.float64
         )
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
@@ -540,7 +540,7 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             grid_size=(f, h, w),
             device=x.device,
         )
-        freqs = torch.complex(freqs_cos.float(), freqs_sin.float()).unsqueeze(-2)
+        freqs = torch.complex(freqs_cos, freqs_sin).unsqueeze(-2)
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)
