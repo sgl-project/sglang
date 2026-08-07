@@ -1,15 +1,7 @@
-"""Unit tests for the /health and /health_generate warmup-awareness fix.
+"""Unit tests for diffusion server liveness and readiness endpoints.
 
-Regression coverage for: `/health` and `/health_generate` used to always
-return 200 regardless of `app.state.server_warmup_done`, so orchestrators
-saw a green health check while the backend scheduler was still mid-warmup
-and real requests were blocked behind `wait_for_server_warmup`. Both
-endpoints now check the warmup event directly and report 503 until it
-fires.
-
-Plus, `_wait_until_http_ready` probes /health inside the warmup task
-itself, so it must treat 503 as "HTTP is up" to prevent warmup from
-deadlocking on health check.
+`/liveness` reports HTTP availability independently of model warmup.
+`/health` and `/health_generate` report readiness for inference traffic.
 """
 
 import asyncio
@@ -21,19 +13,19 @@ from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
     health,
     health_generate,
+    liveness,
 )
 
 
-def _make_request(warmup_done=None) -> SimpleNamespace:
-    state = (
-        SimpleNamespace()
-        if warmup_done is None
-        else SimpleNamespace(server_warmup_done=warmup_done)
-    )
+def _make_request(warmup_done) -> SimpleNamespace:
+    state = SimpleNamespace(server_warmup_done=warmup_done)
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
 class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
+    async def test_liveness_returns_200_before_warmup(self):
+        self.assertEqual(await liveness(), {"status": "ok"})
+
     async def test_health_returns_503_before_warmup(self):
         warmup_done = asyncio.Event()
         resp = await health(_make_request(warmup_done))
@@ -56,12 +48,6 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         resp = await health_generate(_make_request(warmup_done))
         self.assertEqual(resp, {"status": "ok"})
 
-    async def test_health_returns_200_when_state_missing(self):
-        # No server_warmup_done on app.state at all -- should not raise, and
-        # should behave like "ready".
-        resp = await health(_make_request())
-        self.assertEqual(resp, {"status": "ok"})
-
 
 class _FakeResponse:
     def __init__(self, status_code: int):
@@ -69,11 +55,10 @@ class _FakeResponse:
 
 
 class _FakeAsyncClient:
-    """Stands in for `httpx.AsyncClient` inside `_wait_until_http_ready`."""
-
-    def __init__(self, status_code: int):
-        self._status_code = status_code
+    def __init__(self, status_codes: list[int]):
+        self._status_codes = iter(status_codes)
         self.get_calls = 0
+        self.urls = []
 
     def __call__(self, *args, **kwargs):
         return self
@@ -86,29 +71,23 @@ class _FakeAsyncClient:
 
     async def get(self, url, timeout=None):
         self.get_calls += 1
-        return _FakeResponse(self._status_code)
+        self.urls.append(url)
+        return _FakeResponse(next(self._status_codes))
 
 
-class TestWaitUntilHttpReady(unittest.IsolatedAsyncioTestCase):
-    async def test_503_counts_as_http_ready(self):
-        # _wait_until_http_ready now accepts status code 503 to prevent the
-        # warmup task, which awaits this probe, from deadlocking on itself.
-        fake_client = _FakeAsyncClient(503)
+class TestWaitUntilHttpLive(unittest.IsolatedAsyncioTestCase):
+    async def test_waits_for_liveness_200(self):
+        fake_client = _FakeAsyncClient([503, 200])
         server_args = SimpleNamespace(url=lambda: "http://127.0.0.1:11000")
-        with mock.patch.object(http_server.httpx, "AsyncClient", fake_client):
+        with (
+            mock.patch.object(http_server.httpx, "AsyncClient", fake_client),
+            mock.patch.object(http_server.asyncio, "sleep", mock.AsyncMock()),
+        ):
             await asyncio.wait_for(
-                http_server._wait_until_http_ready(server_args), timeout=5.0
+                http_server._wait_until_http_live(server_args), timeout=5.0
             )
-        self.assertEqual(fake_client.get_calls, 1)
-
-    async def test_200_counts_as_http_ready(self):
-        fake_client = _FakeAsyncClient(200)
-        server_args = SimpleNamespace(url=lambda: "http://127.0.0.1:11000")
-        with mock.patch.object(http_server.httpx, "AsyncClient", fake_client):
-            await asyncio.wait_for(
-                http_server._wait_until_http_ready(server_args), timeout=5.0
-            )
-        self.assertEqual(fake_client.get_calls, 1)
+        self.assertEqual(fake_client.get_calls, 2)
+        self.assertEqual(fake_client.urls, ["http://127.0.0.1:11000/liveness"] * 2)
 
 
 if __name__ == "__main__":
