@@ -45,15 +45,45 @@ class ComparableWeight:
         raise NotImplementedError
 
 
+def _unshuffle_aiter_fp8_weight(w_q: torch.Tensor) -> torch.Tensor:
+    """Undo AITER shuffle_weight with layout=(16, 16) for FP8 weights."""
+    if w_q.element_size() != 1:
+        raise ValueError("AITER FP8 unshuffle requires a one-byte element type")
+
+    shape = w_q.shape
+    n, k = shape[-2:]
+    if n % 16 != 0 or k % 32 != 0:
+        raise ValueError(
+            "AITER (16, 16) FP8 layout requires N % 16 == 0 and K % 32 == 0, "
+            f"got shape {tuple(shape)}"
+        )
+
+    return (
+        w_q.reshape(-1, n // 16, k // 32, 2, 16, 16)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .reshape(shape)
+    )
+
+
 class Fp8BlockComparable(ComparableWeight):
     """Deepseek-style FP8 quantization."""
 
-    def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
+    def __init__(
+        self,
+        w_q: torch.Tensor,
+        w_s: torch.Tensor,
+        is_shuffled: bool = False,
+    ):
         self.w_q = w_q
         self.w_s = w_s
+        self.is_shuffled = is_shuffled
 
     def __repr__(self) -> str:
-        return f"fp8_block(shape={tuple(self.w_q.shape)} dtype={self.w_q.dtype})"
+        return (
+            f"fp8_block(shape={tuple(self.w_q.shape)} dtype={self.w_q.dtype} "
+            f"is_shuffled={self.is_shuffled})"
+        )
 
     @staticmethod
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
@@ -90,6 +120,8 @@ class Fp8BlockComparable(ComparableWeight):
         s, block_size = self._scale_and_block_size()
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
             q, s_chunk = q.cuda(), s_chunk.cuda()
+            if self.is_shuffled:
+                q = _unshuffle_aiter_fp8_weight(q)
             yield (
                 block_quant_dequant(q, s_chunk, block_size, dtype=torch.bfloat16),
                 block_quant_dequant(
@@ -99,7 +131,10 @@ class Fp8BlockComparable(ComparableWeight):
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         s, block_size = self._scale_and_block_size()
-        return block_quant_dequant(self.w_q, s, block_size, dtype=dtype)
+        w_q = self.w_q
+        if self.is_shuffled:
+            w_q = _unshuffle_aiter_fp8_weight(w_q)
+        return block_quant_dequant(w_q, s, block_size, dtype=dtype)
 
 
 class RawComparable(ComparableWeight):
