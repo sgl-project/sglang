@@ -366,6 +366,17 @@ class DeepseekV2WeightLoaderMixin:
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
                                 else:
+                                    # Pick the dim to concatenate q_a_proj and
+                                    # kv_a_proj_with_mqa along. Unquantized weights are
+                                    # stored [out_features, in_features] and fuse along
+                                    # dim 0; AWQ/GPTQ-packed weights are stored
+                                    # [in_features, out_features(/pack)] and fuse along
+                                    # dim 1. The model-level quant method alone is not a
+                                    # reliable signal: a checkpoint can be AWQ overall yet
+                                    # leave the attention a_proj layers unquantized via
+                                    # `modules_to_not_convert` (e.g. QuantTrio/GLM-5.1-AWQ),
+                                    # so the cached tensors are plain [out, in] even though
+                                    # quant_config.get_name() == "awq".
                                     cat_dim = 0
                                     if self.quant_config is not None and (
                                         self.quant_config.get_name() == "awq"
@@ -373,6 +384,18 @@ class DeepseekV2WeightLoaderMixin:
                                         or self.quant_config.get_name() == "moe_wna16"
                                     ):
                                         cat_dim = 1
+
+                                    # q_a_proj and kv_a_proj_with_mqa share the
+                                    # input-feature dim and differ on the output-feature
+                                    # dim. If the chosen cat_dim would concatenate along the
+                                    # shared (matching) dim instead, the layout assumption
+                                    # was wrong for this layer -- flip it.
+                                    if (
+                                        q_a_proj_weight.dim() == 2
+                                        and q_a_proj_weight.shape[1 - cat_dim]
+                                        != kv_a_proj_weight.shape[1 - cat_dim]
+                                    ):
+                                        cat_dim = 1 - cat_dim
 
                                     fused_weight = torch.cat(
                                         [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
