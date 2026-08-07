@@ -356,6 +356,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         git clone https://github.com/Tencent/hpc-ops.git && \
         cd hpc-ops && \
         git checkout ${HPC_OPS_COMMIT} && \
+        # PyTorch 2.13 headers require C++20, while the pinned commit uses C++17.
+        sed -i \
+            -e 's/CXX_STANDARD 17/CXX_STANDARD 20/' \
+            -e 's/CUDA_STANDARD 17/CUDA_STANDARD 20/' \
+            -e 's/-std=c++17/-std=c++20/' \
+            CMakeLists.txt && \
+        test "$(grep -Ec '^[[:space:]]*(CXX|CUDA)_STANDARD 20$' CMakeLists.txt)" -eq 2 && \
+        test "$(grep -c -- '-std=c++20' CMakeLists.txt)" -eq 1 && \
         python3 setup.py bdist_wheel -d /wheels; \
     fi
 
