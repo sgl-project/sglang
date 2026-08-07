@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -88,6 +89,26 @@ def handle_model_specific_adjustments(server_args: Any):
         raise ValueError(
             "--enable-dsa-cache-layer-split is only supported for DSA "
             "(DeepSeek Sparse Attention) models."
+        )
+
+    # load_tp_by_experts requires DeepseekV2WeightLoaderMixin.load_weights()
+    # to call _ep_to_tp_transform_all_layers() after loading. Fail early if
+    # the architecture doesn't use that code path.
+    extra_config = json.loads(cfg.model_loader_extra_config)
+    if extra_config.get("load_tp_by_experts", False):
+        _SUPPORTED_EP_LOAD_ARCHS = {
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+            "MistralLarge3ForCausalLM",
+        }
+        assert model_arch in _SUPPORTED_EP_LOAD_ARCHS, (
+            f"load_tp_by_experts is only supported for models using "
+            f"DeepseekV2WeightLoaderMixin ({_SUPPORTED_EP_LOAD_ARCHS}), "
+            f"but got architecture {model_arch!r}"
         )
 
     if cfg.enable_cp_decode_attn_tp:

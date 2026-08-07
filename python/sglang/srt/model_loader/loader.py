@@ -335,7 +335,7 @@ class BaseModelLoader(ABC):
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
-    allowed_keys = {"enable_multithread_load", "num_threads"}
+    allowed_keys = {"enable_multithread_load", "num_threads", "load_tp_by_experts"}
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(
