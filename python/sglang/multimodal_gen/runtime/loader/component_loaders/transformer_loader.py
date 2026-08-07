@@ -1,5 +1,6 @@
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -37,6 +38,10 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
+
+
+def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
+    return ".adaln_proj.linear." not in name
 
 
 def _default_quantized_attention_backend(
@@ -187,6 +192,22 @@ class TransformerLoader(ComponentLoader):
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
+        checkpoint_key_filter: Callable[[str], bool] | None = None
+        adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
+        if adaln_cache_path is not None:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
+                )
+            if component_server_args.model_variant not in ("fl2va", "ref2va"):
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
+                )
+            init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_model_variant"] = (
+                component_server_args.model_variant
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
         if (
             init_params["quant_config"] is None
             and component_server_args.transformer_weights_path is not None
@@ -238,6 +259,7 @@ class TransformerLoader(ComponentLoader):
                 output_dtype=None,
                 strict=False,
                 weight_load_plan=weight_load_plan,
+                checkpoint_key_filter=checkpoint_key_filter,
             )
 
         # post-hooks (e.g., patch scales (nunchaku))
