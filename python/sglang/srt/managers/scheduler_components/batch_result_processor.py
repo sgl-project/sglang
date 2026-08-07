@@ -273,6 +273,10 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        # A decoding request can finish inside a mixed batch
+                        # with decode KV not yet mirrored to the pool; flush
+                        # before its row is freed.
+                        self._prepare_worker_for_kv_cache_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -1007,6 +1011,19 @@ class SchedulerBatchResultProcessor:
             None if logprobs is None else logprobs[i]
         )
 
+    def _prepare_worker_for_kv_cache_release(self, req: Req) -> None:
+        """Run the worker's pre-release hook, if the backend defines one.
+
+        Workers that mirror KV state outside the scheduler pools (MLX) must
+        flush it while *req* still owns its req_to_token row, i.e. before
+        release_kv_cache frees the row for reuse.
+        """
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -1047,11 +1064,7 @@ class SchedulerBatchResultProcessor:
             else:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
+                self._prepare_worker_for_kv_cache_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if get_server_args().enable_mamba_extra_buffer_lazy()
