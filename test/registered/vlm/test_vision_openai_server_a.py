@@ -14,7 +14,6 @@ from sglang.test.vlm_utils import (
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,
-    OmniOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
     terminate_and_kill_process_tree,
@@ -231,7 +230,6 @@ del (
     ImageOpenAITestMixin,
     VideoOpenAITestMixin,
     AudioOpenAITestMixin,
-    OmniOpenAITestMixin,
 )
 
 
