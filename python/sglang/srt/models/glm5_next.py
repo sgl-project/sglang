@@ -554,40 +554,37 @@ class Glm5NextDecoderLayer(nn.Module):
             ),
         )
 
-        if self.config.mhc and self.dsa_enable_prefill_cp:
-            self.layer_communicator = MHCHybridDSACPLayerCommunicator(
-                **shared_kwargs,
+        if self.config.mhc:
+            mhc_kwargs: Dict[str, Any] = dict(
                 is_first_layer=(self.layer_id == 0),
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
             )
-        elif self.config.mhc:
-            self.layer_communicator = MHCLayerCommunicator(
-                **shared_kwargs,
-                is_first_layer=(self.layer_id == 0),
-                hc_mult=config.hc_mult,
-                hc_attn_pre=self.hc_attn_pre,
-                hc_ffn_pre=self.hc_ffn_pre,
-                hc_post=self.hc_post,
-            )
+            if self.dsa_enable_prefill_cp:
+                self.layer_communicator = MHCHybridDSACPLayerCommunicator(
+                    **shared_kwargs,
+                    **mhc_kwargs,
+                )
+            else:
+                self.layer_communicator = MHCLayerCommunicator(
+                    **shared_kwargs,
+                    **mhc_kwargs,
+                )
         elif self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.layer_communicator = DSACPLayerCommunicator(**shared_kwargs)
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
 
-    def hc_attn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
-        """mHC pre-stage for the attention sub-layer (reads hc_attn_* params).
-
-        Flat 2-D contract: hidden_states is ``[s, hc_mult*hidden]``; returns
-        ``(layer_input [s,hidden], h_res [s,n*n], h_post [s,n], norm_fused)``.
-        """
+    def _hc_pre(
+        self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps
+    ):
         return _hc_pre_fn(
             x=hidden_states,
-            hc_fn=self.hc_attn_fn,
-            hc_scale=self.hc_attn_scale,
-            hc_base=self.hc_attn_base,
+            hc_fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
             hc_mult=self.config.hc_mult,
             rms_eps=self.config.rms_norm_eps,
             hc_eps=self.config.hc_eps,
@@ -598,21 +595,25 @@ class Glm5NextDecoderLayer(nn.Module):
             out_norm_eps=out_norm_eps,
         )
 
+    def hc_attn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
+        """Attention-stage mHC pre: hidden_states ``[s, hc_mult*hidden]`` -> (layer_input [s,hidden], h_res [s,n*n], h_post [s,n], norm_fused)."""
+        return self._hc_pre(
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            hidden_states,
+            out_norm_weight,
+            out_norm_eps,
+        )
+
     def hc_ffn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
-        """mHC pre-stage for the FFN sub-layer (reads hc_ffn_* params)."""
-        return _hc_pre_fn(
-            x=hidden_states,
-            hc_fn=self.hc_ffn_fn,
-            hc_scale=self.hc_ffn_scale,
-            hc_base=self.hc_ffn_base,
-            hc_mult=self.config.hc_mult,
-            rms_eps=self.config.rms_norm_eps,
-            hc_eps=self.config.hc_eps,
-            sinkhorn_iters=self.config.hc_sinkhorn_iters,
-            post_mult_value=2.0,
-            hc_norm_weight=None,
-            out_norm_weight=out_norm_weight,
-            out_norm_eps=out_norm_eps,
+        return self._hc_pre(
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            hidden_states,
+            out_norm_weight,
+            out_norm_eps,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):
