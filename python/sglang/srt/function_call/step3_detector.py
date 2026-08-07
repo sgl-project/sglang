@@ -71,7 +71,7 @@ class Step3Detector(BaseFormatDetector):
             r'<steptml:invoke name="([^"]+)">(.+?)</steptml:invoke>', re.DOTALL
         )
         self.param_regex = re.compile(
-            r'<steptml:parameter name="([^"]+)">([^<]*)</steptml:parameter>', re.DOTALL
+            r'<steptml:parameter name="([^"]+)">(.*?)</steptml:parameter>', re.DOTALL
         )
 
         # Streaming state variables
