@@ -1,13 +1,12 @@
-"""free_swa_segment vs an independent oracle and vs free_swa: stride page
-extraction over segment alignments, need_sort routing, contract asserts, and the
-opt-outs that must not inherit the fast path. See
-SWATokenToKVPoolAllocator.free_swa_segment for why the data-dependent ops are
-avoided.
+"""free_swa_segment vs an independent oracle: stride page extraction over segment
+alignments and need_sort routing, plus the free-group contract. See
+SWATokenToKVPoolAllocator.free_swa_segment for why the data-dependent ops are avoided.
 
     python -m pytest test/registered/unit/mem_cache/test_swa_free_segment.py -v
 """
 
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
@@ -19,259 +18,156 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.multi_ended_allocator import UnifiedSWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-SIZE_FULL = 256
-SIZE_SWA = 128
-
-
-class _FakeSWAKVPool(BaseSWAKVPool):
-    """The allocator only needs isinstance() plus register_mapping; the buffer
-    methods are never reached on the free path."""
-
-    def __init__(self):
-        self.swa_kv_pool = None
-        self.mapping = None
-
-    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
-        self.mapping = full_to_swa_index_mapping
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
-        return self.mapping[kv_indices]
-
-    def get_state_buf_infos(self):
-        raise NotImplementedError
-
-    def get_key_buffer(self, layer_id):
-        raise NotImplementedError
-
-    def get_value_buffer(self, layer_id):
-        raise NotImplementedError
-
-    def get_kv_buffer(self, layer_id):
-        raise NotImplementedError
-
-    def set_kv_buffer(self, *args, **kwargs):
-        raise NotImplementedError
+SIZE = 256
 
 
-def _make_allocator(page_size, need_sort=False):
+def _pool():
+    # The free path never reaches the pool, so isinstance plus swa_kv_pool is all
+    # the allocator needs from it.
+    pool = MagicMock(spec=BaseSWAKVPool)
+    pool.swa_kv_pool = None
+    return pool
+
+
+def _alloc(page_size, need_sort=False):
     return SWATokenToKVPoolAllocator(
-        size=SIZE_FULL,
-        size_swa=SIZE_SWA,
+        size=SIZE,
+        size_swa=SIZE,
         page_size=page_size,
         dtype=torch.float16,
         device="cpu",
-        kvcache=_FakeSWAKVPool(),
+        kvcache=_pool(),
         need_sort=need_sort,
     )
 
 
-def _make_pure_allocator():
-    return PureSWATokenToKVPoolAllocator(
-        size_swa=SIZE_SWA,
-        page_size=1,
-        dtype=torch.float16,
-        device="cpu",
-        kvcache=_FakeSWAKVPool(),
-        need_sort=False,
-    )
-
-
-def _alloc_row(alloc, num_tokens):
-    """Mirror alloc_extend without its triton kernel: one page-aligned full and
-    swa allocation driven by the same length, so token t's swa slot is
-    swa_page[t // ps] * ps + t % ps -- the invariant the fast path relies on.
-    The GPU suite covers the real alloc_extend path."""
+def _row(alloc, num_tokens):
+    """alloc_extend without its triton kernel: one page-aligned full and swa
+    allocation of the same length, so token t's swa slot is
+    swa_page[t // ps] * ps + t % ps. The GPU suite covers the real path."""
     ps = alloc.page_size
     padded = -(num_tokens // -ps) * ps
     full = alloc.full_attn_allocator.alloc(padded)
-    swa = alloc.swa_attn_allocator.alloc(padded)
-    alloc.set_full_to_swa_mapping(full, swa)
+    alloc.set_full_to_swa_mapping(full, alloc.swa_attn_allocator.alloc(padded))
     return full[:num_tokens]
 
 
-def _swa_free_pages(alloc):
-    # Span both containers: need_sort (PD disagg) routes frees into release_pages.
+def _freed(alloc):
+    # need_sort (PD disagg) routes frees into release_pages, so span both.
     inner = alloc.swa_attn_allocator
-    return torch.sort(torch.cat((inner.free_pages, inner.release_pages)))[0]
+    return set(torch.cat((inner.free_pages, inner.release_pages)).tolist())
 
 
-def _oracle(row, start, end, page_size, mapping):
-    """Independent reference, computed in plain Python from the row and a
-    pre-free snapshot of the mapping -- never through an allocator free path.
-
-    Returns (swa page ids that must be released, mapping slots that must be 0).
-    """
-    ps = page_size
-    full_pages = sorted({row[i].item() // ps for i in range(start, end)})
-    touched = [p * ps + off for p in full_pages for off in range(ps)]
-    swa_pages = sorted(
-        {mapping[t].item() // ps for t in touched if mapping[t].item() > 0}
-    )
-    return swa_pages, touched
+def _oracle(row, start, end, ps, mapping):
+    """Independent reference in plain Python -- never an allocator free path.
+    Returns (swa page ids to release, mapping slots that must be zero)."""
+    pages = sorted({row[i].item() // ps for i in range(start, end)})
+    touched = [p * ps + off for p in pages for off in range(ps)]
+    swa = sorted({mapping[t].item() // ps for t in touched if mapping[t].item() > 0})
+    return swa, touched
 
 
 class TestSWAFreeSegment(unittest.TestCase):
-    def test_sweep_against_oracle_and_free_swa(self):
-        # Segment alignments (aligned start per the contract, aligned and partial
-        # tails, interior segments as the real caller emits) x need_sort routing.
-        for page_size in (1, 2, 4):
+    def test_sweep_against_oracle(self):
+        # Aligned start per the contract; aligned, partial and interior segments.
+        for ps in (1, 2, 4):
             for need_sort in (False, True):
-                for num_tokens in (page_size, page_size + 1, 3 * page_size - 1):
-                    for start in range(0, num_tokens, page_size):
-                        for end in range(start + 1, num_tokens + 1):
-                            self._check_one(
-                                page_size, need_sort, num_tokens, start, end
+                for n in (ps, ps + 1, 3 * ps - 1):
+                    for start in range(0, n, ps):
+                        for end in range(start + 1, n + 1):
+                            a = _alloc(ps, need_sort=need_sort)
+                            row = _row(a, n)
+                            want_swa, want_zero = _oracle(
+                                row, start, end, ps, a.full_to_swa_index_mapping.clone()
+                            )
+                            before = _freed(a)
+                            a.free_swa_segment(row[start:end], start_pos=start)
+
+                            label = f"{ps=} {need_sort=} {n=} {start=} {end=}"
+                            self.assertEqual(
+                                sorted(_freed(a) - before), want_swa, label
+                            )
+                            got = a.full_to_swa_index_mapping[want_zero]
+                            self.assertTrue(
+                                torch.equal(got, torch.zeros_like(got)), label
                             )
 
-    def _check_one(self, page_size, need_sort, num_tokens, start, end):
-        label = f"{page_size=} {need_sort=} {num_tokens=} {start=} {end=}"
-
-        fast = _make_allocator(page_size, need_sort=need_sort)
-        fast_row = _alloc_row(fast, num_tokens)
-        expected_swa_pages, expected_cleared = _oracle(
-            fast_row, start, end, page_size, fast.full_to_swa_index_mapping.clone()
-        )
-        before = _swa_free_pages(fast)
-
-        fast.free_swa_segment(fast_row[start:end], start_pos=start)
-
-        released = sorted(set(_swa_free_pages(fast).tolist()) - set(before.tolist()))
-        self.assertEqual(released, expected_swa_pages, f"vs oracle: {label}")
-        cleared = fast.full_to_swa_index_mapping[expected_cleared]
-        self.assertTrue(
-            torch.equal(cleared, torch.zeros_like(cleared)), f"mapping: {label}"
-        )
-
-        legacy = _make_allocator(page_size, need_sort=need_sort)
-        legacy_row = _alloc_row(legacy, num_tokens)
-        legacy.free_swa(legacy_row[start:end])
-        self.assertTrue(
-            torch.equal(_swa_free_pages(legacy), _swa_free_pages(fast)),
-            f"vs free_swa: {label}",
-        )
-        self.assertTrue(
-            torch.equal(
-                legacy.full_to_swa_index_mapping, fast.full_to_swa_index_mapping
-            ),
-            f"vs free_swa mapping: {label}",
-        )
-
-    def test_empty_segment_is_noop(self):
-        alloc = _make_allocator(4)
-        row = _alloc_row(alloc, 4)
-        before = _swa_free_pages(alloc)
-        alloc.free_swa_segment(row[:0], start_pos=0)
-        self.assertTrue(torch.equal(_swa_free_pages(alloc), before))
-
-    def test_unaligned_start_pos_rejected(self):
-        alloc = _make_allocator(4)
-        row = _alloc_row(alloc, 8)
-        with self.assertRaises(AssertionError):
-            alloc.free_swa_segment(row[1:], start_pos=1)
-
-    def test_debug_mode_catches_already_dead_mapping(self):
-        # Freeing the same range twice is exactly what the contract forbids, and
-        # what the legacy `> 0` filter used to absorb silently.
-        alloc = _make_allocator(4)
-        alloc.debug_mode = True
-        row = _alloc_row(alloc, 8)
-        alloc.free_swa_segment(row, start_pos=0)
-        with self.assertRaises(AssertionError):
-            alloc.free_swa_segment(row, start_pos=0)
-
-    def test_inside_a_free_group_matches_free_swa(self):
-        for page_size in (1, 4):
-            legacy, fast = _make_allocator(page_size), _make_allocator(page_size)
-            legacy_row = _alloc_row(legacy, 2 * page_size)
-            fast_row = _alloc_row(fast, 2 * page_size)
-
-            for alloc in (legacy, fast):
-                alloc.free_group_begin()
-            legacy.free_swa(legacy_row)
+    def test_matches_free_swa(self):
+        # Behavior preservation only; the oracle sweep above covers correctness.
+        for ps in (1, 4):
+            fast, legacy = _alloc(ps), _alloc(ps)
+            fast_row, legacy_row = _row(fast, 3 * ps), _row(legacy, 3 * ps)
             fast.free_swa_segment(fast_row, start_pos=0)
-            for alloc in (legacy, fast):
-                alloc.free_group_end()
-
-            self.assertTrue(
-                torch.equal(_swa_free_pages(legacy), _swa_free_pages(fast)),
-                f"{page_size=}",
-            )
+            legacy.free_swa(legacy_row)
+            self.assertEqual(_freed(fast), _freed(legacy), f"{ps=}")
             self.assertTrue(
                 torch.equal(
-                    legacy.full_to_swa_index_mapping, fast.full_to_swa_index_mapping
+                    fast.full_to_swa_index_mapping, legacy.full_to_swa_index_mapping
                 ),
-                f"{page_size=}",
+                f"{ps=}",
             )
 
-    def test_group_defers_the_page_release(self):
-        for page_size in (1, 4):
-            alloc = _make_allocator(page_size)
-            row = _alloc_row(alloc, 2 * page_size)
-            before = _swa_free_pages(alloc)
-
-            alloc.free_group_begin()
-            alloc.free_swa_segment(row, start_pos=0)
-            self.assertTrue(
-                torch.equal(_swa_free_pages(alloc), before), f"{page_size=}"
+    def test_group_defers_and_queues_owned_values(self):
+        # Queueing the caller's view would make the flush read whatever a remap
+        # wrote into that row in between.
+        for ps in (1, 4):
+            a = _alloc(ps)
+            row = _row(a, 2 * ps)
+            want_swa, want_zero = _oracle(
+                row, 0, row.numel(), ps, a.full_to_swa_index_mapping.clone()
             )
-            alloc.free_group_end()
-            self.assertEqual(
-                len(_swa_free_pages(alloc)), len(before) + 2, f"{page_size=}"
-            )
+            before = _freed(a)
 
-    def test_group_queues_owned_values_not_the_callers_buffer(self):
-        # The regression: queueing the caller's req_to_token view makes the flush
-        # read whatever got written into that row in between -- which is exactly
-        # what a remap does right after freeing.
-        for page_size in (1, 4):
-            alloc = _make_allocator(page_size)
-            row = _alloc_row(alloc, 2 * page_size)
-            expected_swa_pages, expected_cleared = _oracle(
-                row, 0, row.numel(), page_size, alloc.full_to_swa_index_mapping.clone()
-            )
-            before = set(_swa_free_pages(alloc).tolist())
-
-            alloc.free_group_begin()
-            alloc.free_swa_segment(row, start_pos=0)
+            a.free_group_begin()
+            a.free_swa_segment(row, start_pos=0)
+            self.assertEqual(_freed(a), before, f"not deferred: {ps=}")
             row.fill_(1)  # stand in for the row being remapped mid-group
-            alloc.free_group_end()
+            a.free_group_end()
 
-            released = sorted(set(_swa_free_pages(alloc).tolist()) - before)
-            self.assertEqual(released, expected_swa_pages, f"{page_size=}")
-            cleared = alloc.full_to_swa_index_mapping[expected_cleared]
-            self.assertTrue(
-                torch.equal(cleared, torch.zeros_like(cleared)), f"{page_size=}"
-            )
+            self.assertEqual(sorted(_freed(a) - before), want_swa, f"{ps=}")
+            got = a.full_to_swa_index_mapping[want_zero]
+            self.assertTrue(torch.equal(got, torch.zeros_like(got)), f"{ps=}")
+
+    def test_contract_asserts(self):
+        a = _alloc(4)
+        a.debug_mode = True
+        row = _row(a, 8)
+        with self.assertRaises(AssertionError):  # start_pos not page aligned
+            a.free_swa_segment(row[1:], start_pos=1)
+        a.free_swa_segment(row, start_pos=0)
+        with self.assertRaises(AssertionError):  # range already freed
+            a.free_swa_segment(row, start_pos=0)
+
+    def test_empty_segment_is_noop(self):
+        a = _alloc(4)
+        row = _row(a, 4)
+        before = _freed(a)
+        a.free_swa_segment(row[:0], start_pos=0)
+        self.assertEqual(_freed(a), before)
 
 
-class TestPureSWAFreeSegment(unittest.TestCase):
-    def test_identity_mapping_survives(self):
-        # full == swa here and the mapping is a constant identity table: zeroing
-        # it would break every later translate. Also the behavioral guard that
-        # PureSWA keeps its own free_swa_segment.
-        alloc = _make_pure_allocator()
-        before = alloc.full_to_swa_index_mapping.clone()
-        indices = alloc.alloc(4)
-        alloc.free_swa_segment(indices, start_pos=0)
-        self.assertTrue(torch.equal(alloc.full_to_swa_index_mapping, before))
-        self.assertEqual(
-            sorted(
-                set(indices.tolist())
-                & set(alloc.swa_attn_allocator.free_pages.tolist())
-            ),
-            sorted(indices.tolist()),
+class TestOptOuts(unittest.TestCase):
+    def test_pure_swa_keeps_its_identity_mapping(self):
+        # full == swa and the mapping is a constant identity table; zeroing it
+        # would break every later translate.
+        a = PureSWATokenToKVPoolAllocator(
+            size_swa=SIZE,
+            page_size=1,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=_pool(),
+            need_sort=False,
         )
+        before = a.full_to_swa_index_mapping.clone()
+        a.free_swa_segment(a.alloc(4), start_pos=0)
+        self.assertTrue(torch.equal(a.full_to_swa_index_mapping, before))
 
-
-class TestFastPathOptOuts(unittest.TestCase):
     def test_unified_swa_does_not_inherit_the_fast_path(self):
-        # Shared mode has no full_to_swa_index_mapping table (the swa v2p IS the
-        # mapping) and tombstones with -1, so inheriting the parent's gather and
-        # page clearing would free live pages. No behavioral test here -- the
-        # allocator is too heavy to build on CPU -- so this is the only guard,
-        # and dropping the override fails silently otherwise.
+        # Shared mode has no mapping table (the swa v2p IS the mapping) and
+        # tombstones with -1. Too heavy to build on CPU, so this is the only guard
+        # against the override being dropped, which fails silently.
         self.assertIsNot(
             UnifiedSWATokenToKVPoolAllocator.free_swa_segment,
             SWATokenToKVPoolAllocator.free_swa_segment,

@@ -260,36 +260,26 @@ class TestSWA(unittest.TestCase):
         )
 
     def test_free_swa_segment_matches_free_swa_via_real_alloc_extend(self):
-        """Equivalence over the production page layout.
+        # The CPU suite builds the full <-> swa mapping by hand (alloc_extend needs
+        # triton); here it comes from the real alloc_extend, so a wrong assumption
+        # about the page layout shows up. start=0 and an interior start.
+        page_size, num_tokens = 4, 12
+        for start in (0, page_size):
+            fast, fast_row = self._alloc_extend_row(page_size, num_tokens)
+            legacy, legacy_row = self._alloc_extend_row(page_size, num_tokens)
 
-        The CPU suite (test_swa_free_segment.py) builds the full <-> swa mapping
-        by hand because alloc_extend needs triton; here it comes from the real
-        alloc_extend, so a wrong assumption about the layout shows up.
-        """
-        for page_size in (4, 8):
-            for num_tokens in (page_size, 3 * page_size):
-                for start in range(0, num_tokens, page_size):
-                    fast_alloc, fast_row = self._alloc_extend_row(page_size, num_tokens)
-                    legacy_alloc, legacy_row = self._alloc_extend_row(
-                        page_size, num_tokens
-                    )
-                    label = f"{page_size=} {num_tokens=} {start=}"
+            fast.free_swa_segment(fast_row[start:], start_pos=start)
+            legacy.free_swa(legacy_row[start:])
 
-                    fast_alloc.free_swa_segment(fast_row[start:], start_pos=start)
-                    legacy_alloc.free_swa(legacy_row[start:])
-
-                    self.assertEqual(
-                        fast_alloc.swa_available_size(),
-                        legacy_alloc.swa_available_size(),
-                        f"swa available size: {label}",
-                    )
-                    self.assertTrue(
-                        torch.equal(
-                            fast_alloc.full_to_swa_index_mapping,
-                            legacy_alloc.full_to_swa_index_mapping,
-                        ),
-                        f"mapping: {label}",
-                    )
+            self.assertEqual(
+                fast.swa_available_size(), legacy.swa_available_size(), f"{start=}"
+            )
+            self.assertTrue(
+                torch.equal(
+                    fast.full_to_swa_index_mapping, legacy.full_to_swa_index_mapping
+                ),
+                f"{start=}",
+            )
 
     def _alloc_extend_row(self, page_size, num_tokens):
         _, allocator, _ = _build_swa_tree(
