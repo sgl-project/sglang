@@ -49,9 +49,8 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
             raise TimeoutError("consumer did not release the CUDA IPC tensor")
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            with pool._lock:
-                if not pool._occupied:
-                    break
+            if pool.active_lease_count == 0:
+                break
             time.sleep(0.01)
         else:
             raise TimeoutError("pool did not observe the stream-ordered consumer ack")

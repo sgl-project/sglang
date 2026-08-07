@@ -283,14 +283,14 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
 class TestFabricTransportMetadata(CustomTestCase):
     def test_consumer_slot_uses_global_tp_rank(self):
-        from sglang.srt.utils.fabric_mm_transport import _resolve_consumer_rank
+        from sglang.srt.utils.mm_gpu_memory_pool import resolve_consumer_rank
 
         parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
         with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
-            self.assertEqual(_resolve_consumer_rank(8), 6)
+            self.assertEqual(resolve_consumer_rank(8), 6)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):
-        from sglang.srt.utils import fabric_mm_transport
+        from sglang.srt.utils import fabric_mm_transport, mm_gpu_memory_pool
 
         proxy = fabric_mm_transport.FabricTensorTransportProxy(
             fabric_handle=b"h" * 64,
@@ -304,9 +304,8 @@ class TestFabricTransportMetadata(CustomTestCase):
             generation=3,
             total_consumer_count=4,
         )
-        mapping = SimpleNamespace(va=1000)
-        with patch.object(fabric_mm_transport, "_stream_write_value32") as write:
-            proxy._acknowledge_on_stream(mapping, 0, consumer_count=4)
+        with patch.object(mm_gpu_memory_pool, "stream_write_value32") as write:
+            proxy._acknowledge_on_stream(1000, 0, consumer_count=4)
 
         self.assertEqual(
             [call.args[1] for call in write.call_args_list],
@@ -315,22 +314,24 @@ class TestFabricTransportMetadata(CustomTestCase):
         self.assertEqual([call.args[2] for call in write.call_args_list], [3] * 4)
 
     def test_consumer_rank_must_fit_pool_ack_slots(self):
-        from sglang.srt.utils.fabric_mm_transport import _resolve_consumer_rank
+        from sglang.srt.utils.mm_gpu_memory_pool import resolve_consumer_rank
 
         with self.assertRaisesRegex(RuntimeError, "outside"):
-            _resolve_consumer_rank(4, consumer_rank=4)
+            resolve_consumer_rank(4, consumer_rank=4)
 
     def test_reused_pool_slot_gets_new_generation(self):
-        from sglang.srt.utils.fabric_mm_transport import FabricMmFeatureMemoryPool
+        from sglang.srt.utils.mm_gpu_memory_pool import StreamOrderedMmFeaturePool
 
-        pool = object.__new__(FabricMmFeatureMemoryPool)
+        pool = object.__new__(StreamOrderedMmFeaturePool)
         pool._available_ranges = [(256, 4096)]
         pool._available_slots = [0]
         pool._slot_generations = [0]
         pool._occupied = {}
+        pool.control_words_per_slot = 2
+        pool.transport_name = "test"
 
         first = pool._allocate_locked(512)
-        pool._release_chunk_locked(first)
+        pool._release_locked(first)
         pool._merge_ranges_locked()
         second = pool._allocate_locked(512)
 

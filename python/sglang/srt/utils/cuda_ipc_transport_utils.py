@@ -1,12 +1,15 @@
 import logging
 import threading
-import time
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.mm_gpu_memory_pool import (
+    DEFAULT_MAX_INFLIGHT_SLICES,
+    StreamOrderedMmFeaturePool,
+    StreamOrderedPoolConsumerMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +18,6 @@ MM_FEATURE_CACHE_SIZE = envs.SGLANG_MM_FEATURE_CACHE_MB.get() * 1024 * 1024
 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
     envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
 )
-
-_CONTROL_WORD_BYTES = 4
-_DATA_ALIGNMENT = 256
-_DEFAULT_MAX_INFLIGHT_SLICES = 4096
 
 # Processors set this marker only when their encoder consumes each IPC feature
 # on a single TP rank.  The scheduler then keeps the feature lazy until the
@@ -90,72 +89,6 @@ def _pool_handle_cache_clear():
         _pool_storage_cache.clear()
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def _driver_modules():
-    from cuda.bindings import driver as cuda
-
-    from sglang.srt.distributed.device_communicators.vmm_utils import check_drv
-
-    return cuda, check_drv
-
-
-def _stream_wait_value32(device_id: int, address: int, value: int) -> None:
-    cuda, check_drv = _driver_modules()
-    stream = torch.cuda.current_stream(device_id)
-    check_drv(
-        cuda.cuStreamWaitValue32(stream.cuda_stream, address, value, 0),
-        "cuStreamWaitValue32(mm CUDA IPC)",
-    )
-
-
-def _stream_write_value32(device_id: int, address: int, value: int) -> None:
-    cuda, check_drv = _driver_modules()
-    stream = torch.cuda.current_stream(device_id)
-    check_drv(
-        cuda.cuStreamWriteValue32(stream.cuda_stream, address, value, 0),
-        "cuStreamWriteValue32(mm CUDA IPC)",
-    )
-
-
-def _resolve_consumer_rank(
-    total_consumer_count: int, consumer_rank: Optional[int] = None
-) -> int:
-    if total_consumer_count == 1:
-        return 0
-    if consumer_rank is None:
-        try:
-            from sglang.srt.runtime_context import get_parallel
-
-            rank = int(get_parallel().tp_rank)
-        except Exception as exc:
-            raise RuntimeError(
-                "Cannot resolve the CUDA IPC consumer rank before parallel state "
-                "initialization"
-            ) from exc
-    else:
-        rank = int(consumer_rank)
-    if not 0 <= rank < total_consumer_count:
-        raise RuntimeError(
-            f"CUDA IPC consumer rank {rank} is outside " f"[0, {total_consumer_count})"
-        )
-    return rank
-
-
-@dataclass(frozen=True)
-class MmItemMemoryChunk:
-    start: int
-    end: int
-    slot: int
-    generation: int
-
-    @property
-    def mem_size(self) -> int:
-        return self.end - self.start
-
-
 class MmItemMemoryPool:
     def __init__(
         self,
@@ -163,55 +96,26 @@ class MmItemMemoryPool:
         recycle_interval: float,
         base_gpu_id: int,
         consumer_count: int,
-        max_inflight_slices: int = _DEFAULT_MAX_INFLIGHT_SLICES,
+        max_inflight_slices: int = DEFAULT_MAX_INFLIGHT_SLICES,
     ):
-        if memory_size <= 0:
-            raise ValueError("memory_size must be positive")
-        if consumer_count <= 0:
-            raise ValueError("consumer_count must be positive")
-
         self.device_id = base_gpu_id
         self.consumer_count = consumer_count
-        self.control_words_per_slot = 1 + consumer_count
-        self.max_inflight_slices = max_inflight_slices
-        control_bytes = (
-            max_inflight_slices * self.control_words_per_slot * _CONTROL_WORD_BYTES
-        )
-        self.data_start = _align_up(control_bytes, _DATA_ALIGNMENT)
-        if memory_size <= self.data_start:
-            raise ValueError(
-                "CUDA IPC pool is too small after control metadata: "
-                f"pool={memory_size}, control={self.data_start}"
-            )
-
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.uint8, device=f"cuda:{base_gpu_id}"
         ).contiguous()
-        control_word_count = max_inflight_slices * self.control_words_per_slot
-        self._control_words = (
-            self.memory_pool[: control_word_count * _CONTROL_WORD_BYTES]
-            .view(torch.int32)
-            .view(max_inflight_slices, self.control_words_per_slot)
+        self._pool = StreamOrderedMmFeaturePool(
+            memory_size=memory_size,
+            byte_tensor=self.memory_pool,
+            base_address=self.memory_pool.data_ptr(),
+            device_id=base_gpu_id,
+            consumer_count=consumer_count,
+            recycle_interval=recycle_interval,
+            transport_name="CUDA IPC",
+            max_inflight_slices=max_inflight_slices,
         )
-        self._control_words.zero_()
-        torch.cuda.synchronize(base_gpu_id)
         storage = self.memory_pool.untyped_storage()
         self._pool_ipc_handle = storage._share_cuda_()
-
-        self._available_ranges = [(self.data_start, memory_size)]
-        self._available_slots = list(reversed(range(max_inflight_slices)))
-        self._slot_generations = [0] * max_inflight_slices
-        self._occupied: dict[int, MmItemMemoryChunk] = {}
-
-        self._lock = threading.Lock()
         self._pool_full_warned = False
-
-        self._recycle_interval = recycle_interval
-        self._stop_recycler = False
-        self._recycle_thread = threading.Thread(
-            target=self._recycle_loop, name="MmItemMemoryPoolRecycler", daemon=True
-        )
-        self._recycle_thread.start()
 
         logger.debug(
             f"[MmItemMemoryPool] init: memory_size={memory_size}, "
@@ -219,125 +123,29 @@ class MmItemMemoryPool:
         )
 
     def shutdown(self):
-        self._stop_recycler = True
-        if self._recycle_thread.is_alive():
-            self._recycle_thread.join(timeout=1.0)
+        self._pool.shutdown()
 
-    def _recycle_loop(self):
-        torch.cuda.set_device(self.device_id)
-        while not self._stop_recycler:
-            try:
-                with self._lock, torch.cuda.device(self.device_id):
-                    self._recycle_ready_chunks_locked()
-            except Exception as e:
-                logger.warning(
-                    f"[MmItemMemoryPool] recycle loop error: {e}", exc_info=True
-                )
-
-            time.sleep(self._recycle_interval)
-
-    def _allocate_locked(self, nbytes: int) -> Optional[MmItemMemoryChunk]:
-        candidates = [
-            (end - start, index, start, end)
-            for index, (start, end) in enumerate(self._available_ranges)
-            if end - start >= nbytes
-        ]
-        if not candidates or not self._available_slots:
-            return None
-        _, index, start, end = min(candidates)
-        self._available_ranges.pop(index)
-        if start + nbytes < end:
-            self._available_ranges.append((start + nbytes, end))
-        slot = self._available_slots.pop()
-        generation = self._slot_generations[slot] + 1
-        if generation > 0x7FFFFFFF:
-            raise RuntimeError("CUDA IPC pool slot generation exhausted")
-        self._slot_generations[slot] = generation
-        chunk = MmItemMemoryChunk(start, start + nbytes, slot, generation)
-        self._occupied[slot] = chunk
-        return chunk
-
-    def _release_chunk_locked(self, chunk: MmItemMemoryChunk) -> None:
-        self._occupied.pop(chunk.slot, None)
-        self._available_slots.append(chunk.slot)
-        self._available_ranges.append((chunk.start, chunk.end))
-
-    def _merge_ranges_locked(self) -> None:
-        merged = []
-        for start, end in sorted(self._available_ranges):
-            if merged and merged[-1][1] == start:
-                merged[-1] = (merged[-1][0], end)
-            else:
-                merged.append((start, end))
-        self._available_ranges = merged
-
-    def _recycle_ready_chunks_locked(self) -> None:
-        if not self._occupied:
-            return
-        chunks = list(self._occupied.values())
-        slot_indices = torch.tensor(
-            [chunk.slot for chunk in chunks],
-            dtype=torch.long,
-            device=f"cuda:{self.device_id}",
-        )
-        expected = torch.tensor(
-            [chunk.generation for chunk in chunks],
-            dtype=torch.int32,
-            device=f"cuda:{self.device_id}",
-        ).unsqueeze(1)
-        completed = (
-            (self._control_words.index_select(0, slot_indices) == expected)
-            .all(dim=1)
-            .cpu()
-            .tolist()
-        )
-        for chunk, is_complete in zip(chunks, completed):
-            if is_complete:
-                self._release_chunk_locked(chunk)
-        self._merge_ranges_locked()
+    @property
+    def active_lease_count(self) -> int:
+        return self._pool.active_lease_count
 
     def wrap_tensor(
         self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
     ) -> Optional["CudaIpcTensorTransportProxy"]:
-        if not tensor.is_cuda:
-            raise ValueError("CUDA IPC transport requires a CUDA tensor")
-        source = tensor.contiguous()
-        nbytes = source.numel() * source.element_size()
-        allocation_bytes = _align_up(nbytes, _DATA_ALIGNMENT)
-        with self._lock:
-            chunk = self._allocate_locked(allocation_bytes)
-        if chunk is None:
+        lease, destination = self._pool.copy_tensor(tensor)
+        if lease is None:
+            nbytes = tensor.numel() * tensor.element_size()
             self._warn_pool_full_once(nbytes)
             return None
-
-        try:
-            with torch.cuda.device(self.device_id):
-                destination = self.memory_pool[chunk.start : chunk.start + nbytes]
-                destination.copy_(
-                    source.view(torch.uint8).reshape(-1), non_blocking=True
-                )
-                ready_byte_offset = (
-                    chunk.slot * self.control_words_per_slot * _CONTROL_WORD_BYTES
-                )
-                _stream_write_value32(
-                    self.device_id,
-                    self.memory_pool.data_ptr() + ready_byte_offset,
-                    chunk.generation,
-                )
-        except Exception:
-            with self._lock:
-                self._release_chunk_locked(chunk)
-                self._merge_ranges_locked()
-            raise
 
         return CudaIpcTensorTransportProxy(
             data=destination,
             info_data=tensor,
             pool_ipc_handle=self._pool_ipc_handle,
-            pool_byte_offset=chunk.start,
-            ready_byte_offset=ready_byte_offset,
-            ack_byte_offset=ready_byte_offset + _CONTROL_WORD_BYTES,
-            generation=chunk.generation,
+            pool_byte_offset=lease.start,
+            ready_byte_offset=lease.ready_byte_offset,
+            ack_byte_offset=lease.ack_byte_offset,
+            generation=lease.generation,
             total_consumer_count=self.consumer_count,
             use_pool_handle_cache=use_pool_handle_cache,
         )
@@ -359,7 +167,7 @@ class MmItemMemoryPool:
         )
 
 
-class CudaIpcTensorTransportProxy:
+class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
     """Serializable view of one tensor stored in a CUDA IPC memory pool.
 
     The producer-ready word and one acknowledgement word per consumer live in
@@ -387,8 +195,13 @@ class CudaIpcTensorTransportProxy:
                 f"Input 'data' must be a torch.Tensor, but got {type(data)}"
             )
 
-        if total_consumer_count <= 0:
-            raise ValueError("total_consumer_count must be positive")
+        self._init_stream_ordered_consumer(
+            ready_byte_offset=ready_byte_offset,
+            ack_byte_offset=ack_byte_offset,
+            generation=generation,
+            total_consumer_count=total_consumer_count,
+            transport_name="CUDA IPC",
+        )
 
         self.proxy_state = {
             "ipc_extra": {
@@ -401,16 +214,11 @@ class CudaIpcTensorTransportProxy:
                 "nbytes": data.numel() * data.element_size(),
                 "recons_shape": info_data.shape,
                 "recons_dtype": info_data.dtype,
-                "ready_byte_offset": ready_byte_offset,
-                "ack_byte_offset": ack_byte_offset,
-                "generation": generation,
-                "total_consumer_count": total_consumer_count,
                 "use_pool_handle_cache": use_pool_handle_cache,
             },
             "tensor_data": None,
         }
         self.reconstruct_tensor = None
-        self._consumer_acknowledged = False
         # Keep uncached mappings alive until the work enqueued on the consumer
         # stream has completed.
         self._pool_storage = None
@@ -475,50 +283,6 @@ class CudaIpcTensorTransportProxy:
             _pool_handle_cache_set(cache_key, result[1])
             return result
 
-    @staticmethod
-    def _control_address(storage, byte_offset: int) -> int:
-        return storage.data_ptr() + byte_offset
-
-    def _wait_until_ready(self, storage, device_id: int) -> None:
-        ipc_extra = self.proxy_state["ipc_extra"]
-        _stream_wait_value32(
-            device_id,
-            self._control_address(storage, ipc_extra["ready_byte_offset"]),
-            ipc_extra["generation"],
-        )
-
-    def _acknowledge_on_stream(
-        self,
-        storage,
-        device_id: int,
-        consumer_count: int,
-        consumer_rank: Optional[int],
-    ) -> None:
-        if self._consumer_acknowledged:
-            return
-        ipc_extra = self.proxy_state["ipc_extra"]
-        total_consumer_count = ipc_extra["total_consumer_count"]
-        if consumer_count == total_consumer_count:
-            consumer_ranks = range(total_consumer_count)
-        elif consumer_count == 1:
-            consumer_ranks = (
-                _resolve_consumer_rank(total_consumer_count, consumer_rank),
-            )
-        else:
-            raise ValueError(
-                "consumer_count must be either 1 or total_consumer_count "
-                f"({total_consumer_count}), got {consumer_count}"
-            )
-
-        ack_base = ipc_extra["ack_byte_offset"]
-        for rank in consumer_ranks:
-            _stream_write_value32(
-                device_id,
-                self._control_address(storage, ack_base + rank * _CONTROL_WORD_BYTES),
-                ipc_extra["generation"],
-            )
-        self._consumer_acknowledged = True
-
     def acknowledge_consumption(
         self, consumer_count: int = 1, consumer_rank: Optional[int] = None
     ) -> None:
@@ -528,9 +292,10 @@ class CudaIpcTensorTransportProxy:
         device_id = torch.cuda.current_device()
         with torch.cuda.device(device_id):
             _, storage = self._open_pool_slice(device_id)
-            self._wait_until_ready(storage, device_id)
+            base_address = storage.data_ptr()
+            self._wait_until_ready(base_address, device_id)
             self._acknowledge_on_stream(
-                storage, device_id, consumer_count, consumer_rank
+                base_address, device_id, consumer_count, consumer_rank
             )
         self._pool_storage = storage
 
@@ -550,7 +315,8 @@ class CudaIpcTensorTransportProxy:
         ipc_extra = self.proxy_state["ipc_extra"]
         with torch.cuda.device(rebuild_device):
             slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
-            self._wait_until_ready(storage, rebuild_device_idx)
+            base_address = storage.data_ptr()
+            self._wait_until_ready(base_address, rebuild_device_idx)
             reconstructed_tensor = torch.empty(
                 ipc_extra["recons_shape"],
                 dtype=ipc_extra["recons_dtype"],
@@ -558,7 +324,7 @@ class CudaIpcTensorTransportProxy:
             ).contiguous()
             reconstructed_tensor.view(torch.uint8).reshape(-1).copy_(slice_tensor)
             self._acknowledge_on_stream(
-                storage,
+                base_address,
                 rebuild_device_idx,
                 consumer_count,
                 consumer_rank,
