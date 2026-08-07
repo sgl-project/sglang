@@ -1480,10 +1480,14 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
+        elif not (_is_cuda or _is_hip):
+            disable_reason = (
+                "Shared experts fusion currently requires CUDA or ROCm devices."
+            )
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+        elif _is_hip and torch.cuda.get_device_capability("cuda") < (9, 4):
+            disable_reason = "Shared experts fusion requires gfx942 or newer GPUs."
         elif get_parallel().moe_ep_size > 1:
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
