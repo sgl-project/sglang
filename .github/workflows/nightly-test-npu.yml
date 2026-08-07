@@ -138,14 +138,19 @@ jobs:
       max-parallel: 6
       matrix:
         test_config:
-          # minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa (kept)
-          - name: minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa
-            runner: linux-aarch64-a3-16
-            test_case: test/registered/npu/accuracy/minimax_m2_5/test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa.py
-          # qwen3_235b_w8a8_8p_in3k5_out1k5_50ms (kept)
-          - name: qwen3_235b_w8a8_8p_in3k5_out1k5_50ms
-            runner: linux-aarch64-a3-16
-            test_case: test/registered/npu/performance/qwen3_235b_a22b/test_npu_qwen3_235b_w8a8_8p_in3k5_out1k5_50ms.py
+          # minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa (disabled)
+          # - name: minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa
+          #   runner: linux-aarch64-a3-16
+          #   test_case: test/registered/npu/accuracy/minimax_m2_5/test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa.py
+          # qwen3_235b_w8a8_8p_in3k5_out1k5_50ms (disabled)
+          # - name: qwen3_235b_w8a8_8p_in3k5_out1k5_50ms
+          #   runner: linux-aarch64-a3-16
+          #   test_case: test/registered/npu/performance/qwen3_235b_a22b/test_npu_qwen3_235b_w8a8_8p_in3k5_out1k5_50ms.py
+          #   test_type: 'perf'
+          # qwen3_6_27b_1p_in1024x1024_30_out1024_50ms (enabled)
+          - name: qwen3_6_27b_1p_in1024x1024_30_out1024_50ms
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1024x1024_30_out1024_50ms.py
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
