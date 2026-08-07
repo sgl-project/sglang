@@ -1689,30 +1689,41 @@ class DeepseekOCRForCausalLM(nn.Module):
             else self.vision_model.dtype
         )
         has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
-        pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
-            target_dtype
-        )
 
-        images_crop = (
-            torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(target_dtype)
-            .to(device=pixel_values.device)
-        )
-        images_spatial_crop = (
-            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
-            .type(torch.long)
-            .to(device=pixel_values.device)
-        )
+        # Different images may have a different number of local crop patches
+        # (images_crop shape [1, num_patches, 3, H, W] varies per item), so we
+        # cannot stack them into a single tensor. Process each item separately
+        # and concatenate the resulting feature sequences.
+        vision_feature_lists: List[torch.Tensor] = []
+        for idx, item in enumerate(mm_items):
+            pixel_values = item.feature.unsqueeze(0).type(target_dtype)
+            images_crop = (
+                item.images_crop.unsqueeze(0)
+                .type(target_dtype)
+                .to(device=pixel_values.device)
+            )
+            images_spatial_crop = item.images_spatial_crop.type(torch.long).to(
+                device=pixel_values.device
+            )
+            if images_spatial_crop.dim() == 2:
+                images_spatial_crop = images_spatial_crop.unsqueeze(0)
 
-        assert images_crop.dim() == 6
-        assert images_spatial_crop.dim() == 3
+            assert images_crop.dim() == 6
+            assert images_spatial_crop.dim() == 3
 
-        vision_feature_lists = self._pixel_values_to_embedding(
-            pixel_values=pixel_values,
-            images_crop=images_crop,
-            images_spatial_crop=images_spatial_crop,
-            has_local_crops=has_local_crops,
-        )
+            item_has_local_crops = (
+                [has_local_crops[idx]] if has_local_crops is not None else None
+            )
+
+            vision_feature_lists.extend(
+                self._pixel_values_to_embedding(
+                    pixel_values=pixel_values,
+                    images_crop=images_crop,
+                    images_spatial_crop=images_spatial_crop,
+                    has_local_crops=item_has_local_crops,
+                )
+            )
+
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
 
         return vision_features
