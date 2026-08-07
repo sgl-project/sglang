@@ -636,8 +636,13 @@ class _ConfigBag:
 
     @contextmanager
     def override(self, **kwargs):
-        """Scoped, transactional test-only override of this bag's own leaves
-        (keys validated before any write; restored on exit)."""
+        """Scoped, transactional override of this bag's own leaves (keys
+        validated before any write; restored on exit).
+
+        For a window where one runner's value differs from the process's — a
+        draft model loading under ``--speculative-draft-load-format`` while the
+        target keeps ``--load-format`` — and for tests forcing a code path.
+        A permanent change goes through ``get_context().override``."""
         fields = object.__getattribute__(self, "_fields")
         unknown = set(kwargs) - set(fields)
         if unknown:
@@ -1011,8 +1016,7 @@ class _ServerArgsOverride:
 
     def install(self) -> ServerArgs:
         """Publish a fresh dummy-boundary ``ServerArgs`` carrying the
-        overrides (written through ``ServerArgs.override`` for provenance);
-        returns the published instance."""
+        overrides; returns the published instance."""
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
@@ -1025,7 +1029,7 @@ class _ServerArgsOverride:
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         server_args = ServerArgs(model_path="dummy")
         if self._fields:
-            server_args.override(source="test-override", **self._fields)
+            server_args = server_args.derive("test-override", **self._fields)
         # The dummy boundary skips materialization, which would leave the
         # strict mutation guard unarmed on the published object — mark it
         # materialized so bare post-publish writes raise like they do on a
