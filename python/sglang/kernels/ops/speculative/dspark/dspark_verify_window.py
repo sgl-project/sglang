@@ -767,8 +767,6 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        # BiShengIR cannot compile the nested tl.where below because its mask
-        # lowering mixes i1 and i8. Ascend therefore uses the torch path.
         if not is_npu() and inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)

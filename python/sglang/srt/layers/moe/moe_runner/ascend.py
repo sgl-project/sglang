@@ -98,8 +98,7 @@ class AscendRunnerCore(MoeRunnerCore):
             # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
             self.activation = None
         elif get_moe_a2a_backend().is_deepep():
-            # DeepEP path: preserve the model's activation contract while
-            # fusing the activation with per-token requantization.
+            # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )

@@ -1,13 +1,6 @@
 from typing import Optional, Union
 
 import torch
-from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-    conv_state_rollback,
-    move_intermediate_cache,
-)
-from sgl_kernel_npu.mamba.speculative_state_scatter import (
-    speculative_state_scatter_npu,
-)
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -225,121 +218,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         full_attn_layers: list[int],
     ):
         super().__init__(full_attn_backend, linear_attn_backend, full_attn_layers)
-
-    def update_mamba_state_after_mtp_verify(
-        self,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-        model,
-        req_pool_indices: Optional[torch.Tensor] = None,
-    ):
-        """
-        Commit accepted verify states with the fused NPU state-move kernels.
-
-        This avoids the original advanced-indexing kernels:
-        - index_elementwise_kernel from tensor[bool_mask]
-        - index_select kernel launches
-        - nonzero kernel launches
-        """
-        del req_pool_indices  # accepted for hook parity; slots come from metadata
-        request_number = last_correct_step_indices.shape[0]
-
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
-
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
-
-        conv_states = mamba_caches.conv[0]
-        ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
-        dst_indices_tensor = state_indices_tensor.to(torch.int32)
-        src_indices_tensor = torch.arange(
-            dst_indices_tensor.shape[0],
-            device=dst_indices_tensor.device,
-            dtype=torch.int32,
-        )
-        last_steps = last_correct_step_indices.to(torch.int32)
-
-        move_intermediate_cache(
-            ssm_states,
-            intermediate_state_cache,
-            dst_indices_tensor,
-            src_indices_tensor,
-            last_steps,
-            h_block_size=1,
-        )
-        draft_token_num = intermediate_state_cache.shape[2]
-        has_conv_snapshots = getattr(
-            self.linear_attn_backend,
-            "supports_speculative_conv_state_snapshots",
-            False,
-        )
-        if has_conv_snapshots:
-            intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
-            speculative_state_scatter_npu(
-                conv_states,
-                intermediate_conv_window_cache,
-                dst_indices_tensor,
-                src_indices_tensor,
-                last_steps,
-            )
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            mamba_track_indices = mamba_track_indices.to(torch.int32)
-            mamba_steps_to_track = mamba_steps_to_track.to(torch.int32)
-
-            move_intermediate_cache(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                src_indices_tensor,
-                mamba_steps_to_track,
-                h_block_size=1,
-            )
-
-            if has_conv_snapshots:
-                speculative_state_scatter_npu(
-                    conv_states,
-                    intermediate_conv_window_cache,
-                    mamba_track_indices,
-                    src_indices_tensor,
-                    mamba_steps_to_track,
-                )
-            else:
-                track_mask = mamba_steps_to_track >= 0
-                # Legacy NPU backends do not keep per-step conv intermediates.
-                # Preserve their verify-time window before rolling back the
-                # working slot.
-                track_indices = mamba_track_indices[track_mask]
-                if track_indices.numel() > 0:
-                    conv_states[:, track_indices] = conv_states[
-                        :, dst_indices_tensor[track_mask]
-                    ]
-
-        if not has_conv_snapshots:
-            if dst_indices_tensor.numel() > 0:
-                conv_state_rollback(
-                    conv_states,
-                    dst_indices_tensor,
-                    last_steps,
-                    draft_token_num,
-                )
-
-            if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-                conv_state_rollback(
-                    conv_states,
-                    mamba_track_indices,
-                    mamba_steps_to_track,
-                    draft_token_num,
-                )
-
-        return
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

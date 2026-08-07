@@ -136,7 +136,7 @@ class ModelSlimConfig(QuantizationConfig):
         checkpoint retains the Hugging Face ``block_sparse_moe`` hierarchy.
         Some multimodal checkpoints also keep the outer ``language_model``
         prefix.  Resolve those layout-only differences at the quantization
-        boundary so the shared model implementation does not need NPU checks.
+        boundary.
         """
         candidates = [prefix]
         if ".mlp." in prefix:
