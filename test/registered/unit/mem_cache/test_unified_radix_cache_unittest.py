@@ -2495,7 +2495,6 @@ class UnifiedRadixCacheSuite:
             req_id, cons.root_node.id, array("q", seq), None, None
         )
         self._run_prefetch_to_completion(cons, req_id)
-        cons.drain_storage_control_queues()
 
         # The full prefix must now be a host hit (loaded from L3).
         mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2515,37 +2514,262 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(torch.equal(loaded_v, expected_v))
         cons.sanity_check()
 
+    def test_release_aborted_request_l3_prefetch_io_in_progress(self):
+        """Test release_aborted_request while a prefetch IO is still in-progress.
+        1. Fill KV and SWA to L3.
+        2. Trigger L3 prefetch.
+        3. Hack IO thread, blocking at _page_transfer.
+        4. Call release_aborted_request.  Assert that the KV and SWA buffers are not released (owned by the IO thread).
+        5. Unlbock IO thread.  Assert that KV and SWA buffers are eventually released.
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only fixture required to exercise extra pool")
+
+        # SWA prefetch is all-or-nothing over one full sliding window: size the
+        # request at sw_pages + 1 pages so prepare_prefetch actually materializes
+        # an SWA host transfer.
+        sw_pages = (
+            self.cfg.sliding_window_size + self.cfg.page_size - 1
+        ) // self.cfg.page_size
+        num_pages = max(4, sw_pages + 1)
+        seq = self._make_seq(1, num_pages)
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        # --- Producer tree: D->H backup, H->L3 offload, flush. ---
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        prod_leaf = prod.resolve_node_handle(mp.last_device_node)
+        self._backup_node(prod, prod_leaf)
+        self._write_path_to_l3(prod, prod_leaf)
+        self._flush_l3_backups(prod)
+
+        # --- Consumer tree: prefetch the same tokens straight from L3. ---
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        req_id = "abort-req"
+
+        occupied_before = cons.cache_controller.prefetch_tokens_occupied
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self.assertEqual(
+            cons.cache_controller.prefetch_tokens_occupied,
+            occupied_before + len(seq),
+        )
+        self.assertIn(req_id, cons.ongoing_prefetch)
+
+        # Block IO thread at the entry of _page_transfer.
+        import threading
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        original_sidecar = HybridCacheController._page_transfer_sidecar
+        entered = threading.Event()
+        gate = threading.Event()
+
+        def sidecar_barrier(self_, op):
+            # Signal that the worker has reached the sidecar step, then block
+            # until the main thread releases the gate.
+            entered.set()
+            gate.wait(timeout=10.0)
+            # Forward to the real implementation so the worker runs the
+            # terminate-aware release path itself.
+            original_sidecar(self_, op)
+
+        with mock.patch.object(
+            HybridCacheController, "_page_transfer", sidecar_barrier
+        ):
+            # Pump until the storage-hit queue has been drained, host_indices
+            # are bound, and the IO aux thread has entered the sidecar barrier.
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                cons.drain_storage_control_queues()
+                op = cons.ongoing_prefetch[req_id].operation
+                if op.host_indices is not None and entered.is_set():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("prefetch did not reach the sidecar barrier in time")
+
+            op = cons.ongoing_prefetch[req_id].operation
+            self.assertIsNotNone(op.host_indices)
+            self.assertFalse(op.pool_transfers_done)
+
+            # Extra pool (SWA) must not have been released yet.
+            swa_release_q = cons.cache_controller.extra_host_mem_release_queues.get(
+                PoolName.SWA
+            )
+            self.assertIsNotNone(swa_release_q)
+            self.assertEqual(swa_release_q.qsize(), 0)
+
+            # --- Act: abort while the worker is blocked in the sidecar. ---
+            cons.release_aborted_request(req_id)
+
+        # Release the worker: it now sees _terminated_flag set, so
+        # complete_pool_transfers returns False and the worker falls through to
+        # `append_host_mem_release(extra_pools=operation.pool_transfers)`.
+        gate.set()
+
+        # Wait for the worker to push the SWA pool into the release queue.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if swa_release_q.qsize() > 0:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("SWA extra pool was not released after the abort")
+
+        # --- Asserts after the abort. ---
+        # pool_transfers_done never flipped (terminate raced ahead of
+        # complete_pool_transfers); the SWA extra pool was released by the
+        # worker's fallback path.
+        self.assertFalse(op.pool_transfers_done)
+        cc = cons.cache_controller
+        self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
+        self.assertGreater(swa_release_q.qsize(), 0)
+        self.assertNotIn(req_id, cons.ongoing_prefetch)
+        self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
+        self.assertEqual(
+            cons.cache_controller.prefetch_tokens_occupied, occupied_before
+        )
+
+        cons.sanity_check()
+
+    def test_release_aborted_request_l3_prefetch_io_done(self):
+        """Test release_aborted_request is called after the IO thread has completed
+        prefetch.
+        1. Fill KV and SWA to L3.
+        2. Trigger L3 prefetch.
+        3. Wait until the completion of L3 prefetch IO.
+        4. Call release_aborted_request.  Assert that KV and SWA buffers are released.
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("SWA-only fixture required to exercise extra pool")
+
+        # SWA prefetch is all-or-nothing over one full sliding window: size the
+        # request at sw_pages + 1 pages so prepare_prefetch actually materializes
+        # an SWA host transfer.
+        sw_pages = (
+            self.cfg.sliding_window_size + self.cfg.page_size - 1
+        ) // self.cfg.page_size
+        num_pages = max(4, sw_pages + 1)
+        seq = self._make_seq(1, num_pages)
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        # --- Producer tree: D->H backup, H->L3 offload, flush. ---
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        prod_leaf = prod.resolve_node_handle(mp.last_device_node)
+        self._backup_node(prod, prod_leaf)
+        self._write_path_to_l3(prod, prod_leaf)
+        self._flush_l3_backups(prod)
+
+        # --- Consumer tree: prefetch the same tokens straight from L3. ---
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        req_id = "abort-req"
+
+        occupied_before = cons.cache_controller.prefetch_tokens_occupied
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self.assertEqual(
+            cons.cache_controller.prefetch_tokens_occupied,
+            occupied_before + len(seq),
+        )
+        self.assertIn(req_id, cons.ongoing_prefetch)
+
+        cc = cons.cache_controller
+        swa_release_q = cc.extra_host_mem_release_queues.get(PoolName.SWA)
+        self.assertIsNotNone(swa_release_q)
+
+        # Pump drain until the completion of L3 prefetch IO.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            cons.drain_storage_control_queues()
+            op = cons.ongoing_prefetch[req_id].operation
+            if op.host_indices is not None and op.pool_transfers_done:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("prefetch IO did not complete (pool_transfers_done) in time")
+
+        op = cons.ongoing_prefetch[req_id].operation
+        self.assertIsNotNone(op.host_indices)
+        self.assertTrue(op.pool_transfers_done)
+        self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
+        self.assertEqual(swa_release_q.qsize(), 0)
+
+        # --- Act: abort without committing the prefetch. ---
+        cons.release_aborted_request(req_id)
+
+        self.assertTrue(op.pool_transfers_done)
+        self.assertGreater(swa_release_q.qsize(), 0)
+        self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
+        self.assertNotIn(req_id, cons.ongoing_prefetch)
+        self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
+        self.assertEqual(cc.prefetch_tokens_occupied, occupied_before)
+
+        cons.sanity_check()
+
     # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
 
-    def _patch_tp_all_reduce(self, cache, drop_swa: bool):
-        """Fake all_reduce so check_prefetch_progress runs the tp>1 path."""
+    def _patch_tp_prefetch_sync(self, cache, drop_swa: bool):
+        """Fake all_reduce so _reduce_prefetch_ack runs the tp>1 path."""
         import torch.distributed as dist
 
-        min_sizes = []
+        cc = cache.cache_controller
 
-        def swa_packed_index():
-            # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
-            # matches comp_xfers stored in ongoing_prefetch (one live entry).
-            for info in cache.ongoing_prefetch.values():
-                comp_xfers = info[-1]
-                names = [t.name for xfers in comp_xfers.values() for t in xfers]
-                if PoolName.SWA in names:
-                    return 1 + names.index(PoolName.SWA), 1 + len(names)
-            return None, None
+        # Fake _reduce_prefetch_ack to drop SWA pool_hits when drop_swa is True.
+        def fake_reduce(ack):
+            if drop_swa and ack.pool_hits is not None:
+                if PoolName.SWA.value in ack.pool_hits:
+                    ack.pool_hits[PoolName.SWA.value] = 0
 
-        def fake(tensor, op=None, group=None):
-            if op == dist.ReduceOp.MIN:
-                min_sizes.append(tensor.numel())
-                if drop_swa:
-                    idx, packed_numel = swa_packed_index()
-                    if idx is not None and tensor.numel() == packed_numel:
-                        tensor[idx] = 0
-            return None
+        p_reduce = mock.patch.object(
+            cc, "_reduce_prefetch_ack", side_effect=fake_reduce
+        )
+        p_reduce.start()
+        self.addCleanup(p_reduce.stop)
 
-        p = mock.patch.object(dist, "all_reduce", side_effect=fake)
-        p.start()
-        self.addCleanup(p.stop)
-        return min_sizes
+        # Make all_reduce no-op.  The real all_reduce fails in unit tests with tp_world_size=2.
+        p_dist = mock.patch.object(dist, "all_reduce", return_value=None)
+        p_dist.start()
+        self.addCleanup(p_dist.stop)
 
     def _swa_host_on_path(self, cache, seq):
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2583,7 +2807,6 @@ class UnifiedRadixCacheSuite:
             req_id, cons.root_node.id, array("q", seq), None, None
         )
         self._run_prefetch_to_completion(cons, req_id)
-        cons.drain_storage_control_queues()
 
     def _setup_swa_tp_prefetch(self):
         """Skip non-SWA fixtures; produce one full SWA window+1 page to L3.
@@ -2622,7 +2845,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=True)
+        self._patch_tp_prefetch_sync(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, "drop")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2630,10 +2853,6 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
         )
-        # Full + sidecars must be synced through a packed MIN all_reduce. The
-        # poll loop may observe more than one completed check, so do not pin the
-        # exact number of reductions.
-        self.assertIn(2, min_sizes)
         cons.sanity_check()
 
     def test_tp_swa_prefetch_adopted_when_peer_present(self):
@@ -2646,7 +2865,7 @@ class UnifiedRadixCacheSuite:
 
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
-        min_sizes = self._patch_tp_all_reduce(cons, drop_swa=False)  # peer == local
+        self._patch_tp_prefetch_sync(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, "keep")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -2655,7 +2874,6 @@ class UnifiedRadixCacheSuite:
             self._swa_host_on_path(cons, seq),
             "SWA must be adopted when all ranks have it",
         )
-        self.assertIn(2, min_sizes)
         cons.sanity_check()
 
     def test_tp_swa_prefetch_drop_frees_host_pool(self):
