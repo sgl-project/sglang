@@ -71,6 +71,7 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
 RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
@@ -245,6 +246,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
+    scheduler_rpc_timeout: int | None = None
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -484,6 +486,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
         if not current_platform.is_cpu():
@@ -492,6 +495,20 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_scheduler_rpc_timeout(self) -> None:
+        timeout = self.scheduler_rpc_timeout
+        if timeout is None:
+            return
+        if (
+            not isinstance(timeout, int)
+            or isinstance(timeout, bool)
+            or not 0 < timeout <= MAX_SCHEDULER_RPC_TIMEOUT_S
+        ):
+            raise ValueError(
+                "scheduler_rpc_timeout must be None or an integer between "
+                f"1 and {MAX_SCHEDULER_RPC_TIMEOUT_S} seconds"
+            )
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
         """Sorted, de-duplicated, positive BCG text buckets.
@@ -1552,6 +1569,16 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+        )
+        parser.add_argument(
+            "--scheduler-rpc-timeout",
+            type=int,
+            default=ServerArgs.scheduler_rpc_timeout,
+            help=(
+                "Optional end-to-end timeout in seconds for a scheduler RPC, including "
+                "time spent in the scheduler queue. By default no transport-level "
+                "deadline is imposed; callers may still cancel their request."
+            ),
         )
 
         ServerArgs.add_disagg_cli_args(parser)
