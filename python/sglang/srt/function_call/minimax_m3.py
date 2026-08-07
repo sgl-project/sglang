@@ -458,8 +458,11 @@ class MinimaxM3Detector(BaseFormatDetector):
         if schema_types & NUMBER_TYPES:
             try:
                 parsed = float(value)
+                # int(parsed) raises OverflowError for inf and ValueError for
+                # nan, so a non-finite literal (e.g. "1e999") falls through to
+                # the verbatim return instead of crashing the stream.
                 return parsed if parsed != int(parsed) else int(parsed)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
 
         if schema_types & BOOLEAN_TYPES:
