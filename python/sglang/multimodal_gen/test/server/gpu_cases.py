@@ -22,6 +22,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
@@ -449,6 +450,21 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_video_moe_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            num_gpus=1,
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",
@@ -932,14 +948,12 @@ TWO_GPU_CASES = [
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2I_sampling_params.prompt,

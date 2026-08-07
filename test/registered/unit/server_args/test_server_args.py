@@ -181,6 +181,16 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("deprecated", logs.output[0])
 
+    def test_legacy_keep_flag_rejects_explicit_fabric(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            keep_mm_feature_on_device=True,
+            mm_feature_transport="fabric",
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicts.*fabric"):
+            server_args._handle_multimodal_feature_transport()
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")

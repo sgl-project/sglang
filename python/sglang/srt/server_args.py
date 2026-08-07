@@ -7584,10 +7584,10 @@ class ServerArgs:
         legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
         if self.keep_mm_feature_on_device:
-            if requested_transport == "cpu":
+            if requested_transport not in (None, "cuda_ipc"):
                 raise ValueError(
                     "--keep-mm-feature-on-device conflicts with "
-                    "--mm-feature-transport=cpu. Use only "
+                    f"--mm-feature-transport={requested_transport}. Use only "
                     "--mm-feature-transport=cuda_ipc."
                 )
             requested_transport = "cuda_ipc"
