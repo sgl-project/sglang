@@ -379,7 +379,7 @@ def _validate_default_loader_extra_config(
         # options, so newer versions can add parameters without a SGLang update.
         return
 
-    allowed_keys = {"enable_multithread_load", "num_threads"}
+    allowed_keys = {"enable_multithread_load", "num_threads", "load_tp_by_experts"}
     if load_format in (
         LoadFormat.AUTO,
         LoadFormat.SAFETENSORS,
