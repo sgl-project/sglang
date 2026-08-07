@@ -44,6 +44,17 @@ def _make_info(batch_size=2, **overrides):
     return SamplingBatchInfo(**defaults)
 
 
+def _make_sparse_info(batch_size, entries):
+    rows = [row for row, _token, _value in entries]
+    return _make_info(
+        batch_size=batch_size,
+        logit_bias=torch.tensor([value for _row, _token, value in entries]),
+        logit_bias_rows=torch.tensor(rows),
+        logit_bias_token_ids=torch.tensor([token for _row, token, _value in entries]),
+        logit_bias_rows_cpu=rows,
+    )
+
+
 def _serial_batched_fill(entries, vocab_mask):
     for entry in entries:
         entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
@@ -169,6 +180,20 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         self.assertAlmostEqual(logits[0, 5].item(), 10.0, places=5)
         self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
+    def test_sparse_apply_matches_dense_reference_across_dtypes(self):
+        entries = [(1, 5, 0.125), (4, 7, -1.75)]
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                info = _make_sparse_info(6, entries)
+                actual = torch.zeros(6, VOCAB_SIZE, dtype=dtype)
+                dense = torch.zeros(6, VOCAB_SIZE)
+                dense[1, 5] = 0.125
+                dense[4, 7] = -1.75
+                expected = actual.clone()
+                expected.add_(dense)
+                info.apply_logits_bias(actual)
+                self.assertTrue(torch.equal(actual, expected))
 
     def test_applies_vocab_mask(self):
         """Test that a grammar_mask gets applied to the logits."""
@@ -360,6 +385,31 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([1], keep)
         self.assertIsNone(info.sampling_seed)
 
+    def test_filter_reorders_and_drops_sparse_entries(self):
+        info = _make_sparse_info(4, [(1, 3, 1.0), (3, 9, 2.0)])
+        info.filter_batch([3, 0, 1], torch.tensor([3, 0, 1]))
+        self.assertEqual(info.logit_bias_rows_cpu, [0, 2])
+        self.assertTrue(torch.equal(info.logit_bias_rows, torch.tensor([0, 2])))
+        self.assertTrue(torch.equal(info.logit_bias_token_ids, torch.tensor([9, 3])))
+        self.assertTrue(torch.equal(info.logit_bias, torch.tensor([2.0, 1.0])))
+
+    def test_filter_preserves_duplicate_keep_indices(self):
+        info = _make_sparse_info(4, [(1, 3, 1.0), (3, 9, 2.0)])
+        info.filter_batch([1, 1, 0], torch.tensor([1, 1, 0]))
+        self.assertEqual(info.logit_bias_rows_cpu, [0, 1])
+        self.assertTrue(torch.equal(info.logit_bias, torch.tensor([1.0, 1.0])))
+
+    def test_filter_densifies_above_entry_threshold(self):
+        info = _make_sparse_info(16, [(2, 1, 1.0), (2, 2, 2.0), (2, 3, 3.0)])
+        info.filter_batch([2], torch.tensor([2]))
+        self.assertEqual(info.logit_bias.shape, (1, VOCAB_SIZE))
+        self.assertIsNone(info.logit_bias_rows)
+        self.assertIsNone(info.logit_bias_token_ids)
+        self.assertIsNone(info.logit_bias_rows_cpu)
+        self.assertTrue(
+            torch.equal(info.logit_bias[0, 1:4], torch.tensor([1.0, 2.0, 3.0]))
+        )
+
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
@@ -402,6 +452,27 @@ class TestMergeBatch(CustomTestCase):
         info2.logit_bias = None
         info1.merge_batch(info2)
         self.assertEqual(info1.logit_bias.shape, (2, VOCAB_SIZE))
+
+    def test_merge_sparse_entries_offsets_rhs_rows(self):
+        info1 = _make_sparse_info(16, [(2, 1, 1.0)])
+        info2 = _make_sparse_info(16, [(0, 2, 2.0), (3, 3, 3.0)])
+        info1.merge_batch(info2)
+        self.assertEqual(info1.logit_bias_rows_cpu, [2, 16, 19])
+        self.assertTrue(
+            torch.equal(info1.logit_bias_token_ids, torch.tensor([1, 2, 3]))
+        )
+        self.assertTrue(torch.equal(info1.logit_bias, torch.tensor([1.0, 2.0, 3.0])))
+
+    def test_merge_densifies_above_entry_threshold(self):
+        info1 = _make_sparse_info(1, [(0, 1, 1.0), (0, 2, 2.0), (0, 3, 3.0)])
+        info2 = _make_sparse_info(1, [(0, 4, 4.0), (0, 5, 5.0), (0, 6, 6.0)])
+        info1.merge_batch(info2)
+        self.assertEqual(info1.logit_bias.shape, (2, VOCAB_SIZE))
+        self.assertIsNone(info1.logit_bias_rows)
+        self.assertIsNone(info1.logit_bias_token_ids)
+        self.assertIsNone(info1.logit_bias_rows_cpu)
+        self.assertEqual(info1.logit_bias[0, 3].item(), 3.0)
+        self.assertEqual(info1.logit_bias[1, 6].item(), 6.0)
 
     def test_merge_with_custom_logit_processor(self):
         """Test that merge combines processors when only one side has them."""
@@ -535,19 +606,48 @@ class TestFromScheduleBatch(CustomTestCase):
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_logit_bias_construction(self, mock_server_args):
-        """Test that logit_bias dict is converted to a tensor with correct values."""
+        """Sparse dictionaries retain only their token entries."""
         mock_server_args.return_value.enable_deterministic_inference = False
         mock_server_args.return_value.enable_custom_logit_processor = False
+        mock_server_args.return_value.speculative_algorithm = None
 
-        reqs = [self._make_req(logit_bias={"5": 2.0, "10": -1.0})]
+        reqs = [
+            self._make_req(logit_bias={"5": 2.0, "10": -1.0}),
+            self._make_req(),
+        ]
         batch = MagicMock()
         batch.reqs = reqs
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertIsNotNone(info.logit_bias)
-        self.assertAlmostEqual(info.logit_bias[0, 5].item(), 2.0)
-        self.assertAlmostEqual(info.logit_bias[0, 10].item(), -1.0)
-        self.assertAlmostEqual(info.logit_bias[0, 0].item(), 0.0)
+        self.assertTrue(torch.equal(info.logit_bias, torch.tensor([2.0, -1.0])))
+        self.assertEqual(info.logit_bias_rows_cpu, [0, 0])
+        self.assertTrue(torch.equal(info.logit_bias_rows, torch.tensor([0, 0])))
+        self.assertTrue(torch.equal(info.logit_bias_token_ids, torch.tensor([5, 10])))
+
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
+    def test_logit_bias_dense_fallback_for_high_entry_density(self, mock_server_args):
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+        mock_server_args.return_value.speculative_algorithm = None
+        reqs = [self._make_req(logit_bias={"1": 1.0, "2": 2.0, "3": 3.0})]
+        batch = MagicMock(reqs=reqs, device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.logit_bias.shape, (1, VOCAB_SIZE))
+        self.assertIsNone(info.logit_bias_rows)
+        self.assertIsNone(info.logit_bias_token_ids)
+
+    @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
+    def test_logit_bias_dense_fallback_for_speculative_decoding(self, mock_server_args):
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+        mock_server_args.return_value.speculative_algorithm = "EAGLE"
+        reqs = [self._make_req(logit_bias={"5": 2.0}), self._make_req()]
+        batch = MagicMock(reqs=reqs, device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.logit_bias.shape, (2, VOCAB_SIZE))
+        self.assertEqual(info.logit_bias[0, 5].item(), 2.0)
+        self.assertIsNone(info.logit_bias_rows)
+        self.assertIsNone(info.logit_bias_token_ids)
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_server_args")
     def test_deterministic_seed(self, mock_server_args):
