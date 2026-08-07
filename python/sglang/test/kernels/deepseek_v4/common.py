@@ -100,6 +100,7 @@ class PagedContext:
         seq_lens_cpu: torch.Tensor,
         extend_lens_cpu: torch.Tensor,
         num_q_tokens: int,
+        num_draft_tokens: int = 0,
     ) -> CompressorPrefillPlan:
         return CompressorPrefillPlan.generate(
             compress_ratio=self.compress_ratio,  # type: ignore
@@ -111,6 +112,7 @@ class PagedContext:
             swa_page_size=self.swa_page_size,
             ring_size=self.ring_size,
             num_q_tokens=num_q_tokens,
+            num_draft_tokens=num_draft_tokens,
         )
 
     def make_decode_plan(self, seq_lens_gpu: torch.Tensor) -> CompressorDecodePlan:

@@ -45,7 +45,12 @@ struct Prefill0Params {
   uint32_t num_q_tokens;
   int32_t compress_ratio;
   int32_t swa_page_size;
-  int32_t mtp_pad;
+  /// \brief Upper bound on how many trailing tokens of this batch may be rolled
+  /// back after the forward (= `speculative_num_draft_tokens` on a verify batch,
+  /// 0 on a plain prefill). The per-request write pad is
+  /// `min(extend_len, num_draft_tokens)`, so a captured cuda graph stays valid
+  /// when the real per-step draft count is smaller than this bound.
+  int32_t num_draft_tokens;
 };
 
 struct Prefill1Params {
@@ -202,7 +207,8 @@ __global__ __launch_bounds__(1024, 1)  //
       }
 
       const int32_t last_c_pos = (sl / cr) * cr;
-      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - params.mtp_pad);
+      const int32_t pad = min(static_cast<int32_t>(E), params.num_draft_tokens);
+      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - pad);
       bool do_write = position >= first_w_pos;
       if (!do_write && is_overlap) do_write = (position % sps) >= (sps - cr);
       if (do_write) {
@@ -219,7 +225,8 @@ __global__ __launch_bounds__(1024, 1)  //
       const int32_t sl = s_seq_len[batch_id];
       const int32_t el = sl - pl;
       const int32_t last_c_pos = (sl / cr) * cr;
-      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - params.mtp_pad);
+      const int32_t pad = min(el, params.num_draft_tokens);
+      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - pad);
       for (int32_t j = static_cast<int32_t>(tx); j < el; j += static_cast<int32_t>(block_size)) {
         const int32_t position = pl + j;
         const uint32_t ragged_id = base_e + static_cast<uint32_t>(j);
@@ -448,6 +455,12 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)
  * @param write_plan        `[num_q_tokens,  8]` uint8 (output)
  * @param compress_ratio 4 for c4, 128 for c128
+ * @param num_draft_tokens Upper bound on how many trailing tokens of this batch may be
+ *                         rolled back after the forward: `speculative_num_draft_tokens`
+ *                         on a speculative verify batch, 0 on a plain prefill. The write
+ *                         plan pads down to `seq_len - min(extend_len, num_draft_tokens)`
+ *                         so a future compression window can still read every committed
+ *                         token from the ring regardless of the accept length.
  * @param use_cuda_graph Whether the plans will be used with cuda graph (affects padding)
  * @return (compress plan tensor, write plan tensor)
  */
@@ -462,6 +475,7 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t compress_ratio,
     const int32_t swa_page_size,
     const int32_t ring_size,
+    const int32_t num_draft_tokens,
     const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto N = SymbolicSize{"num_q_tokens"};
@@ -507,12 +521,28 @@ inline PrefillPlan plan_compress_prefill(
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
+  // Ring-capacity bound. A compression at position `p` reads `[p - window_size + 1, p]`;
+  // the part below `prefix_len` can only come from the ring. Slots alias every
+  // `ring_size` positions, so a token this step writes at `w` clobbers `w - ring_size`.
+  // With `p` at the first compression point at or after `prefix_len` (worst case:
+  // accept_len == 1) and writes spanning `[prefix_len, seq_len)`, staying clear of the
+  // window requires `num_draft_tokens <= ring_size - window_size + 2`.
+  RuntimeCheck(num_draft_tokens >= 0, "num_draft_tokens must be non-negative, got ", num_draft_tokens);
+  RuntimeCheck(
+      num_draft_tokens <= ring_size - window_size + 2,
+      "compress state ring too small to keep committed tokens resident: num_draft_tokens=",
+      num_draft_tokens,
+      " exceeds ring_size=",
+      ring_size,
+      " - window_size=",
+      window_size,
+      " + 2 (compress_ratio=",
+      compress_ratio,
+      "); a speculative batch needs the speculative ring -- check "
+      "get_compress_state_ring_size(compress_ratio, is_speculative=True)");
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
-
-  constexpr int32_t kMaxMTPDraftTokens = 4;
-  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
   if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
@@ -531,7 +561,7 @@ inline PrefillPlan plan_compress_prefill(
         .num_q_tokens = num_q_tokens,
         .compress_ratio = compress_ratio,
         .swa_page_size = swa_page_size,
-        .mtp_pad = mtp_pad,
+        .num_draft_tokens = num_draft_tokens,
     };
     LaunchKernel(1, kMaxPrefillBatchSize, device)(plan_compress_prefill_kernel0, params0);
     // kernel_1 sees the already-padded buffers, so num_c == num_w == num_padded == num_q_tokens.
@@ -573,7 +603,8 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    const int32_t pad = std::min(extend_len, num_draft_tokens);
+    const int32_t first_w_pos = std::min(last_c_pos - (is_overlap ? compress_ratio : 0), seq_len - pad);
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;

@@ -532,6 +532,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens_cpu: List[int],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
+        num_draft_tokens: int = 0,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -571,6 +572,7 @@ class DeepseekV4HipRadixBackend(
                 extend_lens=extend_seq_lens,
                 extend_lens_cpu=extend_seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                num_draft_tokens=num_draft_tokens,
             )
         return DSV4Metadata(
             core_attn_metadata,
@@ -631,6 +633,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            num_draft_tokens=self.speculative_num_draft_tokens,
         )
 
     def make_forward_metadata_from_raw_verify(
@@ -677,6 +680,7 @@ class DeepseekV4HipRadixBackend(
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
+            num_draft_tokens=num_draft_tokens,
         )
         return DSV4Metadata(
             core_attn_metadata,
