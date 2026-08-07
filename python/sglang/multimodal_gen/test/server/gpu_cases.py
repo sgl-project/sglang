@@ -457,7 +457,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             modality="video",
             num_gpus=1,
             extras=[
-                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup false"
+                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
             ],
             text_encoder_cpu_offload=True,
         ),

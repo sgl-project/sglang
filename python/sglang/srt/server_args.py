@@ -2165,6 +2165,12 @@ class ServerArgs:
         ),
         NS("spec"),
     ] = None
+    # Internal provenance used after the public draft quantization inherits the
+    # target value. It is a dataclass field so ServerArgs round-trips preserve
+    # whether the user explicitly set the draft option; it has no CLI surface.
+    _speculative_draft_quantization_explicitly_set: A[
+        Optional[bool], Arg(no_cli=True), NS("spec")
+    ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,
         "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
@@ -2742,10 +2748,11 @@ class ServerArgs:
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc"]],
         "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "Unset resolves automatically: single-node CUDA deployments (without "
-        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
-        "back to CPU transport per tensor when the pool is full.",
+        "Unset resolves automatically: multimodal models on single-node CUDA "
+        "deployments (without disaggregation) use cuda_ipc, everything else uses "
+        "cpu. CUDA IPC reserves SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on "
+        "the base GPU and falls back to CPU transport per tensor when the pool is "
+        "full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -4072,6 +4079,10 @@ class ServerArgs:
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self._speculative_draft_quantization_explicitly_set is None:
+            self._speculative_draft_quantization_explicitly_set = (
+                self.speculative_draft_model_quantization is not None
+            )
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
 
@@ -7598,13 +7609,17 @@ class ServerArgs:
                     "encoder-only serving; encoder outputs use "
                     "--encoder-transfer-backend instead."
                 )
-            elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
+            elif (
+                self.get_model_config().is_multimodal
+                and is_cuda()
+                and self.nnodes == 1
+                and self.disaggregation_mode == "null"
+            ):
                 # Auto policy: single-node CUDA serving defaults to the bounded
-                # CUDA-IPC pool. The pool is only allocated when a multimodal
-                # processor exists, so text-only deployments are unaffected; a
-                # full pool degrades to CPU transport per tensor. Multi-node
-                # (IPC handles are intra-node) and PD-disaggregated deployments
-                # keep CPU transport.
+                # CUDA-IPC pool for multimodal models. Text-only deployments do
+                # not need feature transport. Multi-node (IPC handles are
+                # intra-node) and PD-disaggregated deployments keep CPU transport.
+                # A full pool degrades to CPU transport per tensor.
                 requested_transport = "cuda_ipc"
                 logger.info(
                     "Multimodal feature transport auto-resolved to cuda_ipc "
