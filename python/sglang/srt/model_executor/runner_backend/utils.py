@@ -109,6 +109,23 @@ def resolve_prefill_backend(
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
 
+    if (
+        model_runner.device == "npu"
+        and model_runner.server_args.dllm_algorithm is not None
+    ):
+        if backend_name != Backend.FULL:
+            raise ValueError(
+                "NPU dLLM prefill graph currently supports only the 'full' backend, "
+                f"got '{backend_name}'"
+            )
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+            NPUCudaGraphBackend,
+        )
+
+        return NPUCudaGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+        )
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,

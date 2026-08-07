@@ -426,6 +426,15 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
+        # Full prefill graph capture also requires actualSequenceLengthQ.
+        # Keep it as a mutable host-side list so replay can exclude padding.
+        if (
+            forward_batch.forward_mode.is_extend()
+            and getattr(forward_batch, "extend_seq_lens_cpu", None) is not None
+        ):
+            self.forward_metadata.seq_lens_list_cumsum = np.cumsum(
+                forward_batch.extend_seq_lens_cpu
+            ).tolist()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -550,6 +559,15 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # Prefill capture precedes decode capture. Reuse a sufficiently large
+        # allocation so both graphs retain the same metadata storage.
+        if (
+            getattr(self, "_cuda_graph_state_max_bs", 0) >= max_bs
+            and getattr(self, "_cuda_graph_state_max_num_tokens", 0) >= max_num_tokens
+        ):
+            return
+        self._cuda_graph_state_max_bs = max_bs
+        self._cuda_graph_state_max_num_tokens = max_num_tokens
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens

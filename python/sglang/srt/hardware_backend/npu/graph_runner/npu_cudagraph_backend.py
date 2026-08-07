@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import queue
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -25,8 +26,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
 )
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     )
 
 
-class NPUCudaGraphBackend(BaseCudaGraphBackend):
+class NPUCudaGraphBackend(FullCudaGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
@@ -63,6 +64,66 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        self._update_queue: queue.Queue = queue.Queue()
+        self._update_thread = threading.Thread(
+            target=self._update_worker,
+            name="npu-graph-update",
+            daemon=True,
+        )
+        self._update_thread.start()
+        self._bound_update_signatures: Dict[Any, Any] = {}
+
+    def _update_worker(self) -> None:
+        """Reuse one device-bound worker for NPUGraph input updates."""
+        self._device_module.set_device(self._device_id)
+        while True:
+            task = self._update_queue.get()
+            if task is None:
+                return
+            graph, cpu_update_input, done, errors, reuse_dispatch = task
+            try:
+                if reuse_dispatch:
+                    dispatch_mode = graph.graph_dispatch_mode
+                    with torch.npu.stream(dispatch_mode.update_stream):
+                        for record in dispatch_mode.graph_dispatch_records:
+                            torch.npu.graph_task_update_begin(
+                                dispatch_mode.update_stream, record.handle
+                            )
+                            record.op_cache_entry(*record.args, **record.kwargs)
+                            torch.npu.graph_task_update_end(dispatch_mode.update_stream)
+                            record.event.record(dispatch_mode.update_stream)
+                else:
+                    graph.update(cpu_update_input=cpu_update_input)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+    @staticmethod
+    def _update_signature(cpu_update_input: Any) -> Any:
+        """Build a stable value signature for small host graph inputs."""
+
+        def freeze(value: Any) -> Any:
+            if isinstance(value, dict):
+                return tuple(sorted((key, freeze(item)) for key, item in value.items()))
+            if isinstance(value, (list, tuple)):
+                return tuple(freeze(item) for item in value)
+            if isinstance(value, np.ndarray):
+                return (
+                    str(value.dtype),
+                    tuple(value.shape),
+                    tuple(value.reshape(-1).tolist()),
+                )
+            if isinstance(value, torch.Tensor):
+                host = value.detach().cpu()
+                return (
+                    str(host.dtype),
+                    tuple(host.shape),
+                    tuple(host.reshape(-1).tolist()),
+                )
+            return value
+
+        return freeze(cpu_update_input)
 
     @contextmanager
     def capture_session(self, stream):
@@ -165,18 +226,34 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
+        signature = self._update_signature(cpu_update_input)
 
-        def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+        if self._bound_update_signatures.get(shape_key) == signature:
+            # Denoising iterations within one output block retain the same
+            # host-side attention attributes. The external attention tasks and
+            # their events must still be submitted for every replay, but their
+            # arguments no longer need handler lookup and rebinding.
+            done = threading.Event()
+            errors = []
+            self._update_queue.put((graph, None, done, errors, True))
+            graph.replay()
+            done.wait()
+            if errors:
+                raise errors[0]
+            return self._outputs[shape_key]
 
-        thread = threading.Thread(target=_update)
-        thread.start()
+        done = threading.Event()
+        errors = []
+        self._update_queue.put((graph, cpu_update_input, done, errors, False))
         graph.replay()
-        thread.join()
+        done.wait()
+        if errors:
+            raise errors[0]
+        self._bound_update_signatures[shape_key] = signature
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        self._bound_update_signatures.clear()
         self._pool = None

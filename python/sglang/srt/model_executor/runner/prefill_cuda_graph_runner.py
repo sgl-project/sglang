@@ -44,6 +44,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
+import numpy as np
 import torch
 import tqdm
 
@@ -527,6 +528,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
+
+        # Prefill capture runs before decode capture. Ascend therefore needs
+        # its graph metadata buffers allocated here rather than relying on the
+        # decode runner to initialize them later.
+        if is_npu():
+            self.model_runner.attn_backend.init_cuda_graph_state(
+                self.max_bs, self.max_num_tokens
+            )
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
@@ -1668,7 +1677,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            if is_npu() and hasattr(self.backend, "replay_with_input_update"):
+                q_lens = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
+                kv_lens = forward_batch.seq_lens_cpu.int().tolist()
+                hs = self.backend.replay_with_input_update(
+                    shape_key,
+                    seq_lens=None,
+                    cpu_update_input=[
+                        {
+                            "actual_seq_lengths": q_lens,
+                            "actual_seq_lengths_kv": kv_lens,
+                        }
+                    ],
+                )
+            else:
+                hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward

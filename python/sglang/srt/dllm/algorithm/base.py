@@ -77,6 +77,7 @@ class DllmAlgorithm:
         batch_size = forward_batch.batch_size
         start_list = self._block_start_list(forward_batch)
 
+        forward_batch._dllm_inner_replay = False
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         # No mask to denoise: return empty so process_batch_result_dllm skips the
         # stream branch (matches the pre-refactor behavior).
@@ -89,10 +90,13 @@ class DllmAlgorithm:
         # every later forward skip re-planning.
         if _is_npu:
             forward_batch.mark_forward_metadata_ready()
+        fast_graph_replay = model_runner.device == "npu" and out.can_run_graph
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
             if all(done):
                 break
+            if fast_graph_replay:
+                forward_batch._dllm_inner_replay = True
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
         next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
