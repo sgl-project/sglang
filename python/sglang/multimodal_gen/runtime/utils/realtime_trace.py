@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import itertools
+import logging
 import os
 import re
 import socket
@@ -19,15 +22,28 @@ MAX_CLIENT_TRACE_EVENTS = 32
 
 _TRACE_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 _HOSTNAME = socket.gethostname()
-_TRACE_SINKS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+_TRACE_SEQUENCE = itertools.count()
+_TraceSinkKey = tuple[str, str | None, str | None]
+_TRACE_SINKS: dict[_TraceSinkKey, list[Callable[[dict[str, Any]], None]]] = {}
 _TRACE_SINKS_LOCK = threading.RLock()
+_OTLP_LOGGER_LOCK = threading.Lock()
+_OTLP_LOGGER: logging.Logger | bool | None = None
 _RESERVED_PAYLOAD_KEYS = {
     "event",
     "trace_id",
     "session_id",
+    "generation_id",
     "server_epoch_ms",
     "server_elapsed_ms",
     "host",
+}
+_SENSITIVE_TRACE_FIELDS = {
+    "prompt",
+    "image",
+    "first_frame",
+    "latent_payload",
+    "payload",
+    "video",
 }
 
 
@@ -80,22 +96,31 @@ def log_realtime_trace(
     **fields: Any,
 ) -> None:
     payload = realtime_trace_payload(session, event, **fields)
+    emit_realtime_trace_payload(logger, payload)
+
+
+def emit_realtime_trace_payload(logger, payload: dict[str, Any]) -> None:
     logger.info(
         "%s %s",
         TRACE_LOG_PREFIX,
         json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
     )
+    _emit_otlp_trace(payload)
     _notify_realtime_trace_sinks(payload)
 
 
 def register_realtime_trace_sink(
     trace_id: str,
     sink: Callable[[dict[str, Any]], None],
+    *,
+    session_id: str | None = None,
+    generation_id: str | None = None,
 ) -> None:
     if not trace_id:
         return
+    key = (trace_id, session_id, generation_id)
     with _TRACE_SINKS_LOCK:
-        sinks = _TRACE_SINKS.setdefault(trace_id, [])
+        sinks = _TRACE_SINKS.setdefault(key, [])
         if sink not in sinks:
             sinks.append(sink)
 
@@ -103,17 +128,21 @@ def register_realtime_trace_sink(
 def unregister_realtime_trace_sink(
     trace_id: str,
     sink: Callable[[dict[str, Any]], None],
+    *,
+    session_id: str | None = None,
+    generation_id: str | None = None,
 ) -> None:
     if not trace_id:
         return
+    key = (trace_id, session_id, generation_id)
     with _TRACE_SINKS_LOCK:
-        sinks = _TRACE_SINKS.get(trace_id)
+        sinks = _TRACE_SINKS.get(key)
         if not sinks:
             return
         if sink in sinks:
             sinks.remove(sink)
         if not sinks:
-            _TRACE_SINKS.pop(trace_id, None)
+            _TRACE_SINKS.pop(key, None)
 
 
 def log_realtime_trace_for_batch(
@@ -127,6 +156,7 @@ def log_realtime_trace_for_batch(
         return
     session = SimpleNamespace(
         id=getattr(batch, "realtime_session_id", None),
+        generation_id=getattr(batch, "realtime_generation_id", None),
         trace_id=trace_id,
         trace_started_at=getattr(batch, "realtime_trace_started_at", None),
     )
@@ -231,32 +261,142 @@ def tensor_trace_metadata(value: Any, *, prefix: str) -> dict[str, Any]:
 
 def realtime_trace_payload(session, event: str, **fields: Any) -> dict[str, Any]:
     now = time.perf_counter()
+    server_epoch_ms = int(time.time() * 1000)
     started_at = getattr(session, "trace_started_at", None) or now
     payload: dict[str, Any] = {
         "event": event,
         "trace_id": getattr(session, "trace_id", getattr(session, "id", "")),
         "session_id": getattr(session, "id", None),
-        "server_epoch_ms": int(time.time() * 1000),
+        "generation_id": getattr(session, "generation_id", None),
+        "server_epoch_ms": server_epoch_ms,
+        "trace_seq": server_epoch_ms * 1000 + next(_TRACE_SEQUENCE) % 1000,
         "server_elapsed_ms": round((now - started_at) * 1000.0, 3),
         "host": _HOSTNAME,
     }
     for key, value in fields.items():
-        if value is not None and key not in _RESERVED_PAYLOAD_KEYS:
-            payload[key] = _json_safe(value)
+        if value is None or key in _RESERVED_PAYLOAD_KEYS:
+            continue
+        if key in _SENSITIVE_TRACE_FIELDS:
+            if isinstance(value, str):
+                payload[f"{key}_length"] = len(value)
+                payload[f"{key}_sha256"] = hashlib.sha256(
+                    value.encode("utf-8")
+                ).hexdigest()
+            else:
+                payload[f"{key}_redacted"] = True
+            continue
+        payload[key] = _json_safe(value)
     return payload
+
+
+def calculate_overlap_ratio(
+    left: tuple[float, float],
+    right: tuple[float, float],
+) -> float:
+    left_start, left_end = left
+    right_start, right_end = right
+    overlap = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+    longest_stage = max(0.0, left_end - left_start, right_end - right_start)
+    return overlap / longest_stage if longest_stage else 0.0
+
+
+def calculate_overlap_ms(
+    left: tuple[float, float],
+    right: tuple[float, float],
+) -> float:
+    return max(0.0, min(left[1], right[1]) - max(left[0], right[0])) * 1000.0
 
 
 def _notify_realtime_trace_sinks(payload: dict[str, Any]) -> None:
     trace_id = str(payload.get("trace_id") or "")
     if not trace_id:
         return
+    exact_key = (
+        trace_id,
+        str(payload.get("session_id") or "") or None,
+        str(payload.get("generation_id") or "") or None,
+    )
     with _TRACE_SINKS_LOCK:
-        sinks = list(_TRACE_SINKS.get(trace_id, ()))
+        sinks = list(_TRACE_SINKS.get(exact_key, ()))
+        sinks.extend(_TRACE_SINKS.get((trace_id, None, None), ()))
     for sink in sinks:
         try:
             sink(dict(payload))
         except Exception:
             pass
+
+
+def _emit_otlp_trace(payload: dict[str, Any]) -> None:
+    otlp_logger = _get_otlp_trace_logger()
+    if otlp_logger is None:
+        return
+    otlp_logger.info(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def _get_otlp_trace_logger() -> logging.Logger | None:
+    global _OTLP_LOGGER
+    if _OTLP_LOGGER is False:
+        return None
+    if isinstance(_OTLP_LOGGER, logging.Logger):
+        return _OTLP_LOGGER
+
+    with _OTLP_LOGGER_LOCK:
+        if _OTLP_LOGGER is False:
+            return None
+        if isinstance(_OTLP_LOGGER, logging.Logger):
+            return _OTLP_LOGGER
+        endpoint = os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") or os.environ.get(
+            "OTEL_EXPORTER_OTLP_ENDPOINT"
+        )
+        if not endpoint:
+            _OTLP_LOGGER = False
+            return None
+        try:
+            from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+                OTLPLogExporter,
+            )
+            from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+            from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+            from opentelemetry.sdk.resources import Resource
+
+            attributes = {
+                "service.name": os.environ.get(
+                    "OTEL_SERVICE_NAME", "sglang-realtime"
+                )
+            }
+            for item in os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "").split(","):
+                key, separator, value = item.partition("=")
+                if separator and key.strip() and value.strip():
+                    attributes[key.strip()] = value.strip()
+            provider = LoggerProvider(resource=Resource.create(attributes))
+            exporter = OTLPLogExporter(
+                endpoint=endpoint,
+                insecure=endpoint.startswith("http://"),
+            )
+            provider.add_log_record_processor(
+                BatchLogRecordProcessor(
+                    exporter,
+                    schedule_delay_millis=1000,
+                    max_export_batch_size=256,
+                )
+            )
+            otlp_logger = logging.getLogger("sglang.realtime_trace.otlp")
+            otlp_logger.handlers.clear()
+            otlp_logger.addHandler(
+                LoggingHandler(level=logging.INFO, logger_provider=provider)
+            )
+            otlp_logger.setLevel(logging.INFO)
+            otlp_logger.propagate = False
+            _OTLP_LOGGER = otlp_logger
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Failed to configure realtime OTLP log export; stdout trace remains enabled"
+            )
+            _OTLP_LOGGER = False
+            return None
+        return otlp_logger
 
 
 def _batch_elapsed_ms(batch, now: float) -> float:

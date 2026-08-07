@@ -145,7 +145,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
     def _reset_causal_cache_config_defaults(self) -> None:
         arch_config = getattr(
-            getattr(self.transformer, "config", None), "arch_config", None
+            getattr(getattr(self, "transformer", None), "config", None),
+            "arch_config",
+            None,
         )
         if arch_config is None:
             return

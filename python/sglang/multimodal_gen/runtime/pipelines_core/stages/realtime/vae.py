@@ -20,16 +20,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
 )
-from sglang.multimodal_gen.runtime.remote.vae_decode_client import (
-    get_remote_vae_response_transport,
-    get_remote_vae_url,
-)
-from sglang.multimodal_gen.runtime.remote.vae_decode_protocol import (
-    SCHEMA_VERSION as REMOTE_VAE_SCHEMA_VERSION,
-)
-from sglang.multimodal_gen.runtime.remote.vae_decode_protocol import (
-    tensor_to_payload,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
@@ -256,31 +246,6 @@ class CausalVaeDecodingStage(DecodingStage):
             return self.vae.clear_cache
         return None
 
-    @staticmethod
-    def _remote_vae_request(batch: Req) -> dict | None:
-        remote_url = get_remote_vae_url()
-        if remote_url is None:
-            return None
-        return {
-            "schema_version": REMOTE_VAE_SCHEMA_VERSION,
-            "session_id": batch.realtime_session_id
-            or getattr(batch, "request_id", None)
-            or "default",
-            "request_id": getattr(batch, "request_id", None) or "",
-            "block_idx": int(batch.block_idx),
-            "output_block_idx": int(batch.block_idx),
-            "event_id": batch.realtime_event_id,
-            "first_chunk": batch.block_idx == 0,
-            "is_final_chunk": bool(batch.extra.get("realtime_is_final_chunk", False)),
-            "width": batch.width,
-            "height": batch.height,
-            "fps": batch.fps,
-            "realtime_output_format": getattr(batch, "realtime_output_format", None),
-            "response_transport": get_remote_vae_response_transport(remote_url),
-            "trim_leading_frames": 0,
-            "latents": tensor_to_payload(batch.latents),
-        }
-
     def _decode_wan_with_persistent_cache(
         self,
         latents: torch.Tensor,
@@ -362,6 +327,27 @@ class CausalVaeDecodingStage(DecodingStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
+        taehv_checkpoint_path = self._taehv_checkpoint_path(
+            getattr(server_args.pipeline_config, "vae_config", None)
+        )
+        if taehv_checkpoint_path is not None:
+            if not vae_autocast_enabled:
+                latents = latents.to(vae_dtype)
+            if decode_state is None:
+                decode_state = RealtimeVAEDecodeState()
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                return self._decode_with_streaming_taehv(
+                    latents,
+                    decode_state,
+                    taehv_checkpoint_path,
+                    vae_dtype,
+                    first_chunk=first_chunk,
+                )
+
         latents = self.scale_and_shift(latents, server_args)
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
@@ -380,20 +366,6 @@ class CausalVaeDecodingStage(DecodingStage):
 
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-
-            taehv_checkpoint_path = self._taehv_checkpoint_path(
-                getattr(server_args.pipeline_config, "vae_config", None)
-            )
-            if taehv_checkpoint_path is not None:
-                if decode_state is None:
-                    decode_state = RealtimeVAEDecodeState()
-                return self._decode_with_streaming_taehv(
-                    latents,
-                    decode_state,
-                    taehv_checkpoint_path,
-                    vae_dtype,
-                    first_chunk=first_chunk,
-                )
 
             decode_fn = getattr(self.vae, "causal_decode", None)
             if callable(decode_fn):
@@ -420,21 +392,6 @@ class CausalVaeDecodingStage(DecodingStage):
             return super().forward(batch, server_args)
 
         decode_state = batch.session.get_or_create_state(RealtimeVAEDecodeState)
-        remote_request = self._remote_vae_request(batch)
-        if remote_request is not None:
-            return OutputBatch(
-                output=None,
-                remote_vae_request=remote_request,
-                realtime_output_chunk_index_start=batch.block_idx,
-                realtime_output_event_id=batch.realtime_event_id,
-                trajectory_timesteps=batch.trajectory_timesteps,
-                trajectory_latents=batch.trajectory_latents,
-                rollout_trajectory_data=batch.rollout_trajectory_data,
-                trajectory_decoded=None,
-                metrics=batch.metrics,
-                noise_pred=None,
-            )
-
         vae_config = getattr(server_args.pipeline_config, "vae_config", None)
         taehv_checkpoint_path = self._taehv_checkpoint_path(vae_config)
         with realtime_trace_span(
@@ -468,13 +425,15 @@ class CausalVaeDecodingStage(DecodingStage):
             input_tensor=batch.latents,
             chunk_index=batch.block_idx,
             first_chunk=batch.block_idx == 0,
-            decoder_backend=(
-                "taehv" if taehv_checkpoint_path is not None else "causal_vae"
-            ),
+            decoder_backend="taehv"
+            if taehv_checkpoint_path is not None
+            else "causal_vae",
             taehv_checkpoint_path=taehv_checkpoint_path,
             vae_precision=server_args.pipeline_config.vae_precision,
             vae_tiling=server_args.pipeline_config.vae_tiling,
-            use_parallel_decode=bool(getattr(vae_config, "use_parallel_decode", False)),
+            use_parallel_decode=bool(
+                getattr(vae_config, "use_parallel_decode", False)
+            ),
             parallel_decode_mode=getattr(vae_config, "parallel_decode_mode", None),
         ) as trace_span:
             frames = self.decode_causal(

@@ -1,0 +1,194 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-async-vae-l4
+  labels:
+    app.kubernetes.io/part-of: minwm-realtime
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  limits:
+    cpu: "128"
+    nvidia.com/gpu: "8"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-async-vae-l4
+        seedleap.ai/vae-worker: "true"
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      expireAfter: 24h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ray-gpu-ec2-all
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: [us-east-2a, us-east-2b, us-east-2c]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [g6.2xlarge, g6.4xlarge, g6.8xlarge]
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-async-vae
+  namespace: minwm-realtime
+  labels:
+    app.kubernetes.io/name: minwm-async-vae
+    app.kubernetes.io/part-of: minwm-realtime
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  replicas: REPLACE_WITH_VAE_BASE_REPLICAS
+  revisionHistoryLimit: 1
+  progressDeadlineSeconds: 1800
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-async-vae
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-async-vae
+        app.kubernetes.io/part-of: minwm-realtime
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      serviceAccountName: minwm-realtime-worker-discovery
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        seedleap.ai/vae-worker: "true"
+        karpenter.sh/capacity-type: spot
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      initContainers:
+        - name: vae-heartbeat
+          image: REPLACE_WITH_VAE_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
+              --coordinator-url=http://minwm-realtime-coordinator:18081
+              --health-url=http://127.0.0.1:18081/health
+              --state-url=http://127.0.0.1:18081/v1/realtime_worker/state
+              --worker-id=$(POD_UID)
+              --worker-epoch-file=/var/run/minwm-worker/epoch
+              --role=vae
+              --endpoint=ws://$(POD_IP):18081/v1/realtime_vae/decode
+              --reservation-endpoint=http://$(POD_IP):18081/v1/realtime_worker
+              --node-name=$(NODE_NAME)
+              --capacity=16
+              --model-revision=all
+              --vae-fingerprint=taew2_2-d053e216
+              --interval-s=5
+          env:
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+          volumeMounts:
+            - {name: worker-epoch, mountPath: /var/run/minwm-worker, readOnly: true}
+      containers:
+        - name: vae
+          image: REPLACE_WITH_VAE_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          args:
+            - --checkpoint-path=/opt/taehv/taew2_2.pth
+            - --device=cuda
+            - --dtype=bfloat16
+            - --max-sessions=16
+            - --queue-depth-per-session=1
+            # Send each encoded preview frame as soon as it is available so
+            # browser playback can smooth jitter without waiting on a mini-batch.
+            - --encoded-frames-per-batch=1
+            - --max-message-mb=64
+            - --host=0.0.0.0
+            - --port=18081
+          env:
+            - {name: WORKER_EPOCH_FILE, value: /var/run/minwm-worker/epoch}
+            - {name: OTEL_SERVICE_NAME, value: minwm-realtime-vae}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://minwm-realtime-adot:4317
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=minwm,deployment.environment=production,worker.role=vae
+          ports:
+            - {name: vae, containerPort: 18081}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -ec
+                  - |
+                    deadline=$(( $(date +%s) + 50 ))
+                    curl --fail --silent --max-time 3 \
+                      -H 'content-type: application/json' \
+                      --data "{\"deadline\":${deadline}}" \
+                      http://127.0.0.1:18081/v1/realtime_worker/drain
+                    for _ in $(seq 1 23); do
+                      state=$(curl --fail --silent --max-time 2 \
+                        http://127.0.0.1:18081/v1/realtime_worker/state) || break
+                      echo "${state}" | grep -q '"active_sessions":0' && break
+                      sleep 2
+                    done
+          startupProbe:
+            httpGet: {path: /health, port: vae}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 180
+          readinessProbe:
+            httpGet: {path: /health, port: vae}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: vae}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "6"
+              memory: 24Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7"
+              memory: 28Gi
+              ephemeral-storage: 40Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: worker-epoch, mountPath: /var/run/minwm-worker}
+      volumes:
+        - name: worker-epoch
+          emptyDir: {}

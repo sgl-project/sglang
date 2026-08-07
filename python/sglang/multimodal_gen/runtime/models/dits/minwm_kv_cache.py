@@ -563,8 +563,12 @@ class MinWMCausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
                     self.k[:, local_start:local_stop, head_slice, :] = key
                     self.v[:, local_start:local_stop, head_slice, :] = value
             else:
-                old_k = self._head_view(self.k[:, : plan.local_end_before], head_slice)
-                old_v = self._head_view(self.v[:, : plan.local_end_before], head_slice)
+                old_k = self._head_view(
+                    self.k[:, : plan.local_end_before], head_slice
+                )
+                old_v = self._head_view(
+                    self.v[:, : plan.local_end_before], head_slice
+                )
                 selected_k = self._select_kv_with_plan(old_k, key, plan)
                 selected_v = self._select_kv_with_plan(old_v, value, plan)
                 if head_slice is None:
@@ -654,7 +658,7 @@ class MinWMCausalSelfAttentionKVCache(CausalSelfAttentionKVCache):
         )
 
     def copy_committed_history_from(
-        self, other: MinWMCausalSelfAttentionKVCache
+        self, other: "MinWMCausalSelfAttentionKVCache"
     ) -> None:
         """Copy positive-branch self history while preserving cross KV elsewhere."""
         if self.rope_position_mode != other.rope_position_mode:

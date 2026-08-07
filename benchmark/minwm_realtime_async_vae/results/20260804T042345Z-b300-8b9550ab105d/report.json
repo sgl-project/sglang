@@ -1,0 +1,852 @@
+{
+  "async": {
+    "action_p95_slo_ms": 1000.0,
+    "max_supported_concurrency": 2,
+    "min_fps": 16.0,
+    "runs": [
+      {
+        "action_to_first_frame_ms": {
+          "count": 6,
+          "max": 370.941,
+          "mean": 350.6095,
+          "p50": 347.9705,
+          "p95": 370.941,
+          "p99": 370.941
+        },
+        "aggregate_fps": 46.5341735336888,
+        "chunk_total_ms": {
+          "count": 6,
+          "max": 347.0,
+          "mean": 343.8333333333333,
+          "p50": 343.0,
+          "p95": 347.0,
+          "p99": 347.0
+        },
+        "concurrency": 1,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 46.5341735336888,
+        "per_session_fps": {
+          "count": 1,
+          "max": 46.5341735336888,
+          "mean": 46.5341735336888,
+          "p50": 46.5341735336888,
+          "p95": 46.5341735336888,
+          "p99": 46.5341735336888
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 6,
+            "max": 305.732,
+            "mean": 301.29850000000005,
+            "p50": 300.2285,
+            "p95": 305.732,
+            "p99": 305.732
+          },
+          "first_frame_ms": {
+            "count": 6,
+            "max": 18.948,
+            "mean": 17.76666666666667,
+            "p50": 17.579,
+            "p95": 18.948,
+            "p99": 18.948
+          },
+          "frame_encode_ms": {
+            "count": 6,
+            "max": 121.507,
+            "mean": 120.81816666666667,
+            "p50": 120.888,
+            "p95": 121.507,
+            "p99": 121.507
+          },
+          "latent_send_ms": {
+            "count": 6,
+            "max": 0.33,
+            "mean": 0.26466666666666666,
+            "p50": 0.27449999999999997,
+            "p95": 0.33,
+            "p99": 0.33
+          },
+          "latent_serialize_ms": {
+            "count": 6,
+            "max": 0.096,
+            "mean": 0.06583333333333334,
+            "p50": 0.06,
+            "p95": 0.096,
+            "p99": 0.096
+          },
+          "overlap_ratio": {
+            "count": 6,
+            "max": 0.1174,
+            "mean": 0.09463333333333333,
+            "p50": 0.11145,
+            "p95": 0.1174,
+            "p99": 0.1174
+          },
+          "overlap_with_next_denoise_ms": {
+            "count": 6,
+            "max": 35.758,
+            "mean": 29.007166666666667,
+            "p50": 34.234,
+            "p95": 35.758,
+            "p99": 35.758
+          },
+          "vae_credit_wait_ms": {
+            "count": 6,
+            "max": 1.192,
+            "mean": 0.992,
+            "p50": 0.9724999999999999,
+            "p95": 1.192,
+            "p99": 1.192
+          },
+          "vae_decode_ms": {
+            "count": 6,
+            "max": 27.86,
+            "mean": 26.712500000000002,
+            "p50": 26.3385,
+            "p95": 27.86,
+            "p99": 27.86
+          },
+          "vae_encode_ms": {
+            "count": 6,
+            "max": 0.06,
+            "mean": 0.05766666666666667,
+            "p50": 0.0575,
+            "p95": 0.06,
+            "p99": 0.06
+          },
+          "vae_queue_wait_ms": {
+            "count": 6,
+            "max": 0.099,
+            "mean": 0.09116666666666666,
+            "p50": 0.089,
+            "p95": 0.099,
+            "p99": 0.099
+          }
+        },
+        "successful_sessions": 1
+      },
+      {
+        "action_to_first_frame_ms": {
+          "count": 12,
+          "max": 698.765,
+          "mean": 682.2090833333333,
+          "p50": 680.2215,
+          "p95": 698.765,
+          "p99": 698.765
+        },
+        "aggregate_fps": 50.420168067226896,
+        "chunk_total_ms": {
+          "count": 12,
+          "max": 647.0,
+          "mean": 634.0,
+          "p50": 633.0,
+          "p95": 647.0,
+          "p99": 647.0
+        },
+        "concurrency": 2,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 25.210084033613448,
+        "per_session_fps": {
+          "count": 2,
+          "max": 25.263157894736842,
+          "mean": 25.236620964175145,
+          "p50": 25.236620964175145,
+          "p95": 25.263157894736842,
+          "p99": 25.263157894736842
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 12,
+            "max": 299.333,
+            "mean": 295.3025,
+            "p50": 295.0105,
+            "p95": 299.333,
+            "p99": 299.333
+          },
+          "first_frame_ms": {
+            "count": 12,
+            "max": 23.202,
+            "mean": 17.7145,
+            "p50": 17.038,
+            "p95": 23.202,
+            "p99": 23.202
+          },
+          "frame_encode_ms": {
+            "count": 12,
+            "max": 124.789,
+            "mean": 120.40625,
+            "p50": 120.17150000000001,
+            "p95": 124.789,
+            "p99": 124.789
+          },
+          "latent_send_ms": {
+            "count": 12,
+            "max": 0.202,
+            "mean": 0.17791666666666664,
+            "p50": 0.175,
+            "p95": 0.202,
+            "p99": 0.202
+          },
+          "latent_serialize_ms": {
+            "count": 12,
+            "max": 0.059,
+            "mean": 0.05533333333333334,
+            "p50": 0.055,
+            "p95": 0.059,
+            "p99": 0.059
+          },
+          "overlap_ratio": {
+            "count": 12,
+            "max": 0.0594,
+            "mean": 0.04841666666666666,
+            "p50": 0.05795,
+            "p95": 0.0594,
+            "p99": 0.0594
+          },
+          "overlap_with_next_denoise_ms": {
+            "count": 12,
+            "max": 35.652,
+            "mean": 28.851,
+            "p50": 34.5455,
+            "p95": 35.652,
+            "p99": 35.652
+          },
+          "vae_credit_wait_ms": {
+            "count": 12,
+            "max": 1.971,
+            "mean": 0.9674999999999999,
+            "p50": 0.8654999999999999,
+            "p95": 1.971,
+            "p99": 1.971
+          },
+          "vae_decode_ms": {
+            "count": 12,
+            "max": 38.532,
+            "mean": 27.895583333333335,
+            "p50": 26.555,
+            "p95": 38.532,
+            "p99": 38.532
+          },
+          "vae_encode_ms": {
+            "count": 12,
+            "max": 0.064,
+            "mean": 0.05908333333333333,
+            "p50": 0.058,
+            "p95": 0.064,
+            "p99": 0.064
+          },
+          "vae_queue_wait_ms": {
+            "count": 12,
+            "max": 0.104,
+            "mean": 0.08850000000000001,
+            "p50": 0.087,
+            "p95": 0.104,
+            "p99": 0.104
+          }
+        },
+        "successful_sessions": 2
+      },
+      {
+        "action_to_first_frame_ms": {
+          "count": 24,
+          "max": 1318.826,
+          "mean": 1257.4311666666665,
+          "p50": 1251.058,
+          "p95": 1316.174,
+          "p99": 1318.826
+        },
+        "aggregate_fps": 51.84985147177964,
+        "chunk_total_ms": {
+          "count": 24,
+          "max": 1241.0,
+          "mean": 1233.9166666666667,
+          "p50": 1235.0,
+          "p95": 1240.0,
+          "p99": 1241.0
+        },
+        "concurrency": 4,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 12.96246286794491,
+        "per_session_fps": {
+          "count": 4,
+          "max": 12.972972972972972,
+          "mean": 12.966841250289626,
+          "p50": 12.96596458012031,
+          "p95": 12.972972972972972,
+          "p99": 12.972972972972972
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 24,
+            "max": 299.807,
+            "mean": 295.89620833333333,
+            "p50": 295.3405,
+            "p95": 299.655,
+            "p99": 299.807
+          },
+          "first_frame_ms": {
+            "count": 24,
+            "max": 20.547,
+            "mean": 17.853083333333334,
+            "p50": 17.576999999999998,
+            "p95": 19.934,
+            "p99": 20.547
+          },
+          "frame_encode_ms": {
+            "count": 24,
+            "max": 126.768,
+            "mean": 119.79754166666667,
+            "p50": 119.253,
+            "p95": 124.964,
+            "p99": 126.768
+          },
+          "latent_send_ms": {
+            "count": 24,
+            "max": 0.324,
+            "mean": 0.21762499999999999,
+            "p50": 0.208,
+            "p95": 0.285,
+            "p99": 0.324
+          },
+          "latent_serialize_ms": {
+            "count": 24,
+            "max": 0.072,
+            "mean": 0.058375,
+            "p50": 0.057,
+            "p95": 0.066,
+            "p99": 0.072
+          },
+          "overlap_ratio": {
+            "count": 24,
+            "max": 0.032,
+            "mean": 0.0247375,
+            "p50": 0.028900000000000002,
+            "p95": 0.0317,
+            "p99": 0.032
+          },
+          "overlap_with_next_denoise_ms": {
+            "count": 24,
+            "max": 38.29,
+            "mean": 29.613041666666664,
+            "p50": 34.662000000000006,
+            "p95": 38.01,
+            "p99": 38.29
+          },
+          "vae_credit_wait_ms": {
+            "count": 24,
+            "max": 1.221,
+            "mean": 0.9597083333333334,
+            "p50": 0.9464999999999999,
+            "p95": 1.184,
+            "p99": 1.221
+          },
+          "vae_decode_ms": {
+            "count": 24,
+            "max": 30.862,
+            "mean": 27.667916666666667,
+            "p50": 27.0325,
+            "p95": 30.765,
+            "p99": 30.862
+          },
+          "vae_encode_ms": {
+            "count": 24,
+            "max": 0.082,
+            "mean": 0.06125,
+            "p50": 0.058499999999999996,
+            "p95": 0.069,
+            "p99": 0.082
+          },
+          "vae_queue_wait_ms": {
+            "count": 24,
+            "max": 0.12,
+            "mean": 0.09304166666666668,
+            "p50": 0.0925,
+            "p95": 0.114,
+            "p99": 0.12
+          }
+        },
+        "successful_sessions": 4
+      },
+      {
+        "action_to_first_frame_ms": {
+          "count": 48,
+          "max": 2500.94,
+          "mean": 2453.707729166667,
+          "p50": 2455.3235,
+          "p95": 2495.226,
+          "p99": 2500.94
+        },
+        "aggregate_fps": 52.72914521112256,
+        "chunk_total_ms": {
+          "count": 48,
+          "max": 2442.0,
+          "mean": 2426.7916666666665,
+          "p50": 2428.0,
+          "p95": 2440.0,
+          "p99": 2442.0
+        },
+        "concurrency": 8,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 6.59114315139032,
+        "per_session_fps": {
+          "count": 8,
+          "max": 6.595218466611707,
+          "mean": 6.593067263717245,
+          "p50": 6.59295381174244,
+          "p95": 6.595218466611707,
+          "p99": 6.595218466611707
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 48,
+            "max": 299.286,
+            "mean": 295.1557291666667,
+            "p50": 294.985,
+            "p95": 298.52,
+            "p99": 299.286
+          },
+          "first_frame_ms": {
+            "count": 48,
+            "max": 21.812,
+            "mean": 18.356270833333333,
+            "p50": 18.421,
+            "p95": 19.958,
+            "p99": 21.812
+          },
+          "frame_encode_ms": {
+            "count": 48,
+            "max": 128.006,
+            "mean": 120.33039583333334,
+            "p50": 119.926,
+            "p95": 124.285,
+            "p99": 128.006
+          },
+          "latent_send_ms": {
+            "count": 48,
+            "max": 0.631,
+            "mean": 0.21702083333333333,
+            "p50": 0.194,
+            "p95": 0.293,
+            "p99": 0.631
+          },
+          "latent_serialize_ms": {
+            "count": 48,
+            "max": 0.085,
+            "mean": 0.05997916666666667,
+            "p50": 0.057,
+            "p95": 0.08,
+            "p99": 0.085
+          },
+          "overlap_ratio": {
+            "count": 48,
+            "max": 0.0174,
+            "mean": 0.013072916666666665,
+            "p50": 0.0155,
+            "p95": 0.0172,
+            "p99": 0.0174
+          },
+          "overlap_with_next_denoise_ms": {
+            "count": 48,
+            "max": 41.747,
+            "mean": 31.224979166666667,
+            "p50": 37.170500000000004,
+            "p95": 41.089,
+            "p99": 41.747
+          },
+          "vae_credit_wait_ms": {
+            "count": 48,
+            "max": 2.16,
+            "mean": 1.1122291666666666,
+            "p50": 0.9995,
+            "p95": 1.711,
+            "p99": 2.16
+          },
+          "vae_decode_ms": {
+            "count": 48,
+            "max": 31.554,
+            "mean": 28.783583333333336,
+            "p50": 29.1645,
+            "p95": 31.267,
+            "p99": 31.554
+          },
+          "vae_encode_ms": {
+            "count": 48,
+            "max": 0.076,
+            "mean": 0.059520833333333335,
+            "p50": 0.058,
+            "p95": 0.064,
+            "p99": 0.076
+          },
+          "vae_queue_wait_ms": {
+            "count": 48,
+            "max": 0.172,
+            "mean": 0.09781250000000001,
+            "p50": 0.093,
+            "p95": 0.125,
+            "p99": 0.172
+          }
+        },
+        "successful_sessions": 8
+      }
+    ]
+  },
+  "baseline": {
+    "action_p95_slo_ms": 1000.0,
+    "max_supported_concurrency": 2,
+    "min_fps": 16.0,
+    "runs": [
+      {
+        "action_to_first_frame_ms": {
+          "count": 6,
+          "max": 452.178,
+          "mean": 408.258,
+          "p50": 410.368,
+          "p95": 452.178,
+          "p99": 452.178
+        },
+        "aggregate_fps": 41.37931034482759,
+        "chunk_total_ms": {
+          "count": 6,
+          "max": 393.0,
+          "mean": 386.6666666666667,
+          "p50": 384.5,
+          "p95": 393.0,
+          "p99": 393.0
+        },
+        "concurrency": 1,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 41.37931034482759,
+        "per_session_fps": {
+          "count": 1,
+          "max": 41.37931034482759,
+          "mean": 41.37931034482759,
+          "p50": 41.37931034482759,
+          "p95": 41.37931034482759,
+          "p99": 41.37931034482759
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 6,
+            "max": 305.271,
+            "mean": 302.9975,
+            "p50": 302.44,
+            "p95": 305.271,
+            "p99": 305.271
+          },
+          "vae_decode_ms": {
+            "count": 6,
+            "max": 15.248,
+            "mean": 15.161833333333334,
+            "p50": 15.148,
+            "p95": 15.248,
+            "p99": 15.248
+          },
+          "vae_encode_ms": {
+            "count": 6,
+            "max": 0.062,
+            "mean": 0.057499999999999996,
+            "p50": 0.057,
+            "p95": 0.062,
+            "p99": 0.062
+          }
+        },
+        "successful_sessions": 1
+      },
+      {
+        "action_to_first_frame_ms": {
+          "count": 12,
+          "max": 754.984,
+          "mean": 714.5773333333333,
+          "p50": 716.6715,
+          "p95": 754.984,
+          "p99": 754.984
+        },
+        "aggregate_fps": 45.790603386596715,
+        "chunk_total_ms": {
+          "count": 12,
+          "max": 703.0,
+          "mean": 698.5833333333334,
+          "p50": 699.0,
+          "p95": 703.0,
+          "p99": 703.0
+        },
+        "concurrency": 2,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 22.895301693298357,
+        "per_session_fps": {
+          "count": 2,
+          "max": 22.911694510739856,
+          "mean": 22.903498102019107,
+          "p50": 22.903498102019107,
+          "p95": 22.911694510739856,
+          "p99": 22.911694510739856
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 12,
+            "max": 301.837,
+            "mean": 298.92924999999997,
+            "p50": 298.4065,
+            "p95": 301.837,
+            "p99": 301.837
+          },
+          "vae_decode_ms": {
+            "count": 12,
+            "max": 15.287,
+            "mean": 15.100999999999999,
+            "p50": 15.072,
+            "p95": 15.287,
+            "p99": 15.287
+          },
+          "vae_encode_ms": {
+            "count": 12,
+            "max": 0.065,
+            "mean": 0.059416666666666666,
+            "p50": 0.0595,
+            "p95": 0.065,
+            "p99": 0.065
+          }
+        },
+        "successful_sessions": 2
+      },
+      {
+        "action_to_first_frame_ms": {
+          "count": 24,
+          "max": 1408.082,
+          "mean": 1362.0072499999999,
+          "p50": 1362.2015000000001,
+          "p95": 1407.752,
+          "p99": 1408.082
+        },
+        "aggregate_fps": 47.50711369541012,
+        "chunk_total_ms": {
+          "count": 24,
+          "max": 1350.0,
+          "mean": 1346.8333333333333,
+          "p50": 1348.0,
+          "p95": 1350.0,
+          "p99": 1350.0
+        },
+        "concurrency": 4,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 11.87677842385253,
+        "per_session_fps": {
+          "count": 4,
+          "max": 11.881188118811881,
+          "mean": 11.8797181295443,
+          "p50": 11.880452987756392,
+          "p95": 11.881188118811881,
+          "p99": 11.881188118811881
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 24,
+            "max": 302.127,
+            "mean": 297.854875,
+            "p50": 297.257,
+            "p95": 300.653,
+            "p99": 302.127
+          },
+          "vae_decode_ms": {
+            "count": 24,
+            "max": 15.222,
+            "mean": 15.060708333333332,
+            "p50": 15.04,
+            "p95": 15.185,
+            "p99": 15.222
+          },
+          "vae_encode_ms": {
+            "count": 24,
+            "max": 0.066,
+            "mean": 0.05741666666666667,
+            "p50": 0.057,
+            "p95": 0.062,
+            "p99": 0.066
+          }
+        },
+        "successful_sessions": 4
+      },
+      {
+        "action_to_first_frame_ms": {
+          "count": 48,
+          "max": 2711.864,
+          "mean": 2656.2001875,
+          "p50": 2655.203,
+          "p95": 2705.561,
+          "p99": 2711.864
+        },
+        "aggregate_fps": 48.49097108220735,
+        "chunk_total_ms": {
+          "count": 48,
+          "max": 2650.0,
+          "mean": 2638.5208333333335,
+          "p50": 2637.0,
+          "p95": 2646.0,
+          "p99": 2650.0
+        },
+        "concurrency": 8,
+        "error_rate": 0.0,
+        "errors": [],
+        "min_session_fps": 6.061371385275919,
+        "per_session_fps": {
+          "count": 8,
+          "max": 6.065584128388197,
+          "mean": 6.064003908227342,
+          "p50": 6.064243081126202,
+          "p95": 6.065584128388197,
+          "p99": 6.065584128388197
+        },
+        "stage_ms": {
+          "denoise_ms": {
+            "count": 48,
+            "max": 302.117,
+            "mean": 297.21845833333333,
+            "p50": 297.09749999999997,
+            "p95": 299.457,
+            "p99": 302.117
+          },
+          "vae_decode_ms": {
+            "count": 48,
+            "max": 15.285,
+            "mean": 15.1246875,
+            "p50": 15.116,
+            "p95": 15.203,
+            "p99": 15.285
+          },
+          "vae_encode_ms": {
+            "count": 48,
+            "max": 0.076,
+            "mean": 0.057895833333333334,
+            "p50": 0.057,
+            "p95": 0.064,
+            "p99": 0.076
+          }
+        },
+        "successful_sessions": 8
+      }
+    ]
+  },
+  "comparison": {
+    "async_fps": 46.5341735336888,
+    "async_improvement_pct": 17.9657126175975,
+    "async_p95_ms": 370.941,
+    "baseline_fps": 41.37931034482759,
+    "baseline_p95_ms": 452.178,
+    "by_concurrency": [
+      {
+        "action_improvement_pct": 17.9657126175975,
+        "async_action_p95_ms": 370.941,
+        "async_chunk_p95_ms": 347.0,
+        "async_fps": 46.5341735336888,
+        "baseline_action_p95_ms": 452.178,
+        "baseline_chunk_p95_ms": 393.0,
+        "baseline_fps": 41.37931034482759,
+        "chunk_improvement_pct": 11.704834605597965,
+        "concurrency": 1,
+        "throughput_improvement_pct": 12.457586039747932
+      },
+      {
+        "action_improvement_pct": 7.446382969705325,
+        "async_action_p95_ms": 698.765,
+        "async_chunk_p95_ms": 647.0,
+        "async_fps": 50.420168067226896,
+        "baseline_action_p95_ms": 754.984,
+        "baseline_chunk_p95_ms": 703.0,
+        "baseline_fps": 45.790603386596715,
+        "chunk_improvement_pct": 7.965860597439544,
+        "concurrency": 2,
+        "throughput_improvement_pct": 10.110294117647058
+      },
+      {
+        "action_improvement_pct": 6.505265131926645,
+        "async_action_p95_ms": 1316.174,
+        "async_chunk_p95_ms": 1240.0,
+        "async_fps": 51.84985147177964,
+        "baseline_action_p95_ms": 1407.752,
+        "baseline_chunk_p95_ms": 1350.0,
+        "baseline_fps": 47.50711369541012,
+        "chunk_improvement_pct": 8.148148148148149,
+        "concurrency": 4,
+        "throughput_improvement_pct": 9.141236834998649
+      },
+      {
+        "action_improvement_pct": 7.774173267577409,
+        "async_action_p95_ms": 2495.226,
+        "async_chunk_p95_ms": 2440.0,
+        "async_fps": 52.72914521112256,
+        "baseline_action_p95_ms": 2705.561,
+        "baseline_chunk_p95_ms": 2646.0,
+        "baseline_fps": 48.49097108220735,
+        "chunk_improvement_pct": 7.785336356764929,
+        "concurrency": 8,
+        "throughput_improvement_pct": 8.740130449708204
+      }
+    ],
+    "comparison_concurrency": 1
+  },
+  "hardware": {
+    "async": {
+      "account_id": "107014413969",
+      "account_profile": "aws03",
+      "capacity_type": "capacity-block",
+      "checkpoint": "s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt",
+      "cluster": "leap-world-aws03-usw2",
+      "cuda": "13.0",
+      "denoiser": {
+        "cuda_visible_devices": "0",
+        "gpu_count": 1,
+        "gpu_type": "NVIDIA B300 SXM6 AC"
+      },
+      "gpu_driver": "580.159.03",
+      "instance_type": "p6-b300.48xlarge",
+      "node": "ip-172-31-43-49.us-west-2.compute.internal",
+      "node_gpu_count": 8,
+      "region": "us-west-2",
+      "reservation_id": "cr-0d4ac3e93331c7939",
+      "sglang_git_sha": "8b9550ab105d",
+      "torch": "2.12.1+cu130",
+      "vae": {
+        "backend": "TAEHV taew2_2",
+        "cuda_visible_devices": "1",
+        "gpu_count": 1,
+        "gpu_type": "NVIDIA B300 SXM6 AC",
+        "placement": "dedicated VAE worker"
+      }
+    },
+    "baseline": {
+      "account_id": "107014413969",
+      "account_profile": "aws03",
+      "capacity_type": "capacity-block",
+      "checkpoint": "s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt",
+      "cluster": "leap-world-aws03-usw2",
+      "cuda": "13.0",
+      "denoiser": {
+        "cuda_visible_devices": "0",
+        "gpu_count": 1,
+        "gpu_type": "NVIDIA B300 SXM6 AC"
+      },
+      "gpu_driver": "580.159.03",
+      "instance_type": "p6-b300.48xlarge",
+      "node": "ip-172-31-43-49.us-west-2.compute.internal",
+      "node_gpu_count": 8,
+      "region": "us-west-2",
+      "reservation_id": "cr-0d4ac3e93331c7939",
+      "sglang_git_sha": "8b9550ab105d",
+      "torch": "2.12.1+cu130",
+      "vae": {
+        "backend": "TAEHV taew2_2",
+        "gpu_count": 0,
+        "gpu_type": "NVIDIA B300 SXM6 AC",
+        "placement": "denoiser GPU 0"
+      }
+    }
+  },
+  "schema_version": "minwm-async-vae-report/v1"
+}

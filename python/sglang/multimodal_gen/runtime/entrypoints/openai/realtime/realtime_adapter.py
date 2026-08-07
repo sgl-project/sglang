@@ -225,6 +225,18 @@ class BaseRealtimeModelAdapter:
         )
         return batch
 
+    def refresh_queued_request(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+        batch: Req,
+        event_kind: str,
+    ) -> Req | None:
+        """Return a replacement for a chunk that has not reached GPU dispatch."""
+        del session, server_args, chunk, batch, event_kind
+        return None
+
     def apply_realtime_request_fields(
         self,
         batch: Req,
@@ -234,11 +246,14 @@ class BaseRealtimeModelAdapter:
         event_id: int | None,
     ) -> None:
         batch.realtime_session_id = session.id
+        batch.realtime_generation_id = session.generation_id
         batch.realtime_trace_id = session.trace_id
         batch.realtime_trace_started_at = session.trace_started_at
         batch.return_raw_frames = True
         batch.block_idx = chunk.index
         batch.realtime_event_id = event_id
+        batch.realtime_action_version = chunk.action_version
+        batch.realtime_prompt_version = chunk.prompt_version
         if session.request is None:
             return
         batch.realtime_output_format = normalize_realtime_output_format(
@@ -250,10 +265,6 @@ class BaseRealtimeModelAdapter:
         batch.realtime_causal_kv_cache_num_frames = (
             session.request.realtime_causal_kv_cache_num_frames
         )
-        if session.request.max_chunks is not None:
-            batch.extra["realtime_is_final_chunk"] = (
-                chunk.index == session.request.max_chunks - 1
-            )
 
     async def send_output(
         self,

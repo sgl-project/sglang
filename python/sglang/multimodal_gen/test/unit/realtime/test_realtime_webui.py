@@ -32,7 +32,7 @@ def test_realtime_webui_supports_deployment_runtime_config():
     assert 'os.environ.get("REALTIME_UI_CONFIG_JSON", "{}")' in proxy_server
     assert 'app.router.add_get("/runtime-config.js", _runtime_config)' in proxy_server
     assert '<script src="./runtime-config.js"></script>' in index_html
-    assert 'configuredNumber("targetFps", 16)' in app_js
+    assert 'configuredNumber("targetFps", 24)' in app_js
     assert "UI_CONFIG.targetFps == null ? preset.fps : DEFAULT_TARGET_FPS" in app_js
 
 
@@ -50,14 +50,29 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert 'id="referenceSection"' in index_html
     assert 'id="t2vFrameHint"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-t2v-dump-trace-v1" in index_html
+    assert "playback_controller.js?v=realtime-playback-v28" in index_html
+    assert "app.js?v=realtime-production-gateway-v17" in index_html
+    assert 'id="size" value="1280x704"' in index_html
+    assert '<option value="smooth_timeline" selected>' in index_html
     assert "UI_CONFIG.generationModes" in app_js
     assert "UI_CONFIG.generationMode" in app_js
     assert "CONFIGURED_DEFAULT_GENERATION_MODE" in app_js
     assert "generation_mode: generationMode" in app_js
     assert 'generationMode === "i2v"' in app_js
-    assert "numFrames = readT2VNumFrames()" in app_js
+    assert 'const continuousT2V = generationMode === "t2v"' in app_js
+    assert "numFrames = continuousT2V ? undefined : readT2VNumFrames()" in app_js
+    assert "num_frames: continuousT2V ? undefined : numFrames" in app_js
+    assert "const DEFAULT_T2V_NUM_FRAMES = 9;" in app_js
+    assert 'configuredNumber("t2vDefaultNumFrames"' not in app_js
+    assert "let savedT2VNumFrames = String(DEFAULT_T2V_NUM_FRAMES);" in app_js
+    assert "let savedT2VContinuous = true" in app_js
+    assert 'savedT2VNumFrames = $("numFrames").value;' in app_js
+    assert '$("numFrames").value = savedT2VNumFrames;' in app_js
     assert 'max_chunks: generationMode === "t2v"' in app_js
+    assert '$(' + '"continuous"' + ').disabled = false' in app_js
+    assert "let savedT2VContinuous = true" in app_js
+    assert '$(' + '"continuous"' + ').checked = savedT2VContinuous' in app_js
+    assert '"Continuous T2V session"' in app_js
     assert '$("referenceSection").hidden = isT2V' in app_js
 
 
@@ -79,7 +94,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "ControlStateController" in app_js
     assert 'const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";' in app_js
     assert 'id="transportFormat"' in index_html
-    assert 'id="fps" type="number" value="16"' in index_html
+    assert 'id="fps" type="number" value="24"' in index_html
     assert 'id="superResolution" type="checkbox"' in index_html
     assert 'id="upscalingScale"' in index_html
     assert 'class="workspace"' in index_html
@@ -107,11 +122,12 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-t2v-dump-trace-v1" in index_html
-    assert (
-        'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
-    )
-    assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 16);' in app_js
+    assert "app.js?v=realtime-production-gateway-v17" in index_html
+    assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
+    assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 24);' in app_js
+    assert 'const DEFAULT_PREVIEW_MAX_WIDTH = configuredNumber("previewMaxWidth", 832);' in app_js
+    assert 'const MAX_AUTO_PREVIEW_WIDTH = configuredNumber("maxAutoPreviewWidth", 1280);' in app_js
+    assert "function previewMaxWidthForSize(baseSize)" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_EXP = 1;" in app_js
     assert "const DEFAULT_FRAME_INTERPOLATION_SCALE = 1.0;" in app_js
     assert "const DEFAULT_UPSCALING_SCALE = 2;" in app_js
@@ -134,9 +150,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert "preview_scale" in app_js
     assert "sr_scale" in app_js
     assert "playbackController.render(now" in app_js
-    assert (
-        "playbackController.enqueueDecodedFrames(header, decodedFrames, now)" in app_js
-    )
+    assert "playbackController.enqueueDecodedFrames(header, decodedFrames, now)" in app_js
     assert (
         'const REACTOR_PRESET_BASE_URL = "https://www.reactor.inc/lingbot-world-fast-v1";'
         in app_js
@@ -155,12 +169,21 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert app_js.index("Ziggy Stardust") < app_js.index("Plastic Beach")
     assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
     assert "dragon-ride.jpg" in app_js
+    assert 'referenceUrl: "./assets/dragon-ride.jpg"' in app_js
+    assert "function createPresetThumbFallback" in app_js
+    assert "thumb.onerror = () => thumb.replaceWith(createPresetThumbFallback(preset))" in app_js
+    assert "reference image unavailable" in app_js
+    assert ".preset-thumb-fallback" in styles_css
+    assert (
+        repo_root
+        / "python/sglang/multimodal_gen/apps/realtime_webui/assets/dragon-ride.jpg"
+    ).stat().st_size > 0
     assert "stageRenderFps" not in app_js
     assert 'setStatus("Receiving", "live")' in app_js
     assert "pumpDecodeQueue()" in app_js
     assert "receiveChain" not in app_js
-    assert 'message.type === "chunk_stats"' in app_js
-    assert "chunkTotal > 0 ? numFrames / chunkTotal" in app_js
+    assert 'message.type === "chunk_stats"' not in app_js
+    assert "function updateServerChunkStats" not in app_js
     assert ".stage-stat" in styles_css
     assert ".workspace" in styles_css
     assert ".preview-frame" in styles_css
@@ -189,7 +212,8 @@ def test_realtime_webui_exports_replayable_recording_artifacts_on_t2v_branch():
     assert "function recordTrajectoryEvent" in app_js
     assert "function saveRecordingArtifactFiles" in app_js
     assert "function buildReplayHtml" in app_js
-    assert "function drawRecordingInputOverlay" in app_js
+    assert "function drawRecordingStageFrame" in app_js
+    assert "function drawRecordingControls" in app_js
     assert "MediaRecorder" in app_js
     assert "mediarecorder-webm" in app_js
     assert "generation_mode: generationMode" in app_js
@@ -231,17 +255,27 @@ def test_realtime_webui_exposes_live_trace_topology_with_dump_trace_id():
     assert 'id="traceVaeEncodeText"' in index_html
     assert 'id="traceDenoiseText"' in index_html
     assert 'id="traceVaeDecodeText"' in index_html
-    assert (
-        "const traceTopologyApi = window.SGLangRealtimeTraceTopology || {};" in app_js
-    )
-    assert "function currentTracePayload" in app_js
+    assert "const traceTopologyApi = window.SGLangRealtimeTraceTopology || {};" in app_js
     assert "function traceWebSocketUrl" in app_js
-    assert 'message.type === "trace_event"' in app_js
-    assert (
-        'recordTraceTopologyEvent({ event: "server.chunk_complete", ...stats }'
-        in app_js
-    )
+    assert 'message.type === "chunk_stats"' not in app_js
     assert "currentSessionArtifact.trace_id = currentTrace.traceId" in app_js
-    assert "client_trace: currentTracePayload()" in app_js
+    assert "traceHttpClient?.enqueueClientEvent(event)" in app_js
+    assert "traceHttpClient?.setActive(true, 5000)" in app_js
+    assert "traceHttpClient?.setActive(false)" in app_js
+    assert "traceTopology?.setAggregate?.(aggregate)" in app_js
+    assert 'id="traceObservedText"' in index_html
+    assert "client_trace:" not in app_js
+    assert 'message.type === "trace_event"' not in app_js
     assert "trace-panel" in styles_css
     assert ".trace-node" in styles_css
+
+
+def test_realtime_webui_uses_frame_metadata_for_live_business_status():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+
+    assert "lastSampledEventId = Number(header.event_id || lastSampledEventId)" in app_js
+    assert "formatBytes(payloadBytes)" in app_js
+    assert "playback.sourceFps.toFixed(1)" in app_js

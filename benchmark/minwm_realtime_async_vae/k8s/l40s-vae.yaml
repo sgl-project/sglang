@@ -1,0 +1,43 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-async-vae-l40s
+  labels:
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  limits:
+    cpu: "16"
+    nvidia.com/gpu: "1"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-async-vae-l40s
+        seedleap.ai/vae-worker: "true"
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      expireAfter: 4h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ray-gpu-ec2-all
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: [us-east-2a, us-east-2b, us-east-2c]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [g6e.4xlarge, g6e.8xlarge]
+      taints:
+        - key: seedleap.ai/task
+          value: minwm-async-vae
+          effect: NoSchedule

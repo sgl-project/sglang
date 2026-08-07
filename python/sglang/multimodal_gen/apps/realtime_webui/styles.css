@@ -700,6 +700,17 @@ button:focus-visible {
   border-radius: 5px;
   border: 1px solid color-mix(in oklch, var(--line), var(--ink) 8%);
 }
+.preset-thumb-fallback {
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(135deg, rgba(77, 118, 95, 0.16), rgba(63, 96, 124, 0.14)),
+    #eef1ec;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
 .preset b { min-width: 0; font-size: 13px; }
 .preset span { min-width: 0; color: var(--muted); font-size: 11px; line-height: 1.25; }
 .preset[data-tone="green"] { border-left: 4px solid var(--green); }

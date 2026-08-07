@@ -37,7 +37,9 @@ Deployments opt in to the mode selector through runtime config:
 ```
 
 I2V sends `generation_mode: "i2v"` and requires `first_frame`. T2V sends
-`generation_mode: "t2v"`, omits `first_frame`, and uses `num_frames` as the
-complete output horizon. For MinWM, `num_frames` must equal `1 + N * 4`; the
-adapter derives the exact chunk count, so the WebUI does not send `max_chunks`
-for T2V. The `mode=i2v|t2v` query parameter can select an enabled mode.
+`generation_mode: "t2v"` and omits `first_frame`. The WebUI defaults T2V to a
+continuous session by omitting both `num_frames` and `max_chunks`; it runs until
+the user presses Stop. Uncheck Continuous to request a finite output horizon.
+For finite MinWM T2V, `num_frames` must equal `1 + N * 4`; the adapter derives
+the exact chunk count, so the WebUI does not send `max_chunks`. The
+`mode=i2v|t2v` query parameter can select an enabled mode.

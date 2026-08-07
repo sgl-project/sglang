@@ -4,24 +4,25 @@ import types
 from pathlib import Path
 
 
-def _stub_module(name, **attrs):
+def _stub_module(name, monkeypatch, **attrs):
     module = types.ModuleType(name)
     for key, value in attrs.items():
         setattr(module, key, value)
     if name == "sglang" or ".multimodal_gen" in name:
         module.__path__ = []
-    sys.modules[name] = module
+    monkeypatch.setitem(sys.modules, name, module)
     return module
 
 
 def _load_perf_logger_with_namespace_sglang(monkeypatch):
-    sglang = _stub_module("sglang", __file__=None)
-    _stub_module("sglang.multimodal_gen")
-    _stub_module("sglang.multimodal_gen.envs")
-    _stub_module("sglang.multimodal_gen.runtime")
-    _stub_module("sglang.multimodal_gen.runtime.utils")
+    sglang = _stub_module("sglang", monkeypatch, __file__=None)
+    _stub_module("sglang.multimodal_gen", monkeypatch)
+    _stub_module("sglang.multimodal_gen.envs", monkeypatch)
+    _stub_module("sglang.multimodal_gen.runtime", monkeypatch)
+    _stub_module("sglang.multimodal_gen.runtime.utils", monkeypatch)
     _stub_module(
         "sglang.multimodal_gen.runtime.utils.logging_utils",
+        monkeypatch,
         CYAN="",
         RESET="",
         _SGLDiffusionLogger=object,
@@ -30,10 +31,12 @@ def _load_perf_logger_with_namespace_sglang(monkeypatch):
     )
     _stub_module(
         "sglang.multimodal_gen.runtime.platforms",
+        monkeypatch,
         current_platform=types.SimpleNamespace(),
     )
     _stub_module(
         "torch",
+        monkeypatch,
         get_device_module=lambda: types.SimpleNamespace(
             is_available=lambda: False,
             memory_allocated=lambda: 0,
@@ -45,7 +48,10 @@ def _load_perf_logger_with_namespace_sglang(monkeypatch):
 
     module_name = "perf_logger_under_test"
     module_path = (
-        Path(__file__).resolve().parents[3] / "runtime" / "utils" / "perf_logger.py"
+        Path(__file__).resolve().parents[3]
+        / "runtime"
+        / "utils"
+        / "perf_logger.py"
     )
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)

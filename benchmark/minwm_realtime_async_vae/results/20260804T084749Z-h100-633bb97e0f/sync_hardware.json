@@ -1,0 +1,11 @@
+{
+  "code_sha": "633bb97e0fe002ccbe9c9317d71f21fd052278cd",
+  "denoiser_and_vae": {
+    "capacity_type": "spot",
+    "decoder": "TAEHV taew2_2.pth",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "gpus_allocated": 1,
+    "instance": "p5.48xlarge",
+    "physical_gpus_on_node": 8
+  }
+}

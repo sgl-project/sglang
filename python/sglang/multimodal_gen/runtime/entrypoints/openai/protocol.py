@@ -163,7 +163,6 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     realtime_causal_sink_size: Optional[int] = None
     realtime_causal_kv_cache_num_frames: Optional[int] = None
     trace_id: Optional[str] = None
-    client_trace: Optional[Dict[str, Any]] = None
 
 
 class RealtimeEvent(BaseModel):

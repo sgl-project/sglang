@@ -79,6 +79,15 @@ class ReleaseRealtimeSessionReq:
 
 
 @dataclass
+class ReplaceQueuedRealtimeReq:
+    session_id: str
+    generation_id: str
+    chunk_index: int
+    request_id: str
+    replacement: Req
+
+
+@dataclass
 class GetDisaggStatsReq:
     """Request to get disagg pipeline metrics from the scheduler."""
 

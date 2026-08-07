@@ -21,6 +21,12 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    compute_sequence_splits,
+    gather_sequence_varlen,
+    sequence_splits_are_uniform,
+    shard_sequence_varlen,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,

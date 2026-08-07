@@ -46,9 +46,3 @@ def test_fused_pack_peer_first_qkv_matches_torch(dtype, shape, world_size):
     )
     assert output.data_ptr() == output_buffer.data_ptr()
     assert torch.equal(output, expected)
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -1,0 +1,173 @@
+{
+  "hardware": {
+    "account_id": "107014413969",
+    "account_profile": "aws03",
+    "capacity_type": "capacity-block",
+    "checkpoint": "s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt",
+    "cluster": "leap-world-aws03-usw2",
+    "cuda": "13.0",
+    "denoiser": {
+      "cuda_visible_devices": "0",
+      "gpu_count": 1,
+      "gpu_type": "NVIDIA B300 SXM6 AC"
+    },
+    "gpu_driver": "580.159.03",
+    "instance_type": "p6-b300.48xlarge",
+    "node": "ip-172-31-43-49.us-west-2.compute.internal",
+    "node_gpu_count": 8,
+    "region": "us-west-2",
+    "reservation_id": "cr-0d4ac3e93331c7939",
+    "sglang_git_sha": "8b9550ab105d",
+    "torch": "2.12.1+cu130",
+    "vae": {
+      "backend": "TAEHV taew2_2",
+      "cuda_visible_devices": "1",
+      "gpu_count": 1,
+      "gpu_type": "NVIDIA B300 SXM6 AC",
+      "placement": "dedicated VAE worker"
+    }
+  },
+  "profile": "async",
+  "request": {
+    "fps": 24,
+    "measured_chunks": 6,
+    "model": "/work/model",
+    "size": "832x480",
+    "steps": 4,
+    "warmup_chunks": 2
+  },
+  "runs": [
+    {
+      "action_to_first_frame_ms": {
+        "count": 48,
+        "max": 2507.595,
+        "mean": 2457.295791666667,
+        "p50": 2452.5355,
+        "p95": 2503.276,
+        "p99": 2507.595
+      },
+      "aggregate_fps": 52.78713313629803,
+      "chunk_total_ms": {
+        "count": 48,
+        "max": 2431.0,
+        "mean": 2424.1875,
+        "p50": 2425.0,
+        "p95": 2430.0,
+        "p99": 2431.0
+      },
+      "concurrency": 16,
+      "error_rate": 0.5,
+      "errors": [
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED",
+        "realtime admission rejected: CAPACITY_EXHAUSTED"
+      ],
+      "min_session_fps": 6.598391642037254,
+      "per_session_fps": {
+        "count": 8,
+        "max": 6.602021869197442,
+        "mean": 6.600149881243441,
+        "p50": 6.5995256668904,
+        "p95": 6.602021869197442,
+        "p99": 6.602021869197442
+      },
+      "stage_ms": {
+        "denoise_ms": {
+          "count": 48,
+          "max": 299.211,
+          "mean": 294.7231458333333,
+          "p50": 294.2785,
+          "p95": 298.687,
+          "p99": 299.211
+        },
+        "first_frame_ms": {
+          "count": 48,
+          "max": 20.947,
+          "mean": 18.811625,
+          "p50": 18.708,
+          "p95": 20.358,
+          "p99": 20.947
+        },
+        "frame_encode_ms": {
+          "count": 48,
+          "max": 128.658,
+          "mean": 120.98658333333333,
+          "p50": 119.8095,
+          "p95": 128.157,
+          "p99": 128.658
+        },
+        "latent_send_ms": {
+          "count": 48,
+          "max": 0.212,
+          "mean": 0.17931249999999999,
+          "p50": 0.177,
+          "p95": 0.204,
+          "p99": 0.212
+        },
+        "latent_serialize_ms": {
+          "count": 48,
+          "max": 0.067,
+          "mean": 0.056062499999999994,
+          "p50": 0.056,
+          "p95": 0.061,
+          "p99": 0.067
+        },
+        "overlap_ratio": {
+          "count": 48,
+          "max": 0.018,
+          "mean": 0.013377083333333333,
+          "p50": 0.0158,
+          "p95": 0.0174,
+          "p99": 0.018
+        },
+        "overlap_with_next_denoise_ms": {
+          "count": 48,
+          "max": 43.007,
+          "mean": 31.9073125,
+          "p50": 37.64,
+          "p95": 41.445,
+          "p99": 43.007
+        },
+        "vae_credit_wait_ms": {
+          "count": 48,
+          "max": 1.518,
+          "mean": 0.9507291666666666,
+          "p50": 0.902,
+          "p95": 1.202,
+          "p99": 1.518
+        },
+        "vae_decode_ms": {
+          "count": 48,
+          "max": 32.913,
+          "mean": 30.0805625,
+          "p50": 29.83,
+          "p95": 31.873,
+          "p99": 32.913
+        },
+        "vae_encode_ms": {
+          "count": 48,
+          "max": 0.066,
+          "mean": 0.059708333333333335,
+          "p50": 0.059,
+          "p95": 0.065,
+          "p99": 0.066
+        },
+        "vae_queue_wait_ms": {
+          "count": 48,
+          "max": 0.148,
+          "mean": 0.09050000000000001,
+          "p50": 0.089,
+          "p95": 0.096,
+          "p99": 0.148
+        }
+      },
+      "successful_sessions": 8
+    }
+  ],
+  "schema_version": "minwm-realtime-load/v1"
+}

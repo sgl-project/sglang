@@ -13,6 +13,7 @@ from pathlib import Path
 
 import msgspec.msgpack
 import numpy as np
+
 from common import (
     action_label_sequence,
     action_weights,

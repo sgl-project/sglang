@@ -21,150 +21,6 @@ def test_realtime_vae_decode_state_clears_model_cache_on_dispose():
     assert state.reset_causal_decode_state is None
 
 
-def test_remote_vae_request_round_trips_prepared_latents(monkeypatch):
-    from sglang.multimodal_gen.runtime.remote.vae_decode_protocol import (
-        payload_to_tensor,
-    )
-
-    monkeypatch.setenv("SGLANG_REALTIME_REMOTE_VAE_URL", "http://vae:31000")
-    latents = torch.randn(1, 4, 3, 2, 2, dtype=torch.bfloat16)
-    batch = SimpleNamespace(
-        realtime_session_id="session",
-        request_id="request",
-        block_idx=7,
-        realtime_event_id=9,
-        extra={"realtime_is_final_chunk": True},
-        width=1248,
-        height=704,
-        fps=24,
-        realtime_output_format="raw",
-        latents=latents,
-    )
-
-    request = CausalVaeDecodingStage._remote_vae_request(batch)
-
-    assert request is not None
-    assert request["block_idx"] == 7
-    assert request["is_final_chunk"] is True
-    assert request["realtime_output_format"] == "raw"
-    assert request["response_transport"] == "http"
-    torch.testing.assert_close(payload_to_tensor(request["latents"]), latents)
-
-
-def test_raw_transport_batches_are_prejoined_and_split_at_wire_limit():
-    from sglang.multimodal_gen.runtime.remote.vae_decode_protocol import (
-        RAW_RGB_FRAMES_PER_TRANSPORT_BATCH,
-        build_raw_transport_batches,
-    )
-
-    frames = [bytes([index % 256]) for index in range(17)]
-    batches = build_raw_transport_batches([frames])
-
-    assert batches == [
-        [
-            {
-                "num_frames": RAW_RGB_FRAMES_PER_TRANSPORT_BATCH,
-                "payload": b"".join(frames[:RAW_RGB_FRAMES_PER_TRANSPORT_BATCH]),
-            },
-            {"num_frames": 1, "payload": frames[-1]},
-        ]
-    ]
-
-
-def test_remote_vae_client_posts_msgpack_as_requests_data(monkeypatch):
-    from sglang.multimodal_gen.runtime.remote.vae_decode_client import (
-        RemoteVAEDecodeClient,
-    )
-    from sglang.multimodal_gen.runtime.remote.vae_decode_protocol import (
-        RAW_RGB_CONTENT_TYPE,
-        SCHEMA_VERSION,
-        packb,
-        unpackb,
-    )
-
-    request = {"schema_version": SCHEMA_VERSION, "session_id": "session"}
-    expected_frames = [[b"rgb"]]
-    client = RemoteVAEDecodeClient("http://vae:31000", timeout=17)
-
-    def fake_post(url, **kwargs):
-        assert url == "http://vae:31000/decode"
-        assert "content" not in kwargs
-        assert unpackb(kwargs["data"]) == request
-        assert kwargs["headers"] == {"content-type": "application/msgpack"}
-        assert kwargs["timeout"] == 17
-        return SimpleNamespace(
-            content=packb(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "ok",
-                    "raw_frame_batches": expected_frames,
-                    "raw_frame_content_type": RAW_RGB_CONTENT_TYPE,
-                }
-            ),
-            raise_for_status=lambda: None,
-        )
-
-    monkeypatch.setattr(client.session, "post", fake_post)
-
-    result = client.decode(request)
-
-    assert result.raw_frame_batches == expected_frames
-    assert result.raw_transport_batches is None
-    assert result.raw_frame_content_type == RAW_RGB_CONTENT_TYPE
-
-
-def test_remote_vae_client_accepts_shared_memory_raw_transport(monkeypatch, tmp_path):
-    from sglang.multimodal_gen.runtime.remote.vae_decode_client import (
-        RemoteVAEDecodeClient,
-    )
-    from sglang.multimodal_gen.runtime.remote.vae_decode_protocol import (
-        RAW_RGB_CONTENT_TYPE,
-        SCHEMA_VERSION,
-        packb,
-        store_raw_transport_batches_in_shared_memory,
-    )
-
-    transport = [[{"num_frames": 2, "payload": b"abcdef"}]]
-    stored_transport = store_raw_transport_batches_in_shared_memory(
-        transport, root=tmp_path
-    )
-    monkeypatch.setenv("SGLANG_REALTIME_VAE_SHM_DIR", str(tmp_path))
-    client = RemoteVAEDecodeClient("http://vae:31000")
-    monkeypatch.setattr(
-        client.session,
-        "post",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            content=packb(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "ok",
-                    "raw_transport_batches": stored_transport,
-                    "raw_transport_storage": "shared_memory",
-                    "raw_frame_content_type": RAW_RGB_CONTENT_TYPE,
-                }
-            ),
-            raise_for_status=lambda: None,
-        ),
-    )
-
-    result = client.decode({"schema_version": SCHEMA_VERSION})
-
-    assert result.raw_frame_batches is None
-    assert result.raw_transport_batches == transport
-    assert not any(tmp_path.iterdir())
-
-
-def test_loopback_remote_vae_selects_shared_memory_transport():
-    from sglang.multimodal_gen.runtime.remote.vae_decode_client import (
-        get_remote_vae_response_transport,
-    )
-
-    assert (
-        get_remote_vae_response_transport("http://127.0.0.1:31000") == "shared_memory"
-    )
-    assert get_remote_vae_response_transport("http://vae:31000") == "http"
-
-
 def test_causal_vae_decoding_stage_keeps_wan_decoder_cache(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
         vae as realtime_vae,
@@ -369,11 +225,11 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
 
         def get_decode_scale_and_shift(self, device, dtype, vae):
             del device, dtype, vae
-            return 1.0, None
+            raise AssertionError("TAEHV must receive model-space latents directly")
 
         def preprocess_decoding(self, latents, server_args, vae=None):
-            del server_args, vae
-            return latents + 2
+            del latents, server_args, vae
+            raise AssertionError("TAEHV must bypass native VAE preprocessing")
 
     streaming = _StreamingTAEHV()
     monkeypatch.setattr(
@@ -401,8 +257,9 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
         disable_autocast=True,
     )
 
+    model_latents = torch.full((1, 48, 1, 4, 4), 1.5)
     frames = stage.decode_causal(
-        torch.zeros(1, 48, 1, 4, 4),
+        model_latents,
         server_args,
         first_chunk=True,
         decode_state=decode_state,
@@ -411,7 +268,10 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
     assert native_vae.calls == []
     assert streaming.reset_calls == 1
     assert tuple(streaming.inputs[0].shape) == (1, 1, 48, 4, 4)
-    assert torch.equal(streaming.inputs[0], torch.full((1, 1, 48, 4, 4), 2.0))
+    assert torch.equal(
+        streaming.inputs[0],
+        model_latents.permute(0, 2, 1, 3, 4),
+    )
     assert tuple(frames.shape) == (1, 3, 1, 16, 16)
     assert torch.equal(frames, torch.full((1, 3, 1, 16, 16), 0.25))
 

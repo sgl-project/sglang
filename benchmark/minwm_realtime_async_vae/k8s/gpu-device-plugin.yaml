@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: minwm-async-nvidia-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: minwm-async-nvidia-device-plugin
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-async-nvidia-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-async-nvidia-device-plugin
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      priorityClassName: system-node-critical
+      nodeSelector:
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+      tolerations:
+        - key: seedleap.ai/task
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.19.1
+          imagePullPolicy: IfNotPresent
+          command: [nvidia-device-plugin]
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: kubelet-device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: kubelet-device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory

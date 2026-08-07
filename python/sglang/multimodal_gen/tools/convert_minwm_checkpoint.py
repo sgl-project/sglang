@@ -250,7 +250,10 @@ def build_transformer_config(
         raise ValueError("sink_size must be smaller than finite local_attn_size")
     if sliding_window_num_frames <= 0:
         raise ValueError("sliding_window_num_frames must be positive")
-    if local_attn_size != -1 and sliding_window_num_frames != local_attn_size:
+    if (
+        local_attn_size != -1
+        and sliding_window_num_frames != local_attn_size
+    ):
         raise ValueError(
             "bounded MinWM requires sliding_window_num_frames to equal "
             "local_attn_size"

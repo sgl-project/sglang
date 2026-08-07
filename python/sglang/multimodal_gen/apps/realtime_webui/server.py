@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+
 ROOT = Path(__file__).resolve().parent
 UPSTREAM_HTTP = os.environ.get("REALTIME_UPSTREAM_HTTP", "http://127.0.0.1:30000")
 UPSTREAM_WS = os.environ.get("REALTIME_UPSTREAM_WS", "ws://127.0.0.1:30000")

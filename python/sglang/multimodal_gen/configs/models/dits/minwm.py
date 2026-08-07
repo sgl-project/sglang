@@ -96,7 +96,10 @@ class MinWMVideoArchConfig(DiTArchConfig):
             raise ValueError("MinWM local_attn_size must be -1 or positive")
         if self.sink_size < 0:
             raise ValueError("MinWM sink_size must be non-negative")
-        if self.local_attn_size != -1 and self.sink_size >= self.local_attn_size:
+        if (
+            self.local_attn_size != -1
+            and self.sink_size >= self.local_attn_size
+        ):
             raise ValueError("MinWM sink_size must be smaller than local_attn_size")
         if (
             self.local_attn_size != -1

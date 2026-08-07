@@ -62,5 +62,15 @@ assert.doesNotMatch(
   /socket\.close\(expectedClose \? 1000 : 1011/,
   "browser WebSocket.close must not use reserved server close code 1011 from client JS",
 );
+assert.doesNotMatch(
+  appJs,
+  /socket\.close\(expectedClose \? 1000 : 1008/,
+  "browser WebSocket.close must not use reserved server close code 1008 from client JS",
+);
+assert.match(
+  appJs,
+  /socket\.close\(expectedClose \? 1000 : 4000/,
+  "browser aborts should use an application-defined close code",
+);
 
 console.log("realtime msgpack codec ok");

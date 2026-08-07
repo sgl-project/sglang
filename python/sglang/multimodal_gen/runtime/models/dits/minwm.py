@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import importlib.util
 import inspect
+import importlib.util
 import logging
 import os
 from functools import lru_cache
@@ -47,8 +47,8 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanSelfAttention,
-    CausalWanTransformer3DModel,
     CausalWanTransformerBlock,
+    CausalWanTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
     PrimitiveRoPETokenResidualActionEncoder,

@@ -11,6 +11,13 @@
     "denoiseMs",
     "vaeEncodeMs",
     "vaeDecodeMs",
+    "vaeQueueWaitMs",
+    "latentSerializeMs",
+    "latentTransferMs",
+    "frameEncodeMs",
+    "frameTransferMs",
+    "overlapMs",
+    "overlapRatio",
     "postDecodeMs",
     "rawPayloadBuildMs",
     "wsWriteMs",
@@ -40,12 +47,36 @@
     let events = [];
     let eventKeys = new Set();
     let chunks = new Map();
+    let aggregate = null;
+    let aggregateMetricSignature = "";
 
     function reset(nextTraceId = "") {
       traceId = String(nextTraceId || "");
       events = [];
       eventKeys = new Set();
       chunks = new Map();
+      aggregate = null;
+      aggregateMetricSignature = "";
+    }
+
+    function setAggregate(nextAggregate) {
+      if (!nextAggregate || !Array.isArray(nextAggregate.stages)) return false;
+      if (traceId && nextAggregate.trace_id && nextAggregate.trace_id !== traceId) {
+        return false;
+      }
+      if (!traceId && nextAggregate.trace_id) traceId = String(nextAggregate.trace_id);
+      const nextSignature = JSON.stringify(nextAggregate.stages.map((stage) => [
+        stage.id,
+        stage.count,
+        stage.avg_ms,
+        stage.p50_ms,
+        stage.p95_ms,
+        stage.max_ms,
+      ]));
+      const changed = nextSignature !== aggregateMetricSignature;
+      aggregate = nextAggregate;
+      aggregateMetricSignature = nextSignature;
+      return changed;
     }
 
     function addEvent(rawEvent, receivedPerfMs = 0) {
@@ -88,8 +119,8 @@
         sortedChunks,
         latestTimedChunk(sortedChunks) || latestObservedChunk,
       );
-      const nodes = buildNodes(latestChunk, events);
-      const edges = buildEdges(latestChunk, events);
+      const nodes = buildNodes(latestChunk, events, aggregate);
+      const edges = buildEdges(latestChunk, events, aggregate);
       return {
         traceId,
         eventCount: events.length,
@@ -99,12 +130,13 @@
         latestChunk,
         nodes,
         edges,
+        aggregate,
         asyncEstimate: estimateAsyncVae(latestChunk, transferBudgetMs),
       };
     }
 
     reset(options.traceId || "");
-    return { addEvent, reset, summary };
+    return { addEvent, reset, setAggregate, summary };
   }
 
   function normalizeTraceEvent(rawEvent, receivedPerfMs = 0) {
@@ -145,6 +177,13 @@
         denoiseMs: null,
         vaeEncodeMs: null,
         vaeDecodeMs: null,
+        vaeQueueWaitMs: null,
+        latentSerializeMs: null,
+        latentTransferMs: null,
+        frameEncodeMs: null,
+        frameTransferMs: null,
+        overlapMs: null,
+        overlapRatio: null,
         postDecodeMs: null,
         rawPayloadBuildMs: null,
         wsWriteMs: null,
@@ -175,6 +214,27 @@
       assignNumber(chunk, "vaeEncodeMs", preferredDuration(event));
     } else if (event.event === "server.vae_decode_complete") {
       assignNumber(chunk, "vaeDecodeMs", preferredDuration(event));
+    } else if (event.event === "server.vae_queue_wait_complete") {
+      assignNumber(chunk, "vaeQueueWaitMs", preferredDuration(event));
+    } else if (event.event === "server.latent_transfer_accepted") {
+      assignNumber(chunk, "latentSerializeMs", event.latent_serialize_ms);
+      assignNumber(chunk, "latentTransferMs", sumNumbers(event.latent_send_ms, event.vae_credit_wait_ms));
+    } else if (event.event === "server.frame_encode_complete") {
+      assignNumber(chunk, "frameEncodeMs", preferredDuration(event));
+    } else if (event.event === "server.frame_transfer_complete") {
+      assignNumber(chunk, "frameTransferMs", preferredDuration(event));
+    } else if (event.event === "server.remote_vae_complete") {
+      assignNumber(chunk, "vaeQueueWaitMs", event.vae_queue_wait_ms);
+      assignNumber(chunk, "vaeDecodeMs", event.vae_decode_ms);
+      assignNumber(chunk, "latentSerializeMs", event.latent_serialize_ms);
+      assignNumber(chunk, "latentTransferMs", sumNumbers(event.latent_send_ms, event.vae_credit_wait_ms));
+      assignNumber(chunk, "frameEncodeMs", event.frame_encode_ms);
+      assignNumber(chunk, "frameTransferMs", event.latent_to_gateway_complete_ms);
+      assignNumber(chunk, "overlapMs", event.overlap_with_next_denoise_ms);
+      assignNumber(chunk, "overlapRatio", event.overlap_ratio);
+    } else if (event.event === "server.vae_denoise_overlap_complete") {
+      assignNumber(chunk, "overlapMs", event.overlap_with_next_denoise_ms);
+      assignNumber(chunk, "overlapRatio", event.overlap_ratio);
     } else if (event.event === "server.post_decode_complete") {
       assignNumber(chunk, "postDecodeMs", preferredDuration(event));
     } else if (event.event === "server.pipeline_stage_complete") {
@@ -186,27 +246,47 @@
     }
   }
 
-  function buildNodes(latestChunk, events) {
+  function buildNodes(latestChunk, events, aggregate) {
     const latestByStage = latestEventsByStage(events);
+    const aggregateByStage = new Map(
+      (aggregate?.stages || []).map((stage) => [String(stage.id || ""), stage]),
+    );
     return STAGES.map((stage) => {
       const event = latestByStage.get(stage.id);
-      const metric = stageMetric(stage.id, latestChunk, event);
+      const stageAggregate = aggregateByStage.get(stage.id);
+      const metric = aggregateMetric(stageAggregate)
+        || stageMetric(stage.id, latestChunk, event);
       return {
         ...stage,
         metric,
-        status: event ? "active" : "idle",
+        status: Number(stageAggregate?.count || 0) > 0 || event ? "active" : "idle",
       };
     });
   }
 
-  function buildEdges(latestChunk, events) {
+  function buildEdges(latestChunk, events, aggregate) {
+    const aggregateByStage = new Map(
+      (aggregate?.stages || []).map((stage) => [String(stage.id || ""), stage]),
+    );
     const edges = [];
     for (let i = 0; i < STAGES.length - 1; i += 1) {
       const from = STAGES[i].id;
       const to = STAGES[i + 1].id;
-      edges.push({ from, to, label: edgeMetric(from, to, latestChunk, events) });
+      const aggregateLabel = aggregateMetric(aggregateByStage.get(to));
+      edges.push({
+        from,
+        to,
+        label: aggregateLabel || edgeMetric(from, to, latestChunk, events),
+      });
     }
     return edges;
+  }
+
+  function aggregateMetric(stage) {
+    if (!stage || Number(stage.count || 0) <= 0) return "";
+    const p50 = formatTraceDuration(stage.p50_ms);
+    const p95 = formatTraceDuration(stage.p95_ms);
+    return `p50 ${p50} · p95 ${p95}`;
   }
 
   function latestEventsByStage(events) {
@@ -250,10 +330,15 @@
     if (eventName === "server.model_denoise_complete") return "denoise";
     if (
       eventName === "server.vae_decode_complete" ||
+      eventName === "server.vae_queue_wait_complete" ||
+      eventName === "server.frame_encode_complete" ||
       eventName === "server.post_decode_complete"
     ) return "vae_decode";
     if (
       eventName === "server.output_send_start" ||
+      eventName === "server.latent_transfer_accepted" ||
+      eventName === "server.frame_transfer_complete" ||
+      eventName === "server.remote_vae_complete" ||
       eventName === "server.chunk_complete" ||
       eventName === "server.chunk_stats_sent"
     ) return "transport";
@@ -267,7 +352,7 @@
     if (stageId === "scheduler") return formatTraceDuration(chunk.schedulerForwardMs);
     if (stageId === "vae_encode") return formatTraceDuration(chunk.vaeEncodeMs);
     if (stageId === "denoise") return formatTraceDuration(chunk.denoiseMs);
-    if (stageId === "vae_decode") return formatTraceDuration(sumNumbers(chunk.vaeDecodeMs, chunk.postDecodeMs));
+    if (stageId === "vae_decode") return formatTraceDuration(sumNumbers(chunk.vaeQueueWaitMs, chunk.vaeDecodeMs, chunk.postDecodeMs));
     if (stageId === "transport") {
       return formatTraceDuration(sumNumbers(chunk.rawPayloadBuildMs, chunk.wsWriteMs));
     }

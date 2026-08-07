@@ -1,0 +1,521 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minwm-b300-worker-discovery
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minwm-b300-gateway
+  namespace: default
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::107014413969:role/minwm-b300-gateway-trace-query
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: minwm-b300-worker-discovery
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: minwm-b300-worker-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: minwm-b300-worker-discovery
+subjects:
+  - kind: ServiceAccount
+    name: minwm-b300-worker-discovery
+    namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-b300-coordinator
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: minwm-b300-coordinator
+  ports:
+    - name: http
+      port: 18081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-b300-coordinator
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-b300-coordinator
+    app.kubernetes.io/part-of: minwm-b300-realtime
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-b300-coordinator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-b300-coordinator
+        app.kubernetes.io/part-of: minwm-b300-realtime
+    spec:
+      serviceAccountName: minwm-b300-gateway
+      nodeSelector:
+        kubernetes.io/hostname: ip-172-31-44-14.us-west-2.compute.internal
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: coordinator
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:4ac3891b446b46e2f37ddd94d6d4fdc936a267521128ea17056312ce679efee9
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          env:
+            - {name: PYTHONPATH, value: /opt/sglang/python}
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+          args:
+            - >-
+              exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_coordinator_server
+              --host=0.0.0.0
+              --port=18081
+              --backend=memory
+              --ttl-s=30
+              --worker-ttl-s=15
+              --wait-timeout-s=10
+              --candidate-limit=64
+          ports:
+            - name: http
+              containerPort: 18081
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-b300-gateway
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: minwm-b300-gateway
+  ports:
+    - name: http
+      port: 18080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-b300-gateway
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-b300-gateway
+    app.kubernetes.io/part-of: minwm-b300-realtime
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-b300-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-b300-gateway
+        app.kubernetes.io/part-of: minwm-b300-realtime
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ip-172-31-44-14.us-west-2.compute.internal
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: gateway
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:d32767be2bd16754024ead80cde73f79c3ce3c21d29ca6eeb5cc915b04d15272
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server
+              --host=0.0.0.0
+              --port=18080
+              --coordinator-url=http://minwm-b300-coordinator:18081
+              --model-revision=${MODEL_REVISION}
+              --vae-fingerprint=${VAE_FINGERPRINT}
+              --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output
+              --output-queue-depth=128
+              --output-enqueue-timeout-s=5
+              --output-drain-timeout-s=90
+              --lease-renew-interval-s=10
+              --release-grace-s=0.5
+              --trace-log-group=/aws/containerinsights/leap-world-aws03-usw2/application
+          env:
+            - {name: PYTHONPATH, value: /opt/sglang/python}
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - {name: AWS_REGION, value: us-west-2}
+            - {name: AWS_DEFAULT_REGION, value: us-west-2}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - {name: MODEL_REVISION, value: wan22-5b-stage3-dmd-30-gs1800}
+            - {name: VAE_FINGERPRINT, value: taew2_2-d053e216}
+            - name: REALTIME_UI_CONFIG_JSON
+              value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
+          ports:
+            - name: http
+              containerPort: 18080
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-b300-denoiser-headless
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: minwm-b300-denoiser
+  ports:
+    - {name: api, port: 30000, targetPort: api}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minwm-b300-denoiser
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-b300-denoiser
+    app.kubernetes.io/part-of: minwm-b300-realtime
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  serviceName: minwm-b300-denoiser-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-b300-denoiser
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-b300-denoiser
+        app.kubernetes.io/part-of: minwm-b300-realtime
+      annotations:
+        cloudwatch.aws.amazon.com/auto-annotate-dotnet: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-java: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-nodejs: "false"
+        cloudwatch.aws.amazon.com/auto-annotate-python: "false"
+        instrumentation.opentelemetry.io/inject-dotnet: "false"
+        instrumentation.opentelemetry.io/inject-java: "false"
+        instrumentation.opentelemetry.io/inject-nodejs: "false"
+        instrumentation.opentelemetry.io/inject-python: "false"
+    spec:
+      serviceAccountName: minwm-b300-worker-discovery
+      nodeSelector:
+        kubernetes.io/hostname: ip-172-31-35-169.us-west-2.compute.internal
+      tolerations:
+        - key: seedleap.ai/workload
+          operator: Equal
+          value: wan22-ti2v
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: denoiser
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:062399603db572d473b145c39dcb272e2c4b274746e7a13a42d634db6ce92d68
+          imagePullPolicy: IfNotPresent
+          workingDir: /opt/sglang
+          env:
+            - {name: PYTHONPATH, value: /opt/sglang/python}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: MODEL_REVISION, value: wan22-5b-stage3-dmd-30-gs1800}
+            - {name: REALTIME_MAX_SESSIONS, value: "4"}
+            - name: REALTIME_UI_CONFIG_JSON
+              value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
+            - {name: MINWM_MODEL, value: /work/model}
+            - {name: TAEHV_CHECKPOINT_PATH, value: /opt/taehv/taew2_2.pth}
+            - {name: MINWM_ATTENTION_IMPL, value: packed}
+            - {name: MINWM_PACKED_ATTENTION_DETERMINISTIC, value: "false"}
+            - {name: MINWM_NATIVE_COMPONENTS, value: "text_encoder,vae"}
+            - {name: SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D, value: "false"}
+          command: [/bin/bash, -lc]
+          args:
+            - |
+              set -euo pipefail
+              test -f "${MINWM_MODEL}/model_index.json"
+              test -d "${MINWM_MODEL}/transformer"
+              python3 -m sglang.multimodal_gen.runtime.launch_server \
+                --model-path "${MINWM_MODEL}" \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile false \
+                --warmup-mode off \
+                --batching-max-size 4 \
+                --batching-delay-ms 2 \
+                --realtime-max-sessions "${REALTIME_MAX_SESSIONS}" \
+                --realtime-max-sessions-per-worker "${REALTIME_MAX_SESSIONS}" \
+                --realtime-remote-vae-enabled \
+                --realtime-session-idle-timeout-s 60 \
+                --realtime-session-max-lifetime-s 600 \
+                --realtime-admission-wait-s 10 \
+                --realtime-causal-sink-size 8 \
+                --realtime-causal-kv-cache-num-frames 32 \
+                --enable-trace \
+                --host 0.0.0.0 \
+                --port 30000 &
+              child=$!
+              terminate() {
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 143
+              }
+              trap terminate TERM INT
+              wait "${child}"
+          ports:
+            - {name: api, containerPort: 30000}
+          startupProbe:
+            httpGet: {path: /health, port: api}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 270
+          readinessProbe:
+            httpGet: {path: /health, port: api}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: api}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "6"
+              memory: 128Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 256Gi
+              ephemeral-storage: 24Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: work, mountPath: /work, readOnly: true}
+            - {name: shm, mountPath: /dev/shm}
+        - name: heartbeat
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:062399603db572d473b145c39dcb272e2c4b274746e7a13a42d634db6ce92d68
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
+              --coordinator-url=http://minwm-b300-coordinator:18081
+              --health-url=http://127.0.0.1:30000/health
+              --worker-id=$(POD_UID)
+              --role=denoiser
+              --endpoint=ws://$(POD_IP):30000/v1/realtime_video/generate
+              --node-name=$(NODE_NAME)
+              --capacity=4
+              --model-revision=wan22-5b-stage3-dmd-30-gs1800
+              --vae-fingerprint=taew2_2-d053e216
+              --interval-s=5
+          env:
+            - {name: PYTHONPATH, value: /opt/sglang/python}
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+      volumes:
+        - name: work
+          hostPath:
+            path: /var/lib/minwm-async-work
+            type: Directory
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 32Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-b300-vae
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-b300-vae
+    app.kubernetes.io/part-of: minwm-b300-realtime
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-b300-vae
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-b300-vae
+        app.kubernetes.io/part-of: minwm-b300-realtime
+    spec:
+      serviceAccountName: minwm-b300-worker-discovery
+      nodeSelector:
+        kubernetes.io/hostname: ip-172-31-35-169.us-west-2.compute.internal
+      tolerations:
+        - key: seedleap.ai/workload
+          operator: Equal
+          value: wan22-ti2v
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: vae
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:062399603db572d473b145c39dcb272e2c4b274746e7a13a42d634db6ce92d68
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -m
+            - sglang.multimodal_gen.runtime.entrypoints.realtime_vae_server
+          args:
+            - --checkpoint-path=/opt/taehv/taew2_2.pth
+            - --device=cuda
+            - --dtype=bfloat16
+            - --max-sessions=32
+            - --queue-depth-per-session=1
+            # Keep VAE-to-browser payloads below ~170ms at 24fps so public
+            # WebSocket playback can smooth jitter without waiting on a full chunk.
+            - --encoded-frames-per-batch=4
+            - --max-message-mb=64
+            - --host=0.0.0.0
+            - --port=18081
+          env:
+            - {name: PYTHONPATH, value: /opt/sglang/python}
+          ports:
+            - {name: vae, containerPort: 18081}
+          startupProbe:
+            httpGet: {path: /health, port: vae}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 180
+          readinessProbe:
+            httpGet: {path: /health, port: vae}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: vae}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "6"
+              memory: 24Gi
+              ephemeral-storage: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "16"
+              memory: 64Gi
+              ephemeral-storage: 24Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
+        - name: heartbeat
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:294f3761bc3a8128f94a01ebda16f6ad23260d3a819e6c6749c949af2c304a06
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
+              --coordinator-url=http://minwm-b300-coordinator:18081
+              --health-url=http://127.0.0.1:18081/health
+              --worker-id=$(POD_UID)
+              --role=vae
+              --endpoint=ws://$(POD_IP):18081/v1/realtime_vae/decode
+              --node-name=$(NODE_NAME)
+              --capacity=32
+              --model-revision=all
+              --vae-fingerprint=taew2_2-d053e216
+              --interval-s=5
+          env:
+            - {name: PYTHONPATH, value: /opt/sglang/python}
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-b300-public
+  namespace: default
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /healthz
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0d2e23b6eeedac8d2,subnet-07ecaa9e4531071af,subnet-07eb90f6b28dfa087
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  loadBalancerSourceRanges:
+    - 124.64.3.122/32
+    - 5.34.217.44/32
+    - 45.8.204.4/32
+  selector:
+    app.kubernetes.io/name: minwm-b300-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-realtime-public
+  namespace: minwm-realtime
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "18080"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /healthz
+spec:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  allocateLoadBalancerNodePorts: false
+  selector:
+    app.kubernetes.io/name: minwm-realtime-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minwm-realtime-gateway
+  namespace: minwm-realtime
+  annotations:
+    eks.amazonaws.com/role-arn: REPLACE_WITH_GATEWAY_ROLE_ARN
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-realtime-gateway
+  namespace: minwm-realtime
+  labels:
+    app.kubernetes.io/name: minwm-realtime-gateway
+    app.kubernetes.io/part-of: minwm-realtime
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-realtime-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-realtime-gateway
+        app.kubernetes.io/part-of: minwm-realtime
+    spec:
+      serviceAccountName: minwm-realtime-gateway
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        karpenter.sh/nodepool: minwm-realtime-cpu
+      tolerations:
+        - key: seedleap.ai/task
+          operator: Equal
+          value: minwm-realtime-cpu
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: minwm-realtime-gateway
+      containers:
+        - name: gateway
+          image: REPLACE_WITH_GATEWAY_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python -m sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server
+              --host=0.0.0.0
+              --port=18080
+              --coordinator-url=http://minwm-realtime-coordinator:18081
+              --model-revision=${MODEL_REVISION}
+              --vae-fingerprint=${VAE_FINGERPRINT}
+              --internal-output-url=ws://${POD_IP}:18080/v1/internal/realtime_output
+              --output-queue-depth=128
+              --output-enqueue-timeout-s=5
+              --output-drain-timeout-s=90
+              --lease-renew-interval-s=10
+              --release-grace-s=0.5
+              --trace-log-group=${TRACE_LOG_GROUP}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MODEL_REVISION
+              value: REPLACE_WITH_MODEL_ID
+            - name: VAE_FINGERPRINT
+              value: taew2_2-d053e216
+            - name: REALTIME_UI_CONFIG_JSON
+              value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
+            - name: TRACE_LOG_GROUP
+              value: REPLACE_WITH_TRACE_LOG_GROUP
+            - name: AWS_REGION
+              value: REPLACE_WITH_AWS_REGION
+            - name: AWS_DEFAULT_REGION
+              value: REPLACE_WITH_AWS_REGION
+            - name: OTEL_SERVICE_NAME
+              value: minwm-realtime-gateway
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://minwm-realtime-adot:4317
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=minwm,deployment.environment=production
+          ports:
+            - name: http
+              containerPort: 18080
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: minwm-realtime-gateway
+  namespace: minwm-realtime
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-realtime-gateway

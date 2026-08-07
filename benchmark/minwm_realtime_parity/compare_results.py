@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+
 from common import (
     load_cases,
     prompt_switch_boundary,

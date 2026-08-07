@@ -4,9 +4,16 @@
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
 import platform as _platform
+import os as _os
 import sys as _sys
 
-if _sys.platform == "darwin" and _platform.machine() == "arm64":
+_LIGHTWEIGHT_RUNTIME = _os.environ.get("SGLANG_LIGHTWEIGHT_RUNTIME") == "1"
+
+if (
+    not _LIGHTWEIGHT_RUNTIME
+    and _sys.platform == "darwin"
+    and _platform.machine() == "arm64"
+):
     try:
         import torch as _torch
 
@@ -25,92 +32,96 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
         pass
 del _platform
 del _sys
+del _os
 
-from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
+if not _LIGHTWEIGHT_RUNTIME:
+    from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
-_apply_hf_patches()
-del _apply_hf_patches
+    _apply_hf_patches()
+    del _apply_hf_patches
 
-# Frontend Language APIs
-from sglang.global_config import global_config
-from sglang.lang.api import (
-    Engine,
-    Runtime,
-    assistant,
-    assistant_begin,
-    assistant_end,
-    flush_cache,
-    function,
-    gen,
-    gen_int,
-    gen_string,
-    get_server_info,
-    image,
-    select,
-    separate_reasoning,
-    set_default_backend,
-    system,
-    system_begin,
-    system_end,
-    user,
-    user_begin,
-    user_end,
-    video,
-)
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.lang.choices import (
-    greedy_token_selection,
-    token_length_normalized,
-    unconditional_likelihood_normalized,
-)
+    # Frontend Language APIs
+    from sglang.global_config import global_config
+    from sglang.lang.api import (
+        Engine,
+        Runtime,
+        assistant,
+        assistant_begin,
+        assistant_end,
+        flush_cache,
+        function,
+        gen,
+        gen_int,
+        gen_string,
+        get_server_info,
+        image,
+        select,
+        separate_reasoning,
+        set_default_backend,
+        system,
+        system_begin,
+        system_end,
+        user,
+        user_begin,
+        user_end,
+        video,
+    )
+    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+    from sglang.lang.choices import (
+        greedy_token_selection,
+        token_length_normalized,
+        unconditional_likelihood_normalized,
+    )
 
-# Lazy import some libraries
-from sglang.utils import LazyImport
-from sglang.version import __version__
+    # Lazy import some libraries
+    from sglang.utils import LazyImport
+    from sglang.version import __version__
 
-Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
-Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
-LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
-OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
-VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
+    Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
+    Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
+    LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
+    OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
+    VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
 
-# Runtime Engine APIs
-ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
-Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
+    # Runtime Engine APIs
+    ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
+    Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
 
-__all__ = [
-    "Engine",
-    "Runtime",
-    "assistant",
-    "assistant_begin",
-    "assistant_end",
-    "flush_cache",
-    "function",
-    "gen",
-    "gen_int",
-    "gen_string",
-    "get_server_info",
-    "image",
-    "select",
-    "separate_reasoning",
-    "set_default_backend",
-    "system",
-    "system_begin",
-    "system_end",
-    "user",
-    "user_begin",
-    "user_end",
-    "video",
-    "RuntimeEndpoint",
-    "greedy_token_selection",
-    "token_length_normalized",
-    "unconditional_likelihood_normalized",
-    "ServerArgs",
-    "Anthropic",
-    "Crusoe",
-    "LiteLLM",
-    "OpenAI",
-    "VertexAI",
-    "global_config",
-    "__version__",
-]
+    __all__ = [
+        "Engine",
+        "Runtime",
+        "assistant",
+        "assistant_begin",
+        "assistant_end",
+        "flush_cache",
+        "function",
+        "gen",
+        "gen_int",
+        "gen_string",
+        "get_server_info",
+        "image",
+        "select",
+        "separate_reasoning",
+        "set_default_backend",
+        "system",
+        "system_begin",
+        "system_end",
+        "user",
+        "user_begin",
+        "user_end",
+        "video",
+        "RuntimeEndpoint",
+        "greedy_token_selection",
+        "token_length_normalized",
+        "unconditional_likelihood_normalized",
+        "ServerArgs",
+        "Anthropic",
+        "Crusoe",
+        "LiteLLM",
+        "OpenAI",
+        "VertexAI",
+        "global_config",
+        "__version__",
+    ]
+else:
+    __all__: list[str] = []

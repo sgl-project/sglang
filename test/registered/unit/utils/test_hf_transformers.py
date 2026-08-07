@@ -4,9 +4,9 @@ Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+from contextlib import ExitStack
 import tempfile
 import unittest
-from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -32,7 +32,6 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 class TestApplyAllCompatibilityPatches(unittest.TestCase):
     def test_transformers_v4_skips_v5_only_patches(self):
         import transformers
-
         import sglang.srt.utils.hf_transformers_patches as compat
 
         v5_patch_names = (

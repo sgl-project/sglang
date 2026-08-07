@@ -17,6 +17,7 @@ from common import (  # noqa: E402
     materialize_first_frame,
 )
 
+
 DRAGON_CASES = Path(__file__).with_name("cases_dragon_ride_60s_832x480.json")
 STEP1600_T2V_CASES = Path(__file__).with_name("cases_step1600_t2v_30s_832x480.json")
 

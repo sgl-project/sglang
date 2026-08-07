@@ -13,6 +13,7 @@
     minTargetLeadMs: 180,
     maxTargetLeadMs: 360,
     maxLeadExtraChunkRatio: 0.8,
+    lowLatencyMaxLeadFrames: 2,
     startLeadChunkRatio: 0.45,
     minStartLeadMs: 180,
     resumeLeadChunkRatio: 0.45,
@@ -29,6 +30,8 @@
     playbackRateGain: 0.16,
     playbackRateMin: 0.92,
     playbackRateMax: 1.12,
+    smoothTimelinePlaybackRateMin: 0.85,
+    smoothTimelinePlaybackRateMax: 2.5,
     emergencyPlaybackRateMin: 0.86,
     emergencyPlaybackRateMax: 1.3,
     playbackRateSlewPerSecond: 0.35,
@@ -36,6 +39,7 @@
     eventCutoverMaxFrames: 3,
     settleEventCutoverMaxMs: 260,
     settleEventCutoverMaxFrames: 4,
+    eventCutoverHoldBypassMs: 420,
     startupWarmupMinMs: 1500,
     startupWarmupExpectedMultiplier: 3,
   };
@@ -78,6 +82,7 @@
       this.pendingEventId = 0;
       this.pendingEventSentAt = 0;
       this.pendingEventCutoverMode = "motion";
+      this.eventCutoverHoldBypassUntil = 0;
       this.lastDropReason = "";
       this.lastDropAt = 0;
       this.lastDropCount = 0;
@@ -168,7 +173,7 @@
 
       if (this.pendingEventId && eventId >= this.pendingEventId) {
         const oldEventFrameCount = this.#oldEventFrameCount(eventId);
-        if (this.mode === "live") {
+        if (this.#dropsOldEventFramesForCutover()) {
           const graceFrames = this.#eventGraceFrames();
           const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
           if (dropCount > 0) {
@@ -180,6 +185,12 @@
           eventId,
           latencyMs: this.pendingEventSentAt ? now - this.pendingEventSentAt : 0,
         };
+        if (this.mode !== "smooth_timeline") {
+          this.eventCutoverHoldBypassUntil = Math.max(
+            this.eventCutoverHoldBypassUntil,
+            now + this.config.eventCutoverHoldBypassMs,
+          );
+        }
         this.pendingEventId = 0;
         this.pendingEventSentAt = 0;
         this.pendingEventCutoverMode = "motion";
@@ -195,6 +206,7 @@
       this.#decayRebufferBoost(now);
       this.#updateReceiveStallGuard(now);
       const droppedFrames = this.#trimBacklog(now);
+      const bypassTargetLeadHold = this.#shouldBypassTargetLeadHold(now);
       if (!this.queue.length) {
         if (this.renderedFrames && hasPendingInput && !this.buffering) {
           this.buffering = true;
@@ -208,9 +220,9 @@
 
       const bufferMs = this.bufferDurationMs;
       if (
-        this.mode === "live" &&
-        !this.config.lowLatencyPlayback &&
+        this.#usesTargetLeadHold() &&
         this.config.holdForTargetLead &&
+        !bypassTargetLeadHold &&
         hasPendingInput &&
         this.receiveStalled &&
         this.renderedFrames &&
@@ -222,8 +234,9 @@
       }
 
       if (
-        !this.config.lowLatencyPlayback &&
+        this.#usesTargetLeadHold() &&
         this.config.holdForTargetLead &&
+        !bypassTargetLeadHold &&
         hasPendingInput &&
         this.buffering &&
         bufferMs < (this.renderedFrames ? this.#resumeLeadMs() : this.#startLeadMs())
@@ -239,6 +252,13 @@
       }
 
       this.#updatePlaybackRate(now);
+      if (this.mode === "timeline") {
+        const frame = this.queue.shift();
+        this.renderedFrames += 1;
+        this.lastDrawAt = now;
+        return { action: "draw", frame, droppedFrames, snapshot: this.snapshot() };
+      }
+
       const targetMs = 1000 / Math.max(1, this.renderFps);
       const elapsedMs = this.lastDrawAt ? now - this.lastDrawAt : targetMs;
       if (elapsedMs < targetMs) {
@@ -277,6 +297,10 @@
     }
 
     get maxLeadMs() {
+      if (this.#isLowLatencyMode()) {
+        return this.targetLeadMs +
+          this.config.lowLatencyMaxLeadFrames * 1000 / Math.max(1, this.sourceFps);
+      }
       return this.targetLeadMs + this.latestChunkDurationMs * this.config.maxLeadExtraChunkRatio;
     }
 
@@ -325,10 +349,16 @@
         this.hasServerSample = true;
       }
       const effectiveFps = this.hasServerSample
-        ? this.serverFps
+        ? (
+            this.hasDeliverySample
+              ? Math.min(this.serverFps, this.deliveryFps)
+              : this.serverFps
+          )
         : (this.hasDeliverySample ? this.deliveryFps : this.targetFps);
       this.sourceFps = clamp(effectiveFps, this.config.minSourceFps, this.targetFps);
-      if (!isDelivery || !this.hasServerSample) {
+      const shouldUpdateCadence =
+        !isDelivery || (finitePositive(durationMs) && durationMs >= this.latestChunkDurationMs);
+      if (shouldUpdateCadence) {
         this.latestChunkFrames = Math.max(1, Number(frameCount || this.latestChunkFrames));
         this.latestChunkDurationMs = clamp(
           Number(durationMs || (this.latestChunkFrames / Math.max(1, this.sourceFps) * 1000)),
@@ -402,12 +432,13 @@
     #updatePlaybackRate(now) {
       if (this.mode === "timeline") {
         this.playbackRate = 1;
-        this.renderFps = clamp(
-          this.sourceFps,
-          this.config.minSourceFps,
-          this.targetFps,
-        );
+        this.renderFps = this.targetFps;
         this.lastRateUpdateAt = now;
+        return;
+      }
+      if (this.mode === "smooth_timeline" && !this.queue.length) {
+        this.playbackRate = 1;
+        this.renderFps = this.sourceFps;
         return;
       }
       const bufferMs = this.bufferDurationMs;
@@ -417,23 +448,30 @@
         bufferMs > this.maxLeadMs ||
         bufferMs < targetLeadMs * this.config.lowWaterRatio ||
         (this.receiveStalled && bufferMs < targetLeadMs);
-      const minRate = emergency
+      const minRate = this.mode === "smooth_timeline"
+        ? this.config.smoothTimelinePlaybackRateMin
+        : emergency
         ? (
             this.receiveStalled
               ? this.config.receiveStallPlaybackRateMin
               : this.config.emergencyPlaybackRateMin
           )
         : this.config.playbackRateMin;
-      const maxRate = this.receiveStalled && bufferMs < targetLeadMs
+      const maxRate = this.mode === "smooth_timeline"
+        ? this.config.smoothTimelinePlaybackRateMax
+        : this.receiveStalled && bufferMs < targetLeadMs
         ? 1
         : emergency
         ? this.config.emergencyPlaybackRateMax
         : this.config.playbackRateMax;
-      const desiredRate = clamp(
+      let desiredRate = clamp(
         1 + error * this.config.playbackRateGain,
         minRate,
         maxRate,
       );
+      if (this.mode === "smooth_timeline" && bufferMs > this.maxLeadMs) {
+        desiredRate = maxRate;
+      }
 
       if (!this.lastRateUpdateAt) {
         this.playbackRate = desiredRate;
@@ -450,20 +488,39 @@
         );
       }
       this.lastRateUpdateAt = now;
-      const baseRenderFps = this.config.lowLatencyPlayback
-        ? this.targetFps
-        : this.sourceFps;
+      const baseRenderFps = this.sourceFps;
       this.renderFps = clamp(
         baseRenderFps * this.playbackRate,
         this.config.minSourceFps,
-        this.targetFps * this.config.emergencyPlaybackRateMax,
+        this.targetFps * maxRate,
       );
     }
 
     #trimBacklog(now) {
       const droppedFrames = [];
-      if (this.mode === "timeline") return droppedFrames;
+      if (this.#preservesTimelineFrames()) return droppedFrames;
       droppedFrames.push(...this.#trimStaleBacklog(now));
+      if (this.#isLowLatencyMode()) {
+        const backlogDropStart = droppedFrames.length;
+        if (this.queue.length > 1 && this.bufferDurationMs > this.maxLeadMs) {
+          const newestChunk = this.queue.at(-1).chunkIndex;
+          let oldFrameCount = 0;
+          while (
+            oldFrameCount < this.queue.length &&
+            this.queue[oldFrameCount].chunkIndex !== newestChunk
+          ) {
+            oldFrameCount += 1;
+          }
+          if (oldFrameCount) {
+            droppedFrames.push(...this.queue.splice(0, oldFrameCount));
+          }
+        }
+        const backlogDropCount = droppedFrames.length - backlogDropStart;
+        if (backlogDropCount) {
+          this.#recordDrop(backlogDropCount, "low latency backlog", now);
+        }
+        return droppedFrames;
+      }
       while (this.queue.length && this.bufferDurationMs > this.maxLeadMs) {
         const firstChunk = this.queue[0].chunkIndex;
         let dropCount = 0;
@@ -481,7 +538,18 @@
     }
 
     #normalizeMode(mode) {
-      return mode === "timeline" ? "timeline" : "live";
+      if (mode === "timeline") return "timeline";
+      if (mode === "smooth_timeline") return "smooth_timeline";
+      if (mode === "adaptive") return "adaptive";
+      return "live";
+    }
+
+    #preservesTimelineFrames() {
+      return this.mode === "timeline" || this.mode === "smooth_timeline";
+    }
+
+    #dropsOldEventFramesForCutover() {
+      return this.mode !== "timeline" && this.mode !== "smooth_timeline";
     }
 
     #trimStaleBacklog(now) {
@@ -525,7 +593,8 @@
     }
 
     #eventGraceFrames() {
-      if (this.config.lowLatencyPlayback) return 0;
+      if (this.#isLowLatencyMode()) return 0;
+      if (this.mode === "adaptive" && this.pendingEventCutoverMode === "motion") return 0;
       const byTime = Math.max(
         1,
         Math.round(this.sourceFps * this.#eventCutoverMaxMs() / 1000),
@@ -545,6 +614,18 @@
       return this.pendingEventCutoverMode === "settle"
         ? this.config.settleEventCutoverMaxFrames
         : this.config.eventCutoverMaxFrames;
+    }
+
+    #isLowLatencyMode() {
+      return this.mode === "live" && this.config.lowLatencyPlayback;
+    }
+
+    #usesTargetLeadHold() {
+      return this.mode !== "timeline" && !this.#isLowLatencyMode();
+    }
+
+    #shouldBypassTargetLeadHold(now) {
+      return this.eventCutoverHoldBypassUntil > 0 && now <= this.eventCutoverHoldBypassUntil;
     }
 
     #startLeadMs() {

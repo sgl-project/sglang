@@ -33,8 +33,8 @@
         <label>Prompt<textarea id="prompt" rows="4">A cinematic handheld shot of a quiet city street at dusk, soft reflections, natural motion.</textarea></label>
         <button id="enhanceBtn" class="wide">Enhance</button>
         <div class="split">
-          <label>Size<input id="size" value="832x480" /></label>
-          <label>FPS<input id="fps" type="number" value="16" min="1" max="60" /></label>
+          <label>Size<input id="size" value="1280x704" /></label>
+          <label>FPS<input id="fps" type="number" value="24" min="1" max="60" /></label>
         </div>
         <div class="split">
           <label>Frames
@@ -64,7 +64,9 @@
         </div>
         <label>Playback
           <select id="playbackMode">
-            <option value="live" selected>Low latency (may skip)</option>
+            <option value="adaptive">Adaptive (buffered, fast input)</option>
+            <option value="live">Low latency (may skip)</option>
+            <option value="smooth_timeline" selected>Smooth timeline (catch-up, no skip)</option>
             <option value="timeline">Full timeline (no frame skipping)</option>
           </select>
         </label>
@@ -143,7 +145,7 @@
               <input id="previewScale" type="range" min="80" max="170" value="100" />
               <b id="previewScaleText">100%</b>
             </label>
-            <span class="stage-stat">output <b id="outputSizeText">832x480</b></span>
+            <span class="stage-stat">output <b id="outputSizeText">1280x704</b></span>
             <span class="stage-stat">render <b id="renderFps">0</b> fps</span>
             <span class="stage-stat">source <b id="theoreticalFpsText">-</b></span>
             <span class="stage-stat">action <b id="actionStateText">-</b></span>
@@ -197,7 +199,7 @@
         <section class="panel presets" aria-label="Presets and camera">
           <div id="modelSectionTitle" class="section-title">LingBot</div>
           <div class="spec-grid">
-            <span><b id="targetFpsSummary">16 fps</b> target</span>
+            <span><b id="targetFpsSummary">24 fps</b> target</span>
             <span><b>chunked</b> stream</span>
             <span><b>480p/720p</b></span>
             <span><b>Cam + Act</b></span>
@@ -219,6 +221,7 @@
               <span>Trace<b id="traceIdText">-</b></span>
               <span>Chunk<b id="traceChunkText">-</b></span>
               <span>Events<b id="traceEventCountText">0</b></span>
+              <span>Window<b id="traceObservedText">-</b></span>
             </div>
           </div>
           <div id="traceTopology" class="trace-topology" aria-live="polite"></div>
@@ -236,8 +239,9 @@
       </section>
     </main>
   <script src="./runtime-config.js"></script>
-  <script src="./playback_controller.js?v=realtime-playback-v21"></script>
-  <script src="./trace_topology.js?v=realtime-trace-topology-v5"></script>
-  <script src="./app.js?v=realtime-t2v-dump-trace-v1"></script>
+  <script src="./playback_controller.js?v=realtime-playback-v28"></script>
+  <script src="./trace_topology.js?v=realtime-trace-topology-v6"></script>
+  <script src="./trace_transport.js?v=realtime-trace-http-v2"></script>
+  <script src="./app.js?v=realtime-production-gateway-v17"></script>
 </body>
 </html>
