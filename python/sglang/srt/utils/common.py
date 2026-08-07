@@ -2181,6 +2181,13 @@ def configure_logger(server_args, prefix: str = ""):
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    # Server-sent hub warnings (e.g. the unauthenticated-request / HF_TOKEN
+    # hint) are deduplicated per process, so a TP-N launch repeats each one N
+    # times. A prefix means this is a worker process; keep those warnings only
+    # in the main process, where they are printed exactly once.
+    if prefix:
+        logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
+
     if is_flashinfer_available():
         from flashinfer.jit.core import logger as flashinfer_logger
 
