@@ -66,6 +66,7 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
 logger = logging.getLogger(__name__)
+_MLA_ABSORB_BF16_LOGGED = []  # one-shot guard for the MLA-absorb BF16 log line
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -632,12 +633,25 @@ class DeepseekV2WeightLoaderMixin:
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
             if (
+                get_bool_env_var("SGLANG_MLA_ABSORB_BF16")
+                and _use_aiter_gfx95
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "quark"
+                and not _MLA_ABSORB_BF16_LOGGED
+            ):
+                _MLA_ABSORB_BF16_LOGGED.append(1)
+                log_info_on_rank0(
+                    logger,
+                    "SGLANG_MLA_ABSORB_BF16=1: keeping kv_b_proj MLA-absorb weights in BF16 (skipping quark mxfp4 re-quant)",
+                )
+            if (
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
                 and self.config.architectures
                 and self.config.architectures[0]
                 == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                and not get_bool_env_var("SGLANG_MLA_ABSORB_BF16")
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
@@ -668,6 +682,34 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
+                elif (
+                    get_bool_env_var("SGLANG_MLA_ABSORB_BF16")
+                    and _use_aiter_gfx95
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "quark"
+                    and self_attn.w_kc is not None
+                    and self_attn.w_kc.dtype == torch.bfloat16
+                    and self_attn.w_vc is not None
+                    and self_attn.w_vc.dtype == torch.bfloat16
+                    and self_attn.w_scale is not None
+                ):
+                    # BF16 MLA-absorb: w_kc, w_vc and w_scale are all constant,
+                    # yet the plain-BMM absorb path in forward would otherwise
+                    # recompute `w.to(bfloat16) * w_scale` on every decode step
+                    # (an extra elementwise-multiply kernel per absorb BMM, per
+                    # layer, per step). Fold the scale into the BF16 weights once
+                    # here and drop w_scale so the forward path consumes the
+                    # weights directly. Numerically identical (same constant
+                    # fold); does not affect the FP8/MXFP4/deep_gemm absorb
+                    # paths, which keep quantized weights and fuse dequant
+                    # in-kernel.
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_scale = None
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
