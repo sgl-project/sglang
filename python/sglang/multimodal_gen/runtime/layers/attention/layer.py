@@ -850,17 +850,24 @@ class USPAttention(nn.Module):
 
         if attn_mask is not None or meta_only_pad:
             if (
-                num_replicated_prefix
-                or num_replicated_suffix
-                or num_replicated_kv_prefix
+                (
+                    num_replicated_prefix
+                    or num_replicated_suffix
+                    or num_replicated_kv_prefix
+                )
+                and not effective_skip_sp
+                and get_sequence_parallel_world_size() > 1
             ):
-                # This path shards every row through the all-to-all; a
-                # replicated prefix/suffix would be duplicated across ranks and
-                # silently corrupt the output, so refuse loudly instead.
+                # Under SP this path shards every row through the all-to-all;
+                # a replicated prefix/suffix would be duplicated across ranks
+                # and silently corrupt the output, so refuse loudly instead.
+                # On a single rank the mask already describes the full
+                # sequence and the replicated counts are meaningless, so the
+                # call is legal.
                 raise NotImplementedError(
                     "USPAttention's masked path does not support replicated "
-                    "prefix/suffix tokens; drop attn_mask/attn_mask_meta or "
-                    "the replicated segment."
+                    "prefix/suffix tokens under sequence parallelism; drop "
+                    "attn_mask/attn_mask_meta or the replicated segment."
                 )
 
             def _prepare_sdpa_mask(
