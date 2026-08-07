@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35", nightly=True
+    est_time=7200, suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35", nightly=True
 )
 
 QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"
@@ -38,6 +38,8 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
     """Qwen 3.5 GSM8K lm-eval Test for AMD MI35x."""
 
     model_config_name = "lm_eval_configs/Qwen3.5-397B-A17B.yaml"
+    variant_label = ""
+    extra_env: dict[str, str] = {}
 
     @classmethod
     def setUpClass(cls):
@@ -59,6 +61,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
         ]
         env = os.environ.copy()
         env["SGLANG_USE_AITER"] = "1"
+        env.update(self.extra_env)
 
         process = popen_launch_server(
             QWEN35_MODEL_PATH,
@@ -79,7 +82,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
             model_name = eval_config.get("model_name", self.model)
 
             success = True
-            summary = f"### lm-eval accuracy ({model_name})\n"
+            summary = f"### lm-eval accuracy ({model_name}{self.variant_label})\n"
             summary += "| task | metric | expected | measured | status |\n"
             summary += "| ---- | ------ | -------- | -------- | ------ |\n"
             for task in eval_config["tasks"]:
@@ -101,6 +104,19 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
             self.assertTrue(success, "lm-eval validation failed")
         finally:
             kill_process_tree(process.pid)
+
+
+class TestQwen35GdnInProjMergeMI35x(TestQwen35EvalMI35x):
+    """Same eval with the GDN in_proj_qkvzba merge (PR #33068) enabled.
+
+    The merge folds in_proj_ba into in_proj_qkvz as one GEMM, which needs all four
+    shards on one quantization scheme. This bf16 checkpoint has no quant config, so
+    they trivially agree and the merged path runs; the quantized MXFP4-AttnFP8
+    checkpoint excludes in_proj_a/b and falls back to separate projections.
+    """
+
+    variant_label = " + fused in_proj_qkvzba"
+    extra_env = {"SGLANG_GDN_FUSE_QKVZBA": "1"}
 
 
 if __name__ == "__main__":

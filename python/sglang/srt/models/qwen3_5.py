@@ -134,6 +134,7 @@ _qknorm_use_alt_stream = _is_cuda or (
 )
 # in_proj_ba is tiny and shares in_proj_qkvz's input; merging saves a launch. AMD-only.
 _fuse_gdn_qkvzba = get_bool_env_var("SGLANG_GDN_FUSE_QKVZBA", "False") and _is_hip
+# Tile-granularity heuristic for the a8w8 GEMM; correctness only needs N % 16.
 _GEMM_N_ALIGN = 128
 _is_amx_available = cpu_has_amx_support()
 
@@ -595,7 +596,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 tp_size=tp_size,
             )
         except (ValueError, NotImplementedError) as e:
-            logger.debug("in_proj_qkvz and in_proj_ba kept separate: %s", e)
+            logger.info_once(f"in_proj_qkvz and in_proj_ba kept separate: {e}")
             return None
         weight = getattr(merged, "weight", None)
         if pad and weight is not None:
