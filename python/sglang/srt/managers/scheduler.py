@@ -1211,6 +1211,7 @@ class Scheduler(
                     max_delay_passes=get_schedule().prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     device=self.tp_group.device,
+                    debug_log_enabled=self.ps.attn_tp_rank == 0,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
