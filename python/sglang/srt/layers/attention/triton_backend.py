@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_a2a_lse_reduce,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -68,6 +69,24 @@ if TYPE_CHECKING:
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
+
+
+def _reduce_dcp_mha_output(
+    attn_output: torch.Tensor,
+    attn_lse: torch.Tensor,
+    group,
+    comm_backend: str,
+) -> torch.Tensor:
+    """Merge per-rank MHA partials with the configured DCP transport."""
+    if comm_backend in ("a2a", "fi_a2a"):
+        return dcp_a2a_lse_reduce(
+            attn_output,
+            attn_lse,
+            group,
+            is_lse_base_on_e=True,
+            comm_backend=comm_backend,
+        )
+    return cp_lse_ag_out_rs_mha(attn_output, attn_lse, group)
 
 
 def _mla_decode_kv_splits_cap(
@@ -181,6 +200,7 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_comm_backend = model_runner.server_args.dcp_comm_backend
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -1849,7 +1869,12 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            o = _reduce_dcp_mha_output(
+                o_for_decode,
+                local_lse,
+                group,
+                self.dcp_comm_backend,
+            )
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
