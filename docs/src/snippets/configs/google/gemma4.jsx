@@ -340,7 +340,11 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // BLOCKED on sglang 0.5.16: the 12B-QAT checkpoint (gemma-4-12B-it-qat-q4_0-unquantized)
+      // fails at model load — AttributeError: 'Gemma4VisionConfig' object has no attribute
+      // 'model_patch_size' (vision sub-config unhandled by the loader). Pending an sglang fix.
       match: { hw: "h200", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -355,7 +359,11 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // BLOCKED on sglang 0.5.16: the 12B-QAT checkpoint (gemma-4-12B-it-qat-q4_0-unquantized)
+      // fails at model load — AttributeError: 'Gemma4VisionConfig' object has no attribute
+      // 'model_patch_size' (vision sub-config unhandled by the loader). Pending an sglang fix.
       match: { hw: "h200", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -596,7 +604,11 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // BLOCKED on sglang 0.5.16: the 12B-QAT checkpoint (gemma-4-12B-it-qat-q4_0-unquantized)
+      // fails at model load — AttributeError: 'Gemma4VisionConfig' object has no attribute
+      // 'model_patch_size' (vision sub-config unhandled by the loader). Pending an sglang fix.
       match: { hw: "b200", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -611,7 +623,11 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // BLOCKED on sglang 0.5.16: the 12B-QAT checkpoint (gemma-4-12B-it-qat-q4_0-unquantized)
+      // fails at model load — AttributeError: 'Gemma4VisionConfig' object has no attribute
+      // 'model_patch_size' (vision sub-config unhandled by the loader). Pending an sglang fix.
       match: { hw: "b200", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -858,7 +874,11 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // BLOCKED on sglang 0.5.16: the 12B-QAT checkpoint (gemma-4-12B-it-qat-q4_0-unquantized)
+      // fails at model load — AttributeError: 'Gemma4VisionConfig' object has no attribute
+      // 'model_patch_size' (vision sub-config unhandled by the loader). Pending an sglang fix.
       match: { hw: "b300", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -874,7 +894,11 @@ python3 -m sglang.test.run_eval \\
       ],
     },
     {
+      // BLOCKED on sglang 0.5.16: the 12B-QAT checkpoint (gemma-4-12B-it-qat-q4_0-unquantized)
+      // fails at model load — AttributeError: 'Gemma4VisionConfig' object has no attribute
+      // 'model_patch_size' (vision sub-config unhandled by the loader). Pending an sglang fix.
       match: { hw: "b300", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
