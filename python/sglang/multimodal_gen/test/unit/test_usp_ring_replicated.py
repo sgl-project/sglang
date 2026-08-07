@@ -151,7 +151,13 @@ class TestRingReplicatedSuffix(RingReplicatedBase):
         ), patch(
             "torch.distributed.all_gather", side_effect=_fake_gather
         ):
-            obj.forward(q, k, v, num_replicated_suffix=self.REP)
+            # Identity-mocked collectives don't reproduce head-shard shapes,
+            # so the final concat may fail — the kernel K order is recorded
+            # before that and is all this test asserts.
+            try:
+                obj.forward(q, k, v, num_replicated_suffix=self.REP)
+            except RuntimeError:
+                pass
 
         # Bitwise contract: suffix KV stays at the tail in the kernel call.
         kernel_k = obj.attn_impl.seen_k[-1]
