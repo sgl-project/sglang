@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
+    mtp_draft_device_pools: tuple[MLATokenToKVPool, ...] = ()
 
     def __init__(
         self,
@@ -62,8 +63,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        mtp_draft_device_pools: Sequence[MLATokenToKVPool] = (),
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
+        self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -73,6 +80,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            pool_label=pool_label,
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
@@ -94,6 +104,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        if self.mtp_draft_device_pools:
+            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+            self.packed_device_data_ptrs = torch.cat(
+                [pool.data_ptrs for pool in device_pools]
+            )
+            self.packed_device_kv_buffers = [
+                buffer for pool in device_pools for buffer in pool.kv_buffer
+            ]
         self._init_write_back_staging_buffers()
 
     def get_contiguous_buf_infos(self):
@@ -107,7 +125,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
-        self.layer_num = self._effective_host_layer_num()
+        self.target_layer_num = self._effective_host_layer_num()
+        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
@@ -222,26 +241,37 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
-        if not self._is_device_layer_owned(device_pool, layer_id):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        host_layer = self._host_layer_index(layer_id)
+        host_indices = self.dcp_kernel_indices(host_indices)
+        device_indices = self.dcp_kernel_indices(device_indices)
+        # MTP draft layers do not participate in CP layer sharding.
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        cache_dst=device_pool.kv_buffer[layer_id],
-                        cache_src=self.kv_buffer[host_layer],
+                        cache_dst=device_pool.kv_buffer[device_layer_id],
+                        cache_src=self.kv_buffer[host_layer_id],
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
                     )
                 else:
                     transfer_kv_per_layer_mla(
-                        src=self.kv_buffer[host_layer],
-                        dst=device_pool.kv_buffer[layer_id],
+                        src=self.kv_buffer[host_layer_id],
+                        dst=device_pool.kv_buffer[device_layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
@@ -249,8 +279,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        cache_dst=device_pool.kv_buffer[layer_id],
-                        cache_src=self.data_refs[host_layer],
+                        cache_dst=device_pool.kv_buffer[device_layer_id],
+                        cache_src=self.data_refs[host_layer_id],
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
@@ -258,10 +288,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 else:
                     transfer_kv_per_layer_mla_pf_lf(
                         src=self.kv_buffer,
-                        dst=device_pool.kv_buffer[layer_id],
+                        dst=device_pool.kv_buffer[device_layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
-                        layer_id=host_layer,
+                        layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
                     )
@@ -270,8 +300,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[self.kv_buffer[host_layer]],
-                    dst_layers=[device_pool.kv_buffer[layer_id]],
+                    src_layers=[self.kv_buffer[host_layer_id]],
+                    dst_layers=[device_pool.kv_buffer[device_layer_id]],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     page_size=self.page_size,
@@ -279,10 +309,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.kv_buffer],
-                    dst_ptrs=[device_pool.kv_buffer[layer_id]],
+                    dst_ptrs=[device_pool.kv_buffer[device_layer_id]],
                     src_indices=host_indices,
                     dst_indices=device_indices,
-                    layer_id=host_layer,
+                    layer_id=host_layer_id,
                     page_size=self.page_size,
                 )
             else:
@@ -290,7 +320,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
-                if layer_id == 0:
+                if device_layer_id == 0:
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
@@ -309,23 +339,34 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def _backup_from_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
-        host_layer = self._host_layer_index(layer_id)
+        # Indices arrive already translated by backup_from_device_all_layer.
+        # MTP draft layers do not participate in CP layer sharding.
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        cache_dst=self.kv_buffer[host_layer],
-                        cache_src=device_pool.kv_buffer[layer_id],
+                        cache_dst=self.kv_buffer[host_layer_id],
+                        cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
                         indices_src=device_indices,
                         element_dim=self.kv_cache_dim,
                     )
                 else:
                     transfer_kv_per_layer_mla(
-                        src=device_pool.kv_buffer[layer_id],
-                        dst=self.kv_buffer[host_layer],
+                        src=device_pool.kv_buffer[device_layer_id],
+                        dst=self.kv_buffer[host_layer_id],
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
@@ -333,8 +374,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
-                        cache_dst=self.data_refs[host_layer],
-                        cache_src=device_pool.kv_buffer[layer_id],
+                        cache_dst=self.data_refs[host_layer_id],
+                        cache_src=device_pool.kv_buffer[device_layer_id],
                         indices_dst=host_indices,
                         indices_src=device_indices,
                         element_dim=self.kv_cache_dim,
@@ -351,8 +392,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[device_pool.kv_buffer[layer_id]],
-                    dst_layers=[self.kv_buffer[host_layer]],
+                    src_layers=[device_pool.kv_buffer[device_layer_id]],
+                    dst_layers=[self.kv_buffer[host_layer_id]],
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
@@ -367,15 +408,37 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
             )
 
+    def _resolve_device_transfer_buffers(self, device_pool):
+        if self.mtp_draft_device_pools:
+            return self.packed_device_data_ptrs, self.packed_device_kv_buffers
+        return device_pool.data_ptrs, device_pool.kv_buffer
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        host_indices = self.dcp_kernel_indices(host_indices)
+        device_indices = self.dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )
+            for draft_layer_id, draft_device_pool in enumerate(
+                self.mtp_draft_device_pools
+            ):
+                self._backup_from_device_per_layer(
+                    draft_device_pool,
+                    host_indices,
+                    device_indices,
+                    self.device_pool.layer_num + draft_layer_id,
+                    io_backend,
+                    is_draft=True,
+                )
             return
+
+        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
+            device_pool
+        )
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -383,7 +446,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     jit_transfer_hicache_all_layer_mla(
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,
-                        ptr_src=device_pool.data_ptrs,
+                        ptr_src=device_data_ptrs,
                         indices_src=device_indices,
                         cache_dst_stride_bytes=self.token_stride_size,
                         cache_src_stride_bytes=self.token_stride_size,
@@ -391,7 +454,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 else:
                     transfer_kv_all_layer_mla(
-                        src_layers=device_pool.data_ptrs,
+                        src_layers=device_data_ptrs,
                         dst_layers=self.data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
@@ -401,7 +464,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
-                        ptr_src=device_pool.data_ptrs,
+                        ptr_src=device_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         staging=self.staging_buffer,
@@ -410,7 +473,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 else:
                     transfer_kv_all_layer_mla_lf_pf(
-                        src_layers=device_pool.data_ptrs,
+                        src_layers=device_data_ptrs,
                         dst=self.kv_buffer,
                         src_indices=device_indices,
                         dst_indices=host_indices,
@@ -423,7 +486,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=device_pool.kv_buffer,
+                    src_layers=device_kv_buffers,
                     dst_layers=self.data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -431,7 +494,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             elif self.layout == "page_first_direct":
                 transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_pool.kv_buffer,
+                    src_ptrs=device_kv_buffers,
                     dst_ptrs=[self.kv_buffer],
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -459,6 +522,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        assert self.dcp_size == 1, (
+            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
+            "need dcp_rank-scoped keys); --hicache-storage-backend with "
+            "--dcp-size > 1 should have been rejected at server start."
+        )
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
