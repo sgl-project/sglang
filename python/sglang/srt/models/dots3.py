@@ -876,7 +876,6 @@ class Dots3AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
-                rope_dim_at_front=False,
             )
 
         self.attn_mqa = RadixAttention(
@@ -1894,7 +1893,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def determine_num_fused_shared_experts(
-        self, architecture: str = "Dot3NoteForCausalLM"
+        self, architecture: str = "Dots3NoteOmniForCausalLM"
     ):
         self.num_fused_shared_experts = 0
         if global_server_args_dict["disable_shared_experts_fusion"]:
@@ -2400,7 +2399,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         # so this branch is dormant. When a future checkpoint
                         # diverges (independent fine-tune / different quantization /
                         # vocab compression), the override of set_embed_and_head in
-                        # Dot3NoteForCausalLMNextN keeps this loaded value instead
+                        # Dots3NoteOmniForCausalLMNextN keeps this loaded value instead
                         # of overwriting it with the target's. K-heads note: this
                         # routes every per-head head into the same lm_head slot —
                         # the last write wins. The current architecture has one
@@ -2608,12 +2607,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
     def set_embed_and_head(self, embed, head):
         # Destructive share-from-target for the main model. eagle_worker calls
         # this on the *draft* model right after both target and draft have
-        # loaded. For the main `Dot3NoteForCausalLM` (used as the draft only in
+        # loaded. For the main `Dots3NoteOmniForCausalLM` (used as the draft only in
         # the unusual case of a 1-layer target), the loaded weights are
         # discarded and replaced by the target's tensors — saves ~2× embed/head
         # memory and guarantees the draft scores in the same vocab space.
         #
-        # IMPORTANT: `Dot3NoteForCausalLMNextN` overrides this method (see
+        # IMPORTANT: `Dots3NoteOmniForCausalLMNextN` overrides this method (see
         # dots3_nextn.py) to make the share decision *per side* based on
         # whether the checkpoint actually wrote MTP-side embed / head weights.
         # If you change the behaviour here, update the override there too.
@@ -2669,10 +2668,8 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
         if self.pp_group.is_first_rank and not getattr(
             config, "language_only", False
         ):
-            self.audio_tower = DotsNoteOmniAudioEncoder(
-                str(model_dir / "new_ae")
-            )
-            self.visual = DotsNoteOmniVisionEncoder(str(model_dir / "new_ve"))
+            self.audio_tower = DotsNoteOmniAudioEncoder(str(model_dir))
+            self.visual = DotsNoteOmniVisionEncoder(str(model_dir))
         else:
             self.audio_tower = None
             self.visual = None
@@ -2845,7 +2842,15 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         return self.thinker.get_input_embeddings()
 
     def load_weights(self, weights, *args, **kwargs):
-        self.thinker.language_model.load_weights(weights, *args, **kwargs)
+        # Flat dots.note.omni publishes include all three components in one
+        # index. Tower weights are loaded below by their native modules, so do
+        # not pass their names through the language-model loader.
+        language_weights = (
+            (name, weight)
+            for name, weight in weights
+            if not name.startswith(("audio_encoder.", "vision_encoder."))
+        )
+        self.thinker.language_model.load_weights(language_weights, *args, **kwargs)
         if self.thinker.visual is not None:
             self.thinker.visual.load_converted_weights()
             self.thinker.audio_tower.load_converted_weights()
@@ -2869,8 +2874,8 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         )
 
 
-class Dot3NoteForCausalLM(DotsNoteOmniForConditionalGeneration):
-    """Checkpoint-compatible alias for the historical architecture name."""
+class Dots3NoteOmniForCausalLM(DotsNoteOmniForConditionalGeneration):
+    """dots.note.omni architecture exported by the flat checkpoint."""
 
 
-EntryClass = [Dot3NoteForCausalLM]
+EntryClass = [Dots3NoteOmniForCausalLM]

@@ -381,7 +381,6 @@ class Indexer(MultiPlatformOp):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         config=None,
-        rope_dim_at_front: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -391,15 +390,10 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
-        self.rope_dim_at_front = rope_dim_at_front
-        # The fused DSV3.2 Q/K kernels currently hard-code RoPE in the leading
-        # dimensions.  Tail-RoPE models such as dots3 must use the generic path
-        # until those kernels accept the layout explicitly.
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
-            and rope_dim_at_front
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -551,11 +545,6 @@ class Indexer(MultiPlatformOp):
         # index-K cache here matches the fused path that decode reads back.
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
-    def _select_rope_slice(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self.rope_dim_at_front:
-            return tensor[..., : self.rope_head_dim]
-        return tensor[..., -self.rope_head_dim :]
-
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         if (
             forward_batch.forward_mode.is_extend_without_speculative()
@@ -583,7 +572,7 @@ class Indexer(MultiPlatformOp):
             ):
                 query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-                q_rope = self._select_rope_slice(query)
+                q_rope = query[..., : self.rope_head_dim]
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
@@ -591,24 +580,24 @@ class Indexer(MultiPlatformOp):
                 else:
                     key, _ = self.wk(x)
                 key = self.k_norm(key)
-                k_rope = self._select_rope_slice(key)
+                k_rope = key[..., : self.rope_head_dim]
 
             current_stream.wait_stream(self.alt_stream)
         else:
             query, _ = self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-            q_rope = self._select_rope_slice(query)
+            q_rope = query[..., : self.rope_head_dim]
             if self.use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
             key = self.k_norm(key)
-            k_rope = self._select_rope_slice(key)
+            k_rope = key[..., : self.rope_head_dim]
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        self._update_rope_guarded(self._select_rope_slice(query), q_rope)
-        self._update_rope_guarded(self._select_rope_slice(key), k_rope)
+        self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -660,14 +649,14 @@ class Indexer(MultiPlatformOp):
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
         key = self.k_norm(key)
-        k_rope = self._select_rope_slice(key)
+        k_rope = key[..., : self.rope_head_dim]
 
         # The CUDA rotary implementation may update both inputs in place.  Do
         # not alias its query and key inputs: doing so can rotate/corrupt the
         # index K twice in the K-only path used by early chunked prefill.
         dummy_q_rope = torch.empty_like(k_rope)
         _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
-        self._update_rope_guarded(self._select_rope_slice(key), k_rope)
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
         return key

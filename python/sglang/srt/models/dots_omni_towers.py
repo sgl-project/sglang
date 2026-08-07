@@ -1,9 +1,4 @@
-"""In-process vision/audio towers for dots.note.omni.
-
-The converted checkpoint stores the towers in ``new_ve`` and ``new_ae`` next
-to the language-model shards.  This module adapts the existing native tower
-implementations to SGLang without starting the legacy gRPC encoder service.
-"""
+"""In-process vision/audio towers for dots.note.omni."""
 
 from __future__ import annotations
 
@@ -34,14 +29,40 @@ def _read_json(path: Path) -> dict:
         return json.load(file)
 
 
-def _load_safetensor_state(model_dir: Path) -> dict[str, torch.Tensor]:
-    from safetensors.torch import load_file
+def load_omni_component_config(model_dir: Path, component: str) -> dict:
+    """Read a tower config from a flat dots.note.omni publish."""
+    config = _read_json(model_dir / "config.json")
+    nested_name = f"{component}_config"
+    if nested_name not in config:
+        raise KeyError(f"Missing {nested_name!r} in {model_dir / 'config.json'}")
+    return config[nested_name]
+
+
+def _load_safetensor_state(model_dir: Path, key_prefix: str) -> dict[str, torch.Tensor]:
+    """Load one tower without materializing unrelated flat-checkpoint shards."""
+    from safetensors import safe_open
 
     index = _read_json(model_dir / "model.safetensors.index.json")
-    shard_names = sorted(set(index["weight_map"].values()))
-    state = {}
-    for shard_name in shard_names:
-        state.update(load_file(str(model_dir / shard_name), device="cpu"))
+    weight_map = index["weight_map"]
+    selected_weights = {
+        name[len(key_prefix) :]: shard
+        for name, shard in weight_map.items()
+        if name.startswith(key_prefix)
+    }
+    if not selected_weights:
+        raise RuntimeError(
+            f"Flat dots.note.omni index has no weights with prefix {key_prefix!r}"
+        )
+    state: dict[str, torch.Tensor] = {}
+    for shard_name in sorted(set(selected_weights.values())):
+        names = [
+            name for name, shard in selected_weights.items() if shard == shard_name
+        ]
+        with safe_open(
+            str(model_dir / shard_name), framework="pt", device="cpu"
+        ) as file:
+            for name in names:
+                state[name] = file.get_tensor(f"{key_prefix}{name}")
     return state
 
 
@@ -50,13 +71,15 @@ class DotsNoteOmniVisionEncoder(DotsMoEVitModel):
 
     def __init__(self, model_dir: str):
         self.model_dir = Path(model_dir)
-        config = DotsMoEVitConfig(**_read_json(self.model_dir / "config.json"))
+        config = DotsMoEVitConfig(
+            **load_omni_component_config(self.model_dir, "vision")
+        )
         super().__init__(config)
         self.to(torch.bfloat16)
 
     def load_converted_weights(self):
         missing, unexpected = self.load_state_dict(
-            _load_safetensor_state(self.model_dir), strict=False
+            _load_safetensor_state(self.model_dir, "vision_encoder."), strict=False
         )
         if missing:
             raise RuntimeError(f"Dots vision tower missing weights: {missing[:8]}")
@@ -71,7 +94,7 @@ class DotsNoteOmniAudioEncoder(OmniAudioModel):
 
     def __init__(self, model_dir: str):
         self.model_dir = Path(model_dir)
-        config = OmniAudioConfig(**_read_json(self.model_dir / "config.json"))
+        config = OmniAudioConfig(**load_omni_component_config(self.model_dir, "audio"))
         super().__init__(config)
         self.to(torch.bfloat16)
 
@@ -81,7 +104,7 @@ class DotsNoteOmniAudioEncoder(OmniAudioModel):
 
     def load_converted_weights(self):
         missing, unexpected = self.load_state_dict(
-            _load_safetensor_state(self.model_dir), strict=True
+            _load_safetensor_state(self.model_dir, "audio_encoder."), strict=True
         )
         if missing or unexpected:
             raise RuntimeError(
@@ -96,6 +119,7 @@ class DotsNoteOmniImagePreprocessor:
     def __init__(self, model_dir: str):
         model_dir = Path(model_dir)
         config = _read_json(model_dir / "preprocessor_config.json")
+        config = config["vision_config"]
         self.min_pixels = config["min_pixels"]
         self.max_pixels = config["max_pixels"]
         self.patch_size = config["patch_size"]

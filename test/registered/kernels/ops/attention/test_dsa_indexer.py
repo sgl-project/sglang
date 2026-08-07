@@ -894,7 +894,6 @@ class TestDSAIndexer(CustomTestCase):
         indexer = Indexer.__new__(Indexer)
         torch.nn.Module.__init__(indexer)
         indexer.rope_head_dim = 2
-        indexer.rope_dim_at_front = False
 
         raw_key = torch.arange(8, device=self.device, dtype=self.dtype).reshape(2, 4)
         indexer.wk = MagicMock(return_value=(raw_key.clone(), None))
@@ -916,12 +915,8 @@ class TestDSAIndexer(CustomTestCase):
             )
 
         expected = raw_key.clone()
-        expected[..., -2:] += 1
+        expected[..., :2] += 1
         torch.testing.assert_close(result, expected)
-
-    def test_tail_rope_disables_incompatible_indexer_fusion(self):
-        indexer = self._create_indexer(is_neox_style=False, rope_dim_at_front=False)
-        self.assertFalse(indexer.use_dsa_indexer_fusion)
 
     def test_indexer_metadata_interface(self):
         """Test the BaseIndexerMetadata interface implementation."""

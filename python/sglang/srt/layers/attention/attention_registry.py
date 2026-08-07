@@ -291,7 +291,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     if (
         runner.model_config.hf_config.architectures
         and runner.model_config.hf_config.architectures[0]
-        == "Dot3NoteForCausalLM"
+        == "Dots3NoteOmniForCausalLM"
         and getattr(runner.model_config.hf_config, "index_topk", None) is not None
     ):
         from sglang.srt.layers.attention.dots_hybrid_backend import (

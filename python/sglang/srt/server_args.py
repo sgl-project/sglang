@@ -4982,7 +4982,7 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "LongcatFlashForCausalLM",
-            "Dot3NoteForCausalLM",
+            "Dots3NoteOmniForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -7181,7 +7181,7 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
-            "Dot3NoteForCausalLM",
+            "Dots3NoteOmniForCausalLM",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
             "MiMoV2ForCausalLM",

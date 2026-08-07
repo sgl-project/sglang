@@ -9,7 +9,7 @@ if [[ -d "${PYENV_ROOT}/bin" ]]; then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-MODEL_PATH="${MODEL_PATH:-/diancpfs/user/xiaoke/ckpts/dots/release/dots3_note_omni_sft_stage1_dsa_384k_release_fixnan/iter_0009800_hf_fp8_infra}"
+MODEL_PATH="${MODEL_PATH:-/cpfs/user/qianwu/models/note_omni_publish}"
 SGL_PORT="${SGL_PORT:-8192}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 
