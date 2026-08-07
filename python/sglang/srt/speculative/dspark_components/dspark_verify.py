@@ -37,6 +37,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_METHOD,
+    sample_simulated_acc_len,
+)
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -152,15 +156,19 @@ class TargetVerifyExecutor:
         self, *, bs: int, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
         buf = self._simulated_correct_drafts_buf
-        if buf is None or buf.numel() < bs or buf.dtype != dtype:
-            correct_target = int(
-                round(min(max(self._simulate_acc_len - 1.0, 0.0), float(self.gamma)))
-            )
-            buf = torch.full(
-                (max(bs, 512),), correct_target, dtype=dtype, device=device
-            )
+        if (
+            buf is None
+            or buf.numel() < bs
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
+            buf = torch.empty((max(bs, 512),), dtype=dtype, device=device)
             self._simulated_correct_drafts_buf = buf
-        return buf[:bs]
+
+        simulated_acc_len = sample_simulated_acc_len(
+            self._simulate_acc_len, SIMULATE_ACC_METHOD, self.gamma + 1
+        )
+        return buf[:bs].fill_(simulated_acc_len - 1)
 
     def run_idle_participation(
         self,
