@@ -255,6 +255,8 @@ def maybe_flashinfer_autotune_extend(
     untuned at >=8k tokens on sm100). One extra forward at the largest
     per-rank extend token count tunes all buckets up to it.
     """
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+        return
     mr = runner.model_runner
     # max_prefill_tokens is a per-scheduler (per dp-rank) budget, and warmup
     # runs on all dp ranks at once, so the gathered dummy already reaches the
@@ -307,7 +309,17 @@ def maybe_flashinfer_autotune_extend(
         f"FlashInfer autotune: extra EXTEND pass at {num_tokens} tokens "
         f"({batch_size} seqs x {per_req} tokens).",
     )
-    run_flashinfer_autotune_forward(mr, forward_fn, skip_logits=True)
-    # release dummy buffers before capture measures free memory
-    del forward_fn, buffers
-    torch.cuda.empty_cache()
+    try:
+        run_flashinfer_autotune_forward(mr, forward_fn, skip_logits=True)
+    except torch.OutOfMemoryError:
+        # The pass is an optimization; without headroom for the extend-shaped
+        # forward, fall back to untuned extend buckets instead of failing.
+        log_info_on_rank0(
+            logger,
+            "FlashInfer extend autotune skipped: not enough free memory "
+            f"for a {num_tokens}-token dummy forward.",
+        )
+    finally:
+        # release dummy buffers before capture measures free memory
+        del forward_fn, buffers
+        torch.cuda.empty_cache()
