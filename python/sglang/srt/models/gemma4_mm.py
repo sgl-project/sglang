@@ -293,11 +293,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Gemma 4 multimodal ties its LM head to the text embed_tokens
-        embed = self.language_model.embed_tokens.weight
-        return embed, embed
-
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
@@ -1041,40 +1036,53 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return loaded_params
 
     lora_pattern = re.compile(
-        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+        r"^language_model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.(?:experts|down_proj|gate_up_proj))"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
 
     def get_hidden_dim(self, module_name, layer_idx):
+        text_config = (
+            self.config.get_text_config()
+            if hasattr(self.config, "get_text_config")
+            else getattr(self.config, "text_config", self.config)
+        )
+        layer_type = text_config.layer_types[layer_idx]
+        if layer_type == "full_attention":
+            head_dim = getattr(text_config, "global_head_dim", text_config.head_dim)
+        else:
+            head_dim = getattr(text_config, "swa_head_dim", text_config.head_dim)
+
+        intermediate_size = text_config.intermediate_size
+        num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
+        first_kv_shared_layer_idx = text_config.num_hidden_layers - num_kv_shared_layers
+        if (
+            getattr(text_config, "use_double_wide_mlp", False)
+            and num_kv_shared_layers > 0
+            and layer_idx >= first_kv_shared_layer_idx
+        ):
+            intermediate_size *= 2
+
         # return input_dim, output_dim
         if module_name == "qkv_proj":
             return (
-                self.config.hidden_size,
-                self.config.head_dim
+                text_config.hidden_size,
+                head_dim
                 * (
-                    self.config.num_attention_heads
-                    + self.config.num_key_value_heads * 2
+                    text_config.num_attention_heads
+                    + text_config.num_key_value_heads * 2
                 ),
             )
         elif module_name == "o_proj":
             return (
-                self.config.head_dim * self.config.num_attention_heads,
-                self.config.hidden_size,
+                head_dim * text_config.num_attention_heads,
+                text_config.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            assert len(set(self.config.intermediate_size)) == 1, (
-                "Currently SGLang requires uniform intermediate size for all layers. "
-                "Please file an issue if you need support for non-uniform intermediate sizes."
-            )
-            return self.config.hidden_size, self.config.intermediate_size[0] * 2
+            return text_config.hidden_size, intermediate_size * 2
         elif module_name == "down_proj":
-            assert len(set(self.config.intermediate_size)) == 1, (
-                "Currently SGLang requires uniform intermediate size for all layers. "
-                "Please file an issue if you need support for non-uniform intermediate sizes."
-            )
-            return self.config.intermediate_size[0], self.config.hidden_size
+            return intermediate_size, text_config.hidden_size
         else:
             raise NotImplementedError()
 
