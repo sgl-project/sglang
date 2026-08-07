@@ -178,6 +178,16 @@ def handle_attention_aiter(attn, forward_batch):
         return AttnForwardMethod.MLA
 
 
+def handle_attention_moonmath_mla(attn, forward_batch):
+    # Same split as aiter (our backend subclasses AiterAttnBackend): pure prefill -> non-absorbed
+    # MHA (materialized K[192]/V[128]); decode + spec -> absorbed MLA (q[576] -> o[512] latent).
+    # Ineligible shapes fall back to aiter inside the backend's forward_decode / forward_extend.
+    if forward_batch.forward_mode.is_extend_without_speculative():
+        return AttnForwardMethod.MHA
+    else:
+        return AttnForwardMethod.MLA
+
+
 def handle_attention_dsa(attn, forward_batch):
     """
     Dispatch logic is centralized in DeepseekSparseAttnBackend.set_dsa_prefill_impl and executed
@@ -222,6 +232,7 @@ AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
+AttentionBackendRegistry.register("moonmath_mla", handle_attention_moonmath_mla)
 AttentionBackendRegistry.register("dsa", handle_attention_dsa)
 AttentionBackendRegistry.register(
     "nsa", handle_attention_dsa

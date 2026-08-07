@@ -195,6 +195,7 @@ ATTENTION_BACKEND_CHOICES = [
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     # AMD specific
     "aiter",
+    "moonmath_mla",
     "wave",
     # Other platforms
     "intel_amx",
