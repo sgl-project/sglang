@@ -79,6 +79,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     build-essential \
     cmake \
     perl \
+    patch \
     patchelf \
     ccache \
     git-lfs \
@@ -526,6 +527,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
+
+# Apply the FlashInfer CuTeDSL MLA decode-context-parallel runtime patch.
+# Exclude tests because they are not included in the installed wheel.
+COPY docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt /tmp/flashinfer-perkz-dcp-0.6.15.txt
+RUN FLASHINFER_DCP_PATCH=/tmp/flashinfer-perkz-dcp-0.6.15.txt && \
+    FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
+    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
+      patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
+    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
+      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
+    rm -f "${FLASHINFER_DCP_PATCH}" && \
+    rm -rf /root/.cache/flashinfer /root/.cache/pip
 
 # Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
 COPY --from=trtllm_cubin_builder /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
