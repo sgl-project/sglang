@@ -345,6 +345,11 @@ class UnifiedRadixCache(BasePrefixCache):
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 server_args.hicache_storage_backend_extra_config
             )
+            if server_args.file_storage_path:
+                storage_extra_config = dict(storage_extra_config or {})
+                storage_extra_config.setdefault(
+                    "file_storage_path", server_args.file_storage_path
+                )
 
         attach_hybrid_pool_to_unified_cache(
             self,
