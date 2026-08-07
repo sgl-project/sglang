@@ -18,6 +18,9 @@
 export const config = {
   modelName: "Qwen3.5",
 
+  // TTFT/TPOT are P50 (median_ttft_ms / median_tpot_ms from bench_serving).
+  latencyPercentile: "P50",
+
   supportedHardware: [
     "h100", "h200", "b200", "b300",
     "mi300x", "mi325x", "mi355x",
@@ -123,7 +126,7 @@ python3 benchmark/gsm8k/bench_sglang.py --port {{CURL_PORT}}`,
 `# Run from the sglang repo root
 python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --max-new-tokens 512`,
     },
-    numPromptsByConc: { 1: 8, 16: 64, 1024: 2048, 4096: 8192 },
+    numPromptsByConc: { 1: 8, 16: 64, 1024: 2048 },
   },
 
   // The page's measured evals are GSM8K + MMMU (vision) — not the engine's
