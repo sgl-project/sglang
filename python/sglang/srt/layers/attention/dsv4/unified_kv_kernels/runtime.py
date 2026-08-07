@@ -128,36 +128,75 @@ def store_swa_into_unified(
         )
 
         buff, rope = pack_native_bf16_to_2buff(kv)  # [T,512] fp8, [T,64] bf16
-        buff_u8 = buff.contiguous().view(torch.uint8)
-        rope = rope.contiguous()
-        _swa_scatter_kernel[(n_rows,)](
-            buff_u8,
-            state_slot,
-            positions,
-            fp_arg,
-            unified_kv_fp8.view(torch.uint8),
-            n_rows,
-            ring_stride,
+        swa_scatter_fp8_mirror(
+            buff=buff,
+            rope=rope,
+            state_slot=state_slot,
+            positions=positions,
+            unified_kv_fp8=unified_kv_fp8,
+            unified_kv_rope=unified_kv_rope,
             win=win,
-            D=512,
-            HAS_FINAL=has_final,
-            BLOCK_D=triton.next_power_of_2(512),
-            num_warps=8,
+            ring_stride=ring_stride,
+            final_pos=final_pos,
         )
-        _swa_scatter_kernel[(n_rows,)](
-            rope,
-            state_slot,
-            positions,
-            fp_arg,
-            unified_kv_rope,
-            n_rows,
-            ring_stride,
-            win=win,
-            D=64,
-            HAS_FINAL=has_final,
-            BLOCK_D=triton.next_power_of_2(64),
-            num_warps=4,
-        )
+
+
+def swa_scatter_fp8_mirror(
+    *,
+    buff: torch.Tensor,  # [T, 512] fp8 (already packed)
+    rope: torch.Tensor,  # [T, 64]  bf16 (already packed)
+    state_slot: torch.Tensor,  # [T] int
+    positions: torch.Tensor,  # [T] int
+    unified_kv_fp8: torch.Tensor,  # [pages, 512] fp8 mirror
+    unified_kv_rope: torch.Tensor,  # [pages, 64]  bf16 mirror
+    win: int,
+    ring_stride: int,
+    final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+) -> None:
+    """Scatter pre-packed fp8/rope rows into the SWA ring mirror.
+
+    Uses the same loc + final-window mask as the bf16 SWA scatter. Split out of
+    ``store_swa_into_unified`` so the decode path can pack the SWA new-token rows
+    together with the compressed rows in a *single* ``_quant_k_cache`` launch and
+    then scatter each slice, instead of paying two separate pack launches per
+    layer. fp8 is scattered as raw bytes (uint8 view) since triton has no float8
+    store.
+    """
+    n_rows = buff.shape[0]
+    if n_rows == 0:
+        return
+    has_final = final_pos is not None
+    fp_arg = final_pos if has_final else positions
+    buff_u8 = buff.contiguous().view(torch.uint8)
+    rope = rope.contiguous()
+    _swa_scatter_kernel[(n_rows,)](
+        buff_u8,
+        state_slot,
+        positions,
+        fp_arg,
+        unified_kv_fp8.view(torch.uint8),
+        n_rows,
+        ring_stride,
+        win=win,
+        D=512,
+        HAS_FINAL=has_final,
+        BLOCK_D=triton.next_power_of_2(512),
+        num_warps=8,
+    )
+    _swa_scatter_kernel[(n_rows,)](
+        rope,
+        state_slot,
+        positions,
+        fp_arg,
+        unified_kv_rope,
+        n_rows,
+        ring_stride,
+        win=win,
+        D=64,
+        HAS_FINAL=has_final,
+        BLOCK_D=triton.next_power_of_2(64),
+        num_warps=4,
+    )
 
 
 # ---------------------------------------------------------------------------

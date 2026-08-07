@@ -546,7 +546,17 @@ class CompressorBackendMixin:
             # mirror (and rope) so aiter decode reads fixed-shape fp8. Only the
             # unified_kv-triton compressed store (bf16_store, non-indexer) feeds
             # the mla-decode KV; indexer/extra-key stores are not read by it.
-            if bf16_store and not compressor.is_in_indexer:
+            #
+            # DECODE: skip here. The attention backend folds this compressed-row
+            # pack into a SINGLE _quant_k_cache launch together with the SWA
+            # new-token pack (see _forward_unified_kv), halving the packer
+            # launches per decode layer. PREFILL still mirrors here (variable
+            # shape, non-graph path).
+            if (
+                bf16_store
+                and not compressor.is_in_indexer
+                and not forward_batch.forward_mode.is_decode_or_idle()
+            ):
                 _get_fp8 = getattr(token_to_kv_pool, "get_unified_kv_fp8", None)
                 fp8_buf = _get_fp8(layer_id) if _get_fp8 is not None else None
                 if fp8_buf is not None:

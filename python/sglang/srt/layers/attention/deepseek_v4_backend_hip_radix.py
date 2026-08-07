@@ -1160,7 +1160,10 @@ class DeepseekV4HipRadixBackend(
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         if is_decode:
             state_slot = forward_batch.req_pool_indices[:T]
+            unified_metadata = core_attn_metadata.unified
             if save_kv_cache:
+                # bf16 SWA ring scatter (fp8 mirror is handled by the single
+                # merged pack below, so don't pass the fp8 buffers here).
                 runtime.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
@@ -1169,10 +1172,45 @@ class DeepseekV4HipRadixBackend(
                     win=win,
                     ring_stride=ring_stride,
                     final_pos=positions,
-                    unified_kv_fp8=unified_fp8,
-                    unified_kv_rope=unified_rope,
                 )
-            unified_metadata = core_attn_metadata.unified
+                # Store-time fp8 mirror in a SINGLE _quant_k_cache launch: pack the
+                # SWA new-token K together with the freshly-written compressed rows
+                # (the compressor wrote their bf16 into ``unified`` at c*_out_loc
+                # earlier this layer, and skips its own pack in decode), then
+                # scatter each slice to its mirror region. Was two pack launches
+                # per decode layer -> one. Shapes are static (T fixed per graph),
+                # so this stays cuda-graph safe.
+                if unified_fp8 is not None:
+                    if compress_ratio == 128:
+                        comp_loc = getattr(unified_metadata, "c128_out_loc", None)
+                    elif compress_ratio == 4:
+                        comp_loc = getattr(unified_metadata, "c4_out_loc", None)
+                    else:
+                        comp_loc = None
+                    if comp_loc is not None:
+                        comp_loc = comp_loc[:T].long()
+                        rows = torch.cat([kv, unified[comp_loc]], dim=0)
+                    else:
+                        rows = kv
+                    from sglang.srt.layers.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+                        pack_native_bf16_to_2buff,
+                    )
+
+                    buff, rope = pack_native_bf16_to_2buff(rows)
+                    runtime.swa_scatter_fp8_mirror(
+                        buff=buff[:T],
+                        rope=rope[:T],
+                        state_slot=state_slot,
+                        positions=positions,
+                        unified_kv_fp8=unified_fp8,
+                        unified_kv_rope=unified_rope,
+                        win=win,
+                        ring_stride=ring_stride,
+                        final_pos=positions,
+                    )
+                    if comp_loc is not None:
+                        unified_fp8[comp_loc] = buff[T:]
+                        unified_rope[comp_loc] = rope[T:]
             if compress_ratio == 0:
                 kv_indices = unified_metadata.swa_indices
                 kv_indptr = unified_metadata.swa_indptr
