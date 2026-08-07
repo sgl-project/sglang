@@ -96,6 +96,19 @@ TRTLLM_MLA_MAX_BATCH_SIZE = 8192
 # base-invariant.
 LSE_BASE2_FROM_NATURAL_LOG = math.log2(math.e)
 
+# Whether a flashinfer MLA decode kernel returns a natural-log LSE, and so needs
+# the rebase above. flashinfer's own trtllm-gen MLA test asserts only the LSE
+# dtype, shape and finiteness, never its base, so this is not documented
+# upstream and was measured on B200/SM100 (flashinfer 0.6.15.post1) against a
+# torch.logsumexp reference: trtllm-gen already emits base-2
+# (median lse/ln_ref = 1.442695 = log2(e), max abs error 4e-6 against the
+# rebased reference), while cute-dsl emits natural log. An unlisted backend
+# falls back to no rebase, matching trtllm-gen.
+DECODE_LSE_IS_NATURAL_LOG_BY_BACKEND = {
+    "trtllm-gen": False,
+    "cute-dsl": True,
+}
+
 
 def _multi_ctas_kv_counter_bytes(
     device: torch.device, num_q_heads: int, batch_size: int
@@ -203,14 +216,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # LSE base emitted by this backend's decode kernel, used to decide whether
-    # the DCP merge needs the log2(e) rebase.
-    # TODO(dcp): UNVERIFIED for trtllm-gen. flashinfer's own trtllm-gen MLA test
-    # asserts only the LSE dtype/shape/finiteness, never its base, so this must
-    # be measured against a torch.logsumexp reference on SM100 before the DCP
-    # decode path below can be trusted. A wrong value here yields plausible but
-    # incorrect logits rather than a failure.
-    decode_lse_is_natural_log: bool = True
+    # Resolved per instance from ``backend`` in __init__; the class default keeps
+    # the no-rebase behaviour for instances built without it.
+    decode_lse_is_natural_log: bool = False
 
     def __init__(
         self,
@@ -243,6 +251,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         self.backend = backend
+        self.decode_lse_is_natural_log = DECODE_LSE_IS_NATURAL_LOG_BY_BACKEND.get(
+            backend, False
+        )
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
