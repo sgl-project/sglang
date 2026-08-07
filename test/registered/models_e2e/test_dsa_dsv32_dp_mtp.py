@@ -9,18 +9,21 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
 )
 
 register_cuda_ci(
-    est_time=400,
-    stage="base-c",
+    est_time=600,
+    stage="extra-b",
     runner_config="8-gpu-h200",
+    disabled="DSA + MTP is covered in CI by the GLM-5.2 variants, which share this "
+    "fixture and code path; kept runnable locally against DeepSeek-V3.2",
 )
 
 
-class TestGLM52TPMTP(
+class TestDeepseekV32DPMTP(
     DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin, SpecDecodingMixin
 ):
-    model = "zai-org/GLM-5.2-FP8"
-    mem_fraction_static = 0.8
-    bs_1_speed_thres = 150
+    model = "deepseek-ai/DeepSeek-V3.2"
+    mem_fraction_static = 0.85
+    enable_dp_attention = True
+    bs_1_speed_thres = 90
 
 
 if __name__ == "__main__":
