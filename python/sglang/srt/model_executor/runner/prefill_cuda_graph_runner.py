@@ -42,7 +42,7 @@ import inspect
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 import tqdm
@@ -120,6 +120,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidde
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_npu,
+    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
@@ -297,6 +298,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
+        self.mamba_cache_chunk_size = model_runner.server_args.mamba_cache_chunk_size
+        if not self.mamba_track_enabled and self._mamba_track_wanted():
+            # Said once here rather than from the replay-eligibility check,
+            # which runs per forward. Without it the eager fallback is
+            # invisible and reads as unexplained loss of graph coverage.
+            log_info_on_rank0(
+                logger,
+                "Mamba state tracking is not wired into the prefill CUDA graph "
+                "buffers under speculative decoding, so prefill batches that "
+                "need a track write will fall back to eager.",
+            )
 
         # --- buffers ---------------------------------------------------
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
@@ -536,12 +548,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_num_tokens = 0
         self.raw_bs = 0
 
-    def _is_mamba_track_enabled(self) -> bool:
+    def _mamba_track_wanted(self) -> bool:
+        """Whether the config asks for mamba tracking, ignoring whether this
+        runner can honor it. Separates "tracking is off by design" from
+        "tracking is wanted but unwired", which is the case that must not
+        replay."""
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
         )
+
+    def _is_mamba_track_enabled(self) -> bool:
+        return self._mamba_track_wanted() and self.model_runner.spec_algorithm.is_none()
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -1041,6 +1059,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return_logprob: bool,
         lora_ineligible: bool = False,
         chunked_prefix_uncapturable: bool = False,
+        extend_lens: Optional[List[int]] = None,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1074,6 +1093,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and any(prefix_lens)
         ):
             return False
+        # Mamba state tracking is only wired into the static buffers when
+        # _is_mamba_track_enabled() holds, which notably excludes speculative
+        # decoding. Replaying without them silently skips the track write while
+        # the scheduler still advances the ping-pong cursor, so the radix cache
+        # commits a never-written slot and a later prefix hit restores a valid
+        # but wrong mamba state. A request is tracked when its extend reaches
+        # mamba_cache_chunk_size (see _mamba_radix_cache_v2_req_prepare_for_extend),
+        # so this reads CPU lengths and never syncs the device-side mask.
+        # extend_lens is None at call sites that cannot supply it; be
+        # conservative there rather than replay into a skipped track write.
+        if not self.mamba_track_enabled and self._mamba_track_wanted():
+            if (
+                extend_lens is None
+                or max(extend_lens, default=0) >= self.mamba_cache_chunk_size
+            ):
+                return False
         # FullCG's chunked-prefix topology covers a bounded prefix. The flag
         # gating it is FULL-backend-only, so this is inert for the breakable
         # vote path.
@@ -1136,6 +1171,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self._has_prefix_hit(forward_batch)
                 and self._select_prefix_capture_chunks(forward_batch) is None
             ),
+            extend_lens=forward_batch.extend_seq_lens_cpu,
         ):
             return False
         if getattr(self, "enable_cp_v2_bcg_capture", False) and is_cp_v2_active(
