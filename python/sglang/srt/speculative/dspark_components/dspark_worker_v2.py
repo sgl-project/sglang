@@ -22,8 +22,8 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
-    make_draft_block_spec_info,
     clamp_verify_lens,
+    make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
