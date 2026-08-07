@@ -1300,14 +1300,16 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 
     server_args = _global_state.tokenizer_manager.server_args
     try:
-        resp = requests.get(
-            f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
-            params={"rank": rank},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as session:
+            async with session.get(
+                f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
+                params={"rank": rank},
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
         logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
 
     return ORJSONResponse(
