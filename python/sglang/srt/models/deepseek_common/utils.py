@@ -50,6 +50,91 @@ _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
+if _use_aiter_gfx95:
+    try:
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm_per_token_quant as _aiter_fused_qk_rmsnorm_per_token_quant,
+        )
+        from aiter.ops.quant import (
+            dynamic_per_token_scaled_quant as _aiter_dynamic_per_token_scaled_quant,
+        )
+
+        def fused_rms_fp8_per_token_quant(
+            inp1: torch.Tensor,
+            inp1_weight: torch.Tensor,
+            inp1_epsilon: float,
+            inp2: Optional[torch.Tensor] = None,
+            inp2_weight: Optional[torch.Tensor] = None,
+            inp2_epsilon: Optional[float] = None,
+            dtype_quant: torch.dtype = torch.float8_e4m3fn,
+            res1: Optional[torch.Tensor] = None,
+            output_unquantized_inp1: bool = False,
+        ):
+            """QK-RMSNorm + FP8 per-token quant on the aiter HIP kernel."""
+            m, n1 = inp1.shape
+            out1_fp8 = torch.empty((m, n1), dtype=dtype_quant, device=inp1.device)
+            out1_scale = torch.empty((m, 1), dtype=torch.float32, device=inp1.device)
+            out1_bf16 = torch.empty_like(inp1) if output_unquantized_inp1 else None
+            out2 = torch.empty_like(inp2) if inp2 is not None else None
+            out_res1 = torch.empty_like(inp1) if res1 is not None else None
+
+            _aiter_fused_qk_rmsnorm_per_token_quant(
+                out1_fp8,
+                out1_scale,
+                inp1,
+                inp1_weight,
+                inp1_epsilon,
+                q_out_unquantized=out1_bf16,
+                k_out=out2,
+                q_res_out=out_res1,
+                k=inp2,
+                k_weight=inp2_weight,
+                k_epsilon=inp2_epsilon,
+                q_residual=res1,
+            )
+            return (out1_fp8, out1_scale), out1_bf16, out2, out_res1
+
+        def flatten_fp8_per_token_quant(
+            x: torch.Tensor,
+            dtype_quant: torch.dtype = torch.float8_e4m3fn,
+        ):
+            """FP8 per-token quant of a flattened contiguous activation on HIP."""
+            m = x.shape[0]
+            n = x.numel() // m
+            out = torch.empty((m, n), dtype=dtype_quant, device=x.device)
+            scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+            _aiter_dynamic_per_token_scaled_quant(
+                out,
+                x.view(m, n),
+                scale,
+                shuffle_scale=False,
+            )
+            return out, scale
+
+    except ImportError:
+        from aiter.ops.quant import per_token_quant_hip as _aiter_per_token_quant_hip
+        from aiter.ops.triton.fused_fp8_quant import (
+            fused_rms_fp8_group_quant as _triton_fused_rms_fp8_group_quant,
+        )
+
+        def fused_rms_fp8_per_token_quant(inp1: torch.Tensor, *args, **kwargs):
+            return _triton_fused_rms_fp8_group_quant(
+                inp1,
+                *args,
+                group_size=inp1.shape[-1],
+                transpose_scale=False,
+                **kwargs,
+            )
+
+        def flatten_fp8_per_token_quant(
+            x: torch.Tensor,
+            dtype_quant: torch.dtype = torch.float8_e4m3fn,
+        ):
+            return _aiter_per_token_quant_hip(
+                x.reshape(x.shape[0], -1),
+                quant_dtype=dtype_quant,
+            )
+
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
