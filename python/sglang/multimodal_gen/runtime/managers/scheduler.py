@@ -413,10 +413,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             )
 
     def _sequential_prefetch_enabled(self) -> bool:
+        overlap_mode = getattr(self.server_args, "ar_dit_overlap_mode", "off")
+        if overlap_mode == "off":
+            return False
+        if overlap_mode == "auto" and self.server_args.num_gpus != 1:
+            return False
+
         pipeline_config = self.server_args.pipeline_config
         return (
             self.receiver is not None
-            and self.server_args.num_gpus == 1
             and self._dynamic_batching_enabled()
             and pipeline_config.supports_native_grouped_requests()
             and pipeline_config.supports_sequential_dit_inference()
