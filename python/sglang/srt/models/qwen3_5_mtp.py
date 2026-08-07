@@ -34,7 +34,11 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -57,13 +61,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() in (
-            "modelopt_fp4",
-            "modelopt_mixed",
+        # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
+        # BF16. Disable quantization for those checkpoints; non-serialized
+        # modelopt_fp4 still converts MoE expert weights on load.
+        if quant_config and (
+            quant_config.get_name() == "modelopt_mixed"
+            or (
+                quant_config.get_name() == "modelopt_fp4"
+                and quant_config.is_checkpoint_nvfp4_serialized
+            )
         ):
             quant_config = None
-        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
+        if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
 
         # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
@@ -153,7 +162,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if (
             is_npu()
             and self.quant_config is None
-            and get_server_args().quantization is not None
+            and get_model().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))

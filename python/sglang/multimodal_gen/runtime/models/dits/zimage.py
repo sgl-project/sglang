@@ -127,14 +127,6 @@ def zimage_rmsnorm_scale(
     return norm(x) * scale
 
 
-class SelectFirstElement(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x[0]
-
-
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
         super().__init__()
@@ -754,8 +746,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
-    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
-
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping

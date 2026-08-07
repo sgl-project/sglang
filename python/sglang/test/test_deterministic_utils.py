@@ -1,12 +1,12 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_deterministic import BenchArgs, test_deterministic
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
@@ -43,7 +43,7 @@ class TestDeterministicBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _extract_host_and_port(self, url):
         return url.split("://")[-1].split(":")[0], int(url.split(":")[-1])
