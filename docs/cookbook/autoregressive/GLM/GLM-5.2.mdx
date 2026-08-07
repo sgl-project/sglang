@@ -264,12 +264,3 @@ When deploying with PD Disaggregation, the prefill node can choose to enable [La
 --cp-strategy interleave \
 ```
 With LayerSplit, the kv cache on each rank can be sharded over the CP attention group, and prefetched when necessary. This can reduce kv cache memory by up to 75%, thus increasing the throughput on prefill side.
-
-## Community Configs
-
-Deployment configs contributed by the community. See the linked PR for benchmarks and discussion.
-
-import { CommunityConfigs } from "/src/snippets/_community.jsx";
-import { community }        from "/src/snippets/configs/zai-org/glm-5.2-community.jsx";
-
-<CommunityConfigs community={community} config={config} />
