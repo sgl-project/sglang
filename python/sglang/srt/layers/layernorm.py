@@ -222,6 +222,14 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
+                # Every caller reaches this helper with the producer's
+                # all-reduce still owed — they take an explicit all-reduce path
+                # when they do not expect the fusion — so a backend that
+                # declined (a shape its workspace cannot serve) must not leave
+                # the reduction undone.
+                x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
+
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
