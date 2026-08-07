@@ -53,6 +53,7 @@ class SchedulerKvEventsPublisher:
     send_metrics_from_scheduler: Optional[zmq.Socket]
     max_running_requests: int
     max_total_num_tokens: int
+    page_size: int
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
@@ -80,13 +81,14 @@ class SchedulerKvEventsPublisher:
         if not self.enable_kv_cache_events:
             return
 
+        # These are page counts, not token counts.
+        num_blocks = self.max_total_num_tokens // self.page_size
+
         kv_metrics = KvMetrics()
         kv_metrics.request_active_slots = self.get_stats().num_running_reqs.total
         kv_metrics.request_total_slots = self.max_running_requests
-        kv_metrics.kv_active_blocks = int(
-            self.get_stats().token_usage * self.max_total_num_tokens
-        )
-        kv_metrics.kv_total_blocks = self.max_total_num_tokens
+        kv_metrics.kv_active_blocks = int(self.get_stats().token_usage * num_blocks)
+        kv_metrics.kv_total_blocks = num_blocks
         kv_metrics.num_requests_waiting = self.get_stats().num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.get_stats().token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.get_stats().cache_hit_rate
