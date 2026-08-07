@@ -1338,6 +1338,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
                       "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
@@ -1577,7 +1578,8 @@
                     "tag": "approx",
                     "pages": [
                       "docs/sglang-diffusion/cache_dit",
-                      "docs/sglang-diffusion/teacache"
+                      "docs/sglang-diffusion/teacache",
+                      "docs/sglang-diffusion/spectrum"
                     ]
                   },
                   "docs/sglang-diffusion/progressive_resolution",

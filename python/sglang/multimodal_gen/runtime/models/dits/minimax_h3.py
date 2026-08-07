@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -485,7 +488,7 @@ def _minimax_h3_attention_core_impl(
             get_attn_backend(
                 attention.head_dim,
                 q.dtype,
-                supported_attention_backends=attention._supported_attention_backends,
+                attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
     out = attention._attention_impl.forward_varlen(
@@ -527,7 +530,6 @@ class MiniMaxH3Attention(nn.Module):
         self.inner_dim = self.total_num_heads * self.head_dim
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
-        self._supported_attention_backends = arch._supported_attention_backends
         self._attention_impl = None
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
@@ -1015,7 +1017,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
     _compile_conditions = _ARCH_DEFAULTS._compile_conditions
-    _supported_attention_backends = _ARCH_DEFAULTS._supported_attention_backends
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
@@ -1178,7 +1179,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
-            supported_attention_backends=self._supported_attention_backends,
+            attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):

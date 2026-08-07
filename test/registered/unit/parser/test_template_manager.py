@@ -13,6 +13,7 @@ from sglang.srt.parser.template_detection import (
     detect_tool_call_parser,
     resolve_auto_parsers,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2.0, suite="base-a-test-cpu")
@@ -769,21 +770,15 @@ class TestResolveAutoParsers(unittest.TestCase):
 
     qwen3_template = "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
 
-    class _Args(SimpleNamespace):
-        # Write-through override, per the runtime-context testing idiom:
-        # production adjusts parsers through override(source, ...), so the
-        # stand-in needs the method (a bare SimpleNamespace would raise).
-        def override(self, source, **fields):
-            for key, value in fields.items():
-                setattr(self, key, value)
-
     def _make_server_args(
         self, reasoning_parser=None, tool_call_parser=None, chat_template=None
     ):
-        return self._Args(
+        # The dummy model path skips resolution; the tokenizer / HF-config
+        # loads that detection performs are patched per test.
+        return ServerArgs(
+            model_path="dummy",
             reasoning_parser=reasoning_parser,
             tool_call_parser=tool_call_parser,
-            model_path="Qwen/Qwen3-0.6B",
             trust_remote_code=False,
             chat_template=chat_template,
         )
@@ -826,7 +821,11 @@ class TestResolveAutoParsers(unittest.TestCase):
 
     def test_nonexistent_model_disables_both_parsers(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
-        args.model_path = "nonexistent/model-does-not-exist-xyz"
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        object.__setattr__(args, "model_path", "nonexistent/model-does-not-exist-xyz")
         with _patch_hf_transformers_utils(
             Mock(side_effect=RuntimeError("tokenizer unavailable")),
             Mock(side_effect=RuntimeError("config unavailable")),
