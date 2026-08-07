@@ -8728,10 +8728,16 @@ class ServerArgs:
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
+        cp_tbo = (
+            is_hip()
+            and self.enable_dsa_prefill_context_parallel
+            and self.dsa_prefill_cp_mode == "round-robin-split"
+        )
         if (
             self.enable_two_batch_overlap
             and self.moe_a2a_backend == "none"
             and not self.enable_dp_attention
+            and not cp_tbo
         ):
             raise ValueError(
                 "When enabling two batch overlap without an EP a2a backend "
