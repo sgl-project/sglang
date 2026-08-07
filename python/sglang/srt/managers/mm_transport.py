@@ -140,21 +140,16 @@ def broadcast_mm_cpu_tensors(
             _restore_mm_tensors(originals)
 
     tensors = source_tensors if is_src else _allocate_mm_tensors(result)
-    handles = []
-    payloads = []
-    for tensor in tensors:
-        if tensor.numel() == 0:
-            continue
-        payload = tensor if tensor.is_contiguous() else tensor.contiguous()
-        payloads.append(payload)
-        handles.append(
-            dist.broadcast(
-                payload,
-                src=src,
-                group=dist_group,
-                async_op=True,
-            )
-        )
-    for handle in handles:
-        handle.wait()
+    pending: List[tuple[Any, torch.Tensor]] = []
+    try:
+        for tensor in tensors:
+            if tensor.numel() == 0:
+                continue
+            payload = tensor if tensor.is_contiguous() else tensor.contiguous()
+            handle = dist.broadcast(payload, src=src, group=dist_group, async_op=True)
+            # Keep the payload alive until its asynchronous collective finishes.
+            pending.append((handle, payload))
+    finally:
+        for handle, _payload in pending:
+            handle.wait()
     return result
