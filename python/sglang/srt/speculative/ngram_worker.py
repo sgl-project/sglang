@@ -71,6 +71,10 @@ class NGRAMWorker(BaseSpecWorker):
             raise ValueError(
                 "SGLANG_ENABLE_NGRAM_PRECOMPUTE requires overlap scheduling."
             )
+        logger.info(
+            "NGRAM execution mode: %s",
+            "precompute fully overlap" if self.enable_precompute else "spec v2",
+        )
         self.precompute_wide_bonus_ratio = (
             envs.SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO.get()
         )
@@ -585,8 +589,8 @@ class NGRAMWorker(BaseSpecWorker):
         if not prev_token_ids.is_cpu:
             prev_token_ids = prev_token_ids.cpu()
             prev_accept_lens = prev_accept_lens.cpu()
-        # Worker-level staging: written here at draft prep, consumed by
-        # _update_ngram_corpus after verify within the same forward call.
+        # In the ordinary path these tokens also update the online trie. With
+        # precompute they are used only to build the next precompute context.
         self.prev_token_ids = prev_token_ids.tolist()
         self.prev_accept_lens = prev_accept_lens.tolist()
 
@@ -722,12 +726,14 @@ class NGRAMWorker(BaseSpecWorker):
         )
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
-        self._ensure_prev_accept_cpu_ready()
         batch_tokens = []
         i, stride = 0, self.draft_token_num
-        # Same splice condition as _prepare_draft_tokens: only overlap mode
-        # has accepted tokens missing from req.output_ids.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        # Precompute accepts a one-iteration-lagged online trie so this update
+        # never needs the previous verify result. The ordinary NGRAM path keeps
+        # the original splice and its fresher corpus.
+        use_prev_tokens = (
+            self.enable_overlap and not self.enable_precompute and not batch.has_grammar
+        )
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
@@ -784,6 +790,7 @@ class NGRAMWorker(BaseSpecWorker):
             return
 
         self._ensure_selected_drafts_cpu_ready()
+        self._ensure_prev_accept_cpu_ready()
 
         bs = len(batch.reqs)
         d = self.draft_token_num
