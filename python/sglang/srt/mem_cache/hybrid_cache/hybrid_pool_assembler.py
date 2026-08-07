@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -33,6 +34,7 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -151,6 +153,59 @@ def build_pool_entry(
     )
 
 
+def _build_canary_entry(
+    *,
+    kv_pool: Any,
+    kv_host_pool: Any,
+    transfer_layer_num: int,
+    canary_group: Optional[CanaryBufferGroup] = None,
+    pool_name: PoolName = PoolName.CANARY,
+) -> Optional[PoolEntry]:
+    """Build a kv-canary sidecar PoolEntry, or None when canary is off."""
+    if canary_group is not None:
+        group = canary_group
+    else:
+        groups = getattr(kv_pool, "canary_buffer_groups", None)
+        if not groups or len(groups) != 1:
+            return None
+        group = groups[0]
+
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.pool_host.canary import CanaryPoolHost
+
+    v_half_enabled = envs.SGLANG_KV_CANARY_ENABLE_MHA_V.get()
+    device_bufs = {"k_head": group.k_head, "k_tail": group.k_tail}
+    if group.v_head is not None and v_half_enabled:
+        device_bufs["v_head"] = group.v_head
+    if group.v_tail is not None and v_half_enabled:
+        device_bufs["v_tail"] = group.v_tail
+    canary_host = CanaryPoolHost(
+        device_num_slots=int(group.k_tail.shape[0]),
+        host_num_slots=kv_host_pool.size,
+        device_bufs=device_bufs,
+        pin_memory=kv_host_pool.pin_memory,
+        can_use_write_back_jit=getattr(kv_host_pool, "can_use_write_back_jit", False),
+        can_use_jit=getattr(kv_host_pool, "can_use_jit", False),
+        host_kv_k_buffer=getattr(kv_host_pool, "k_buffer", None),
+        host_kv_v_buffer=getattr(kv_host_pool, "v_buffer", None),
+        host_kv_layout=getattr(kv_host_pool, "layout", None),
+        host_kv_page_size=getattr(kv_host_pool, "page_size", 1),
+        host_kv_layer_num=getattr(kv_host_pool, "layer_num", 0),
+        real_kv_hash_mode=getattr(
+            kv_pool, "canary_real_kv_hash_mode", RealKvHashMode.NONE
+        ),
+        real_kv_read_bytes=getattr(kv_pool, "canary_real_kv_read_bytes", 0),
+        pool_name=str(pool_name),
+    )
+    return build_pool_entry(
+        name=pool_name,
+        host_pool=canary_host,
+        device_pool=kv_pool,
+        layer_mapping={0: 0},
+        transfer_layer_num=transfer_layer_num,
+    )
+
+
 def build_kv_only_stack(
     *,
     params: CacheInitParams,
@@ -193,6 +248,13 @@ def build_kv_only_stack(
             is_anchor=True,
         )
     ]
+    canary_entry = _build_canary_entry(
+        kv_pool=kv_pool,
+        kv_host_pool=kv_host_pool,
+        transfer_layer_num=transfer_layer_num,
+    )
+    if canary_entry is not None:
+        entries.append(canary_entry)
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -235,6 +297,7 @@ def build_hybrid_swa_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    swa_kv_pool_outer: Optional[Any] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
     # MTP draft pools follow the target SWA layout; select their SWA storage.
@@ -297,6 +360,27 @@ def build_hybrid_swa_stack(
             device_free_fn=swa_attn_allocator.free,
         ),
     ]
+    if swa_kv_pool_outer is not None:
+        canary_groups = getattr(swa_kv_pool_outer, "canary_buffer_groups", None)
+        if canary_groups and len(canary_groups) == 2:
+            full_canary = _build_canary_entry(
+                kv_pool=swa_kv_pool_outer,
+                kv_host_pool=kv_host_pool,
+                transfer_layer_num=transfer_layer_num,
+                canary_group=canary_groups[0],
+                pool_name=PoolName.CANARY,
+            )
+            if full_canary is not None:
+                entries.append(full_canary)
+            swa_canary = _build_canary_entry(
+                kv_pool=swa_kv_pool_outer,
+                kv_host_pool=swa_host_pool,
+                transfer_layer_num=transfer_layer_num,
+                canary_group=canary_groups[1],
+                pool_name=PoolName.CANARY_SWA,
+            )
+            if swa_canary is not None:
+                entries.append(swa_canary)
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1111,9 +1195,7 @@ class StackStrategy:
 
 class _DeepSeekV4Strategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
         return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components == {
             ComponentType.FULL,
@@ -1254,9 +1336,7 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
@@ -1298,6 +1378,23 @@ class _SwaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            swa_kv_pool_outer=kvcache,
+        )
+        canary_groups = getattr(kvcache, "canary_buffer_groups", None)
+        sidecars = (
+            [
+                SidecarPoolSpec(
+                    pool_name=PoolName.CANARY,
+                    indices_from_pool=PoolName.KV,
+                ),
+                SidecarPoolSpec(
+                    pool_name=PoolName.CANARY_SWA,
+                    indices_from_pool=PoolName.SWA,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ]
+            if canary_groups and len(canary_groups) == 2
+            else []
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1306,6 +1403,7 @@ class _SwaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
             },
+            sidecars=sidecars,
             transfer_layer_num=len(full_layer_mapping | swa_layer_mapping),
             pools_desc="Full + SWA",
         )
@@ -1313,9 +1411,7 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
@@ -1508,9 +1604,7 @@ class _MiniMaxSparseStrategy(StackStrategy):
 
 class _PlainKvStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.memory_pool import (
             DSATokenToKVPool,
             HybridLinearKVPool,
@@ -1563,12 +1657,19 @@ class _PlainKvStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        canary_groups = getattr(full_kv_pool, "canary_buffer_groups", None)
+        sidecars = (
+            [SidecarPoolSpec(pool_name=PoolName.CANARY, indices_from_pool=PoolName.KV)]
+            if canary_groups and len(canary_groups) == 1
+            else []
+        )
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
             component_host_pools={
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
             },
+            sidecars=sidecars,
             transfer_layer_num=len(full_layer_mapping),
             pools_desc="KV",
         )
