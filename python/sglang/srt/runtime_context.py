@@ -50,7 +50,7 @@ import dataclasses
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -760,16 +760,20 @@ class RuntimeContext:
         self.resources = Resources()
         self.forward = ForwardFlags()
 
-    def get_stream(self, name: str) -> Any:
-        """Named process-level CUDA side stream: get-or-create, shared by
-        name (the keyed-lazy pattern of the persistent buffers). Creation is
-        a driver call that must stay outside cuda-graph capture — call sites
-        lease their stream at init/warmup time."""
+    def get_stream(self, name: str, *, factory: Callable[[], Any] | None = None) -> Any:
+        """Named process-level side stream: get-or-create, shared by name.
+
+        ``factory`` lets device-agnostic call sites create a stream from their
+        active device module. CUDA-only callers keep the default. Stream
+        creation is a driver call that must stay outside graph capture.
+        """
         stream = self.resources.streams.get(name)
         if stream is None:
-            import torch
+            if factory is None:
+                import torch
 
-            stream = torch.cuda.Stream()
+                factory = torch.cuda.Stream
+            stream = factory()
             self.resources.streams[name] = stream
         return stream
 
@@ -1320,8 +1324,8 @@ def publish_role() -> str | None:
     return _CONTEXT._publish_role
 
 
-def get_stream(name: str) -> Any:
-    return _CONTEXT.get_stream(name)
+def get_stream(name: str, *, factory: Callable[[], Any] | None = None) -> Any:
+    return _CONTEXT.get_stream(name, factory=factory)
 
 
 def set_stream(name: str, stream: Any) -> Any:

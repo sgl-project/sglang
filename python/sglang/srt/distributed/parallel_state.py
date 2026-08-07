@@ -52,6 +52,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
+    get_stream,
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
@@ -107,6 +108,9 @@ def get_torch_distributed_pg_options(group_name=None):
 @dataclass
 class GraphCaptureContext:
     stream: torch.get_device_module().Stream
+
+
+_PROCESS_GRAPH_CAPTURE_STREAM = "cuda_graph_capture"
 
 
 @dataclass
@@ -1965,21 +1969,22 @@ def get_mooncake_transfer_engine():
 
 @contextmanager
 def graph_capture(stream=None):
+    """Coordinate graph capture across all parallel groups.
+
+    Default captures reuse one process-level side stream. Combined with the
+    process-level graph memory pool, this lets separate runner capture sessions
+    reuse allocator blocks that are compatible in size and lifetime. Callers
+    that require a particular stream can still pass it explicitly.
     """
-    `graph_capture` is a context manager which should surround the code that
-    is capturing the CUDA graph. Its main purpose is to ensure that the
-    some operations will be run after the graph is captured, before the graph
-    is replayed. It returns a `GraphCaptureContext` object which contains the
-    necessary data for the graph capture. Currently, it only contains the
-    stream that the graph capture is running on. This stream is set to the
-    current CUDA stream when the context manager is entered and reset to the
-    default stream when the context manager is exited. This is to ensure that
-    the graph capture is running on a separate stream from the default stream,
-    in order to explicitly distinguish the kernels to capture
-    from other kernels possibly launched on background in the default stream.
-    """
+    tp_group = get_tp_group()
+    if stream is None:
+        stream = get_stream(
+            _PROCESS_GRAPH_CAPTURE_STREAM,
+            factory=tp_group.device_module.Stream,
+        )
+
     with (
-        get_tp_group().graph_capture(stream=stream) as context,
+        tp_group.graph_capture(stream=stream) as context,
         get_pp_group().graph_capture(context),
     ):
         with contextlib.ExitStack() as stack:

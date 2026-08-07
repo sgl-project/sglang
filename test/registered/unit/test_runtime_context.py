@@ -555,6 +555,20 @@ class TestNamedStreams(_IsolatedServerArgs):
         self.assertIsNot(a, c)
         self.assertEqual(len(created), 2)
 
+    def test_get_or_create_accepts_device_factory(self):
+        reset_context()
+        created = []
+
+        def factory():
+            stream = object()
+            created.append(stream)
+            return stream
+
+        a = get_context().get_stream("device", factory=factory)
+        b = get_context().get_stream("device", factory=factory)
+        self.assertIs(a, b)
+        self.assertEqual(len(created), 1)
+
     def test_get_buffer_keyed_lazy(self):
         reset_context()
         created = []
@@ -580,6 +594,58 @@ class TestNamedStreams(_IsolatedServerArgs):
         get_context().set_stream("alt", object())
         reset_context()
         self.assertEqual(get_context().resources.streams, {})
+
+    def test_graph_capture_default_stream_is_process_scoped(self):
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.distributed import parallel_state
+
+        reset_context()
+        created_streams = []
+
+        class FakeDeviceModule:
+            @staticmethod
+            def Stream():
+                stream = object()
+                created_streams.append(stream)
+                return stream
+
+        @contextmanager
+        def coordinator_capture(graph_capture_context=None, stream=None):
+            if graph_capture_context is None:
+                graph_capture_context = parallel_state.GraphCaptureContext(stream)
+            yield graph_capture_context
+
+        group = SimpleNamespace(
+            device_module=FakeDeviceModule,
+            graph_capture=coordinator_capture,
+        )
+        with (
+            patch.object(parallel_state, "get_tp_group", return_value=group),
+            patch.object(parallel_state, "get_pp_group", return_value=group),
+            patch.object(parallel_state, "_DCP", None),
+            patch.object(parallel_state, "_ATTN_TP", None),
+            patch.object(parallel_state, "_MOE_EP", None),
+            patch.object(parallel_state, "_MOE_TP", None),
+        ):
+            with parallel_state.graph_capture() as first:
+                pass
+            with parallel_state.graph_capture() as second:
+                pass
+            explicit_stream = object()
+            with parallel_state.graph_capture(stream=explicit_stream) as explicit:
+                pass
+
+            reset_context()
+            with parallel_state.graph_capture() as after_reset:
+                pass
+
+        self.assertEqual(len(created_streams), 2)
+        self.assertIs(first.stream, second.stream)
+        self.assertIs(explicit.stream, explicit_stream)
+        self.assertIsNot(after_reset.stream, first.stream)
 
     def test_capturer_slots_roundtrip_and_reset(self):
         from sglang.srt.state_capturer.indexer_topk import (
