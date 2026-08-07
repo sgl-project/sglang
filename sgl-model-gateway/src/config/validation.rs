@@ -151,7 +151,10 @@ impl ConfigValidator {
             | PolicyConfig::RoundRobin
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
-            PolicyConfig::BoundedConsistentHashing { max_load_skew } => {
+            PolicyConfig::BoundedConsistentHashing {
+                max_load_skew,
+                min_load_gap: _,
+            } => {
                 if !max_load_skew.is_finite() || *max_load_skew < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "max_load_skew".to_string(),
@@ -681,18 +684,21 @@ mod tests {
         assert!(
             ConfigValidator::validate_policy(&PolicyConfig::BoundedConsistentHashing {
                 max_load_skew: 1.0,
+                min_load_gap: 2,
             })
             .is_ok()
         );
         assert!(
             ConfigValidator::validate_policy(&PolicyConfig::BoundedConsistentHashing {
                 max_load_skew: 0.99,
+                min_load_gap: 2,
             })
             .is_err()
         );
         assert!(
             ConfigValidator::validate_policy(&PolicyConfig::BoundedConsistentHashing {
                 max_load_skew: f64::NAN,
+                min_load_gap: 2,
             })
             .is_err()
         );

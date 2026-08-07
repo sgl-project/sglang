@@ -20,14 +20,19 @@ use crate::{
 /// Configuration for the bounded consistent hashing policy.
 #[derive(Debug, Clone, Copy)]
 pub struct BoundedConsistentHashingConfig {
-    /// Maximum allowed worker load divided by the healthy-worker load baseline.
-    /// The baseline is the greater of the average load and one active request.
+    /// Maximum preferred-worker load relative to the healthy-worker mean.
     pub max_load_skew: f64,
+
+    /// Minimum preferred-to-least-loaded gap, in active requests, before spillover.
+    pub min_load_gap: usize,
 }
 
 impl Default for BoundedConsistentHashingConfig {
     fn default() -> Self {
-        Self { max_load_skew: 1.5 }
+        Self {
+            max_load_skew: 1.5,
+            min_load_gap: 2,
+        }
     }
 }
 
@@ -78,14 +83,19 @@ impl BoundedConsistentHashingPolicy {
     }
 
     #[inline]
-    fn load_ok(&self, worker_load: usize, total_load: usize, worker_count: usize) -> bool {
-        if total_load == 0 || worker_count == 0 {
-            return true;
-        }
+    fn within_relative_bound(&self, worker_load: usize, mean_healthy_load: f64) -> bool {
+        worker_load as f64 <= mean_healthy_load * self.config.max_load_skew
+    }
 
-        let average_load = total_load as f64 / worker_count as f64;
-        let load_baseline = average_load.max(1.0);
-        worker_load as f64 <= load_baseline * self.config.max_load_skew
+    #[inline]
+    fn should_spill(
+        &self,
+        preferred_load: usize,
+        min_healthy_load: usize,
+        mean_healthy_load: f64,
+    ) -> bool {
+        preferred_load.saturating_sub(min_healthy_load) > self.config.min_load_gap
+            && preferred_load as f64 > mean_healthy_load * self.config.max_load_skew
     }
 
     fn find_bounded_by_consistent_hash(
@@ -105,11 +115,15 @@ impl BoundedConsistentHashingPolicy {
             return (None, Branch::NoHealthyWorkers);
         }
 
-        let total_load = workers
+        let (total_load, min_healthy_load) = workers
             .iter()
             .filter(|worker| worker.is_healthy())
-            .fold(0usize, |total, worker| total.saturating_add(worker.load()));
+            .fold((0usize, usize::MAX), |(total, min_load), worker| {
+                let load = worker.load();
+                (total.saturating_add(load), min_load.min(load))
+            });
         let worker_count = healthy_url_to_idx.len();
+        let mean_healthy_load = total_load as f64 / worker_count as f64;
 
         // Use the exact same preferred-worker selection as consistent_hashing.
         // This preserves ring behavior when a worker is unhealthy or the ring
@@ -120,7 +134,8 @@ impl BoundedConsistentHashingPolicy {
                 None => return (None, Branch::NoHealthyWorkers),
             };
 
-        if self.load_ok(workers[preferred_idx].load(), total_load, worker_count) {
+        let preferred_load = workers[preferred_idx].load();
+        if !self.should_spill(preferred_load, min_healthy_load, mean_healthy_load) {
             return (Some(preferred_idx), Branch::ExplicitRoutingKeyHit);
         }
 
@@ -130,9 +145,9 @@ impl BoundedConsistentHashingPolicy {
         // worker instead of failing an otherwise routable request.
         let candidate_idx = if let Some(ring) = info.hash_ring.as_ref() {
             ring.find_healthy_url(key, |url| {
-                healthy_url_to_idx
-                    .get(url)
-                    .is_some_and(|idx| self.load_ok(workers[*idx].load(), total_load, worker_count))
+                healthy_url_to_idx.get(url).is_some_and(|idx| {
+                    self.within_relative_bound(workers[*idx].load(), mean_healthy_load)
+                })
             })
             .and_then(|url| healthy_url_to_idx.get(url).copied())
         } else {
@@ -140,7 +155,8 @@ impl BoundedConsistentHashingPolicy {
                 .iter()
                 .enumerate()
                 .find(|(_, worker)| {
-                    worker.is_healthy() && self.load_ok(worker.load(), total_load, worker_count)
+                    worker.is_healthy()
+                        && self.within_relative_bound(worker.load(), mean_healthy_load)
                 })
                 .map(|(idx, _)| idx)
         };
@@ -242,7 +258,7 @@ impl LoadBalancingPolicy for BoundedConsistentHashingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, HashRing, WorkerType};
+    use crate::core::{BasicWorkerBuilder, HashRing, WorkerLoadGuard, WorkerType};
 
     fn headers_with_routing_key(key: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
@@ -290,10 +306,34 @@ mod tests {
         panic!("could not find a key for worker {target}");
     }
 
+    fn set_loads(workers: &[Arc<dyn Worker>], loads: &[usize]) {
+        assert_eq!(workers.len(), loads.len());
+        for (worker, load) in workers.iter().zip(loads) {
+            for _ in 0..*load {
+                worker.increment_load();
+            }
+        }
+    }
+
+    fn select_explicit(
+        policy: &BoundedConsistentHashingPolicy,
+        workers: &[Arc<dyn Worker>],
+        ring: &Arc<HashRing>,
+        key: &str,
+    ) -> (Option<usize>, Branch) {
+        let headers = headers_with_routing_key(key);
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            hash_ring: Some(Arc::clone(ring)),
+            ..Default::default()
+        };
+        policy.select_worker_impl(workers, &info)
+    }
     #[tokio::test]
     async fn preserves_affinity_when_preferred_worker_is_within_bound() {
         let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
             max_load_skew: 1.5,
+            min_load_gap: 2,
         });
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -316,9 +356,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_one_request_floor_for_low_load() {
+    async fn absolute_gap_preserves_affinity_at_low_load() {
         let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
             max_load_skew: 1.0,
+            min_load_gap: 2,
         });
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(&workers));
@@ -441,6 +482,7 @@ mod tests {
     async fn one_worker_is_always_selected() {
         let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
             max_load_skew: 1.0,
+            min_load_gap: 2,
         });
         let workers = create_workers(&["http://w1:8000"]);
         for _ in 0..100 {
@@ -455,5 +497,205 @@ mod tests {
 
         let (result, _) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(0));
+    }
+    #[test]
+    fn near_idle_four_worker_vectors_require_both_thresholds() {
+        for (loads, should_spill) in [
+            ([0usize, 0, 0, 0], false),
+            ([1usize, 0, 0, 0], false),
+            ([2usize, 0, 0, 0], false),
+            ([3usize, 0, 0, 0], true),
+        ] {
+            let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+                max_load_skew: 1.5,
+                min_load_gap: 2,
+            });
+            let workers = create_workers(&[
+                "http://w1:8000",
+                "http://w2:8000",
+                "http://w3:8000",
+                "http://w4:8000",
+            ]);
+            let ring = Arc::new(HashRing::new(&workers));
+            let key = key_for_worker(&workers, &ring, 0);
+            set_loads(&workers, &loads);
+
+            let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+            if should_spill {
+                assert_ne!(result, Some(0), "loads={loads:?}");
+                assert_eq!(branch, Branch::ExplicitRoutingKeySpillover);
+            } else {
+                assert_eq!(result, Some(0), "loads={loads:?}");
+                assert_eq!(branch, Branch::ExplicitRoutingKeyHit);
+            }
+        }
+    }
+
+    #[test]
+    fn relative_threshold_alone_does_not_spill() {
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 1.5,
+            min_load_gap: 2,
+        });
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        set_loads(&workers, &[2, 0, 0, 0]);
+
+        let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+        assert_eq!(result, Some(0));
+        assert_eq!(branch, Branch::ExplicitRoutingKeyHit);
+    }
+
+    #[test]
+    fn absolute_threshold_alone_does_not_spill() {
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 1.5,
+            min_load_gap: 0,
+        });
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        set_loads(&workers, &[4, 3, 3, 3]);
+
+        let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+        assert_eq!(result, Some(0));
+        assert_eq!(branch, Branch::ExplicitRoutingKeyHit);
+    }
+
+    #[test]
+    fn both_thresholds_spill_to_first_clockwise_eligible_worker() {
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 1.5,
+            min_load_gap: 2,
+        });
+        let workers = create_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        set_loads(&workers, &[3, 0, 0, 0]);
+
+        let mean_healthy_load = 3.0 / 4.0;
+        let expected_url = ring
+            .find_healthy_url(&key, |url| {
+                workers
+                    .iter()
+                    .find(|worker| worker.url() == url)
+                    .is_some_and(|worker| worker.load() as f64 <= mean_healthy_load * 1.5)
+            })
+            .unwrap();
+        let expected_idx = workers
+            .iter()
+            .position(|worker| worker.url() == expected_url)
+            .unwrap();
+
+        let first = select_explicit(&policy, &workers, &ring, &key);
+        let second = select_explicit(&policy, &workers, &ring, &key);
+        assert_eq!(
+            first,
+            (Some(expected_idx), Branch::ExplicitRoutingKeySpillover)
+        );
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn candidate_gaps_compare_placement_and_same_key_concurrency() {
+        for min_load_gap in [1usize, 2, 4] {
+            let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+                max_load_skew: 1.5,
+                min_load_gap,
+            });
+            let workers = create_workers(&[
+                "http://w1:8000",
+                "http://w2:8000",
+                "http://w3:8000",
+                "http://w4:8000",
+            ]);
+            let ring = Arc::new(HashRing::new(&workers));
+            let key = key_for_worker(&workers, &ring, 0);
+            let headers = headers_with_routing_key(&key);
+            let mut guards = Vec::new();
+            let mut spill_idx = None;
+
+            for request_index in 0..=(min_load_gap + 1) {
+                let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+                let selected = result.unwrap();
+                if request_index <= min_load_gap {
+                    assert_eq!(selected, 0);
+                    assert_eq!(branch, Branch::ExplicitRoutingKeyHit);
+                } else {
+                    assert_ne!(selected, 0);
+                    assert_eq!(branch, Branch::ExplicitRoutingKeySpillover);
+                    spill_idx = Some(selected);
+                }
+                guards.push(WorkerLoadGuard::new(
+                    Arc::clone(&workers[selected]),
+                    Some(&headers),
+                ));
+            }
+
+            let spill_idx = spill_idx.unwrap();
+            assert_eq!(workers[0].load(), min_load_gap + 1);
+            assert_eq!(workers[0].worker_routing_key_load().value(), 1);
+            assert_eq!(workers[spill_idx].load(), 1);
+            assert_eq!(workers[spill_idx].worker_routing_key_load().value(), 1);
+
+            let mut placement: Vec<_> = workers.iter().map(|worker| worker.load()).collect();
+            placement.sort_unstable_by(|left, right| right.cmp(left));
+            assert_eq!(placement, vec![min_load_gap + 1, 1, 0, 0]);
+
+            drop(guards);
+            for worker in &workers {
+                assert_eq!(worker.load(), 0);
+                assert_eq!(worker.worker_routing_key_load().value(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn no_eligible_candidate_retains_preferred_worker() {
+        // Public validation rejects max_load_skew < 1.0. Constructing the
+        // policy directly exercises the defensive no-candidate fallback.
+        let policy = BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            max_load_skew: 0.1,
+            min_load_gap: 0,
+        });
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        set_loads(&workers, &[4, 1]);
+
+        let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+        assert_eq!(result, Some(0));
+        assert_eq!(branch, Branch::ExplicitRoutingKeyNoEligibleCandidate);
+    }
+
+    #[test]
+    fn no_healthy_worker_returns_none() {
+        let policy = BoundedConsistentHashingPolicy::with_defaults();
+        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let ring = Arc::new(HashRing::new(&workers));
+        let key = key_for_worker(&workers, &ring, 0);
+        for worker in &workers {
+            worker.set_healthy(false);
+        }
+
+        let (result, branch) = select_explicit(&policy, &workers, &ring, &key);
+        assert_eq!(result, None);
+        assert_eq!(branch, Branch::NoHealthyWorkers);
     }
 }

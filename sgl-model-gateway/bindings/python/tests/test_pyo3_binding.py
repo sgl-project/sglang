@@ -362,6 +362,8 @@ class TestRouterFromArgsKitchenSink:
             args = RouterArgs(
                 worker_urls=["http://w1:8000"],
                 policy=policy,
+                max_load_skew=1.75,
+                min_load_gap=4,
                 pd_disaggregation=True,
                 prefill_urls=[("http://prefill1:8000", None)],
                 decode_urls=["http://decode1:8001"],

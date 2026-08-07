@@ -190,6 +190,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     max_load_skew: f64,
 
+    /// Minimum active-request gap before bounded_consistent_hashing may spill
+    #[arg(long, default_value_t = 2, help_heading = "Routing Policy")]
+    min_load_gap: usize,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
@@ -780,6 +784,7 @@ impl CliArgs {
             },
             "bounded_consistent_hashing" => PolicyConfig::BoundedConsistentHashing {
                 max_load_skew: self.max_load_skew,
+                min_load_gap: self.min_load_gap,
             },
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,

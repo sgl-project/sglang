@@ -61,11 +61,15 @@ impl PolicyFactory {
                 Arc::new(ManualPolicy::with_config(config))
             }
             PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
-            PolicyConfig::BoundedConsistentHashing { max_load_skew } => Arc::new(
-                BoundedConsistentHashingPolicy::new(BoundedConsistentHashingConfig {
+            PolicyConfig::BoundedConsistentHashing {
+                max_load_skew,
+                min_load_gap,
+            } => Arc::new(BoundedConsistentHashingPolicy::new(
+                BoundedConsistentHashingConfig {
                     max_load_skew: *max_load_skew,
-                }),
-            ),
+                    min_load_gap: *min_load_gap,
+                },
+            )),
             PolicyConfig::PrefixHash {
                 prefix_token_count,
                 load_factor,
@@ -145,6 +149,7 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::BoundedConsistentHashing {
             max_load_skew: 1.5,
+            min_load_gap: 2,
         });
         assert_eq!(policy.name(), "bounded_consistent_hashing");
     }
