@@ -219,7 +219,12 @@ def build_capture_verify_lens(
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     """Layout riding the batch's spec input, or None. Tolerates the runner's
     ad-hoc replay batch views, which may not carry spec_info at all."""
-    spec_info = getattr(forward_batch, "spec_info", None)
+    return spec_info_ragged_verify_layout(getattr(forward_batch, "spec_info", None))
+
+
+def spec_info_ragged_verify_layout(spec_info) -> Optional[RaggedVerifyLayout]:
+    """Layout carried by a spec input, or None. For the cuda-graph init paths,
+    which receive spec_info directly rather than a ForwardBatch."""
     if spec_info is None:
         return None
     return spec_info.ragged_verify_layout

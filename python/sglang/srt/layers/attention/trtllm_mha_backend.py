@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import get_buffer, get_spec
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
+    spec_info_ragged_verify_layout,
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
@@ -607,7 +608,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 : bs + 1
             ]
             metadata.is_ragged_verify = (
-                spec_info is not None and spec_info.ragged_verify_layout is not None
+                spec_info_ragged_verify_layout(spec_info) is not None
             )
             metadata.max_seq_len_q = (
                 self.speculative_num_draft_tokens
@@ -715,7 +716,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            if spec_info is not None and spec_info.ragged_verify_layout is not None:
+            if spec_info_ragged_verify_layout(spec_info) is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
                 # rebuild this metadata. It is written eagerly on every
