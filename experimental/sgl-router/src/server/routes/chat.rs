@@ -199,10 +199,16 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     // Per-session timing statistics (see `crate::session_stats`; measurement
     // only). The session is identified by the sticky routing key; other policies
-    // leave it `None` and are not tracked. The dispatch / first-token / turn-end
-    // instants are stamped below — dispatch is taken just before forwarding to
-    // the worker (so router-internal route/tokenize time is excluded).
+    // leave it `None` and are not tracked. `t_recv` (the denominator anchor for
+    // the turn cycle — includes router/retry time) is stamped here at handler
+    // entry; `t_dispatch` (prefill start) is stamped just before forwarding
+    // below. Only streaming turns are tracked.
     let session_id: Option<String> = routing_key.map(|s| s.to_string());
+    if streaming {
+        if let Some(sid) = session_id.as_deref() {
+            ctx.session_stats.on_recv(sid, start);
+        }
+    }
 
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
@@ -401,10 +407,10 @@ pub async fn chat_completions(
         build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
 
     // Stamp the per-session dispatch instant (prefill start) for streaming
-    // requests — taken here, just before forwarding, so router-side route/
-    // tokenize time is excluded. A client retry re-enters the handler and
-    // re-stamps it. Non-streaming requests aren't tracked (their first token ==
-    // total latency, already in the global histograms).
+    // requests — taken here, just before forwarding, so prefill is measured
+    // cleanly from dispatch. The router/retry overhead (t_dispatch - t_recv) is
+    // still captured in the recv-anchored total. A client retry re-enters the
+    // handler and re-stamps t_dispatch while keeping t_recv.
     if streaming {
         if let Some(sid) = session_id.as_deref() {
             ctx.session_stats
