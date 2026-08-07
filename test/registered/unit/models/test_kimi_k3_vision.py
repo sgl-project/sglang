@@ -570,6 +570,16 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     assert one.tolist() == [[1.0, 0.0]]
 
 
+def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():
+    from sglang.srt.managers.mm_schedule import _can_skip_pre_embed_feature_move
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+
+    assert _can_skip_pre_embed_feature_move(model.get_image_feature)
+
+
 def test_kimi_k3_rejects_aggregated_items():
     """One item must carry exactly one logical image: the DP owner
     assignment and the bounded CUDA-IPC lease accounting are per-item, so
