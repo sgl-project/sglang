@@ -118,6 +118,56 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_use_aiter = _is_hip and envs.SGLANG_USE_AITER.get()
+_aiter_greedy_sample = None
+
+if _use_aiter:
+    from aiter import greedy_sample as _aiter_greedy_sample
+
+
+def _aiter_draft_topk1_postprocess(
+    next_token_logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: Optional[torch.Tensor] = None,
+    draft_token_column: int = 0,
+):
+    """Select greedy draft tokens with AITER and update SGLang-owned metadata."""
+    assert next_token_logits.ndim == 2
+    assert next_token_logits.stride(1) == 1
+    assert positions.ndim == 1
+    assert positions.dtype == torch.long
+    assert positions.is_contiguous()
+    assert positions.shape[0] == next_token_logits.shape[0]
+    assert positions.device == next_token_logits.device
+
+    batch_size, vocab_size = next_token_logits.shape
+    assert vocab_size > 0
+    topk_index_i32 = torch.empty(
+        batch_size, dtype=torch.int32, device=next_token_logits.device
+    )
+    _aiter_greedy_sample(topk_index_i32, next_token_logits)
+    topk_index = topk_index_i32.to(dtype=torch.long).view(batch_size, 1)
+    topk_p = torch.ones(
+        (batch_size, 1), dtype=torch.float32, device=next_token_logits.device
+    )
+
+    positions.add_(1)
+    if draft_tokens is not None:
+        assert draft_tokens.ndim == 2
+        assert draft_tokens.dtype == torch.long
+        assert draft_tokens.device == next_token_logits.device
+        assert draft_tokens.shape[0] == batch_size
+        assert 0 <= draft_token_column < draft_tokens.shape[1]
+        draft_tokens[:, draft_token_column].copy_(topk_index[:, 0])
+
+    return topk_p, topk_index
+
+
+def _use_draft_topk1_postprocess() -> bool:
+    """Whether this backend may select topk=1 directly from raw draft logits."""
+    return _is_cuda or (
+        _use_aiter and envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.get()
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -578,13 +628,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
         )
-        # Materialize the chain directly only when the CUDA kernel can write
-        # every subsequent column. Other topk=1 paths retain the token list and
-        # assemble it with one final cat instead of launching a copy per step.
+        # Materialize the chain directly only when the accelerated postprocess can
+        # write every subsequent column. Other topk=1 paths retain the token list
+        # and assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
         if (
             topk1_chain_fits
-            and _is_cuda
+            and _use_draft_topk1_postprocess()
             and self.hot_token_id is None
             and not get_spec().speculative_use_rejection_sampling
         ):
@@ -658,15 +708,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 draft_probs_list.append(probs)
                 forward_batch.positions.add_(1)
-            elif self.topk == 1 and not _is_hip:
-                if _is_cuda:
-                    # The positions advance is fused into the kernel.
-                    topk_p, topk_index = draft_topk1_postprocess(
-                        logits_output.next_token_logits,
-                        forward_batch.positions,
-                        draft_tokens_topk1,
-                        i + 1,
-                    )
+            elif self.topk == 1 and (not _is_hip or _use_draft_topk1_postprocess()):
+                if _use_draft_topk1_postprocess():
+                    if _is_cuda:
+                        # The positions advance is fused into the Triton kernel.
+                        topk_p, topk_index = draft_topk1_postprocess(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                        )
+                    else:
+                        topk_p, topk_index = _aiter_draft_topk1_postprocess(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                        )
                 else:
                     topk_index = torch.argmax(
                         logits_output.next_token_logits, dim=-1, keepdim=True

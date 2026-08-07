@@ -1,4 +1,4 @@
-"""Benchmark CUDA topk=1 speculative decoding helpers."""
+"""Benchmark accelerated topk=1 speculative decoding helpers."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from sglang.kernels.jit.benchmark.utils import (
     run_benchmark,
 )
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.speculative.eagle_worker_v2 import _aiter_draft_topk1_postprocess
+from sglang.srt.utils.common import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -33,6 +35,9 @@ VOCAB_SIZE_RANGE = get_benchmark_range(
     ci_range=list(VOCAB_SIZES.values()),
 )
 NUM_STEPS = 3
+QWEN3_5_VOCAB_SIZE = 248320
+PRODUCTION_BATCH_BUCKETS = [4, 64, 256]
+_is_hip = is_hip()
 
 
 def make_logits(batch_size: int, vocab_size: int) -> torch.Tensor:
@@ -68,8 +73,25 @@ def eager_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor)
     return topk_p, topk_index
 
 
-def fused_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
-    return draft_topk1_postprocess(logits, positions)
+def accelerated_draft_topk1_postprocess(
+    logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: torch.Tensor | None = None,
+    draft_token_column: int = 0,
+):
+    if _is_hip:
+        return _aiter_draft_topk1_postprocess(
+            logits, positions, draft_tokens, draft_token_column
+        )
+    return draft_topk1_postprocess(
+        logits, positions, draft_tokens, draft_token_column
+    )
+
+
+def softmax_max_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
+    topk_p, topk_index = torch.max(torch.softmax(logits, dim=-1), dim=-1, keepdim=True)
+    positions.add_(1)
+    return topk_p, topk_index
 
 
 def eager_chain_materialize(
@@ -84,7 +106,7 @@ def eager_chain_materialize(
     return torch.cat(token_list, dim=1)
 
 
-def fused_chain_materialize(
+def accelerated_chain_materialize(
     seed_topk_index: torch.Tensor,
     logits: list[torch.Tensor],
     positions: torch.Tensor,
@@ -96,7 +118,7 @@ def fused_chain_materialize(
     )
     draft_tokens[:, :1].copy_(seed_topk_index)
     for i, step_logits in enumerate(logits, start=1):
-        draft_topk1_postprocess(
+        accelerated_draft_topk1_postprocess(
             step_logits,
             positions,
             draft_tokens,
@@ -110,8 +132,8 @@ def fused_chain_materialize(
         x_names=["batch_size", "vocab_size"],
         x_vals=[(bs, vocab) for bs in BATCH_SIZE_RANGE for vocab in VOCAB_SIZE_RANGE],
         line_arg="provider",
-        line_vals=["fused", "eager"],
-        line_names=["Fused Triton", "Eager torch"],
+        line_vals=["accelerated", "eager"],
+        line_names=["AITER / Triton", "Eager torch"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="spec-topk1-draft-postprocess",
@@ -122,8 +144,8 @@ def benchmark_draft_postprocess(
     batch_size: int, vocab_size: int, provider: str
 ) -> tuple[float, float, float]:
     logits, positions = make_draft_case(batch_size, vocab_size)
-    if provider == "fused":
-        fn = lambda: fused_draft_topk1_postprocess(logits, positions)
+    if provider == "accelerated":
+        fn = lambda: accelerated_draft_topk1_postprocess(logits, positions)
     elif provider == "eager":
         fn = lambda: eager_draft_topk1_postprocess(logits, positions)
     else:
@@ -138,8 +160,8 @@ def benchmark_draft_postprocess(
         x_names=["batch_size", "vocab_size"],
         x_vals=[(bs, vocab) for bs in BATCH_SIZE_RANGE for vocab in VOCAB_SIZE_RANGE],
         line_arg="provider",
-        line_vals=["fused", "eager"],
-        line_names=["Fused Triton", "Eager argmax + cat"],
+        line_vals=["accelerated", "eager"],
+        line_names=["AITER / Triton", "Eager argmax + cat"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="spec-topk1-chain-materialize",
@@ -150,10 +172,41 @@ def benchmark_chain_materialize(
     batch_size: int, vocab_size: int, provider: str
 ) -> tuple[float, float, float]:
     seed_topk_index, logits, positions = make_chain_case(batch_size, vocab_size)
-    if provider == "fused":
-        fn = lambda: fused_chain_materialize(seed_topk_index, logits, positions)
+    if provider == "accelerated":
+        fn = lambda: accelerated_chain_materialize(
+            seed_topk_index, logits, positions
+        )
     elif provider == "eager":
         fn = lambda: eager_chain_materialize(seed_topk_index, logits, positions)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+    fn()
+    torch.cuda.synchronize()
+    return run_benchmark(fn)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["batch_size"],
+        x_vals=PRODUCTION_BATCH_BUCKETS,
+        line_arg="provider",
+        line_vals=["raw_argmax", "softmax_max"],
+        line_names=["Raw-logits AITER / Triton", "Softmax + torch.max"],
+        styles=[("blue", "-"), ("orange", "--")],
+        ylabel="us",
+        plot_name="qwen3-5-production-draft-topk1",
+        args={"vocab_size": QWEN3_5_VOCAB_SIZE},
+    )
+)
+def benchmark_qwen_production_draft_topk1(
+    batch_size: int, vocab_size: int, provider: str
+) -> tuple[float, float, float]:
+    logits = make_logits(batch_size, vocab_size)
+    positions = torch.zeros(batch_size, dtype=torch.long, device=DEFAULT_DEVICE)
+    if provider == "raw_argmax":
+        fn = lambda: accelerated_draft_topk1_postprocess(logits, positions)
+    elif provider == "softmax_max":
+        fn = lambda: softmax_max_draft_topk1_postprocess(logits, positions)
     else:
         raise ValueError(f"Unknown provider: {provider}")
     fn()
@@ -164,3 +217,4 @@ def benchmark_chain_materialize(
 if __name__ == "__main__":
     benchmark_draft_postprocess.run(print_data=True)
     benchmark_chain_materialize.run(print_data=True)
+    benchmark_qwen_production_draft_topk1.run(print_data=True)

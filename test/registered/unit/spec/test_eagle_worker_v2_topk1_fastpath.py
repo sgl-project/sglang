@@ -12,11 +12,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _aiter_draft_topk1_postprocess,
+    _use_draft_topk1_postprocess,
+)
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -139,6 +145,62 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
+    def test_aiter_raw_logits_postprocess_is_opt_in(self):
+        self.assertFalse(envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.default)
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", False), patch(
+            "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
+        ):
+            with envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(False):
+                self.assertFalse(_use_draft_topk1_postprocess())
+            with envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(True):
+                self.assertTrue(_use_draft_topk1_postprocess())
+
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", False), patch(
+            "sglang.srt.speculative.eagle_worker_v2._use_aiter", False
+        ), envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(True):
+            self.assertFalse(_use_draft_topk1_postprocess())
+
+    def test_cuda_raw_logits_postprocess_remains_enabled(self):
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_cuda", True), patch(
+            "sglang.srt.speculative.eagle_worker_v2._use_aiter", False
+        ):
+            with envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(False):
+                self.assertTrue(_use_draft_topk1_postprocess())
+
+    def test_aiter_postprocess_updates_indices_positions_and_draft_chain(self):
+        logits = torch.zeros((3, 16), dtype=torch.float32, device=DEVICE)
+        positions = torch.tensor([10, 20, 30], dtype=torch.long, device=DEVICE)
+        draft_tokens = torch.full((3, 4), -1, dtype=torch.long, device=DEVICE)
+
+        def fake_greedy_sample(output, _logits):
+            output.copy_(
+                torch.tensor([2, 5, 11], dtype=torch.int32, device=output.device)
+            )
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2._aiter_greedy_sample",
+            side_effect=fake_greedy_sample,
+        ):
+            topk_p, topk_index = _aiter_draft_topk1_postprocess(
+                logits, positions, draft_tokens, draft_token_column=2
+            )
+
+        torch.testing.assert_close(
+            topk_index,
+            torch.tensor([[2], [5], [11]], dtype=torch.long, device=DEVICE),
+        )
+        torch.testing.assert_close(topk_p, torch.ones_like(topk_p))
+        torch.testing.assert_close(
+            positions, torch.tensor([11, 21, 31], dtype=torch.long, device=DEVICE)
+        )
+        torch.testing.assert_close(
+            draft_tokens[:, 2],
+            torch.tensor([2, 5, 11], dtype=torch.long, device=DEVICE),
+        )
+        torch.testing.assert_close(
+            draft_tokens[:, (0, 1, 3)],
+            torch.full((3, 3), -1, dtype=torch.long, device=DEVICE),
+        )
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):
