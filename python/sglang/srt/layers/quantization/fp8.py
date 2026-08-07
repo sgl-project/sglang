@@ -2125,11 +2125,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        ):
+            self._prepare_flashinfer_trtllm_activation_params(layer)
+
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+
+    def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
+        """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
+        num_experts = int(layer.num_local_experts)
+        device = layer.w13_weight.device
+        for name, value in (
+            ("gemm1_alpha", self.moe_runner_config.gemm1_alpha),
+            ("gemm1_beta", self.moe_runner_config.gemm1_beta),
+            ("gemm1_clamp_limit", self.moe_runner_config.gemm1_clamp_limit),
+        ):
+            tensor = (
+                None
+                if value is None
+                else torch.full(
+                    (num_experts,),
+                    float(value),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            )
+            setattr(layer, f"_flashinfer_trtllm_{name}", tensor)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
@@ -2538,6 +2565,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 w2_weight_scale_inv=(
                     layer.w2_weight_scale_inv if self.block_quant else None
+                ),
+                gemm1_alpha=getattr(layer, "_flashinfer_trtllm_gemm1_alpha", None),
+                gemm1_beta=getattr(layer, "_flashinfer_trtllm_gemm1_beta", None),
+                gemm1_clamp_limit=getattr(
+                    layer, "_flashinfer_trtllm_gemm1_clamp_limit", None
                 ),
                 w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
                 output1_scales_scalar=(
