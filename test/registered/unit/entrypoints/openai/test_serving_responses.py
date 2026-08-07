@@ -118,6 +118,39 @@ class InputMessageConstructionTestCase(unittest.TestCase):
             ],
         )
 
+    def test_function_call_output_parts_normalized_for_chat_templates(self):
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [
+                        {"type": "input_text", "text": "First result"},
+                        {"type": "input_text", "text": "Second result"},
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request)
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_abc",
+                    "content": [
+                        {"type": "text", "text": "First result"},
+                        {"type": "text", "text": "Second result"},
+                    ],
+                }
+            ],
+        )
+
     def test_previous_response_id_input_list_does_not_call_copy_module(self):
         serving = make_serving()
         serving.use_harmony = True
