@@ -317,7 +317,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
         img_cos_sin_cache = torch.cat([img_cos_half, img_sin_half], dim=-1)
         txt_cos_sin_cache = torch.cat([txt_cos_half, txt_sin_half], dim=-1)
-        return img_cos_sin_cache, txt_cos_sin_cache
+        return (img_cos_sin_cache, txt_cos_sin_cache), (img_freqs, txt_freqs)
 
     def _prepare_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
@@ -351,19 +351,24 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": None,
+                "freqs_complex": None,
                 "encoder_hidden_states_mask": encoder_hidden_states_mask,
             }
             return cond_kwargs
 
-        freqs_cis = self.get_freqs_cis(
+        freqs_cis, freqs_complex = self.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
         img_cache, txt_cache = freqs_cis
         img_cache = shard_rotary_emb_for_sp(img_cache)
+
+        img_complex, txt_complex = freqs_complex
+        img_complex = shard_rotary_emb_for_sp(img_complex)
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
+            "freqs_complex": (img_complex, txt_complex),
             "img_shapes": img_shapes,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
