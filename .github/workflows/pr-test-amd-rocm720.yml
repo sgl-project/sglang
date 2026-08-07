@@ -1242,7 +1242,7 @@ jobs:
           )
         )
       )
-    runs-on: linux-mi35x-gpu-8.fabric
+    runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1252,20 +1252,8 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
-      - name: Check Host RDMA Environment
-        run: |
-          set -euo pipefail
-          test -d /dev/infiniband
-          HCA_COUNT=$(ibv_devinfo -list 2>&1 | awk '/HCAs? found/ {print $1; exit}')
-          ibv_devinfo -list
-          if [[ -z "${HCA_COUNT}" || "${HCA_COUNT}" -lt 1 ]]; then
-            echo "No active RDMA HCA found"
-            exit 1
-          fi
-          echo "SGLANG_TEST_RDMA_DEVICE=rdma0" >> "$GITHUB_ENV"
-
-      - name: Start Fresh RDMA Container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
+      - name: Start Fresh ROCm 7.2 Container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"
@@ -1273,12 +1261,11 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Verify RDMA and UMBP in Container
+      - name: Verify Local UMBP in Container
         run: |
           docker exec -u root ci_sglang bash -lc '
             set -euo pipefail
-            test -e /dev/infiniband/rdma_cm
-            ibv_devinfo -list
+            test ! -e /dev/infiniband/rdma_cm
             python3 -c "import mori.umbp; print(\"mori.umbp OK:\", mori.umbp.__file__)"
           '
 
@@ -1286,7 +1273,6 @@ jobs:
         timeout-minutes: 120
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
-            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -e MC_LOG_LEVEL=TRACE \
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" \
