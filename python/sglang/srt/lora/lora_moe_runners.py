@@ -338,6 +338,8 @@ def _add_lora_gate_up_delta(
     if is_gated:
         inter_size = gate_up_b.shape[2] // 2
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+        # The B halves are also the tuple form the virtual-experts kernel
+        # expects for the gated case (one shrink at K=2*r, two expands at K=r).
         lora_b_stacked = [
             gate_up_b[:, :, :inter_size, :],
             gate_up_b[:, :, inter_size:, :],
@@ -351,7 +353,7 @@ def _add_lora_gate_up_delta(
             output=intermediate_cache,
             hidden_states=hidden_states,
             lora_a=gate_up_a,
-            lora_b=gate_up_b,
+            lora_b=tuple(lora_b_stacked) if is_gated else gate_up_b,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
