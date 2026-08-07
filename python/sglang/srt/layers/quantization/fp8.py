@@ -32,6 +32,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
+    create_flashinfer_trtllm_gemm1_activation_tensors,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
@@ -1069,6 +1070,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        self.flashinfer_trtllm_gemm1_alpha: Optional[torch.Tensor] = None
+        self.flashinfer_trtllm_gemm1_beta: Optional[torch.Tensor] = None
+        self.flashinfer_trtllm_gemm1_clamp_limit: Optional[torch.Tensor] = None
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -2281,6 +2285,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        self.flashinfer_trtllm_gemm1_alpha = None
+        self.flashinfer_trtllm_gemm1_beta = None
+        self.flashinfer_trtllm_gemm1_clamp_limit = None
+
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -2292,6 +2300,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend == MoeRunnerBackend.FLASHINFER_TRTLLM and self.use_mxfp8:
+            (
+                self.flashinfer_trtllm_gemm1_alpha,
+                self.flashinfer_trtllm_gemm1_beta,
+                self.flashinfer_trtllm_gemm1_clamp_limit,
+            ) = create_flashinfer_trtllm_gemm1_activation_tensors(
+                moe_runner_config,
+                int(getattr(layer, "num_local_experts")),
+                layer.w13_weight.device,
+            )
 
         if (
             moe_runner_backend.is_deep_gemm()
@@ -2555,6 +2574,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
+                gemm1_alpha=self.flashinfer_trtllm_gemm1_alpha,
+                gemm1_beta=self.flashinfer_trtllm_gemm1_beta,
+                gemm1_clamp_limit=self.flashinfer_trtllm_gemm1_clamp_limit,
                 activation_type=activation_type,
             )
         elif self.runner.runner_backend.is_hpc_ops():

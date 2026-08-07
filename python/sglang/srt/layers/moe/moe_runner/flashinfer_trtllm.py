@@ -624,6 +624,66 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
     return act.value
 
 
+def create_flashinfer_trtllm_gemm1_activation_tensors(
+    runner_config: MoeRunnerConfig,
+    local_num_experts: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Create per-expert activation parameters expected by TRT-LLM MoE."""
+    gemm1_alpha = (
+        torch.full(
+            (local_num_experts,),
+            float(runner_config.gemm1_alpha),
+            dtype=torch.float32,
+            device=device,
+        )
+        if runner_config.gemm1_alpha is not None
+        else None
+    )
+    # gemm1_alpha selects the SwiGLU-OAI contract used by MiniMax/GPT-OSS,
+    # whose up-projection term is shifted by beta=1.
+    gemm1_beta = (
+        torch.ones((local_num_experts,), dtype=torch.float32, device=device)
+        if gemm1_alpha is not None
+        else None
+    )
+    gemm1_clamp_limit = (
+        torch.full(
+            (local_num_experts,),
+            float(runner_config.gemm1_clamp_limit),
+            dtype=torch.float32,
+            device=device,
+        )
+        if runner_config.gemm1_clamp_limit is not None
+        else None
+    )
+    return gemm1_alpha, gemm1_beta, gemm1_clamp_limit
+
+
+def resolve_flashinfer_trtllm_routed_scaling_factor(
+    routing_method_type: int | None,
+    topk_routed_scaling_factor: float | None,
+    runner_config: MoeRunnerConfig,
+    default: float | None = None,
+) -> float | None:
+    """Resolve the scaling factor for the ordinary TRT-LLM routing kernel.
+
+    MiniMax keeps this value on TopKConfig so the pre-routed path can apply it
+    before packing. The ordinary path bypasses TopK and must pass it to the
+    FlashInfer routing kernel instead.
+    """
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    if (
+        routing_method_type == RoutingMethodType.MiniMax2
+        and topk_routed_scaling_factor is not None
+    ):
+        return topk_routed_scaling_factor
+    if runner_config.routed_scaling_factor is not None:
+        return runner_config.routed_scaling_factor
+    return default
+
+
 @dataclass
 class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP8 MoE kernels."""
@@ -653,6 +713,11 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     output1_scales_gate_scalar: torch.Tensor | None = None
     output2_scales_scalar: torch.Tensor | None = None
     use_routing_scales_on_input: bool = False
+
+    # Per-expert GEMM1 activation parameters
+    gemm1_alpha: torch.Tensor | None = None
+    gemm1_beta: torch.Tensor | None = None
+    gemm1_clamp_limit: torch.Tensor | None = None
 
     # Activation type (None = kernel default / Swiglu)
     activation_type: int | None = None
@@ -790,15 +855,21 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=quant_info.local_num_experts,
                 routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
+                    resolve_flashinfer_trtllm_routed_scaling_factor(
+                        routing_method_type,
+                        topk_config.routed_scaling_factor,
+                        runner_config,
+                        default=1.0,
+                    )
                 ),
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=use_shuffled_weight,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
         output = symm_output
     else:
@@ -1153,6 +1224,11 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     global_num_experts: int
     local_expert_offset: int
 
+    # Per-expert GEMM1 activation parameters
+    gemm1_alpha: torch.Tensor | None = None
+    gemm1_beta: torch.Tensor | None = None
+    gemm1_clamp_limit: torch.Tensor | None = None
+
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
     dispatch_output: StandardDispatchOutput,
@@ -1255,9 +1331,16 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=runner_config.num_local_experts,
                 routing_method_type=runner_config.routing_method_type,
-                routed_scaling_factor=runner_config.routed_scaling_factor,
+                routed_scaling_factor=resolve_flashinfer_trtllm_routed_scaling_factor(
+                    runner_config.routing_method_type,
+                    topk_config.routed_scaling_factor,
+                    runner_config,
+                ),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             )
 
     return StandardCombineInput(hidden_states=final_hidden_states)

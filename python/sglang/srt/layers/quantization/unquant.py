@@ -312,6 +312,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
+        self.flashinfer_trtllm_gemm1_alpha: Optional[torch.Tensor] = None
+        self.flashinfer_trtllm_gemm1_beta: Optional[torch.Tensor] = None
+        self.flashinfer_trtllm_gemm1_clamp_limit: Optional[torch.Tensor] = None
 
     def create_weights(
         self,
@@ -544,6 +547,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.flashinfer_trtllm_gemm1_alpha = None
+        self.flashinfer_trtllm_gemm1_beta = None
+        self.flashinfer_trtllm_gemm1_clamp_limit = None
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -565,6 +571,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.ASCEND
         else:
             backend = MoeRunnerBackend.TRITON
+
+        if (
+            self.use_flashinfer_trtllm_moe
+            and get_moe_runner_backend() == MoeRunnerBackend.FLASHINFER_TRTLLM
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                create_flashinfer_trtllm_gemm1_activation_tensors,
+            )
+
+            (
+                self.flashinfer_trtllm_gemm1_alpha,
+                self.flashinfer_trtllm_gemm1_beta,
+                self.flashinfer_trtllm_gemm1_clamp_limit,
+            ) = create_flashinfer_trtllm_gemm1_activation_tensors(
+                moe_runner_config,
+                int(getattr(layer, "num_local_experts")),
+                layer.w13_weight.device,
+            )
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
@@ -684,6 +708,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                gemm1_alpha=self.flashinfer_trtllm_gemm1_alpha,
+                gemm1_beta=self.flashinfer_trtllm_gemm1_beta,
+                gemm1_clamp_limit=self.flashinfer_trtllm_gemm1_clamp_limit,
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

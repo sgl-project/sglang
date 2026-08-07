@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import get_cu_seqblocks
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -13,6 +15,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+    _warn_msa_fallback,
     minimax_sparse_decode,
     minimax_sparse_prefill,
 )
@@ -32,6 +35,23 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
     if q_scale is not None:
         q = q / q_scale
     return q.to(torch.float8_e4m3fn)
+
+
+@dataclass
+class MiniMaxSparsePrefillMetadata:
+    """Layer-invariant metadata for one sparse prefill forward."""
+
+    cu_seqlens: torch.Tensor
+    seq_lens: torch.Tensor
+    prefix_lens: torch.Tensor
+    actual_num_tokens: int
+    cu_seqblocks_q: torch.Tensor
+    max_seqblock_q: int
+    all_seqblock_q: int
+    use_msa: bool
+    msa_prefill_metadata: Optional[Any] = None
+    msa_kv_indices: Optional[torch.Tensor] = None
+    msa_plan: Optional[Any] = None
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
@@ -85,6 +105,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
             msa_available,
+            msa_direct_prefill_available,
         )
 
         # MSA (fmha_sm100) runs bf16, or uniform fp8_e4m3 under fp8 attn-GEMM mode
@@ -154,6 +175,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
+        _full_prefill_cuda_graph = check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+        # Full prefill graphs capture metadata tensor addresses. Until MSA has
+        # a graph-stable prefill plan/update API, preserve the old per-layer
+        # Triton path there. Eager, breakable, and piecewise prefill all run the
+        # request-level preparation once before entering the layer loop.
+        self._cache_prefill_metadata = not _full_prefill_cuda_graph
+        # MSA sparse prefill supports BF16 and uniform FP8 through the fmha_sm100
+        # bridge. The stable direct sparse-prefill API is only enabled for BF16;
+        # FP8 keeps the bridge so its plan and dequant scales stay explicit.
+        self._use_msa_prefill = self.use_msa and not _full_prefill_cuda_graph
+        self._use_msa_direct_prefill = (
+            self._use_msa_prefill
+            and self.kv_pool.main_pool.dtype == torch.bfloat16
+            and msa_direct_prefill_available()
+        )
+        self._prefill_meta: Optional[MiniMaxSparsePrefillMetadata] = None
         self._use_msa_decode = self.use_msa and (
             not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
         )
@@ -175,11 +212,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
+        if self._use_msa_prefill:
+            prefill_attn = (
+                "MSA-direct" if self._use_msa_direct_prefill else "MSA-bridge"
+            )
+        else:
+            prefill_attn = "triton"
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
-            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
-            f"msa_decode={self._use_msa_decode}, "
+            f"prefill_attn={prefill_attn}, "
+            f"decode_attn={'MSA' if self._use_msa_decode else 'triton'}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
             f"fp8_attn_gemm={self.fp8_attn_gemm}, "
@@ -198,20 +241,197 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         self._msa_dec_meta = None
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
-            self._max_seqlen_q = int(max(extend_lens))
+        self._prefill_meta = None
+        extend_lens_cpu = self._to_int_list(
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+        )
+        if extend_lens_cpu:
+            self._max_seqlen_q = max(extend_lens_cpu)
         else:
-            self._max_seqlen_q = 1
+            extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+            self._max_seqlen_q = (
+                int(extend_seq_lens.max().item())
+                if extend_seq_lens is not None and extend_seq_lens.numel() > 0
+                else 1
+            )
         if in_capture and forward_batch.forward_mode.is_decode_or_idle():
             self._max_seqlen_k = self.max_context_len
         else:
-            self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            seq_lens_cpu = self._to_int_list(forward_batch.seq_lens_cpu)
+            self._max_seqlen_k = (
+                max(seq_lens_cpu)
+                if seq_lens_cpu
+                else (
+                    int(forward_batch.seq_lens.max().item())
+                    if forward_batch.seq_lens.numel() > 0
+                    else 1
+                )
+            )
+
+        if (
+            self._cache_prefill_metadata
+            and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            and getattr(forward_batch, "extend_seq_lens", None) is not None
+        ):
+            self._prefill_meta = self._build_prefill_metadata(
+                forward_batch, use_host_lengths=True
+            )
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
+
+    @staticmethod
+    def _to_int_list(values) -> Optional[list[int]]:
+        if values is None:
+            return None
+        if torch.is_tensor(values):
+            return [int(value) for value in values.tolist()]
+        return [int(value) for value in values]
+
+    @staticmethod
+    def _make_cu_seqlens(
+        lengths: torch.Tensor,
+        lengths_cpu: Optional[Sequence[int]],
+        *,
+        use_host_lengths: bool,
+    ) -> torch.Tensor:
+        if (
+            use_host_lengths
+            and lengths_cpu is not None
+            and len(lengths_cpu) == lengths.numel()
+        ):
+            cumulative = [0]
+            for length in lengths_cpu:
+                cumulative.append(cumulative[-1] + int(length))
+            return torch.tensor(cumulative, dtype=torch.int32, device=lengths.device)
+        lengths_i32 = lengths.to(torch.int32)
+        return torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=lengths.device),
+                lengths_i32.cumsum(0),
+            ]
+        )
+
+    def _build_prefill_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        use_host_lengths: bool,
+    ) -> MiniMaxSparsePrefillMetadata:
+        extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        extend_lens_cpu = self._to_int_list(
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+        )
+        if extend_lens_cpu is not None:
+            actual_num_tokens = sum(extend_lens_cpu)
+        else:
+            actual_num_tokens = int(extend_seq_lens.sum().item())
+
+        cu_seqlens = self._make_cu_seqlens(
+            extend_seq_lens,
+            extend_lens_cpu,
+            use_host_lengths=use_host_lengths,
+        )
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        if forward_batch.extend_prefix_lens is None:
+            prefix_lens = torch.zeros_like(seq_lens)
+        else:
+            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+
+        # MiniMax-M3 fixes block_size_q=1. In that case query block offsets are
+        # exactly token offsets, so alias cu_seqlens instead of launching the
+        # generic diff/div/cumsum helper (which also computes unused K blocks).
+        if self.block_size_q == 1:
+            cu_seqblocks_q = cu_seqlens
+            max_seqblock_q = self._max_seqlen_q
+            all_seqblock_q = actual_num_tokens
+        else:
+            (
+                cu_seqblocks_q,
+                max_seqblock_q,
+                all_seqblock_q,
+                _,
+                _,
+                _,
+            ) = get_cu_seqblocks(
+                cu_seqlens,
+                self._max_seqlen_q,
+                self.block_size_q,
+                self.block_size_k,
+                extend_lens_cpu,
+            )
+
+        use_msa = self._use_msa_prefill
+        msa_prefill_metadata = None
+        msa_kv_indices = None
+        msa_plan = None
+        if use_msa:
+            from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+                MSAUnavailableError,
+                build_msa_prefill_bridge_meta,
+                build_msa_prefill_metadata,
+            )
+
+            seq_lens_cpu = self._to_int_list(forward_batch.seq_lens_cpu)
+            if seq_lens_cpu is not None and len(seq_lens_cpu) != seq_lens.numel():
+                seq_lens_cpu = None
+            try:
+                # MSA selects sparse prefill when at least one row has more
+                # than 32 query tokens. Its direct CuTe API also supports the
+                # shorter rows in a mixed varlen batch, so keep the whole batch
+                # on the direct path and avoid rebuilding bridge metadata in
+                # every sparse layer.
+                use_direct_msa = (
+                    self._use_msa_direct_prefill
+                    and extend_lens_cpu is not None
+                    and len(extend_lens_cpu) == extend_seq_lens.numel()
+                    and max(extend_lens_cpu, default=0) > 32
+                )
+                if use_direct_msa:
+                    msa_prefill_metadata = build_msa_prefill_metadata(
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        cu_seqlens,
+                        extend_seq_lens,
+                        seq_lens,
+                        prefix_lens,
+                        self.block_size_k,
+                        self._max_seqlen_q,
+                        self._max_seqlen_k,
+                        seq_lens_cpu,
+                    )
+                else:
+                    msa_kv_indices, msa_plan = build_msa_prefill_bridge_meta(
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        extend_seq_lens,
+                        seq_lens,
+                        prefix_lens,
+                        self.num_q_heads,
+                        self.num_kv_heads,
+                        self.block_size_k,
+                        self.topk_blocks,
+                        is_fp8=self.fp8_attn_gemm,
+                    )
+            except MSAUnavailableError as err:
+                _warn_msa_fallback(err)
+                use_msa = False
+
+        return MiniMaxSparsePrefillMetadata(
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            actual_num_tokens=actual_num_tokens,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            use_msa=use_msa,
+            msa_prefill_metadata=msa_prefill_metadata,
+            msa_kv_indices=msa_kv_indices,
+            msa_plan=msa_plan,
+        )
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
         from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
@@ -332,26 +552,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
-                ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
-            ]
-        )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
-            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
-        else:
-            prefix_lens = torch.zeros_like(seq_lens)
+        prefill_meta = self._prefill_meta
+        if prefill_meta is None:
+            # Experimental full-prefill CUDA graph keeps the old per-layer
+            # construction so metadata ops are captured with stable addresses.
+            prefill_meta = self._build_prefill_metadata(
+                forward_batch, use_host_lengths=self._cache_prefill_metadata
+            )
+
+        cu_seqlens = prefill_meta.cu_seqlens
+        seq_lens = prefill_meta.seq_lens
+        prefix_lens = prefill_meta.prefix_lens
+        actual_num_tokens = prefill_meta.actual_num_tokens
 
         # DP attention pads q beyond the real token count for collective alignment;
         # trim to actual tokens so the sparse kernel sees consistent shapes.
-        if forward_batch.extend_seq_lens_cpu is not None:
-            actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
-        else:
-            actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]
@@ -386,8 +601,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.local_blocks,
             score_type=self.score_type,
             disable_index_value=disable_value,
-            use_msa=self.use_msa,
-            seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            use_msa=prefill_meta.use_msa,
+            cu_seqblocks_q=prefill_meta.cu_seqblocks_q,
+            max_seqblock_q=prefill_meta.max_seqblock_q,
+            all_seqblock_q=prefill_meta.all_seqblock_q,
+            seqlens_cpu=getattr(forward_batch, "extend_seq_lens_cpu", None),
+            msa_prefill_metadata=prefill_meta.msa_prefill_metadata,
+            msa_kv_indices=prefill_meta.msa_kv_indices,
+            msa_plan=prefill_meta.msa_plan,
             q_scale=layer.q_scale_float,
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
