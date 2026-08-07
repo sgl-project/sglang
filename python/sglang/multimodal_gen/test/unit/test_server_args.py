@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanCo
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -39,9 +43,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_non_diffusers_pipeline_name,
+    is_known_non_diffusers_multimodal_model,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
+)
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    MiniMaxH3Pipeline,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -410,12 +421,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             execute_serve_cmd(args, unknown_args)
 
         server_args = dispatch_launch.call_args.args[0]
-        self.assertTrue(server_args.warmup)
-        self.assertTrue(server_args.server_warmup)
-        self.assertFalse(server_args.is_arg_explicitly_set("warmup"))
-        self.assertFalse(server_args.is_arg_explicitly_set("server_warmup"))
+        self.assertEqual(server_args.warmup_mode, "server")
+        self.assertFalse(server_args.is_arg_explicitly_set("warmup_mode"))
 
-    def test_serve_cli_preserves_explicit_warmup_false(self):
+    def test_serve_cli_preserves_explicit_warmup_mode_off(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
             add_multimodal_gen_serve_args,
             execute_serve_cmd,
@@ -426,8 +435,8 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         argv = [
             "--model-path",
             "/fake",
-            "--warmup",
-            "false",
+            "--warmup-mode",
+            "off",
         ]
 
         with (
@@ -443,18 +452,17 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             execute_serve_cmd(args, unknown_args)
 
         server_args = dispatch_launch.call_args.args[0]
-        self.assertFalse(server_args.warmup)
-        self.assertFalse(server_args.server_warmup)
-        self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
+        self.assertEqual(server_args.warmup_mode, "off")
+        self.assertTrue(server_args.is_arg_explicitly_set("warmup_mode"))
 
-    def test_serve_cli_preserves_config_warmup_false(self):
+    def test_serve_cli_preserves_config_warmup_mode_off(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
             add_multimodal_gen_serve_args,
             execute_serve_cmd,
         )
 
         with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
-            json.dump({"model_path": "/fake", "warmup": False}, config_file)
+            json.dump({"model_path": "/fake", "warmup_mode": "off"}, config_file)
             config_file.flush()
 
             parser = FlexibleArgumentParser()
@@ -479,9 +487,18 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 execute_serve_cmd(args, unknown_args)
 
         server_args = dispatch_launch.call_args.args[0]
-        self.assertFalse(server_args.warmup)
-        self.assertFalse(server_args.server_warmup)
-        self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
+        self.assertEqual(server_args.warmup_mode, "off")
+        self.assertTrue(server_args.is_arg_explicitly_set("warmup_mode"))
+
+    def test_retired_warmup_config_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "warmup.*warmup_mode"):
+            _from_dict_without_model_resolution(
+                {"model_path": "/fake", "warmup": False}
+            )
+
+    def test_retired_warmup_kwargs_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "warmup.*warmup_mode"):
+            ServerArgs.from_kwargs(model_path="/fake", warmup=False)
 
     def test_disagg_role_disables_server_warmup(self):
         with patch.object(
@@ -490,156 +507,82 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args = ServerArgs.from_dict(
                 {
                     "model_path": "/fake",
-                    "warmup": True,
-                    "server_warmup": True,
+                    "warmup_mode": "server",
                     "disagg_role": "server",
                 }
             )
 
-        self.assertTrue(server_args.warmup)
-        self.assertFalse(server_args.server_warmup)
+        self.assertEqual(server_args.warmup_mode, "request")
 
 
 class TestWarmupModeNormalization(unittest.TestCase):
-    """`_adjust_warmup` resolves the canonical warmup_mode and its derived booleans."""
+    """`_adjust_warmup` resolves the canonical warmup mode."""
 
     def _resolve(
         self,
         *,
         warmup_mode=None,
-        warmup=False,
-        server_warmup=False,
         warmup_resolutions=None,
         enable_torch_compile=False,
+        enable_breakable_cuda_graph=False,
         disagg_role=None,
-        explicit=(),
     ):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         sa = ServerArgs.__new__(ServerArgs)
         sa.warmup_mode = warmup_mode
-        sa.warmup = warmup
-        sa.server_warmup = server_warmup
         sa.warmup_resolutions = warmup_resolutions
         sa.enable_torch_compile = enable_torch_compile
+        sa.enable_breakable_cuda_graph = enable_breakable_cuda_graph
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
-        sa._explicit_arg_names = set(explicit)
         sa._adjust_warmup()
         return sa
 
     def test_explicit_mode_off_disables_all(self):
-        sa = self._resolve(warmup_mode="off", explicit=("warmup_mode",))
+        sa = self._resolve(warmup_mode="off")
         self.assertEqual(sa.warmup_mode, "off")
-        self.assertFalse(sa.warmup)
-        self.assertFalse(sa.server_warmup)
 
     def test_explicit_mode_request(self):
-        sa = self._resolve(warmup_mode="request", explicit=("warmup_mode",))
+        sa = self._resolve(warmup_mode="request")
         self.assertEqual(sa.warmup_mode, "request")
-        self.assertTrue(sa.warmup)
-        self.assertFalse(sa.server_warmup)
 
     def test_explicit_mode_server(self):
-        sa = self._resolve(warmup_mode="server", explicit=("warmup_mode",))
-        self.assertEqual(sa.warmup_mode, "server")
-        self.assertTrue(sa.warmup)
-        self.assertTrue(sa.server_warmup)
-
-    def test_explicit_mode_overrides_explicit_legacy(self):
-        sa = self._resolve(
-            warmup_mode="request",
-            warmup=True,
-            server_warmup=True,
-            explicit=("warmup_mode", "warmup", "server_warmup"),
-        )
-        self.assertEqual(sa.warmup_mode, "request")
-        self.assertTrue(sa.warmup)
-        self.assertFalse(sa.server_warmup)
-
-    def test_explicit_legacy_false_beats_defaulted_mode(self):
-        # serve defaults warmup_mode="server" (not explicit); `--warmup false` wins.
-        sa = self._resolve(
-            warmup_mode="server",
-            warmup=False,
-            server_warmup=False,
-            explicit=("warmup",),
-        )
-        self.assertEqual(sa.warmup_mode, "off")
-        self.assertFalse(sa.warmup)
-        self.assertFalse(sa.server_warmup)
-
-    def test_defaulted_mode_applies_without_legacy_flags(self):
-        # bare `sglang serve`: warmup_mode="server" defaulted, no legacy override.
         sa = self._resolve(warmup_mode="server")
         self.assertEqual(sa.warmup_mode, "server")
-        self.assertTrue(sa.warmup)
-        self.assertTrue(sa.server_warmup)
 
-    def test_legacy_only_maps_to_request(self):
-        sa = self._resolve(warmup_mode=None, warmup=True, explicit=("warmup",))
-        self.assertEqual(sa.warmup_mode, "request")
-        self.assertTrue(sa.warmup)
-        self.assertFalse(sa.server_warmup)
+    def test_defaulted_mode_applies_without_legacy_flags(self):
+        # Bare `sglang serve` defaults to server-based warmup.
+        sa = self._resolve(warmup_mode="server")
+        self.assertEqual(sa.warmup_mode, "server")
 
     def test_resolutions_force_warmup_on(self):
         sa = self._resolve(
             warmup_mode="off",
             warmup_resolutions=["512x512"],
-            explicit=("warmup_mode",),
         )
-        self.assertTrue(sa.warmup)
-        self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
 
     def test_torch_compile_defaults_to_server_warmup(self):
         sa = self._resolve(enable_torch_compile=True)
 
         self.assertEqual(sa.warmup_mode, "server")
-        self.assertTrue(sa.warmup)
-        self.assertTrue(sa.server_warmup)
-
-    def test_legacy_warmup_on_uses_defaulted_server_mode(self):
-        # `serve --warmup` (legacy ON, mode defaulted to "server" but not
-        # explicit) must resolve to server-based warmup, not silently downgrade
-        # to request mode.
-        sa = self._resolve(warmup_mode="server", warmup=True, explicit=("warmup",))
-
-        self.assertEqual(sa.warmup_mode, "server")
-        self.assertTrue(sa.warmup)
-        self.assertTrue(sa.server_warmup)
 
     def test_torch_compile_respects_explicit_warmup_off(self):
         sa = self._resolve(
             warmup_mode="off",
             enable_torch_compile=True,
-            explicit=("warmup_mode",),
         )
         self.assertEqual(sa.warmup_mode, "off")
-        self.assertFalse(sa.warmup)
-        self.assertFalse(sa.server_warmup)
 
     def test_torch_compile_uses_server_warmup_for_explicit_resolutions(self):
         sa = self._resolve(
             warmup_resolutions=["1024x1024"],
             enable_torch_compile=True,
-            explicit=("warmup_resolutions",),
         )
         self.assertEqual(sa.warmup_mode, "server")
-        self.assertTrue(sa.warmup)
-        self.assertTrue(sa.server_warmup)
 
-    def test_legacy_warmup_with_resolutions_runs_server_warmup(self):
-        # Dead-zone regression: `serve --warmup --warmup-resolutions X` must run
-        # server-based (synthetic) warmup, not end up with no warmup at all
-        # (request-based warmup bails out when warmup_resolutions is set).
-        sa = self._resolve(
-            warmup_mode="server",
-            warmup=True,
-            warmup_resolutions=["1024x1024"],
-            explicit=("warmup",),
-        )
-        self.assertTrue(sa.warmup)
-        self.assertTrue(sa.server_warmup)
+    def test_breakable_cuda_graph_forces_server_warmup(self):
+        sa = self._resolve(enable_breakable_cuda_graph=True)
         self.assertEqual(sa.warmup_mode, "server")
 
     def test_disagg_role_disables_server_warmup(self):
@@ -648,10 +591,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa = self._resolve(
             warmup_mode="server",
             disagg_role=RoleType.DENOISER,
-            explicit=("warmup_mode",),
         )
-        self.assertTrue(sa.warmup)
-        self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
 
     def test_torch_compile_server_warmup_disabled_for_disagg_role(self):
@@ -659,12 +599,10 @@ class TestWarmupModeNormalization(unittest.TestCase):
 
         sa = self._resolve(enable_torch_compile=True, disagg_role=RoleType.DENOISER)
         self.assertEqual(sa.warmup_mode, "request")
-        self.assertTrue(sa.warmup)
-        self.assertFalse(sa.server_warmup)
 
     def test_invalid_mode_raises(self):
         with self.assertRaises(ValueError):
-            self._resolve(warmup_mode="bogus", explicit=("warmup_mode",))
+            self._resolve(warmup_mode="bogus")
 
 
 class TestWarmupImageIsModelValid(unittest.TestCase):
@@ -687,7 +625,65 @@ class TestWarmupImageIsModelValid(unittest.TestCase):
         self.assertGreaterEqual(height, 64)
 
 
+class TestDiffusionModelDetection(unittest.TestCase):
+    def test_registered_local_model_path_is_detected_as_diffusion(self):
+        with tempfile.TemporaryDirectory() as root:
+            model_path = os.path.join(root, "Z-Image-Turbo")
+            os.mkdir(model_path)
+            self.assertTrue(get_is_diffusion_model(model_path))
+
+
+class TestMiniMaxH3Routing(unittest.TestCase):
+
+    def test_semantic_variants_map_to_checkpoint_partitions(self):
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
+        )
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("ref2va"), "Ref2VA"
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported MiniMax H3 model variant"):
+            MiniMaxH3Pipeline.model_subfolder_for_variant("v2v")
+
+    def test_modelscope_id_resolves_to_the_huggingface_config(self):
+        expected = _get_config_info("MiniMaxAI/MiniMax-H3")
+        actual = _get_config_info("MiniMax/MiniMax-H3")
+        self.assertIsNotNone(expected)
+        self.assertIs(actual, expected)
+        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("/models/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
+
+
 class TestOffloadDefaults(unittest.TestCase):
+    def test_wan_decode_precision_defaults(self):
+        for pipeline_config in (
+            WanT2V480PConfig(),
+            WanI2V480PConfig(),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                self.assertEqual(pipeline_config.vae_precision, "fp32")
+                self.assertEqual(pipeline_config.vae_decode_precision, "bf16")
+
+        for pipeline_config in (
+            FastWan2_2_TI2V_5B_Config(),
+            Wan2_2_T2V_A14B_Config(),
+            Wan2_2_I2V_A14B_Config(),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                self.assertEqual(pipeline_config.vae_precision, "fp32")
+                self.assertEqual(pipeline_config.vae_decode_precision, "fp32")
+
+        generic_config = PipelineConfig()
+        self.assertEqual(generic_config.vae_precision, "fp32")
+        self.assertIsNone(generic_config.vae_decode_precision)
+
     def _from_dict_with_pipeline_config(
         self,
         pipeline_config,
@@ -1484,6 +1480,73 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         self.assertFalse(args.vae_cpu_offload)
 
+    def test_auto_minimax_h3_keeps_large_components_resident_with_headroom(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            memory_gb=141,
+            available_memory_gb=130,
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertNotIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertNotIn("vae", args.layerwise_offload_components or [])
+
+    def test_auto_minimax_h3_keeps_memory_policy_below_residency_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            memory_gb=96,
+            available_memory_gb=90,
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_memory_minimax_h3_combines_fsdp_with_aux_layerwise_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "memory",
+                "use_fsdp_inference": True,
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_minimax_h3_rejects_explicit_cfg_parallel(self):
+        with self.assertRaisesRegex(
+            ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
+        ):
+            self._from_dict_with_pipeline_config(
+                MiniMaxH3PipelineConfig(),
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "cfg_parallel_degree": 2,
+                },
+            )
+
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
@@ -1537,6 +1600,20 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.enable_torch_compile)
+
+    def test_speed_mode_uses_minimax_h3_compile_policy(self):
+        for explicit, expected in ((None, False), (True, True)):
+            kwargs = {
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "performance_mode": "speed",
+            }
+            if explicit is not None:
+                kwargs["enable_torch_compile"] = explicit
+            with self.subTest(explicit=explicit):
+                args = self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(), kwargs=kwargs
+                )
+                self.assertEqual(args.enable_torch_compile, expected)
 
     def test_auto_mode_leaves_torch_compile_off(self):
         args = self._from_dict_with_pipeline_config(
@@ -1683,6 +1760,107 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
 
 
+class TestKVGatherDegree(unittest.TestCase):
+    def test_sp2_defaults_to_kv_gather(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertTrue(args.sp_split_auto)
+        # gather rows occupy the contiguous inner SP dimension
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.sp_degree, 2)
+
+    def test_higher_sp_defaults_to_ulysses(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertFalse(args.sp_split_auto)
+        self.assertEqual(args.ulysses_degree, 4)
+
+    def test_explicit_ulysses_is_not_overridden(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "ulysses_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 2)
+
+    def test_explicit_degree_is_not_auto(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "kv_gather_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertFalse(args.sp_split_auto)
+
+    def test_kv_gather_supports_tp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 4,
+                "tp_size": 2,
+                "sp_degree": 2,
+                "kv_gather_degree": 2,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.kv_gather_degree, 2)
+
+    def test_kv_gather_supports_fsdp(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "num_gpus": 2,
+                "sp_degree": 2,
+                "kv_gather_degree": 2,
+                "use_fsdp_inference": True,
+                "performance_mode": "manual",
+            }
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertEqual(args.kv_gather_degree, 2)
+
+    def test_kv_gather_does_not_compose_yet(self):
+        for extra in ({"ulysses_degree": 2}, {"ring_degree": 2}):
+            with self.assertRaisesRegex(ValueError, "does not compose"):
+                _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": 4,
+                        "sp_degree": 4,
+                        "kv_gather_degree": 2,
+                        "performance_mode": "manual",
+                        **extra,
+                    }
+                )
+
+
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
         self.assertTrue(
@@ -1812,24 +1990,9 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertIsNone(par["ulysses_degree"])
         self.assertIsNone(par["ring_degree"])
 
-    def test_decoder_tp_is_alias_of_decoder_sp(self):
-        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
-        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-
-        self.assertEqual(args.decoder_sp, 2)
-        par = args.get_role_parallelism(RoleType.DECODER)
-        self.assertIsNone(par["tp_size"])
-        self.assertEqual(par["sp_degree"], 2)
-
-    def test_conflicting_decoder_tp_and_decoder_sp_raise(self):
-        with self.assertRaisesRegex(ValueError, "decoder_tp is deprecated"):
-            self._from_dict(
-                {
-                    "model_path": "/fake",
-                    "decoder_tp": 2,
-                    "decoder_sp": 4,
-                }
-            )
+    def test_removed_decoder_tp_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "decoder_tp.*decoder_sp"):
+            self._from_dict({"model_path": "/fake", "decoder_tp": 2})
 
     def test_monolithic_returns_all_none(self):
         args = self._from_dict({"model_path": "/fake", "encoder_tp": 2})
@@ -1940,7 +2103,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.denoiser_ring, 2)
         self.assertEqual(args.encoder_tp, 1)
         self.assertEqual(args.decoder_sp, 8)
-        self.assertIsNone(args.decoder_tp)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):
@@ -2051,6 +2213,24 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
 
         args, _unknown = parser.parse_known_args(argv)
         self.assertEqual(args.disagg_transfer_backend, "mock")
+
+
+class TestNcclNvlsArgs(unittest.TestCase):
+    def test_enable_nccl_nvls_cli_arg(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        default_args, _ = parser.parse_known_args(["--model-path", "/fake"])
+        enabled_args, _ = parser.parse_known_args(
+            ["--model-path", "/fake", "--enable-nccl-nvls"]
+        )
+        disabled_args, _ = parser.parse_known_args(
+            ["--model-path", "/fake", "--enable-nccl-nvls", "false"]
+        )
+
+        self.assertFalse(default_args.enable_nccl_nvls)
+        self.assertTrue(enabled_args.enable_nccl_nvls)
+        self.assertFalse(disabled_args.enable_nccl_nvls)
 
 
 if __name__ == "__main__":

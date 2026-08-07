@@ -69,7 +69,18 @@ jobs:
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
-          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+          # HF /whoami-v2 is aggressively rate-limited and the three matrix
+          # jobs (1/2/4-GPU) all hit it at the same second under a scheduled
+          # run. Retry with linear backoff + jitter to desynchronize them.
+          docker exec ci_sglang_xpu /bin/bash -c '
+            for i in 1 2 3 4 5; do
+              /opt/venv/bin/hf auth login --token "${HF_TOKEN}" && exit 0
+              sleep_secs=$((i * 15 + RANDOM % 15))
+              echo "hf auth login failed (attempt $i), retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+            done
+            exit 1
+          '
 
       - name: Download olmOCR-bench dataset (for test_deepseek_ocr_2_olmbench)
         timeout-minutes: 30
@@ -143,7 +154,18 @@ jobs:
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
-          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+          # HF /whoami-v2 is aggressively rate-limited and the three matrix
+          # jobs (1/2/4-GPU) all hit it at the same second under a scheduled
+          # run. Retry with linear backoff + jitter to desynchronize them.
+          docker exec ci_sglang_xpu /bin/bash -c '
+            for i in 1 2 3 4 5; do
+              /opt/venv/bin/hf auth login --token "${HF_TOKEN}" && exit 0
+              sleep_secs=$((i * 15 + RANDOM % 15))
+              echo "hf auth login failed (attempt $i), retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+            done
+            exit 1
+          '
 
       - name: Nightly Test (2-GPU XPU)
         timeout-minutes: 240
@@ -206,7 +228,18 @@ jobs:
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
-          docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
+          # HF /whoami-v2 is aggressively rate-limited and the three matrix
+          # jobs (1/2/4-GPU) all hit it at the same second under a scheduled
+          # run. Retry with linear backoff + jitter to desynchronize them.
+          docker exec ci_sglang_xpu /bin/bash -c '
+            for i in 1 2 3 4 5; do
+              /opt/venv/bin/hf auth login --token "${HF_TOKEN}" && exit 0
+              sleep_secs=$((i * 15 + RANDOM % 15))
+              echo "hf auth login failed (attempt $i), retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+            done
+            exit 1
+          '
 
       - name: Nightly Test (4-GPU XPU)
         timeout-minutes: 480

@@ -461,6 +461,7 @@ Several limitations currently affect offline quantized model loading in sglang, 
 
     Dense (non-MoE) linear layers run on any x86 CPU: Intel CPUs with AMX use the optimized AMX path, while other x86 CPUs fall back to the AVX512 path. INT4 MoE experts still require an Intel CPU with AMX support.
 
+
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
 ```bash Command
