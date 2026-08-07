@@ -115,6 +115,9 @@ class _TinyModel(nn.Module):
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
+        self.register_buffer(
+            "derived_cache", torch.full((8,), 0.42), persistent=False
+        )
 
 
 class _FakeModelRunner:
@@ -526,6 +529,11 @@ class TestSnapshot(_WeightCheckerTestBase):
         }
         self.assertEqual(keys, expected)
 
+    def test_excludes_non_persistent_buffers(self):
+        self.assertIn("derived_cache", dict(self.model.named_buffers()))
+        self.checker._snapshot()
+        self.assertNotIn("derived_cache", self.checker._snapshot_tensors)
+
     def test_detaches_and_moves_to_cpu(self):
         self.checker._snapshot()
         for tensor in self.checker._snapshot_tensors.values():
@@ -595,9 +603,7 @@ class TestCompare(_WeightCheckerTestBase):
         snapshot = {k: v.clone() for k, v in self.checker._snapshot_tensors.items()}
         self.checker._reset_tensors()
         with torch.no_grad():
-            for name, tensor in self.model.named_parameters():
-                tensor.data.copy_(snapshot[name].to(tensor.device))
-            for name, tensor in self.model.named_buffers():
+            for name, tensor in self.checker._model_state():
                 tensor.data.copy_(snapshot[name].to(tensor.device))
         self.checker._compare()
 
