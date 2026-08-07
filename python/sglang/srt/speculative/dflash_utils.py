@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
+from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -611,8 +611,8 @@ def apply_dflash_simulated_acceptance(
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
     block_size = candidates.shape[1]
 
-    # _sample_simulated_acc_len clamps to [1, block_size].
-    forced_commit_len = _sample_simulated_acc_len(
+    # sample_simulated_acc_len clamps to [1, block_size].
+    forced_commit_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, block_size
     )
     forced_accept_len = forced_commit_len - 1
