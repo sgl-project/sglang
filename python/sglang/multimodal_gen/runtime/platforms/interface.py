@@ -226,6 +226,10 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        torch.get_device_module(device).set_device(device)
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
