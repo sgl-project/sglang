@@ -1,3 +1,4 @@
+import re
 from typing import List
 
 THINK_OPEN = "<|open|>think<|sep|>"
@@ -41,6 +42,20 @@ def strip_partial_marker_suffix(text: str) -> str:
     return text
 
 
+# the model sometimes hand-writes a marker out of ordinary text tokens instead of
+# emitting the atomic special token, e.g. "<|open|>think<|sep|" with no closing ">",
+# or a truncated sep followed by a complete one; at least one sep is required so
+# prose that legitimately mentions a bare "<|open|>think" is left alone
+_HANDWRITTEN_MARKER_RE = re.compile(
+    r"<\|(?:open|close)\|>(?:think|response|message|tools)(?:<\|sep(?:\|>?)?)+"
+)
+
+
+def strip_handwritten_markers(text: str) -> str:
+    """Drop section markers the model spelled out as text rather than emitting."""
+    return _HANDWRITTEN_MARKER_RE.sub("", text)
+
+
 def strip_response_wrappers(text: str) -> str:
     open_idx = text.find(RESPONSE_OPEN)
     if open_idx != -1:
@@ -52,4 +67,4 @@ def strip_response_wrappers(text: str) -> str:
     else:
         text = text.replace(RESPONSE_CLOSE, "")
     text = text.replace(MESSAGE_CLOSE, "")
-    return strip_partial_marker_suffix(text)
+    return strip_partial_marker_suffix(strip_handwritten_markers(text))

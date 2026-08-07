@@ -219,3 +219,43 @@ def test_detector_capabilities_and_registration() -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_handwritten_marker_before_prose() -> None:
+    # the model spells the marker out with plain text tokens instead of emitting
+    # it, so the sep is truncated: reported from two b300 deployments
+    detector = KimiK3Detector()
+    result = detector.detect_and_parse(
+        "<|open|>think<|sep|the answer is 4", [_make_tool("python")]
+    )
+    assert result.normal_text == "the answer is 4"
+
+
+def test_handwritten_marker_before_tools_channel() -> None:
+    detector = KimiK3Detector()
+    tools_channel = (
+        TOOLS_OPEN + _call_block("python", 1, {"code": ("string", "1")}) + TOOLS_CLOSE
+    )
+    result = detector.detect_and_parse(
+        "<|open|>think<|sep|" + tools_channel, [_make_tool("python")]
+    )
+    assert result.normal_text == ""
+    assert len(result.calls) == 1
+
+
+def test_repeated_seps_in_handwritten_marker() -> None:
+    # truncated sep followed by a complete one, at the tail of a text block
+    detector = KimiK3Detector()
+    result = detector.detect_and_parse(
+        "Let me try that.\n<|close|>think<|sep|<|sep|>", [_make_tool("python")]
+    )
+    assert result.normal_text == "Let me try that.\n"
+
+
+def test_prose_about_bare_marker_survives() -> None:
+    # a reply explaining the syntax must not be scrubbed; a bare marker with no
+    # sep is not a marker
+    from sglang.srt.function_call.kimik3_format import strip_handwritten_markers
+
+    prose = "you asked about <|open|>think and what it does"
+    assert strip_handwritten_markers(prose) == prose
