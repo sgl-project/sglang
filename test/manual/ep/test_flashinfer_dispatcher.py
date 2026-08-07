@@ -4,6 +4,8 @@ import torch
 
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     get_tp_group,
     initialize_model_parallel,
 )
@@ -41,9 +43,18 @@ class TestFlashinferDispatcher(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Clean up distributed environment
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+        try:
+            from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
+
+            for workspace in MoeAlltoAll._WORKSPACE_CACHE.values():
+                mnnvl_mem = workspace.get("mnnvl_mem")
+                if mnnvl_mem is not None and hasattr(mnnvl_mem, "ptr"):
+                    delattr(mnnvl_mem, "ptr")
+            MoeAlltoAll._WORKSPACE_CACHE.clear()
+        except ImportError:
+            pass
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
     def create_dispatcher(
         self, router_topk=2, num_experts=8, num_local_experts=4, hidden_size=128
@@ -60,6 +71,31 @@ class TestFlashinferDispatcher(CustomTestCase):
 
     def set_dispatch_type(self, dispatch_type):
         self.__class__.server_args.flashinfer_a2a_dispatch_type = dispatch_type
+
+    def _zero_moe_a2a_dispatch_payloads(self):
+        # Shared MoeAlltoAll workspaces keep stale recv payloads across tests.
+        # Zero only the payload region so unused-source == 0 asserts stay valid.
+        try:
+            from flashinfer.comm.trtllm_moe_alltoall import (
+                MoeAlltoAll,
+                get_moe_alltoall_module,
+            )
+        except ImportError:
+            return
+
+        module = get_moe_alltoall_module()
+        for ws in MoeAlltoAll._WORKSPACE_CACHE.values():
+            workspace = ws["workspace"]
+            aux = int(
+                module.moe_a2a_get_aux_data_size(
+                    ws["ep_size"],
+                    ws["max_num_tokens"],
+                    ws["eplb_stats_num_experts"],
+                )
+            )
+            aux = ((aux + 127) // 128) * 128
+            if aux < workspace.shape[1]:
+                workspace[:, aux:].zero_()
 
     def test_dispatch_basic(self):
         """Test basic dispatch functionality"""
@@ -151,7 +187,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         self.set_dispatch_type("bf16")
         # This tests the dummy token handling
         num_tokens = 16
-        hidden_size = 1
+        hidden_size = 128
         router_topk = 1  # Single expert per token for simplicity
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
@@ -200,6 +236,9 @@ class TestFlashinferDispatcher(CustomTestCase):
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
         )
+
+        self._zero_moe_a2a_dispatch_payloads()
+        torch.distributed.barrier()
 
         dispatcher = self.create_dispatcher(
             router_topk=router_topk,
