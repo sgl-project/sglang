@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 _SHM_DIR = Path("/dev/shm")
 _SGL_SHM_PREFIX = "sgl_shm"
 
-# Leaked-segment families whose names carry no creator pid (rule 2).
 _ORPHAN_PREFIXES = (
     "sglang_loads_",  # managers/load_snapshot.py slot files
     "cuda.shm.",  # CUDA IPC segments
@@ -30,8 +29,7 @@ _ORPHAN_PREFIXES = (
 
 
 def make_shm_name(kind: str) -> str:
-    """Name a shared-memory segment so cleanup_stale_shm can identify and
-    reclaim it after its creator process dies: sgl_shm_<kind>_<pid>_<rand>."""
+    """Pid-stamped name (sgl_shm_<kind>_<pid>_<rand>) the sweep can reclaim."""
     return f"{_SGL_SHM_PREFIX}_{kind}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 
@@ -82,9 +80,8 @@ def cleanup_stale_shm() -> None:
 
 
 def _is_in_ci() -> bool:
-    # Read the env var directly (same semantics as sglang.utils.is_in_ci) so
-    # this module stays import-free and runnable by path from CI scripts
-    # before sglang is installed.
+    # Same semantics as sglang.utils.is_in_ci, read directly so the module
+    # stays import-free (CI runs it by path before sglang is installed).
     return os.environ.get("SGLANG_IS_IN_CI", "false").lower() in ("true", "1")
 
 

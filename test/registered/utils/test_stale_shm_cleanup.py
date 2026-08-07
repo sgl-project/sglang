@@ -122,8 +122,7 @@ class TestCleanupStaleShm(unittest.TestCase):
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
 
     def _make_raw_file(self, name: str) -> str:
-        """Create a plain /dev/shm file (orphan families are not created via
-        shared_memory)."""
+        """Orphan families are plain files, not shared_memory segments."""
         path = f"/dev/shm/{name}"
         with open(path, "wb") as f:
             f.write(b"\0" * 4096)
