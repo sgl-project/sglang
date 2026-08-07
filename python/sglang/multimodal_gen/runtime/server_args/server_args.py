@@ -203,6 +203,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
+    enable_nccl_nvls: bool = False
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -218,6 +219,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
+    # rows split inside attention, exchanged with one K/V all-gather instead
+    # of Ulysses a2a or ring rotation; auto-assigned at sp_degree=2 when no SP
+    # degree is set explicitly
+    kv_gather_degree: Optional[int] = None
+    # whether the SP split was auto-assigned (lets layers fall back per call)
+    sp_split_auto: bool = False
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
@@ -262,7 +269,8 @@ class ServerArgs(DisaggServerArgsMixin):
     # filename logic.
     component_transformer_weights_paths: dict[str, str] = field(default_factory=dict)
 
-    # Quantization method for online quantization
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
@@ -314,29 +322,19 @@ class ServerArgs(DisaggServerArgsMixin):
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
 
-    # warmup
-    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    # Warmup is controlled by the canonical `warmup_mode` knob: one of WARMUP_MODES.
     #   - "off":     no warmup.
     #   - "server":  server-based warmup — a synthetic request right after the
     #                server is ready, before real traffic
     #   - "request": request-based warmup — warm on the first real request(s).
-    #                This is a BENCHMARK aid
-    # existing consumers keep working) and as deprecated CLI aliases. None means
-    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    #                This is a BENCHMARK aid.
+    # None is resolved by _adjust_warmup from the selected runtime features.
     warmup_mode: str | None = None
-
-    # deprecated: warmup and server_warmup
-    warmup: bool = False
-    server_warmup: bool = False
 
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
-
-    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
-    # When set, the transformer loader will use this instead of auto-detection.
-    quantization: str | None = None
 
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
@@ -386,9 +384,6 @@ class ServerArgs(DisaggServerArgsMixin):
         }
     )
 
-    # # DMD parameters
-    # dmd_denoising_steps: List[int] | None = field(default=None)
-
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
@@ -417,7 +412,6 @@ class ServerArgs(DisaggServerArgsMixin):
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
     decoder_sp: int | None = None
-    decoder_tp: int | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
     pool_control_endpoint: str | None = None
@@ -463,7 +457,6 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
-        self._adjust_disagg_parallelism_aliases()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
@@ -485,21 +478,6 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
-
-    def _adjust_disagg_parallelism_aliases(self):
-        if self.decoder_tp is None:
-            return
-        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
-            raise ValueError(
-                "decoder_tp is deprecated in favor of decoder_sp; "
-                "please set only one of them or keep the same value."
-            )
-        if self.decoder_sp is None:
-            logger.warning(
-                "decoder_tp is deprecated and is treated as decoder_sp for "
-                "decoder/VAE parallel decode. Please use decoder_sp instead."
-            )
-            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -895,64 +873,37 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
-        #   --warmup-mode > --warmup/--server-warmup
-        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
-        legacy_explicit = self.is_arg_explicitly_set(
-            "warmup"
-        ) or self.is_arg_explicitly_set("server_warmup")
-        if self.warmup_mode is not None:
-            if self.warmup_mode not in WARMUP_MODES:
-                raise ValueError(
-                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
-                    f"expected one of {WARMUP_MODES}."
-                )
-            if mode_explicit and legacy_explicit:
-                logger.warning(
-                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
-                    "were set; --warmup-mode=%s takes precedence.",
-                    self.warmup_mode,
-                )
-            if mode_explicit or not legacy_explicit:
-                self.warmup = self.warmup_mode != "off"
-                self.server_warmup = self.warmup_mode == "server"
-            elif self.warmup:
-                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
+        if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
+            raise ValueError(
+                f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                f"expected one of {WARMUP_MODES}."
+            )
 
-        # Explicit resolutions imply warmup is on (request-based).
-        if self.warmup_resolutions is not None:
-            self.warmup = True
-
-        if (
-            self.enable_torch_compile
-            and self.warmup_mode is None
-            and not mode_explicit
-            and not legacy_explicit
-        ):
-            self.warmup = True
-            self.server_warmup = True
+        if self.enable_torch_compile and self.warmup_mode is None:
+            self.warmup_mode = "server"
             logger.info(
                 "Automatically enabled server warmup for torch.compile so first "
                 "real requests do not pay compile latency. Set --warmup-mode off "
                 "to disable this behavior."
             )
 
+        # Explicit resolutions need a request path unless an existing server
+        # default already supplies the synthetic startup request.
+        if self.warmup_resolutions is not None and self.warmup_mode in (None, "off"):
+            self.warmup_mode = "request"
+
         # BCG captures every graph during a synthetic warmup forward at startup
-        # so that serving never records a fresh graph. That requires
-        # server-based warmup (a real warmup request issued at startup), not
-        # request-based warmup which runs no forward until the first request.
+        # so serving never records a fresh graph.
         if self.enable_breakable_cuda_graph and self.disagg_role == RoleType.MONOLITHIC:
-            self.warmup = True
-            self.server_warmup = True
+            self.warmup_mode = "server"
 
-        if self.disagg_role != RoleType.MONOLITHIC:
-            self.server_warmup = False
+        # Disaggregated roles do not host the HTTP startup request. Preserve
+        # warmup intent, but schedule it on the first request instead.
+        if self.disagg_role != RoleType.MONOLITHIC and self.warmup_mode == "server":
+            self.warmup_mode = "request"
 
-        if not self.warmup:
-            self.server_warmup = False
-
-        self.warmup_mode = (
-            "off" if not self.warmup else "server" if self.server_warmup else "request"
-        )
+        if self.warmup_mode is None:
+            self.warmup_mode = "off"
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -1097,12 +1048,35 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.ulysses_degree is None
             and self.ring_degree is None
+            and self.kv_gather_degree is None
             and self.sp_degree != 1
         ):
-            self.ulysses_degree = self.sp_degree
-            logger.info(
-                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
-            )
+            if self.sp_degree == 2:
+                # measured-win zone for the K/V-gather exchange; layers whose
+                # calls the gather path cannot take fall back to Ulysses
+                self.kv_gather_degree = 2
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=2; set "
+                    "--ulysses-degree explicitly to keep the Ulysses exchange"
+                )
+            else:
+                self.ulysses_degree = self.sp_degree
+                logger.info(
+                    "Automatically set ulysses_degree=sp_degree=%d for the "
+                    "sequence-parallel process-group layout",
+                    self.ulysses_degree,
+                )
+
+        if self.kv_gather_degree is None:
+            self.kv_gather_degree = 1
+
+        if self.kv_gather_degree > 1:
+            if (self.ulysses_degree or 1) != 1 or (self.ring_degree or 1) != 1:
+                raise ValueError(
+                    "kv_gather_degree does not compose with ulysses_degree or "
+                    "ring_degree yet; set exactly one of them above 1"
+                )
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
@@ -1113,6 +1087,13 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+        if self.kv_gather_degree > 1:
+            # K/V-gather rows occupy the contiguous inner SP dimension; the
+            # process groups are built from ulysses_degree, so alias it until
+            # gather gets a first-class dimension (needed only once it
+            # composes with Ulysses).
+            self.ulysses_degree = self.kv_gather_degree
 
     def _model_default_uses_cfg(self) -> bool:
         """
@@ -1439,6 +1420,12 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         # Parallelism
         parser.add_argument(
+            "--enable-nccl-nvls",
+            action=StoreBoolean,
+            default=ServerArgs.enable_nccl_nvls,
+            help="Enable NCCL NVLS when available.",
+        )
+        parser.add_argument(
             "--num-gpus",
             type=int,
             default=ServerArgs.num_gpus,
@@ -1498,6 +1485,20 @@ class ServerArgs(DisaggServerArgsMixin):
                 "encoder weights; `dp` never folds and splits the batch across "
                 "ranks (best batched throughput; requires TP=1 and DP=1); "
                 "`replicate` disables both. The default is `auto`."
+            ),
+        )
+        parser.add_argument(
+            "--kv-gather-degree",
+            type=int,
+            default=ServerArgs.kv_gather_degree,
+            help=(
+                "Sequence-parallel degree that splits rows inside attention "
+                "and exchanges with one K/V all-gather (queries stay local) "
+                "instead of Ulysses all-to-all. Non-causal attention only; "
+                "does not compose with --ulysses-degree/--ring-degree yet. "
+                "When no SP degree is set explicitly, sp_degree=2 defaults to "
+                "kv_gather_degree=2 (its measured-win zone) and higher "
+                "degrees default to Ulysses."
             ),
         )
         parser.add_argument(
@@ -1628,26 +1629,14 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=list(WARMUP_MODES),
             default=ServerArgs.warmup_mode,
             help=(
-                "Warmup mode (canonical knob). One of: "
-                "`off` (no warmup); `request` (request-based: warm on real "
-                "incoming requests); `server` (server-based: a synthetic warmup "
-                "request right after the server is ready, before traffic). "
-                "Takes precedence over the deprecated --warmup/--server-warmup. "
-                "`sglang serve` defaults to `server`; other entrypoints default "
+                "Warmup mode. One of: `off` (no warmup); `request` "
+                "(request-based: warm on real incoming requests); `server` "
+                "(server-based: a synthetic warmup request right after the server "
+                "is ready, before traffic). `sglang serve` defaults to `server`; "
+                "other entrypoints default "
                 "to request-based when warmup is enabled. When enabled, look for "
                 "the line ending with `(with warmup excluded)` for actual "
                 "processing time."
-            ),
-        )
-        parser.add_argument(
-            "--warmup",
-            action=StoreBoolean,
-            default=ServerArgs.warmup,
-            help=(
-                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
-                "traffic. Maps to --warmup-mode request (or server, combined "
-                "with --server-warmup). Recommended when benchmarking for fair "
-                "comparison and best performance."
             ),
         )
         parser.add_argument(
@@ -1663,16 +1652,6 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
-        parser.add_argument(
-            "--server-warmup",
-            action=StoreBoolean,
-            default=ServerArgs.server_warmup,
-            help=(
-                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
-                "request after the server is ready (server-based warmup)."
-            ),
-        )
-
         # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
@@ -2244,6 +2223,7 @@ class ServerArgs(DisaggServerArgsMixin):
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
+        cls._reject_retired_args(kwargs)
         attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
         explicit_arg_names = kwargs.get("_explicit_arg_names")
@@ -2271,6 +2251,20 @@ class ServerArgs(DisaggServerArgsMixin):
         return cls(**server_args_kwargs)
 
     @staticmethod
+    def _reject_retired_args(kwargs: dict[str, Any]) -> None:
+        retired_args = {
+            "decoder_tp": "decoder_sp for decoder/VAE parallel decode",
+            "warmup": "warmup_mode=request or warmup_mode=off",
+            "server_warmup": "warmup_mode=server or warmup_mode=off",
+        }
+        removed = [name for name in retired_args if name in kwargs]
+        if removed:
+            replacements = "; ".join(
+                f"{name} -> {retired_args[name]}" for name in removed
+            )
+            raise ValueError(f"Removed server argument(s): {replacements}")
+
+    @staticmethod
     def load_config_file(config_file: str) -> dict[str, Any]:
         """Load a config file."""
         if config_file.endswith(".json"):
@@ -2291,6 +2285,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        cls._reject_retired_args(kwargs)
         explicit_arg_names = set(kwargs)
 
         # Convert backend string to enum if necessary
@@ -2453,6 +2448,15 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_parallelism(self):
+        if self.kv_gather_degree < 1:
+            raise ValueError("kv_gather_degree must be >= 1")
+        if self.kv_gather_degree > 1 and self.sp_degree != self.kv_gather_degree:
+            raise ValueError(
+                f"kv_gather_degree ({self.kv_gather_degree}) must equal "
+                f"sp_degree ({self.sp_degree}); check how many GPUs remain for "
+                "sequence parallelism after dp/tp/cfg"
+            )
+
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
