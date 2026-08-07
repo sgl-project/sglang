@@ -254,6 +254,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        live_prefix_only: bool = False,
     ) -> PageTablePositionsResult:
         return build_page_table_positions(
             req_to_token=req_to_token,
@@ -262,6 +263,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            live_prefix_only=live_prefix_only,
         )
 
     @classmethod
@@ -274,6 +276,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        live_prefix_only: bool = False,
     ) -> PageTablePositionsResult:
         return build_page_table_positions_triton(
             req_to_token=req_to_token,
@@ -282,6 +285,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            live_prefix_only=live_prefix_only,
         )
 
 
@@ -293,6 +297,7 @@ def build_page_table_positions(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    live_prefix_only: bool = False,
 ) -> PageTablePositionsResult:
     seq_lens_casual = seq_lens_casual.to(torch.int32)
     positions_casual = seq_lens_casual - 1
@@ -300,6 +305,22 @@ def build_page_table_positions(
         req_pool_indices_repeated.to(torch.int64), :max_seq_len:page_size
     ]
     page_table = (page_table // page_size).to(torch.int32)
+    if live_prefix_only:
+        # The CUDA path leaves non-live columns undefined. Give the reference
+        # path deterministic values there while preserving the same contract:
+        # only columns below live_pages are consumable.
+        live_pages = torch.clamp(
+            torch.div(
+                torch.clamp(seq_lens_casual, min=0) + page_size - 1,
+                page_size,
+                rounding_mode="floor",
+            ),
+            max=page_table.shape[1],
+        )
+        page_offsets = torch.arange(
+            page_table.shape[1], dtype=torch.int32, device=page_table.device
+        )
+        page_table.masked_fill_(page_offsets[None, :] >= live_pages[:, None], -1)
     swa_topk_lengths = torch.clamp(seq_lens_casual, max=swa_window)
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_casual,
@@ -323,19 +344,37 @@ def _page_table_positions_kernel(
     page_size,
     swa_window,
     BLOCK_P: tl.constexpr,
+    LIVE_PREFIX_ONLY: tl.constexpr,
 ):
     row = tl.program_id(0)
+    page_block = tl.program_id(1)
     seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
-    tl.store(seq_lens_out_ptr + row, seq_len)
-    tl.store(positions_out_ptr + row, seq_len - 1)
-    tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
+
+    # Full-tail launches one column program per row; live-prefix launches a
+    # graph-static column grid whose first program exclusively owns scalars.
+    if (not LIVE_PREFIX_ONLY) or page_block == 0:
+        tl.store(seq_lens_out_ptr + row, seq_len)
+        tl.store(positions_out_ptr + row, seq_len - 1)
+        tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
+
+    page_start = 0
+    page_bound = num_pages
+    if LIVE_PREFIX_ONLY:
+        page_start = page_block * BLOCK_P
+        live_pages = tl.cdiv(tl.maximum(seq_len, 0), page_size)
+        page_bound = tl.minimum(live_pages, num_pages)
+    if page_start >= page_bound:
+        return
 
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
     base = req_to_token_ptr + rp * rt_stride
     out_base = page_table_ptr + row.to(tl.int64) * num_pages
-    for p0 in range(0, num_pages, BLOCK_P):
+    page_end = page_bound
+    if LIVE_PREFIX_ONLY:
+        page_end = tl.minimum(page_start + BLOCK_P, page_bound)
+    for p0 in tl.range(page_start, page_end, BLOCK_P):
         p = p0 + tl.arange(0, BLOCK_P)
-        pmask = p < num_pages
+        pmask = p < page_bound
         tok = tl.load(base + p.to(tl.int64) * page_size, mask=pmask, other=0).to(
             tl.int32
         )
@@ -350,7 +389,15 @@ def build_page_table_positions_triton(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    live_prefix_only: bool = False,
 ) -> PageTablePositionsResult:
+    """Build per-query page tables and position metadata on CUDA.
+
+    ``live_prefix_only`` refreshes only ``ceil(max(seq_len, 0) / page_size)``
+    columns per row. Consumers must bound reads by the corresponding sequence
+    length because the remaining capacity is undefined. The default continues
+    to initialize every page-table column.
+    """
     num_q = seq_lens_casual.shape[0]
     num_pages = (max_seq_len + page_size - 1) // page_size
     device = seq_lens_casual.device
@@ -360,7 +407,7 @@ def build_page_table_positions_triton(
     page_table = torch.empty((num_q, num_pages), dtype=torch.int32, device=device)
     topk_out = torch.empty(num_q, dtype=torch.int32, device=device)
     BLOCK_P = 256
-    _page_table_positions_kernel[(num_q,)](
+    args = (
         req_to_token,
         req_pool_indices_repeated,
         seq_lens_casual,
@@ -372,7 +419,12 @@ def build_page_table_positions_triton(
         num_pages,
         page_size,
         swa_window,
+    )
+    num_page_blocks = max(triton.cdiv(num_pages, BLOCK_P), 1) if live_prefix_only else 1
+    _page_table_positions_kernel[(num_q, num_page_blocks)](
+        *args,
         BLOCK_P=BLOCK_P,
+        LIVE_PREFIX_ONLY=live_prefix_only,
     )
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_out,
