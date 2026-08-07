@@ -16,7 +16,10 @@ from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
     _parse_ui_config,
     create_app,
 )
-from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import decode_message
+from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+    decode_message,
+    encode_message,
+)
 from sglang.multimodal_gen.runtime.realtime.coordinator import (
     CoordinatorRejected,
     SessionAssignment,

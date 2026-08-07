@@ -10,7 +10,6 @@ from sglang.multimodal_gen.runtime.realtime.gateway import (
     AdmissionQueueFull,
     BoundedAdmissionWaiterGate,
     GatewayOutputRegistry,
-    OutputBackpressureError,
     OutputProtocolError,
     build_denoiser_url,
     worker_message_allowed,
@@ -72,17 +71,17 @@ def test_gateway_output_route_is_fenced_ordered_and_bounded():
 
         await route.put(_frame(0, 0))
         await route.put(_frame(0, 1))
-        with pytest.raises(OutputBackpressureError):
-            await route.put(_frame(1, 0))
+        await route.put(_frame(1, 0))
+        assert route.dropped_messages == 1
 
-        assert await route.get() == _frame(0, 0)
+        assert await route.get() == _frame(0, 1)
         route.task_done()
         with pytest.raises(OutputProtocolError, match="stale generation"):
             await route.put(_frame(1, 0, generation="old"))
-        with pytest.raises(OutputProtocolError, match="duplicate"):
+        with pytest.raises(OutputProtocolError, match="stale chunk"):
             await route.put(_frame(0, 1))
 
-        assert await route.get() == _frame(0, 1)
+        assert await route.get() == _frame(1, 0)
         route.task_done()
         await route.join()
 

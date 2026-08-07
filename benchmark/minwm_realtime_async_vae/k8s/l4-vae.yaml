@@ -127,9 +127,9 @@ spec:
             - --dtype=bfloat16
             - --max-sessions=16
             - --queue-depth-per-session=1
-            # Keep VAE-to-browser payloads below ~170ms at 24fps so public
-            # WebSocket playback can smooth jitter without waiting on a full chunk.
-            - --encoded-frames-per-batch=4
+            # Send each encoded preview frame as soon as it is available so
+            # browser playback can smooth jitter without waiting on a mini-batch.
+            - --encoded-frames-per-batch=1
             - --max-message-mb=64
             - --host=0.0.0.0
             - --port=18081

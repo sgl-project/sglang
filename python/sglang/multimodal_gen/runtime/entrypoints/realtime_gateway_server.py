@@ -670,7 +670,7 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("REALTIME_GATEWAY_OUTPUT_URL"),
     )
     parser.add_argument("--output-queue-depth", type=int, default=2)
-    parser.add_argument("--output-enqueue-timeout-s", type=float, default=1.0)
+    parser.add_argument("--output-enqueue-timeout-s", type=float, default=5.0)
     parser.add_argument("--output-drain-timeout-s", type=float, default=5.0)
     parser.add_argument("--lease-renew-interval-s", type=float, default=10.0)
     parser.add_argument("--release-grace-s", type=float, default=0.5)

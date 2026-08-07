@@ -59,8 +59,12 @@ const T2V_FRAME_STEP = Math.max(
 );
 const DEFAULT_T2V_NUM_FRAMES = 9;
 const RECONNECT_CLOSE_TIMEOUT_MS = 15000;
-const DECODE_QUEUE_SECONDS = 0.5;
-const STARTUP_DECODE_QUEUE_SECONDS = 0.75;
+const DECODE_QUEUE_SECONDS = configuredNumber("decodeQueueSeconds", 5);
+const STARTUP_DECODE_QUEUE_SECONDS = configuredNumber("startupDecodeQueueSeconds", 5);
+const MAX_DECODE_QUEUE_BYTES = configuredNumber(
+  "maxDecodeQueueBytes",
+  192 * 1024 * 1024,
+);
 const RECENT_DROP_DISPLAY_MS = 1800;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
 const CONTROL_TRANSITION_FLUSH_DELAY_MS = 50;
@@ -374,6 +378,7 @@ let fpsSamples = [];
 let renderLoopSamples = [];
 let decodeQueue = [];
 let queuedDecodeFrames = 0;
+let queuedDecodeBytes = 0;
 let decodeInProgress = false;
 let pendingDecodeBatches = 0;
 let droppedDecodeFrames = 0;
@@ -456,6 +461,8 @@ const playbackController = new RealtimePlaybackController({
   minTargetLeadMs: 360,
   maxTargetLeadMs: 900,
   lowLatencyMaxLeadFrames: 12,
+  smoothTimelinePlaybackRateMin: 0.85,
+  smoothTimelinePlaybackRateMax: 2.5,
   startLeadChunkRatio: 0.55,
   minStartLeadMs: 260,
   resumeLeadChunkRatio: 0.55,
@@ -801,6 +808,7 @@ function resetStreamStats() {
   clearQueueOnClose = false;
   decodeQueue = [];
   queuedDecodeFrames = 0;
+  queuedDecodeBytes = 0;
   decodeInProgress = false;
   pendingDecodeBatches = 0;
   droppedDecodeFrames = 0;
@@ -961,8 +969,10 @@ function updateStats() {
   const playbackLabel =
     playback.mode === "timeline"
       ? "full timeline"
+      : playback.mode === "smooth_timeline"
+      ? "smooth timeline"
       : playback.mode === "adaptive"
-      ? "adaptive"
+      ? "adaptive input-fast"
       : "low latency";
   const queueParts = [
     playbackLabel,
@@ -970,7 +980,10 @@ function updateStats() {
   ];
   queueParts.push(`q ${playback.queueFrames}`);
   if (playback.buffering && playback.queueFrames) queueParts.push("hold");
-  if (pendingDecodeBatches) queueParts.push(`decode ${pendingDecodeBatches}`);
+  if (pendingDecodeBatches) {
+    queueParts.push(`decode ${pendingDecodeBatches}`);
+    if (queuedDecodeBytes) queueParts.push(`decode-bytes ${formatBytes(queuedDecodeBytes)}`);
+  }
   const now = performance.now();
   if (playback.lastDropAt && now - playback.lastDropAt < RECENT_DROP_DISPLAY_MS) {
     const reason = playback.lastDropReason ? ` ${playback.lastDropReason}` : "";
@@ -1007,7 +1020,7 @@ function syncPlaybackTargetFps() {
 
 function selectedPlaybackMode() {
   const value = $("playbackMode")?.value;
-  if (value === "timeline" || value === "adaptive") return value;
+  if (value === "timeline" || value === "adaptive" || value === "smooth_timeline") return value;
   return "live";
 }
 
@@ -1018,8 +1031,10 @@ function syncPlaybackMode({ addToHistory = true } = {}) {
     const historyText =
       mode === "timeline"
         ? "playback · full timeline (no frame skipping)"
+        : mode === "smooth_timeline"
+        ? "playback · smooth timeline (bounded lag)"
         : mode === "adaptive"
-        ? "playback · adaptive (smooth, bounded lag)"
+        ? "playback · adaptive (buffered, fast input)"
         : "playback · low latency (may skip old frames)";
     addHistory(historyText);
   }
@@ -2718,31 +2733,48 @@ function hasPendingPlaybackInput() {
 
 function enqueueDecodeBatch(header, data, epoch) {
   const frameCount = Number(header.num_frames || 1);
-  decodeQueue.push({ header, data, epoch, frameCount });
+  const payloadBytes = payloadByteLength(data);
+  decodeQueue.push({ header, data, epoch, frameCount, payloadBytes });
   queuedDecodeFrames += frameCount;
+  queuedDecodeBytes += payloadBytes;
   pendingDecodeBatches += 1;
   trimDecodeQueue();
   pumpDecodeQueue();
   updateStats();
 }
 
+function payloadByteLength(data) {
+  if (!data) return 0;
+  return Number(data.byteLength || data.size || data.length || 0);
+}
+
 function trimDecodeQueue() {
-  if (selectedPlaybackMode() === "timeline") return;
   if (recordingActive) return;
   if (!decodeQueue.length) return;
+  const preservesTimeline =
+    selectedPlaybackMode() === "timeline" ||
+    selectedPlaybackMode() === "smooth_timeline";
   const playback = playbackController.snapshot();
   const decodeWindowSeconds = renderedPreviewFrames
     ? Math.max(DECODE_QUEUE_SECONDS, (playback.maxLeadMs || 0) / 1000)
     : STARTUP_DECODE_QUEUE_SECONDS;
-  const maxQueuedFrames = Math.max(
-    2,
-    Math.round(previewPlaybackTargetFps() * decodeWindowSeconds),
-  );
-  while (queuedDecodeFrames > maxQueuedFrames && decodeQueue.length > 1) {
-    const item = decodeQueue[0];
-    if (!isEncodedPreviewContentType(item.header.content_type)) break;
-    decodeQueue.shift();
+  const maxQueuedFrames = preservesTimeline
+    ? Number.POSITIVE_INFINITY
+    : Math.max(
+        2,
+        Math.round(previewPlaybackTargetFps() * decodeWindowSeconds),
+      );
+  while (
+    (queuedDecodeFrames > maxQueuedFrames || queuedDecodeBytes > MAX_DECODE_QUEUE_BYTES) &&
+    decodeQueue.length > 1
+  ) {
+    const dropIndex = decodeQueue.findIndex((item, index) => (
+      index < decodeQueue.length - 1 && canDropQueuedDecodeItem(item)
+    ));
+    if (dropIndex < 0) break;
+    const [item] = decodeQueue.splice(dropIndex, 1);
     queuedDecodeFrames = Math.max(0, queuedDecodeFrames - item.frameCount);
+    queuedDecodeBytes = Math.max(0, queuedDecodeBytes - item.payloadBytes);
     pendingDecodeBatches = Math.max(0, pendingDecodeBatches - 1);
     droppedDecodeFrames += item.frameCount;
     lastDecodeDropAt = performance.now();
@@ -2750,11 +2782,19 @@ function trimDecodeQueue() {
   }
 }
 
+function canDropQueuedDecodeItem(item) {
+  return (
+    item?.header?.content_type === RAW_RGB_CONTENT_TYPE ||
+    isEncodedPreviewContentType(item?.header?.content_type)
+  );
+}
+
 async function pumpDecodeQueue() {
   if (decodeInProgress) return;
   const item = decodeQueue.shift();
   if (!item) return;
   queuedDecodeFrames = Math.max(0, queuedDecodeFrames - item.frameCount);
+  queuedDecodeBytes = Math.max(0, queuedDecodeBytes - item.payloadBytes);
   decodeInProgress = true;
   try {
     await decodeAndEnqueueFrameBatch(item.header, item.data, item.epoch);
@@ -3956,7 +3996,7 @@ async function applyQueryParams() {
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
   const playbackParam = params.get("playback");
-  if (playbackParam === "live" || playbackParam === "timeline" || playbackParam === "adaptive") {
+  if (playbackParam === "live" || playbackParam === "timeline" || playbackParam === "adaptive" || playbackParam === "smooth_timeline") {
     $("playbackMode").value = playbackParam;
   }
   const srParam = params.get("sr");
@@ -4388,6 +4428,8 @@ window.__sglangRealtimeDebug = () => ({
     : [],
   bytes,
   decodeInProgress,
+  queuedDecodeBytes,
+  queuedDecodeFrames,
   decodeQueueLength: decodeQueue.length,
   droppedDecodeFrames,
   frames,

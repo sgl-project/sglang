@@ -78,13 +78,43 @@ assert.match(
 );
 assert.match(
   indexHtml,
-  /<option value="adaptive" selected>Adaptive \(smooth, bounded lag\)<\/option>/,
-  "webui should expose adaptive playback as the default smooth low-lag mode",
+  /<input id="size" value="1280x704" \/>/,
+  "webui should default to the 720p-ish realtime profile",
+);
+assert.match(
+  indexHtml,
+  /<span class="stage-stat">output <b id="outputSizeText">1280x704<\/b><\/span>/,
+  "webui should show the default output size before the first server response",
+);
+assert.match(
+  indexHtml,
+  /<option value="adaptive">Adaptive \(buffered, fast input\)<\/option>/,
+  "webui should keep adaptive playback available",
+);
+assert.match(
+  indexHtml,
+  /<option value="smooth_timeline" selected>Smooth timeline \(catch-up, no skip\)<\/option>/,
+  "webui should default to the no-skip catch-up timeline mode for smoother playback",
 );
 assert.match(
   appJs,
-  /playbackParam === "live" \|\| playbackParam === "timeline" \|\| playbackParam === "adaptive"/,
-  "webui should accept playback=adaptive from the URL",
+  /playbackParam === "live" \|\| playbackParam === "timeline" \|\| playbackParam === "adaptive" \|\| playbackParam === "smooth_timeline"/,
+  "webui should accept playback=adaptive and playback=smooth_timeline from the URL",
+);
+assert.match(
+  appJs,
+  /const preservesTimeline[\s\S]*selectedPlaybackMode\(\) === "timeline"[\s\S]*selectedPlaybackMode\(\) === "smooth_timeline"/,
+  "webui should avoid browser decode drops in smooth timeline except at the byte cap",
+);
+assert.match(
+  appJs,
+  /const DECODE_QUEUE_SECONDS\s*=\s*configuredNumber\("decodeQueueSeconds", 5\);/,
+  "webui should default to a browser-side decode queue that drains the backend websocket",
+);
+assert.match(
+  appJs,
+  /const MAX_DECODE_QUEUE_BYTES\s*=\s*configuredNumber\([\s\S]*192 \* 1024 \* 1024/,
+  "webui should bound browser-side decode buffering by bytes",
 );
 assert.match(
   appJs,
@@ -140,6 +170,11 @@ assert.match(
   appJs,
   /maxDeliveryLeadBoostMs:\s*360/,
   "webui should bound adaptive jitter buffering",
+);
+assert.match(
+  appJs,
+  /smoothTimelinePlaybackRateMax:\s*2\.5/,
+  "smooth timeline should catch up quickly without dropping old backlog",
 );
 assert.match(
   appJs,

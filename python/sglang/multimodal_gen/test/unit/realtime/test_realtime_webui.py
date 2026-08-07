@@ -50,8 +50,10 @@ def test_realtime_webui_supports_explicit_minwm_t2v_sessions():
     assert 'id="referenceSection"' in index_html
     assert 'id="t2vFrameHint"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "playback_controller.js?v=realtime-playback-v22" in index_html
-    assert "app.js?v=realtime-production-gateway-v8" in index_html
+    assert "playback_controller.js?v=realtime-playback-v28" in index_html
+    assert "app.js?v=realtime-production-gateway-v17" in index_html
+    assert 'id="size" value="1280x704"' in index_html
+    assert '<option value="smooth_timeline" selected>' in index_html
     assert "UI_CONFIG.generationModes" in app_js
     assert "UI_CONFIG.generationMode" in app_js
     assert "CONFIGURED_DEFAULT_GENERATION_MODE" in app_js
@@ -120,7 +122,7 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert 'id="steps" type="number" value="4"' in index_html
     assert 'id="guidance" type="number" value="1"' in index_html
     assert "styles.css?v=realtime-t2v-dump-trace-v1" in index_html
-    assert "app.js?v=realtime-production-gateway-v8" in index_html
+    assert "app.js?v=realtime-production-gateway-v17" in index_html
     assert 'const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";' in app_js
     assert 'const DEFAULT_TARGET_FPS = configuredNumber("targetFps", 24);' in app_js
     assert 'const DEFAULT_PREVIEW_MAX_WIDTH = configuredNumber("previewMaxWidth", 832);' in app_js

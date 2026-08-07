@@ -135,6 +135,7 @@ class GatewayOutputRoute:
     _chunk_completed: dict[int, asyncio.Event] = field(
         default_factory=dict, init=False
     )
+    dropped_messages: int = field(default=0, init=False)
     bound: bool = field(default=False, init=False)
     closed: bool = field(default=False, init=False)
 
@@ -187,14 +188,7 @@ class GatewayOutputRoute:
             )
             if completed.is_set():
                 raise OutputProtocolError("duplicate completion")
-            try:
-                await asyncio.wait_for(
-                    self._queue.put(wire), timeout=self.enqueue_timeout_s
-                )
-            except TimeoutError as exc:
-                raise OutputBackpressureError(
-                    "Gateway output queue remained full"
-                ) from exc
+            await self._put_with_bounded_drop(wire)
             completed.set()
             return
 
@@ -210,14 +204,7 @@ class GatewayOutputRoute:
                 raise OutputProtocolError("duplicate frame batch")
         elif frame_batch_index != 0:
             raise OutputProtocolError("new chunk must start at frame batch zero")
-        try:
-            await asyncio.wait_for(
-                self._queue.put(wire), timeout=self.enqueue_timeout_s
-            )
-        except TimeoutError as exc:
-            raise OutputBackpressureError(
-                "Gateway output queue remained full"
-            ) from exc
+        await self._put_with_bounded_drop(wire)
         self._last_chunk_index = chunk_index
         self._last_frame_batch_index = frame_batch_index
         self._seen_chunks.add(chunk_index)
@@ -225,6 +212,43 @@ class GatewayOutputRoute:
             self._chunk_completed.setdefault(
                 chunk_index, asyncio.Event()
             ).set()
+
+    async def _put_with_bounded_drop(self, wire: bytes) -> None:
+        try:
+            await asyncio.wait_for(
+                self._queue.put(wire), timeout=self.enqueue_timeout_s
+            )
+            return
+        except TimeoutError:
+            pass
+
+        # A slow browser/network path should not tear down the model session.
+        # Keep Gateway memory bounded by discarding the oldest unsent message and
+        # enqueueing the newest data after the timeout budget is exhausted.
+        while self._queue.full():
+            self._drop_oldest_queued_message()
+        try:
+            self._queue.put_nowait(wire)
+        except asyncio.QueueFull as exc:
+            raise OutputBackpressureError(
+                "Gateway output queue remained full"
+            ) from exc
+
+    def _drop_oldest_queued_message(self) -> None:
+        try:
+            dropped = self._queue.get_nowait()
+        except asyncio.QueueEmpty as exc:
+            raise OutputBackpressureError(
+                "Gateway output queue remained full"
+            ) from exc
+        if dropped is None:
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+            raise OutputRouteClosed("output route is closed")
+        self._queue.task_done()
+        self.dropped_messages += 1
 
     async def get(self) -> bytes:
         wire = await self._queue.get()
