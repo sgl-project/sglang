@@ -721,6 +721,12 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # Raise if Triton loads a kernel after the engine starts serving. This
+    # verifies that startup warmup covers every kernel specialization used at
+    # serving time.
+    SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
+    SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
+    SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
