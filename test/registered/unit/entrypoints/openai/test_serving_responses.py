@@ -660,5 +660,40 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         self.assertIsNotNone(msg)
 
 
+class ExplicitThinkingEffortTestCase(unittest.TestCase):
+    """reasoning.effort is the only way to ask for thinking on this endpoint:
+    chat_template_kwargs is not part of the Responses request, so gating
+    explicit-thinking parsers on it left the template thinking with the
+    detector switched off, and the transcript plus the close tag reached the
+    client as the answer."""
+
+    def _enabled(self, effort, mode="explicit_thinking"):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-v4"
+        serving.template_manager.force_reasoning = False
+        serving.template_manager.reasoning_config = None
+        serving._reasoning_detector = Mock(reasoning_default=mode)
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            reasoning={"effort": effort} if effort is not None else None,
+        )
+        return serving._is_thinking_enabled_for_request(request)
+
+    def test_effort_enables_thinking(self):
+        for effort in ("low", "medium", "high"):
+            self.assertTrue(self._enabled(effort), effort)
+
+    def test_no_effort_leaves_thinking_off(self):
+        self.assertFalse(self._enabled(None))
+
+    def test_effort_none_leaves_thinking_off(self):
+        self.assertFalse(self._enabled("none"))
+
+    def test_explicit_enable_thinking_mode_matches(self):
+        self.assertTrue(self._enabled("medium", mode="explicit_enable_thinking"))
+        self.assertFalse(self._enabled(None, mode="explicit_enable_thinking"))
+
+
 if __name__ == "__main__":
     unittest.main()
