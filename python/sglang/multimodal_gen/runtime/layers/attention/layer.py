@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ipc_input_a2a_qkv,
+    _ring_attention_varlen,
     _usp_input_all_to_all,
     _usp_input_all_to_all_qkv,
     _usp_input_all_to_all_varlen,
@@ -962,8 +963,15 @@ class USPAttention(nn.Module):
                     ).transpose(1, 2)
 
             if get_ring_parallel_world_size() > 1:
+                if (
+                    meta_only_pad
+                    and q.shape[0] == 1
+                    and self.backend == AttentionBackendEnum.FA
+                ):
+                    return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
                 raise NotImplementedError(
-                    "USPAttention masked path does not support ring parallelism yet."
+                    "USPAttention masked path supports ring parallelism only "
+                    "for batch-1 tail-pad metadata on the FA backend."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
@@ -1189,6 +1197,32 @@ class USPAttention(nn.Module):
             out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
+
+    def _forward_ring_tail_pad(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask_meta: dict,
+    ) -> torch.Tensor:
+        """Ring attention for a tail-padded shard.
+
+        After the Ulysses all-to-all each ring rank holds one contiguous block
+        of the gathered sequence, and the tail-pad invariant keeps all padding
+        at the global tail — exactly the ring kernel's real-length clamp, so
+        no masks or repacking are needed. Pad rows receive garbage output,
+        which the tail-pad consumers already trim.
+        """
+        q, k, v = _usp_input_all_to_all_qkv(q, k, v)
+        out = _ring_attention_varlen(
+            q.squeeze(0),
+            k.squeeze(0),
+            v.squeeze(0),
+            softmax_scale=self.softmax_scale,
+            real_seq_len=int(attn_mask_meta["pad_start"]),
+            ring_ws=get_ring_parallel_world_size(),
+        )
+        return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
 
     @staticmethod
     def _gather_sharded_sequence(
