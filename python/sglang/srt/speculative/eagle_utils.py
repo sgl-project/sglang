@@ -742,15 +742,10 @@ def eagle_sample(
 
         if _is_npu:
             from sgl_kernel_npu.sample import (
-                chain_speculative_sampling_rejection,
-                top_k_top_p_renorm_probs,
+                chain_speculative_sampling_triton,
+                top_k_renorm_prob,
+                top_p_renorm_prob,
                 tree_speculative_sampling_target_only,
-            )
-
-            sampling_fn = (
-                chain_speculative_sampling_rejection
-                if use_rejection_sampling
-                else tree_speculative_sampling_target_only
             )
         else:
             from sgl_kernel import (
@@ -763,57 +758,38 @@ def eagle_sample(
                 chain_speculative_sampling_triton,
             )
 
-            sampling_fn = (
-                chain_speculative_sampling_triton
-                if use_rejection_sampling
-                else tree_speculative_sampling_target_only
-            )
+        sampling_fn = (
+            chain_speculative_sampling_triton
+            if use_rejection_sampling
+            else tree_speculative_sampling_target_only
+        )
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        sampling_logits = next_token_logits.float() if _is_npu else next_token_logits
         target_probs = F.softmax(
-            sampling_logits / expanded_temperature, dim=-1
+            next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
 
-        if _is_npu:
-            target_probs = top_k_top_p_renorm_probs(
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, verify_input.draft_token_num, dim=0
                 ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, verify_input.draft_token_num, dim=0
                 ),
-                sampling_info.need_top_k_sampling,
-                sampling_info.need_top_p_sampling,
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after renorm")
-        else:
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -831,10 +807,6 @@ def eagle_sample(
                 "distribution; the current speculative algorithm/draft worker "
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
-
-        if _is_npu:
-            target_probs = target_probs.contiguous()
-            draft_probs = draft_probs.float().contiguous()
 
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
