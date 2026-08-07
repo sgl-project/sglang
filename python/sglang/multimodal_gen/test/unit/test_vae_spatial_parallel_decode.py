@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
     SpatialParallelConv3d,
+    _can_fuse_causal_conv3d_cat_pad,
     chunk_height_by_sizes,
     split_for_parallel_decode,
 )
@@ -74,6 +75,19 @@ class _DispatchProbeVAE(ParallelTiledVAE):
         raise AssertionError(
             "spatial_shard decode should not use parallel_tiled_decode"
         )
+
+
+class _FakeCudaTensor:
+    def __init__(self, shape, dtype=torch.float16):
+        self.shape = shape
+        self.dtype = dtype
+        self.is_cuda = True
+
+    def dim(self):
+        return len(self.shape)
+
+    def is_contiguous(self):
+        return True
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
@@ -289,6 +303,18 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(rank0.shape[-2], 6)
         self.assertEqual(rank1.shape[-2], 4)
         torch.testing.assert_close(torch.cat([rank0, rank1], dim=-2), x)
+
+    def test_causal_conv3d_fusion_disabled_on_non_cuda_platform(self):
+        x = _FakeCudaTensor((1, 2, 3, 4, 4))
+        cache_x = _FakeCudaTensor((1, 2, 1, 4, 4))
+
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.parallel_conv.current_platform.is_cuda",
+            return_value=False,
+        ):
+            self.assertFalse(
+                _can_fuse_causal_conv3d_cat_pad(x, cache_x, [1, 1, 1, 1, 1, 0])
+            )
 
     def test_qwen_decoder_uses_spatial_parallel_components(self):
         with (
