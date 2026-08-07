@@ -759,6 +759,25 @@ def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
         )
 
 
+def test_kimi_k3_does_not_defer_empty_image_batch():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
+        assert not processor._should_defer_gpu_preprocessing([])
+
+
+def test_kimi_k3_eager_preprocessing_preserves_float_tensor_support():
+    from sglang.srt.multimodal.processors.kimi_k3 import _k3_to_cuda_chw
+
+    image = torch.zeros((1, 4, 4), dtype=torch.float32)
+    with patch.object(torch.Tensor, "cuda", lambda self: self):
+        output = _k3_to_cuda_chw(image)
+
+    assert output.dtype == torch.float32
+    assert output.shape == (3, 4, 4)
+
+
 @pytest.mark.parametrize("transport", ["cuda_ipc", "fabric"])
 def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
     processor = object.__new__(KimiK3ImageProcessor)

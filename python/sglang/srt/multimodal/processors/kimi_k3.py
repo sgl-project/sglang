@@ -138,7 +138,15 @@ def _expand_k3_image_prompt_text(
 
 
 def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
-    return to_chw_uint8(image, device="cuda")
+    if isinstance(image, Image.Image):
+        return to_chw_uint8(image, device="cuda")
+
+    image = image.cuda()
+    if image.dim() == 2:
+        image = image.unsqueeze(0)
+    if image.shape[0] == 1:
+        image = image.repeat(3, 1, 1)
+    return image
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
@@ -309,7 +317,8 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         if (
-            self.mm_feature_transport != "cpu"
+            not images
+            or self.mm_feature_transport != "cpu"
             or not is_cuda()
             or not all(
                 isinstance(image, Image.Image)
