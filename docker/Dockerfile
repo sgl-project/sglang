@@ -811,7 +811,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
-ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
+ENV PATH="/root/.cargo/bin:${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
