@@ -21,12 +21,10 @@ fused TileLang kernels (``mhc_pre`` / ``mhc_post``) for performance.
 from __future__ import annotations
 
 import logging
-from typing import Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 
 import torch
 from torch import nn
-
-import sglang.srt.models.deepseek_v2 as deepseek_v2
 
 # Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
 # so that torch.compile can trace through the mHC module. Without registration,
@@ -46,6 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models import deepseek_v2
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -311,11 +310,11 @@ class TeleChat4DecoderLayer(nn.Module):
         self,
         config: TeleChat4Config,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        moe_quant_config_override: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
+        moe_quant_config_override: QuantizationConfig | None = None,
         is_nextn: bool = False,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
     ) -> None:
@@ -344,7 +343,7 @@ class TeleChat4DecoderLayer(nn.Module):
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
         v_head_dim = getattr(config, "v_head_dim", 0)
         kv_lora_rank = getattr(config, "kv_lora_rank", 0)
-        is_v32 = hasattr(config, "index_topk")
+        hasattr(config, "index_topk")
         use_mha = config.model_type == "deepseek" or all(
             dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
         )
@@ -450,13 +449,13 @@ class TeleChat4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         zero_allocator,
         gemm_output_zero_allocator=None,
-        llama_4_scaling: Optional[torch.Tensor] = None,
-        prev_topk_indices: Optional[torch.Tensor] = None,
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
-        next_full_attention_layer_id: Optional[int] = None,
+        llama_4_scaling: torch.Tensor | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
+        captured_last_layer_outputs: list[torch.Tensor] | None = None,
+        next_full_attention_layer_id: int | None = None,
     ) -> torch.Tensor:
         if self.enable_mhc and not self.is_mtp_layer:
             S = hidden_states.shape[0]
@@ -640,20 +639,20 @@ class TeleChat4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         zero_allocator,
-        tbo_subbatch_index: Optional[int] = None,
+        tbo_subbatch_index: int | None = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
         state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                zero_allocator=zero_allocator,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
+            {
+                "forward_batch": forward_batch,
+                "positions": positions,
+                "zero_allocator": zero_allocator,
+                "tbo_subbatch_index": tbo_subbatch_index,
+            }
         )
 
     def op_comm_prepare_mlp(self, state):
@@ -672,14 +671,14 @@ class TeleChat4DecoderLayer(nn.Module):
             state.forward_batch,
         )
 
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
+        output = {
+            "positions": state.positions,
+            "hidden_states": hidden_states,
+            "residual": residual,
+            "forward_batch": state.forward_batch,
+            "zero_allocator": state.zero_allocator,
+            "tbo_subbatch_index": state.tbo_subbatch_index,
+        }
 
         state.clear(
             expect_keys={
@@ -696,7 +695,7 @@ class TeleChat4Model(nn.Module):
     def __init__(
         self,
         config: TeleChat4Config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -745,11 +744,11 @@ class TeleChat4Model(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> torch.Tensor:
         if self.pp_group.is_first_rank:
             if input_embeds is not None:
@@ -773,7 +772,6 @@ class TeleChat4Model(nn.Module):
             hidden_states = input_expand(hidden_states, n_streams)
 
         residual = None
-        topk_indices = None
 
         from sglang.srt.utils import BumpAllocator
 
@@ -788,7 +786,7 @@ class TeleChat4Model(nn.Module):
         for layer in self.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            hidden_states, residual, topk_indices = layer(
+            hidden_states, residual, _topk_indices = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
@@ -815,7 +813,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def __init__(
         self,
         config: TeleChat4Config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -886,7 +884,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.communicator import get_attn_tp_context
 
@@ -902,7 +900,7 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         else:
             return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], is_nextn=False):
         processed_weights = []
         hc_weights = []
 
