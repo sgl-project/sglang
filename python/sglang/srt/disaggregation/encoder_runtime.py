@@ -465,17 +465,30 @@ class DPDispatcher:
         self._metadata_counter += 1
         return key
 
+    @staticmethod
+    def _pending_req_info(key: str) -> Tuple[str, str]:
+        marker_index, dp_type = max(
+            (
+                (key.rfind("_send_"), "send"),
+                (key.rfind("_metadata_"), "wait_metadata"),
+                (key.rfind("_register_"), "register_destinations"),
+            ),
+            key=lambda item: item[0],
+        )
+        if marker_index >= 0:
+            return key[:marker_index], dp_type
+        return key, "encode"
+
     def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
         # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
         pending = self.pending_futures[rank]
         for key, future in list(pending.items()):
             if not future.done():
-                # /send keys are _send_req_key's shape; the rest are req_id.
-                marker = key.rfind("_send_")
+                req_id, dp_type = self._pending_req_info(key)
                 future.set_result(
                     {
-                        "req_id": key[:marker] if marker >= 0 else key,
-                        "_dp_type": "send" if marker >= 0 else "encode",
+                        "req_id": req_id,
+                        "_dp_type": dp_type,
                         "content": None,
                         "_error": reason,
                         "_error_type": error_type,
