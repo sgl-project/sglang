@@ -21,12 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -429,7 +429,7 @@ def _forward_with_allreduce_fusion_quant_per_token(
     return (fp8_out, scale_out), residual_out
 
 
-class RMSNorm(MultiPlatformOp):
+class RMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -863,7 +863,7 @@ class RMSNorm(MultiPlatformOp):
         )
 
 
-class LayerNorm(MultiPlatformOp):
+class LayerNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -947,7 +947,7 @@ class LayerNorm(MultiPlatformOp):
             return self.forward_native(x)
 
 
-class GemmaRMSNorm(MultiPlatformOp):
+class GemmaRMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
@@ -1107,6 +1107,16 @@ class GemmaRMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
 
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # sgl_kernel's gemma norm ops are built for MUSA (see the import gate
+        # above); opt into the CUDA-path implementation explicitly.
+        return self._forward_impl(x, residual, post_residual_addition)
+
     def forward_with_allreduce_fusion(
         self,
         x: torch.Tensor,
@@ -1161,7 +1171,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         )
 
 
-class Gemma3RMSNorm(MultiPlatformOp):
+class Gemma3RMSNorm(BaseFusedOp):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -1200,6 +1210,10 @@ class Gemma3RMSNorm(MultiPlatformOp):
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
 
+    def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x, residual)
+
     def forward_hip(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma_rmsnorm/gemma_fused_add_rmsnorm are not available on
         # ROCm; delegate to the pure-PyTorch implementation.
@@ -1215,7 +1229,7 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-class Gemma4RMSNorm(MultiPlatformOp):
+class Gemma4RMSNorm(BaseFusedOp):
     def __init__(
         self,
         dim: int,
@@ -1287,13 +1301,17 @@ class Gemma4RMSNorm(MultiPlatformOp):
             out = rmsnorm(x, self.weight.data, self.eps)
         return out
 
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
+        return self.forward_cuda(x)
+
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
 
 
-class RMSNormWithoutScale(MultiPlatformOp):
+class RMSNormWithoutScale(BaseFusedOp):
     def __init__(self, hidden_size: int, eps=1e-6):
         super().__init__()
         self.hidden_size = hidden_size

@@ -219,6 +219,74 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     )
 
 
+# FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
+_FLASHINFER_MHC_PRE_SPLITS = (1, 2, 4, 8, 16)
+
+
+@functools.cache
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _flashinfer_mhc_pre_num_splits(num_tokens: int, hc_hidden_size: int) -> int:
+    block_m = block_k = 64
+    grid_m = (num_tokens + block_m - 1) // block_m
+    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    raw = max(1, min(_cuda_sm_count() // max(grid_m, 1), num_block_k // 4))
+    best = 1
+    for split in _FLASHINFER_MHC_PRE_SPLITS:
+        if split <= raw:
+            best = split
+    return best
+
+
+def _flashinfer_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from flashinfer.mhc import mhc_pre_big_fuse
+
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+    num_tokens, hc_mult, hidden_size = x.shape
+    hc_hidden_size = hc_mult * hidden_size
+    mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
+    n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+
+    dot_mix = torch.empty(
+        (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
+    )
+    sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=x.device)
+    tf32_hc_prenorm_gemm(
+        x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
+    )
+    if n_splits == 1:
+        dot_mix = dot_mix.squeeze(0)
+        sqrsum = sqrsum.squeeze(0)
+
+    post, comb, layer_input = mhc_pre_big_fuse(
+        dot_mix,
+        sqrsum,
+        x,
+        hc_scale,
+        hc_base,
+        hc_hidden_size,
+        rms_eps=rms_eps,
+        mhc_pre_eps=hc_eps,
+        mhc_sinkhorn_eps=hc_eps,
+        mhc_post_mult_value=_MHC_POST_MULT_VALUE,
+        sinkhorn_repeat=sinkhorn_iters,
+        num_splits=n_splits,
+    )
+    return layer_input, post.squeeze(-1), comb
+
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
@@ -1513,6 +1581,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+            y, post, comb = _flashinfer_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
+            return y, post, comb, False
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
@@ -1605,6 +1685,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+            from flashinfer.mhc import mhc_post
+
+            return mhc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_post
