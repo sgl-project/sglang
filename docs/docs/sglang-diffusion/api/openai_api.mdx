@@ -70,6 +70,10 @@ The server implements an OpenAI-compatible Images API under the `/v1/images` nam
 
 **Endpoint:** `POST /v1/images/generations`
 
+#### Request quality
+
+`quality` selects a model-owned sampling level when that model advertises one: use `lossless` for the reference path or `high` for a validated accelerated path. Omit it (or send OpenAI's default `auto`) to keep the runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
+
 **Python Example (b64_json response):**
 
 ```python Python

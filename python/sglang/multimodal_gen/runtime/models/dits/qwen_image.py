@@ -768,7 +768,9 @@ class QwenImageCrossAttention(nn.Module):
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
         seg_qkv = None
-        if sp_text_sharded:
+        # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
+        # the join_seqs path and exchanges inside the attention instead.
+        if sp_text_sharded and self.attn.sp_attention_mode == "ulysses":
             from sglang.multimodal_gen.runtime.layers.usp import (
                 _ipc_input_a2a_qkv_segmented,
             )

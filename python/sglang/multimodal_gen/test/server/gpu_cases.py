@@ -457,7 +457,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             modality="video",
             num_gpus=1,
             extras=[
-                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup false"
+                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
             ],
             text_encoder_cpu_offload=True,
         ),
@@ -897,7 +897,6 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--component-attention-backends transformer=fa",
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
@@ -933,14 +932,12 @@ TWO_GPU_CASES = [
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2I_sampling_params.prompt,
@@ -1146,6 +1143,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_ipc_a2a_2_gpu.py",
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py",
     ],
 }
 
@@ -1184,6 +1182,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
         # one capture plus three replays on a 32K-element exchange
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
+        # two SDPA parity checks on 128+6 rows
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
     },
 }
 

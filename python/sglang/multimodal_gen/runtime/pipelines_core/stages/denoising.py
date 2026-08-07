@@ -358,7 +358,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if (
             not args.enable_torch_compile
             or not args.offload_during_compile
-            or not args.warmup
+            or args.warmup_mode == "off"
             or not self._owns_compile_warmup_lifecycle()
             or args.use_fsdp_inference
             or self._cache_dit_requested()
