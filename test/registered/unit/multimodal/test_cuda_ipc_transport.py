@@ -13,7 +13,7 @@ import unittest
 
 import torch
 
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     _pool_handle_cache_clear,
 )

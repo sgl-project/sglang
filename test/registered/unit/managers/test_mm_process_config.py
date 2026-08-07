@@ -283,16 +283,16 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
 class TestFabricTransportMetadata(CustomTestCase):
     def test_consumer_slot_uses_global_tp_rank(self):
-        from sglang.srt.utils.mm_gpu_memory_pool import resolve_consumer_rank
+        from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
 
         parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
         with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
             self.assertEqual(resolve_consumer_rank(8), 6)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):
-        from sglang.srt.utils import fabric_mm_transport, mm_gpu_memory_pool
+        from sglang.srt.multimodal.transport import fabric, memory_pool
 
-        proxy = fabric_mm_transport.FabricTensorTransportProxy(
+        proxy = fabric.FabricTensorTransportProxy(
             fabric_handle=b"h" * 64,
             allocation_size=1 << 20,
             data_byte_offset=4096,
@@ -304,7 +304,7 @@ class TestFabricTransportMetadata(CustomTestCase):
             generation=3,
             total_consumer_count=4,
         )
-        with patch.object(mm_gpu_memory_pool, "stream_write_value32") as write:
+        with patch.object(memory_pool, "stream_write_value32") as write:
             proxy._acknowledge_on_stream(1000, 0, consumer_count=4)
 
         self.assertEqual(
@@ -314,13 +314,15 @@ class TestFabricTransportMetadata(CustomTestCase):
         self.assertEqual([call.args[2] for call in write.call_args_list], [3] * 4)
 
     def test_consumer_rank_must_fit_pool_ack_slots(self):
-        from sglang.srt.utils.mm_gpu_memory_pool import resolve_consumer_rank
+        from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
 
         with self.assertRaisesRegex(RuntimeError, "outside"):
             resolve_consumer_rank(4, consumer_rank=4)
 
     def test_reused_pool_slot_gets_new_generation(self):
-        from sglang.srt.utils.mm_gpu_memory_pool import StreamOrderedMmFeaturePool
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
 
         pool = object.__new__(StreamOrderedMmFeaturePool)
         pool._available_ranges = [(256, 4096)]

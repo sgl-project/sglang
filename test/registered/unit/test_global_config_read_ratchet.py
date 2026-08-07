@@ -29,7 +29,7 @@ What legitimately remains:
     property would demand the group either way.
   - ``allocation.dcp_size`` asks whether DCP was *configured*; the live property
     reads ``get_dcp_group()``, and that group is only installed when DCP is on.
-  - ``cuda_ipc_transport_utils.tp_size`` runs in the tokenizer process, which has
+  - ``multimodal/transport/cuda_ipc.tp_size`` runs in the tokenizer process, which has
     no groups at all (the call site already guards for "not published yet").
   - ``dp_attention.attn_cp_size`` / ``moe_dp_size``: the configuration the
     predicate detects (``attn_cp_size > moe_dp_size``) is the one where
@@ -77,7 +77,7 @@ _CONFIG_INTENT_SIZES = frozenset(
         ("srt/layers/dp_attention.py", "moe_dp_size"),
         ("srt/mem_cache/allocation.py", "dcp_size"),
         ("srt/model_loader/loader.py", "moe_dp_size"),
-        ("srt/utils/cuda_ipc_transport_utils.py", "tp_size"),
+        ("srt/multimodal/transport/cuda_ipc.py", "tp_size"),
     }
 )
 
