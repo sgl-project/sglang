@@ -10,10 +10,12 @@ import multiprocessing as mp
 import queue
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     _pool_handle_cache_clear,
 )
@@ -119,6 +121,21 @@ class TestCudaIpcTransport(CustomTestCase):
                     producer.terminate()
                     producer.join(timeout=10)
             self.assertEqual(producer.exitcode, 0)
+
+    def test_uncached_mapping_waits_before_proxy_release(self):
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        proxy.proxy_state = {"ipc_extra": {"use_pool_handle_cache": False}}
+        proxy._pool_storage = None
+        stream = Mock()
+
+        with patch(
+            "sglang.srt.multimodal.transport.cuda_ipc.torch.cuda.current_stream",
+            return_value=stream,
+        ):
+            proxy._retain_storage_until_stream_completes(object(), 0)
+
+        stream.synchronize.assert_called_once_with()
+        self.assertIsNone(proxy._pool_storage)
 
 
 if __name__ == "__main__":
