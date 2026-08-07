@@ -289,7 +289,28 @@ def parse_output_message(message: Message):
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
-        if message.recipient.startswith("functions."):
+        if recipient is None:
+            # A preamble: user-visible text the model emits before calling a
+            # tool. Same item type as a final answer.
+            contents = [
+                ResponseOutputText(
+                    text=content.text,
+                    annotations=[],  # TODO
+                    type="output_text",
+                    logprobs=None,  # TODO
+                )
+                for content in message.content
+            ]
+            output_items.append(
+                ResponseOutputMessage(
+                    id=f"msg_{random_uuid()}",
+                    content=contents,
+                    role=message.author.role,
+                    status="completed",
+                    type="message",
+                )
+            )
+        elif message.recipient.startswith("functions."):
             function_name = message.recipient.split(".")[-1]
             for content in message.content:
                 random_id = random_uuid()

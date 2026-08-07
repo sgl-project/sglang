@@ -660,5 +660,73 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         self.assertIsNotNone(msg)
 
 
+class HarmonyPreambleTestCase(unittest.TestCase):
+    """A Harmony preamble is an assistant message on the `commentary` channel
+    with no recipient -- user-visible text the model emits before calling a
+    tool. `parse_output_message` assumed every commentary message was a tool
+    call and dereferenced `recipient`, so a preamble raised AttributeError.
+    """
+
+    @staticmethod
+    def _commentary(*texts, recipient=None):
+        from openai_harmony import Message, Role, TextContent
+
+        msg = Message.from_role_and_contents(
+            Role.ASSISTANT, [TextContent(text=t) for t in texts]
+        ).with_channel("commentary")
+        return msg.with_recipient(recipient) if recipient else msg
+
+    def test_preamble_becomes_a_message_item(self):
+        from openai.types.responses import ResponseOutputMessage
+
+        from sglang.srt.entrypoints.harmony_utils import parse_output_message
+
+        items = parse_output_message(self._commentary("Let me check the weather."))
+
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertIsInstance(item, ResponseOutputMessage)
+        self.assertEqual(item.type, "message")
+        self.assertEqual(item.role, "assistant")
+        self.assertEqual(item.status, "completed")
+        self.assertEqual(len(item.content), 1)
+        self.assertEqual(item.content[0].type, "output_text")
+        self.assertEqual(item.content[0].text, "Let me check the weather.")
+        self.assertEqual(item.content[0].annotations, [])
+
+    def test_preamble_preserves_every_content_block_in_order(self):
+        from sglang.srt.entrypoints.harmony_utils import parse_output_message
+
+        items = parse_output_message(self._commentary("First. ", "Second."))
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual([c.text for c in items[0].content], ["First. ", "Second."])
+
+    def test_function_call_is_still_a_tool_call(self):
+        from openai.types.responses.response_function_tool_call import (
+            ResponseFunctionToolCall,
+        )
+
+        from sglang.srt.entrypoints.harmony_utils import parse_output_message
+
+        items = parse_output_message(
+            self._commentary('{"location": "Paris"}', recipient="functions.get_weather")
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertIsInstance(items[0], ResponseFunctionToolCall)
+        self.assertEqual(items[0].name, "get_weather")
+
+    def test_python_tool_call_is_still_reasoning(self):
+        from openai.types.responses import ResponseReasoningItem
+
+        from sglang.srt.entrypoints.harmony_utils import parse_output_message
+
+        items = parse_output_message(self._commentary("print(1)", recipient="python"))
+
+        self.assertEqual(len(items), 1)
+        self.assertIsInstance(items[0], ResponseReasoningItem)
+
+
 if __name__ == "__main__":
     unittest.main()
