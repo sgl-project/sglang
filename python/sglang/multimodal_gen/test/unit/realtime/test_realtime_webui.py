@@ -159,6 +159,10 @@ def test_realtime_webui_presets_do_not_emit_camera_scripts():
     assert app_js.index("Dragon Dolly") < app_js.index("Kid A")
     assert "dragon-ride.jpg" in app_js
     assert 'referenceUrl: "./assets/dragon-ride.jpg"' in app_js
+    assert "function createPresetThumbFallback" in app_js
+    assert "thumb.onerror = () => thumb.replaceWith(createPresetThumbFallback(preset))" in app_js
+    assert "reference image unavailable" in app_js
+    assert ".preset-thumb-fallback" in styles_css
     assert (
         repo_root
         / "python/sglang/multimodal_gen/apps/realtime_webui/assets/dragon-ride.jpg"

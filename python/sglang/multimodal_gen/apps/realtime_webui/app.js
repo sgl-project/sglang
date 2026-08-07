@@ -3088,6 +3088,13 @@ function drawReferencePreviewFromImageSource(src, label) {
     if (src.startsWith("blob:")) URL.revokeObjectURL(src);
   };
   img.onerror = () => {
+    previewCtx.fillStyle = "#11140f";
+    previewCtx.fillRect(0, 0, preview.width, preview.height);
+    previewCtx.fillStyle = "#8c9288";
+    previewCtx.font = "14px ui-sans-serif, Avenir Next, Helvetica Neue, sans-serif";
+    previewCtx.textAlign = "center";
+    previewCtx.textBaseline = "middle";
+    previewCtx.fillText("reference image unavailable", preview.width / 2, preview.height / 2);
     if (src.startsWith("blob:")) URL.revokeObjectURL(src);
   };
   img.src = src;
@@ -3873,10 +3880,34 @@ function renderPresets() {
     const btn = document.createElement("button");
     btn.className = "preset";
     btn.dataset.tone = preset.tone;
-    btn.innerHTML = `<img class="preset-thumb" src="${preset.referenceUrl}" alt="" loading="lazy" /><b>${preset.name}</b><span>${preset.source} · ${preset.size} · ${preset.fps}fps</span>`;
+    const thumb = document.createElement("img");
+    thumb.className = "preset-thumb";
+    thumb.src = preset.referenceUrl;
+    thumb.alt = "";
+    thumb.loading = "lazy";
+    thumb.onerror = () => thumb.replaceWith(createPresetThumbFallback(preset));
+    const title = document.createElement("b");
+    title.textContent = preset.name;
+    const meta = document.createElement("span");
+    meta.textContent = `${preset.source} · ${preset.size} · ${preset.fps}fps`;
+    btn.append(thumb, title, meta);
     btn.onclick = () => applyPreset(preset).catch(showError);
     $("presetList").appendChild(btn);
   });
+}
+
+function createPresetThumbFallback(preset) {
+  const fallback = document.createElement("span");
+  fallback.className = "preset-thumb preset-thumb-fallback";
+  fallback.textContent = preset.name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((word) => word[0] || "")
+    .join("")
+    .toUpperCase();
+  fallback.title = `${preset.name} reference image unavailable`;
+  return fallback;
 }
 
 async function applyQueryParams() {
