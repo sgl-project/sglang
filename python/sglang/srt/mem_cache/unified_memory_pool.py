@@ -260,12 +260,8 @@ class UnifiedKVPool:
                 total_bytes + view_tail_pad_bytes, dtype=torch.uint8, device=device
             )
         if envs.SGLANG_DEBUG_POISON_POOL.get():
-            # Debug: fill the pool with bf16-NaN bit patterns (0x7FC1 LE) so
-            # every never-written byte reads as NaN. Converts the boot-lottery
-            # "does freed GPU heap contain NaN patterns" into a deterministic
-            # switch: if an attention kernel arithmetically masks (instead of
-            # selectively masking) the unwritten tail rows of a partial last
-            # page, the NaN leaks into its output on EVERY boot under poison.
+            # Debug: bf16-NaN-fill so NaN-unsafe reads of never-written bytes
+            # fail deterministically.
             self._raw.view(torch.int16).fill_(0x7FC1)
             logger.warning(
                 "[unified-memory-pool] POISONED: pool filled with bf16-NaN "
@@ -686,14 +682,8 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
             env[tgt_pages] = env[src_pages]
 
     def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
-        """Zero whole page envelopes (PHYSICAL page ids) on allocator hand-out.
-
-        Guarantees the never-written tail rows of a request's last partial
-        page read as 0.0: the trtllm MLA kernel masks those rows
-        arithmetically, so NaN / exp-overflow-huge garbage there leaks into
-        the attention output (proven by the NaN-poison harness). Zeros give
-        the shared pool the same safety static pools get from torch.zeros.
-        """
+        """Zero whole page envelopes (PHYSICAL page ids) on allocator
+        hand-out."""
         if phys_pages.numel() == 0:
             return
         env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(

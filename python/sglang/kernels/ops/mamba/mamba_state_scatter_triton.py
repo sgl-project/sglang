@@ -14,16 +14,10 @@ import triton.language as tl
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
 ) -> None:
-    """Enforce the scatter kernels' TRUE dst layout contract.
-
-    The kernels index ``dst`` through its real ``stride(0)`` (layer) and
-    ``stride(1)`` (slot) — promoted to int64 before the multiply — then add a
-    FLAT element offset within one (layer, slot) entry. So the layer/slot
-    strides may be arbitrary (the unified pool's envelope-strided views have
-    slot stride = entry_bytes/itemsize and layer stride < slot stride), but the
-    trailing entry dims (``entry_start_dim``..) must be contiguous.
-    ``dst.is_contiguous()`` is stricter than the kernels need and would reject
-    the unified-memory pool views.
+    """dst layout contract: the kernels index through the real layer/slot
+    strides (int64) plus a FLAT element offset within one (layer, slot)
+    entry — layer/slot strides may be arbitrary (envelope-strided unified
+    pool views), but the trailing entry dims must be contiguous.
     """
     expected = 1
     for i in range(dst.ndim - 1, entry_start_dim - 1, -1):
@@ -296,11 +290,6 @@ def fused_mamba_state_scatter_with_mask(
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
-    # dst: only the per-entry trailing dims must be contiguous — the kernel
-    # consumes real layer/slot strides, so the unified pool's envelope-strided
-    # views pass. src is the local intermediate scratch and stays fully
-    # contiguous (the kernel flat-copies its entry rows the same way but we
-    # keep the stronger check since it is always allocated contiguous).
     _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
@@ -448,9 +437,6 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # dst: the kernel writes `... + dst_idx * dst.stride(1) + e` with `e` flat
-    # over (dim, K-1), so only the per-entry (dim, K-1) dims must be contiguous
-    # — envelope-strided unified-pool views (arbitrary layer/slot strides) pass.
     # `src` is an intentionally non-contiguous (overlapping) view indexed per
     # dim through its real strides, so we do NOT assert src contiguity here
     # (unlike the dense scatter).

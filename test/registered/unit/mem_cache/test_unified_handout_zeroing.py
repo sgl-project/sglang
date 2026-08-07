@@ -115,11 +115,10 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         self.assertTrue((env[pages2] == 0).all().item())
 
     def test_zeroing_enabled_for_single_layer_multiplier(self):
-        # Regression pin (review finding): a shard owning exactly ONE
-        # full-attention MLA layer has kernel_page_multiplier == 1 but its
-        # pool is still UnifiedMLATokenToKVPool with the same NaN-unsafe
-        # partial-page reads — zeroing must key on the pool type, not on
-        # multiplier > 1.
+        # A shard owning exactly ONE full-attention MLA layer has
+        # kernel_page_multiplier == 1 but its pool is still
+        # UnifiedMLATokenToKVPool with the same NaN-unsafe partial-page
+        # reads — zeroing must key on the pool type, not on multiplier > 1.
         buf, kvcache, allocator = _build("cuda", kernel_page_multiplier=1)
         self.assertTrue(allocator._zero_pages_on_alloc)
         self._poison(buf)

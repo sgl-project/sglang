@@ -1197,21 +1197,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
-        # Callers pass the ScheduleBatch-side `batch.mamba_track_indices`, which
-        # holds VIRTUAL mamba slot ids (the ForwardBatch copy is rebound to the
-        # translated tensor in _forward_metadata, but the ScheduleBatch tensor is
-        # never touched). The scatter below writes the PHYSICAL pool views, so
-        # translate here — identity on static pools; under the unified pool a
-        # freed slot translates to -1 and the scatter kernels' dst_idx >= 0
-        # bounds check skips it.
+        # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
         if mamba_track_indices is not None:
             mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
                 mamba_track_indices
             )
 
-        # forward_metadata.mamba_cache_indices is PHYSICAL in both paths (eager
-        # translates in _forward_metadata; graph replay fills state_indices_list
-        # with translated ids).
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
