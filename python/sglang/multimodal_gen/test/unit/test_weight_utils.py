@@ -1,16 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""_disable_runai_streamer_rank_discovery_collective: patches
-runai_model_streamer's find_local_ranks() to never touch torch.distributed,
-regardless of world size or initialization state.
-
-Context (see the docstring on the function under test): the unpatched
-find_local_ranks() issues a real dist.new_group()/all_gather_object()
-collective purely to populate a bookkeeping env var, unconditionally on the
-first stream_files() call of every DistributedStreamer instance -- even for
-this loader's calls, which always pass is_distributed=False. Divergent
-per-rank timing can call it out of lockstep and hang; this patch removes the
-collective entirely so that can't happen.
-"""
+"""The patched find_local_ranks() must never touch torch.distributed."""
 
 import unittest
 from unittest.mock import patch
