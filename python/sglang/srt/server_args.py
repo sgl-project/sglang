@@ -2750,10 +2750,11 @@ class ServerArgs:
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
         "pool, or a bounded MNNVL FABRIC pool. "
         "Unset resolves automatically: multimodal models on single-node CUDA "
-        "deployments (without disaggregation) use cuda_ipc, everything else uses "
-        "cpu. GPU transports reserve SGLANG_MM_FEATURE_CACHE_MB (default 1024 "
-        "MiB) on the base GPU and fall back to CPU transport per tensor when the "
-        "pool is full. Use fabric for cross-node GB200/GB300 MNNVL deployments.",
+        "deployments (without disaggregation) use cuda_ipc; multi-node GB200/GB300 "
+        "MNNVL deployments use fabric when an IMEX channel is available; all other "
+        "deployments use cpu. GPU transports reserve SGLANG_MM_FEATURE_CACHE_MB "
+        "(default 1024 MiB) on the base GPU and fall back to CPU transport per "
+        "tensor when the pool is full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
