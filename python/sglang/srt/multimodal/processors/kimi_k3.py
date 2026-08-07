@@ -30,7 +30,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _gpu_preprocess_images,
     navit_resize_config,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 

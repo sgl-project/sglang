@@ -5,7 +5,7 @@ from typing import Any, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.mm_gpu_memory_pool import (
+from sglang.srt.multimodal.transport.memory_pool import (
     DEFAULT_MAX_INFLIGHT_SLICES,
     StreamOrderedMmFeaturePool,
     StreamOrderedPoolConsumerMixin,

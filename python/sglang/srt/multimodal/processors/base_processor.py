@@ -20,6 +20,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    MmItemMemoryPool,
+    get_mm_feature_pool_size_per_worker,
+)
+from sglang.srt.multimodal.transport.fabric import FabricMmFeatureMemoryPool
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     envs,
@@ -31,13 +38,6 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    MmItemMemoryPool,
-    get_mm_feature_pool_size_per_worker,
-)
-from sglang.srt.utils.fabric_mm_transport import FabricMmFeatureMemoryPool
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
