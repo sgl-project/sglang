@@ -195,6 +195,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -360,6 +361,7 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )

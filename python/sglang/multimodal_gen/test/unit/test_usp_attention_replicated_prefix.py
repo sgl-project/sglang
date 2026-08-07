@@ -107,3 +107,23 @@ class TestUSPAttentionReplicatedPrefix(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUSPAttentionMaskedReplicatedGuard(unittest.TestCase):
+    def test_masked_path_rejects_replicated_tokens(self):
+        obj = USPAttention.__new__(USPAttention)
+        obj.attn_impl = _CaptureAttn()
+        obj.skip_sequence_parallel = False
+        obj.sp_attention_mode = "ulysses"
+        obj.sp_attention_mode_is_auto = False
+        q = torch.randn(1, 6, 2, 4)
+        mask = torch.ones(1, 6, dtype=torch.bool)
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=MagicMock(attn_metadata=None),
+            ),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=2),
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "replicated"):
+                obj.forward(q, q, q, attn_mask=mask, num_replicated_suffix=2)
