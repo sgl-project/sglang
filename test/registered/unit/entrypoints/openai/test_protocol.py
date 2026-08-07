@@ -123,6 +123,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.messages[0].content, "Hello")
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
+        self.assertFalse(request.return_sampling_mask)
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
     def test_sampling_param_build(self):
