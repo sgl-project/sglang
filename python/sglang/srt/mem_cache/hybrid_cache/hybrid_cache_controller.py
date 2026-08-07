@@ -783,21 +783,20 @@ class HybridCacheController(BaseHiCacheController):
             # would prevent restore from ever triggering on follower ranks,
             # causing NaN on DSpark speculative hits.
             sidecar_ok = True
-            if sidecar_ok:
-                for transfer in backup_transfers:
-                    result = results.get(transfer.name)
-                    if result is None:
-                        result = results.get(transfer.name.value)
-                    expected = len(transfer.keys or [])
-                    if expected == 0 and transfer.host_indices is not None:
-                        expected = int(transfer.host_indices.numel())
-                    if (
-                        not isinstance(result, (list, tuple))
-                        or len(result) != expected
-                        or not all(bool(ok) for ok in result)
-                    ):
-                        sidecar_ok = False
-                        break
+            for transfer in backup_transfers:
+                result = results.get(transfer.name)
+                if result is None:
+                    result = results.get(transfer.name.value)
+                expected = len(transfer.keys or [])
+                if expected == 0 and transfer.host_indices is not None:
+                    expected = int(transfer.host_indices.numel())
+                if (
+                    not isinstance(result, (list, tuple))
+                    or len(result) != expected
+                    or not all(bool(ok) for ok in result)
+                ):
+                    sidecar_ok = False
+                    break
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
