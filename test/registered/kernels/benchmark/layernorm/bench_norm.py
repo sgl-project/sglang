@@ -7,10 +7,8 @@ from flashinfer.norm import fused_add_rmsnorm as fi_fused_add_rmsnorm
 from flashinfer.norm import rmsnorm as fi_rmsnorm
 
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.kernels.ops.layernorm._jit_norm import (
-    fused_add_rmsnorm as jit_fused_add_rmsnorm,
-)
-from sglang.kernels.ops.layernorm._jit_norm import rmsnorm as jit_rmsnorm
+from sglang.kernels.ops.layernorm.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

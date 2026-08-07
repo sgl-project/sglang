@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.activation._jit_activation import (
+from sglang.kernels.ops.activation.activation import (
     SUPPORTED_ACTIVATIONS,
     relu2,
     run_activation,

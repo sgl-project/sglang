@@ -1,19 +1,19 @@
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_empty, create_random
-
-# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
-# kernel is kept only as the perf baseline for this benchmark.
-from sglang.kernels.ops.quantization._jit_per_token_group_quant import (
-    per_token_group_quant,
-)
-from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
-    per_token_group_quant_8bit_v2,
-)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
     fp8_min,
+)
+
+# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
+# kernel is kept only as the perf baseline for this benchmark.
+from sglang.kernels.ops.quantization.per_token_group_quant import (
+    per_token_group_quant,
+)
+from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+    per_token_group_quant_8bit_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -68,7 +68,6 @@ def benchmark(group_size: int, layout: str, num_tokens: int, impl: str):
     return marker.do_bench(
         FN[impl],
         input_args=(group_size, x, x_q, x_s, scale_ue8m0),
-        graph_clone_args=(1,),
         memory_args=(x,),
         memory_output=(x_q, x_s),
     )

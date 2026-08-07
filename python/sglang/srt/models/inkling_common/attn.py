@@ -6,14 +6,14 @@ from functools import cache
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
+from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
     apply_log_scaling_tau as _apply_log_scaling_tau,
 )
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
-from sglang.kernels.ops.model.inkling.inkling_rel_proj import rel_proj_small_t
-from sglang.kernels.ops.model.inkling.inkling_row_scale import row_compact_bf16
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -29,7 +29,11 @@ from sglang.srt.models.inkling_common.kernels.comm import (
 from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+)
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
 try:
@@ -296,7 +300,7 @@ class InklingAttention(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer attn_sconv runs on the [T, H/P] shard).
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
 
         if is_local:
             self.rel_extent = local_extent
@@ -364,7 +368,7 @@ class InklingAttention(nn.Module):
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
-        (kernels/ops/model/inkling/inkling_attn_prologue.py); returns
+        (kernels/ops/attention/inkling_attn_prologue.py); returns
         ``(q, k, v, did_store)``.
 
         The fused kernel writes raw bf16 KV, so it only does the store when the
@@ -377,7 +381,7 @@ class InklingAttention(nn.Module):
         qk-norm stay fused either way. For the FA4 MXFP8 pool, the prologue can
         quantize Q and directly fill the fp8 K/V cache plus interleaved scale
         buffers, returning Q's per-token scales as ``q_descale``/``sfq``."""
-        from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+        from sglang.kernels.ops.attention.inkling_attn_prologue import (
             inkling_attn_prologue_verify,
         )
         from sglang.srt.model_executor.forward_context import (
@@ -410,8 +414,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_server_args()
-        if server_args.kv_cache_dtype == "mxfp8" and hasattr(
+        if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
@@ -481,7 +484,7 @@ class InklingAttention(nn.Module):
         the backend store. Store gating (bf16 NHD / FA4 MXFP8 pools, SWA loc
         translation) is identical to the verify prologue. Returns
         (q, k, v, did_store, q_descale)."""
-        from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+        from sglang.kernels.ops.attention.inkling_attn_prologue import (
             inkling_attn_prologue_extend,
         )
         from sglang.srt.model_executor.forward_context import (
@@ -525,8 +528,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_server_args()
-        if server_args.kv_cache_dtype == "mxfp8" and hasattr(
+        if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
@@ -615,7 +617,7 @@ class InklingAttention(nn.Module):
         kernel. Decode is one token/seq so the conv taps come from the working
         cache (no cross-token reads, no barrier). Returns
         (q, k, v, did_store, q_descale)."""
-        from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+        from sglang.kernels.ops.attention.inkling_attn_prologue import (
             inkling_attn_prologue_decode,
         )
         from sglang.srt.model_executor.forward_context import (
@@ -645,8 +647,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_server_args()
-        if server_args.kv_cache_dtype == "mxfp8" and hasattr(
+        if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
             sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
@@ -726,12 +727,12 @@ class InklingAttention(nn.Module):
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
-        server_args = get_server_args()
-        assert server_args.attention_backend in ("fa4", "triton")
+        attention_backend = get_exec().kernel.attention_backend
+        assert attention_backend in ("fa4", "triton")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
         # TODO(triton): plumb rel_bias_event through the triton attn path too.
-        fa4 = server_args.attention_backend == "fa4"
+        fa4 = attention_backend == "fa4"
 
         rel_event = None
         prologue_did_store = False
@@ -870,7 +871,7 @@ class InklingAttention(nn.Module):
             )
 
         extra_attn_kwargs = {}
-        if server_args.kv_cache_dtype == "mxfp8":
+        if get_model().kv_cache_dtype == "mxfp8":
             # Must run AFTER v is joined above (wait_event(v_event)): v (and k)
             # may be produced by sconv on the alt stream, and quantizing them on
             # the main stream before the join reads half-written buffers under
@@ -883,7 +884,7 @@ class InklingAttention(nn.Module):
             if prologue_q_descale is not None:
                 extra_attn_kwargs["q_descale"] = prologue_q_descale
             else:
-                from sglang.srt.layers.quantization.mxfp8_quant import to_mxfp8
+                from sglang.kernels.ops.quantization.mxfp8_quant import to_mxfp8
 
                 q_mxfp = to_mxfp8(q.view(num_tokens, self.num_tp_heads, self.head_dim))
                 q = q_mxfp.data.view(num_tokens, -1)

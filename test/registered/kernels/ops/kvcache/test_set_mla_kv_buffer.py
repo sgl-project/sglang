@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.kvcache._jit_set_mla_kv_buffer import (
+from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
     can_use_set_mla_kv_buffer,
     set_mla_kv_buffer,
 )

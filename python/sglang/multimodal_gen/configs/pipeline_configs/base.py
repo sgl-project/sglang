@@ -224,6 +224,7 @@ class PipelineConfig:
     # VAE configuration
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
+    vae_decode_precision: str | None = None
     vae_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
@@ -265,6 +266,11 @@ class PipelineConfig:
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # return the model-specific config for optimal deployment setting
         return ModelDeploymentConfig()
+
+    def validate_server_args(self, server_args: Any) -> None:
+        """Validate model-owned constraints after server args are normalized."""
+
+        del server_args
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -393,8 +399,21 @@ class PipelineConfig:
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
+    def supports_disaggregation(self) -> bool:
+        """Return whether multi-service disaggregated deployment is supported."""
+
+        return True
+
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
+        return False
+
+    def supports_sequential_dit_inference(self):
+        """Return whether batched AR is followed by per-request DiT inference."""
+        return False
+
+    def supports_sequential_multi_output_inference(self):
+        """Return whether one request's outputs run through DiT/VAE sequentially."""
         return False
 
     def estimate_request_cost(self, batch) -> float:
@@ -797,6 +816,17 @@ class PipelineConfig:
             default=PipelineConfig.vae_precision,
             choices=["fp32", "fp16", "bf16"],
             help="Precision for VAE",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-decode-precision",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_decode_precision",
+            default=PipelineConfig.vae_decode_precision,
+            choices=["fp32", "fp16", "bf16"],
+            help=(
+                "Optional decode-only VAE precision override. "
+                "Defaults to --vae-precision when unset."
+            ),
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-tiling",

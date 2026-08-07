@@ -22,13 +22,13 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.quantization._jit_per_token_group_quant import (
-    per_token_group_quant,
-)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
+)
+from sglang.kernels.ops.quantization.per_token_group_quant import (
+    per_token_group_quant,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -429,6 +429,82 @@ def test_masked_fused():
         if m > 0:
             assert _dequant_rel_err(x_q[e, :m], deq_scale[e, :m], act[e, :m], G) < 0.05
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
+
+
+@pytest.mark.parametrize("poison", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("scale_ue8m0", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
+    """CUDA-graph capture warmup runs the model on reused, uninitialized
+    buffers, so quant inputs can contain NaN/Inf bit patterns. The v1/v2/Triton
+    kernels clamp before converting (IEEE fminf/fmaxf drop the NaN operand),
+    quantizing non-finite values to +-fp8_max; emitting fp8 NaN codes instead
+    poisons the downstream GEMM and trips the sampler NaN check
+    (TestTBOWithTPAttn H100 CI). Pin the sanitizing behavior."""
+    torch.manual_seed(0)
+    if masked:
+        x = torch.randn(4, 32, 512, device="cuda", dtype=torch.bfloat16)
+        x[1, 3, 100] = poison
+        x[2, 0, 300] = poison
+        masked_m = torch.tensor([32, 16, 4, 0], device="cuda", dtype=torch.int32)
+    else:
+        x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+        x[3, 100] = poison
+        x[7, 500] = poison
+        masked_m = None
+
+    x_q, x_s = per_token_group_quant(
+        x,
+        group_size=G,
+        scale_ue8m0=scale_ue8m0,
+        masked_m=masked_m,
+        column_major_scales=scale_ue8m0,
+    )
+    torch.cuda.synchronize()
+    if masked:
+        rows = [x_q[e, :m] for e, m in enumerate(masked_m.tolist()) if m > 0]
+        written = torch.cat([r.reshape(-1, x_q.shape[-1]) for r in rows])
+    else:
+        written = x_q
+    assert not torch.isnan(written.float()).any(), "quant emitted fp8 NaN codes"
+
+
+def test_mn_major_tma_aligned_transform_keeps_ownership():
+    """The masked fused quant emits scales already MN-major/TMA-aligned, which
+    makes deep_gemm's get_mn_major_tma_aligned_tensor hit its no-op fast path.
+    In sgl-deep-gemm <= 0.1.4.post1 that path returns a non-owning
+    ``torch::from_blob`` alias across TVM-FFI; the production caller rebinds
+    the result over its only reference, so an alias frees the scale storage
+    before the down GEMM reads it (NaN logits / host-pointer crash under CUDA
+    graph capture). The wrapper must hand back the input tensor itself."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        pytest.skip("deep_gemm unavailable")
+
+    E, N, num_groups = 18, 128, 20  # N 4-aligned -> already-TMA-aligned layout
+    s = torch.empty((E, num_groups, N), device="cuda", dtype=torch.float32)
+    s = s.transpose(-1, -2)
+    s.copy_(torch.rand(E, N, num_groups, device="cuda") + 1.0)
+    expected = s.clone()
+
+    out = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(s)
+    assert out is s, "already-aligned input must be returned as-is (owning)"
+
+    # The production pattern: rebind + allocator churn between quant and GEMM.
+    del s
+    reuse = torch.full((E, num_groups, N), float("nan"), device="cuda")
+    torch.cuda.synchronize()
+    assert not torch.isnan(out).any(), "scale storage was freed and reused"
+    torch.testing.assert_close(out, expected)
+    del reuse
+
+    # Row-major input still takes the real transform into an owning buffer.
+    row_major = expected.contiguous()
+    out2 = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(row_major)
+    assert out2.data_ptr() != row_major.data_ptr()
+    assert out2.stride(-2) == 1
+    torch.testing.assert_close(out2, row_major)
 
 
 @pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)

@@ -3,14 +3,14 @@ from sgl_kernel import sgl_per_token_group_quant_8bit
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
-    per_token_group_quant_8bit_v2,
-)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
     fp8_min,
+)
+from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+    per_token_group_quant_8bit_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
