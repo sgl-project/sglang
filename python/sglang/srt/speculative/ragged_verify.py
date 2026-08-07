@@ -217,9 +217,10 @@ def build_capture_verify_lens(
 
 
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
-    """Layout riding the batch's spec input, or None. Tolerates the runner's
-    ad-hoc replay batch views, which may not carry spec_info at all."""
-    return spec_info_ragged_verify_layout(getattr(forward_batch, "spec_info", None))
+    """Canonical read of the batch's verify layout (ForwardBatch field).
+    Tolerates the runner's ad-hoc replay batch views, which may not carry
+    the field at all."""
+    return getattr(forward_batch, "ragged_verify_layout", None)
 
 
 def spec_info_ragged_verify_layout(spec_info) -> Optional[RaggedVerifyLayout]:
