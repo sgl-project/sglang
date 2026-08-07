@@ -293,6 +293,12 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     )
     a = torch.empty_like(b)
     grid = (batch * seq_len, num_heads_qk)
+    # Each program moves `v_per_group * head_v` elements for both v and z. For
+    # the small head-group ratios (<= 512 elements) a single warp is the best
+    # fit; wider ratios (e.g. 8 v-heads per k-head) need more lanes so the
+    # per-program vector load/store does not serialize.
+    v_elems_per_program = (num_heads_v // num_heads_qk) * head_v
+    num_warps = 1 if v_elems_per_program <= 512 else 4
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
         z,
@@ -304,7 +310,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_heads_v,
         head_qk,
         head_v,
-        num_warps=1,
+        num_warps=num_warps,
         num_stages=3,
     )
     return mixed_qkv, z, b, a
