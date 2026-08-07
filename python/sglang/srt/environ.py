@@ -635,6 +635,9 @@ class Envs:
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Fuse the absorbed MLA w_kc projection with RoPE and KV-cache writes in
+    # one AITER grid during Kimi-K2.5 HIP-graph decode.
+    SGLANG_ROCM_FUSE_MLA_PROJECTION_ROPE_CACHE = EnvBool(True)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
