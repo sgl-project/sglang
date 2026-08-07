@@ -335,9 +335,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
         # async asserts: the fused path writes the pool directly and would
         # skip the pool's OOB probe.
+        # Also disabled under DCP: unlike its fp8 sibling, set_mla_kv_concat_q
+        # takes no dcp_world_size/dcp_rank, so it writes the KV row at the raw
+        # VIRTUAL out_cache_loc from every rank. Under DCP that loc is widened
+        # and the reader (create_mla_kv_page_table_for_dcp) expects the
+        # compacted row loc // dcp_size written only by the owning rank, so the
+        # fused write lands where no page table points. Fall back to the pool's
+        # DCP-aware set_mla_kv_buffer instead.
         self._fused_set_kv_concat_q = (
             self.data_type == torch.bfloat16
             and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+            and not get_parallel().dcp_enabled
             and can_use_set_mla_kv_concat_q(
                 self.kv_lora_rank * 2, self.qk_rope_head_dim * 2
             )
