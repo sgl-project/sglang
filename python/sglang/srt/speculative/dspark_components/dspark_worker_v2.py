@@ -347,11 +347,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = (
-                    self._maybe_build_draft_sampler()
-                    if is_cuda()
-                    else None
-                )
+                self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
