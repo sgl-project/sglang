@@ -121,7 +121,7 @@ def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
 
 
 class RelLogitsProj(nn.Module):
-    def __init__(self, d_rel: int, rel_extent: int):
+    def __init__(self, d_rel: int, rel_extent: int, *, deterministic: bool = False):
         super().__init__()
         self.d_rel = d_rel
         self.rel_extent = rel_extent
@@ -137,8 +137,7 @@ class RelLogitsProj(nn.Module):
         # The dispatch keys off the token count, so a row's kernel would follow
         # the batch composition.
         self._proj_dispatch = (
-            envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
-            and not get_exec().deterministic.enable_deterministic_inference
+            envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get() and not deterministic
         )
 
     def _project(self, r: torch.Tensor) -> torch.Tensor:
@@ -314,7 +313,11 @@ class InklingAttention(nn.Module):
             self.rel_extent = rel_extent
             self.local_extent = None
 
-        self.rel_logits_proj = RelLogitsProj(self.d_rel, self.rel_extent)
+        self.rel_logits_proj = RelLogitsProj(
+            self.d_rel,
+            self.rel_extent,
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
+        )
         # Fold the conditional log-scaling tau into the fused prologue's q
         # path (deletes the external scale kernel; bit-exact rounding).
         self._fused_log_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
