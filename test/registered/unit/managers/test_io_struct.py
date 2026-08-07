@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -304,6 +304,38 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
+
+    def test_parallel_sampling_keeps_one_logical_rid_per_prompt(self):
+        """Test logical RID and reasoning control preservation across parallel samples."""
+        single = GenerateReqInput(
+            text="Hello",
+            rid="single",
+            sampling_params={"n": 3},
+            require_reasoning=True,
+            max_thinking_tokens=128,
+        )
+        single.normalize_batch_and_arguments()
+
+        self.assertEqual(single.rid, ["single"])
+        self.assertEqual([single[i].rid for i in range(3)], ["single"] * 3)
+        self.assertTrue(all(single[i].require_reasoning for i in range(3)))
+        self.assertEqual(
+            [single[i].max_thinking_tokens for i in range(3)],
+            [128] * 3,
+        )
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            rid="batch",
+            sampling_params={"n": 2},
+        )
+        batch.normalize_batch_and_arguments()
+
+        self.assertEqual(batch.rid, ["batch_0", "batch_1"])
+        self.assertEqual(
+            [batch[i].rid for i in range(4)],
+            ["batch_0", "batch_1", "batch_0", "batch_1"],
+        )
 
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
@@ -648,6 +680,15 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
 
+    def test_regenerate_rid_with_parent_prefix(self):
+        """Test RID regeneration with a logical parent prefix."""
+        req = GenerateReqInput(text="Hello", rid="logical")
+        req.normalize_batch_and_arguments()
+
+        new_rid = req.regenerate_rid(prefix="logical")
+
+        self.assertTrue(new_rid.startswith("logical_"))
+
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided
@@ -661,6 +702,26 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
             req.normalize_batch_and_arguments()
+
+
+class TestEmbeddingReqInputGetItem(CustomTestCase):
+    """Test EmbeddingReqInput.__getitem__."""
+
+    def test_priority_is_preserved(self):
+        """Priority must survive the batch split, in both __getitem__ branches."""
+        req = EmbeddingReqInput(text=["Hello", "World"], priority=7)
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].priority, req[1].priority], [7, 7])
+
+        cross_encoder_req = EmbeddingReqInput(
+            text=[["query 1", "doc 1"], ["query 2", "doc 2"]],
+            is_cross_encoder_request=True,
+            priority=3,
+        )
+        cross_encoder_req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
+        )
 
 
 if __name__ == "__main__":

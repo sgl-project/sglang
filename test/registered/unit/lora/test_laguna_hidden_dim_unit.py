@@ -16,11 +16,10 @@ Usage:
     python -m pytest test/registered/unit/lora/test_laguna_hidden_dim_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
 
