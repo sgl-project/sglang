@@ -1702,7 +1702,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+        ):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online")
@@ -1739,7 +1742,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="modelopt_fp4")
