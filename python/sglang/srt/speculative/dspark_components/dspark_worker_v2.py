@@ -565,6 +565,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             max_position_embeddings=self.model_runner.req_to_token_pool.max_context_len,
         )
 
+        if not bool(torch.all(actual_verify_lens > 0)):
+            raise RuntimeError(
+                "DSpark scheduled a request with no context/generation budget"
+            )
+
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
@@ -576,6 +581,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
+            verify_lens=actual_verify_lens,
+            max_position_embeddings=self.model_runner.req_to_token_pool.max_context_len,
         )
 
         sampling_info = batch.sampling_info
@@ -636,17 +643,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         # race-free — no concurrent path mutates seq_lens or output_ids during
         # this call.
         #
-        # run_non_compact path: run_compact = (layout is not None).  When
-        # clipping occurs we always produce a RaggedVerifyLayout, so
-        # run_compact=True and run_non_compact is never reached for a clipped
-        # batch.  The existing alloc_verify_window (which still uses the
-        # unclipped verify_num_draft_tokens) is only consumed by run_non_compact
-        # and is therefore safe.
+        # The draft window keeps its fixed gamma-wide shape, but its padded tail
+        # positions were already made safe from actual_verify_lens above. A
+        # clipped layout still selects compact target verify below.
         planned_verify_lens = requested_verify_lens if layout is None else layout.verify_lens
         actual_verify_lens = torch.minimum(planned_verify_lens.to(torch.int64), actual_verify_lens)
         if not torch.equal(actual_verify_lens, planned_verify_lens):
-            if not bool(torch.all(actual_verify_lens > 0)):
-                raise RuntimeError("DSpark scheduled a request with no context/generation budget")
             graph_num_tokens = (
                 int(actual_verify_lens.sum().item())
                 if layout is None

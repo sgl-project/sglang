@@ -2,6 +2,7 @@
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ import torch
 
 ROOT = Path(__file__).parents[4]
 SOURCE = ROOT / "python/sglang/srt/speculative/draft_worker_common.py"
+PLANNER_SOURCE = ROOT / "python/sglang/srt/speculative/dspark_components/dspark_planner.py"
 
 
 def load_clamp_verify_lens():
@@ -20,8 +22,33 @@ def load_clamp_verify_lens():
     if node is None:
         pytest.fail("clamp_verify_lens is missing from draft_worker_common.py")
     namespace = {"torch": torch}
+
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), namespace)
     return namespace["clamp_verify_lens"]
+def load_alloc_verify_window():
+    """Load the production planner helper with a deterministic cache-loc stub."""
+    tree = ast.parse(PLANNER_SOURCE.read_text())
+    node = next(
+        (item for item in tree.body if getattr(item, "name", None) == "alloc_verify_window"),
+        None,
+    )
+    if node is None:
+        pytest.fail("alloc_verify_window is missing from dspark_planner.py")
+
+    def fake_assign_extend_cache_locs_func(*, batch_size, draft_token_num, device, **_):
+        return torch.arange(batch_size * draft_token_num, dtype=torch.int64, device=device)
+
+    namespace = {
+        "torch": torch,
+        "VerifyWindow": SimpleNamespace,
+        "ScheduleBatch": object,
+        "assign_extend_cache_locs_func": fake_assign_extend_cache_locs_func,
+    }
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), str(PLANNER_SOURCE), "exec"),
+        namespace,
+    )
+    return namespace["alloc_verify_window"]
 
 
 def test_clamp_verify_lens_context_boundary_cpu():
@@ -60,11 +87,45 @@ def test_clamp_verify_lens_preserves_short_context_verify_window():
     assert actual.tolist() == [6]
 
 
+def test_alloc_verify_window_pads_draft_tail_with_last_legal_position_cpu():
+    """Draft forward must never receive the full, out-of-bound DSpark window."""
+    alloc_verify_window = load_alloc_verify_window()
+    prefix_lens = torch.tensor([98, 97], dtype=torch.int64)
+    verify_lens = torch.tensor([2, 2], dtype=torch.int64)
+    offsets = torch.arange(6, dtype=torch.int64)
+    batch = SimpleNamespace(
+        seq_lens=prefix_lens,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+    )
+    model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 128), dtype=torch.int64))
+    )
+    unsafe_positions = (prefix_lens.unsqueeze(1) + offsets).tolist()
+    print("DSpark draft-window trace")
+    print(f"before prefix_lens={prefix_lens.tolist()} verify_lens={verify_lens.tolist()}")
+    print(f"before full_positions={unsafe_positions}")
+
+    window = alloc_verify_window(
+        batch=batch,
+        bs=2,
+        device=torch.device("cpu"),
+        verify_num_draft_tokens=6,
+        block_pos_offsets=offsets,
+        model_runner=model_runner,
+        verify_lens=verify_lens,
+        max_position_embeddings=100,
+    )
+    print(f"after safe_positions={window.positions_2d.tolist()}")
+    print(f"after cache_locs={window.verify_cache_loc_2d.tolist()}")
+    assert window.positions_2d.tolist() == [[98, 99, 99, 99, 99, 99], [97, 98, 98, 98, 98, 98]]
+    assert int(window.positions_2d.max()) < 100
+
 def test_worker_uses_the_boundary_clamp_before_target_verify():
     source = (
         ROOT / "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py"
     ).read_text()
     assert "clamp_verify_lens(" in source
+    assert "verify_lens=actual_verify_lens" in source
 
 def test_valid_layout_positions_never_cross_context_boundary():
     tree = ast.parse(SOURCE.read_text())
