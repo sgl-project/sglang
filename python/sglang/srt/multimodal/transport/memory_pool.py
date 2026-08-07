@@ -78,7 +78,7 @@ def resolve_consumer_rank(
 
 
 class StreamOrderedPoolConsumerMixin:
-    """Ready/wait/ack protocol shared by CUDA IPC and FABRIC proxies."""
+    """Ready/wait/ack protocol for stream-ordered GPU feature proxies."""
 
     def _init_stream_ordered_consumer(
         self,

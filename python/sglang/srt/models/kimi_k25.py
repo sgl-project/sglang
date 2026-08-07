@@ -637,6 +637,8 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    supports_cuda_vmm_feature_transport = True
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
