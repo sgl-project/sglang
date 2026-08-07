@@ -71,6 +71,8 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+DEFAULT_SCHEDULER_RECV_TIMEOUT_MS = 6_000_000
+MAX_SCHEDULER_RECV_TIMEOUT_MS = 2_147_483_647
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -242,6 +244,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
+    scheduler_recv_timeout_ms: int = DEFAULT_SCHEDULER_RECV_TIMEOUT_MS
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -481,6 +484,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        self._validate_scheduler_recv_timeout()
         self._validate_pipeline()
         self._validate_offload()
         if not current_platform.is_cpu():
@@ -489,6 +493,18 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_scheduler_recv_timeout(self) -> None:
+        timeout_ms = self.scheduler_recv_timeout_ms
+        if (
+            not isinstance(timeout_ms, int)
+            or isinstance(timeout_ms, bool)
+            or not (timeout_ms == -1 or 0 < timeout_ms <= MAX_SCHEDULER_RECV_TIMEOUT_MS)
+        ):
+            raise ValueError(
+                "scheduler_recv_timeout_ms must be -1 or an integer between "
+                f"1 and {MAX_SCHEDULER_RECV_TIMEOUT_MS}"
+            )
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
         """Sorted, de-duplicated, positive BCG text buckets.
@@ -1546,6 +1562,16 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+        )
+        parser.add_argument(
+            "--scheduler-recv-timeout-ms",
+            type=int,
+            default=ServerArgs.scheduler_recv_timeout_ms,
+            help=(
+                "Timeout in milliseconds for waiting on a scheduler response over ZMQ. "
+                "Set to -1 to block indefinitely. The default is "
+                f"{DEFAULT_SCHEDULER_RECV_TIMEOUT_MS} (100 minutes)."
+            ),
         )
 
         ServerArgs.add_disagg_cli_args(parser)

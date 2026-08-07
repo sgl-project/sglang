@@ -25,7 +25,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    MAX_SCHEDULER_RECV_TIMEOUT_MS,
+    ServerArgs,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.request_logger import (
     DiffusionRequestLogger,
@@ -48,6 +51,20 @@ _CONTROL_REQ_TYPES = (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
+
+
+def _configure_recv_timeout(socket: Any, timeout_ms: int) -> None:
+    if (
+        not isinstance(timeout_ms, int)
+        or isinstance(timeout_ms, bool)
+        or not (timeout_ms == -1 or 0 < timeout_ms <= MAX_SCHEDULER_RECV_TIMEOUT_MS)
+    ):
+        raise ValueError(
+            "timeout_ms must be -1 or an integer between "
+            f"1 and {MAX_SCHEDULER_RECV_TIMEOUT_MS}"
+        )
+    if timeout_ms > 0:
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
 
 
 async def run_zeromq_broker(server_args: ServerArgs):
@@ -138,9 +155,14 @@ class SchedulerClient:
 
     def _forward_one(self, endpoint: str, batch: Any, timeout_ms: int | None) -> Any:
         socket = self.context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.RCVTIMEO, timeout_ms if timeout_ms else 6000000)
         try:
+            socket.setsockopt(zmq.LINGER, 0)
+            effective_timeout = (
+                self.server_args.scheduler_recv_timeout_ms
+                if timeout_ms is None
+                else timeout_ms
+            )
+            _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
             socket.send_pyobj(batch)
             output_batch = socket.recv_pyobj()
@@ -220,7 +242,7 @@ class AsyncSchedulerClient:
         self.context = zmq.asyncio.Context()
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
 
-    async def forward(self, batch: Any) -> Any:
+    async def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
         self.request_logger.log_received_request(batch)
         if self.context is None:
@@ -231,23 +253,33 @@ class AsyncSchedulerClient:
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
-            results = [await self._forward_one(ep, batch) for ep in endpoints]
+            results = [
+                await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
+            ]
             output_batch = _merge_fanout_results(results)
         else:
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
-            output_batch = await self._forward_one(endpoints[replica], batch)
+            output_batch = await self._forward_one(
+                endpoints[replica], batch, timeout_ms
+            )
         self.request_logger.log_finished_request(batch, output_batch)
         return output_batch
 
-    async def _forward_one(self, endpoint: str, batch: Any) -> Any:
+    async def _forward_one(
+        self, endpoint: str, batch: Any, timeout_ms: int | None
+    ) -> Any:
         # a temporary REQ socket per request keeps concurrent requests from
         # interleaving on one socket's strict send/recv alternation
         socket = self.context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
-        socket.connect(endpoint)
         try:
+            socket.setsockopt(zmq.LINGER, 0)
+            effective_timeout = (
+                self.server_args.scheduler_recv_timeout_ms
+                if timeout_ms is None
+                else timeout_ms
+            )
+            _configure_recv_timeout(socket, effective_timeout)
+            socket.connect(endpoint)
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
             output_batch = pickle.loads(payload)

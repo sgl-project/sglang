@@ -445,6 +445,7 @@ async def _dispatch_job_async(
             async_scheduler_client,
             batch,
             scheduler_batches=scheduler_batches,
+            scheduler_timeout_ms=-1,
         )
         save_file_path = save_file_path_list[0]
         try:

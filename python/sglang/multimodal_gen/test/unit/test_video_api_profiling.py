@@ -1,6 +1,8 @@
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -50,3 +52,30 @@ def test_video_api_forwards_profiling_options():
     assert kwargs["num_profiled_timesteps"] == 3
     assert kwargs["profile_all_stages"] is False
     assert kwargs["quality"] == "high"
+
+
+def test_video_background_job_uses_indefinite_scheduler_timeout():
+    captured = {}
+
+    async def fake_process_generation_batch(_client, _batch, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after capturing scheduler arguments")
+
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(cleanup_video_request=lambda _batch: None)
+    )
+    update_fields = AsyncMock()
+
+    with (
+        patch.object(
+            video_api,
+            "process_generation_batch",
+            new=fake_process_generation_batch,
+        ),
+        patch.object(video_api.VIDEO_STORE, "update_fields", new=update_fields),
+        patch.object(video_api.logger, "exception"),
+    ):
+        asyncio.run(video_api._dispatch_job_async("job-id", batch))
+
+    assert captured["scheduler_timeout_ms"] == -1
+    update_fields.assert_awaited_once()

@@ -54,7 +54,10 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    MAX_SCHEDULER_RECV_TIMEOUT_MS,
+    ServerArgs,
+)
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
@@ -2194,6 +2197,53 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
         )
 
         self.assertEqual(args.disagg_role, RoleType.DENOISER)
+
+
+class TestSchedulerRecvTimeoutArgs(unittest.TestCase):
+    def test_scheduler_recv_timeout_defaults_to_bounded(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.scheduler_recv_timeout_ms, 6_000_000)
+
+    def test_scheduler_recv_timeout_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--scheduler-recv-timeout-ms",
+            "3600000",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.scheduler_recv_timeout_ms, 3600000)
+
+    def test_scheduler_recv_timeout_cli_arg_indefinite_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--scheduler-recv-timeout-ms",
+            "-1",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.scheduler_recv_timeout_ms, -1)
+
+    def test_scheduler_recv_timeout_rejects_invalid_values(self):
+        invalid_values = (0, -2, MAX_SCHEDULER_RECV_TIMEOUT_MS + 1, True, 1.5, "1")
+
+        for invalid_value in invalid_values:
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError, "scheduler_recv_timeout_ms must be -1"
+                ):
+                    _from_dict_without_model_resolution(
+                        {
+                            "model_path": "/fake",
+                            "scheduler_recv_timeout_ms": invalid_value,
+                        }
+                    )
 
 
 class TestDisaggTransferBackendArgs(unittest.TestCase):

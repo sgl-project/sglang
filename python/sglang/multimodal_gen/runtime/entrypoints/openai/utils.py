@@ -343,12 +343,17 @@ async def process_generation_batch(
     batch,
     *,
     scheduler_batches=None,
+    scheduler_timeout_ms: int | None = None,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward(
-            scheduler_batches if scheduler_batches is not None else [batch]
-        )
+        forward_batch = scheduler_batches if scheduler_batches is not None else [batch]
+        if scheduler_timeout_ms is None:
+            result = await scheduler_client.forward(forward_batch)
+        else:
+            result = await scheduler_client.forward(
+                forward_batch, timeout_ms=scheduler_timeout_ms
+            )
 
         if (
             result.output is None
