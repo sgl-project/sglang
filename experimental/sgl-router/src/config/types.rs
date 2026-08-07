@@ -286,6 +286,37 @@ pub struct CacheAwareConfig {
     /// so a busy fleet never becomes a selection error. A value at or above
     /// the fleet size recovers the exact-minimum behavior.
     pub min_load_choices: usize,
+    /// Fleet-saturation floor for the matched-set fallback, only meaningful
+    /// under [`LoadGate::PerWorkerQueue`] (the CLI rejects it otherwise, so
+    /// it is never silently set-but-unread). `None` — the default — keeps the
+    /// historical behavior: when every prefix owner is over the queue limit,
+    /// the request diverts to a sampled min-load worker regardless of how
+    /// busy the rest of the fleet is.
+    ///
+    /// With a floor set, that diversion is first checked for a payoff: if no
+    /// worker in the fleet has a fresh queue reading strictly below the
+    /// floor, every destination is already making requests wait, so
+    /// diverting cannot dodge the queue — it only forfeits the matched
+    /// prefix (and on long-prompt traffic converts a wait into a full cold
+    /// prefill, which is how a saturated fleet's hit rate collapses and
+    /// stays collapsed). The request then routes to the least-loaded prefix
+    /// owner instead, recorded as `cache_hit_all_queued`.
+    ///
+    /// A worker with no fresh snapshot does NOT count as idle here — the
+    /// opposite polarity from [`LoadGate::admits_affinity`], and deliberately
+    /// so: that gate fails open because keeping affinity is the safe default
+    /// action, while this check asks whether a *provably better* destination
+    /// exists, and an unknown queue is not proof. Both polarities keep the
+    /// request with its prefix owner when the signal is missing.
+    ///
+    /// The CLI enforces `floor <= worker-queue-limit`, which yields the
+    /// invariant that makes the metric readable: every selection booked
+    /// `cache_hit_all_queued` actually kept its affinity (the old
+    /// sampled-draw path for that label becomes unreachable — all workers
+    /// fresh-and-over-limit implies all are at-or-over the floor, so the pin
+    /// fires first). Like the queue limit, scale it with `dp_size`: the
+    /// queue reading is summed across a worker's dp ranks.
+    pub saturation_queue_floor: Option<NonZeroUsize>,
 }
 
 impl Default for CacheAwareConfig {
@@ -294,6 +325,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             load_gate: LoadGate::default(),
             min_load_choices: default_min_load_choices(),
+            saturation_queue_floor: None,
         }
     }
 }

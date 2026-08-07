@@ -69,6 +69,19 @@
 //!    lands, which usually is NOT a prefix owner; treat it as locality only
 //!    on fleets pinned to unsampled picks (`min_load_choices >= fleet`).
 //!
+//!    With `saturation_queue_floor` configured, the matched-set fallback is
+//!    additionally payoff-checked BEFORE any diversion: when no worker in
+//!    the fleet has a fresh queue reading below the floor, diverting cannot
+//!    dodge a wait but does forfeit the matched prefix, so the request pins
+//!    to the least-loaded prefix owner instead — also recorded as
+//!    `cache_hit_all_queued`, which under a floor always means affinity was
+//!    kept (the CLI enforces `floor <= limit`, making the off-owner draw for
+//!    that label unreachable). This is the guard against the saturation
+//!    death spiral: on long-prompt traffic every diverted request cold-
+//!    prefills on a non-owner, evicting other prefixes and manufacturing the
+//!    next round of misses, so a briefly saturated fleet stays saturated
+//!    long after the burst that queued it has passed.
+//!
 //! The implementation never returns `None` for a non-empty `workers` slice;
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
 //! tiebreak, not a routing failure.
@@ -84,6 +97,7 @@ use crate::server::metrics::{CacheAwareDecision, MetricsRegistry};
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -103,6 +117,7 @@ static TOKENIZATION_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HASH_CONFIG_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MATCHED_FALLBACK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static QUEUE_GATE_BLIND_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SATURATION_PIN_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn should_log(counter: &AtomicU64) -> bool {
     counter
@@ -386,6 +401,24 @@ impl CacheAwareZmqPolicy {
         use rand::seq::SliceRandom;
         let (sample, _) = pool.partial_shuffle(&mut rand::thread_rng(), k);
         min_of(sample)
+    }
+
+    /// True when some worker has a fresh queue reading strictly below
+    /// `floor` — a destination where a diverted request would provably wait
+    /// behind fewer than `floor` others. Workers with no fresh snapshot do
+    /// not count: the saturation pin asks whether a provably better
+    /// destination exists, and an unknown queue is not proof. This is the
+    /// opposite polarity from [`LoadGate::admits_affinity`]'s fail-open, and
+    /// the two compose: both leave the request with its prefix owner when
+    /// the signal is missing.
+    fn fleet_has_idle_worker(
+        workers: &[Arc<Worker>],
+        loads: &WorkerLoads,
+        floor: NonZeroUsize,
+    ) -> bool {
+        workers
+            .iter()
+            .any(|w| loads.waiting_of(w).is_some_and(|q| q < floor.get()))
     }
 
     /// Detect load imbalance. Returns the min/max load snapshot together
@@ -753,6 +786,48 @@ impl Policy for CacheAwareZmqPolicy {
             let owners_present = workers
                 .iter()
                 .any(|w| matched_urls.contains(w.url.as_str()));
+            // Saturation pin: diversion is only worth its prefix loss when a
+            // meaningfully idle destination exists. With a floor configured
+            // and every fresh queue reading at or above it, the diverted
+            // request would wait wherever it lands — so waiting at a prefix
+            // owner dominates: same wait, prefill from cache instead of a
+            // full cold prefill that evicts other prefixes and manufactures
+            // the next round of misses. Booked as `cache_hit_all_queued`,
+            // which under a floor (CLI enforces floor <= limit) always means
+            // affinity kept — the off-owner draw for that label below
+            // becomes unreachable, because all-fresh-and-over-limit implies
+            // no reading under the floor.
+            if owners_present {
+                if let Some(floor) = self.config.saturation_queue_floor {
+                    if !Self::fleet_has_idle_worker(workers, &loads, floor) {
+                        let pinned = workers
+                            .iter()
+                            .filter(|w| matched_urls.contains(w.url.as_str()))
+                            .min_by_key(|w| loads.load_of(w))
+                            .map(Arc::clone);
+                        if let Some(w) = pinned {
+                            self.record_decision(model_id, CacheAwareDecision::CacheHitAllQueued);
+                            if should_log(&SATURATION_PIN_LOG_COUNTER) {
+                                tracing::info!(
+                                    model = %ctx.model(),
+                                    worker = %w.url,
+                                    worker_load = loads.load_of(&w),
+                                    worker_waiting = loads.waiting_of(&w),
+                                    saturation_queue_floor = floor.get(),
+                                    worker_queue_limit = queue_limit,
+                                    matched_workers = matched_urls.len(),
+                                    n_blocks = outcome.query_blocks,
+                                    matched_blocks = outcome.matched_blocks,
+                                    engine_load_workers = loads.engine_worker_count(),
+                                    engine_load_expected = self.engine_load.expected_count(),
+                                    "cache-aware-zmq: fleet saturated, keeping affinity with a queueing prefix owner instead of diverting",
+                                );
+                            }
+                            return Some(w);
+                        }
+                    }
+                }
+            }
             // The fallback prefers an unqueued worker but is never queue-
             // *bounded*: with no unqueued worker it samples the whole fleet
             // and takes the least-loaded of the sample regardless, so a fleet
@@ -2832,6 +2907,16 @@ mod tests {
             cache_threshold: 0.0, // any match counts; the gate is what's under test
             load_gate: LoadGate::PerWorkerQueue(NonZeroUsize::new(limit).expect("limit > 0")),
             min_load_choices: usize::MAX,
+            saturation_queue_floor: None,
+        }
+    }
+
+    /// `queue_cfg` plus a saturation floor: the payoff check that cancels
+    /// diversions when no worker in the fleet is meaningfully idle.
+    fn queue_cfg_with_floor(limit: usize, floor: usize) -> CacheAwareConfig {
+        CacheAwareConfig {
+            saturation_queue_floor: Some(NonZeroUsize::new(floor).expect("floor > 0")),
+            ..queue_cfg(limit)
         }
     }
 
@@ -3124,6 +3209,180 @@ mod tests {
             !rendered.contains("decision=\"cache_hit\"}"),
             "must NOT be indistinguishable from an unqueued hit — that is the \
              whole point of the separate label; got:\n{rendered}"
+        );
+    }
+
+    /// The saturation pin: when every fresh queue reading is at or above the
+    /// floor, diverting cannot dodge a wait — it only forfeits the prefix —
+    /// so the request stays with its owner even though the owner is over the
+    /// queue limit. This is the difference from the no-floor arm
+    /// (`queue_gate_never_returns_none_when_the_whole_fleet_is_queueing`
+    /// routes the same shape of fleet to the least-loaded NON-owner).
+    #[test]
+    fn saturation_floor_pins_to_the_queueing_owner_when_no_worker_is_below_it() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // Owner over the limit; the others below the LIMIT would normally
+        // attract the diversion, but none is below the FLOOR — every
+        // destination already makes requests wait.
+        engine_load.set("http://w0:30000", 0, load_stat(20, 9), now);
+        engine_load.set("http://w1:30000", 0, load_stat(1, 3), now);
+        engine_load.set("http://w2:30000", 0, load_stat(2, 2), now);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg_with_floor(4, 2),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "with no worker under the floor the wait is unavoidable, so the \
+             queueing prefix owner must win over less-queued non-owners",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 1"
+            ),
+            "the pin is the saturation label; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("decision=\"cache_worker_queued\""),
+            "no diversion happened; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("sgl_router_diverted_overlap_blocks_count{model_id=\"tiny\"}"),
+            "a kept prefix must not appear in the diverted histogram; got:\n{rendered}"
+        );
+    }
+
+    /// The floor only cancels diversions that have no payoff. With a worker
+    /// under the floor, diverting provably dodges the owner's backlog, so the
+    /// gate's normal behavior is unchanged.
+    #[test]
+    fn saturation_floor_still_diverts_while_an_idle_worker_exists() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(20, 9), now);
+        engine_load.set("http://w1:30000", 0, load_stat(1, 0), now);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg_with_floor(4, 2),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "an idle worker exists, so the diversion pays and must still happen",
+        );
+        assert!(
+            metrics.render().contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_worker_queued\"} 1"
+            ),
+            "a real diversion keeps its label; got:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// A worker with no fresh snapshot must not count as idle: an unknown
+    /// queue is not proof that diverting pays. (The opposite polarity from
+    /// `admits_affinity`'s fail-open — both leave the request with its
+    /// owner when the signal is missing.)
+    #[test]
+    fn saturation_floor_does_not_count_snapshotless_workers_as_idle() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        // Only the owner has a fresh reading; w1 never published one.
+        engine_load.set("http://w0:30000", 0, load_stat(20, 9), now);
+
+        let metrics = MetricsRegistry::new();
+        let policy = new_policy_with_load(
+            queue_cfg_with_floor(4, 2),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        )
+        .with_metrics(Arc::clone(&metrics));
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w0:30000",
+            "an unknown queue is not an idle worker; the owner must keep the request",
+        );
+        assert!(
+            metrics.render().contains(
+                "sgl_router_cache_aware_decisions_total{model_id=\"tiny\",decision=\"cache_hit_all_queued\"} 1"
+            ),
+            "got:\n{}",
+            metrics.render()
+        );
+    }
+
+    /// With several owners over the limit, the pin still load-ranks within
+    /// the matched set — saturation suspends the gate, not the tiebreak.
+    #[test]
+    fn saturation_floor_pins_to_the_least_loaded_owner() {
+        let registry = tokenizer_registry_with_tiny();
+        let (tree, body) = queue_fixture(&registry, &["http://w0:30000", "http://w1:30000"]);
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(20, 9), now); // depth 29
+        engine_load.set("http://w1:30000", 0, load_stat(2, 6), now); // depth 8
+        engine_load.set("http://w2:30000", 0, load_stat(1, 4), now); // depth 5, still >= floor
+
+        let policy = new_policy_with_load(
+            queue_cfg_with_floor(4, 2),
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+            worker("http://w2:30000", "tiny"),
+        ];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, Some(&body));
+        assert_eq!(
+            policy.select(&workers, &ctx).expect("must pick").url,
+            "http://w1:30000",
+            "the pin picks the least-loaded OWNER, not the fleet minimum (w2 holds nothing)",
         );
     }
 

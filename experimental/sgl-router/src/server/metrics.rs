@@ -239,20 +239,29 @@ pub enum CacheAwareDecision {
     /// router's per-worker cap is excluded upstream and lands there. Read the
     /// two together when attributing locality loss to load.
     CacheWorkerQueued,
-    /// Every prefix owner was over the queue limit AND so was every other
-    /// candidate — NO worker in the fleet was unqueued — so the min-load
-    /// fallback picked among queueing workers. It carries its own label
-    /// because of that reachability condition, not because of where the pick
-    /// lands: under sampled min-load picks (the default) the fallback usually
-    /// lands OFF the cache home, so routing is NOT necessarily identical to a
-    /// cache hit. Folded into `cache_hit` it would make a fully saturated
-    /// fleet read as a healthy one, which is the opposite of what an operator
-    /// sizing the limit needs.
+    /// The fleet-saturation label; which selection it describes depends on
+    /// whether `--saturation-queue-floor` is set.
     ///
-    /// Alert on it for saturation. Do NOT count it with `cache_hit` for
-    /// locality unless the fleet pins `--min-load-choices` at or above the
-    /// fleet size — with sampled picks the chosen worker usually does not
-    /// hold the prefix.
+    /// Without a floor: every prefix owner was over the queue limit AND so
+    /// was every other candidate — NO worker in the fleet was unqueued — so
+    /// the min-load fallback picked among queueing workers. It carries its
+    /// own label because of that reachability condition, not because of
+    /// where the pick lands: under sampled min-load picks (the default) the
+    /// fallback usually lands OFF the cache home, so routing is NOT
+    /// necessarily identical to a cache hit. Folded into `cache_hit` it
+    /// would make a fully saturated fleet read as a healthy one, which is
+    /// the opposite of what an operator sizing the limit needs.
+    ///
+    /// With a floor: the owners were over the limit and no worker had a
+    /// fresh queue reading below the floor, so the request was PINNED to the
+    /// least-loaded prefix owner rather than diverted — affinity was kept.
+    /// The floor's `<= limit` bound (CLI-enforced) makes the off-owner draw
+    /// above unreachable, so under a floor this label ALWAYS means the
+    /// chosen worker holds the prefix and may be counted with `cache_hit`
+    /// for locality.
+    ///
+    /// Either way, alert on it for saturation: it is the leading indicator
+    /// that the whole fleet is making requests wait.
     CacheHitAllQueued,
 }
 

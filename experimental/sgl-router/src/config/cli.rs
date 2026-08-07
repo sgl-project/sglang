@@ -110,6 +110,28 @@ pub struct Cli {
     /// the deterministic exact fleet-wide minimum.
     #[arg(long)]
     pub min_load_choices: Option<NonZeroUsize>,
+    /// Fleet-saturation floor below which `--worker-queue-limit` diversions
+    /// are cancelled and the request stays with its prefix owner. When every
+    /// owner is over the queue limit, the router normally diverts to a
+    /// min-load sample; with this set, it first checks whether any worker in
+    /// the fleet has a fresh queue reading strictly below the floor. If none
+    /// does, the fleet is saturated: diverting cannot dodge a wait — every
+    /// destination is already queueing — but it does forfeit the matched
+    /// prefix, and on long-prompt traffic that converts one wait into a full
+    /// cold prefill that evicts other prefixes in turn (the self-sustaining
+    /// hit-rate-collapse mode under overload). The request then routes to
+    /// the least-loaded prefix owner instead, recorded as
+    /// `cache_hit_all_queued`.
+    ///
+    /// Must be at most `--worker-queue-limit` (and requires it). Start at 2-4
+    /// on a single-rank worker: high enough that a queue of one draining
+    /// immediately doesn't read as saturation, low enough that a worker with
+    /// real spare capacity still attracts diversions. Scale with `dp_size`
+    /// like the limit — the queue reading is summed across dp ranks. Workers
+    /// with no fresh load snapshot do not count as idle: an unknown queue is
+    /// not proof that diverting pays.
+    #[arg(long)]
+    pub saturation_queue_floor: Option<NonZeroUsize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -200,11 +222,13 @@ impl Cli {
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some()
             || self.worker_queue_limit.is_some()
-            || self.min_load_choices.is_some();
+            || self.min_load_choices.is_some()
+            || self.saturation_queue_floor.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
-                 --balance-rel-threshold / --worker-queue-limit / --min-load-choices) \
+                 --balance-rel-threshold / --worker-queue-limit / --min-load-choices / \
+                 --saturation-queue-floor) \
                  requires --policy cache_aware_zmq"
             ));
         }
@@ -218,6 +242,28 @@ impl Cli {
                 "--worker-queue-limit replaces the fleet-spread check, so it cannot be \
                  combined with --balance-abs-threshold / --balance-rel-threshold; pass only one"
             ));
+        }
+        // The floor modifies the queue gate's diversion; without the gate there
+        // is no diversion to cancel, and the policy would never read it.
+        if let Some(floor) = self.saturation_queue_floor {
+            let Some(limit) = self.worker_queue_limit else {
+                return Err(anyhow!(
+                    "--saturation-queue-floor gates the diversions made by \
+                     --worker-queue-limit, so it requires that flag"
+                ));
+            };
+            // floor <= limit is what makes `cache_hit_all_queued` mean
+            // "affinity kept": all workers fresh-and-over-limit then implies
+            // all are at-or-over the floor, so the owner pin fires before the
+            // sampled fallback can book that label for an off-owner draw.
+            if floor > limit {
+                return Err(anyhow!(
+                    "--saturation-queue-floor ({floor}) must be at most \
+                     --worker-queue-limit ({limit}): a floor above the limit would \
+                     declare the fleet saturated while workers the gate still \
+                     admits exist"
+                ));
+            }
         }
 
         let tuned_sticky = self.routing_key_header.is_some()
@@ -311,6 +357,7 @@ impl Cli {
                     .min_load_choices
                     .map(NonZeroUsize::get)
                     .unwrap_or(d.min_load_choices),
+                saturation_queue_floor: self.saturation_queue_floor,
             })
         } else {
             None
@@ -991,6 +1038,109 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("min-load-choices"), "got: {err}");
+    }
+
+    #[test]
+    fn saturation_queue_floor_reaches_the_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "14",
+            "--saturation-queue-floor",
+            "4",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.saturation_queue_floor.map(NonZeroUsize::get), Some(4));
+        // Tuning any other knob must not set a floor: `None` keeps the
+        // historical divert-on-queued behavior.
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "14",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.saturation_queue_floor, None);
+    }
+
+    /// Without the queue gate there is no diversion for the floor to cancel;
+    /// accepting it would leave the knob silently dead.
+    #[test]
+    fn rejects_saturation_queue_floor_without_worker_queue_limit() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--saturation-queue-floor",
+            "4",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires"), "got: {err}");
+        assert!(err.contains("worker-queue-limit"), "got: {err}");
+    }
+
+    /// `floor <= limit` is the invariant that makes `cache_hit_all_queued`
+    /// mean "affinity kept": a floor above the limit would declare the fleet
+    /// saturated while workers the gate still admits exist.
+    #[test]
+    fn rejects_saturation_queue_floor_above_worker_queue_limit() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "4",
+            "--saturation-queue-floor",
+            "5",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most"), "got: {err}");
+    }
+
+    /// The boundary is inclusive: floor == limit is the strictest useful
+    /// setting (divert only when some worker is under the gate's own bar).
+    #[test]
+    fn accepts_saturation_queue_floor_equal_to_worker_queue_limit() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "4",
+            "--saturation-queue-floor",
+            "4",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.saturation_queue_floor.map(NonZeroUsize::get), Some(4));
+    }
+
+    #[test]
+    fn rejects_saturation_queue_floor_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--saturation-queue-floor",
+            "4",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires --policy cache_aware_zmq"),
+            "got: {err}"
+        );
     }
 
     /// The queue gate replaces the fleet-spread check rather than layering
