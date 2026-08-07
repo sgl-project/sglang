@@ -786,6 +786,13 @@ class USPAttention(nn.Module):
             ), "Varlen USPAttention does not support masks or replicated tokens"
             if effective_skip_sp or get_sequence_parallel_world_size() == 1:
                 return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            if get_ring_parallel_world_size() > 1:
+                # The varlen all-to-all spans the combined SP group and is not
+                # ring-aware; it would shuffle rows across ring ranks instead
+                # of rotating KV, corrupting the output silently.
+                raise NotImplementedError(
+                    "Varlen USPAttention does not support ring parallelism yet."
+                )
             qkv = torch.cat([q, k, v], dim=0)
             qkv = _usp_input_all_to_all_varlen(qkv, seq_lens, head_dim=2)
             qkv = self.attn_impl.preprocess_qkv(qkv, ctx_attn_metadata)
