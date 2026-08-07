@@ -194,6 +194,69 @@ def _run_pair_fp8(H_Q, H_KV, D, B, S, fp8_dtype, dev="cuda", seed=0):
     return _call(False), _call(True)
 
 
+def _run_pair_paged(
+    H_Q, H_KV, D, B, S, page_size, dev="cuda", dt=torch.float16, seed=0
+):
+    """Standard vs Lean on a **paged** 4-D KV buffer ``[num_pages, page_size, head, dim]``.
+
+    The KV cache is stored in pages and addressed through scattered slot ids in ``kv_indices``
+    (a permutation), so the kernel's page-aware address math (``kv_loc // page_size`` /
+    ``kv_loc % page_size``) is genuinely exercised — not the contiguous fast path. Both arms read
+    the identical buffer + indices, so their outputs must agree. Returns (o_std, o_lean).
+    """
+    torch.manual_seed(seed)
+    D_V = D
+    kv_group_num = H_Q // H_KV
+    sm = 1.0 / (D**0.5)
+    tot = B * S
+    assert (
+        tot % page_size == 0
+    ), "test setup: total tokens must be a multiple of page_size"
+    num_pages = tot // page_size
+
+    # 4-D paged KV buffers [num_pages, page_size, head, dim] (the shared-pool layout).
+    k = torch.randn(num_pages, page_size, H_KV, D, dtype=dt, device=dev)
+    v = torch.randn(num_pages, page_size, H_KV, D_V, dtype=dt, device=dev)
+
+    kv_indptr = torch.arange(0, (B + 1) * S, step=S, device=dev, dtype=torch.int32)
+    # Scatter slots across pages so page_id/tok_in_p vary within every BLOCK_N tile.
+    kv_indices = torch.randperm(tot, device=dev).to(torch.int32)
+    q = torch.randn(B, H_Q, D, dtype=dt, device=dev)
+    num_kv_splits = torch.full((B,), MAX_KV_SPLITS, dtype=torch.int32, device=dev)
+
+    def _call(enable_lean):
+        attn_logits = torch.empty(
+            (B, H_Q, MAX_KV_SPLITS, D_V), dtype=torch.float32, device=dev
+        )
+        attn_lse = torch.empty((B, H_Q, MAX_KV_SPLITS), dtype=torch.float32, device=dev)
+        o = torch.zeros(B, H_Q, D_V, dtype=dt, device=dev)
+        mp, lp, op, locks = _lean_scratch(H_KV, kv_group_num, D_V, dev)
+        decode_attention_fwd(
+            q,
+            k,
+            v,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            MAX_KV_SPLITS,
+            sm,
+            1.0,
+            1.0,
+            page_size=page_size,
+            enable_lean=enable_lean,
+            lean_Mp=mp,
+            lean_Lp=lp,
+            lean_Op=op,
+            lean_locks=locks,
+        )
+        return o
+
+    return _call(False), _call(True)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "Lean decode kernel requires a GPU")
 class TestLeanAttentionParity(CustomTestCase):
     """Lean must be numerically identical to the standard SplitK kernel."""
@@ -247,6 +310,29 @@ class TestLeanAttentionParity(CustomTestCase):
                             0.99,
                             f"{name} b={B} ctx={S}: Lean fp8 diverged from SplitK (cos={cos:.5f})",
                         )
+
+    def test_paged_kv_parity(self):
+        # Lean must read a paged 4-D KV buffer the same way the standard kernel does. Guards
+        # the page-aware address math (kv_loc // page_size, kv_loc % page_size); a regression
+        # to the contiguous-only form would scramble reads and drop cos well below 1.
+        for name, H_Q, H_KV, D in GQA_SHAPES:
+            for page_size in (16, 64):
+                with self.subTest(model=name, page_size=page_size):
+                    o_std, o_lean = _run_pair_paged(
+                        H_Q, H_KV, D, B=2, S=8192, page_size=page_size
+                    )
+                    self.assertTrue(
+                        torch.isfinite(o_lean).all(),
+                        f"{name} ps={page_size}: non-finite Lean paged output",
+                    )
+                    cos = torch.nn.functional.cosine_similarity(
+                        o_lean.flatten().float(), o_std.flatten().float(), dim=0
+                    ).item()
+                    self.assertGreater(
+                        cos,
+                        0.999,
+                        f"{name} ps={page_size}: Lean paged diverged from SplitK (cos={cos:.5f})",
+                    )
 
 
 @unittest.skipUnless(

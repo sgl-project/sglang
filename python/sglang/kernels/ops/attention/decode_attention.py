@@ -1010,16 +1010,15 @@ def decode_attention_fwd(
     # schedule from kv_indptr on-device, so this path involves no host sync and is safe to
     # capture in a CUDA graph. Whether Lean pays off for a given shape is decided cheaply by
     # the backend's host-side seqlen gate (lean_decode_seqlen_gate) before we get here.
-    # Lean assumes a contiguous 3-D [N, head, dim] KV buffer, so it only runs at page_size==1.
-    if (
-        page_size == 1
-        and _lean_head_dim_ok(k_buffer.shape[-1], v_buffer.shape[-1])
-        and _should_use_lean_decode(
-            enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
-        )
+    # Lean supports both the contiguous 3-D [N, head, dim] and paged 4-D
+    # [num_pages, page_size, head, dim] KV layouts (page-aware address math in the kernel).
+    if _lean_head_dim_ok(
+        k_buffer.shape[-1], v_buffer.shape[-1]
+    ) and _should_use_lean_decode(
+        enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
-            v_buffer.shape[1], kv_group_num
+            v_buffer.shape[-2], kv_group_num
         )
         _decode_lean_attention_fwd(
             q,
@@ -1039,6 +1038,7 @@ def decode_attention_fwd(
             lean_Lp,
             lean_Op,
             lean_locks,
+            page_size=page_size,
         )
         return
 
@@ -1216,8 +1216,12 @@ def _lean_attention_decode_kernel(
     stride_qh,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_buf_kpage,
+    stride_buf_ktok,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_vpage,
+    stride_buf_vtok,
     stride_obs,
     stride_oh,
     kv_group_num: tl.constexpr,
@@ -1228,6 +1232,7 @@ def _lean_attention_decode_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
     XCD_REMAP: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     batch_size: tl.constexpr,
@@ -1384,11 +1389,24 @@ def _lean_attention_decode_kernel(
             )
 
             # Load K transposed: [BLOCK_DMODEL, BLOCK_N] so qk = q @ k directly.
-            offs_buf_k = (
-                kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
-            )
+            # Page-aware KV address math (mirrors the standard grouped kernel): at
+            # PAGE_SIZE==1 the slot index addresses directly; otherwise it splits into
+            # (page_id, tok_in_p) for a [num_pages, page_size, head, dim] paged buffer.
+            if PAGE_SIZE == 1:
+                offs_buf_k = (
+                    kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None]
+                )
+            else:
+                page_id = kv_loc // PAGE_SIZE
+                tok_in_p = kv_loc % PAGE_SIZE
+                offs_buf_k = (
+                    page_id[None, :] * stride_buf_kpage
+                    + tok_in_p[None, :] * stride_buf_ktok
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None]
+                )
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[None, :] < tok_end) & (mask_d[:, None]),
@@ -1397,11 +1415,19 @@ def _lean_attention_decode_kernel(
 
             qk = tl.dot(q_k, k)  # [BLOCK_M, BLOCK_N]
             if BLOCK_DPE > 0:
-                offs_buf_kpe = (
-                    kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
-                )
+                if PAGE_SIZE == 1:
+                    offs_buf_kpe = (
+                        kv_loc[None, :] * stride_buf_kbs
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
+                else:
+                    offs_buf_kpe = (
+                        page_id[None, :] * stride_buf_kpage
+                        + tok_in_p[None, :] * stride_buf_ktok
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
                     mask=(offs_n[None, :] < tok_end) & (mask_dpe[:, None]),
@@ -1420,11 +1446,19 @@ def _lean_attention_decode_kernel(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            if PAGE_SIZE == 1:
+                offs_buf_v = (
+                    kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+            else:
+                offs_buf_v = (
+                    page_id[:, None] * stride_buf_vpage
+                    + tok_in_p[:, None] * stride_buf_vtok
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
             v = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=(offs_n[:, None] < tok_end) & (mask_dv[None, :]),
@@ -1722,16 +1756,21 @@ def _decode_lean_attention_fwd(
     Lp,
     Op,
     locks,
+    page_size=1,
 ):
     """Wrapper for Lean Attention kernel.
 
     ``total_programs`` is the fixed persistent-grid size (2× device CU count). The kernel
     derives its own tile schedule from ``kv_indptr`` on-device, so no host sync is needed and
     the launch is CUDA-graph capturable. ``Mp``, ``Lp``, ``Op``, ``locks`` are pre-allocated
-    persistent-grid partial-result buffers reused across decode steps.
+    persistent-grid partial-result buffers reused across decode steps. ``page_size`` selects
+    the KV address math: 1 for a contiguous ``[N, head, dim]`` buffer, >1 for a paged
+    ``[num_pages, page_size, head, dim]`` buffer (strides via ``_extract_kv_strides``).
     """
     batch, head_num = q.shape[0], q.shape[1]
-    num_kv_heads = k_buffer.shape[1]
+    # head_num lives at dim -2 for both the 3-D [N, head, dim] and 4-D paged
+    # [num_pages, page_size, head, dim] layouts.
+    num_kv_heads = k_buffer.shape[-2]
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
     kv_group_num = head_num // num_kv_heads
@@ -1771,6 +1810,12 @@ def _decode_lean_attention_fwd(
 
     max_output_tile_cnt = math.ceil((head_num * batch) / total_programs) + 4
 
+    # Page-aware KV strides. For a 3-D buffer these synthesize page/tok strides so the
+    # PAGE_SIZE>1 math collapses to the contiguous slot address; for a 4-D paged buffer they
+    # come from the real page/token strides. (See _extract_kv_strides.)
+    k_bs, k_h, k_page, k_tok = _extract_kv_strides(k_buffer, page_size)
+    v_bs, v_h, v_page, v_tok = _extract_kv_strides(v_buffer, page_size)
+
     _lean_attention_decode_kernel[(total_programs,)](
         q,
         k_buffer,
@@ -1787,10 +1832,14 @@ def _decode_lean_attention_fwd(
         v_scale,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_bs,
+        k_h,
+        k_page,
+        k_tok,
+        v_bs,
+        v_h,
+        v_page,
+        v_tok,
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
@@ -1801,6 +1850,7 @@ def _decode_lean_attention_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        PAGE_SIZE=page_size,
         XCD_REMAP=XCD_REMAP,
         NUM_XCDS=NUM_XCDS,
         batch_size=batch,
