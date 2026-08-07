@@ -64,10 +64,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
     RaggedVerifyMode,
     compute_ragged_extend_lengths,
     compute_target_verify_graph_key,
-    compute_uniform_extend_lengths,
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
@@ -512,6 +512,7 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self._uniform_layout_cache: dict = {}
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
@@ -901,19 +902,16 @@ class DeepseekV4AttnBackend(
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> DSV4Metadata:
         if ragged_layout is None:
-            lengths = compute_uniform_extend_lengths(
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
+            ragged_layout = self._uniform_verify_layout(
+                bs=int(seq_lens.shape[0]),
                 extend_len=self.speculative_num_draft_tokens,
             )
-            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
-        else:
-            lengths = compute_ragged_extend_lengths(
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                ragged_layout=ragged_layout,
-            )
-            extend_seq_lens = ragged_layout.verify_lens
+        lengths = compute_ragged_extend_lengths(
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            ragged_layout=ragged_layout,
+        )
+        extend_seq_lens = ragged_layout.verify_lens
         seq_lens = lengths.seq_lens_extended
         seq_lens_cpu = lengths.seq_lens_cpu_extended
         extend_seq_lens_cpu = lengths.extend_seq_lens_cpu
@@ -936,6 +934,20 @@ class DeepseekV4AttnBackend(
             online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
 
+    def _uniform_verify_layout(self, *, bs: int, extend_len: int) -> RaggedVerifyLayout:
+        # Uniform verify / draft-block geometry as a trivial layout, cached per
+        # shape so the device tensors build once.
+        key = (bs, extend_len)
+        layout = self._uniform_layout_cache.get(key)
+        if layout is None:
+            layout = RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=[extend_len] * bs,
+                device=self.device,
+                grid=[bs * extend_len],
+            )
+            self._uniform_layout_cache[key] = layout
+        return layout
+
     def init_forward_metadata_dspark_draft_block(
         self,
         max_seq_len: int,
@@ -949,12 +961,15 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu_list = seq_lens.tolist()
         else:
             seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
-        lengths = compute_uniform_extend_lengths(
+        layout = self._uniform_verify_layout(
+            bs=int(seq_lens.shape[0]), extend_len=block_size
+        )
+        lengths = compute_ragged_extend_lengths(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu_list,
-            extend_len=block_size,
+            ragged_layout=layout,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        extend_seq_lens = layout.verify_lens
         return self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,

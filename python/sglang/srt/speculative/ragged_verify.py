@@ -277,27 +277,7 @@ class VerifyExtendLengths(msgspec.Struct, frozen=True):
     seq_lens_cpu_extended: List[int]
     extend_seq_lens_cpu: List[int]
     num_tokens: int
-    extend_start_loc: Optional[torch.Tensor]
-
-
-def compute_uniform_extend_lengths(
-    *,
-    seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
-    extend_len: int,
-) -> VerifyExtendLengths:
-    batch_size = len(seq_lens_cpu)
-    seq_lens_extended = seq_lens + extend_len
-    seq_lens_cpu_extended = [x + extend_len for x in seq_lens_cpu]
-    extend_seq_lens_cpu = [extend_len] * batch_size
-    num_tokens = extend_len * batch_size
-    return VerifyExtendLengths(
-        seq_lens_extended=seq_lens_extended,
-        seq_lens_cpu_extended=seq_lens_cpu_extended,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
-        num_tokens=num_tokens,
-        extend_start_loc=None,
-    )
+    extend_start_loc: torch.Tensor
 
 
 def compute_ragged_extend_lengths(
