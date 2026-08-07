@@ -424,6 +424,7 @@ if __name__ == "__main__":
 class _K3TowerStub:
     device = torch.device("cpu")
     merge_kernel_size = (2, 2)
+    patch_size = 2
 
     def __init__(self):
         self.config = SimpleNamespace(hidden_size=2)
@@ -500,6 +501,73 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
         both,
         torch.cat([items[0].feature, items[1].feature]).to(torch.float32),
     )
+
+
+def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
+    from unittest.mock import patch as mock_patch
+
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.kimi_k3_image_processing import (
+        DEFERRED_PREPROCESSING_KEY,
+    )
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _K3TowerStub()
+    model.mm_projector = lambda image_embeds: image_embeds
+
+    deferred_config = {
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+        "transparent_bg_config": None,
+        "resize_config": {
+            "num_tokens": 1,
+            "new_width": 2,
+            "new_height": 2,
+            "pad_width": 0,
+            "pad_height": 0,
+        },
+    }
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(index, index)],
+            feature=torch.full((3, 2, 2), index, dtype=torch.uint8),
+            model_specific_data={
+                "image_grid_thw": torch.tensor([[1, 1, 1]]),
+                DEFERRED_PREPROCESSING_KEY: deferred_config,
+            },
+        )
+        for index in range(2)
+    ]
+    calls = []
+
+    def fake_preprocess(images, resize_configs, *args, **kwargs):
+        calls.append([int(image[0, 0, 0]) for image in images])
+        return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
+
+    with mock_patch(
+        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+        return_value=torch.zeros(1, 2),
+    ) as run_dp, mock_patch(
+        "sglang.srt.models.kimi_k3.get_server_args",
+        return_value=SimpleNamespace(tp_size=1),
+    ), mock_patch(
+        "sglang.srt.models.kimi_k3.get_parallel",
+        return_value=SimpleNamespace(attn_tp_size=1),
+    ), mock_patch(
+        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+        side_effect=fake_preprocess,
+    ):
+        model.get_image_feature(items)
+        loader = run_dp.call_args.kwargs["load_local_pixel_values"]
+        one = loader([1])
+
+    assert calls == [[1]]
+    assert one.dtype == torch.float32
+    assert one.tolist() == [[1.0, 0.0]]
 
 
 def test_kimi_k3_rejects_aggregated_items():
