@@ -273,13 +273,15 @@ class BaseRunner(ABC):
         comm backend; must run before CG capture (it syncs the stream + barriers
         cross-rank, uncapturable) and raises early on non-MNNVL platforms.
         """
-        parallel = get_parallel()
-        if not parallel.dcp_enabled or parallel.dcp_comm_backend != "fi_a2a":
+        if (
+            not get_parallel().dcp_enabled
+            or get_parallel().dcp_comm_backend != "fi_a2a"
+        ):
             return
 
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
-        init_fi_a2a_workspace(parallel.dcp_group)
+        init_fi_a2a_workspace(get_parallel().dcp_group)
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
