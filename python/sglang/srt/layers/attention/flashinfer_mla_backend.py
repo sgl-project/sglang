@@ -207,6 +207,9 @@ class FlashInferMhaChunkKVRunner:
 
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
 
     # Verify metadata is ragged-layout aware via generate_attn_arg_prefill;
     # graphs key their wrappers by token tier (_verify_graph_key).
