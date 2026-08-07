@@ -340,6 +340,25 @@ class TestFabricTransportMetadata(CustomTestCase):
         self.assertEqual(first.generation, 1)
         self.assertEqual(second.generation, 2)
 
+    def test_pool_rejects_duplicate_release(self):
+        from sglang.srt.multimodal.transport.memory_pool import (
+            StreamOrderedMmFeaturePool,
+        )
+
+        pool = object.__new__(StreamOrderedMmFeaturePool)
+        pool._available_ranges = [(256, 4096)]
+        pool._available_slots = [0]
+        pool._slot_generations = [0]
+        pool._occupied = {}
+        pool.control_words_per_slot = 2
+        pool.transport_name = "test"
+
+        lease = pool._allocate_locked(512)
+        pool._release_locked(lease)
+
+        with self.assertRaisesRegex(RuntimeError, "inactive test pool lease"):
+            pool._release_locked(lease)
+
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
     @staticmethod
