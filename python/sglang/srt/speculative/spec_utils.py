@@ -38,7 +38,10 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.schedule_batch import (
+    mamba_lazy_spec_in_window,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -749,6 +752,39 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+def _recover_ssm_track_unreachable(
+    batch: ScheduleBatch, server_args: ServerArgs
+) -> bool:
+    """Whether RecoverSSM may drop this verify's mamba-track plan entirely.
+
+    RecoverSSM (``--gdn-mtp-cache-mode none``) caches no intermediate h, so its
+    interval checkpoint is a second full per-GDN-layer recovery sweep rather
+    than a scatter out of a cache (see
+    ``HybridLinearAttnBackend._no_cache_mtp_recompute``). When no request can
+    reach a track boundary this step that sweep only refolds h_0 into the
+    reserved discard slot, so dropping the plan lets the commit path skip both
+    it and its conv counterpart. Only RecoverSSM opts in: the other modes
+    checkpoint with a scatter whose cost does not scale with the layer count.
+
+    Reuses ``mamba_lazy_spec_in_window``, whose 2x draft-token window absorbs
+    ``kv_committed_len`` lagging the device ``seq_lens`` under overlap. True
+    therefore means a crossing is *impossible* this step, never merely absent,
+    so a real checkpoint can never be skipped -- which is what keeps this
+    consistent with the independently computed ping-pong advance in
+    ``BatchResultProcessor._mamba_check_track_boundary``.
+    """
+    if server_args.gdn_mtp_cache_mode != "none":
+        return False
+    max_draft_tokens = server_args.max_speculative_num_draft_tokens
+    if max_draft_tokens is None:
+        return False
+    mamba_track_interval = server_args.mamba_track_interval
+    return not any(
+        mamba_lazy_spec_in_window(req, mamba_track_interval, max_draft_tokens)
+        for req in batch.reqs
+    )
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
@@ -760,9 +796,19 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
 
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
+
+    RecoverSSM: leave the plan unset on steps where no crossing is reachable,
+    which elides a whole per-GDN-layer boundary recovery sweep.
     """
     server_args = get_server_args()
     if not server_args.enable_mamba_extra_buffer():
+        return
+    if _recover_ssm_track_unreachable(batch, server_args):
+        # Cleared explicitly: a plan built for an earlier step would otherwise
+        # survive here and re-arm the boundary sweep against stale slots.
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
         return
     track_positions = None
     if server_args.enable_mamba_extra_buffer_lazy():
