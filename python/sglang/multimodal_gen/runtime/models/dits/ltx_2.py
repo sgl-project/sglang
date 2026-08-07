@@ -31,7 +31,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -49,7 +49,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
 
 _is_npu = current_platform.is_npu()
 
@@ -484,7 +483,9 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         num_rope_elems = num_pos_dims * 2
         # LTX-2.3 HQ is sensitive to RoPE rounding; keep frequency generation on
         # the target device instead of caching a CPU/NumPy tensor.
-        freqs_dtype = torch.float64 if self.double_precision and not _is_npu else torch.float32
+        freqs_dtype = (
+            torch.float64 if self.double_precision and not _is_npu else torch.float32
+        )
         pow_indices = torch.pow(
             self.theta,
             torch.linspace(
@@ -1672,7 +1673,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.audio_scale_factors = (4,)
 
         if rope_double_precision and _is_npu:
-            logger.warning(f"Double precison is not supported by NPU. Use float32 for RoPE.")
+            logger.warning(
+                f"Double precision is not supported by NPU. Use float32 for RoPE."
+            )
 
         self.rope = LTX2AudioVideoRotaryPosEmbed(
             dim=self.hidden_size,
