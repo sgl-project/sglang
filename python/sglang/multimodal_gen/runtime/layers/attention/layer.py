@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_to_all_4D,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_rank,
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
     get_sp_group,
@@ -1222,6 +1223,13 @@ class USPAttention(nn.Module):
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
         )
+        # Match the Ulysses tail path: masked query rows read as zeros. This
+        # rank's chunk covers global rows [rank*chunk, (rank+1)*chunk).
+        pad_from = (
+            int(attn_mask_meta["pad_start"]) - get_ring_parallel_rank() * out.shape[0]
+        )
+        if pad_from < out.shape[0]:
+            out[max(pad_from, 0) :].zero_()
         return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
 
     @staticmethod

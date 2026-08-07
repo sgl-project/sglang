@@ -32,9 +32,12 @@ class TestRingTailPadDispatch(unittest.TestCase):
 
         def fake_ring(qc, kc, vc, *, softmax_scale, real_seq_len, ring_ws):
             seen.update(
-                shape=tuple(qc.shape), real=real_seq_len, ws=ring_ws, scale=softmax_scale
+                shape=tuple(qc.shape),
+                real=real_seq_len,
+                ws=ring_ws,
+                scale=softmax_scale,
             )
-            return torch.zeros_like(qc)
+            return torch.ones_like(qc)
 
         with (
             patch(
@@ -43,9 +46,15 @@ class TestRingTailPadDispatch(unittest.TestCase):
             ),
             patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=4),
             patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=2),
-            patch(f"{_LAYER}._usp_input_all_to_all_qkv", side_effect=lambda q, k, v: (q, k, v)),
-            patch(f"{_LAYER}._usp_output_all_to_all", side_effect=lambda t, head_dim: t),
+            patch(
+                f"{_LAYER}._usp_input_all_to_all_qkv",
+                side_effect=lambda q, k, v: (q, k, v),
+            ),
+            patch(
+                f"{_LAYER}._usp_output_all_to_all", side_effect=lambda t, head_dim: t
+            ),
             patch(f"{_LAYER}._ring_attention_varlen", side_effect=fake_ring),
+            patch(f"{_LAYER}.get_ring_parallel_rank", return_value=3),
         ):
             out = obj.forward(q, q, q, attn_mask_meta=meta)
 
@@ -53,6 +62,9 @@ class TestRingTailPadDispatch(unittest.TestCase):
         self.assertEqual(seen["real"], 13)
         self.assertEqual(seen["ws"], 2)
         self.assertEqual(seen["shape"], (4, 2, 8))
+        # Last ring rank holds global rows [12, 16): row 13 onward is pad.
+        self.assertTrue(torch.all(out[0, 1:] == 0))
+        self.assertTrue(torch.all(out[0, :1] == 1))
 
     def test_explicit_mask_under_ring_still_refuses(self):
         obj = self._attn()
