@@ -620,7 +620,7 @@ sgl-eval run aime25 \\
 
     {
       match: { hw: "b300", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -628,8 +628,6 @@ sgl-eval run aime25 \\
         "--tp 4",
         "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algorithm DSPARK",
-        "--chunked-prefill-size 4096",
-        "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

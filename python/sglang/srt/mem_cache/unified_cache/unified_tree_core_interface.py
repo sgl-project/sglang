@@ -461,6 +461,15 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+        """Clear the in-flight H->D marks on the anchor's root path at ack time."""
+        ...
+
+    # Order-sensitive digest of write_back duplicate-reclaim victim ids,
+    # cross-checked across TP ranks; cores that never reclaim keep 0.
+    write_back_duplicate_reclaim_digest: int = 0
+
+    @abstractmethod
     def mark_write_through_pending(self, node_id: NodeId) -> None:
         """Mark a node as having an in-flight write-through backup."""
         ...
