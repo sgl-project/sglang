@@ -463,12 +463,26 @@ def _encode_item_policy_misses(
                 f"per-item embedding count {len(embeddings)} != "
                 f"cache-miss item count {len(items)}"
             )
-            split_embeddings = [
-                embedding.reshape(-1, embedding.shape[-1]) for embedding in embeddings
-            ]
+            split_embeddings = []
+            for item_hash, embedding, token_count in zip(
+                ordered_hashes, embeddings, token_counts
+            ):
+                embedding = embedding.reshape(-1, embedding.shape[-1])
+                if embedding.shape[0] != token_count:
+                    raise RuntimeError(
+                        f"item {item_hash} produced {embedding.shape[0]} "
+                        f"embedding tokens, expected {token_count}"
+                    )
+                split_embeddings.append(embedding)
             clone_cached_splits = False
         else:
             embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+            expected_tokens = sum(token_counts)
+            if embeddings.shape[0] != expected_tokens:
+                raise RuntimeError(
+                    f"item embedding batch produced {embeddings.shape[0]} tokens, "
+                    f"expected {expected_tokens}"
+                )
             split_embeddings = torch.split(embeddings, token_counts, dim=0)
             clone_cached_splits = len(items) > 1
 
@@ -530,10 +544,15 @@ def _resolve_item_policy_embeddings(
                 else None
             )
             if cached is not None:
-                hash_to_embedding[item.hash] = cached.embedding
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
-            else:
-                unique_misses[item.hash] = (item, token_count)
+                cached_embedding = cached.embedding.reshape(
+                    -1, cached.embedding.shape[-1]
+                )
+                if cached_embedding.shape[0] == token_count:
+                    hash_to_embedding[item.hash] = cached_embedding
+                    _acknowledge_deferred_cuda_ipc_cache_hits([item])
+                    continue
+                embedding_cache.free(item.hash, None)
+            unique_misses[item.hash] = (item, token_count)
 
     hash_to_embedding.update(
         _encode_item_policy_misses(data_embedding_func, unique_misses, device)

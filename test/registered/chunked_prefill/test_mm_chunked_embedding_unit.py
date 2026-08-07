@@ -329,6 +329,78 @@ def test_same_hash_requires_matching_item_policy_metadata():
             )
 
 
+@pytest.mark.parametrize("cached_token_count", [1, 3])
+def test_item_policy_reencodes_wrong_length_cache_hit(cached_token_count):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=6000,
+        feature=torch.zeros(1),
+        offsets=[(0, 1)],
+        encoder_batch_key=("audio",),
+    )
+    mm_schedule.embedding_cache.set(
+        item.hash,
+        mm_schedule.EmbeddingResult(embedding=torch.zeros(cached_token_count, HIDDEN)),
+    )
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=[item],
+        items_offset=[item.offsets[0]],
+        extend_prefix_len=0,
+        extend_seq_len=2,
+    )
+    encoder_calls = []
+
+    def encoder(items):
+        encoder_calls.append(len(items))
+        return _encoder_tensor(items)
+
+    embeddings = mm_schedule._resolve_item_policy_embeddings(encoder, [request], _CPU)
+
+    assert encoder_calls == [1]
+    assert embeddings[item.hash].shape == (2, HIDDEN)
+    assert mm_schedule.embedding_cache.get_single(item.hash).embedding.shape == (
+        2,
+        HIDDEN,
+    )
+
+
+@pytest.mark.parametrize("token_count", [1, 3])
+@pytest.mark.parametrize("returns_list", [False, True])
+def test_item_policy_rejects_wrong_length_encoder_result(token_count, returns_list):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=7000 + token_count,
+        feature=torch.zeros(1),
+        offsets=[(0, 1)],
+        encoder_batch_key=("audio",),
+    )
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=[item],
+        items_offset=[item.offsets[0]],
+        extend_prefix_len=0,
+        extend_seq_len=2,
+    )
+
+    output = torch.zeros(token_count, HIDDEN)
+    if returns_list:
+        output = [output]
+        expected_message = "embedding tokens, expected 2"
+    else:
+        expected_message = "embedding batch produced .* tokens, expected 2"
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        mm_schedule._resolve_item_policy_embeddings(
+            lambda _items: output,
+            [request],
+            _CPU,
+        )
+    assert not mm_schedule.embedding_cache.has(item.hash)
+
+
 if __name__ == "__main__":
     import sys
 

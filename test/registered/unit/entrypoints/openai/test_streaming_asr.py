@@ -270,6 +270,21 @@ class TestStreamingASR(CustomTestCase):
             "five",
         )
 
+    def test_encoder_window_handoff_echo_is_not_reemitted(self):
+        tokenizer_manager, processor, state = _encoder_window_processor("C D E")
+        state.transcript.emitted_text = "A B"
+        state.transcript.confirmed_text = "A B"
+        state.transcript.full_transcript = "A B C D"
+        state.audio.append_pcm(b"\x01\x00\x02\x00")
+
+        self.assertEqual(
+            _run(processor.process(state, is_last=False, sampling_params={})),
+            "",
+        )
+        self.assertEqual(tokenizer_manager.requests[0].text, "PROMPT:B C D")
+        self.assertEqual(state.decoder_suffix.pending_suffix, "C D E")
+        self.assertEqual(processor.flush_pending_transcript(state), "C D E")
+
     def test_encoder_window_mode_starts_only_after_the_audio_gate(self):
         tokenizer_manager, processor, state = _encoder_window_processor(
             "alpha beta", min_audio_sec=60.0

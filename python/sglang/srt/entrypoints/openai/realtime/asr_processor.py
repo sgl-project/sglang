@@ -431,6 +431,13 @@ class RealtimeASRProcessor:
             return _TranscriptionOutcome(audio_processed=False)
 
         if not state.encoder_window_active:
+            # The first continuation may replay only the un-emitted cumulative
+            # tail rather than the full decoder prefix. Prepend that tail once.
+            text = suffix_state.trim_prefix_echo(
+                text,
+                step.handoff_text,
+                trim_short_prefix=True,
+            )
             text = join_handoff_text(step.handoff_text, text)
 
         update = suffix_state.reconcile(
