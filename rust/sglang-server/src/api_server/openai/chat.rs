@@ -24,6 +24,8 @@ use futures::StreamExt;
 
 use super::super::guard::AbortGuard;
 use super::super::submit::submit_openai;
+use dynamo_protocols::types::CompletionUsage;
+
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
@@ -36,7 +38,7 @@ use super::{
     require_served_model, stream_include_usage, unix_seconds_u32,
 };
 use crate::ids::Rid;
-use crate::message::{ChunkExtras, GenerateRequest, OneOrMany, SamplingParams};
+use crate::message::{ChunkEvent, ChunkExtras, GenerateRequest, OneOrMany, SamplingParams};
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -138,9 +140,13 @@ async fn chat_completions(
     let stream = request.stream.unwrap_or(false);
     let n = request.n.unwrap_or(1) as usize;
     let want_logprobs = request.logprobs.unwrap_or(false);
-    let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
-    let stream_tool_choice = request.tool_choice.clone();
-    let uses_tool_call_structural_tag = sampling.structural_tag.is_some();
+    let tool_cfg = ToolCallConfig {
+        parser,
+        tools,
+        tool_choice: request.tool_choice.clone(),
+        uses_tool_call_structural_tag: sampling.structural_tag.is_some(),
+        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+    };
     let service_tier = request.service_tier;
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
@@ -187,22 +193,21 @@ async fn chat_completions(
         });
     }
 
+    let identity = ChatResponseIdentity {
+        response_id,
+        model,
+        created,
+        service_tier,
+    };
     if stream {
         let event_stream = chat_event_stream(
             submitted,
             guard,
-            response_id,
-            model,
-            created,
+            identity,
             want_logprobs,
             include_usage,
-            parser,
             reasoning_parser,
-            tools,
-            stream_tool_choice,
-            uses_tool_call_structural_tag,
-            parallel_tool_calls,
-            service_tier,
+            tool_cfg,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(event_stream).into_response()
@@ -210,15 +215,10 @@ async fn chat_completions(
         unary_chat(
             submitted,
             guard,
-            response_id,
-            model,
-            created,
+            identity,
             want_logprobs,
-            parser,
             reasoning_parser,
-            tools,
-            parallel_tool_calls,
-            service_tier,
+            tool_cfg,
         )
         .await
     }
@@ -371,20 +371,37 @@ pub(super) fn chat_sampling_params(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn unary_chat(
+/// Tool-calling knobs resolved once in the handler preamble. The stream path
+/// consumes all of them (the jail needs choice + structural-tag); the unary
+/// parser ignores `tool_choice`/`uses_tool_call_structural_tag`.
+struct ToolCallConfig {
+    parser: Option<String>,
+    tools: Option<Vec<ToolDefinition>>,
+    tool_choice: Option<ChatCompletionToolChoiceOption>,
+    uses_tool_call_structural_tag: bool,
+    parallel_tool_calls: bool,
+}
+
+async fn unary_chat(
     submitted: Vec<OpenAiChoice>,
     mut guard: AbortGuard,
-    response_id: String,
-    model: String,
-    created: u32,
+    identity: ChatResponseIdentity,
     want_logprobs: bool,
-    parser: Option<String>,
     reasoning_parser: Option<String>,
-    tools: Option<Vec<ToolDefinition>>,
-    parallel_tool_calls: bool,
-    service_tier: Option<ChatServiceTier>,
+    tool_cfg: ToolCallConfig,
 ) -> Response {
+    let ChatResponseIdentity {
+        response_id,
+        model,
+        created,
+        service_tier,
+    } = identity;
+    let ToolCallConfig {
+        parser,
+        tools,
+        parallel_tool_calls,
+        ..
+    } = tool_cfg;
     let (outputs, prompt_tokens, completion_tokens) =
         match collect_choices(submitted, &mut guard).await {
             Ok(collected) => collected,
@@ -447,197 +464,60 @@ pub(super) async fn unary_chat(
     .into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn chat_event_stream(
+fn chat_event_stream(
     submitted: Vec<OpenAiChoice>,
     guard: AbortGuard,
-    response_id: String,
-    model: String,
-    created: u32,
+    chunks: ChatResponseIdentity,
     want_logprobs: bool,
     include_usage: bool,
-    parser: Option<String>,
     reasoning_parser: Option<String>,
-    tools: Option<Vec<ToolDefinition>>,
-    tool_choice: Option<ChatCompletionToolChoiceOption>,
-    uses_tool_call_structural_tag: bool,
-    parallel_tool_calls: bool,
-    service_tier: Option<ChatServiceTier>,
+    tool_cfg: ToolCallConfig,
 ) -> impl futures::Stream<Item = String> {
+    let ToolCallConfig {
+        parser,
+        tools,
+        tool_choice,
+        uses_tool_call_structural_tag,
+        parallel_tool_calls,
+    } = tool_cfg;
     let count = submitted.len();
-    let raw = async_stream::stream! {
-        let count = submitted.len();
-        // One stateful reasoning splitter per choice (Python keeps a
-        // `reasoning_parser_dict` per index).
-        let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
-            if reasoning_parser.is_some() {
-                (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
-                    .collect()
-            } else {
-                vec![]
-            };
-        let reasoning_enabled = !reasoning_splitters.is_empty();
-
-        for choice in &submitted {
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id.clone(),
-                    choices: vec![ChatChoiceStream {
-                        index: u32::try_from(choice.index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, Some(Role::Assistant), None, None),
-                        finish_reason: None,
-                        logprobs: None,
-                    }],
-                    created,
-                    model: model.clone(),
-                    service_tier: service_tier.clone(),
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: None,
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
-        }
-
-        let steps = choice_step_stream(submitted, guard);
-        futures::pin_mut!(steps);
-        while let Some(step) = steps.next().await {
-            let (index, output) = match step {
-                ChoiceStep::Error(payload) => {
-                    yield Annotated {
-                        data: None,
-                        id: None,
-                        event: None,
-                        comment: None,
-                        error: Some(payload),
-                    };
-                    continue;
-                }
-                ChoiceStep::Usage { prompt_tokens, completion_tokens } => {
-                    if include_usage {
-                        yield Annotated {
-                            data: Some(CreateChatCompletionStreamResponse {
-                                id: response_id.clone(),
-                                choices: vec![],
-                                created,
-                                model: model.clone(),
-                                service_tier: service_tier.clone(),
-                                system_fingerprint: None,
-                                object: "chat.completion.chunk".into(),
-                                usage: Some(completion_usage(
-                                    prompt_tokens,
-                                    u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                                )),
-                            }),
-                            id: None,
-                            event: None,
-                            comment: None,
-                            error: None,
-                        };
-                    }
-                    continue;
-                }
-                ChoiceStep::Output { index, output, .. } => (index, output),
-            };
-            let finish_reason = chat_finish_reason(&output);
-            // Split the step's text into (reasoning, normal) deltas when
-            // `--reasoning-parser` is set. Mirrors Python's per-step emission:
-            // reasoning chunk first (logprobs ride it), then the content chunk.
-            let mut emitted = Vec::with_capacity(2);
-            if reasoning_enabled {
-                let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
-                let mut remaining_logprobs =
-                    want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-                if !reasoning_text.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(reasoning_text)),
-                        finish_reason: None,
-                        logprobs: remaining_logprobs.clone(),
-                    });
-                    remaining_logprobs = None;
-                }
-                if !normal_text.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(normal_text), None, None, None),
-                        finish_reason: None,
-                        logprobs: remaining_logprobs,
-                    });
-                }
-            } else {
-                emitted.push(ChatChoiceStream {
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    delta: chat_delta(
-                        (!output.text.is_empty()).then_some(output.text),
-                        None,
-                        None,
-                        None,
-                    ),
-                    finish_reason: None,
-                    logprobs: want_logprobs.then(|| chat_logprobs(output.extras.as_deref())),
-                });
-            };
-            // Flush the choice's buffered reasoning tail before its terminal
-            // frame (Python `parse_stream_end`, which skips aborts — abort
-            // frames already became error chunks above). Both columns flush:
-            // some parsers buffer the answer text until EOF.
-            if reasoning_enabled && finish_reason.is_some() {
-                let (reasoning_tail, normal_tail) = reasoning_splitters[index].finish();
-                if !reasoning_tail.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(reasoning_tail)),
-                        finish_reason: None,
-                        logprobs: None,
-                    });
-                }
-                if !normal_tail.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(normal_tail), None, None, None),
-                        finish_reason: None,
-                        logprobs: None,
-                    });
-                }
-            }
-            // The finish reason rides the last emitted chunk (the wire format
-            // the equivalence tests pin); a step whose text was entirely
-            // buffered inside the parser still gets a finish-only frame.
-            match emitted.last_mut() {
-                Some(last) => last.finish_reason = finish_reason,
-                None => emitted.push(ChatChoiceStream {
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    delta: chat_delta(None, None, None, None),
-                    finish_reason,
-                    logprobs: None,
-                }),
-            }
-            for choice in emitted {
-                yield Annotated {
-                    data: Some(CreateChatCompletionStreamResponse {
-                        id: response_id.clone(),
-                        choices: vec![choice],
-                        created,
-                        model: model.clone(),
-                        service_tier: service_tier.clone(),
-                        system_fingerprint: None,
-                        object: "chat.completion.chunk".into(),
-                        usage: None,
-                    }),
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: None,
-                };
-            }
-        }
+    // One stateful reasoning splitter per choice (Python keeps a
+    // `reasoning_parser_dict` per index); empty when no parser is set. Built
+    // out here and moved into the stream — the parser string never needs to.
+    let mut reasoning_splitters: Vec<ReasoningStreamSplitter> = if reasoning_parser.is_some() {
+        (0..count)
+            .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
+            .collect()
+    } else {
+        vec![]
     };
+    let role_preamble: Vec<_> = submitted
+        .iter()
+        .map(|choice| {
+            chunks.chunk(
+                vec![ChatChoiceStream {
+                    index: u32::try_from(choice.index).unwrap_or(u32::MAX),
+                    delta: chat_delta(None, Some(Role::Assistant), None, None),
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                None,
+            )
+        })
+        .collect();
+    // Assistant-role deltas first, then every driver step rendered to its
+    // wire chunks — plain stream combinators, no generator blocks.
+    let raw = futures::stream::iter(role_preamble).chain(
+        choice_step_stream(submitted, guard).flat_map(move |step| {
+            futures::stream::iter(render_chat_step(
+                step,
+                &mut reasoning_splitters,
+                &chunks,
+                include_usage,
+                want_logprobs,
+            ))
+        }),
+    );
 
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
@@ -653,37 +533,216 @@ pub(super) fn chat_event_stream(
         Box::pin(raw)
     };
 
-    async_stream::stream! {
-        let mut tool_calls_seen = vec![false; count];
-        futures::pin_mut!(parsed);
-        while let Some(mut item) = parsed.next().await {
-            if let Some(response) = item.data.as_mut() {
+    let mut tool_calls_seen = vec![false; count];
+    parsed
+        .filter_map(move |mut item| {
+            let rendered = if let Some(response) = item.data.as_mut() {
                 if !parallel_tool_calls {
-                    for choice in &mut response.choices {
-                        let index = choice.index as usize;
-                        if let Some(calls) = choice.delta.tool_calls.as_mut() {
-                            if tool_calls_seen.get(index).copied().unwrap_or(false) {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                                if !calls.is_empty()
-                                    && let Some(seen) = tool_calls_seen.get_mut(index)
-                                {
-                                    *seen = true;
-                                }
-                            }
-                            if calls.is_empty() {
-                                choice.delta.tool_calls = None;
-                            }
-                        }
-                    }
+                    enforce_single_tool_call(response, &mut tool_calls_seen);
                 }
-                yield serialize_chat_stream_response(response.clone());
-            } else if let Some(error) = item.error {
-                yield error;
+                Some(serialize_chat_stream_response(response.clone()))
+            } else {
+                item.error
+            };
+            futures::future::ready(rendered)
+        })
+        .chain(futures::stream::once(futures::future::ready(
+            "[DONE]".to_string(),
+        )))
+}
+
+/// Render one driver step into zero or more wire chunk envelopes. Pure and
+/// synchronous — the stream layer above is plumbing only.
+fn render_chat_step(
+    step: ChoiceStep,
+    reasoning_splitters: &mut [ReasoningStreamSplitter],
+    chunks: &ChatResponseIdentity,
+    include_usage: bool,
+    want_logprobs: bool,
+) -> Vec<Annotated<CreateChatCompletionStreamResponse>> {
+    match step {
+        ChoiceStep::Error(payload) => vec![ChatResponseIdentity::error(payload)],
+        ChoiceStep::Usage {
+            prompt_tokens,
+            completion_tokens,
+        } => {
+            if include_usage {
+                vec![chunks.chunk(
+                    vec![],
+                    Some(completion_usage(
+                        prompt_tokens,
+                        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                    )),
+                )]
+            } else {
+                vec![]
             }
         }
-        yield "[DONE]".to_string();
+        ChoiceStep::Output { index, output, .. } => chat_output_chunks(
+            index,
+            output,
+            reasoning_splitters.get_mut(index),
+            want_logprobs,
+        )
+        .into_iter()
+        .map(|choice| chunks.chunk(vec![choice], None))
+        .collect(),
+    }
+}
+
+/// The per-response identity constants (`id`/`model`/`created`/tier). The
+/// unary path stamps them onto the final response; the stream path stamps
+/// them onto every chunk envelope via `chunk` (Python rebuilds the same
+/// envelope inline at each yield site).
+struct ChatResponseIdentity {
+    response_id: String,
+    model: String,
+    created: u32,
+    service_tier: Option<ChatServiceTier>,
+}
+
+impl ChatResponseIdentity {
+    fn chunk(
+        &self,
+        choices: Vec<ChatChoiceStream>,
+        usage: Option<CompletionUsage>,
+    ) -> Annotated<CreateChatCompletionStreamResponse> {
+        Annotated {
+            data: Some(CreateChatCompletionStreamResponse {
+                id: self.response_id.clone(),
+                choices,
+                created: self.created,
+                model: self.model.clone(),
+                service_tier: self.service_tier.clone(),
+                system_fingerprint: None,
+                object: "chat.completion.chunk".into(),
+                usage,
+            }),
+            id: None,
+            event: None,
+            comment: None,
+            error: None,
+        }
+    }
+
+    /// An in-band error frame (the payload is already OpenAI-shaped by the
+    /// step driver).
+    fn error(payload: String) -> Annotated<CreateChatCompletionStreamResponse> {
+        Annotated {
+            data: None,
+            id: None,
+            event: None,
+            comment: None,
+            error: Some(payload),
+        }
+    }
+}
+
+/// Render one generation step into its wire chunks. With a reasoning splitter:
+/// the step's text splits into (reasoning, normal) deltas — reasoning first,
+/// logprobs ride the first emitted chunk — and the terminal step flushes the
+/// splitter's buffered tails (Python `parse_stream_end`; abort frames already
+/// became error chunks in the driver). The finish reason rides the LAST chunk
+/// (the wire format the equivalence tests pin); a step whose text was entirely
+/// buffered inside the parser still gets a finish-only frame.
+fn chat_output_chunks(
+    index: usize,
+    output: ChunkEvent,
+    splitter: Option<&mut ReasoningStreamSplitter>,
+    want_logprobs: bool,
+) -> Vec<ChatChoiceStream> {
+    let wire_index = u32::try_from(index).unwrap_or(u32::MAX);
+    let finish_reason = chat_finish_reason(&output);
+    let mut emitted = Vec::with_capacity(2);
+    if let Some(splitter) = splitter {
+        let (reasoning_text, normal_text) = splitter.split(&output.text, &output.token_ids);
+        let mut remaining_logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
+        if !reasoning_text.is_empty() {
+            emitted.push(ChatChoiceStream {
+                index: wire_index,
+                delta: chat_delta(None, None, None, Some(reasoning_text)),
+                finish_reason: None,
+                logprobs: remaining_logprobs.clone(),
+            });
+            remaining_logprobs = None;
+        }
+        if !normal_text.is_empty() {
+            emitted.push(ChatChoiceStream {
+                index: wire_index,
+                delta: chat_delta(Some(normal_text), None, None, None),
+                finish_reason: None,
+                logprobs: remaining_logprobs,
+            });
+        }
+        // Both columns flush: some parsers buffer the answer text until EOF.
+        if finish_reason.is_some() {
+            let (reasoning_tail, normal_tail) = splitter.finish();
+            if !reasoning_tail.is_empty() {
+                emitted.push(ChatChoiceStream {
+                    index: wire_index,
+                    delta: chat_delta(None, None, None, Some(reasoning_tail)),
+                    finish_reason: None,
+                    logprobs: None,
+                });
+            }
+            if !normal_tail.is_empty() {
+                emitted.push(ChatChoiceStream {
+                    index: wire_index,
+                    delta: chat_delta(Some(normal_tail), None, None, None),
+                    finish_reason: None,
+                    logprobs: None,
+                });
+            }
+        }
+    } else {
+        emitted.push(ChatChoiceStream {
+            index: wire_index,
+            delta: chat_delta(
+                (!output.text.is_empty()).then_some(output.text),
+                None,
+                None,
+                None,
+            ),
+            finish_reason: None,
+            logprobs: want_logprobs.then(|| chat_logprobs(output.extras.as_deref())),
+        });
+    }
+    match emitted.last_mut() {
+        Some(last) => last.finish_reason = finish_reason,
+        None => emitted.push(ChatChoiceStream {
+            index: wire_index,
+            delta: chat_delta(None, None, None, None),
+            finish_reason,
+            logprobs: None,
+        }),
+    }
+    emitted
+}
+
+/// `parallel_tool_calls: false`: keep only the first tool call of the whole
+/// stream per choice — truncate the first delta's list to one, drop every
+/// later delta's calls (Python applies the same rule after the jail).
+fn enforce_single_tool_call(
+    response: &mut CreateChatCompletionStreamResponse,
+    tool_calls_seen: &mut [bool],
+) {
+    for choice in &mut response.choices {
+        let index = choice.index as usize;
+        if let Some(calls) = choice.delta.tool_calls.as_mut() {
+            if tool_calls_seen.get(index).copied().unwrap_or(false) {
+                calls.clear();
+            } else {
+                calls.truncate(1);
+                if !calls.is_empty()
+                    && let Some(seen) = tool_calls_seen.get_mut(index)
+                {
+                    *seen = true;
+                }
+            }
+            if calls.is_empty() {
+                choice.delta.tool_calls = None;
+            }
+        }
     }
 }
 
@@ -755,8 +814,8 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        ChatResponseIdentity, SamplingDefaults, ToolCallConfig, chat_event_stream, chat_logprobs,
+        chat_sampling_params, merge_template_stops, unary_chat,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
@@ -764,6 +823,25 @@ mod tests {
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
+
+    fn test_identity() -> ChatResponseIdentity {
+        ChatResponseIdentity {
+            response_id: "chatcmpl-test".into(),
+            model: "model".into(),
+            created: 1,
+            service_tier: None,
+        }
+    }
+
+    fn no_tools() -> ToolCallConfig {
+        ToolCallConfig {
+            parser: None,
+            tools: None,
+            tool_choice: None,
+            uses_tool_call_structural_tag: false,
+            parallel_tool_calls: true,
+        }
+    }
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -939,15 +1017,10 @@ mod tests {
         let response = unary_chat(
             vec![choice0, choice1],
             AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
+            test_identity(),
             false,
             None,
-            None,
-            None,
-            true,
-            None,
+            no_tools(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -976,15 +1049,10 @@ mod tests {
         let response = unary_chat(
             vec![choice],
             AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
+            test_identity(),
             false,
-            None,
             Some("deepseek-r1".into()),
-            None,
-            true,
-            None,
+            no_tools(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1014,18 +1082,11 @@ mod tests {
         let stream = chat_event_stream(
             vec![choice],
             AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
+            test_identity(),
             false,
             true,
-            None,
             Some("deepseek-r1".into()),
-            None,
-            None,
-            false,
-            true,
-            None,
+            no_tools(),
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;
@@ -1060,18 +1121,11 @@ mod tests {
         let stream = chat_event_stream(
             vec![choice],
             AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
+            test_identity(),
             false,
             true,
             None,
-            None,
-            None,
-            None,
-            false,
-            true,
-            None,
+            no_tools(),
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;
