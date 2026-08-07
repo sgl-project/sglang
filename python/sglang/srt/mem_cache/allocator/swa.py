@@ -5,7 +5,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import get_bool_env_var, get_num_new_pages
 
 _is_npu = is_npu()
 
@@ -96,6 +96,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.swa_segment_group = []
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         self._kvcache = kvcache
         self.clear()
@@ -363,9 +365,52 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Fixed-shape counterpart of free_swa(): no output shape depends on
+        device data, so the call stays a pure async launch.
+
+        Contract beyond base: ``start_pos`` is page aligned and every page the
+        slice touches still has a live SWA mapping (the caller owns the range and
+        has not freed it) -- ranges that may be dead keep using ``free_swa``. A
+        free group queues owned values, not the caller's view, so the row may be
+        rewritten before the group closes.
+        """
+        if free_index.numel() == 0:
+            return
+
+        ps = self.page_size
+        assert start_pos % ps == 0, f"{start_pos=} must be page aligned"
+
+        full_reps = free_index[::ps]
+        swa_reps = self.full_to_swa_index_mapping[full_reps]
+        page_starts = (full_reps.to(torch.int64) // ps) * ps
+        if self.debug_mode:
+            assert bool(
+                (swa_reps > 0).all()
+            ), "free_swa_segment on a range whose SWA mapping is already dead"
+
+        if self.is_not_in_free_group:
+            self.swa_attn_allocator.free_page_reps(swa_reps)
+            self._clear_mapping_pages(page_starts)
+        else:
+            self.swa_segment_group.append((swa_reps, page_starts))
+
+    def _clear_mapping_pages(self, page_starts: torch.Tensor) -> None:
+        """Zero the mapping for each whole page. index_fill_ rather than
+        ``mapping[idx] = 0``: the scalar setitem form synchronizes on CUDA."""
+        ps = self.page_size
+        if ps == 1:
+            self.full_to_swa_index_mapping.index_fill_(0, page_starts, 0)
+            return
+        offsets = torch.arange(ps, dtype=torch.int64, device=page_starts.device)
+        self.full_to_swa_index_mapping.index_fill_(
+            0, (page_starts[:, None] + offsets[None, :]).reshape(-1), 0
+        )
+
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
+        self.swa_segment_group = []
 
     def free_group_end(self):
         super().free_group_end()
@@ -373,6 +418,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
             self.free_swa(torch.cat(swa_free_group))
+        if self.swa_segment_group:
+            segments = self.swa_segment_group
+            self.swa_segment_group = []
+            self.swa_attn_allocator.free_page_reps(
+                torch.cat([swa_reps for swa_reps, _ in segments])
+            )
+            self._clear_mapping_pages(
+                torch.cat([page_starts for _, page_starts in segments])
+            )
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
@@ -403,6 +457,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.swa_segment_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -454,6 +509,8 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.swa_segment_group = []
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         self._kvcache = kvcache
         self.swa_attn_allocator.clear()
@@ -511,17 +568,38 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             self.free_group.append(free_index)
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """full == swa and the mapping is a constant identity table: a slot is its
+        own SWA rep and the table is never zeroed. With no gather to produce an
+        owned value, a group snapshots rather than hold the caller's view."""
+        if free_index.numel() == 0:
+            return
+        if self.debug_mode:
+            assert bool(
+                (free_index > 0).all()
+            ), "free_swa_segment on the padding slot 0"
+        if self.is_not_in_free_group:
+            self.swa_attn_allocator.free_page_reps(free_index)
+        else:
+            self.swa_segment_group.append(free_index.clone())
+
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
+        self.swa_segment_group = []
 
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
             self.free(torch.cat(self.free_group))
         self.free_group = []
+        if self.swa_segment_group:
+            segments = self.swa_segment_group
+            self.swa_segment_group = []
+            self.swa_attn_allocator.free_page_reps(torch.cat(segments))
 
     def clear(self):
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.swa_segment_group = []

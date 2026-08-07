@@ -259,6 +259,48 @@ class TestSWA(unittest.TestCase):
             available_before_free + all_indices.numel(),
         )
 
+    def test_free_swa_segment_matches_free_swa_via_real_alloc_extend(self):
+        # The CPU suite builds the full <-> swa mapping by hand (alloc_extend needs
+        # triton); here it comes from the real alloc_extend, so a wrong assumption
+        # about the page layout shows up. start=0 and an interior start.
+        page_size, num_tokens = 4, 12
+        for start in (0, page_size):
+            fast, fast_row = self._alloc_extend_row(page_size, num_tokens)
+            legacy, legacy_row = self._alloc_extend_row(page_size, num_tokens)
+
+            fast.free_swa_segment(fast_row[start:], start_pos=start)
+            legacy.free_swa(legacy_row[start:])
+
+            self.assertEqual(
+                fast.swa_available_size(), legacy.swa_available_size(), f"{start=}"
+            )
+            self.assertTrue(
+                torch.equal(
+                    fast.full_to_swa_index_mapping, legacy.full_to_swa_index_mapping
+                ),
+                f"{start=}",
+            )
+
+    def _alloc_extend_row(self, page_size, num_tokens):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16 * page_size,
+            kv_size_swa=16 * page_size,
+            sliding_window_size=page_size,
+        )
+        device = allocator.device
+        row = allocator.alloc_extend(
+            prefix_lens=torch.zeros(1, dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.zeros(1, dtype=torch.int64),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=num_tokens,
+        )
+        assert row is not None
+        return allocator, row
+
     def test_swa_radix_cache_1(self):
         # args
         req_size = 10

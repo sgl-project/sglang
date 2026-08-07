@@ -3233,51 +3233,56 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
             self.token_to_kv_pool_allocator.free_group_begin()
-            for idx, req in enumerate(self.reqs):
-                if self.forward_mode.is_decode():
-                    # We set evict_swa condition here with two reasons:
-                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval iterations to reduce the overhead.
-                    if swa_maintenance_step and req.decode_batch_idx >= 1:
-                        self._evict_swa(req, req.seqlen - 1)
+            try:
+                for idx, req in enumerate(self.reqs):
+                    if self.forward_mode.is_decode():
+                        # We set evict_swa condition here with two reasons:
+                        # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
+                        # 2. Evict swa every eviction_interval iterations to reduce the overhead.
+                        if swa_maintenance_step and req.decode_batch_idx >= 1:
+                            self._evict_swa(req, req.seqlen - 1)
 
-                    # DSV4-NPU only (no-op elsewhere): the small paged compress-state
-                    # pool must drain every decode step, independent of SWA cadence.
-                    maybe_evict_dsv4_state(self, req, req.seqlen - 1)
+                        # DSV4-NPU only (no-op elsewhere): the small paged compress-state
+                        # pool must drain every decode step, independent of SWA cadence.
+                        maybe_evict_dsv4_state(self, req, req.seqlen - 1)
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
-                    if (
-                        release_leaf_lock
-                        and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
-                        and req.last_node is not None
-                        and req.decode_batch_idx >= sliding_window_size
-                    ):
-                        self.tree_cache.dec_swa_lock_only(
-                            req.last_node,
-                            req.swa_uuid_for_lock,
-                            skip_lock_node_ids=req.skip_lock_node_ids,
-                        )
-                        req.swa_prefix_lock_released = True
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
-                    pre_len = self.prefix_lens[idx]
-                    if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
-                        if req.extend_batch_idx < 2:
-                            continue
-                        else:
-                            pre_len = (
-                                pre_len - get_schedule().chunked_prefill_size
-                                if get_schedule().chunked_prefill_size > 0
-                                else pre_len
+                        # Once the decode position has moved past the sliding window,
+                        # the SWA portion of the prefill-time tree lock is no longer
+                        # needed by this request. Convert it from protected to
+                        # evictable so SWA LRU can reclaim it under pressure.
+                        if (
+                            release_leaf_lock
+                            and not req.swa_prefix_lock_released
+                            and req.swa_uuid_for_lock is not None
+                            and req.last_node is not None
+                            and req.decode_batch_idx >= sliding_window_size
+                        ):
+                            self.tree_cache.dec_swa_lock_only(
+                                req.last_node,
+                                req.swa_uuid_for_lock,
+                                skip_lock_node_ids=req.skip_lock_node_ids,
                             )
+                            req.swa_prefix_lock_released = True
+                    elif (
+                        self.forward_mode.is_extend()
+                        and self.tree_cache.is_chunk_cache()
+                    ):
+                        pre_len = self.prefix_lens[idx]
+                        if self.enable_overlap:
+                            # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                            if req.extend_batch_idx < 2:
+                                continue
+                            else:
+                                pre_len = (
+                                    pre_len - get_schedule().chunked_prefill_size
+                                    if get_schedule().chunked_prefill_size > 0
+                                    else pre_len
+                                )
+                                self._evict_swa(req, pre_len)
+                        else:
                             self._evict_swa(req, pre_len)
-                    else:
-                        self._evict_swa(req, pre_len)
-            self.token_to_kv_pool_allocator.free_group_end()
+            finally:
+                self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"

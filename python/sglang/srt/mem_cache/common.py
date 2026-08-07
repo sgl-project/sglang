@@ -88,7 +88,11 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa(free_slots)
+        # Contract holds: both ends are page aligned (swa_evicted_seqlen only ever
+        # advances to an aligned value), and the range is what this req kept alive.
+        token_to_kv_pool_allocator.free_swa_segment(
+            free_slots, start_pos=req.kv.swa_evicted_seqlen
+        )
         maybe_evict_dsv4_state_on_swa(
             token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
         )
