@@ -8,6 +8,7 @@ composition rule rather than a hand-copy of it.
 """
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -44,15 +45,18 @@ class TestLagunaRopeScaling(CustomTestCase):
                 "attention_factor": attention_factor,
             }
         )
-        emb = get_rope(
-            128,
-            rotary_dim=128,
-            max_position=262144,
-            base=500000,
-            rope_scaling=rope_scaling,
-            partial_rotary_factor=0.5,
-            dtype=torch.float32,
-        )
+        # Pose as the CPU engine: RotaryEmbedding.__init__ otherwise hard-imports
+        # vllm on the GPU-less CI runners. No kernel or forward is used here.
+        with mock.patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True):
+            emb = get_rope(
+                128,
+                rotary_dim=128,
+                max_position=262144,
+                base=500000,
+                rope_scaling=rope_scaling,
+                partial_rotary_factor=0.5,
+                dtype=torch.float32,
+            )
         return float(emb.mscale)
 
     def test_s_mscale_matches_hf(self):
