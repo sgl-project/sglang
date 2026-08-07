@@ -171,9 +171,7 @@ def _use_output_workspace_view() -> bool:
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
-    combine_dtype = (
-        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
-    )
+    combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
     if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
         raise ValueError(
             "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
@@ -587,13 +585,12 @@ def run_flashinfer_megamoe(
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
     )
-    with torch.inference_mode():
-        if _use_output_workspace_view() and getattr(mega, "supports_output_view", False):
-            y = mega.forward(t, return_workspace_view=True)
-        else:
-            # Keep compatibility with older MegaMoE implementations that do
-            # not expose the workspace-view capability.
-            y = mega.forward(t)
+    if _use_output_workspace_view() and getattr(mega, "supports_output_view", False):
+        y = mega.forward(t, return_workspace_view=True)
+    else:
+        # Keep compatibility with older MegaMoE implementations that do
+        # not expose the workspace-view capability.
+        y = mega.forward(t)
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor
