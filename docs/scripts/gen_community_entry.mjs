@@ -4,33 +4,13 @@
 //   node docs/scripts/gen_community_entry.mjs --pr 31006
 //   node docs/scripts/gen_community_entry.mjs --pr 31006 --repo sgl-project/sglang
 //
-// Why this exists: a community entry's config and benchmarks must be BYTE-FAITHFUL to
-// what the contributor actually ran. Hand-transcribing a diff into the data file works
-// right up until it doesn't, and a silently mistyped flag or throughput number is
-// exactly the failure this section is supposed to prevent. So everything mechanical is
-// extracted here. The ONLY field a human writes is `source.org` — GitHub does not know
-// a contributor's affiliation.
+// Config files are plain `export const config = {...}` data modules, so head and base
+// are imported and compared as OBJECTS — cells at head but not base are the
+// contribution. Immune to diff formatting, unlike a regex over `gh pr diff`.
 //
-// How it extracts (structural, not textual): the cookbook config files are plain
-// `export const config = {...}` data modules, so both the PR-head and base versions can
-// be imported and compared as OBJECTS. Cells present at head but absent at base are the
-// contribution. This is immune to diff-hunk formatting, reordering, and context lines —
-// a regex over `gh pr diff` is not.
-//
-// What each generated field is derived from:
-//   flags, env          the added cell, verbatim
-//   modelName           head config `modelNames[hw|variant|quant]` → `[variant|quant]`
-//   dockerImage         head config `dockerImages[hw|quant|strategy]` → `[hw|quant]` → `[hw]`
-//   hardware            the hw entry's label + vram, from the PR's `config.hardware`
-//                       addition, else the shared HARDWARE_CATALOG in _deployment.jsx.
-//                       GPU MODEL ONLY — the card derives the count from --tp × --nnodes
-//   sglangVersion       the added benchmarks entry's `sglang_version`
-//   (benchmark numbers are NOT extracted — they stay in the PR; the section shows the
-//    config and links there)
-//   source              PR number/url + author login; `org` is emitted as "TODO"
-//   reportedAt          the PR's last-updated date
-//   title               "<hw> · <QUANT> · <strategy>", the chip label when a PR
-//                       contributes several configs
+// flags/env come off the cell verbatim; modelName, dockerImage and hardware replay the
+// engine's own lookup chains. Benchmark numbers are not extracted — they stay in the PR.
+// The only field a human writes is `source.org`.
 //
 // Requires `gh` authenticated. Read-only: prints to stdout, writes nothing.
 
@@ -64,8 +44,7 @@ const baseSha = pr.base.sha;
 const files = ghJson("api", `repos/${REPO}/pulls/${PR}/files`, "--paginate")
   .map((f) => f.filename);
 
-// The cookbook config path moved docs_new/ → docs/ mid-2026, so a PR opened before the
-// move names the old prefix. Match on the tail rather than the full path.
+// Match on the tail: the path moved docs_new/ → docs/ mid-2026.
 const configPath = files.find((f) =>
   /src\/snippets\/configs\/.+\.jsx$/.test(f)
   && !f.includes("benchmark") && !f.endsWith("-community.jsx"));
@@ -122,8 +101,8 @@ const benchFor = (match) => {
 };
 
 // ------------------------------------------------------------------ hardware label
-// Prefer the PR's own `config.hardware` addition; fall back to the shared catalog in
-// _deployment.jsx, sliced out of the source and evaluated (a plain object literal).
+// Prefer the PR's `config.hardware` addition; else the shared catalog, sliced out of
+// _deployment.jsx source (a plain object literal).
 const sharedCatalog = (() => {
   const src = readFileSync(join(SNIPPETS, "_deployment.jsx"), "utf8");
   const start = src.indexOf("const HARDWARE_CATALOG = {");
@@ -166,9 +145,7 @@ const slug = (m) => [m.hw, m.quant, m.strategy].filter(Boolean).join("-");
 const lines = [];
 const warnings = [];
 
-// One CONTRIBUTION per PR, holding every config that PR added. Grouping by PR is the
-// shape the section renders: a reader browsing community work wants a PR's configs
-// together under the credit and link they came from.
+// One contribution per PR, holding every config that PR added.
 lines.push(`  // GENERATED from PR #${PR} — ${headRepo}@${headSha.slice(0, 7)}`);
 lines.push(`  {`);
 lines.push(`    source: {`);
@@ -193,8 +170,7 @@ for (const cell of addedCells) {
   if (bench && !bench.sglang_version) warnings.push(`benchmarks entry for ${slug(m)} has no sglang_version`);
   if (cell.verified) warnings.push(`cell ${slug(m)} carries verified:true — dropped, community configs are not team-verified`);
 
-  // The chip label when a PR contributes several configs, so it must be SHORT: the
-  // hardware and checkpoint already render on the identity line beside it.
+  // Chip label when a PR has several configs — keep it short.
   const title = [
     hw.text ? hw.text.replace(/^(NVIDIA|AMD) /, "").replace(/ \(.*\)$/, "") : m.hw,
     m.quant ? String(m.quant).toUpperCase() : null,

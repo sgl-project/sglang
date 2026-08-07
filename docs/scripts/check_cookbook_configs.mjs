@@ -203,14 +203,10 @@ for (const path of walk(CONFIGS)) {
 }
 
 // ----------------------------------------------------------- 5. Community configs
-// Community entries never enter the cell matrix, so the matrix checks above do not
-// apply. The unit is a CONTRIBUTION (one PR) holding that PR's configs. What matters is
-// that every config can be attributed and reproduced: a config missing its PR link,
-// author, hardware or version is a command nobody is accountable for, which is the
-// failure mode the section exists to avoid.
-//
-// Retired fields are rejected BY NAME so an entry written against an older draft fails
-// loudly instead of silently rendering nothing.
+// Community entries never enter the cell matrix. The unit is a contribution (one PR)
+// holding that PR's configs; every config must be attributable (PR link, author,
+// hardware, version). Retired fields are rejected by name so an entry written against
+// an older draft fails loudly instead of rendering nothing.
 const RETIRED_ENTRY = {
   status: "the status taxonomy was dropped — the section intro states these are not team-reproduced",
   caveats: "dropped — discussion of a config's caveats lives in the linked PR",

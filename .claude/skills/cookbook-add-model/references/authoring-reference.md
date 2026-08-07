@@ -328,8 +328,51 @@ export const community = [
 **Do not hand-write this file.** Generate each block from the contribution PR:
 
 ```bash
-node docs/scripts/gen_community_entry.mjs --pr 31006
+node docs/scripts/gen_community_entry.mjs --pr 31006      # --repo defaults to sgl-project/sglang
 ```
+
+It prints a pasteable block to stdout and writes nothing; warnings go to stderr, so
+`> block.js` captures clean JS. Needs an authenticated `gh`; no npm deps. Worked
+example, against PR #31006:
+
+```js
+  // GENERATED from PR #31006 — yiminghub2024/sglang@87f9dc2
+  {
+    source: {
+      label: "PR #31006", url: "https://github.com/sgl-project/sglang/pull/31006",
+      author: "yiminghub2024", org: "TODO",
+      authorUrl: "https://github.com/yiminghub2024",
+    },
+    reportedAt: "2026-07-24",
+    configs: [
+      {
+        id: "h20-w4afp8-low-latency",
+        title: "H20 · W4AFP8 · low-latency",
+        hardware: "NVIDIA H20 (96GB)",   // from config.hardware (added by this PR)
+        modelName: "PhalaCloud/GLM-5.2-W4AFP8",
+        sglangVersion: "0.5.14",
+        dockerImage: "lmsysorg/sglang:v0.5.14",
+        env: [],
+        flags: [
+          "--model-path {{MODEL_NAME}}", "--tp 8",
+          "--speculative-algorithm EAGLE", "--speculative-num-steps 5",
+          /* … 8 more, verbatim from the cell … */
+          "--host {{HOST_IP}}", "--port {{PORT}}",
+        ],
+      },
+    ],
+  },
+```
+
+```
+1 thing(s) needing a human:
+  - cell h20-w4afp8-low-latency carries verified:true — dropped, community configs are not team-verified
+```
+
+Paste the block into the array, replace `org: "TODO"`, run
+`node docs/scripts/check_cookbook_configs.mjs`. That card then renders as
+`8× NVIDIA H20 (96GB)` (from `--tp 8 × --nnodes 1`) with the knob line
+`W4AFP8 · EAGLE 5-1-6 · prefill CP8 · mem-fraction 0.8`, both computed from `flags`.
 
 The generator imports the PR's config + benchmarks files as *objects* at both the PR
 head and its base and structurally diffs them, so `flags` / `env` / `modelName` /
@@ -351,12 +394,15 @@ them by name so an entry written against an older draft fails loudly:
 - **`status` / `caveats` / `editorNotes`** — no trust taxonomy and no editorial
   layer. Caveats, review, and discussion live in the linked PR.
 
-MDX, as the **last** section on the page:
+MDX, as the **last** section on the page. Keep the intro to one sentence — introduce
+the feature and point at the PR. Do **not** restate the trust framing (not team-
+verified, see the PR for caveats) on every model page: that belongs here in the skill,
+not duplicated into each cookbook:
 
 ```mdx
 ## Community Configs
 
-[one sentence: contributed, not part of the verified matrix, see the PR]
+Deployment configs contributed by the community. See the linked PR for benchmarks and discussion.
 
 import { CommunityConfigs } from "/src/snippets/_community.jsx";
 import { community }        from "/src/snippets/configs/<org>/<model>-community.jsx";
