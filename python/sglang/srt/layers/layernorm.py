@@ -203,8 +203,10 @@ def _forward_with_allreduce_fusion(
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
-            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-            if _use_aiter:
+            # Prefer the communicator-native fused AR+RMSNorm when one exists
+            # (AITER on AMD, b12x on SM120); both go through the same coordinator
+            # entry point, which returns None when the fused path does not apply.
+            if _use_aiter or envs.SGLANG_B12X_PCIE_AR.get():
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, residual, weight, norm_module.variance_epsilon
                 )
@@ -224,6 +226,12 @@ def _forward_with_allreduce_fusion(
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
+                x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
+
+            # Same for b12x: the caller skipped its own all-reduce because it
+            # expected fusion, so it has to happen here when the kernel declines.
+            if envs.SGLANG_B12X_PCIE_AR.get():
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 

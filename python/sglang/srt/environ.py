@@ -589,6 +589,18 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
 
+    # b12x PCIe all-reduce (SM120 / Blackwell workstation & server parts, no NVLink).
+    # Requires the `b12x` PyPI package. Falls back to NCCL whenever a tensor is
+    # outside the kernels' supported range.
+    SGLANG_B12X_PCIE_AR = EnvBool(False)
+    # Additionally route large (prefill-sized) all-reduces through the b12x DMA ring.
+    SGLANG_B12X_PCIE_DMA = EnvBool(False)
+    # Upper bound of the DMA ring scratch buffer; sized for the largest all-reduce
+    # the model can issue (chunked_prefill_size x hidden x dtype).
+    SGLANG_B12X_DMA_MAX_BYTES = EnvInt(256 * 1024 * 1024)
+    # DMA ring wire format: "ring" / "a2a" for FP8, empty string for BF16.
+    SGLANG_B12X_DMA_FP8 = EnvStr("ring")
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)

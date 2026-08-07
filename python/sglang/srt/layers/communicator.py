@@ -179,6 +179,20 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
+# The b12x fused all-reduce + RMSNorm kernel is specialized for small token
+# counts; keep this in sync with _FUSED_MAX_ROWS in b12x_pcie_ar.py.
+_B12X_FUSED_MAX_ROWS = 36
+
+
+def apply_b12x_all_reduce_fusion(input_tensor: torch.Tensor):
+    return (
+        envs.SGLANG_B12X_PCIE_AR.get()
+        and input_tensor.numel() > 0
+        and input_tensor.shape[0] <= _B12X_FUSED_MAX_ROWS
+        and not is_dp_attention_enabled()
+    )
+
+
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
@@ -583,6 +597,7 @@ class LayerCommunicator:
                 if (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                    or apply_b12x_all_reduce_fusion(hidden_states)
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
                     if (
@@ -840,6 +855,12 @@ class LayerCommunicator:
         return (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
+                or (
+                    envs.SGLANG_B12X_PCIE_AR.get()
+                    and 0 < batch_size <= _B12X_FUSED_MAX_ROWS
+                    and not is_dp_attention_enabled()
+                    and get_moe_a2a_backend().is_none()
+                )
                 or (
                     _use_aiter
                     and batch_size > 0
@@ -1142,6 +1163,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                or apply_b12x_all_reduce_fusion(hidden_states)
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True
