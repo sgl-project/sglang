@@ -342,9 +342,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
-
         hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
 
         if hidden_scales is None:
@@ -352,6 +349,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 "W4AFP8 DeepEP low-latency requires FP8 dispatcher output "
                 "with per-token-group scales."
             )
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_ll,
+        )
 
         output = cutlass_w4a8_moe_deepep_ll(
             hidden_states,
@@ -384,10 +385,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-            cutlass_w4a8_moe_deepep_normal,
-        )
-
         hidden_states, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
             dispatch_output.topk_ids,
@@ -404,6 +401,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         num_tokens = hidden_states.shape[0]
         if num_tokens > 0:
+            from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+                cutlass_w4a8_moe_deepep_normal,
+            )
+
             return cutlass_w4a8_moe_deepep_normal(
                 hidden_states,
                 layer.w13_weight,

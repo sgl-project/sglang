@@ -1,16 +1,26 @@
 """Regression test for W4AFP8 DeepEP-normal post-reorder scaling."""
 
+import sys
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8_moe
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+# The function under test is a GPU implementation, but this test replaces every
+# launched kernel and only verifies the host-side call contract.  Stub the
+# extension symbols so importing the module remains valid on CPU CI runners.
+_sgl_kernel_stub = ModuleType("sgl_kernel")
+_sgl_kernel_stub.cutlass_w4a8_moe_mm = Mock()
+_sgl_kernel_stub.get_cutlass_w4a8_moe_mm_data = Mock()
+_sgl_kernel_stub.silu_and_mul = Mock()
+with patch.dict(sys.modules, {"sgl_kernel": _sgl_kernel_stub}):
+    from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8_moe
 
 
 class _KernelLauncher:
