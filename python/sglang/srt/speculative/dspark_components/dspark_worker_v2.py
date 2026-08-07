@@ -699,6 +699,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 local_ctx = self.draft_model.project_target_hidden_partial(
                     target_hidden, self._pp_context_feature_indices
                 )
+            if output_pp_proxy_tensors is not None:
+                output_pp_proxy_tensors.tensors.pop("dspark_aux_hidden_states", None)
             ctx_acc = None
             if incoming_ctx is not None and local_ctx is not None:
                 ctx_acc = (
