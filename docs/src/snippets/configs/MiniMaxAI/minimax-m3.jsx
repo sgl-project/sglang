@@ -212,9 +212,10 @@ sgl-eval run mmmu_pro \\
   cells: [
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-      verified: true,
-      // On 0.5.16 the deep_gemm MoE runner OOMs at cuda-graph capture at
-      // mem-fraction 0.65 without expandable segments; this env is required.
+      // PENDING the 0.5.16 re-bench: tp8 needs a full 8x-b200 node, none currently
+      // available. On 0.5.16 serving requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      // (--mem-fraction-static 0.65 OOMs at cuda-graph capture without it).
+      verified: false,
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       flags: [
         "--trust-remote-code",
