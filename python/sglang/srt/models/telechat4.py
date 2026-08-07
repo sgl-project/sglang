@@ -14,13 +14,14 @@
 """TeleChat4 model for SGLang.
 
 Adapts the TeleChat4 architecture (MLA attention + MoE + mHC residual streams)
-on top of sglang's DeepSeek-V2 building blocks.  The mHC module uses sglang's
-fused TileLang kernels (``mhc_pre`` / ``mhc_post``) for performance.
+on top of sglang's DeepSeek-V2 building blocks. The mHC module uses dedicated
+fused kernels for the model's 3584-wide residual streams.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -43,7 +44,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
 # Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
@@ -52,6 +53,15 @@ from sglang.srt.utils.custom_op import register_custom_op
 # TVM/TileLang C-extension calls attempt to access the data pointer of FakeTensors.
 from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
 from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
+
+_NPU_MHC_BACKEND = os.environ.get(
+    "SGLANG_TELECHAT4_MHC_BACKEND", "triton"
+).lower()
+if _NPU_MHC_BACKEND not in ("triton", "torch"):
+    raise ValueError(
+        "SGLANG_TELECHAT4_MHC_BACKEND must be 'triton' or 'torch', "
+        f"got {_NPU_MHC_BACKEND!r}"
+    )
 
 
 def _mhc_pre_fake(
@@ -99,6 +109,39 @@ def mhc_pre(
     n_splits: int,
     n_splits_pre: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if is_npu():
+        if _NPU_MHC_BACKEND == "torch":
+            from sglang.srt.layers.telechat4_mhc_torch import (
+                telechat4_mhc_pre_torch,
+            )
+
+            return telechat4_mhc_pre_torch(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+
+        from sglang.srt.layers.telechat4_mhc_triton import telechat4_mhc_pre
+
+        return telechat4_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            split_k=n_splits_pre,
+        )
+
     return _mhc_pre_orig(
         residual=residual,
         fn=fn,
@@ -125,6 +168,20 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if is_npu():
+        if _NPU_MHC_BACKEND == "torch":
+            from sglang.srt.layers.telechat4_mhc_torch import (
+                telechat4_mhc_post_torch,
+            )
+
+            return telechat4_mhc_post_torch(
+                x, residual, post_layer_mix, comb_res_mix
+            )
+
+        from sglang.srt.layers.telechat4_mhc_triton import telechat4_mhc_post
+
+        return telechat4_mhc_post(x, residual, post_layer_mix, comb_res_mix)
+
     return _mhc_post_orig(x, residual, post_layer_mix, comb_res_mix)
 
 
@@ -134,9 +191,8 @@ logger = logging.getLogger(__name__)
 class mHCModule(nn.Module):
     """mHC (Manifold-constrained Hyper-Connection) module.
 
-    Backed by sglang's fused TileLang kernels (``mhc_pre`` / ``mhc_post``).
-    The fp32 op operands (``fn`` / ``hc_scale`` / ``hc_base``) are materialised
-    once in :meth:`finalize` after weight loading.
+    Backed by platform-specific fused kernels. The kernel operands are
+    materialised once in :meth:`finalize` after weight loading.
     """
 
     def __init__(self, config, layer_number: int):
@@ -168,7 +224,7 @@ class mHCModule(nn.Module):
 
         self.bias = nn.Parameter(torch.zeros(out_features))
 
-        # fp32 op operands, filled by finalize() after weight loading.
+        # Kernel operands, filled by finalize() after weight loading.
         self.register_buffer(
             "fn",
             torch.zeros(out_features, self.n * self.hidden_size),
@@ -182,10 +238,13 @@ class mHCModule(nn.Module):
 
     @torch.no_grad()
     def finalize(self) -> None:
-        """Build the fp32 op operands from the loaded parameters."""
-        self.fn = self.mapping_proj.weight.detach().to(
-            torch.float32
-        ).contiguous()
+        """Build the fused-kernel operands from the loaded parameters."""
+        fn_dtype = (
+            torch.bfloat16
+            if is_npu() and _NPU_MHC_BACKEND == "triton"
+            else torch.float32
+        )
+        self.fn = self.mapping_proj.weight.detach().to(fn_dtype).contiguous()
         self.hc_scale = (
             torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res])
             .detach()
@@ -328,7 +387,7 @@ class TeleChat4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
 
-        if hasattr(config, "rope_parameters"):
+        if getattr(config, "rope_parameters", None) is not None:
             rope_theta = config.rope_parameters["rope_theta"]
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None
@@ -963,9 +1022,8 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.do_load_weights(processed_weights, is_nextn)
 
-        # Build fp32 op operands (fn / hc_scale / hc_base) for every mHC module
-        # so that the fused mhc_pre / mhc_post kernels can run without per-step
-        # parameter materialisation.
+        # Build mHC kernel operands once so forward does not materialise
+        # parameters on every step.
         for m in self.modules():
             if isinstance(m, mHCModule):
                 m.finalize()
@@ -978,8 +1036,12 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if is_npu():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

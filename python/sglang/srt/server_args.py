@@ -5293,16 +5293,14 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
-                
+
         elif model_arch in ["TeleChat4ForCausalLM"]:
-            # TeleChat4 uses the TileLang mhc_pre/mhc_post kernels (sglang.kernels.ops.layernorm.mhc)
-            # for its mHC module. The DeepGEMM tf32_hc_prenorm_gemm path is a raw C
-            # extension that torch.compile (fullgraph=True, used by tc_piecewise prefill
-            # backend) cannot trace, raising:
+            # The DeepGEMM tf32_hc_prenorm_gemm path is a raw C extension that
+            # torch.compile (fullgraph=True, used by tc_piecewise prefill backend)
+            # cannot trace, raising:
             #   torch._dynamo.exc.Unsupported: Dynamo does not know how to trace
             #   method `__call__` of class `Function`
-            # Disable it so mhc_pre falls through to the TileLang splitk path which
-            # already supports telechat4's hc_hidden_size=14336 (4 * 3584).
+            # TeleChat4 selects its platform-specific 3584-wide mHC path directly.
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
 
         elif model_arch in ["GptOssForCausalLM"]:
