@@ -1017,6 +1017,12 @@ class DeepseekV2MoE(nn.Module):
         current_stream.wait_stream(self.alt_stream)
 
         if deferred_finalize:
+            handed_off = self._maybe_hand_off_moe_finalize(
+                final_hidden_states, shared_output
+            )
+            if handed_off is not None:
+                return handed_off
+
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 finalize_flashinfer_trtllm_deferred_output,
             )
@@ -1042,6 +1048,33 @@ class DeepseekV2MoE(nn.Module):
         if self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _maybe_hand_off_moe_finalize(self, deferred, shared_output):
+        """Push the deferred finalize one layer downstream, into the fused
+        collective the CuTe DSL all-reduce backend runs at the next layer's
+        input RMSNorm. Returns the carrier tensor, or None to finalize here.
+
+        Only reachable when the post-experts all-reduce is already being
+        skipped for that same fusion; the carrier is the shared-expert output,
+        which the fused kernel consumes as its shared operand.
+        """
+        if not get_forward().fuse_mlp_allreduce or self._shared_expert_tp1:
+            return None
+        if shared_output is None or self.tp_size <= 1:
+            return None
+
+        from sglang.srt.layers.mnnvl_cutedsl_fusion import (
+            attach_deferred_moe_finalize,
+            can_defer_moe_finalize,
+        )
+
+        if not can_defer_moe_finalize(
+            num_tokens=shared_output.shape[0],
+            hidden_size=shared_output.shape[-1],
+            top_k=deferred.top_k,
+        ):
+            return None
+        return attach_deferred_moe_finalize(shared_output, deferred)
 
     def forward_normal(
         self,

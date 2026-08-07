@@ -25,6 +25,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
+CUTE_DSL_BACKEND = "cute-dsl"
+
 # FlashInfer allreduce fusion: set when flashinfer is available (see block below)
 _flashinfer_comm = None
 _TorchDistBackend = None
@@ -49,6 +51,14 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
         raise ValueError(
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
+
+    if backend == CUTE_DSL_BACKEND:
+        if not is_sm100_supported():
+            raise ValueError(
+                "FlashInfer allreduce fusion cute-dsl backend requires a "
+                "Blackwell system."
+            )
+        return backend
 
     if backend == "auto":
         if is_multi_node:
@@ -632,6 +642,85 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     return manager
 
 
+def _fusion_group(use_attn_tp_group: bool):
+    """``(world_size, rank, coordinator)`` for the group this fusion reduces
+    over: the attention TP group, or the MoE EP/TP group for an MLP output."""
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size, parallel.attn_tp_rank, get_attn_tp_group()
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_size, parallel.moe_ep_rank, get_moe_ep_group()
+    return parallel.moe_tp_size, parallel.moe_tp_rank, get_moe_tp_group()
+
+
+def _cute_dsl_buffer_name(use_attn_tp_group: bool) -> str:
+    return (
+        "cute_dsl_fusion_attn_tp_workspace"
+        if use_attn_tp_group
+        else "cute_dsl_fusion_moe_tp_workspace"
+    )
+
+
+def cute_dsl_backend_selected() -> bool:
+    return get_server_args().flashinfer_allreduce_fusion_backend == CUTE_DSL_BACKEND
+
+
+def get_cute_dsl_workspace(use_attn_tp_group: bool):
+    """The pre-built CuTe DSL workspace for this group, or None.
+
+    The CuTe DSL backend compiles its kernels and rendezvouses symmetric memory
+    up front (see ``pre_initialize_workspaces``); nothing creates one lazily
+    from inside a forward pass.
+    """
+    if not cute_dsl_backend_selected():
+        return None
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().buffers.get(_cute_dsl_buffer_name(use_attn_tp_group))
+
+
+def _init_cute_dsl_workspaces(
+    *,
+    max_token_num: int,
+    hidden_size: int,
+    top_k: int,
+    rms_eps: float,
+    include_shared_expert: bool,
+    dtype: torch.dtype,
+) -> bool:
+    """Compile one workspace per distinct comm group. Without DP attention the
+    attention-TP and MoE-TP groups are the same group, and one compiled
+    workspace serves both."""
+    from sglang.srt.layers.mnnvl_cutedsl_fusion import create_workspace
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    by_group: dict[int, object] = {}
+    for use_attn_tp_group in (False, True):
+        world_size, rank, coordinator = _fusion_group(use_attn_tp_group)
+        if world_size <= 1:
+            continue
+        device_group = coordinator.device_group
+        handle = by_group.get(id(device_group))
+        if handle is None:
+            handle = create_workspace(
+                tp_size=world_size,
+                tp_rank=rank,
+                device_group=device_group,
+                max_token_num=max_token_num,
+                hidden_size=hidden_size,
+                top_k=top_k,
+                rms_eps=rms_eps,
+                include_shared_expert=include_shared_expert,
+                dtype=dtype,
+            )
+            if handle is None:
+                return False
+            by_group[id(device_group)] = handle
+        buffers[_cute_dsl_buffer_name(use_attn_tp_group)] = handle
+    return True
+
+
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 
@@ -799,13 +888,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-        else:
-            world_size = get_parallel().moe_tp_size
+    world_size, _, _ = _fusion_group(use_attn_tp_group)
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
@@ -819,6 +902,15 @@ def flashinfer_allreduce_residual_rmsnorm(
     ):
         logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
         return None, None
+
+    cute_dsl = get_cute_dsl_workspace(use_attn_tp_group)
+    if cute_dsl is not None:
+        if not cute_dsl.serves(input_tensor.shape[0], input_tensor.shape[-1], eps):
+            logger.debug("CuTe DSL workspace does not serve this shape")
+            return None, None
+        from sglang.srt.layers.mnnvl_cutedsl_fusion import allreduce_residual_rmsnorm
+
+        return allreduce_residual_rmsnorm(cute_dsl, input_tensor, residual, weight, eps)
 
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
@@ -865,14 +957,42 @@ def pre_initialize_workspaces(
     hidden_dim: int,
     dtype: torch.dtype,
     use_oneshot: Optional[bool] = None,
+    top_k: Optional[int] = None,
+    rms_eps: Optional[float] = None,
+    include_shared_expert: bool = False,
 ):
     """Pre-initialize flashinfer workspaces before CUDA graph capture.
 
     This must be called before graph capture to avoid collective operations
     (broadcasts, barriers) inside the graph capture context, which can
     deadlock with custom_all_reduce.register_graph_buffers.
+
+    ``top_k`` / ``rms_eps`` / ``include_shared_expert`` are the CuTe DSL
+    backend's compile-time contract; that backend builds here or not at all.
     """
+    global _flashinfer_allreduce_unavailable
+
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+        return
+
+    if cute_dsl_backend_selected():
+        if top_k is None or rms_eps is None:
+            logger.warning(
+                "The cute-dsl allreduce fusion backend needs the model's top_k "
+                "and RMSNorm epsilon; disabling allreduce fusion."
+            )
+            _flashinfer_allreduce_unavailable = True
+            return
+        if not _init_cute_dsl_workspaces(
+            max_token_num=max_token_num,
+            hidden_size=hidden_dim,
+            top_k=top_k,
+            rms_eps=rms_eps,
+            include_shared_expert=include_shared_expert,
+            dtype=dtype,
+        ):
+            _flashinfer_allreduce_unavailable = True
+        _sync_allreduce_unavailable_across_tp()
         return
 
     # Initialize MoE workspace
@@ -905,3 +1025,11 @@ def cleanup_flashinfer_workspace():
         manager = buffers.get(name)
         if manager is not None:
             manager.cleanup()
+    for name in (
+        _cute_dsl_buffer_name(True),
+        _cute_dsl_buffer_name(False),
+    ):
+        handle = buffers.get(name)
+        if handle is not None:
+            handle.destroy()
+            buffers[name] = None

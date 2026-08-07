@@ -54,6 +54,7 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.mnnvl_cutedsl_fusion import fuse_deferred_moe_finalize
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -580,7 +581,19 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                if (
+                # A MoE layer that deferred its finalize for the CuTe DSL
+                # backend hands the operands over here. This either folds the
+                # finalize into the collective and returns both outputs, or
+                # materializes it in place and lets the paths below run.
+                fused_finalize = fuse_deferred_moe_finalize(
+                    hidden_states,
+                    residual,
+                    self.input_layernorm.weight,
+                    self.input_layernorm.variance_epsilon,
+                )
+                if fused_finalize is not None:
+                    hidden_states, residual = fused_finalize
+                elif (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):

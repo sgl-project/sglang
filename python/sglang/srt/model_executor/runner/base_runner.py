@@ -262,10 +262,16 @@ class BaseRunner(ABC):
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
         from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
+        hf_config = mr.model_config.hf_config
+        top_k = getattr(hf_config, "num_experts_per_tok", None)
+        num_shared_experts = getattr(hf_config, "n_shared_experts", None)
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
+            top_k=top_k,
+            rms_eps=getattr(hf_config, "rms_norm_eps", None),
+            include_shared_expert=bool(num_shared_experts),
         )
 
     def _pre_initialize_fi_a2a_workspace(self):
