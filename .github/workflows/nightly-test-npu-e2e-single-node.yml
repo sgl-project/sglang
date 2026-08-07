@@ -174,8 +174,18 @@ jobs:
           echo "Log path: ${log_path}"
 
           echo "Running test case ${test_case}"
+          # Run the test with its output captured to a file, and stream the file
+          # live. Avoid a `| tee` pipeline, which can hang until the step timeout
+          # when a leaked child process (e.g. an orphaned sglang server) keeps the
+          # stdout pipe open after the test itself has finished.
+          : > /tmp/test_output.log
           test_exit_code=0
-          ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u ${test_case} > /tmp/test_output.log 2>&1 &
+          TEST_PID=$!
+          tail -n +1 -f /tmp/test_output.log &
+          TAIL_PID=$!
+          wait ${TEST_PID} || test_exit_code=$?
+          kill ${TAIL_PID} 2>/dev/null || true
           echo "Finished test case ${test_case}"
 
           if [ "${test_exit_code}" = "0" ]; then

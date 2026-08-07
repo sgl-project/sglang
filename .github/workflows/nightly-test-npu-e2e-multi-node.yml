@@ -103,22 +103,30 @@ jobs:
           cp -r ${current_path}/* ${target_path}/
 
       - name: Clear resources
+        timeout-minutes: 30
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
+          max_wait_sec=600
+          waited_sec=0
+          while [ ${waited_sec} -lt ${max_wait_sec} ]; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
+              waited_sec=$((waited_sec + 30))
               kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
             else
               echo "No sglang job exist, start test case..."
               break
             fi
           done
+          if [ ${waited_sec} -ge ${max_wait_sec} ]; then
+            echo "ERROR: timed out waiting for pods to be cleaned up, aborting"
+            exit 1
+          fi
 
       - name: Run test
         timeout-minutes: 300
@@ -213,6 +221,7 @@ jobs:
 
       - name: Post process
         if: always()
+        timeout-minutes: 30
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
@@ -220,13 +229,20 @@ jobs:
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
+          max_wait_sec=600
+          waited_sec=0
+          while [ ${waited_sec} -lt ${max_wait_sec} ]; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
+              waited_sec=$((waited_sec + 30))
               kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
             else
               echo "No sglang job exist, start test case..."
               break
             fi
           done
+          if [ ${waited_sec} -ge ${max_wait_sec} ]; then
+            echo "ERROR: timed out waiting for pods to be cleaned up, aborting"
+            exit 1
+          fi

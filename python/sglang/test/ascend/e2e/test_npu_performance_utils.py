@@ -802,6 +802,25 @@ def assert_metrics(self, metrics):
     if not metrics:
         raise Exception("No metrics obtained from benchmark")
 
+    # Fail loudly when the benchmark produced no usable metrics, instead of
+    # crashing later with a cryptic TypeError on float(None).
+    required_metrics = {
+        "mean_tpot": self.tpot,
+        "total_tps": self.output_token_throughput,
+        "mean_ttft": self.ttft,
+        "mean_e2e_latency": self.mean_e2e_latency,
+    }
+    missing = [
+        name
+        for name, expected in required_metrics.items()
+        if expected is not None and metrics.get(name) is None
+    ]
+    if missing:
+        raise Exception(
+            "Benchmark produced no valid metrics, missing: "
+            f"{missing}. Got: {metrics}"
+        )
+
     tc_name = self.__class__.__name__
     if self.tpot and metrics.get("mean_tpot"):
         dump_metric(
