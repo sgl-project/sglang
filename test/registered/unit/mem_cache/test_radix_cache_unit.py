@@ -434,6 +434,7 @@ class TestRadixCache(unittest.TestCase):
             req_pool_idx=0,
             cache_protected_len=0,
             extra_key=None,
+            cache_salt=None,
             priority=0,
             last_node=cache.root_node,
         )
