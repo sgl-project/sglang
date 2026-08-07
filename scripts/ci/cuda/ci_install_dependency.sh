@@ -616,6 +616,28 @@ install_extra_deps() {
         NIXL_BIN_NAME="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
+
+    # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #3272 wheels -----------
+    MOONCAKE_WHEEL_ZIP_URL=""
+    if [ "$(uname -m)" = "x86_64" ]; then
+        case "${CU_MAJOR}:${SYS_PYTHON_VER}" in
+            12:3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8914670761.zip" ;;
+            12:3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8914632483.zip" ;;
+            13:3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8914719140.zip" ;;
+            13:3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8914652456.zip" ;;
+        esac
+    fi
+    if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
+        MOONCAKE_WHEEL_DIR="$(mktemp -d)"
+        curl -fSL --retry 3 --retry-delay 2 \
+            -o "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_ZIP_URL}"
+        python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+            "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_DIR}"
+        MOONCAKE_PKG="$(ls "${MOONCAKE_WHEEL_DIR}"/*.whl)"
+        echo "TEMP: overriding Mooncake with PR #3272 wheel for x86_64/CU${CU_MAJOR}/py${SYS_PYTHON_VER}: ${MOONCAKE_PKG}"
+    fi
+    # <<< TEMP ---------------------------------------------------------------
+
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
     # files that the live variant's RECORD still references, so we force a
