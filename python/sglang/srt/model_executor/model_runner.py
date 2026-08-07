@@ -1236,6 +1236,8 @@ class ModelRunner:
     @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
+        if self.enable_hisparse and self.server_args.disaggregation_mode == "decode":
+            return self.token_to_kv_pool_allocator.size_full
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
