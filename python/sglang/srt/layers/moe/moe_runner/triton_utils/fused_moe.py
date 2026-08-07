@@ -672,7 +672,20 @@ def _fused_moe_kernel_sequence(
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                x = intermediate_cache1.view(-1, N)
+                if (
+                    _is_hip
+                    and getattr(
+                        torch.cuda.get_device_properties(x.device),
+                        "gcnArchName",
+                        "",
+                    ).split(":")[0]
+                    == "gfx1201"
+                ):
+                    d = x.shape[-1] // 2
+                    intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+                else:
+                    silu_and_mul(x, intermediate_cache2)
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:

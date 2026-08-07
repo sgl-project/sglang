@@ -69,6 +69,88 @@ def moe_align_block_size(
     ignore_invalid_expert: bool = False,
 ) -> None:
     """Align and sort expert token ids into block-padded output buffers."""
+    import torch
+
+    if (
+        torch.version.hip is not None
+        and topk_ids.is_cuda
+        and getattr(
+            torch.cuda.get_device_properties(topk_ids.device),
+            "gcnArchName",
+            "",
+        ).split(":")[0]
+        == "gfx1201"
+    ):
+        # The AOT HIP kernel crashes on gfx1201. Routing tensors are small, so
+        # preserve its exact expert-major, block-padded ABI with a CPU fallback.
+        flat_ids = topk_ids.detach().cpu().reshape(-1).tolist()
+        buckets = [[] for _ in range(num_experts)]
+        for token_id, expert_id in enumerate(flat_ids):
+            if ignore_invalid_expert and expert_id < 0:
+                continue
+            buckets[expert_id + 1].append(token_id)
+
+        sentinel = len(flat_ids)
+        sorted_values = []
+        expert_values = []
+        cumsum_values = [0] * (num_experts + 1)
+        actual_positions = []
+        actual_values = []
+        padded_offset = 0
+        for bucket_id, token_ids in enumerate(buckets):
+            cumsum_values[bucket_id] = padded_offset + len(token_ids)
+            actual_positions.extend(range(padded_offset, padded_offset + len(token_ids)))
+            actual_values.extend(token_ids)
+            padded_count = (
+                (len(token_ids) + block_size - 1) // block_size * block_size
+            )
+            if padded_count:
+                sorted_values.extend(token_ids)
+                sorted_values.extend([sentinel] * (padded_count - len(token_ids)))
+                expert_values.extend([bucket_id - 1] * (padded_count // block_size))
+                padded_offset += padded_count
+        cumsum_values[num_experts] = padded_offset
+
+        if pad_sorted_token_ids:
+            sorted_token_ids.fill_(sentinel)
+            if sorted_values:
+                sorted_token_ids[:padded_offset].copy_(
+                    torch.tensor(
+                        sorted_values,
+                        dtype=sorted_token_ids.dtype,
+                        device=sorted_token_ids.device,
+                    )
+                )
+        elif actual_positions:
+            sorted_token_ids.index_copy_(
+                0,
+                torch.tensor(
+                    actual_positions, dtype=torch.int64, device=sorted_token_ids.device
+                ),
+                torch.tensor(
+                    actual_values,
+                    dtype=sorted_token_ids.dtype,
+                    device=sorted_token_ids.device,
+                ),
+            )
+        if expert_values:
+            experts_ids[: len(expert_values)].copy_(
+                torch.tensor(
+                    expert_values,
+                    dtype=experts_ids.dtype,
+                    device=experts_ids.device,
+                )
+            )
+        num_tokens_post_pad.fill_(padded_offset)
+        cumsum_buffer[: len(cumsum_values)].copy_(
+            torch.tensor(
+                cumsum_values,
+                dtype=cumsum_buffer.dtype,
+                device=cumsum_buffer.device,
+            )
+        )
+        return None
+
     kernel = get_kernel("moe.moe_align_block_size", KernelBackend.AOT)
     if ignore_invalid_expert:
         return kernel(
@@ -103,6 +185,41 @@ def topk_softmax(
     correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute top-k softmax routing weights/ids for MoE."""
+    import torch
+
+    if (
+        torch.version.hip is not None
+        and gating_output.is_cuda
+        and getattr(
+            torch.cuda.get_device_properties(gating_output.device),
+            "gcnArchName",
+            "",
+        ).split(":")[0]
+        == "gfx1201"
+    ):
+        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+
+        bias = (
+            correction_bias
+            if correction_bias is not None
+            else torch.zeros(
+                gating_output.shape[1],
+                dtype=torch.float32,
+                device=gating_output.device,
+            )
+        )
+        weights, ids = moe_fused_gate(
+            gating_output,
+            bias,
+            topk_weights.shape[1],
+            scoring_func="softmax",
+            renormalize=renormalize,
+            moe_softcapping=moe_softcapping,
+        )
+        topk_weights.copy_(weights)
+        topk_ids.copy_(ids)
+        return None
+
     return get_kernel("moe.topk_softmax", KernelBackend.AOT)(
         topk_weights,
         topk_ids,
