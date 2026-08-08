@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    fused_layernorm_modulate_raw,
+    is_plain_layer_norm,
+)
 from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
@@ -16,6 +21,101 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_SANA_FUSED_LN_MOD_DISABLED = False
+# (shape/stride/dtype/eps) signatures whose fused output was torch.equal-
+# verified against the live eager chain.
+_SANA_FUSED_LN_MOD_OK_SIGS: set = set()
+
+
+def _eager_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    return norm(x) * (1 + scale) + shift
+
+
+def _sana_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs eager.
+
+    ``scale`` / ``shift`` are Sana's ``(batch, 1, dim)`` adaLN rows.  Each
+    new input signature is verified with ``torch.equal`` against the eager
+    chain (bit-exactness depends on which LayerNorm kernel aten dispatches
+    to); any mismatch disables the fast path permanently.
+
+    The fusion only engages in CUDA-graph contexts (stream capture, or the
+    non-default stream the breakable-CUDA-graph runner warms up and captures
+    on, #33989), where replay pays no Python launch cost.  Sana's eager mode
+    is CPU-launch bound and one Triton launch costs more Python than the
+    whole aten chain it replaces (+14% forward wall), so default-stream
+    serving keeps the eager chain.
+
+    ``x`` reaches every site transposed (patch-embed / GLUMBConv permute
+    layout); aten's LayerNorm contiguizes internally, and the fast path
+    issues the same copy explicitly.
+    """
+    global _SANA_FUSED_LN_MOD_DISABLED
+
+    if _SANA_FUSED_LN_MOD_DISABLED or torch.compiler.is_compiling() or not x.is_cuda:
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing and torch.cuda.current_stream() == torch.cuda.default_stream():
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    sig = (
+        x.shape,
+        x.stride(),
+        x.dtype,
+        scale.shape,
+        scale.stride(),
+        shift.stride(),
+        norm.eps,
+    )
+    if sig in _SANA_FUSED_LN_MOD_OK_SIGS:
+        return fused_layernorm_modulate_raw(
+            x.contiguous(), scale[:, 0], shift[:, 0], norm.eps
+        )
+    if capturing:
+        # unverified signature during capture: cannot sync-verify here
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    if (
+        x.dtype is torch.bfloat16
+        and x.dim() == 3
+        and scale.dim() == 3
+        and scale.shape[1] == 1
+        and shift.shape == scale.shape
+        and is_plain_layer_norm(norm, x.shape[-1])
+    ):
+        x_c = x.contiguous()
+        if not can_use_fused_layernorm_modulate(x_c, scale[:, 0], shift[:, 0]):
+            return _eager_ln_modulate(norm, x, scale, shift)
+        try:
+            out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
+        except Exception as exc:
+            logger.warning_once(f"Disabling Sana fused LN+modulate fast path: {exc}")
+            _SANA_FUSED_LN_MOD_DISABLED = True
+        else:
+            ref = _eager_ln_modulate(norm, x, scale, shift)
+            if torch.equal(out, ref):
+                _SANA_FUSED_LN_MOD_OK_SIGS.add(sig)
+                return out
+            logger.warning_once(
+                "Sana fused LN+modulate fast path is not bit-exact against "
+                "this platform's LayerNorm dispatch; falling back to eager"
+            )
+            _SANA_FUSED_LN_MOD_DISABLED = True
+            return ref
+
+    return _eager_ln_modulate(norm, x, scale, shift)
 
 
 def _mps_safe_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -96,11 +196,9 @@ class SanaModulatedNorm(nn.Module):
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
     def forward(self, x, temb, scale_shift_table):
-        x = self.norm(x)
         scale_shift_table = _mps_match_dtype(scale_shift_table, temb)
         shift, scale = (scale_shift_table[None] + temb[:, None]).chunk(2, dim=1)
-        x = x * (1 + scale) + shift
-        return x
+        return _sana_ln_modulate(self.norm, x, scale, shift)
 
 
 class GLUMBConv(nn.Module):
@@ -271,8 +369,7 @@ class SanaTransformerBlock(nn.Module):
             scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
 
-        norm_hidden = self.norm1(hidden_states)
-        norm_hidden = norm_hidden * (1 + scale_msa) + shift_msa
+        norm_hidden = _sana_ln_modulate(self.norm1, hidden_states, scale_msa, shift_msa)
         attn_output = self.attn1(norm_hidden)
         hidden_states = hidden_states + gate_msa * attn_output
 
@@ -281,8 +378,7 @@ class SanaTransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + attn_output
 
-        norm_hidden = self.norm2(hidden_states)
-        norm_hidden = norm_hidden * (1 + scale_mlp) + shift_mlp
+        norm_hidden = _sana_ln_modulate(self.norm2, hidden_states, scale_mlp, shift_mlp)
         norm_hidden = norm_hidden.unflatten(1, (height, width)).permute(0, 3, 1, 2)
         ff_output = self.ff(norm_hidden)
         ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)

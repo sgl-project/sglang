@@ -151,7 +151,26 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str | AttentionBackendEnum:
         try:
             from sageattention import sageattn  # noqa: F401
+        except ImportError as e:
+            logger.info(e)
+            logger.info(
+                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+            )
+            return AttentionBackendEnum.FA
 
+        if platform.is_hopper():
+            try:
+                # fixed SM90 bindings retain the fake implementation under its own name
+                from sageattention.sm90_compile import (  # noqa: F401
+                    qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_fake_impl,
+                )
+            except ImportError:
+                logger.warning(
+                    "Installed Sage Attention is missing the SM90 binding fix. Falling back to Flash Attention. Reinstall with `pip install --force-reinstall git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`."
+                )
+                return AttentionBackendEnum.FA
+
+        try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
                 SageAttentionBackend,
             )
@@ -160,7 +179,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
         except ImportError as e:
             logger.info(e)
             logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
+                "Sage Attention backend failed to import. Falling back to Flash Attention."
             )
             return AttentionBackendEnum.FA
 

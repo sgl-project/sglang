@@ -9,7 +9,7 @@
 #include <bit>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 #ifndef SGL_TOPK
 #define SGL_TOPK 512
@@ -337,4 +337,4 @@ struct TopKKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

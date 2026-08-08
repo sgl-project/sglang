@@ -376,6 +376,20 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # The shared-experts-fusion decision, per runner — the runner_backend /
+    # speculative_runner_backend shape. Both leaves are seeded from the config
+    # intent by ``initialize_moe_config``; each MoE model's gate
+    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
+    # before its layers build and read it. ``speculative_moe_backend_context``
+    # brackets a draft's build: on exit the draft's effective decision is
+    # persisted onto the speculative leaf (inspectable afterwards) and the
+    # target's ACTIVE value returns.
+    disable_shared_experts_fusion: bool | None = None
+    speculative_disable_shared_experts_fusion: bool | None = None
+    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
+    # speculative_moe_backend_context is active, so a draft gate's write also
+    # lands on the speculative leaf.
+    in_speculative_scope: bool = False
 
 
 @dataclasses.dataclass
@@ -1027,9 +1041,19 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
+        from sglang.srt.arg_groups.overrides import _apply_fields
+
         server_args = ServerArgs(model_path="dummy")
-        if self._fields:
-            server_args = server_args.derive("test-override", **self._fields)
+        # Underscore names seed private property caches (the strict guard
+        # exempts them); everything else must be a real config field.
+        unknown = {name for name in self._fields if not name.startswith("_")} - set(
+            type(server_args).__dataclass_fields__
+        )
+        if unknown:
+            raise ValueError(
+                f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
+            )
+        _apply_fields(server_args, self._fields)
         # The dummy boundary skips materialization, which would leave the
         # strict mutation guard unarmed on the published object — mark it
         # materialized so bare post-publish writes raise like they do on a

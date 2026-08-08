@@ -161,6 +161,42 @@ export const config = {
   // cell is showing, so turning speculation on does not triple the cell count.
   overlayDims: [
     {
+      id: "mmTransport",
+      title: "VLM Transport",
+      default: "auto",
+      showWhen: (s) => s.pdMode !== "decode",
+      options: [
+        {
+          id: "auto",
+          label: "Auto (topology-aware)",
+          hints: (s) => {
+            if (s.pdMode !== "unified") {
+              return [
+                "VLM transport: Auto -> CPU for PD; KV/KDA transfer is separate.",
+              ];
+            }
+            if (s.hw === "b300") {
+              return [
+                "VLM transport: Auto -> CUDA IPC (up to 1 GiB HBM; CPU fallback when full).",
+              ];
+            }
+            if (["gb200", "gb300"].includes(s.hw)) {
+              return [
+                "VLM transport: Auto -> CUDA VMM with IMEX, otherwise CPU (up to 1 GiB HBM).",
+              ];
+            }
+            return ["VLM transport: Auto -> CPU on this topology."];
+          },
+        },
+        {
+          id: "cpu",
+          label: "CPU (save HBM)",
+          flags: ["--mm-feature-transport cpu"],
+          hints: ["VLM transport: CPU; no GPU feature pool."],
+        },
+      ],
+    },
+    {
       id: "spec",
       title: "Spec Decode",
       default: "dspark",

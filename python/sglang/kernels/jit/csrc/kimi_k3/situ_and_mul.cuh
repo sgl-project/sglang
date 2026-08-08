@@ -44,10 +44,6 @@ SGL_DEVICE float situ_activate(float g, float u, float beta, float inv_beta, flo
 
 }  // namespace kimi_k3
 
-}  // namespace sglang
-
-namespace {
-
 // SiTU (SoftCap-GLU) activation:
 //   gate_out = beta * tanh(gate / beta) * sigmoid(gate)
 //   up_out   = linear_beta * tanh(up / linear_beta)
@@ -104,8 +100,7 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
     const float g = cast<fp32_t>(gate[i]);
     const float u = cast<fp32_t>(up[i]);
 
-    out[i] =
-        cast<T>(sglang::kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
+    out[i] = cast<T>(kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
   }
 
   store_as<vec_t>(params.out, out, output_offset);
@@ -218,8 +213,8 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
   // kHasLinearBeta=true: this path always softcaps the up operand, as before.
-  const float val0 = sglang::kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
-  const float val1 = sglang::kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val0 = kimi_k3::situ_activate<true>(g0, u0, beta, inv_beta, linear_beta, inv_linear_beta);
+  const float val1 = kimi_k3::situ_activate<true>(g1, u1, beta, inv_beta, linear_beta, inv_linear_beta);
   if constexpr (kPrecise) {
     return {val0, val1};
   } else {
@@ -449,4 +444,4 @@ struct SituAndMulMaskedPostQuantKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

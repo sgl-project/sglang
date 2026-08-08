@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <limits>
 
+namespace sglang {
+
 namespace host::compress {
 
 constexpr auto kDLUInt8 = DLDataType{.code = kDLUInt, .bits = 8, .lanes = 1};
@@ -840,3 +842,5 @@ inline tvm::ffi::Tensor plan_compress_decode_legacy(
 }  // namespace host::compress
 
 using namespace host::compress;  // expose binding
+
+}  // namespace sglang

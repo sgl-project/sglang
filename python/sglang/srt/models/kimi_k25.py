@@ -637,6 +637,8 @@ def mm_projection_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    supports_cuda_vmm_feature_transport = True
+
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
     # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
@@ -645,6 +647,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
             "language_model.layers.": "language_model.model.layers.",
         }
     )
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.text_config, quant_config
+        )
 
     def __init__(
         self,

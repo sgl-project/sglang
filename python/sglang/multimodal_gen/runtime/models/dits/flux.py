@@ -33,6 +33,16 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
+from sglang.kernels.ops.diffusion.fused_ln_modulate import (
+    can_fuse_ln_modulate,
+    fused_ln_modulate,
+    fused_ln_modulate_active,
+    mark_fused_ln_modulate_site,
+)
+from sglang.kernels.ops.diffusion.modulate_scale_shift import (
+    can_use_modulate_scale_shift_cuda,
+    modulate_scale_shift_cuda,
+)
 from sglang.kernels.ops.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
@@ -119,6 +129,115 @@ def _flux_residual_gate_add(
             _FLUX_RESIDUAL_GATE_CUDA_DISABLED = True
 
     return residual + gate * update
+
+
+_FLUX_MODULATE_CUDA_DISABLED = False
+
+
+def _flux_modulate(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """``x * (1 + scale[:, None]) + shift[:, None]`` in one CUDA kernel.
+
+    The kernel keeps the eager chain's per-op fp32-opmath/round-to-storage
+    boundaries, so it is bit-exact vs eager and needs no quality gate.
+    Guarded inputs fall back to the eager expression.
+    """
+    global _FLUX_MODULATE_CUDA_DISABLED
+
+    if not _FLUX_MODULATE_CUDA_DISABLED and can_use_modulate_scale_shift_cuda(
+        x, scale, shift
+    ):
+        try:
+            return modulate_scale_shift_cuda(x, scale, shift)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling FLUX modulate CUDA fast path: {exc}")
+            _FLUX_MODULATE_CUDA_DISABLED = True
+
+    return x * (1 + scale[:, None]) + shift[:, None]
+
+
+def _flux_norm_modulate(
+    site: nn.Module,
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
+
+    Default: affine-free LayerNorm + the bit-exact fused modulate.  When the
+    site is mounted (``quality="high"``) and the per-call guard passes, the
+    modulate is folded into the LN affine instead (one kernel; not bit-exact).
+    """
+    if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
+        return fused_ln_modulate(x, scale, shift, norm.eps)
+    return _flux_modulate(norm(x), scale, shift)
+
+
+class FluxAdaLayerNormZero(AdaLayerNormZero):
+    """diffusers ``AdaLayerNormZero`` with the modulate routed through
+    :func:`_flux_norm_modulate`; parameters match the parent."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        mark_fused_ln_modulate_site(self)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        hidden_dtype: Optional[torch.dtype] = None,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
+            6, dim=1
+        )
+        x = _flux_norm_modulate(self, self.norm, x, scale_msa, shift_msa)
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class FluxAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
+    """diffusers ``AdaLayerNormZeroSingle`` with the modulate routed through
+    :func:`_flux_norm_modulate`; parameters match the parent."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        mark_fused_ln_modulate_site(self)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        x = _flux_norm_modulate(self, self.norm, x, scale_msa, shift_msa)
+        return x, gate_msa
+
+
+def _rope_cos_sin_cache(
+    freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None],
+) -> Optional[torch.Tensor]:
+    """Concatenate a ``(cos, sin)`` RoPE tuple into the fp32 cache layout that
+    ``apply_qk_norm_with_optional_rope`` consumes; a prebuilt cache tensor
+    passes through unchanged."""
+    if freqs_cis is None or isinstance(freqs_cis, torch.Tensor):
+        return freqs_cis
+    cos, sin = freqs_cis
+    return torch.cat(
+        [
+            cos.to(dtype=torch.float32).contiguous(),
+            sin.to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
 
 
 try:
@@ -554,16 +673,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (num_heads, -1))
         key = key.unflatten(-1, (num_heads, -1))
         value = value.unflatten(-1, (num_heads, -1))
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        # Raw (cos, sin) tuple, or the cache prebuilt by the transformer forward.
+        cos_sin_cache = _rope_cos_sin_cache(freqs_cis)
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (num_heads, -1))
@@ -658,7 +769,7 @@ class FluxSingleTransformerBlock(nn.Module):
         self.local_mlp_hidden_dim = divide(self.mlp_hidden_dim, self.tp_size)
         self.local_dim = divide(dim, self.tp_size)
 
-        self.norm = AdaLayerNormZeroSingle(dim)
+        self.norm = FluxAdaLayerNormZeroSingle(dim)
 
         if self.use_nunchaku_structure:
             self.mlp_fc1 = ColumnParallelLinear(
@@ -765,7 +876,7 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -849,8 +960,8 @@ class FluxTransformerBlock(nn.Module):
     ):
         super().__init__()
 
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = FluxAdaLayerNormZero(dim)
+        self.norm1_context = FluxAdaLayerNormZero(dim)
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -867,6 +978,9 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        # quality="high" site: the norm2/norm2_context modulate folds into the
+        # LN affine when mounted.
+        mark_fused_ln_modulate_site(self)
 
         nunchaku_enabled = (
             quant_config is not None
@@ -928,7 +1042,7 @@ class FluxTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -963,14 +1077,14 @@ class FluxTransformerBlock(nn.Module):
         hidden_states = _flux_residual_gate_add(
             hidden_states, attn_output, gate_msa.unsqueeze(1)
         )
-        norm_hidden_states = self.norm2(hidden_states)
         if self.use_nunchaku_structure:
+            norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = (
                 norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
             )
         else:
-            norm_hidden_states = (
-                norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            norm_hidden_states = _flux_norm_modulate(
+                self, self.norm2, hidden_states, scale_mlp, shift_mlp
             )
 
         ff_output = self.ff(norm_hidden_states)
@@ -985,15 +1099,18 @@ class FluxTransformerBlock(nn.Module):
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
         )
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         if self.use_nunchaku_structure:
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
             norm_encoder_hidden_states = (
                 norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
             )
         else:
-            norm_encoder_hidden_states = (
-                norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-                + c_shift_mlp[:, None]
+            norm_encoder_hidden_states = _flux_norm_modulate(
+                self,
+                self.norm2_context,
+                encoder_hidden_states,
+                c_scale_mlp,
+                c_shift_mlp,
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
@@ -1232,6 +1349,16 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(cos[:t_loc], cos[t_loc:], pad, dim=0),
                         join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
                     )
+
+        # Build the RoPE cos/sin cache once per step; every attention call
+        # below reuses the same tensor.
+        hoisted_freqs_cis = _rope_cos_sin_cache(freqs_cis)
+        singles_freqs_cis = (
+            hoisted_freqs_cis
+            if singles_freqs_cis is freqs_cis
+            else _rope_cos_sin_cache(singles_freqs_cis)
+        )
+        freqs_cis = hoisted_freqs_cis
 
         if (
             joint_attention_kwargs is not None

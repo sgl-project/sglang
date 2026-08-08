@@ -22,9 +22,9 @@
 
 #include <cstdint>
 
-namespace sglang_usp_relayout {
+namespace sglang {
 
-namespace {
+namespace usp_relayout {
 
 constexpr int kBlockSize = 256;
 constexpr int64_t kMaxGrid = 65535;
@@ -135,8 +135,6 @@ __global__ void usp_merge_heads_scalar_kernel(
   }
 }
 
-}  // namespace
-
 template <typename T>
 struct UspMergeHeadsKernel {
   static void run(tvm::ffi::TensorView out, tvm::ffi::TensorView x) {
@@ -179,4 +177,6 @@ struct UspMergeHeadsKernel {
   }
 };
 
-}  // namespace sglang_usp_relayout
+}  // namespace usp_relayout
+
+}  // namespace sglang

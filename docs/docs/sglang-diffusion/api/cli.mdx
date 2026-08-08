@@ -99,6 +99,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](../models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
+- `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](../models_with_pe).
 
 ### Sampling and output
@@ -113,7 +114,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
-### Quantized transformers
+### Quantization
 
 For quantized transformer checkpoints, prefer:
 
@@ -123,7 +124,13 @@ For quantized transformer checkpoints, prefer:
 - `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
-See [Quantization](../quantization) for supported quantization families and examples.
+For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
+compresses completed KV-cache chunks independently of transformer weight
+quantization. It is lossy and disabled by default.
+
+See [Realtime and Causal Video Models](../realtime_models) for the runtime and
+model scope, and [Quantization](../quantization) for supported quantization
+families and examples.
 
 ### Request logging
 
@@ -217,6 +224,24 @@ sglang serve \
   --ring-degree 2 \
   --port 30010
 ```
+
+### Health endpoints
+
+SGLang Diffusion separates process liveness from inference readiness:
+
+| Endpoint | Success condition | Recommended use |
+| --- | --- | --- |
+| `GET /liveness` | The HTTP server is accepting requests. It remains `200` during server warmup. | Kubernetes liveness probe |
+| `GET /health` | The server is ready for normal inference traffic. It returns `503` while server-based synthetic warmup is running and `200` after it completes. | Startup and readiness probes |
+| `GET /health_generate` | Compatibility alias for `/health`. It does not currently issue a generation request in SGLang Diffusion. | Existing integrations only |
+
+`/health` gates only server-based warmup. With `--warmup-mode off` or
+`--warmup-mode request`, it returns `200` once the HTTP server starts; those modes
+do not promise that compilation or other first-request work has completed. If
+server-based warmup fails, the server terminates instead of reporting ready.
+
+Do not use `/health` as a liveness probe: a long server warmup can legitimately
+keep it at `503` for several minutes.
 
 ### Cloud Storage
 

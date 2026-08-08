@@ -120,12 +120,36 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
             ulysses_size=4,
             ring_size=1,
         )
-    with pytest.raises(NotImplementedError):
+    # ring is implemented now: it splits rows, not heads, so it carries no
+    # head-divisibility constraint of its own
+    MiniMaxH3DiTModel._validate_sequence_parallel_config(
+        arch=arch,
+        tp_size=1,
+        ulysses_size=1,
+        ring_size=2,
+    )
+    MiniMaxH3DiTModel._validate_sequence_parallel_config(
+        arch=arch,
+        tp_size=1,
+        ulysses_size=8,
+        ring_size=2,
+    )
+    # what ring does constrain is the packed-sequence alignment, which has to
+    # divide by the *combined* degree because ring adds an outer row split on
+    # top of Ulysses's inner one
+    with pytest.raises(ValueError):
+        MiniMaxH3DiTModel._validate_sequence_parallel_config(
+            arch=arch,
+            tp_size=1,
+            ulysses_size=8,
+            ring_size=3,
+        )
+    with pytest.raises(ValueError):
         MiniMaxH3DiTModel._validate_sequence_parallel_config(
             arch=arch,
             tp_size=1,
             ulysses_size=1,
-            ring_size=2,
+            ring_size=0,
         )
 
 

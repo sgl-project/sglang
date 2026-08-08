@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import functools
 import hashlib
 import logging
 from pathlib import Path
@@ -23,6 +24,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -48,6 +51,10 @@ def should_run_flashinfer_autotune(
     if mr.device != "cuda":
         return False
     if mr.server_args.disable_flashinfer_autotune:
+        return False
+    if mr.server_args.enable_deterministic_inference:
+        # Tuned configs are per problem shape, so the reduction order would follow
+        # the batch shape.
         return False
 
     server_args = mr.server_args
@@ -238,3 +245,85 @@ def maybe_flashinfer_autotune_speculative_draft(
 
     run_flashinfer_autotune_forward(mr, run_and_reset, skip_logits=skip_logits)
     tuned_phases.add(phase_key)
+
+
+def maybe_flashinfer_autotune_extend(
+    runner: BaseRunner, *, decode_num_tokens: int
+) -> None:
+    """Also autotune one EXTEND-shaped dummy forward.
+
+    The decode-shaped autotune only covers token counts up to the decode
+    batch size, so larger prefill/extend batches fall outside the tuned
+    buckets and run flashinfer's default heuristic — which can be far
+    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
+    untuned at >=8k tokens on sm100). One extra forward at the largest
+    per-rank extend token count tunes all buckets up to it.
+    """
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+        return
+    mr = runner.model_runner
+    # max_prefill_tokens is a per-scheduler (per dp-rank) budget, and warmup
+    # runs on all dp ranks at once, so the gathered dummy already reaches the
+    # worst-case serving gather. Do not divide by dp_size.
+    num_tokens = mr.server_args.max_prefill_tokens
+    if num_tokens <= (decode_num_tokens or 0):
+        return  # decode-shaped autotune already covered these buckets
+    if not mr.is_generation or mr.spec_algorithm.is_speculative():
+        # _dummy_run forces TARGET_VERIFY shapes for speculative runners;
+        # extend-bucket autotune for spec configs is a follow-up.
+        return
+    if mr.model_config.is_multimodal:
+        # The dummy runs mm_inputs=None, which multimodal prefill paths iterate.
+        return
+
+    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
+        pool_size = mr.req_to_token_pool.size
+        num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
+    else:
+        # Packed dummies tune measurably worse tactics for the same token
+        # bucket, so pack only where the backend would otherwise crash. None
+        # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
+        num_tokens_per_req = None
+    per_req = num_tokens_per_req or 1
+    batch_size = (num_tokens + per_req - 1) // per_req
+    num_tokens = batch_size * per_req
+
+    buffers = runner._alloc_dummy_decode_buffers(
+        batch_size,
+        num_tokens_per_req=per_req,
+        allocate_logits_buffer=False,
+    )
+    canary_run_ctx = (
+        c.with_active_single_forward_manager(0)
+        if (c := mr.canary_manager) is not None
+        else empty_context()
+    )
+
+    forward_fn = functools.partial(
+        runner._dummy_run,
+        batch_size=batch_size,
+        buffers=buffers,
+        run_ctx=canary_run_ctx,
+        forward_mode_override=ForwardMode.EXTEND,
+        extend_num_tokens_per_req=num_tokens_per_req,
+    )
+
+    log_info_on_rank0(
+        logger,
+        f"FlashInfer autotune: extra EXTEND pass at {num_tokens} tokens "
+        f"({batch_size} seqs x {per_req} tokens).",
+    )
+    try:
+        run_flashinfer_autotune_forward(mr, forward_fn, skip_logits=True)
+    except torch.OutOfMemoryError:
+        # The pass is an optimization; without headroom for the extend-shaped
+        # forward, fall back to untuned extend buckets instead of failing.
+        log_info_on_rank0(
+            logger,
+            "FlashInfer extend autotune skipped: not enough free memory "
+            f"for a {num_tokens}-token dummy forward.",
+        )
+    finally:
+        # release dummy buffers before capture measures free memory
+        del forward_fn, buffers
+        torch.cuda.empty_cache()

@@ -57,6 +57,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import (
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
@@ -137,9 +140,10 @@ cached_get_processor = lru_cache(get_processor)
 
 
 def _disable_shared_experts_fusion() -> bool:
-    # Resolved lazily: the global server args is not set at module import time
-    # (e.g. when this module is imported by unit tests).
-    return get_exec().moe.disable_shared_experts_fusion
+    # Resolved lazily: the flag is written by the owning model's gate before
+    # its layers build (per runner); models without a gate see the config
+    # intent through the accessor's fallback.
+    return is_shared_experts_fusion_disabled()
 
 
 if _is_cuda:
@@ -1308,25 +1312,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 f"get_hidden_dim not implemented for {module_name}"
             )
 
-    def _maybe_autodisable_shared_experts_fusion(self, config, quant_config):
-        # Auto-disable fusion when the checkpoint can't fuse (e.g. MXFP4 Qwen3.5)
-        # so the model still gets the #25885 multi-streaming path. ROCm-only.
-        if (
-            config.model_type == "qwen3_5_moe_text"
-            and not get_exec().moe.disable_shared_experts_fusion
-            and not can_fuse_shared_expert(config, quant_config)
-        ):
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
-                {"disable_shared_experts_fusion": True},
-            )
-            logger.info(
-                "Qwen3.5: shared-expert fusion not supported for this checkpoint; "
-                "auto-disabling (multi-streaming #25885 still applies)."
-            )
-
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1338,9 +1323,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
-
-        if _is_hip:
-            self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
@@ -2314,6 +2296,40 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+
+def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
+    """Why this Qwen3.5 checkpoint cannot fuse its shared expert, or None.
+
+    ROCm-only: an MXFP4 checkpoint cannot fuse, and the model still wants the
+    #25885 multi-streaming path. Asked by the loader before any layer is built,
+    so it resolves the text config itself -- the loader hands over whichever
+    config the entry class takes.
+    """
+    if not _is_hip:
+        return None
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if getattr(text_config, "model_type", None) != "qwen3_5_moe_text":
+        return None
+    if can_fuse_shared_expert(text_config, quant_config):
+        return None
+    return (
+        "Qwen3.5: shared-expert fusion not supported for this checkpoint "
+        "(multi-streaming #25885 still applies)."
+    )
+
+
+# Every class the loader may instantiate for a Qwen3.5 checkpoint answers the
+# fusion question the same way.
+for _entry_class in (
+    Qwen3_5ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+):
+    _entry_class.shared_experts_fusion_disable_reason = staticmethod(
+        _qwen3_5_shared_experts_fusion_disable_reason
+    )
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

@@ -115,7 +115,6 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         """Sized from the CONFIGURED capture shapes, once, never reallocated:
         growing a buffer after a graph captured it moves the address that graph
         reads, and prefill captures before the decode runner reports its bounds."""
-        server_args = get_server_args()
         cuda_graph_config = get_exec().graph.cuda_graph_config
         decode_bs: list[int] = []
         prefill_tokens: list[int] = []
@@ -564,6 +563,10 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         # The sidecar's is reached via conv_state_metadata, so this is the attention
         # one (KV write locs, the SWA loc translate).
         return self.full_attn_backend.forward_metadata
+
+    @forward_metadata.setter
+    def forward_metadata(self, value):
+        self.full_attn_backend.forward_metadata = value
 
     @property
     def supports_ragged_verify_graph(self) -> bool:

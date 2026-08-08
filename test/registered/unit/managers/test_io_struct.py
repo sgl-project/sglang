@@ -703,6 +703,30 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
+    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
+        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 2)
+        self.assertIsNone(req.data_parallel_rank)
+
+    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
+        req = GenerateReqInput(
+            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 1)
+
+    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            data_parallel_rank=3,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_dp_rank, 3)
+        self.assertEqual(req[1].routed_dp_rank, 3)
+
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""

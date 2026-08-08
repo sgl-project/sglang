@@ -15,7 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
     kimi_linear_config,
     linear_attn_model_spec,
 )
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -118,6 +118,10 @@ class TritonAttnBackend(AttentionBackend):
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
 
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -133,6 +137,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.kernels.ops.attention.verify_mla import (
+            verify_mla_fwd,
+        )
         from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
         )
@@ -147,6 +154,8 @@ class TritonAttnBackend(AttentionBackend):
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
+        # MLA split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
+        self.verify_mla_fwd = torch.compiler.disable(verify_mla_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -179,6 +188,14 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        # The MLA verify kernel (verify_mla_fwd) is tuned and validated for the
+        # Kimi-K3 absorbed-MLA shape; gate it on K3.
+        self.use_verify_mla = (
+            is_gfx95_supported()
+            and self.topk == 1
+            and self.use_mla
+            and is_kimi_k3(model_runner.model_config.hf_config)
+        )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
@@ -205,9 +222,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            # Use start_layer instead of 0 to handle pipeline parallelism.
+            # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+                model_runner.token_to_kv_pool.start_layer
+            ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -1390,11 +1409,19 @@ class TritonAttnBackend(AttentionBackend):
         # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
+        # Route target-verify to the K3-tuned MLA kernel when eligible, else the
+        # per-head split-KV kernel.
+        if self.use_verify_mla:
+            verify_fwd = self.verify_mla_fwd
+        elif self.use_verify_splitkv:
+            verify_fwd = self.verify_splitkv_fwd
+        else:
+            verify_fwd = None
         if (
-            self.use_verify_splitkv
+            verify_fwd is not None
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
-            and self.verify_splitkv_fwd(
+            and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),

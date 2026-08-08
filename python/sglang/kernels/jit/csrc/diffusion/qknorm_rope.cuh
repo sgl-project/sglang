@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 struct QKNormRopeParams {
   void* __restrict__ q_ptr;
@@ -313,4 +313,4 @@ struct QKNormRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

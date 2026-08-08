@@ -6,6 +6,8 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Coroutine
+from contextlib import suppress
 from typing import Any, Dict, Optional
 
 from fastapi import (
@@ -61,6 +63,29 @@ _VIDEO_EXTENSIONS = {
     ".mpg",
     ".webm",
 }
+_VIDEO_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
+
+
+def _discard_video_job_task(job_id: str, task: asyncio.Task[None]) -> None:
+    if _VIDEO_JOB_TASKS.get(job_id) is task:
+        del _VIDEO_JOB_TASKS[job_id]
+
+
+def _start_video_job(job_id: str, job: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    task = asyncio.create_task(job, name=f"video-job-{job_id}")
+    _VIDEO_JOB_TASKS[job_id] = task
+    task.add_done_callback(lambda completed: _discard_video_job_task(job_id, completed))
+    return task
+
+
+async def shutdown_video_jobs() -> None:
+    tasks = list(_VIDEO_JOB_TASKS.values())
+    _VIDEO_JOB_TASKS.clear()
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
@@ -826,14 +851,15 @@ async def create_video(
 
     assert batch is not None
     # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(
+    _start_video_job(
+        request_id,
         _dispatch_job_async(
             request_id,
             batch,
             scheduler_batches=scheduler_batches,
             temp_dirs=temp_dirs or None,
             output_persistent=output_persistent,
-        )
+        ),
     )
     return VideoResponse(**job)
 

@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <limits>
 
+namespace sglang {
+
 namespace device::topk {
 
 namespace cg = cooperative_groups;
@@ -840,3 +842,5 @@ struct TopKCluster : TopKRadixBase<10> {
 };
 
 }  // namespace device::topk
+
+}  // namespace sglang

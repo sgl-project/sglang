@@ -524,6 +524,28 @@ def test_kimi_lazy_ipc_feature_acknowledges_all_tp_consumers():
     proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=8)
 
 
+def test_kimi_lazy_vmm_feature_uses_proxy_consumer_count():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.consumer_count = 2
+    proxy.reconstruct_on_target_device = Mock(return_value=torch.randn(1, 2))
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.reconstruct(0, ipc_consumer_count=8)
+
+    proxy.reconstruct_on_target_device.assert_called_once_with(0, consumer_count=2)
+
+
+def test_kimi_lazy_vmm_cache_hit_uses_proxy_consumer_count():
+    proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    proxy.consumer_count = 2
+    proxy.acknowledge_consumption = Mock()
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+    item.acknowledge_deferred_cuda_ipc_feature(consumer_count=8)
+
+    proxy.acknowledge_consumption.assert_called_once_with(2)
+
+
 class _Tokenizer:
     def encode(self, text, allowed_special=None):
         tokens = {
@@ -675,6 +697,7 @@ def test_kimi_k3_rejects_silently_dropped_images():
 
 def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
     processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.fast_load_mm_data = AsyncMock(
         return_value=SimpleNamespace(

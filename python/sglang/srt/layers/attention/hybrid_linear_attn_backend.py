@@ -962,6 +962,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
         )
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     @property
     def data_type(self):

@@ -21,9 +21,9 @@
 
 #include <cstdint>
 
-namespace sglang_residual_gate_add {
+namespace sglang {
 
-namespace {
+namespace residual_gate_add {
 
 constexpr int kBlockSize = 256;
 constexpr int kBcastRowsPerBlock = 4;
@@ -303,8 +303,6 @@ inline GateMode validate_residual_gate_add(
   return GateMode::kBcastRow;
 }
 
-}  // namespace
-
 template <typename T>
 struct ResidualGateAddKernel {
   static void
@@ -314,4 +312,6 @@ struct ResidualGateAddKernel {
   }
 };
 
-}  // namespace sglang_residual_gate_add
+}  // namespace residual_gate_add
+
+}  // namespace sglang

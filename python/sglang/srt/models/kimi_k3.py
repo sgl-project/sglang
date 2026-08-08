@@ -2933,6 +2933,8 @@ class KimiK3LinearForCausalLM(nn.Module):
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
+    supports_cuda_vmm_feature_transport = True
+
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
     encoder_only_safetensors_weight_prefixes = (
         "vision_tower.",

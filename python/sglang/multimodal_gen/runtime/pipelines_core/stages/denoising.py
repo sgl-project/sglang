@@ -28,6 +28,10 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     mount_fused_linear_gelu,
     unmount_fused_linear_gelu,
 )
+from sglang.kernels.ops.diffusion.fused_ln_modulate import (
+    mount_fused_ln_modulate,
+    unmount_fused_ln_modulate,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -136,7 +140,6 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
     maybe_enable_inductor_compute_comm_overlap,
     resolve_torch_compile_mode,
 )
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
 
@@ -479,18 +482,23 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return
         mounted_gelu = False
         mounted_gate_norm = False
+        mounted_ln_modulate = False
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             if want:
                 mounted_gelu |= mount_fused_linear_gelu(transformer)
                 mounted_gate_norm |= mount_fused_gate_rmsnorm(transformer)
+                mounted_ln_modulate |= mount_fused_ln_modulate(transformer)
             else:
                 unmount_fused_linear_gelu(transformer)
                 unmount_fused_gate_rmsnorm(transformer)
+                unmount_fused_ln_modulate(transformer)
         self._quality_fusions_mounted = want
         if want and mounted_gelu:
             logger.info(
                 "Mounted fused linear+GELU (cublasLt epilogue) for quality=high"
             )
+        if want and mounted_ln_modulate:
+            logger.info("Mounted fused LN+modulate (affine folding) for quality=high")
         if want and mounted_gate_norm:
             logger.info(
                 "Mounted fused gate RMSNorm (Z-Image Triton suite) for quality=high"
@@ -978,7 +986,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 

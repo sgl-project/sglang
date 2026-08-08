@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <iterator>
 
-namespace {
+namespace sglang {
 
 namespace impl = device::topk;
 using impl::TopKProblem;
@@ -460,4 +460,4 @@ struct TopKKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

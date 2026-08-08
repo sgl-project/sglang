@@ -83,6 +83,9 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.moe.utils import (
+    install_shared_experts_fusion_decision,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -314,6 +317,13 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    # Decide the shared-experts-fusion question here, once per runner, before any
+    # layer exists: this is the only place a model class is instantiated, and it
+    # is the last point that still knows both the checkpoint's quantization and
+    # (through the build scope) whether this runner is a draft.
+    install_shared_experts_fusion_decision(
+        model_class, model_config.hf_config, quant_config
+    )
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
@@ -586,7 +596,6 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_server_args()
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             weight_loader_prefetch = get_model().weight_loader_prefetch_checkpoints
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads

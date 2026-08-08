@@ -52,10 +52,12 @@ ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 # --- 1. Kimi-K3 SGLang code (replaces the base's stock sglang, editable) ---
 # Keep the installed extension modules, but discard Rust and pip build
 # artifacts that are not used at runtime.
+ARG SGLANG_COMMIT="25035bff8d34f3fcce2c1a2a5b1fe610225e84ed"
 RUN rm -rf /sgl-workspace/sglang && \
-    git clone --branch main \
+    git clone --no-checkout \
       https://github.com/sgl-project/sglang.git /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang && \
+    git checkout --detach "${SGLANG_COMMIT}" && \
     rm -rf .git && \
     test ! -e .git && \
     pip install -e python --no-deps && \

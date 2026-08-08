@@ -200,7 +200,6 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="decode",
             enable_hisparse=False,
-            dcp_size=1,
         )
 
         with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(

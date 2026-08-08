@@ -117,6 +117,7 @@ from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
     is_sbo_enabled,
+    is_shared_experts_fusion_disabled,
     is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -203,7 +204,6 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
-    log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
 )
@@ -571,7 +571,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_exec().moe.disable_shared_experts_fusion
+        _fusion_disabled = is_shared_experts_fusion_disabled()
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -954,7 +954,6 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -1055,7 +1054,6 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -2968,24 +2966,27 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    def determine_num_fused_shared_experts(
-        self, architecture: str = "DeepseekV3ForCausalLM"
-    ):
-        self.num_fused_shared_experts = 0
-        server_args = get_server_args()
+    # The architecture this class fuses shared experts for; a subclass whose
+    # checkpoint reports a different name (the NextN drafts, GLM's DSA variant)
+    # overrides it.
+    fused_shared_experts_architecture = "DeepseekV3ForCausalLM"
 
-        if get_exec().moe.disable_shared_experts_fusion:
-            return
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None.
 
-        disable_reason = None
+        Evaluated by the loader once per runner, before any layer is built (see
+        ``install_shared_experts_fusion_decision``), so it takes the config and
+        quantization it is asked about rather than reading an instance.
+        """
         if get_exec().moe.enforce_shared_experts_fusion:
-            pass
-        elif is_sbo_enabled() or is_tbo_enabled():
-            disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
-        elif is_deepep_class_backend():
-            disable_reason = "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
-        elif (
-            self.config.architectures[0] != architecture
+            return None
+        if is_sbo_enabled() or is_tbo_enabled():
+            return "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
+        if is_deepep_class_backend():
+            return "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
+        if (
+            hf_config.architectures[0] != cls.fused_shared_experts_architecture
             # Allow-list of n_routed_experts values that have been validated
             # for shared-experts fusion under this code path. Currently:
             #   256 -> DeepSeek-V3 / R1
@@ -2994,51 +2995,40 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             #          moonshotai/Kimi-K2.5 (compressed-tensors) checkpoint
             #          stores the shared expert loose and is NOT pre-fused,
             #          so the fused path silently mis-loads it.
-            or self.config.n_routed_experts not in (256, 384)
-            or self.config.n_shared_experts != 1
+            or hf_config.n_routed_experts not in (256, 384)
+            or hf_config.n_shared_experts != 1
             or (
-                self.config.n_routed_experts == 384
-                and (
-                    self.quant_config is None or self.quant_config.get_name() != "quark"
-                )
+                hf_config.n_routed_experts == 384
+                and (quant_config is None or quant_config.get_name() != "quark")
             )
         ):
-            disable_reason = "Config does not support fused shared expert(s)."
-        elif (
+            return "Config does not support fused shared expert(s)."
+        if (
             (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
             and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
             and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
         ):
-            disable_reason = (
+            return (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
                 "or MT-platform with capability >= 31 can use shared experts fusion optimization."
             )
-        elif get_parallel().moe_ep_size > 1 and (
+        if get_parallel().moe_ep_size > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            disable_reason = (
+            return (
                 "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) "
                 "can use shared experts fusion optimization under expert parallelism."
             )
-        elif is_wint4afp8_or_wint4a16_config(self.quant_config):
-            disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        if is_wint4afp8_or_wint4a16_config(quant_config):
+            return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        return None
 
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV2ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+    def determine_num_fused_shared_experts(self):
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
