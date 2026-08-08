@@ -1093,8 +1093,9 @@ class GroupCoordinator:
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_to_all_single(output, input)
+        if pynccl_comm is not None:
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.all_to_all_single(output, input)
         else:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
