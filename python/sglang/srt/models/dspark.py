@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -18,6 +20,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +71,14 @@ class VanillaMarkov(nn.Module):
 
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
@@ -77,13 +87,20 @@ class VanillaMarkov(nn.Module):
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w2 = ReplicatedLinear(
+            self.markov_rank,
+            self.vocab_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("markov_w2", prefix),
+        )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
 
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
-        return self.markov_w2(latent_states)
+        bias, _ = self.markov_w2(latent_states)
+        return bias
 
     def compute_step_bias(
         self,
@@ -134,8 +151,21 @@ class GatedMarkovHead(VanillaMarkov):
 
     markov_head_type = "gated"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         self.gate_proj = nn.Linear(int(hidden_size) + markov_rank, markov_rank)
 
     def compute_gate(
@@ -165,8 +195,21 @@ class RNNHead(VanillaMarkov):
 
     markov_head_type = "rnn"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         self.hidden_size = int(hidden_size)
         self.state_size = markov_rank
         self.joint_proj = nn.Linear(2 * markov_rank + self.hidden_size, 3 * markov_rank)
@@ -263,7 +306,9 @@ class RNNHead(VanillaMarkov):
         )
 
 
-def build_markov_head(config) -> Optional[nn.Module]:
+def build_markov_head(
+    config, quant_config=None, prefix: str = ""
+) -> Optional[nn.Module]:
     markov_rank = int(getattr(config, "markov_rank", 0))
     if markov_rank <= 0:
         raise ValueError(
@@ -273,15 +318,29 @@ def build_markov_head(config) -> Optional[nn.Module]:
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
+    markov_prefix = add_prefix("markov_head", prefix)
     if markov_head_type == "vanilla":
-        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+        return VanillaMarkov(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            quant_config=quant_config,
+            prefix=markov_prefix,
+        )
     if markov_head_type == "gated":
         return GatedMarkovHead(
-            vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            prefix=markov_prefix,
         )
     if markov_head_type == "rnn":
         return RNNHead(
-            vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            prefix=markov_prefix,
         )
     raise ValueError(f"Unsupported DSpark markov_head_type={markov_head_type!r}.")
 
@@ -354,7 +413,6 @@ def build_confidence_head(config) -> Optional[nn.Module]:
 
 
 _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
-    "embed_tokens.",
     "lm_head.",
     "rotary_emb.",
 )
@@ -371,14 +429,17 @@ class DSparkDraftMixin:
                 f"got markov_rank={dspark_config.markov_rank}."
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
-        self.markov_head = build_markov_head(config)
+        self.markov_head = build_markov_head(
+            config, quant_config=quant_config, prefix=prefix
+        )
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        self.embed_tokens = embed_tokens
+        if self.get_input_embeddings() is None:
+            self.embed_tokens = embed_tokens
         self.lm_head = lm_head
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -396,9 +457,13 @@ class DSparkDraftMixin:
                 "(call attach_shared_modules first)."
             )
         weight = self.lm_head.weight
-        if hidden.dtype != weight.dtype:
-            hidden = hidden.to(weight.dtype)
-        local_logits = torch.matmul(hidden, weight.T)
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(self.lm_head, quant_method):
+            local_logits = quant_method.apply(self.lm_head, hidden, None)
+        else:
+            if hidden.dtype != weight.dtype:
+                hidden = hidden.to(weight.dtype)
+            local_logits = torch.matmul(hidden, weight.T)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 
