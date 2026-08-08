@@ -47,3 +47,9 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     torch.cuda.synchronize()
     assert torch.equal(out, _eager_ln_modulate(norm, x, scale, shift))
     assert torch.equal(out2, out) and not sana._SANA_FUSED_LN_MOD_DISABLED
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
