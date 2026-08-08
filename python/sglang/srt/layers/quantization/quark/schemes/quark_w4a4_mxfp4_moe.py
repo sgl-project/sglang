@@ -614,7 +614,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            from dataclasses import replace
+
+            # MXFP4 hard-codes Swiglu in the AITER kernel path (mirror Mxfp4MoEMethod):
+            # aiter.fused_moe only applies clamped SwiGLU-OAI when activation==Swiglu.
+            self.runner = MoeRunner(
+                moe_runner_backend, replace(moe_runner_config, activation="swiglu")
+            )
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -647,5 +653,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
+            swiglu_limit=(
+                self.moe_runner_config.gemm1_clamp_limit
+                or self.moe_runner_config.swiglu_limit
+                or 0.0
+            ),
         )
         return self.runner.run(dispatch_output, quant_info)

@@ -186,9 +186,21 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
+            # Choose gate/up layout from the model's actual weight layout, not
+            # only the env default. Models whose experts are NOT gate/up-
+            # interleaved (e.g. MiniMax-M3, MoeRunnerConfig.gate_up_interleaved
+            # =False) require SEPARATED; interleaved models (e.g. gpt-oss, whose
+            # Mxfp4MoEMethod also preshuffles into the interleaved layout) require
+            # INTERLEAVE. The env var still lets users override the interleaved
+            # default. Using INTERLEAVE on a separated checkpoint reads gate/up
+            # transposed and produces incoherent output.
+            use_interleave = (
+                self.config.gate_up_interleaved
+                and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            )
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                if use_interleave
                 else GateMode.SEPARATED.value
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
