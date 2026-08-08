@@ -35,6 +35,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -502,6 +503,11 @@ def embed_mm_inputs(
     return input_embeds, other_info
 
 
+def _is_precomputed_mm_item(item: MultimodalDataItem) -> bool:
+    """Recognize both internal and public precomputed-embedding formats."""
+    return item.precomputed_embeddings is not None or item.is_precomputed_embedding()
+
+
 def _embed_mm_inputs_with_split(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -514,14 +520,12 @@ def _embed_mm_inputs_with_split(
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
 ):
-    """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
+    """Group requests with precomputed items before per-modality embedding."""
     precomputed_req_indices = []
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
         items = [item for item in mm_input.mm_items if item is not None]
-        if items and all(
-            getattr(item, "precomputed_embeddings", None) is not None for item in items
-        ):
+        if items and any(_is_precomputed_mm_item(item) for item in items):
             precomputed_req_indices.append(idx)
         else:
             non_precomputed_req_indices.append(idx)
@@ -657,7 +661,20 @@ def general_mm_embed_routine(
             # encoder/ViT execution and multimodal feature placement, while
             # the language model range below excludes both.
             with torch.profiler.record_function("sglang.vlm.mm_embedding"):
-                if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
+                should_split_mm_inputs = bool(
+                    server_args is not None
+                    and get_disagg().enable_adaptive_dispatch_to_encoder
+                )
+                if not should_split_mm_inputs:
+                    input_kinds = {
+                        _is_precomputed_mm_item(item)
+                        for mm_input in mm_inputs_list
+                        for item in mm_input.mm_items
+                        if item is not None
+                    }
+                    should_split_mm_inputs = len(input_kinds) > 1
+
+                if should_split_mm_inputs:
                     # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                     input_embeds, other_info = _embed_mm_inputs_with_split(
                         mm_inputs_list=mm_inputs_list,
