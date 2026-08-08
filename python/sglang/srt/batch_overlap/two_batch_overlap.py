@@ -374,12 +374,10 @@ class TboCudaGraphRunnerPlugin:
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
-        tbo_split_seq_index, tbo_split_token_index = (
-            compute_split_indices_for_cuda_graph_replay(
-                forward_mode=forward_mode,
-                cuda_graph_num_tokens=bs * token_num_per_seq,
-                spec_info=spec_info,
-            )
+        _, tbo_split_token_index = compute_split_indices_for_cuda_graph_replay(
+            forward_mode=forward_mode,
+            cuda_graph_num_tokens=bs * token_num_per_seq,
+            spec_info=spec_info,
         )
 
         self._tbo_children_num_token_non_padded[...] = (
