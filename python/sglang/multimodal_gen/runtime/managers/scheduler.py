@@ -5,6 +5,7 @@ import dataclasses
 import pickle
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
@@ -75,6 +76,12 @@ _BATCH_METRICS_LOG_INTERVAL = 5
 @dataclasses.dataclass(frozen=True)
 class _SequentiallyReturnedOutputs:
     outputs: Iterator[OutputBatch]
+
+
+@dataclasses.dataclass
+class _SequentialGroupPrefetch:
+    items: list[tuple[bytes | None, Req]]
+    future: Future[list[Req]]
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
@@ -165,6 +172,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
+        self._sequential_prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sequential-ar-prefetch"
+        )
+        self._sequential_prefetch: _SequentialGroupPrefetch | None = None
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -400,6 +411,147 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 reqs=reqs,
                 error_msg=f"Native grouped execution failed: {e}",
             )
+
+    def _sequential_prefetch_enabled(self) -> bool:
+        overlap_mode = getattr(self.server_args, "ar_dit_overlap_mode", "off")
+        if overlap_mode != "on":
+            return False
+
+        pipeline_config = self.server_args.pipeline_config
+        return (
+            self.receiver is not None
+            and self._dynamic_batching_enabled()
+            and pipeline_config.supports_native_grouped_requests()
+            and pipeline_config.supports_sequential_dit_inference()
+            and pipeline_config.supports_async_ar_prefetch()
+        )
+
+    def _get_next_sequential_prefetch_items(
+        self,
+    ) -> list[tuple[bytes | None, Req]] | None:
+        """Pop compatible generation requests for AR prefetch during DiT compute."""
+        if not self.waiting_queue or not self._sequential_prefetch_enabled():
+            return None
+
+        identity, req, enqueue_time = self.waiting_queue[0]
+        if not isinstance(req, Req) or not self._can_dynamic_batch(req, req):
+            return None
+
+        compatible_indices: list[int] = [0]
+        compatible_reqs: list[Req] = [req]
+        reject_reasons: list[str] = []
+        for idx in range(1, len(self.waiting_queue)):
+            if len(
+                compatible_indices
+            ) >= self._batching_max_size or self._batch_admission.batch_is_full(
+                compatible_reqs
+            ):
+                break
+            _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
+            if isinstance(candidate_req, Req) and self._can_dynamic_batch(
+                req, candidate_req
+            ):
+                admission_reject = self._batch_admission.reject_reason_for_candidate(
+                    compatible_reqs, candidate_req
+                )
+                if admission_reject is None:
+                    compatible_indices.append(idx)
+                    compatible_reqs.append(candidate_req)
+                elif self._batch_metrics_enabled:
+                    reject_reasons.append(admission_reject)
+            elif self._batch_metrics_enabled and isinstance(candidate_req, Req):
+                reason = self._get_dynamic_batch_reject_reason(req, candidate_req)
+                if reason is not None:
+                    reject_reasons.append(reason)
+
+        batch_len = len(compatible_indices)
+        batch_items: list[tuple[bytes | None, Req]] = [None] * batch_len
+        for pos, idx in enumerate(reversed(compatible_indices)):
+            item_identity, item_req, _ = self.waiting_queue[idx]
+            batch_items[batch_len - 1 - pos] = (item_identity, item_req)
+            del self.waiting_queue[idx]
+
+        stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
+        if stop_reason is None:
+            stop_reason = (
+                "max_size"
+                if batch_len >= self._batching_max_size
+                else "sequential_prefetch"
+            )
+        self._record_batch_dispatch_metrics(
+            batch_size=batch_len,
+            queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
+            effective_max_batch_size=self._batch_admission.max_admissible_batch_size(
+                compatible_reqs[0]
+            ),
+            reject_reasons=reject_reasons,
+            stop_reason=stop_reason,
+        )
+        return batch_items
+
+    def _receive_prefetchable_requests(self) -> None:
+        try:
+            new_reqs = self.recv_reqs()
+            new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+        except Exception as e:
+            logger.warning(
+                "Failed to receive requests during sequential AR prefetch: %s",
+                e,
+                exc_info=True,
+            )
+            return
+
+        if not new_reqs:
+            return
+        now = time.monotonic()
+        self.waiting_queue.extend((identity, req, now) for identity, req in new_reqs)
+
+    def _maybe_start_sequential_prefetch(self) -> None:
+        if self._sequential_prefetch is not None:
+            return
+        if self.worker.is_sleeping():
+            return
+
+        self._receive_prefetchable_requests()
+        items = self._get_next_sequential_prefetch_items()
+        if not items:
+            return
+
+        reqs = [req for _identity, req in items]
+        future = self._sequential_prefetch_executor.submit(
+            self.worker.prepare_forward_sequential_group, reqs
+        )
+        self._sequential_prefetch = _SequentialGroupPrefetch(items=items, future=future)
+        logger.info(
+            "Started sequential AR prefetch for %d request(s) while DiT is running.",
+            len(items),
+        )
+
+    def _take_sequential_prefetch_result(
+        self,
+    ) -> tuple[list[tuple[bytes | None, Req]], _SequentiallyReturnedOutputs] | None:
+        prefetch = self._sequential_prefetch
+        if prefetch is None:
+            return None
+        if not prefetch.future.done():
+            return None
+
+        self._sequential_prefetch = None
+        try:
+            prepared_reqs = prefetch.future.result()
+        except Exception as e:
+            logger.error("Sequential AR prefetch failed: %s", e, exc_info=True)
+            outputs = iter(
+                [
+                    OutputBatch(error=f"Sequential AR prefetch failed: {e}")
+                    for _ in prefetch.items
+                ]
+            )
+            return prefetch.items, _SequentiallyReturnedOutputs(outputs)
+
+        return prefetch.items, _SequentiallyReturnedOutputs(
+            self.worker.execute_prepared_forward_sequentially(prepared_reqs)
+        )
 
     def _iter_grouped_outputs_sequentially(
         self, reqs: List[Req]
@@ -766,6 +918,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_iter = iter(outputs)
         try:
             for index, item in enumerate(items):
+                self._maybe_start_sequential_prefetch()
                 output_batch, error = self._fetch_next_output(output_iter)
                 if error is not None:
                     self._return_sequential_errors(items[index:], error)
@@ -774,6 +927,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 assert output_batch is not None
                 self._return_item_result(item, output_batch)
                 del output_batch
+                if index < len(items) - 1:
+                    self._maybe_start_sequential_prefetch()
         finally:
             close = getattr(output_iter, "close", None)
             if close is not None:
@@ -1217,7 +1372,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continue
 
             # 2: execute, make sure a reply is always sent
-            items = self.get_next_batch_to_run()
+            prefetched = self._take_sequential_prefetch_result()
+            if prefetched is not None:
+                items, handler_result = prefetched
+            else:
+                if self._sequential_prefetch is not None:
+                    if self.receiver is not None:
+                        self._poller.poll(timeout=10)
+                    else:
+                        time.sleep(0.01)
+                    continue
+                items = self.get_next_batch_to_run()
+                handler_result = None
             if not items:
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
@@ -1229,14 +1395,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
-            try:
-                handler_result = self._dispatch_items(items)
-            except Exception as e:
-                logger.error(
-                    f"Error executing request in scheduler event loop: {e}",
-                    exc_info=True,
-                )
-                handler_result = OutputBatch(error=str(e))
+            if handler_result is None:
+                try:
+                    handler_result = self._dispatch_items(items)
+                except Exception as e:
+                    logger.error(
+                        f"Error executing request in scheduler event loop: {e}",
+                        exc_info=True,
+                    )
+                    handler_result = OutputBatch(error=str(e))
 
             if isinstance(handler_result, _SequentiallyReturnedOutputs):
                 try:
@@ -1279,6 +1446,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         if self.receiver is not None:
             self.receiver.close()
+        self._sequential_prefetch_executor.shutdown(wait=False)
         self._cleanup_disagg()
         self.context.destroy(linger=0)
 

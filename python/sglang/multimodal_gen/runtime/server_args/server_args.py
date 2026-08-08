@@ -384,6 +384,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    ar_dit_overlap_mode: str = "off"
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -1963,6 +1964,17 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--ar-dit-overlap-mode",
+            type=str,
+            default=ServerArgs.ar_dit_overlap_mode,
+            choices=["off", "on"],
+            help=(
+                "Control AR/DiT overlap for separated GLM-Image deployments. "
+                "'off' disables overlap; 'on' enables it whenever the pipeline "
+                "supports async AR prefetch. Defaults to 'off'."
+            ),
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -2698,6 +2710,8 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.ar_dit_overlap_mode not in ("off", "on"):
+            raise ValueError("ar_dit_overlap_mode must be one of: off, on")
         if self.encoder_parallel == "dp" and (
             (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
         ):

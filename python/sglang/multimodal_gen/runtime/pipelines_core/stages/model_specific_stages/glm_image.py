@@ -476,8 +476,9 @@ class GlmImageAR(PipelineStage):
         height: int,
         width: int,
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
-        device = get_local_torch_device()
+        device = device or get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         input_ids = []
@@ -552,12 +553,54 @@ class GlmImageAR(PipelineStage):
         )
         if not can_batch_ar:
             return super().run_grouped_requests(batches, server_args)
-
         height = batches[0].height
         width = batches[0].width
         if any(batch.height != height or batch.width != width for batch in batches[1:]):
             return super().run_grouped_requests(batches, server_args)
+        return self.prepare_external_ar_group(batches, server_args)
 
+    @staticmethod
+    def can_prepare_external_ar_group(
+        batches: list[Req],
+        server_args: ServerArgs,
+        *,
+        require_single_output: bool = False,
+    ) -> bool:
+        if server_args.srt_encoder_url is None:
+            return False
+        if not batches:
+            return False
+        if not all(
+            isinstance(batch.prompt, str) and batch.image_path is None
+            for batch in batches
+        ):
+            return False
+        if require_single_output and any(
+            _num_outputs_per_prompt(batch) != 1 for batch in batches
+        ):
+            return False
+        height = batches[0].height
+        width = batches[0].width
+        return not any(
+            batch.height != height or batch.width != width for batch in batches[1:]
+        )
+
+    def prepare_external_ar_group(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+        *,
+        require_single_output: bool = False,
+    ) -> list[Req]:
+        if not self.can_prepare_external_ar_group(
+            batches, server_args, require_single_output=require_single_output
+        ):
+            raise ValueError(
+                "GLM-Image external AR prefetch received incompatible requests"
+            )
+
+        height = batches[0].height
+        width = batches[0].width
         start_time = time.time()
         output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
         prompts = [
@@ -576,6 +619,7 @@ class GlmImageAR(PipelineStage):
             height=height,
             width=width,
             server_args=server_args,
+            device=torch.device("cpu"),
         )
         duration = time.time() - start_time
         logger.info(

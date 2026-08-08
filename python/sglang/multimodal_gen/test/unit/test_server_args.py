@@ -132,6 +132,39 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
         self.assertEqual(args.model_path, "/data/my-model")
 
+    def test_ar_dit_overlap_mode_defaults_to_off(self):
+        args = self._from_dict_without_model_resolution({"model_path": "/data/model"})
+
+        self.assertEqual(args.ar_dit_overlap_mode, "off")
+
+    def test_ar_dit_overlap_mode_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, unknown_args = parser.parse_known_args(
+            [
+                "--model-path",
+                "/data/model",
+                "--ar-dit-overlap-mode",
+                "on",
+            ]
+        )
+
+        with (
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            _mock_cuda_platform(),
+        ):
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.ar_dit_overlap_mode, "on")
+
+    def test_invalid_ar_dit_overlap_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {"model_path": "/data/model", "ar_dit_overlap_mode": "bad"}
+            )
+
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
             {

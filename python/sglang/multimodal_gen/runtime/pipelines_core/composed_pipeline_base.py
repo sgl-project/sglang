@@ -1089,3 +1089,30 @@ class ComposedPipelineBase(ABC):
             batches,
             server_args,
         )
+
+    def prepare_async_ar_prefetch(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        """Prepare AR outputs in a thread-safe pipeline-specific fast path."""
+        raise NotImplementedError(
+            f"{self.pipeline_name} does not support async AR prefetch"
+        )
+
+    @torch.no_grad()
+    def forward_prepared_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield terminal outputs for requests whose grouped prep already ran."""
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        remaining_stages = self.stages[1:]
+        for batch in batches:
+            yield self.executor.execute_with_profiling(
+                remaining_stages, batch, server_args
+            )

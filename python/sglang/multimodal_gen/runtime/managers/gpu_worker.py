@@ -442,6 +442,36 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ]
         return self._merge_expanded_output_batches(output_batches)
 
+    def prepare_forward_sequential_group(self, batch: list[Req]) -> list[Req]:
+        """Run grouped preparation before per-request DiT/VAE execution."""
+        assert self.pipeline is not None
+        return self.pipeline.prepare_async_ar_prefetch(batch, self.server_args)
+
+    def execute_prepared_forward_sequentially(
+        self, batch: list[Req]
+    ) -> Iterator[OutputBatch]:
+        """Yield outputs for a group whose shared preparation already completed."""
+        assert self.pipeline is not None
+        results = self.pipeline.forward_prepared_batch_sequentially(
+            batch, self.server_args
+        )
+        group_start_time = time.monotonic()
+
+        for req in batch:
+            output_batch = self._execute_forward_common(
+                req,
+                forward_fn=lambda results=results: next(results),
+                log_reqs=[req],
+                return_req=False,
+                save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                    req, output_batch
+                ),
+                error_context=f"prefetched grouped request {req.request_id}",
+                execution_start_time=group_start_time,
+            )
+            assert isinstance(output_batch, OutputBatch)
+            yield output_batch
+
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
