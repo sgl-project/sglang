@@ -28,7 +28,7 @@ register_cuda_ci(
 
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
-    model = "/data/radixark/model-cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa"
+    model = "nvidia/GLM-5.2-NVFP4"
 
     # Full GSM8K test set (1319 questions) with a tight accuracy floor.
     gsm8k_accuracy_thres = 0.935
