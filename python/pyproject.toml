@@ -126,7 +126,8 @@ diffusion = [
 diffusion-qvg = [
   # quant-videogen 0.1.0 pins an incompatible Torch version, so it is
   # installed separately with --no-deps; this extra provides its missing
-  # import-time dependency.
+  # import-time dependencies.
+  "loguru>=0.7",
   "termcolor>=2.3",
 ]
 
