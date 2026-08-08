@@ -44,14 +44,20 @@ class TestMmHashesContract(CustomTestCase):
         self.assertIsNone(req.mm_hashes)
 
     def test_set_pad_value_honors_preset_hash(self):
-        """set_pad_value() must use a pre-set hash without recomputing."""
+        """Disabling automatic hashing must not replace a producer hash."""
         item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xDEADBEEF)
         # If hash_feature is invoked, the test fails — we patch it to
         # raise so any accidental recompute is loud.
-        with patch(
-            "sglang.srt.managers.mm_utils.hash_feature",
-            side_effect=AssertionError(
-                "hash_feature must NOT be called when hash is preset"
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_MM_SKIP_COMPUTE_HASH.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.managers.mm_utils.hash_feature",
+                side_effect=AssertionError(
+                    "hash_feature must NOT be called when hash is preset"
+                ),
             ),
         ):
             item.set_pad_value()

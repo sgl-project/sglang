@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from sglang.srt.multimodal.audio_encoder_windowing import AudioEncoderWindowSpec
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -50,6 +51,16 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
             return DEFAULT_ASR_PROMPT
         return input_text
 
+    @property
+    def audio_encoder_window_spec(self) -> AudioEncoderWindowSpec:
+        audio_config = self.hf_config.thinker_config.audio_config
+        # The encoder chunks mel features in 2 * n_window-frame blocks, so a
+        # reusable attention window must contain an integral number of them.
+        return AudioEncoderWindowSpec(
+            window_frames=int(audio_config.n_window_infer),
+            alignment_frames=2 * int(audio_config.n_window),
+        )
+
     def compute_mrope_positions(self, input_ids, mm_items):
         if isinstance(input_ids, list):
             seq_len = len(input_ids)
@@ -64,6 +75,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         audio_data=None,
         input_text=None,
         request_obj=None,
+        audio_encoder_window_config=None,
         **kwargs,
     ):
         if not audio_data:
@@ -79,8 +91,10 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output,
+            self.mm_tokens,
+            audio_encoder_window_config=audio_encoder_window_config,
         )
 
         mrope_positions, mrope_position_delta = self.compute_mrope_positions(

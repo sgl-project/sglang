@@ -1,13 +1,52 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import List, Optional
+
+import msgspec
 
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionUsage,
     TranscriptionVerboseResponse,
 )
+
+
+class RealtimeEncoderWindowPolicy(msgspec.Struct, frozen=True):
+    """Adapter policy for long-audio encoder-window continuation."""
+
+    min_audio_sec: float
+    max_audio_context_windows: int
+    supported_languages: tuple[str, ...]
+    decoder_prefix_max_tokens: int = 192
+    decoder_prefix_holdback_words: int = 1
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.min_audio_sec) or self.min_audio_sec < 0:
+            raise ValueError("min_audio_sec must be finite and non-negative")
+        if self.max_audio_context_windows <= 0:
+            raise ValueError("max_audio_context_windows must be positive")
+        if self.decoder_prefix_max_tokens <= 0:
+            raise ValueError("decoder_prefix_max_tokens must be positive")
+        if self.decoder_prefix_holdback_words < 0:
+            raise ValueError("decoder_prefix_holdback_words must be non-negative")
+        if not self.supported_languages or not all(
+            isinstance(language, str) and language.strip()
+            for language in self.supported_languages
+        ):
+            raise ValueError("supported_languages must contain language codes")
+        normalized_languages = tuple(
+            language.strip().lower().replace("_", "-").split("-", 1)[0]
+            for language in self.supported_languages
+        )
+        msgspec.structs.force_setattr(self, "supported_languages", normalized_languages)
+
+    def supports_language(self, language: Optional[str]) -> bool:
+        if not language:
+            return False
+        primary = language.strip().lower().replace("_", "-").split("-", 1)[0]
+        return primary in self.supported_languages
 
 
 class TranscriptionAdapter(ABC):
@@ -106,6 +145,11 @@ class TranscriptionAdapter(ABC):
         Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.
         """
         return {}
+
+    @property
+    def realtime_encoder_window_policy(self) -> Optional[RealtimeEncoderWindowPolicy]:
+        """Return the long-audio window policy, or None when unsupported."""
+        return None
 
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.
