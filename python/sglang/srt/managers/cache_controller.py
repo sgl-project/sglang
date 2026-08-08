@@ -738,10 +738,12 @@ class HiCacheController:
             ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
-            # still alive when the write stream is executing.
-            if host_indices.is_cuda:
+            # still alive when the write stream is executing. Guard on
+            # device-type (not is_cuda) so accelerator tensors on XPU/other
+            # backends are also kept alive against the async stream.
+            if host_indices.device.type != "cpu":
                 host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type != "cpu":
                 device_indices.record_stream(self.write_stream)
 
         self.ack_write_queue.append(
@@ -841,10 +843,12 @@ class HiCacheController:
             ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
+            # still alive when the load stream is executing. Guard on
+            # device-type (not is_cuda) so accelerator tensors on XPU/other
+            # backends are also kept alive against the async stream.
+            if host_indices.device.type != "cpu":
                 host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type != "cpu":
                 device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(

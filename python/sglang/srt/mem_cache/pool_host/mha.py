@@ -46,7 +46,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,

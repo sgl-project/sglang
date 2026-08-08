@@ -171,6 +171,13 @@ def alloc_with_pin_memory(
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    if pin_memory and buffer.data_ptr() == 0:
+        n_bytes = buffer.numel() * buffer.element_size()
+        raise RuntimeError(
+            f"Pinned host memory allocation of {n_bytes / (1024 ** 3):.1f} GiB "
+            f"({n_bytes} bytes) failed on device={device!r}. Reduce the host KV "
+            "pool via a smaller --hicache-ratio or --mem-fraction-static."
+        )
     return buffer
 
 
@@ -179,5 +186,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "xpu": alloc_with_pin_memory,
     },
 )
