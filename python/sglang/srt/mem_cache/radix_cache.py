@@ -464,7 +464,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    is_finished=True,
+                )
             )
             freed_end = result.prefix_len
         else:
