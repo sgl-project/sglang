@@ -223,6 +223,7 @@ class SchedulerRequestReceiver:
         # transport and must not pay an additional CPU-transport dispatch.
         if (
             self.model_config.is_multimodal
+            and self.server_args.nnodes > 1
             and self.server_args.dist_init_addr
             and self.server_args.mm_feature_transport == "cpu"
         ):

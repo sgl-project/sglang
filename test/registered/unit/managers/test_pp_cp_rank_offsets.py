@@ -42,6 +42,7 @@ def _make_receiver(
     is_multimodal: bool = False,
     dist_init_addr: str | None = None,
     mm_feature_transport: str = "cpu",
+    nnodes: int = 1,
 ) -> SchedulerRequestReceiver:
     group = _fake_group()
     return SchedulerRequestReceiver(
@@ -63,6 +64,7 @@ def _make_receiver(
             enable_dp_attention_local_control_broadcast=False,
             dist_init_addr=dist_init_addr,
             mm_feature_transport=mm_feature_transport,
+            nnodes=nnodes,
         ),
         model_config=SimpleNamespace(is_multimodal=is_multimodal),
         max_recv_per_poll=-1,
@@ -78,6 +80,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
             is_multimodal=True,
             dist_init_addr="10.0.0.1:12345",
             mm_feature_transport="cuda_vmm",
+            nnodes=2,
         )
 
         with (
@@ -105,6 +108,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
             is_multimodal=True,
             dist_init_addr="10.0.0.1:12345",
             mm_feature_transport="cpu",
+            nnodes=2,
         )
 
         with patch(
@@ -118,6 +122,34 @@ class TestPPCPRankOffsets(unittest.TestCase):
 
         self.assertEqual(result, ["work"])
         mm_broadcast.assert_called_once()
+
+    def test_mm_cpu_broadcast_is_not_used_for_single_node(self):
+        receiver = _make_receiver(
+            _make_ps(pp_size=1, tp_size=2),
+            is_multimodal=True,
+            dist_init_addr="127.0.0.1:12345",
+            mm_feature_transport="cpu",
+            nnodes=1,
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_mm_cpu_tensors"
+            ) as mm_broadcast,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_pyobj",
+                side_effect=lambda data, *args, **kwargs: data,
+            ) as pyobj_broadcast,
+        ):
+            result = receiver._broadcast_work_reqs(
+                ["work"], rank=0, dist_group=object(), src=0
+            )
+
+        self.assertEqual(result, ["work"])
+        mm_broadcast.assert_not_called()
+        pyobj_broadcast.assert_called_once()
 
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
