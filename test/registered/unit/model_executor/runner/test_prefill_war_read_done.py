@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils import maybe_publish_prefill_war_read_done
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -20,11 +21,12 @@ class _Event:
 
 
 def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
+    boundary = (
+        SharedReadBoundary.PRE_REPLAY if compliant else SharedReadBoundary.UNKNOWN
+    )
     return SimpleNamespace(
         spec_algorithm=spec_algorithm,
-        attn_backend=SimpleNamespace(
-            prefill_shared_reads_end_at_metadata_init=compliant
-        ),
+        attn_backend=SimpleNamespace(shared_read_boundary=lambda mode: boundary),
         war_fastpath_read_done_event=None,
     )
 
@@ -60,7 +62,7 @@ def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backen
             (_model_runner(), _batch(ForwardMode.DECODE)),
             # The algorithm has a later prefill reader or unverified ownership.
             (_model_runner(spec_algorithm=SpeculativeAlgorithm.EAGLE), _batch()),
-            # Backend has not declared metadata-init compliance.
+            # Backend has not declared a pre-replay prefill read boundary.
             (_model_runner(compliant=False), _batch()),
         ):
             maybe_publish_prefill_war_read_done(runner, batch, _DEVICE_MODULE)
