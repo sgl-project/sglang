@@ -10,6 +10,7 @@ __all__ = [
     "CIBundle",
     "collect_tests",
     "bundle_in_process_groups",
+    "validate_in_process_groups",
     "auto_partition",
     "register_cpu_ci",
     "register_cuda_ci",
@@ -64,9 +65,18 @@ class CIRegistry:
     #     identifier; JIT paths under python/ map to sglang.*)
     #   - define unittest.TestCase subclasses (pytest function tests are
     #     rejected at bundle run time — unittest would skip them silently)
+    #   - not import sibling modules by bare name. `python3 file.py` puts the
+    #     file's own directory on sys.path[0]; `-m unittest` puts cwd (test/)
+    #     there instead. `conftest.py` does not rescue this — it's a pytest
+    #     hook unittest never loads.
+    #   - tolerate every other member's module-level code running first:
+    #     unittest imports all named modules before executing any test.
+    #   - tolerate shared GPU/host state across members — one CUDA context
+    #     and one caching allocator for the whole bundle, and leaked server
+    #     processes or ports are no longer reclaimed by process exit.
     # Files without this set keep the existing per-file `python3 file.py -f`
-    # behavior. Group identity is per-suite — `bundle_in_process_groups`
-    # validates uniformity across members before bundling.
+    # behavior. Group identity must be uniform in (backend, suite, nightly);
+    # `validate_in_process_groups` enforces that over the unfiltered registry.
     in_process_group: Optional[str] = None
 
     @property
@@ -385,6 +395,40 @@ def _member_est_time(member: CIRegistry, live_est: Optional[dict]) -> float:
     return float(member.est_time)
 
 
+def validate_in_process_groups(all_tests: List[CIRegistry]) -> None:
+    """Every `in_process_group` must be uniform in (backend, suite, nightly).
+
+    `bundle_in_process_groups` only ever sees a list the caller already
+    narrowed to one backend/suite/nightly triple (`filter_tests` in
+    run_suite, the per-suite `suite_tests[suite]` grouping in
+    compute_partitions), so its own uniformity check can't fire: a
+    non-uniform group silently splits into one partial bundle per triple
+    instead of erroring. Validate over the unfiltered registry, where the
+    split is still visible -- called from `collect_tests` so both
+    run_suite and check-changes reject it pre-flight.
+    """
+    by_key: dict = {}
+    for t in all_tests:
+        if not t.in_process_group:
+            continue
+        by_key.setdefault(t.in_process_group, []).append(t)
+
+    errors = []
+    for key, members in sorted(by_key.items()):
+        triples = {(m.backend.name, m.effective_suite, m.nightly) for m in members}
+        if len(triples) > 1:
+            detail = ", ".join(
+                sorted(f"{b}/{s or '<none>'}/nightly={n}" for b, s, n in triples)
+            )
+            errors.append(f"  in_process_group={key!r} spans: {detail}")
+    if errors:
+        raise ValueError(
+            "in_process_group members must share one (backend, suite, nightly) "
+            "triple; otherwise the group silently splits into partial bundles "
+            "that each pay their own cold import:\n" + "\n".join(errors)
+        )
+
+
 def bundle_in_process_groups(
     files: List[CIRegistry], live_est: Optional[dict] = None
 ) -> List[Union[CIRegistry, CIBundle]]:
@@ -411,8 +455,9 @@ def bundle_in_process_groups(
 
     units: List[Union[CIRegistry, CIBundle]] = list(singletons)
     for key, members in grouped.items():
-        # All members of a bundle must share `effective_suite` so they're
-        # legitimately schedulable to the same partition.
+        # Defensive only -- callers pass an already-filtered list, so this
+        # can't fire in practice. `validate_in_process_groups` (run from
+        # `collect_tests`) is the authoritative check.
         suites = {m.effective_suite for m in members}
         if len(suites) > 1:
             raise ValueError(
@@ -424,11 +469,16 @@ def bundle_in_process_groups(
         if live_est is not None and live_key in live_est:
             est = float(live_est[live_key])
         else:
-            est = (
-                sum(_member_est_time(m, live_est) for m in members)
-                - max(0, len(members) - 1) * _BUNDLE_IMPORT_COST_SEC
-            )
-            est = max(est, 1.0)  # never zero or negative
+            member_ests = [_member_est_time(m, live_est) for m in members]
+            est = sum(member_ests) - max(0, len(members) - 1) * _BUNDLE_IMPORT_COST_SEC
+            # Amortization assumes each member_est contains one cold import,
+            # which is false for members cheaper than that (20 files x 2s ->
+            # 40 - 190 = -150). Floor at the two hard lower bounds: a bundle
+            # can't beat one cold `import sglang`, nor its slowest member.
+            # Without this the bundle bin-packs as the cheapest unit in the
+            # suite while really costing ~50s, so the shard it lands on
+            # overruns its stage timeout.
+            est = max(est, _BUNDLE_IMPORT_COST_SEC, max(member_ests))
         # Stable, filename-sorted member order so dotted-module argv is
         # deterministic between partition runs.
         ordered = sorted(members, key=lambda m: m.filename)
@@ -511,5 +561,9 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
             )
 
         ci_tests.extend(registries)
+
+    # Cross-file check: needs the unfiltered set, so it can't live in
+    # `bundle_in_process_groups` (see its docstring).
+    validate_in_process_groups(ci_tests)
 
     return ci_tests

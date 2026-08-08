@@ -447,19 +447,30 @@ def run_unittest_files(
             # bundle reason (no per-member re-run yet); with unittest -f,
             # modules after the first failure may not have run but are still
             # listed as failed.
-            bundle_passed = _run_one_bundle(
-                bundle=file,
-                idx=i,
-                total=len(files),
-                timeout_per_file=timeout_per_file,
-                enable_retry=enable_retry,
-                max_attempts=max_attempts,
-                retry_wait_seconds=retry_wait_seconds,
-                passed_tests=passed_tests,
-                failed_tests=failed_tests,
-                retried_tests=retried_tests,
-                file_elapsed=file_elapsed,
-            )
+            try:
+                bundle_passed = _run_one_bundle(
+                    bundle=file,
+                    idx=i,
+                    total=len(files),
+                    timeout_per_file=timeout_per_file,
+                    enable_retry=enable_retry,
+                    max_attempts=max_attempts,
+                    retry_wait_seconds=retry_wait_seconds,
+                    passed_tests=passed_tests,
+                    failed_tests=failed_tests,
+                    retried_tests=retried_tests,
+                    file_elapsed=file_elapsed,
+                )
+            except ValueError as e:
+                # Bundle pre-flight (module-path mapping, TestCase presence)
+                # raises before any subprocess starts. Fail just this bundle:
+                # letting it escape kills run_unittest_files before the
+                # summary and TIMINGS block, losing the results of every
+                # unit that already ran in this partition.
+                logger.info(f"\n✗ FAILED (pre-flight): {file.filename}: {e}\n")
+                for m in file.members:
+                    failed_tests.append((m.filename, f"bundle pre-flight: {e}"))
+                bundle_passed = False
             if bundle_passed:
                 units_passed_count += 1
             else:

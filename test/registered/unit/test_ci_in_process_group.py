@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import (
     auto_partition,
     bundle_in_process_groups,
     register_cpu_ci,
+    validate_in_process_groups,
 )
 from sglang.test.ci.ci_utils import (
     _assert_bundle_members_unittest_loadable,
@@ -42,14 +43,60 @@ def _reg(
     *,
     suite: str = "base-b-test-1-gpu-small",
     in_process_group: Optional[str] = None,
+    nightly: bool = False,
+    backend: HWBackend = HWBackend.CUDA,
 ) -> CIRegistry:
     return CIRegistry(
-        backend=HWBackend.CUDA,
+        backend=backend,
         filename=filename,
         est_time=est_time,
         suite=suite,
+        nightly=nightly,
         in_process_group=in_process_group,
     )
+
+
+class TestValidateInProcessGroups(CustomTestCase):
+    """The authoritative uniformity check, run over the unfiltered registry.
+
+    `bundle_in_process_groups` only ever receives a list already narrowed to
+    one (backend, suite, nightly) triple, so its own check can't fire —
+    a non-uniform group silently splits into partial bundles instead.
+    """
+
+    def test_multi_suite_group_raises(self):
+        validate_in_process_groups([_reg("a.py", in_process_group="g")])  # uniform: ok
+        files = [
+            _reg("a.py", suite="suite-a", in_process_group="g"),
+            _reg("b.py", suite="suite-b", in_process_group="g"),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_in_process_groups(files)
+        self.assertIn("g", str(ctx.exception))
+
+    def test_nightly_split_group_raises(self):
+        """Same suite, mixed nightly -> one bundle per run type. Must not pass."""
+        files = [
+            _reg("a.py", in_process_group="g"),
+            _reg("b.py", in_process_group="g", nightly=True),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_in_process_groups(files)
+        self.assertIn("nightly", str(ctx.exception))
+
+    def test_backend_split_group_raises(self):
+        files = [
+            _reg("a.py", in_process_group="g"),
+            _reg("b.py", in_process_group="g", backend=HWBackend.AMD),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_in_process_groups(files)
+        self.assertIn("g", str(ctx.exception))
+
+    def test_ungrouped_files_ignored(self):
+        validate_in_process_groups(
+            [_reg("a.py", suite="suite-a"), _reg("b.py", suite="suite-b")]
+        )
 
 
 class TestBundleInProcessGroups(CustomTestCase):
@@ -64,8 +111,8 @@ class TestBundleInProcessGroups(CustomTestCase):
         self.assertIn("multiple suites", str(ctx.exception))
         self.assertIn("g", str(ctx.exception))
 
-    def test_fallback_est_amortizes_import_and_floors(self):
-        """Without group live_est, est = sum(member) - (N-1)*import, floored at 1."""
+    def test_fallback_est_amortizes_import(self):
+        """Without group live_est, est = sum(member) - (N-1)*import."""
         members = [
             _reg("a.py", est_time=30.0, in_process_group="attn"),
             _reg("b.py", est_time=30.0, in_process_group="attn"),
@@ -78,13 +125,27 @@ class TestBundleInProcessGroups(CustomTestCase):
         expected = 3 * 30.0 - 2 * _BUNDLE_IMPORT_COST_SEC
         self.assertAlmostEqual(bundle.est_time, expected)
 
-        # Tiny members: amortization must not go to zero/negative.
-        tiny = [
-            _reg("t1.py", est_time=1.0, in_process_group="tiny"),
-            _reg("t2.py", est_time=1.0, in_process_group="tiny"),
+    def test_fallback_est_never_below_hard_lower_bounds(self):
+        """A bundle can't beat one cold import, nor its slowest member.
+
+        Amortizing (N-1)*import off a sum of sub-import members underflows
+        (20 x 2s -> -150s). A bundle bin-packed as the cheapest unit in the
+        suite makes its shard overrun the stage timeout, and the est can't
+        self-correct because `live_est["group:<key>"]` only lands on a run
+        that passed.
+        """
+        many_cheap = [
+            _reg(f"c{i}.py", est_time=2.0, in_process_group="cheap") for i in range(20)
         ]
-        tiny_bundle = bundle_in_process_groups(tiny)[0]
-        self.assertEqual(tiny_bundle.est_time, 1.0)
+        bundle = bundle_in_process_groups(many_cheap)[0]
+        self.assertGreaterEqual(bundle.est_time, _BUNDLE_IMPORT_COST_SEC)
+
+        # Slowest member dominates when amortization overshoots.
+        skewed = [_reg("slow.py", est_time=45.0, in_process_group="skew")] + [
+            _reg(f"f{i}.py", est_time=1.0, in_process_group="skew") for i in range(8)
+        ]
+        skewed_bundle = bundle_in_process_groups(skewed)[0]
+        self.assertGreaterEqual(skewed_bundle.est_time, 45.0)
 
     def test_fallback_prefers_per_file_live_est(self):
         """First-run (no group:<key>) must use per-file live_est when present."""
