@@ -1,142 +1,195 @@
-from functools import partial
-
-import helion
-import helion.language as hl
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
-    get_model_depths,
-    helion_aot_autotune,
-)
 from sglang.srt.utils.common import is_sm121
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
 
 
-def silu_and_mul_key(
-    gateup_output: torch.Tensor,
-    topk_weights: torch.Tensor | None,
-    out_dtype: object | None = None,
+@triton.jit(do_not_specialize=["M"])
+def silu_and_mul_interleaved_kernel(
+    gateup_out_ptr,  # type: ignore  # [M, 2N], rows are [g0, u0, g1, u1, ...]
+    topk_weights_ptr,  # type: ignore  # [M] (unused when HAS_TOPK_WEIGHTS=False)
+    down_inp_ptr,  # type: ignore  # [M, N]
+    M,  # type: ignore
+    stride_gm,  # type: ignore
+    N: tl.constexpr,
+    HAS_TOPK_WEIGHTS: tl.constexpr,
+    INT64_INDEX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    # Keep this stable across inputs for Helion AOT autotune.
-    del out_dtype
-    return gateup_output.shape[1], (gateup_output.dtype,), (topk_weights is not None,)
+    # Flat grid, N-tile fastest: consecutive CTAs read consecutive spans of
+    # the same rows, which measures faster than row-fastest rasterization.
+    pid = tl.program_id(0)
+    if INT64_INDEX:
+        pid = pid.to(tl.int64)
+    NUM_BLOCKS_N: tl.constexpr = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // NUM_BLOCKS_N
+    pid_n = pid % NUM_BLOCKS_N
 
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    offs_2n = pid_n * (2 * BLOCK_N) + tl.arange(0, 2 * BLOCK_N)
+    mask_2n = offs_2n < 2 * N
+    if BLOCK_M == 1:
+        # The grid covers M exactly; eliding the row mask measurably helps
+        # at bandwidth-bound shapes.
+        mask_mn = mask_n[None, :]
+        mask_m2n = mask_2n[None, :]
+    else:
+        mask_m = offs_m < M
+        mask_mn = mask_m[:, None] & mask_n[None, :]
+        mask_m2n = mask_m[:, None] & mask_2n[None, :]
 
-def silu_and_mul_inputs(sizes: list[int]):
-    # Used only for Helion autotune input generation.
-    inputs = []
-    numel = 2**30
-    with torch.device("cuda"):
-        for size in sizes:
-            x = torch.randn(numel // size, 2 * size, dtype=torch.bfloat16)
-            inputs.append((x, None, None))
-            inputs.append((x, torch.randn(numel // size, dtype=torch.bfloat16), None))
-    return inputs
-
-
-@helion_aot_autotune(
-    "silu_and_mul_interleaved",
-    kernel_key=silu_and_mul_key,
-    primary_inputs=partial(silu_and_mul_inputs, sizes=[512, 2048, 48 * 96, 6144, 8192]),
-    secondary_inputs=partial(
-        silu_and_mul_inputs,
-        sizes=[512]
-        + [i * 96 for i in get_model_depths()]
-        + list(range(1024, 8192 + 1, 1024)),
-    ),
-)
-@helion.kernel(static_shapes=False)
-def _silu_and_mul_helion_interleaved_kernel(
-    gateup_output,
-    topk_weights: torch.Tensor | None = None,
-    out_dtype: hl.constexpr | None = None,
-):
-    """
-    Interleaved version of silu_and_mul using Helion kernel.
-    Input format: [gate[0], up[0], gate[1], up[1], ...]
-    This matches the interleaved w13 weight format.
-    """
-    batch_size, hidden_size = gateup_output.shape
-    hidden_size = hl.specialize(hidden_size)
-    assert hidden_size % 2 == 0, f"{hidden_size=}"
-
-    half_hidden_size = hidden_size // 2
-    down_input = gateup_output.new_empty(
-        batch_size, half_hidden_size, dtype=out_dtype or gateup_output.dtype
+    # Contiguous load of the [g, u] pairs, deinterleaved in registers via
+    # tl.split; element-strided gather loads halve the effective bandwidth.
+    gateup = tl.load(
+        gateup_out_ptr + offs_m[:, None] * stride_gm + offs_2n[None, :],
+        mask=mask_m2n,
+        other=0.0,
     )
-    for batch_tile, hidden_tile in hl.tile([batch_size, half_hidden_size]):
-        gate_output = gateup_output[batch_tile, 2 * hidden_tile.index].to(torch.float32)
-        up_output = gateup_output[batch_tile, 2 * hidden_tile.index + 1].to(
-            torch.float32
-        )
-        silu_mul_output = gate_output * torch.sigmoid(gate_output) * up_output
-        if topk_weights is not None:
-            weight_scale = topk_weights[batch_tile, None].to(torch.float32)
-            silu_mul_output = silu_mul_output * weight_scale
-        down_input[batch_tile, hidden_tile] = silu_mul_output
-    return down_input
+    gate, up = tl.split(tl.reshape(gateup, (BLOCK_M, BLOCK_N, 2)))
+    gate = gate.to(tl.float32)
+    up = up.to(tl.float32)
 
+    down_inp = gate * tl.sigmoid(gate) * up
+    if HAS_TOPK_WEIGHTS:
+        if BLOCK_M == 1:
+            weight_scale = tl.load(
+                topk_weights_ptr + offs_m, eviction_policy="evict_last"
+            ).to(tl.float32)
+        else:
+            weight_scale = tl.load(
+                topk_weights_ptr + offs_m,
+                mask=offs_m < M,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+        down_inp = down_inp * weight_scale[:, None]
 
-@helion_aot_autotune(
-    "silu_and_mul",
-    kernel_key=silu_and_mul_key,
-    primary_inputs=partial(silu_and_mul_inputs, sizes=[512, 2048, 48 * 96, 6144, 8192]),
-    secondary_inputs=partial(
-        silu_and_mul_inputs,
-        sizes=[512]
-        + [i * 96 for i in get_model_depths()]
-        + list(range(1024, 8192 + 1, 1024)),
-    ),
-)
-@helion.kernel(static_shapes=False)
-def _silu_and_mul_helion_non_interleaved_kernel(
-    gateup_output,
-    topk_weights: torch.Tensor | None = None,
-    out_dtype: hl.constexpr | None = None,
-):
-    """
-    Non-interleaved version of silu_and_mul using Helion kernel.
-    Input format: [gate[0], gate[1], ..., gate[N-1], up[0], up[1], ..., up[N-1]]
-    """
-    batch_size, hidden_size = gateup_output.shape
-    hidden_size = hl.specialize(hidden_size)
-    assert hidden_size % 2 == 0, f"{hidden_size=}"
-
-    half_hidden_size = hidden_size // 2
-    down_input = gateup_output.new_empty(
-        batch_size, half_hidden_size, dtype=out_dtype or gateup_output.dtype
+    offs_mn = offs_m[:, None] * N + offs_n[None, :]
+    tl.store(
+        down_inp_ptr + offs_mn,
+        down_inp.to(down_inp_ptr.dtype.element_ty),
+        mask=mask_mn,
     )
-    for batch_tile, hidden_tile in hl.tile([batch_size, half_hidden_size]):
-        gate_output = gateup_output[batch_tile, hidden_tile.index].to(torch.float32)
-        up_output = gateup_output[batch_tile, hidden_tile.index + half_hidden_size].to(
-            torch.float32
-        )
-        silu_mul_output = gate_output * torch.sigmoid(gate_output) * up_output
-        if topk_weights is not None:
-            weight_scale = topk_weights[batch_tile, None].to(torch.float32)
-            silu_mul_output = silu_mul_output * weight_scale
-        down_input[batch_tile, hidden_tile] = silu_mul_output
-    return down_input
 
 
-def silu_and_mul_helion(
+@triton.jit(do_not_specialize=["M"])
+def silu_and_mul_non_interleaved_kernel(
+    gateup_out_ptr,  # type: ignore  # [M, 2N], rows are [g0, ..., gN-1, u0, ..., uN-1]
+    topk_weights_ptr,  # type: ignore  # [M] (unused when HAS_TOPK_WEIGHTS=False)
+    down_inp_ptr,  # type: ignore  # [M, N]
+    M,  # type: ignore
+    stride_gm,  # type: ignore
+    N: tl.constexpr,
+    HAS_TOPK_WEIGHTS: tl.constexpr,
+    INT64_INDEX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Flat grid, N-tile fastest: consecutive CTAs read consecutive spans of
+    # the same rows, which measures faster than row-fastest rasterization.
+    pid = tl.program_id(0)
+    if INT64_INDEX:
+        pid = pid.to(tl.int64)
+    NUM_BLOCKS_N: tl.constexpr = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // NUM_BLOCKS_N
+    pid_n = pid % NUM_BLOCKS_N
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    if BLOCK_M == 1:
+        # The grid covers M exactly; eliding the row mask measurably helps
+        # at bandwidth-bound shapes.
+        mask_mn = mask_n[None, :]
+    else:
+        mask_m = offs_m < M
+        mask_mn = mask_m[:, None] & mask_n[None, :]
+
+    # Cache hints match the tuned helion config (numerics-neutral): the gate
+    # stream stays in L2 while the up stream of the same rows loads.
+    offs_gate = offs_m[:, None] * stride_gm + offs_n[None, :]
+    gate = tl.load(
+        gateup_out_ptr + offs_gate,
+        mask=mask_mn,
+        other=0.0,
+        eviction_policy="evict_last",
+    ).to(tl.float32)
+    up = tl.load(
+        gateup_out_ptr + offs_gate + N,
+        mask=mask_mn,
+        other=0.0,
+        eviction_policy="evict_first",
+    ).to(tl.float32)
+
+    down_inp = gate * tl.sigmoid(gate) * up
+    if HAS_TOPK_WEIGHTS:
+        if BLOCK_M == 1:
+            weight_scale = tl.load(
+                topk_weights_ptr + offs_m, eviction_policy="evict_last"
+            ).to(tl.float32)
+        else:
+            weight_scale = tl.load(
+                topk_weights_ptr + offs_m,
+                mask=offs_m < M,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+        down_inp = down_inp * weight_scale[:, None]
+
+    offs_mn = offs_m[:, None] * N + offs_n[None, :]
+    tl.store(
+        down_inp_ptr + offs_mn,
+        down_inp.to(down_inp_ptr.dtype.element_ty),
+        mask=mask_mn,
+    )
+
+
+def _select_silu_and_mul_config(
+    M: int, N: int, interleaved: bool
+) -> tuple[int, int, int]:
+    """(BLOCK_M, BLOCK_N, num_warps) heuristic from a GB300 (sm_100) sweep.
+
+    One row per CTA keeps the grid large enough to fill the GPU at decode row
+    counts. BLOCK_N=512 avoids a quarter-masked tail block for N=1536-style
+    widths; other widths prefer the widest contiguous load even when the tail
+    block is masked. The non-interleaved kernel reads two separate streams per
+    row and prefers (2, 512) tiles at prefill row counts.
+    """
+    if not interleaved and M > 4096 and N % 512 == 0:
+        return 2, 512, 1
+    BLOCK_M = 1
+    if N % 512 == 0 and N % 1024 != 0:
+        BLOCK_N = 512
+    else:
+        BLOCK_N = min(1024, triton.next_power_of_2(N))
+    if M <= 4096:
+        num_warps = 4
+    else:
+        num_warps = 2 if interleaved else 1
+    return BLOCK_M, BLOCK_N, num_warps
+
+
+def silu_and_mul(
     gateup_output: torch.Tensor,
     topk_weights: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     use_interleaved: bool = True,
 ) -> torch.Tensor:
-    """
-    Unified silu_and_mul function using Helion kernel.
-    Supports both interleaved and non-interleaved input formats.
+    """silu(gate) * up over routed rows, optionally scaled by per-row weights.
+
+    Bitwise-identical port of the former Helion kernels (fp32 math,
+    gate * sigmoid(gate) * up, weight scale last, one rounding cast at the
+    store).
 
     Args:
         gateup_output: Input tensor of shape (batch_size, hidden_size)
-        topk_weights: Optional topk weights tensor
+        topk_weights: Optional per-row weights tensor of shape (batch_size,)
         out_dtype: Optional output dtype
         use_interleaved: If True, expects interleaved format [gate[0], up[0], gate[1], up[1], ...]
                         If False, expects non-interleaved format [gate[0], ..., gate[N-1], up[0], ..., up[N-1]]
@@ -144,20 +197,51 @@ def silu_and_mul_helion(
     Returns:
         Output tensor of shape (batch_size, hidden_size // 2)
     """
-    if use_interleaved:
-        return _silu_and_mul_helion_interleaved_kernel(
-            gateup_output, topk_weights, out_dtype
-        )
-    else:
-        return _silu_and_mul_helion_non_interleaved_kernel(
-            gateup_output, topk_weights, out_dtype
-        )
+    assert gateup_output.ndim == 2, f"{gateup_output.shape=}"
+    assert gateup_output.stride(1) == 1, f"{gateup_output.stride()=}"
+    M, hidden_size = gateup_output.shape
+    assert hidden_size % 2 == 0, f"{hidden_size=}"
+    N = hidden_size // 2
+    if topk_weights is not None:
+        assert topk_weights.is_contiguous(), f"{topk_weights.stride()=}"
+        assert topk_weights.shape == (M,), f"{topk_weights.shape=} {M=}"
+
+    down_input = torch.empty(
+        (M, N), device=gateup_output.device, dtype=out_dtype or gateup_output.dtype
+    )
+    if M == 0:
+        return down_input
+
+    BLOCK_M, BLOCK_N, num_warps = _select_silu_and_mul_config(M, N, use_interleaved)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    kernel = (
+        silu_and_mul_interleaved_kernel
+        if use_interleaved
+        else silu_and_mul_non_interleaved_kernel
+    )
+    kernel[grid](
+        gateup_out_ptr=gateup_output,
+        topk_weights_ptr=topk_weights,
+        down_inp_ptr=down_input,
+        M=M,
+        stride_gm=gateup_output.stride(0),
+        N=N,
+        HAS_TOPK_WEIGHTS=topk_weights is not None,
+        INT64_INDEX=gateup_output.nbytes >= 2**31 or down_input.nbytes >= 2**31,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+    )
+    return down_input
 
 
 # ---------------------------------------------------------------------------
-# Triton silu_and_mul
-# Used by InklingBatchDenseMLP._swiglu because the helion kernel above produces
-# NaN for small shared-expert batches in EP+DP configs.
+# Persistent-grid Triton silu_and_mul
+# Used by InklingBatchDenseMLP._swiglu. It predates the plain-Triton port of
+# silu_and_mul above: the helion kernels that silu_and_mul replaced were
+# reported to produce NaN for small shared-expert batches in EP+DP configs.
+# Unlike silu_and_mul it can read the row count from a device tensor (M_ptr)
+# and supports PDL.
 # ---------------------------------------------------------------------------
 
 

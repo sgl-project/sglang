@@ -11,7 +11,7 @@ from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-register_npu_ci(est_time=2, suite="stage-b-test-1-npu-a3")
+register_npu_ci(est_time=2, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=2, suite="nightly-1-npu-a3", nightly=True)
 
 
