@@ -1173,7 +1173,8 @@
               {
                 "group": "Edge & Embedded",
                 "pages": [
-                  "docs/hardware-platforms/nvidia_jetson"
+                  "docs/hardware-platforms/nvidia_jetson",
+                  "docs/hardware-platforms/rvv"
                 ]
               },
               "docs/hardware-platforms/mthreads_gpu",
