@@ -111,7 +111,6 @@ void act_gelu_inner(
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}
 at::Tensor silu_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
@@ -134,7 +133,6 @@ at::Tensor silu_and_mul_cpu(const at::Tensor& input) {
 }
 
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::gelu_tanh_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
@@ -157,7 +155,6 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
 }
 
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::gelu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;

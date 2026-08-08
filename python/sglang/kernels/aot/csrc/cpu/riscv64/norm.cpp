@@ -318,7 +318,6 @@ void fused_add_layernorm_kernel_impl(
 // Public API from sgl-kernel/csrc/cpu/norm.cpp
 // input: {batch_size, hidden_size}
 at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
-  RECORD_FUNCTION("sgl-kernel::l2norm_cpu", std::vector<c10::IValue>({input}));
   CHECK_INPUT(input);
   CHECK_DIM(2, input);
   int64_t batch_size = input.size(0);
@@ -334,7 +333,6 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION("sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
   CHECK_DIM(2, input);
@@ -362,7 +360,6 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
 // bias  : {hidden_size} (optional)
 at::Tensor
 layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps) {
-  RECORD_FUNCTION("sgl-kernel::layernorm_cpu", std::vector<c10::IValue>({input, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
   CHECK_DIM(2, input);
@@ -395,7 +392,6 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}  — scale = 1 + weight
 at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION("sgl-kernel::gemma_rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
   CHECK_DIM(2, input);
@@ -421,7 +417,6 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) 
 // input : {batch_size, hidden_size} or {batch_size, num_head, seq_len, head_dim}
 // weight: {hidden_size}  — scale = 1 + weight
 at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION("sgl-kernel::gemma3_rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
   TORCH_CHECK(
@@ -476,7 +471,6 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}, gate: {batch_size, hidden_size}
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps) {
-  RECORD_FUNCTION("sgl-kernel::fused_rmsnorm_gated_cpu", std::vector<c10::IValue>({input, weight, gate}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
   CHECK_INPUT(gate);
@@ -508,7 +502,6 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
 // residual: {batch_size, hidden_size}
 // weight  : {hidden_size}
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION("sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
@@ -537,7 +530,6 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
 }
 
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
-  RECORD_FUNCTION("sgl-kernel::gemma_fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
@@ -575,7 +567,6 @@ at::Tensor fused_add_layernorm_cpu(
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias,
     double eps) {
-  RECORD_FUNCTION("sgl-kernel::fused_add_layernorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
