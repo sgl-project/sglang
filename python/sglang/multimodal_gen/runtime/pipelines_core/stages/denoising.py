@@ -1230,7 +1230,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         step: DenoisingStepState,
         batch: Req,
         server_args: ServerArgs,
-    ) -> None:
+    ) -> torch.Tensor:
         """Run one scheduler-backed denoising step in the shared base path.
 
         Model-specific stages should override this instead of the whole loop
@@ -1307,6 +1307,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ctx.latents,
             ctx.z,
         )
+        return noise_pred
 
     def _record_trajectory(
         self,

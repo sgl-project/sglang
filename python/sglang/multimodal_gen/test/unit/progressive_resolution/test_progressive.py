@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Focused unit tests for the experimental progressive-resolution path."""
+"""Focused unit tests for progressive-resolution generation."""
 
 import argparse
 import dataclasses
@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     reset_scheduler_at_step,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
+    FluxProgressiveDenoisingStage,
     _flux_pack,
     _flux_unpack,
 )
@@ -32,8 +33,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     _ideogram4_unpack,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.qwen_image import (
+    QwenImageProgressiveDenoisingStage,
     _qwen_image_pack,
     _qwen_image_unpack,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.selflift import (
+    flow_match_clean_sample,
+    flow_match_renoise,
+    mix_selflift_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.spectral_ops import (
     dct_2d,
@@ -47,6 +54,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     WanProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
+    ZImageProgressiveDenoisingStage,
     _zimage_repack,
     _zimage_unpack,
 )
@@ -89,8 +97,12 @@ class TestProgressiveSamplingParams(unittest.TestCase):
         self.assertEqual(params.progressive_mode, "fullres")
         self.assertEqual(params.progressive_levels, 1)
         self.assertAlmostEqual(params.progressive_delta, 0.01)
+        self.assertAlmostEqual(params.selflift_mix_ratio, 0.4)
+        self.assertAlmostEqual(params.selflift_pixel_min, 0.7)
+        self.assertAlmostEqual(params.selflift_pixel_max, 1.0)
+        self.assertAlmostEqual(params.selflift_noise_shift, 0.97)
 
-        for mode in ("fullres", "dct", "dct_rewind"):
+        for mode in ("fullres", "dct", "dct_rewind", "selflift"):
             with self.subTest(mode=mode):
                 self.assertEqual(
                     SamplingParams(progressive_mode=mode).progressive_mode, mode
@@ -103,6 +115,13 @@ class TestProgressiveSamplingParams(unittest.TestCase):
             {"progressive_levels": True},
             {"progressive_delta": 0},
             {"progressive_delta": 1},
+            {"selflift_mix_ratio": 0},
+            {"selflift_mix_ratio": 1.1},
+            {"selflift_pixel_min": -0.1},
+            {"selflift_pixel_max": 1.1},
+            {"selflift_pixel_min": 0.8, "selflift_pixel_max": 0.7},
+            {"selflift_noise_shift": -0.1},
+            {"selflift_noise_shift": float("nan")},
         ]
         for kwargs in invalid_cases:
             with self.subTest(kwargs=kwargs):
@@ -111,7 +130,15 @@ class TestProgressiveSamplingParams(unittest.TestCase):
 
     def test_fields_stay_in_batch_signature(self):
         fields = {field.name: field for field in dataclasses.fields(SamplingParams)}
-        for name in ("progressive_mode", "progressive_levels", "progressive_delta"):
+        for name in (
+            "progressive_mode",
+            "progressive_levels",
+            "progressive_delta",
+            "selflift_mix_ratio",
+            "selflift_pixel_min",
+            "selflift_pixel_max",
+            "selflift_noise_shift",
+        ):
             with self.subTest(field=name):
                 self.assertFalse(fields[name].metadata.get("batch_sig_exclude"))
 
@@ -121,17 +148,29 @@ class TestProgressiveSamplingParams(unittest.TestCase):
         kwargs = self._parse_cli_kwargs(
             [
                 "--progressive-mode",
-                "dct_rewind",
+                "selflift",
                 "--progressive-levels",
                 "2",
                 "--progressive-delta",
                 "0.05",
+                "--selflift-mix-ratio",
+                "0.4",
+                "--selflift-pixel-min",
+                "0.3",
+                "--selflift-pixel-max",
+                "0.9",
+                "--selflift-noise-shift",
+                "0.95",
             ]
         )
 
-        self.assertEqual(kwargs["progressive_mode"], "dct_rewind")
+        self.assertEqual(kwargs["progressive_mode"], "selflift")
         self.assertEqual(kwargs["progressive_levels"], 2)
         self.assertAlmostEqual(kwargs["progressive_delta"], 0.05)
+        self.assertAlmostEqual(kwargs["selflift_mix_ratio"], 0.4)
+        self.assertAlmostEqual(kwargs["selflift_pixel_min"], 0.3)
+        self.assertAlmostEqual(kwargs["selflift_pixel_max"], 0.9)
+        self.assertAlmostEqual(kwargs["selflift_noise_shift"], 0.95)
 
 
 class TestProgressiveRouter(unittest.TestCase):
@@ -172,6 +211,17 @@ class TestProgressiveRouter(unittest.TestCase):
         self.assertEqual(batch.route_name, "progressive")
         self.assertEqual(len(calls), 1)
 
+    def test_selflift_routes_to_progressive_stage(self):
+        router = ProgressiveDenoisingStageRouter(
+            standard_stage=_DummyDenoisingStage("standard"),
+            progressive_stage_factory=lambda: _DummyDenoisingStage("progressive"),
+        )
+
+        batch = SimpleNamespace(progressive_mode="selflift")
+        router.forward(batch, SimpleNamespace())
+
+        self.assertEqual(batch.route_name, "progressive")
+
     def test_invalid_mode_raises(self):
         router = ProgressiveDenoisingStageRouter(
             standard_stage=_DummyDenoisingStage("standard"),
@@ -186,6 +236,7 @@ class TestProgressiveRouter(unittest.TestCase):
     def test_mode_predicate(self):
         self.assertTrue(is_progressive_resolution_mode("dct"))
         self.assertTrue(is_progressive_resolution_mode("dct_rewind"))
+        self.assertTrue(is_progressive_resolution_mode("selflift"))
         self.assertFalse(is_progressive_resolution_mode("fullres"))
         self.assertFalse(is_progressive_resolution_mode(None))
 
@@ -273,6 +324,99 @@ class TestSpectralUpsample(unittest.TestCase):
             apply_upsample(torch.zeros(1, 1, 2, 2), 0.1, 0, "wavelet")
 
 
+class TestSelfLiftOps(unittest.TestCase):
+    def test_flow_match_clean_sample_and_renoise(self):
+        clean = torch.tensor([[[1.0, 2.0]]])
+        noise = torch.tensor([[[5.0, 6.0]]])
+        sigma = torch.tensor(0.25)
+        sample = flow_match_renoise(clean, noise, sigma)
+        velocity = noise - clean
+
+        torch.testing.assert_close(
+            flow_match_clean_sample(sample, velocity, sigma), clean
+        )
+
+    def test_mix_uses_sparse_normalized_error_mask(self):
+        latent = torch.zeros(1, 1, 2, 2)
+        pixel = torch.tensor([[[[0.0, 1.0], [2.0, 4.0]]]])
+
+        mixed, pixel_weight = mix_selflift_latents(
+            latent,
+            pixel,
+            mix_ratio=0.5,
+            pixel_min=0.5,
+            pixel_max=1.0,
+        )
+
+        expected_weight = torch.tensor([[[[0.0, 0.0], [0.0, 1.0]]]])
+        torch.testing.assert_close(pixel_weight, expected_weight)
+        torch.testing.assert_close(mixed, pixel * expected_weight)
+
+    def test_identical_branches_stay_finite_and_unchanged(self):
+        latent = torch.randn(2, 3, 4, 5)
+
+        mixed, pixel_weight = mix_selflift_latents(
+            latent,
+            latent,
+            mix_ratio=0.5,
+            pixel_min=0.5,
+            pixel_max=1.0,
+        )
+
+        torch.testing.assert_close(mixed, latent)
+        self.assertTrue(torch.isfinite(pixel_weight).all())
+        self.assertEqual(int(torch.count_nonzero(pixel_weight)), 0)
+
+    def test_mix_supports_5d_video_latents(self):
+        latent = torch.zeros(1, 2, 3, 4, 5)
+        pixel = torch.randn_like(latent)
+
+        mixed, pixel_weight = mix_selflift_latents(
+            latent,
+            pixel,
+            mix_ratio=0.25,
+            pixel_min=0.7,
+            pixel_max=1.0,
+        )
+
+        self.assertEqual(mixed.shape, latent.shape)
+        self.assertEqual(pixel_weight.shape, (1, 1, 3, 4, 5))
+        self.assertTrue(torch.isfinite(mixed).all())
+        self.assertTrue(torch.isfinite(pixel_weight).all())
+
+    def test_flux2_selflift_vae_adapters_roundtrip_shape(self):
+        stage = object.__new__(Flux2ProgressiveDenoisingStage)
+        clean_grid = torch.randn(1, 4, 2, 3)
+        vae = SimpleNamespace(
+            bn=torch.nn.BatchNorm2d(4, affine=False),
+            config=SimpleNamespace(batch_norm_eps=1e-5),
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                get_decode_scale_and_shift=lambda device, dtype, vae: (
+                    1
+                    / torch.sqrt(
+                        vae.bn.running_var.view(1, -1, 1, 1).to(device, dtype)
+                        + vae.config.batch_norm_eps
+                    ),
+                    vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype),
+                ),
+            )
+        )
+        batch = SimpleNamespace()
+
+        vae_latent = stage._selflift_spatial_to_vae_latent(
+            clean_grid, batch, server_args, vae
+        )
+        roundtrip = stage._selflift_vae_latent_to_spatial(
+            vae_latent, batch, server_args, vae
+        )
+
+        self.assertEqual(vae_latent.shape, (1, 1, 4, 6))
+        self.assertEqual(roundtrip.shape, clean_grid.shape)
+        self.assertTrue(torch.isfinite(roundtrip).all())
+
+
 class TestProgressiveStageHelpers(unittest.TestCase):
     def test_seed_helpers_support_batch_seed_lists(self):
         stage = object.__new__(ProgressiveDenoisingStage)
@@ -321,6 +465,56 @@ class TestProgressiveStageHelpers(unittest.TestCase):
         self.assertEqual(flux2_stage._latent_scale_factor(flux2_args), 16)
         self.assertEqual(wan_stage._latent_scale_factor(wan_args), 8)
         self.assertEqual(ideogram_stage._latent_scale_factor(ideogram_args), 16)
+
+    def test_official_non_ideogram_progressive_stages_accept_selflift(self):
+        base_stage = object.__new__(ProgressiveDenoisingStage)
+        supported_stages = (
+            object.__new__(FluxProgressiveDenoisingStage),
+            object.__new__(Flux2ProgressiveDenoisingStage),
+            object.__new__(QwenImageProgressiveDenoisingStage),
+            object.__new__(WanProgressiveDenoisingStage),
+            object.__new__(ZImageProgressiveDenoisingStage),
+        )
+        ideogram_stage = object.__new__(Ideogram4ProgressiveDenoisingStage)
+
+        self.assertNotIn("selflift", base_stage._supported_progressive_modes())
+        self.assertNotIn("selflift", ideogram_stage._supported_progressive_modes())
+        for stage in supported_stages:
+            self.assertIn("selflift", stage._supported_progressive_modes())
+
+    def test_selflift_stage_saves_pre_step_sample_and_prediction(self):
+        stage = object.__new__(ProgressiveDenoisingStage)
+        previous_sample = torch.randn(1, 4, 8)
+        next_sample = torch.randn_like(previous_sample)
+        prediction = torch.randn_like(previous_sample)
+        timestep = torch.tensor(750.0)
+        ctx = SimpleNamespace(extra={}, latents=previous_sample)
+        step = SimpleNamespace(t_device=timestep)
+
+        def prepare_step(*args):
+            return step
+
+        def run_step(ctx, *args):
+            ctx.latents = next_sample
+            return prediction
+
+        stage._prepare_step_state = prepare_step
+        stage._run_denoising_step = run_step
+        stage._run_stage_steps(
+            ctx=ctx,
+            batch=SimpleNamespace(progressive_mode="selflift"),
+            server_args=SimpleNamespace(),
+            timesteps_cpu=torch.tensor([750.0]),
+            start_step=0,
+            end_step=1,
+        )
+
+        saved_sample, saved_prediction, saved_timestep = ctx.extra[
+            "progressive_last_prediction"
+        ]
+        self.assertIs(saved_sample, previous_sample)
+        self.assertIs(saved_prediction, prediction)
+        self.assertIs(saved_timestep, timestep)
 
 
 class TestLatentAdapters(unittest.TestCase):

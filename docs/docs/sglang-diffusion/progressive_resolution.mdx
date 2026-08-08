@@ -6,7 +6,7 @@ tag: "approx"
 
 Progressive resolution growing is an experimental feature for selected SGLang Diffusion pipelines. It runs early denoising steps at a coarser latent resolution and spectrally upsamples the latent before the full-resolution steps. On the benchmark setup below, this reduces the quadratic attention cost of the DiT transformer and yields up to **1.63× speedup on FLUX.1**, **1.93× speedup on FLUX.2**, **2.33× speedup on Z-Image**, **2.78× speedup on Wan 2.1 T2V**, **1.69× speedup on Qwen-Image**, and **1.56× speedup on Ideogram 4**.
 
-Based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736).
+The progressive schedule is based on [Spectral Progressive Diffusion (arXiv 2605.18736)](https://arxiv.org/abs/2605.18736). The stable SelfLift transition is based on [SelfLift](https://happygirlty.github.io/SelfLift_res/), where additional method details and visual comparisons are available.
 
 ## Overview
 
@@ -26,9 +26,28 @@ The transition point — how many steps to run at each resolution — is compute
 
 | Parameter | CLI flag | Default | Description |
 |-----------|----------|---------|-------------|
-| `progressive_mode` | `--progressive-mode` | `"fullres"` | `"fullres"` disables (identical to standard generation). `"dct_rewind"` enables spectral upsample with scheduler rewind (recommended). `"dct"` enables upsample without rewind. |
+| `progressive_mode` | `--progressive-mode` | `"fullres"` | `"fullres"` disables (identical to standard generation). `"dct_rewind"` enables spectral upsample with scheduler rewind (recommended). `"dct"` enables upsample without rewind. `"selflift"` enables the SelfLift transition. |
 | `progressive_levels` | `--progressive-levels` | `1` | Number of resolution halvings. `1` = one coarse stage (64×64 latent → 128×128). `2` = two coarse stages (32×32 → 64×64 → 128×128). |
 | `progressive_delta` | `--progressive-delta` | `0.01` | Noise-dominated tolerance δ. Controls how many steps run at coarse resolution. Higher δ = more coarse steps = more speedup. |
+
+### SelfLift Transition
+
+`progressive_mode="selflift"` provides a more stable transition between consecutive resolution stages. It combines latent-space and VAE pixel-space lifting to reduce structural and text drift during the low-to-high resolution switch, which is particularly useful for few-step distilled models or more aggressive stage splits for greater speedup.
+
+SelfLift uses the same stage schedule as `dct_rewind`: `progressive_levels` defines the resolution stages, while `progressive_delta` determines the denoising-step split. It replaces only the resolution-boundary transition, leaving the number of denoising steps and the coarse-stage compute savings unchanged.
+
+> **Note:** SelfLift requires one additional VAE decode/encode operation at each resolution boundary. In the benchmarked configurations, this adds negligible transition overhead. SelfLift is currently enabled for FLUX.1, FLUX.2, Qwen-Image, Wan, and ZImage.
+
+#### SelfLift parameters
+
+| Parameter | CLI flag | Default | Description |
+|-----------|----------|---------|-------------|
+| `selflift_mix_ratio` | `--selflift-mix-ratio` | `0.4` | Fraction of positions with the largest latent/pixel branch error retained by the sparse correction mask. |
+| `selflift_pixel_min` | `--selflift-pixel-min` | `0.7` | Lower end of the pixel-branch weight range for nonzero normalized mask entries. |
+| `selflift_pixel_max` | `--selflift-pixel-max` | `1.0` | Upper end of the pixel-branch weight range for nonzero normalized mask entries. |
+| `selflift_noise_shift` | `--selflift-noise-shift` | `0.97` | Multiplier applied to the transition sigma before re-noising. Set it to `0` to keep the original transition sigma. |
+
+The defaults provide a balanced transition. Increasing the retained correction region or the pixel-branch weights can reduce transition drift, but may produce a softer result. These parameters affect only output quality and do not change the acceleration benefit, allowing users to adjust the quality tradeoff for their workloads.
 
 > **Tip:** Add `--dit-cpu-offload false` to keep the transformer GPU-resident. With CPU offload each step pays a fixed PCIe transfer cost regardless of sequence length, which dilutes the speedup.
 

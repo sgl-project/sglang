@@ -67,6 +67,9 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
             arch, "spatial_compression_ratio", 8
         )
 
+    def _supported_progressive_modes(self) -> frozenset[str]:
+        return super()._supported_progressive_modes() | {"selflift"}
+
     # ------------------------------------------------------------------
     # Pack / Unpack overrides  (Wan latent is already [B, C, T, H, W])
     # ------------------------------------------------------------------
