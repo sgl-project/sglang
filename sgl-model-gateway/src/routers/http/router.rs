@@ -811,6 +811,16 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_classify_native(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/classify", model_id)
+            .await
+    }
+
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
