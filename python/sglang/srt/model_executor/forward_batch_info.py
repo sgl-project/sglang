@@ -1005,12 +1005,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for r in batch.reqs
                 ]
 
-        token_type_ids = [
-            r.token_type_ids for r in batch.reqs if r.token_type_ids is not None
-        ]
-        if token_type_ids:
+        if any(r.token_type_ids is not None for r in batch.reqs):
+            flattened_token_type_ids = []
+            for req in batch.reqs:
+                flattened_token_type_ids.extend(
+                    req.token_type_ids
+                    if req.token_type_ids is not None
+                    else [0] * len(req.origin_input_ids)
+                )
             self.token_type_ids = torch.tensor(
-                sum(token_type_ids, []),
+                flattened_token_type_ids,
                 dtype=torch.int64,
                 pin_memory=is_pin_memory_available(batch.device),
             ).to(batch.device, non_blocking=True)
@@ -1438,6 +1442,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        if self.token_type_ids is not None:
+            self.token_type_ids = self._pad_tensor_to_size(
+                self.token_type_ids, num_tokens
+            )
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
@@ -1554,6 +1562,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # branch below does the same for speculative batches.
         if self.spec_info is None and self._original_num_tokens is not None:
             self.positions = self.positions[: self._original_num_tokens]
+            if self.token_type_ids is not None:
+                self.token_type_ids = self.token_type_ids[: self._original_num_tokens]
             self.seq_lens = self.seq_lens[:bs]
             self.req_pool_indices = self.req_pool_indices[:bs]
             if self.seq_lens_cpu is not None:
