@@ -431,11 +431,14 @@ class MultimodalDataItem:
     def reconstruct(self, target_device: int, ipc_consumer_count: int = 1):
         """materialize cuda ipc proxy tensors in-place on target_device"""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            if ipc_consumer_count == 1:
+            consumer_count = self._resolve_transport_consumer_count(
+                self.feature, ipc_consumer_count
+            )
+            if consumer_count == 1:
                 self.feature = self.feature.reconstruct_on_target_device(target_device)
             else:
                 self.feature = self.feature.reconstruct_on_target_device(
-                    target_device, consumer_count=ipc_consumer_count
+                    target_device, consumer_count=consumer_count
                 )
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
@@ -474,7 +477,20 @@ class MultimodalDataItem:
     def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
         """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            consumer_count = self._resolve_transport_consumer_count(
+                self.feature, consumer_count
+            )
             self.feature.acknowledge_consumption(consumer_count)
+
+    @staticmethod
+    def _resolve_transport_consumer_count(proxy, requested_count: int) -> int:
+        """Clamp a group acknowledgement to the proxy's actual consumer set."""
+        proxy_count = getattr(
+            proxy,
+            "total_consumer_count",
+            getattr(proxy, "consumer_count", requested_count),
+        )
+        return min(requested_count, proxy_count)
 
 
 @dataclasses.dataclass
@@ -3244,7 +3260,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
-            server_args = get_server_args()
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
@@ -3252,14 +3267,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval iterations to reduce the overhead.
-                    if swa_maintenance_step and req.decode_batch_idx >= 1:
+                    # 2. Evict only once >= eviction_interval tokens have slid
+                    # out of the window, amortizing eviction work while keeping
+                    # each request's overshoot within the interval the pool
+                    # budget reserves. Gating on accumulated tokens (rather
+                    # than an iteration-counter phase) cannot starve because
+                    # seqlen progress is monotonic per KV handle.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.kv is not None
+                        and req.seqlen - 1 - sliding_window_size
+                        >= req.kv.swa_evicted_seqlen + eviction_interval
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # DSV4-NPU only (no-op elsewhere): the small paged compress-state

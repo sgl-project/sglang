@@ -263,6 +263,11 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    # Deprecated alias for `routed_dp_rank`, still accepted because
+    # sgl-model-gateway's dp-aware mode injects this spelling into every
+    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
+    # entrypoints and Engine.generate() accept it as well.
+    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -365,6 +370,18 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
