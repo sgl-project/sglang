@@ -989,7 +989,9 @@ class Scheduler(
         if (
             get_exec().moe.elastic_ep_backend is not None
             and get_exec().moe.ep_join_mode == "recover"
+            and not self.server_args.is_ep_offset_joiner
         ):
+            # Offset joiners already re-joined eagerly in ModelRunner.__init__.
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
@@ -2961,6 +2963,9 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # Admission gate: block batches during FLIP_MASK -> RECONFIG (stale expert map).
+        if self._elastic_scale_down_in_transition():
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3973,10 +3978,27 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _elastic_scale_down_in_transition(self) -> bool:
+        """True during FLIP_MASK -> RECONFIG (map + NIXL peer state inconsistent)."""
+        if self.server_args.elastic_ep_backend is None:
+            return False
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        return ElasticEPStateManager.get_scale_phase() in ("retiring", "reconfiguring")
+
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
+
+        # Tick shrink FSM outside is_fully_idle so admission-gated ticks still advance.
+        if self.server_args.elastic_ep_backend is not None:
+            model_runner = getattr(self.tp_worker, "model_runner", None)
+            if model_runner is not None:
+                model_runner.maybe_retire_ep_ranks()
+                pending = getattr(model_runner, "_pending_elastic_scale_update", None)
+                if pending is not None:
+                    self.ipc_channels.send_to_tokenizer.send_output(pending)
+                    model_runner._pending_elastic_scale_update = None
 
         if not self.is_fully_idle():
             return
@@ -4642,16 +4664,53 @@ class Scheduler(
             max_ep_size,
         )
 
-        if new_ep_size <= old_ep_size:
+        # Shrink extension (Mooncake only): splits upstream's `<= old_ep_size` reject
+        # into equality-noop, shrink (validated below), and grow (upstream fall-through).
+        if new_ep_size == old_ep_size:
             return ScaleElasticEPReqOutput(
                 success=False,
-                message=(
-                    f"new_ep_size ({new_ep_size}) must be greater than current "
-                    f"effective_ep_size ({old_ep_size})."
-                ),
+                message=f"new_ep_size ({new_ep_size}) == current ({old_ep_size}); noop.",
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
+        if new_ep_size < old_ep_size:
+            if self.server_args.elastic_ep_backend != "mooncake":
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    message=(
+                        f"Scale-down ({new_ep_size}<{old_ep_size}) requires "
+                        f"--elastic-ep-backend mooncake; got {self.server_args.elastic_ep_backend!r}."
+                    ),
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                )
+            if new_ep_size < 1:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    message=f"new_ep_size ({new_ep_size}) must be >= 1.",
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                )
+            # Reject shrinks leaving any logical with zero replicas (EPLB divmod).
+            import math
+            from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None:
+                num_local = metadata.num_local_physical_experts
+                num_logical = metadata.num_logical_experts
+                if num_local * new_ep_size < num_logical:
+                    min_ep = math.ceil(num_logical / num_local)
+                    return ScaleElasticEPReqOutput(
+                        success=False,
+                        message=(
+                            f"new_ep_size ({new_ep_size}) < min feasible ({min_ep}); "
+                            f"num_local={num_local} num_logical={num_logical}. "
+                            "Increase --ep-num-redundant-experts."
+                        ),
+                        old_ep_size=old_ep_size,
+                        new_ep_size=new_ep_size,
+                    )
+
         if new_ep_size > max_ep_size:
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -4675,6 +4734,31 @@ class Scheduler(
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
 
+        # Grow-only: classify recover-mode (retired slot) vs scale-mode (append); mixing rejected.
+        pending_recover_ranks: List[int] = []
+        if new_ep_size > old_ep_size:
+            launch_ep = self.server_args.elastic_ep_initial_size or self.server_args.tp_size
+            inst = ElasticEPStateManager.instance()
+            active = (inst.active_ranks_cpu.detach().numpy()
+                      if inst is not None and inst.active_ranks_cpu is not None else None)
+            recover_slots, scale_slots = [], []
+            for slot in range(old_ep_size, new_ep_size):
+                if slot < launch_ep and (active is None or int(active[slot]) == 0):
+                    recover_slots.append(slot)
+                else:
+                    scale_slots.append(slot)
+            if recover_slots and scale_slots:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    message=(
+                        f"Mixed grow (recover {recover_slots} + scale {scale_slots}) unsupported; "
+                        "grow into retired slots first, then append."
+                    ),
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                )
+            pending_recover_ranks = recover_slots
+
         if not ElasticEPStateManager.request_scale(new_ep_size):
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -4689,6 +4773,7 @@ class Scheduler(
             )
         if (eplb_manager := self.tp_worker.model_runner.eplb_manager) is not None:
             eplb_manager.disable_rebalance("elastic EP scale-up is pending")
+        ElasticEPStateManager.set_pending_recover_ranks(pending_recover_ranks)
         logger.debug(
             "[Elastic EP][scale] scale requested: target_ep_size=%d; "
             "waiting for a joining cohort",
@@ -4993,6 +5078,10 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        # Ex-joiners: clear ep_join_mode (keep ep_join_rank_offset for _elastic_global_rank).
+        if scheduler.server_args.ep_join_mode in ("recover", "scale"):
+            scheduler.server_args.override("elastic_ep.joined", ep_join_mode=None)
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

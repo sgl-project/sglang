@@ -288,7 +288,8 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        if get_exec().moe.ep_join_mode == "scale":
+        # Offset joiners: use launch-cohort size (DeepGEMM cache + MoE shape match).
+        if get_exec().moe.ep_join_mode in ("scale", "recover"):
             storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (

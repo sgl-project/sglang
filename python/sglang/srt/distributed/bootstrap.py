@@ -202,10 +202,14 @@ def _init_parallel_groups(
 ) -> None:
     is_ep_joiner = server_args.is_ep_joiner
     is_scale_joiner = server_args.is_ep_scale_joiner
-    rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
+    is_offset_joiner = server_args.is_ep_offset_joiner
+    rank_offset = server_args.ep_join_rank_offset if is_offset_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
+    # Recover-into-retired-slot: WORLD is the launch cohort, not tp*pp.
+    if is_offset_joiner and not is_scale_joiner:
+        world_size = (server_args.elastic_ep_initial_size or tp_size) * pp_size
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
     init_distributed_environment(

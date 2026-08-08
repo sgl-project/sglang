@@ -6854,7 +6854,7 @@ class ServerArgs:
                 "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
             )
 
-        if self.enable_eplb and self.ep_join_mode != "scale":
+        if self.enable_eplb and self.ep_join_mode != "scale" and not self.is_ep_offset_joiner:
             assert self._resolved().ep_size > 1
 
     def _handle_elastic_ep(self):
@@ -6884,6 +6884,15 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
+                # Reject raw-NCCL fast paths that bypass active_ranks.
+                if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get():
+                    raise ValueError("SGLANG_SYNC_TOKEN_IDS_ACROSS_TP + mooncake bypasses active_ranks.")
+                if self.enable_symm_mem:
+                    raise ValueError("--enable-symm-mem + mooncake bypasses active_ranks.")
+                # shm broadcaster deadlocks on retiree exit (fixed-size, no remove_reader).
+                if envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+                    envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.set(False)
+                    logger.warning("[Elastic EP] mooncake: force SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=False")
         if self.ep_join_mode is not None:
             assert (
                 self.elastic_ep_backend is not None
@@ -6899,9 +6908,10 @@ class ServerArgs:
                     "effective EP size."
                 )
         if self.ep_join_rank_offset != 0:
-            assert self.ep_join_mode == "scale", (
+            # Only scale + recover-with-offset joiners use non-zero (fault recovery is offset=0).
+            assert self.ep_join_mode in ("scale", "recover"), (
                 "--elastic-ep-join-rank-offset is only valid with "
-                "--elastic-ep-join-mode scale."
+                "--elastic-ep-join-mode scale or recover."
             )
             assert (
                 self.ep_join_rank_offset >= 0
@@ -6959,6 +6969,15 @@ class ServerArgs:
                         "A single-rank Elastic EP joining group requires "
                         "--moe-dense-tp-size 1."
                     )
+            elif self.is_ep_offset_joiner:
+                # Recover-into-retired-slot: slot must lie inside launch cohort.
+                assert self.elastic_ep_initial_size is not None, "recover joiner needs --elastic-ep-initial-size"
+                join_target = self.ep_join_rank_offset + self.tp_size
+                assert join_target <= self.elastic_ep_initial_size, (
+                    f"recover joiner target {join_target} > launch cohort {self.elastic_ep_initial_size}"
+                )
+                if self.tp_size == 1:
+                    assert self.moe_dense_tp_size == 1, "single-rank recover joiner needs --moe-dense-tp-size 1"
             else:
                 if self.elastic_ep_initial_size is None:
                     self.elastic_ep_initial_size = self.tp_size
@@ -7018,8 +7037,8 @@ class ServerArgs:
                 "Elastic EP scale-up requires dp_size == tp_size "
                 f"(got dp_size={self.dp_size}, tp_size={self.tp_size})."
             )
-            assert resolved.moe_a2a_backend == "nixl", (
-                "Elastic EP scale-up requires --moe-a2a-backend nixl "
+            assert resolved.moe_a2a_backend in ("nixl", "mooncake"), (
+                "Elastic EP requires --moe-a2a-backend nixl or mooncake "
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
 
@@ -8597,6 +8616,13 @@ class ServerArgs:
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
 
+    @property
+    def is_ep_offset_joiner(self) -> bool:
+        """Joiner slotting into a specific global rank (scale append OR recover with offset>0)."""
+        return self.ep_join_mode == "scale" or (
+            self.ep_join_mode == "recover" and self.ep_join_rank_offset > 0
+        )
+
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
 
@@ -8780,8 +8806,8 @@ class ServerArgs:
             )
 
     def check_server_args(self):
-        # Check parallel size constraints
-        if self.ep_join_mode != "scale":
+        # Check parallel size constraints (offset joiners run per-cohort tp_size).
+        if not self.is_ep_offset_joiner:
             assert (
                 self.tp_size * self.pp_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
@@ -9578,7 +9604,8 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
-            if server_args.is_ep_scale_joiner:
+            if server_args.is_ep_offset_joiner:
+                # Offset joiners co-locate with primary; derive from server_args.port to avoid collision.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA

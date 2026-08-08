@@ -185,6 +185,12 @@ class MLPSyncBatchInfo:
         cpu_data = tp0_info[:, :2].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        # Sanitize retiree-slot garbage (Mooncake WORLD all-reduce mask-flip race).
+        _MAX = 1 << 30
+        self.global_num_tokens = [0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens]
+        self.global_num_tokens_for_logprob = [
+            0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens_for_logprob
+        ]
         self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())

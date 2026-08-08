@@ -2339,7 +2339,7 @@ def _wait_and_warmup(
         _wait_weights_ready()
 
     # Joiner schedulers are served through the primary after adoption.
-    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+    skip_elastic_joiner_warmup = server_args.is_ep_offset_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
             "[Elastic EP] Skipping server warmup for elastic joiner "

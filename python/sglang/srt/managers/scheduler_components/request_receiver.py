@@ -181,7 +181,7 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or self.server_args.is_ep_scale_joiner
+                or self.server_args.is_ep_offset_joiner
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:

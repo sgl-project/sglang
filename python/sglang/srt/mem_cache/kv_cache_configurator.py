@@ -1615,10 +1615,12 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # Offset joiners init after survivors leave WORLD collectives -> local free-mem query.
+        is_offset_joiner = bool(getattr(self.server_args, "is_ep_offset_joiner", False))
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=(not is_offset_joiner) and get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
 
