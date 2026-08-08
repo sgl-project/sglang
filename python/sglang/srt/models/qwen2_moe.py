@@ -351,6 +351,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
+        # Overlap shared_expert with DeepEP dispatch/combine on CUDA. Cached at
+        # init time per the general code style rule on init-static extraction;
+        # ``_forward_deepep`` reads this instead of re-deriving every layer.
+        self._enable_deepep_cuda_shared_overlap = (
+            _is_cuda
+            and self.alt_stream is not None
+            and self.shared_expert is not None
+            and get_moe_a2a_backend().is_deepep()
+        )
         self.is_nextn = is_nextn
 
     def get_moe_weights(self):
@@ -464,7 +473,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and forward_batch.forward_mode.is_cuda_graph()
         )
+        enable_cuda_alt_stream = (
+            self._enable_deepep_cuda_shared_overlap and not enable_dual_stream
+        )
         shared_output = None
+        shared_event = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -472,6 +485,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
+            elif enable_cuda_alt_stream:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    if shared_output is not None:
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -494,6 +515,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if enable_dual_stream:
             wait_share_stream()
+        if shared_event is not None:
+            torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             final_hidden_states.add_(shared_output)
