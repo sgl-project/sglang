@@ -294,7 +294,11 @@ DSV4_ENV_STR="${DSV4_ENV[*]}"
 # A recipe carrying a `model:` block supplies its OWN docker env (below), so the
 # DSV4 env must not leak into it; the DSV4 recipes keep the string above.
 [[ "$HAS_MODEL" == "1" ]] && DSV4_ENV_STR=""
-MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+# Bound a lost MORI completion notification. Healthy MI355X transfers completed in
+# under 30s in instrumented runs; 300s gives 10x headroom while turning the
+# observed 2h30m SLURM_TIME_LIMIT hang into an explicit, actionable failure.
+# The MORI default remains unchanged for every caller outside this workflow.
+MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1 -e SGLANG_MORI_TRANSFER_TIMEOUT_MS=300000"
 # Wide-EP (engine spans >1 node) adds mori all-to-all MoE tuning + the cross-node
 # torch-dist socket NIC. Gated on nodes-per-engine>1 so EP<=8 recipes are untouched.
 if (( PN_PER > 1 || DN_PER > 1 )); then
