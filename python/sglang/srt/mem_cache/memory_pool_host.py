@@ -671,6 +671,10 @@ class LogicalHostPool:
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
+    def destroy(self) -> None:
+        """Logical anchors own no backing buffers or registrations to release."""
+        return None
+
     def available_size(self):
         return len(self.free_slots)
 

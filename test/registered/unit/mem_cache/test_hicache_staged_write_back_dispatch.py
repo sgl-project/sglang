@@ -684,6 +684,22 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(group.layout, "page_first")
         self.assertTrue(group.can_use_write_back_jit)
 
+    def test_host_pool_group_destroys_logical_anchor(self):
+        logical_host_pool = LogicalHostPool(8, 2, layout="page_first")
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=logical_host_pool,
+                    device_pool=None,
+                    layer_mapper=lambda _: 0,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+
+        self.assertIsNone(group.destroy())
+
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = {}
 
