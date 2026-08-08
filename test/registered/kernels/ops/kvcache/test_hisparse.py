@@ -521,6 +521,89 @@ def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
 
 
 @pytest.mark.skipif(
+    not is_hip(), reason="Covers the ROCm wavefront64 fused DSv4 token copy."
+)
+def test_load_cache_to_device_buffer_dsv4_fused_copy_multi_miss() -> None:
+    """Several DSv4 misses in one launch must each land byte-exact.
+
+    The fused copy walks the 576B value and the 8B scale as one 73-word space,
+    so the seam between them falls on a lane index rather than a call boundary.
+    Vary both the source and the destination page offset, including tokens on
+    the second page, so the seam is not always at the same address.
+    """
+    hot_buffer_size = 4
+    num_pages = 2
+    # seq_len stays above the queried tokens so none of them is the newest
+    # token, which the kernel places without a host copy.
+    seq_len = 16
+    host_locs = list(range(seq_len))
+    miss_tokens = [4, 5, 6, 7]
+    # Source offsets: mid-page, last slot of page 0, first slot of page 1,
+    # last slot of page 1.
+    for token, loc in zip(miss_tokens, [10, 63, 64, 127]):
+        host_locs[token] = loc
+    # Destination offsets: first, second, last of page 0, then page 1.
+    device_locs = [0, 1, 63, 64, 65]
+
+    host_cache = torch.zeros(
+        (num_pages, DSV4_PAGE_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
+    )
+    for loc in host_locs:
+        _write_dsv4_token(host_cache, loc, seed=loc + 1)
+
+    device_buffer = torch.full(
+        (num_pages, DSV4_PAGE_BYTES), 0xFF, dtype=torch.uint8, device=DEVICE
+    )
+
+    top_k_tokens = torch.tensor([miss_tokens], dtype=torch.int32, device=DEVICE)
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_dsv4_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=torch.tensor(
+            [[0, 1, 2, 3, -1]], dtype=torch.int32, device=DEVICE
+        ),
+        host_cache_locs=torch.tensor([host_locs], dtype=torch.int64, device=DEVICE),
+        device_buffer_locs=torch.tensor(
+            [device_locs], dtype=torch.int32, device=DEVICE
+        ),
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE).view(
+            1, -1
+        ),
+        item_size_bytes=DSV4_ITEM_BYTES,
+        num_top_k=len(miss_tokens),
+        hot_buffer_size=hot_buffer_size,
+        page_size=DSV4_PAGE_SIZE,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    # Which slot each miss evicts is up to the LRU, so take the destinations
+    # from the kernel; only require that they are distinct and in range.
+    landed = out.cpu().tolist()[0]
+    assert len(set(landed)) == len(landed)
+    assert set(landed).issubset(device_locs)
+
+    device_cpu = device_buffer.cpu()
+    for token, dst_loc in zip(miss_tokens, landed):
+        assert torch.equal(
+            _read_dsv4_token(device_cpu, dst_loc),
+            _read_dsv4_token(host_cache, host_locs[token]),
+        ), f"token {token} -> device loc {dst_loc}"
+
+    # Slots the kernel never wrote must keep their fill, so an over-copy that
+    # ran past the value or the scale would be caught.
+    for loc in set(device_locs) - set(landed):
+        assert torch.all(_read_dsv4_token(device_cpu, loc) == 0xFF)
+
+
+@pytest.mark.skipif(
     not is_hip(), reason="Covers a ROCm wavefront64 LRU writeback regression."
 )
 def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
