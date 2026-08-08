@@ -57,6 +57,9 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -235,10 +238,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        use_rms_k_norm = (
+            config is not None
+            and getattr(config, "index_k_norm_type", "layer") == "rms"
+        )
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
+            and not use_rms_k_norm
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -285,10 +293,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 params_dtype=torch.bfloat16,
                 prefix=add_prefix("weights_proj", prefix),
             )
-        if (
-            config is not None
-            and getattr(config, "index_k_norm_type", "layer") == "rms"
-        ):
+        if use_rms_k_norm:
             self.k_norm = RMSNorm(self.head_dim)
         else:
             self.k_norm = LayerNorm(
@@ -678,13 +683,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
     @staticmethod
+    def _deep_gemm_supported_head_counts() -> Tuple[int, ...]:
+        """Head counts the pinned DeepGEMM MQA-logits kernels natively accept
+        on the current architecture, sorted ascending. SM90 only implements
+        32/64 heads; SM100/SM120 (Blackwell) also accept 8/16 natively."""
+        if is_sm100_supported() or is_sm120_supported():
+            return (8, 16, 32, 64)
+        elif is_sm90_supported():
+            return (32, 64)
+        else:
+            return ()
+
+    @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
-        """Pad q and weights to 32 heads when num_heads < 32,
-        so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
+        """Pad q and weights to the smallest DeepGEMM-supported head count
+        for the current architecture."""
         num_heads = q_fp8.shape[1]
-        if num_heads >= 32:
+        target_heads = num_heads
+        for supported in Indexer._deep_gemm_supported_head_counts():
+            if num_heads <= supported:
+                target_heads = supported
+                break
+        assert num_heads <= target_heads
+        if num_heads == target_heads:
             return q_fp8, weights, num_heads
-        target_heads = 32
         q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, target_heads - num_heads))
         weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
         return q_fp8, weights, num_heads
@@ -856,11 +878,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
         elif use_dg_native:
+            q_fp8_padded, weights_padded, _ = self._pad_heads_for_deep_gemm(
+                q_fp8, weights
+            )
             logits = deepgemm_paged_mqa_logits_native(
                 deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
+                q_fp8_padded,
                 kv_cache_fp8,
-                weights,
+                weights_padded,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
@@ -870,11 +895,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 next_n=next_n,
             )
         else:
+            q_fp8_padded, weights_padded, _ = self._pad_heads_for_deep_gemm(
+                q_fp8, weights
+            )
             logits = deepgemm_paged_mqa_logits_split(
                 deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
+                q_fp8_padded,
                 kv_cache_fp8,
-                weights,
+                weights_padded,
                 seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
