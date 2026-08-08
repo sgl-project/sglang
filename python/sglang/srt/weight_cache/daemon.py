@@ -51,7 +51,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
-    check_ipc_quant_support,
+    WeightCacheQuantStates,
     cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
@@ -143,9 +143,6 @@ class WeightCacheDaemon:
                 f"Distributed already initialized, skipping"
             )
             return
-
-        # Initialize distributed environment
-        import torch.distributed as dist
 
         if not dist.is_initialized():
             if self.dist_init_method is None:
@@ -249,6 +246,13 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
+        self.quant_states = WeightCacheQuantStates(
+            quant_config=quant_config,
+            quant_method=quant_method,
+            server_args=server_args,
+            where="daemon",
+        )
+
         self.config = CacheConfig(
             model_path=self.model_path,
             model_arch=(
@@ -267,17 +271,12 @@ class WeightCacheDaemon:
             dtype=str(model_config.dtype),
             revision=self.revision or "",
             **compute_env_stamp(),
+            **self.quant_states.compute_quant_stamp(),
         )
-
-        # Refuse to serve quant methods not verified to round-trip through pure
-        # IPC tensor export. Checked before loading so an unsupported model
-        # fails fast instead of after minutes of disk I/O.
-        check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
 
-        # Build load config
         load_config = LoadConfig(
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
@@ -290,7 +289,9 @@ class WeightCacheDaemon:
         )
         tic = time.perf_counter()
 
-        # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
+        # Load model: the full pipeline, including TP sharding and the quant
+        # methods' process_weights_after_loading. Clients map the result of that
+        # pass, so it always runs here and never on a client.
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
             model_config=model_config,
@@ -307,6 +308,8 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+
+        self.quant_states.capture_module_attrs(self.model)
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -505,6 +508,7 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
+                    "module_attrs": self.quant_states.module_attrs,
                     # PID so the client can watch daemon liveness: if this
                     # process dies while clients hold IPC mappings, their
                     # param.data (and any CUDA-graph-captured addresses) dangle.

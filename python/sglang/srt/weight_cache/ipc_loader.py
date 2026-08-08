@@ -26,6 +26,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
+    WeightCacheQuantStates,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
@@ -129,17 +130,29 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        # Only now that we are certain we will map the daemon's tensors: this
+        # gives us the per-method adaptation the daemon used (which shapes may
+        # differ, what has to be rewired). Constructing it resolves this
+        # process's MoE/FP4 backends -- a no-op repeat of what the engine
+        # already did, but it needs published server args, which the disk
+        # fallback path above must not require.
+        from sglang.srt.runtime_context import get_server_args
+
+        quant_states = WeightCacheQuantStates(
+            quant_config=engine_quant_config,
+            quant_method=quant_method,
+            server_args=get_server_args(),
+            where="client",
+        )
+
         model = self._load_zero_copy_mode(
             model_config,
             device_config,
             entries,
             quant_config,
+            quant_states=quant_states,
+            module_attrs=cache_data.get("module_attrs") or {},
         )
-
-        # Skip _post_load_weights: the daemon already ran
-        # process_weights_after_loading on the weights before exporting
-        # IPC handles. Running it again would double-process (e.g.,
-        # re-quantize already-quantized weights), corrupting tensor data.
 
         # Rebuild stale tensor views. Some modules store tensor views as
         # plain attributes (not parameters/buffers) during __init__. When
@@ -290,6 +303,8 @@ class IpcModelLoader(BaseModelLoader):
         device_config,
         entries,
         quant_config,
+        quant_states: WeightCacheQuantStates,
+        module_attrs: Optional[dict] = None,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -331,7 +346,13 @@ class IpcModelLoader(BaseModelLoader):
         imported_count = 0
         mismatched = []
         new_params_count = 0
+        reshaped_count = 0
         map_tic = time.perf_counter()
+
+        # A method whose post-processing pads/swizzles says so, and the client
+        # then rebinds to the daemon's shapes instead of treating the difference
+        # from its own create_weights as daemon/client drift.
+        postprocess_reshapes = quant_states.ipc_reshapes_weights()
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
@@ -350,16 +371,18 @@ class IpcModelLoader(BaseModelLoader):
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
-                    mismatched.append(
-                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
-                        f"vs model={ref_param.shape}/{ref_param.dtype}"
-                    )
-                    del imported_tensor
-                    continue
+                    if not postprocess_reshapes:
+                        mismatched.append(
+                            f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                            f"vs model={ref_param.shape}/{ref_param.dtype}"
+                        )
+                        del imported_tensor
+                        continue
+                    reshaped_count += 1
 
             # Replace or register the tensor in the model
             self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
-            imported_refs.append(imported_tensor)
+            imported_refs.append((name, imported_tensor))
             imported_count += 1
 
             if name not in existing_names:
@@ -375,6 +398,21 @@ class IpcModelLoader(BaseModelLoader):
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
+
+        # Reproduce the parts of the daemon's post-processing pass that are not
+        # tensor data. A daemon that shuffled for a different MoE backend never
+        # reaches here: moe_runner_backend is part of the CacheConfig
+        # fingerprint, so it is rejected as a config mismatch at fetch time.
+        if module_attrs:
+            changed = quant_states.apply_module_attrs(model, module_attrs)
+            logger.info(
+                f"[IpcModelLoader] Applied daemon module attributes "
+                f"({changed} changed across {len(module_attrs)} modules)"
+            )
+        for _, module in model.named_modules():
+            if getattr(module, "quant_method", None) is None:
+                continue
+            quant_states.ipc_rebind_after_import(module)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
@@ -412,10 +450,15 @@ class IpcModelLoader(BaseModelLoader):
             )
 
         map_elapsed = time.perf_counter() - map_tic
+        if reshaped_count:
+            logger.info(
+                f"[IpcModelLoader] Rebound {reshaped_count} tensor(s) to the "
+                f"daemon's post-processed shape (expected for {quant_states.quant_method})"
+            )
 
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)
         if imported_refs:
-            model._ipc_imported_tensors = imported_refs
+            model._ipc_imported_tensors = [tensor for _, tensor in imported_refs]
 
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
@@ -506,6 +549,7 @@ class IpcModelLoader(BaseModelLoader):
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
                 **compute_env_stamp(),
+                **WeightCacheQuantStates.quant_stamp_for(quant_method),
             )
 
             logger.info(

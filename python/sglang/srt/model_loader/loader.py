@@ -4144,7 +4144,11 @@ def get_model_loader(
         model_config
         and not modelopt_fp4_online
         and load_config.load_format
-        not in (LoadFormat.RUNAI_STREAMER, LoadFormat.REMOTE_INSTANCE)
+        not in (
+            LoadFormat.RUNAI_STREAMER,
+            LoadFormat.REMOTE_INSTANCE,
+            LoadFormat.IPC_CACHE,
+        )
     )
 
     if model_optloader_allowed and (
