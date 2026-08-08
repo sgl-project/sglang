@@ -169,6 +169,24 @@ def _get_missing_declared_weight_components(model_path: str) -> list[str]:
     return missing_files
 
 
+def _is_metadata_only_pipeline_snapshot(model_path: str) -> bool:
+    """Detect a snapshot holding only pipeline metadata, with no component weights.
+
+    ``maybe_download_model_index`` probes a repo by fetching just ``model_index.json``;
+    that single-file fetch materializes a full cache entry, so a later
+    ``local_files_only`` snapshot resolves it as a hit — offline there is no remote file
+    list to tell "cached" from "fully cached", so completeness must be read off disk.
+
+    Requires *all* declared components missing, not any: a partially populated snapshot
+    is legitimate (``allow_patterns``-filtered fetch), so only total absence is
+    unambiguously the probe stub. No declarations means no evidence to act on.
+    """
+    declared = _get_declared_weight_component_dirs(model_path)
+    if not declared:
+        return False
+    return len(_get_missing_declared_weight_components(model_path)) == len(declared)
+
+
 def _check_index_files_for_missing_shards(
     model_path: str,
 ) -> tuple[bool, list[str], list[str]]:
@@ -822,8 +840,23 @@ def maybe_download_model(
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
         if not force_diffusers_model:
-            return model_name_or_path
-        if is_lora or _verify_diffusers_model_complete(model_name_or_path):
+            # A metadata-only snapshot is not a usable cache hit: returning it would
+            # skip the download and resurface as a missing-component error. LoRA repos
+            # declare no components, so they can never be the probe stub.
+            if is_lora or not _is_metadata_only_pipeline_snapshot(local_path):
+                return str(local_path)
+            if not download:
+                raise ValueError(
+                    f"Model {model_name_or_path} found in cache but only contains "
+                    "pipeline metadata (no component weights) and download=False."
+                )
+            logger.info(
+                "Cached snapshot for %s only contains pipeline metadata, "
+                "will download component weights from %s",
+                model_name_or_path,
+                _model_hub_name(),
+            )
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(
                     model_name_or_path
