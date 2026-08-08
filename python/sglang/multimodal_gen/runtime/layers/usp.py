@@ -8,14 +8,19 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
     pack_qkv_destination_major,
 )
 from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
     get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    flash_attn as _fa_backend,
 )
 from sglang.srt.utils.common import torch_release
 
@@ -675,6 +680,7 @@ def ring_attn(
     attn_impl: "AttentionImpl",
     is_causal: bool = False,
     dropout_p: float = 0.0,
+    return_softmax_lse: bool = False,
 ):
     """
     Ring Attention implementation.
@@ -748,15 +754,169 @@ def ring_attn(
     if use_segment_id:
         # For torch >= 2.6, segment_id is required. The value '1' is a placeholder
         # as we are not using complex segmentation features.
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             seq_dim=1,  # segment_id
             **attn_kwargs,
         )
     else:
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             **attn_kwargs,
         )
 
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])
+    if return_softmax_lse:
+        return output, lse
     return output
+
+
+def _merge_attention_partials(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> torch.Tensor:
+    """Merge two attention partials computed over disjoint KV sets.
+
+    `out_*` are `[B, S, H, D]`; `lse_*` are the dense-FA LSE layout `[B, H, S]`.
+    Each partial is self-normalized over its own KV, so the exact combine is a
+    two-term logsumexp reweighting; done in fp32 for stability.
+    """
+    lse_a = lse_a.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    lse_b = lse_b.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    new_lse = torch.logaddexp(lse_a, lse_b)
+    return out_a.to(torch.float32) * torch.exp(lse_a - new_lse) + out_b.to(
+        torch.float32
+    ) * torch.exp(lse_b - new_lse)
+
+
+def _ring_merge_attention(
+    out_acc: torch.Tensor | None,
+    lse_acc: torch.Tensor | None,
+    step_out: torch.Tensor,
+    step_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Online-softmax combine of one more ring step's partial attention.
+
+    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
+    layout `[H, T]`. Both are already self-normalized over their own KV
+    chunk, so combining chunks is the standard two-term logsumexp merge
+    (exact up to float rounding); done in fp32 for stability.
+    """
+    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+    step_out = step_out.to(torch.float32)
+    if out_acc is None:
+        return step_out, step_lse
+    new_lse = torch.logaddexp(lse_acc, step_lse)
+    out_acc = out_acc * torch.exp(lse_acc - new_lse) + step_out * torch.exp(
+        step_lse - new_lse
+    )
+    return out_acc, new_lse
+
+
+def _ring_attention_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float,
+    real_seq_len: int,
+    ring_ws: int,
+) -> torch.Tensor:
+    """Ring-rotated varlen attention over one rank's local packed chunk.
+
+    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
+    real rows followed by however many of this chunk's rows are padding).
+    KV is P2P-rotated around the ring one hop per step (send this step's
+    buffer to the next rank, receive the following step's buffer from the
+    previous rank) so the hop for step+1 overlaps this step's attention
+    compute -- unlike a single blocking all_gather, no step waits on the
+    full ring's transfer before its own compute can start. Each hop's
+    *real* prefix is attended locally and merged via online softmax.
+    Padding rows never contribute to any KV chunk (their output is unused
+    downstream, but must not be corrupted by attending across the padding
+    boundary), and a chunk that is entirely padding is skipped outright.
+    """
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+    ring_chunk_len = q.shape[0]
+    _, ring_rank = get_ring_ctx()
+
+    # `isend`/`irecv` (unlike collectives) address peers by global rank even
+    # under a sub-group, so resolve this ring's neighbors once up front.
+    next_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank + 1) % ring_ws
+    )
+    prev_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank - 1) % ring_ws
+    )
+
+    # K and V travel as one stacked buffer so each hop is a single P2P
+    # send/recv pair instead of two; stacking also makes the buffer
+    # contiguous, so no separate .contiguous() call is needed.
+    kv0 = torch.stack((k, v))
+    kv_bufs = [kv0, torch.empty_like(kv0)]
+    cur = 0
+
+    q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
+    out_acc: torch.Tensor | None = None
+    lse_acc: torch.Tensor | None = None
+    pending_ops = None
+    for step in range(ring_ws):
+        nxt = 1 - cur
+        if step < ring_ws - 1:
+            # kick off next hop before this step's compute so the transfer
+            # overlaps it; wait for completion only after issuing compute.
+            pending_ops = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        kv_bufs[cur],
+                        next_global_rank,
+                        group=ring_pg,
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        kv_bufs[nxt],
+                        prev_global_rank,
+                        group=ring_pg,
+                    ),
+                ]
+            )
+
+        src_rank = (ring_rank - step) % ring_ws
+        remote_used = min(
+            max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
+        )
+        if remote_used > 0:
+            k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
+            result = flash_attn_varlen_func(
+                q,
+                kv_bufs[cur][0, :remote_used],
+                kv_bufs[cur][1, :remote_used],
+                cu_seqlens_q=q_cu,
+                cu_seqlens_k=k_cu,
+                max_seqlen_q=ring_chunk_len,
+                max_seqlen_k=remote_used,
+                softmax_scale=softmax_scale,
+                causal=False,
+                ver=_fa_backend.fa_ver,
+                return_softmax_lse=True,
+            )
+            if not isinstance(result, tuple):
+                raise RuntimeError(
+                    "flash_attn_varlen_func did not return softmax_lse; ring "
+                    "parallelism requires a backend that supports "
+                    "return_softmax_lse=True."
+                )
+            step_out, step_lse, *_ = result
+            out_acc, lse_acc = _ring_merge_attention(
+                out_acc, lse_acc, step_out, step_lse
+            )
+
+        if pending_ops is not None:
+            for op in pending_ops:
+                op.wait()
+            pending_ops = None
+            cur = nxt
+    return out_acc.to(q.dtype)

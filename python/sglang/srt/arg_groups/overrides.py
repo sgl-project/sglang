@@ -1292,6 +1292,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -1320,6 +1321,14 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         "attention_backend": sm100_default_attn_backend,
         "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
     }
+
+
+@_register_for("InternS2MobiusForConditionalGeneration")
+def _interns2_mobius_baseline_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Select the only MoE runner validated for the 2,560-expert baseline."""
+    if server_args.moe_runner_backend == "auto":
+        return {"moe_runner_backend": "triton_kernel"}
+    return {}
 
 
 @_register_for("Qwen3VLForConditionalGeneration")
@@ -1470,6 +1479,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
+        "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
