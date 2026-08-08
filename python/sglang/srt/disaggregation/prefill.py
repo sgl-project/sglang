@@ -809,6 +809,14 @@ class SchedulerDisaggregationPrefillMixin:
                     assert (
                         req.metadata_buffer_index >= 0
                     ), f"Req {req.rid} does not have metadata buffer allocated"
+                    # Under overlap scheduling this chunk is handed over while
+                    # its own forward may still be running on forward_stream,
+                    # and the transfer worker reads device memory outside the
+                    # CUDA stream. Gate that read on this chunk's writes, the
+                    # same way the early-send path below does.
+                    ev = torch.cuda.Event()
+                    ev.record(self.forward_stream)
+                    req.disagg_kv_sender._early_send_wait_event = ev
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
