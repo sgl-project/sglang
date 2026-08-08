@@ -5,6 +5,7 @@ pub mod header_forwarding_test;
 pub mod load_balancing_test;
 pub mod manual_routing_test;
 pub mod payload_size_test;
+pub mod pd_circuit_breaker_test;
 pub mod pd_routing_test;
 pub mod policy_registry_integration;
 pub mod power_of_two_test;
