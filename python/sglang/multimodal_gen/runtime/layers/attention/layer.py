@@ -25,11 +25,13 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_to_all_4D,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_rank,
     get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
@@ -45,6 +47,8 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ipc_input_a2a_qkv,
+    _merge_attention_partials,
+    _ring_attention_varlen,
     _usp_input_all_to_all,
     _usp_input_all_to_all_qkv,
     _usp_input_all_to_all_varlen,
@@ -689,15 +693,12 @@ class USPAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         if get_ring_parallel_world_size() > 1:
-            backend_enum = attn_backend.get_enum()
-            if backend_enum not in (
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.SAGE_ATTN,
-            ):
+            if not attn_backend.supports_ring_rotation():
                 raise RuntimeError(
-                    f"Ring Attention is only supported for FlashAttention or SageAttention backends, "
-                    f"but got {backend_enum.name}. "
-                    f"Please ensure your platform supports these backends."
+                    f"Ring Attention requires a backend whose kernel exposes the "
+                    f"softmax LSE for the per-hop merge; "
+                    f"{attn_backend.get_enum().name} does not declare support "
+                    f"(see AttentionBackend.supports_ring_rotation)."
                 )
         impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -744,6 +745,7 @@ class USPAttention(nn.Module):
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
         qkv_pre_all_to_all: bool = False,
+        seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -778,6 +780,31 @@ class USPAttention(nn.Module):
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
+        if seq_lens is not None:
+            assert (
+                attn_mask is None
+                and attn_mask_meta is None
+                and not num_replicated_prefix
+                and not num_replicated_suffix
+                and not num_replicated_kv_prefix
+            ), "Varlen USPAttention does not support masks or replicated tokens"
+            if effective_skip_sp or get_sequence_parallel_world_size() == 1:
+                return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            if get_ring_parallel_world_size() > 1:
+                # The varlen all-to-all spans the combined SP group and is not
+                # ring-aware; it would shuffle rows across ring ranks instead
+                # of rotating KV, corrupting the output silently.
+                raise NotImplementedError(
+                    "Varlen USPAttention does not support ring parallelism yet."
+                )
+            qkv = torch.cat([q, k, v], dim=0)
+            qkv = _usp_input_all_to_all_varlen(qkv, seq_lens, head_dim=2)
+            qkv = self.attn_impl.preprocess_qkv(qkv, ctx_attn_metadata)
+            q, k, v = qkv.chunk(3, dim=0)
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.postprocess_output(out, ctx_attn_metadata)
+            return _usp_output_all_to_all_varlen(out, seq_lens, head_dim=2)
+
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
@@ -830,6 +857,26 @@ class USPAttention(nn.Module):
                 raise NotImplementedError(unsupported)
 
         if attn_mask is not None or meta_only_pad:
+            if (
+                (
+                    num_replicated_prefix
+                    or num_replicated_suffix
+                    or num_replicated_kv_prefix
+                )
+                and not effective_skip_sp
+                and get_sequence_parallel_world_size() > 1
+            ):
+                # Under SP this path shards every row through the all-to-all;
+                # a replicated prefix/suffix would be duplicated across ranks
+                # and silently corrupt the output, so refuse loudly instead.
+                # On a single rank the mask already describes the full
+                # sequence and the replicated counts are meaningless, so the
+                # call is legal.
+                raise NotImplementedError(
+                    "USPAttention's masked path does not support replicated "
+                    "prefix/suffix tokens under sequence parallelism; drop "
+                    "attn_mask/attn_mask_meta or the replicated segment."
+                )
 
             def _prepare_sdpa_mask(
                 mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
@@ -919,8 +966,15 @@ class USPAttention(nn.Module):
                     ).transpose(1, 2)
 
             if get_ring_parallel_world_size() > 1:
+                if (
+                    meta_only_pad
+                    and q.shape[0] == 1
+                    and self.backend == AttentionBackendEnum.FA
+                ):
+                    return self._forward_ring_tail_pad(q, k, v, attn_mask_meta)
                 raise NotImplementedError(
-                    "USPAttention masked path does not support ring parallelism yet."
+                    "USPAttention masked path supports ring parallelism only "
+                    "for batch-1 tail-pad metadata on the FA backend."
                 )
             if attn_mask is not None and attn_mask.dim() != 2:
                 raise NotImplementedError(
@@ -1096,15 +1150,19 @@ class USPAttention(nn.Module):
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."
             )
-        if sp_size > 1 and num_replicated_prefix > 0:
+        # Replicated-token handling is keyed on the full SP group: with u=1,
+        # r>1 the plain ring path would rotate the replicated tokens as if
+        # they were sharded rows, double-counting them.
+        sp_ws = get_sequence_parallel_world_size()
+        if sp_ws > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
                 q, k, v, ctx_attn_metadata, num_replicated_prefix
             )
-        if sp_size > 1 and num_replicated_suffix > 0:
+        if sp_ws > 1 and num_replicated_suffix > 0:
             return self._forward_with_replicated_suffix(
                 q, k, v, ctx_attn_metadata, num_replicated_suffix
             )
-        if sp_size > 1 and num_replicated_kv_prefix > 0:
+        if sp_ws > 1 and num_replicated_kv_prefix > 0:
             return self._forward_with_replicated_kv_prefix(
                 q, k, v, ctx_attn_metadata, num_replicated_kv_prefix
             )
@@ -1146,6 +1204,39 @@ class USPAttention(nn.Module):
             out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
+
+    def _forward_ring_tail_pad(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask_meta: dict,
+    ) -> torch.Tensor:
+        """Ring attention for a tail-padded shard.
+
+        After the Ulysses all-to-all each ring rank holds one contiguous block
+        of the gathered sequence, and the tail-pad invariant keeps all padding
+        at the global tail — exactly the ring kernel's real-length clamp, so
+        no masks or repacking are needed. Pad rows receive garbage output,
+        which the tail-pad consumers already trim.
+        """
+        q, k, v = _usp_input_all_to_all_qkv(q, k, v)
+        out = _ring_attention_varlen(
+            q.squeeze(0),
+            k.squeeze(0),
+            v.squeeze(0),
+            softmax_scale=self.softmax_scale,
+            real_seq_len=int(attn_mask_meta["pad_start"]),
+            ring_ws=get_ring_parallel_world_size(),
+        )
+        # Match the Ulysses tail path: masked query rows read as zeros. This
+        # rank's chunk covers global rows [rank*chunk, (rank+1)*chunk).
+        pad_from = (
+            int(attn_mask_meta["pad_start"]) - get_ring_parallel_rank() * out.shape[0]
+        )
+        if pad_from < out.shape[0]:
+            out[max(pad_from, 0) :].zero_()
+        return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
 
     @staticmethod
     def _gather_sharded_sequence(
@@ -1353,13 +1444,8 @@ class USPAttention(nn.Module):
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
         """
-        if get_ring_parallel_world_size() > 1:
-            raise NotImplementedError(
-                "USPAttention replicated-prefix/suffix path does not support "
-                "ring parallelism yet."
-            )
         sp_size = get_ulysses_parallel_world_size()
-        sp_rank = get_sp_parallel_rank()
+        u_rank = get_ulysses_parallel_rank()
 
         q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
@@ -1374,32 +1460,72 @@ class USPAttention(nn.Module):
         # For MHA (kv heads == q heads) this is identical to the q shard.
         h_local = q_shard.shape[2]
         kv_h_local = k_shard.shape[2]
-        h_start = sp_rank * h_local
-        kv_h_start = sp_rank * kv_h_local
+        h_start = u_rank * h_local
+        kv_h_start = u_rank * kv_h_local
         q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
         k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
         v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
 
         q = torch.cat([q_rep, q_shard], dim=1)
-        k = torch.cat([k_rep, k_shard], dim=1)
-        v = torch.cat([v_rep, v_shard], dim=1)
-
-        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        out = self._replicated_kv_attention(
+            q, k_shard, v_shard, k_rep, v_rep, ctx_attn_metadata
+        )
 
         out_rep = out[:, :num_rep]
         out_shard = out[:, num_rep:]
 
         out_shard = _usp_output_all_to_all(out_shard, head_dim=2)
 
-        gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
-        torch.distributed.all_gather(
-            gathered,
-            out_rep.contiguous(),
-            group=get_sp_group().ulysses_group,
-        )
-        out_rep = torch.cat(gathered, dim=2)
+        if sp_size > 1:
+            gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
+            torch.distributed.all_gather(
+                gathered,
+                out_rep.contiguous(),
+                group=get_sp_group().ulysses_group,
+            )
+            out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
+
+    def _replicated_kv_attention(
+        self,
+        q: torch.Tensor,
+        k_shard: torch.Tensor,
+        v_shard: torch.Tensor,
+        k_rep: torch.Tensor,
+        v_rep: torch.Tensor,
+        ctx_attn_metadata,
+        rep_first: bool = True,
+    ) -> torch.Tensor:
+        """Attention of q against replicated + ring-sharded KV.
+
+        Without ring parallelism the two KV parts concatenate into one local
+        kernel call, replicated part first unless `rep_first=False` (the
+        suffix path keeps KV in tail order for bitwise stability). Under ring
+        parallelism the sharded KV rotates around the ring while the
+        replicated KV contributes one extra local partial, LSE-merged with
+        the ring result (exact up to float reordering).
+        """
+        if get_ring_parallel_world_size() > 1:
+            out_ring, lse_ring = ring_attn(
+                q, k_shard, v_shard, self.attn_impl, return_softmax_lse=True
+            )
+            out_rep, lse_rep, *_ = self.attn_impl.forward(
+                q, k_rep, v_rep, attn_metadata=None, return_softmax_lse=True
+            )
+            merged = _merge_attention_partials(out_ring, lse_ring, out_rep, lse_rep)
+            return merged.to(q.dtype)
+        kv_parts = (
+            ([k_rep, k_shard], [v_rep, v_shard])
+            if rep_first
+            else (
+                [k_shard, k_rep],
+                [v_shard, v_rep],
+            )
+        )
+        k = torch.cat(kv_parts[0], dim=1)
+        v = torch.cat(kv_parts[1], dim=1)
+        return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
     def forward_with_replicated_kv_prefix(
         self,
@@ -1425,7 +1551,10 @@ class USPAttention(nn.Module):
             v = torch.cat([v_prefix, v_suffix], dim=1)
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
-        if get_ulysses_parallel_world_size() == 1:
+        if (
+            get_ulysses_parallel_world_size() == 1
+            and get_ring_parallel_world_size() == 1
+        ):
             k = torch.cat([k_prefix, k_suffix], dim=1)
             v = torch.cat([v_prefix, v_suffix], dim=1)
             return self(q, k, v)
@@ -1472,14 +1601,9 @@ class USPAttention(nn.Module):
         ctx_attn_metadata,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
-        if get_ring_parallel_world_size() > 1:
-            raise NotImplementedError(
-                "USPAttention replicated-kv-prefix path does not support "
-                "ring parallelism yet."
-            )
-        sp_rank = get_sp_parallel_rank()
+        u_rank = get_ulysses_parallel_rank()
 
-        if q.device.type == "cuda":
+        if q.device.type == "cuda" and get_ulysses_parallel_world_size() > 1:
             q, k_shard, v_shard = async_a2a_communicate(
                 [q, k_shard, v_shard],
                 get_ulysses_parallel_world_size(),
@@ -1496,15 +1620,14 @@ class USPAttention(nn.Module):
             v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
         h_kv_local = k_shard.shape[2]
-        h_start = sp_rank * h_kv_local
+        h_start = u_rank * h_kv_local
         h_end = h_start + h_kv_local
         k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
         v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
 
-        k = torch.cat([k_rep, k_shard], dim=1)
-        v = torch.cat([v_rep, v_shard], dim=1)
-
-        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        out = self._replicated_kv_attention(
+            q, k_shard, v_shard, k_rep, v_rep, ctx_attn_metadata
+        )
         return _usp_output_all_to_all(out, head_dim=2)
 
     def _forward_with_replicated_suffix(
@@ -1516,26 +1639,53 @@ class USPAttention(nn.Module):
         num_rep: int,
     ) -> torch.Tensor:
         """Ulysses attention where the last num_rep tokens are replicated
-        across SP ranks and should not be duplicated by the all-to-all."""
+        across SP ranks and should not be duplicated by the all-to-all.
+
+        The suffix stays at the sequence tail so every query scans K/V in the
+        same order as a single rank (bitwise-stable across SP degrees);
+        rotating it to the front reorders the reduction, and few-step models
+        amplify that into visible drift.
+        """
         if num_rep <= 0:
             raise ValueError("num_rep must be positive for replicated suffix.")
+        u_rank = get_ulysses_parallel_rank()
 
         q_shard, q_rep = q[:, :-num_rep], q[:, -num_rep:]
         k_shard, k_rep = k[:, :-num_rep], k[:, -num_rep:]
         v_shard, v_rep = v[:, :-num_rep], v[:, -num_rep:]
 
-        # dense self-attention is permutation equivariant for non-causal use.
-        # 1. rotate the replicated suffix to the front
-        # 2. reuse the validated replicated-prefix path, then
-        # 3. rotate the output back
-        out = self._forward_with_replicated_prefix(
-            torch.cat([q_rep, q_shard], dim=1),
-            torch.cat([k_rep, k_shard], dim=1),
-            torch.cat([v_rep, v_shard], dim=1),
-            ctx_attn_metadata,
-            num_rep,
+        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
+        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+
+        h_local = q_shard.shape[2]
+        kv_h_local = k_shard.shape[2]
+        h_start = u_rank * h_local
+        kv_h_start = u_rank * kv_h_local
+        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
+        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+
+        q = torch.cat([q_shard, q_rep], dim=1)
+        out = self._replicated_kv_attention(
+            q, k_shard, v_shard, k_rep, v_rep, ctx_attn_metadata, rep_first=False
         )
-        out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
+
+        out_shard = out[:, :-num_rep]
+        out_rep = out[:, -num_rep:]
+
+        out_shard = _usp_output_all_to_all(out_shard, head_dim=2)
+
+        sp_size = get_ulysses_parallel_world_size()
+        if sp_size > 1:
+            gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
+            torch.distributed.all_gather(
+                gathered,
+                out_rep.contiguous(),
+                group=get_sp_group().ulysses_group,
+            )
+            out_rep = torch.cat(gathered, dim=2)
+
         return torch.cat([out_shard, out_rep], dim=1)
 
 
