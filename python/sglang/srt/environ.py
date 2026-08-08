@@ -1210,6 +1210,10 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Experimental: MXFP4 KV cache (block-32 E8M0+E2M1) for DSV4 on Hopper.
+    # When enabled, the memory pool stores keys in 368 B/token MXFP4 format
+    # instead of the default 584 B/token FP8 format.
+    SGLANG_OPT_DSV4_MXFP4_KVCACHE = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

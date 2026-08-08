@@ -708,7 +708,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        kv_bytes_fp8 = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if envs.SGLANG_OPT_DSV4_MXFP4_KVCACHE.get():
+            from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+                MXFP4_BYTES_PER_TOKEN,
+            )
+
+            kv_bytes_swa = MXFP4_BYTES_PER_TOKEN
+        else:
+            kv_bytes_swa = kv_bytes_fp8
 
         quant_block_size = 128
         indexer_bytes = (
@@ -737,9 +745,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
+            self.swa_ratio * kv_bytes_swa * self.num_layers_total
+            + c4_frac * kv_bytes_fp8 * self.num_layers_ca4
+            + 1 / 128 * kv_bytes_fp8 * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128

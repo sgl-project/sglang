@@ -1135,6 +1135,12 @@ class DeepseekV4AttnBackend(
                 raw_metadata=self.forward_metadata,
             )
 
+        # NOTE: for MXFP4 decode, _mx_nv defaults to swa_window=128. This is
+        # set only in init_forward_metadata_out_graph during CUDA graph capture.
+        # In the non-CUDA-graph path, keeping the default avoids dilution from
+        # zero-K tokens (the dequant path zeros out invalid token positions,
+        # so scanning more tokens is safe with the SDPA zero-masking approach).
+
         # Compute the SWA KV-store write target once per forward and cache it on
         # the metadata for every layer's store. This is recorded inside the cuda
         # graph, so replay re-reads the live out_cache_loc buffer (spec-v2 and DP
@@ -1378,6 +1384,35 @@ class DeepseekV4AttnBackend(
                 )
                 else None
             )
+
+        # Pre-compute MXFP4 decode params (avoids GPU→CPU .item() in forward,
+        # which breaks CUDA graph capture).
+        if self.token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+            swa_window = 128
+            if seq_lens_cpu is not None:
+                seq_len = int(seq_lens_cpu.min().item())
+            elif seq_lens is not None and seq_lens.numel() > 0:
+                seq_len = swa_window  # safe default during capture
+            else:
+                seq_len = swa_window
+            self._mx_nv = min(seq_len, swa_window)
+            # Pre-compute extra_tk caps for C4/C128 layers.
+            # Using extra_topk_lengths.shape[-1] in the forward pass gives
+            # N_heads = bs * n_heads_per_req, which balloons with batch size
+            # and floods softmax with invalid zero-K entries.  Instead,
+            # capture the actual per-request max here (outside the CUDA
+            # graph, so .item() is safe).
+            self._mx_extra_tk_c4 = 0
+            self._mx_extra_tk_c128 = 0
+            metadata = getattr(self, "forward_metadata", None)
+            core = getattr(metadata, "core_attn_metadata", None)
+            if core is not None:
+                c128_len = getattr(core, "c128_topk_lengths_clamp1", None)
+                if c128_len is not None and c128_len.numel() > 0:
+                    self._mx_extra_tk_c128 = int(c128_len.max().item())
+                c4_len = getattr(core, "c4_sparse_topk_lengths", None)
+                if c4_len is not None and c4_len.numel() > 0:
+                    self._mx_extra_tk_c4 = int(c4_len.max().item())
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
@@ -1676,6 +1711,40 @@ class DeepseekV4AttnBackend(
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
+            # --- MXFP4 path (before FP8-specific reshapes) ---
+            if token_to_kv_pool.dsv4_kv_cache_store_mxfp4:
+                # Use sparse prefill for true multi-token extend (prefill)
+                # batches. For decode (single-token, or decode CUDA graph
+                # capture with bs>1 but is_extend=False), use the fused
+                # MXFP4 decode kernel.
+                num_q_tokens = q.shape[0]
+                is_real_extend = (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                )
+                if is_real_extend and num_q_tokens > 1:
+                    return self._forward_prefill_sparse(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                    )
+                # Decode (or small extend): fused MXFP4 jit_kernel
+                return self._forward_mxfp4_decode(
+                    q=q,
+                    forward_batch=forward_batch,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=core_attn_metadata.swa_page_indices,
+                    swa_topk_lengths=core_attn_metadata.swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    compress_ratio=compress_ratio,
+                    attn_sink=attn_sink,
+                )
+
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
@@ -1794,6 +1863,293 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
+    def _forward_mxfp4_decode(
+        self,
+        q: torch.Tensor,
+        forward_batch,  # ForwardBatch
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_topk_lengths: torch.Tensor | None,
+        compress_ratio: int,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """MXFP4 decode: fused kernel for SWA, lightweight merge for C4/C128 extras."""
+        from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
+        from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+            MXFP4_BYTES_PER_TOKEN,
+            MXFP4_TOTAL_DIM,
+            dequantize_dsv4_mxfp4_k_cache_paged,
+        )
+
+        dev = q.device
+        # q is [bs, n_heads, 512] (decode: bs=1) → flatten to [bs*n_heads, 512]
+        q_orig_shape = q.shape
+        if q.ndim >= 3:
+            q = q.reshape(-1, q.shape[-1])
+        assert q.ndim == 2 and q.shape[1] == MXFP4_TOTAL_DIM
+        N_heads = q.shape[0]
+
+        # num_valid is pre-computed in init_forward_metadata_out_graph
+        # (avoids GPU→CPU .item() which breaks CUDA graph capture).
+        # Fall back to swa_topk_lengths[0] which is the actual count of
+        # valid SWA tokens (avoids diluting attention with zero-K entries).
+        swa_window = 128
+        num_valid = getattr(self, "_mx_nv", None)
+        if num_valid is None:
+            # Non-CUDA-graph path: use actual SWA token count
+            num_valid = min(int(swa_topk_lengths.min().item()), swa_window)
+            self._mx_nv = num_valid
+
+        # Expand per-request indices/values to per-head via repeat_interleave.
+        # The old _match used constant-value padding which made row 0 correct
+        # but left all other heads with dummy values (0 or -1).  This caused
+        # both SWA-only fused-kernel heads 1..n_heads-1 and C4/C128 per-head
+        # dequant to see garbage indices at batch sizes > 1.
+        def _tile_for_heads(x, n_repeats, value):
+            if x is None or x.shape[0] == N_heads:
+                return x
+            if x.shape[0] > N_heads:
+                return x[:N_heads]
+            # x.shape[0] == bs, N_heads == bs * n_repeats
+            return x.repeat_interleave(n_repeats, dim=0)
+
+        n_heads_per_req = 1
+        if len(q_orig_shape) >= 3:
+            n_heads_per_req = q_orig_shape[1]
+        elif N_heads > 1:
+            # Fallback: every row is a separate "request" with 1 head.
+            n_heads_per_req = 1
+
+        swa_page_indices = _tile_for_heads(swa_page_indices, n_heads_per_req, 0)
+        swa_topk_lengths = _tile_for_heads(swa_topk_lengths, n_heads_per_req, 1)
+        extra_indices = _tile_for_heads(extra_indices, n_heads_per_req, -1)
+        extra_topk_lengths = _tile_for_heads(extra_topk_lengths, n_heads_per_req, 1)
+        # attn_sink has a fixed dimension (e.g. 4096) unrelated to bs —
+        # keep the old padding behaviour here.
+        if attn_sink is not None and attn_sink.shape[0] < N_heads:
+            attn_sink = torch.nn.functional.pad(
+                attn_sink,
+                (0, 0) * (attn_sink.ndim - 1) + (0, N_heads - attn_sink.shape[0]),
+                value=0.0,
+            )
+        elif attn_sink is not None and attn_sink.shape[0] > N_heads:
+            attn_sink = attn_sink[:N_heads]
+
+        bs = N_heads // n_heads_per_req if n_heads_per_req > 0 else 1
+
+        # compress_ratio > 0 means C4 or C128 — has extras (FP8 format)
+        has_extras = compress_ratio > 0 and extra_k_cache is not None
+
+        # Multi-kernel-page fallback (should only trigger for num_valid > swa_window,
+        # which doesn't happen in decode since _mx_nv is capped).
+        if num_valid > swa_window:
+            return self._mxfp4_decode_sdpa_fallback(
+                q=q,
+                q_orig_shape=q_orig_shape,
+                swa_k_cache=swa_k_cache,
+                swa_page_indices=swa_page_indices,
+                swa_topk_lengths=swa_topk_lengths,
+                page_size=self.token_to_kv_pool.swa_page_size,
+                sm_scale=self.softmax_scale,
+                attn_sink=attn_sink,
+            )
+
+        if not has_extras:
+            # ── SWA-only (compress_ratio=0): fused decode kernel ────
+            k_cache_flat = swa_k_cache.view(-1, MXFP4_BYTES_PER_TOKEN)
+            # swa_page_indices contains TOKEN positions (not page indices).
+            # Convert to kernel page index by dividing by page size (128).
+            swa_start_token = swa_page_indices[:, 0]
+            kernel_page_idx = (
+                (swa_start_token // swa_window).to(torch.int32).contiguous()
+            )
+            _sink = attn_sink.float() if attn_sink is not None else None
+            o_swa = mxfp4_decode_attention(
+                q=q,
+                k_cache=k_cache_flat,
+                page_indices=kernel_page_idx,
+                sm_scale=self.softmax_scale,
+                page_size=swa_window,
+                num_valid=num_valid,
+                attn_sink=_sink,
+            )
+            return o_swa.view(*q_orig_shape[:-1], -1)
+
+        # ── C4/C128: dequant + SDPA ──────
+        #
+        # Two paths for performance:
+        #  - bs == 1 (common): single dequant, single batched SDPA — as fast
+        #    as the original commit-ad6404c2 code.
+        #  - bs > 1 (multi-request): per-request dequant + batched SDPA with
+        #    per-request attention mask — avoids cross-request KV cache
+        #    contamination at the cost of multiple dequant calls.
+        swa_phys_page_size = self.token_to_kv_pool.swa_page_size
+        extra_page_size = self.token_to_kv_pool.page_size // compress_ratio
+
+        from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+            dequantize_k_cache_paged as dequantize_fp8_k_cache_paged,
+        )
+
+        swa_tk = num_valid
+        _fallback_cap = 64 if compress_ratio == 4 else 16
+        if compress_ratio == 128:
+            extra_cap = getattr(self, "_mx_extra_tk_c128", 0) or _fallback_cap
+        elif compress_ratio == 4:
+            extra_cap = getattr(self, "_mx_extra_tk_c4", 0) or _fallback_cap
+        else:
+            extra_cap = _fallback_cap
+        extra_max_tk = (
+            min(extra_cap, extra_indices.shape[-1]) if extra_indices is not None else 0
+        )
+
+        def _dequant_swa(row_idx: int) -> torch.Tensor:
+            """Dequant SWA tokens for the request at source row *row_idx*."""
+            pos = swa_page_indices[row_idx, :swa_tk].long()
+            valid = pos >= 0
+            dq = dequantize_dsv4_mxfp4_k_cache_paged(
+                swa_k_cache, pos.clamp(min=0), swa_phys_page_size
+            )[:, 0, :]
+            return dq * valid.unsqueeze(1).float()
+
+        def _dequant_extra(row_idx: int) -> torch.Tensor | None:
+            """Dequant extra pages for the request at source row *row_idx*."""
+            if extra_indices is None or extra_max_tk <= 0 or extra_k_cache is None:
+                return None
+            pos = extra_indices[row_idx, :extra_max_tk].long()
+            valid = pos >= 0
+            dq = dequantize_fp8_k_cache_paged(
+                extra_k_cache, pos.clamp(min=0), extra_page_size
+            )[:, 0, :]
+            return dq * valid.unsqueeze(1).float()
+
+        # --- fast path: bs == 1 (single dequant + batched SDPA) ---
+        if bs == 1:
+            swa_deq = _dequant_swa(0)
+            extra_deq = _dequant_extra(0)
+            parts = [swa_deq]
+            if extra_deq is not None:
+                parts.append(extra_deq)
+            k_all = torch.cat(parts, dim=0).float()  # [T, 512]
+            q_f32 = q.float()
+            scores = (q_f32 @ k_all.T) * self.softmax_scale
+            if attn_sink is not None:
+                sink = attn_sink.float().unsqueeze(1)
+                scores_aug = torch.cat([scores, sink], dim=1)
+                weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
+            else:
+                weights = torch.softmax(scores, dim=1)
+            out = weights @ k_all
+            return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
+
+        # --- general path: bs > 1, per-request dequant + masked SDPA ---
+        k_segments: list[torch.Tensor] = []
+        k_offsets: list[int] = [0]
+
+        for r in range(bs):
+            head_row = r * n_heads_per_req
+            swa_deq = _dequant_swa(head_row)
+            extra_deq = _dequant_extra(head_row)
+            parts = [swa_deq]
+            if extra_deq is not None:
+                parts.append(extra_deq)
+            k_r = torch.cat(parts, dim=0).float()
+            k_segments.append(k_r)
+            k_offsets.append(k_offsets[-1] + int(k_r.shape[0]))
+
+        k_all = torch.cat(k_segments, dim=0).float()  # [T_total, 512]
+        q_f32 = q.float()  # [N_heads, 512]
+        T_total = k_all.shape[0]
+
+        mask = torch.zeros(N_heads, T_total, dtype=torch.bool, device=dev)
+        for r in range(bs):
+            h_slice = slice(r * n_heads_per_req, (r + 1) * n_heads_per_req)
+            t_slice = slice(k_offsets[r], k_offsets[r + 1])
+            mask[h_slice, t_slice] = True
+
+        scores = (q_f32 @ k_all.T) * self.softmax_scale
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+        if attn_sink is not None:
+            sink = attn_sink.float().unsqueeze(1)
+            scores_aug = torch.cat([scores, sink], dim=1)
+            weights = torch.softmax(scores_aug, dim=1)[:, :T_total]
+        else:
+            weights = torch.softmax(scores, dim=1)
+
+        out = weights @ k_all
+        return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
+
+    def _mxfp4_decode_sdpa_fallback(
+        self,
+        *,
+        q: torch.Tensor,
+        q_orig_shape: torch.Size,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        page_size: int,
+        sm_scale: float,
+        attn_sink: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """SDPA fallback when the SWA window spans multiple MXFP4 pages."""
+        from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+            MXFP4_TOTAL_DIM,
+            dequantize_dsv4_mxfp4_k_cache_paged,
+        )
+
+        N = q.shape[0]
+        dev = q.device
+        swa_page_size = page_size
+
+        # Collect unique SWA pages from all heads (graph-safe: use shape,
+        # not .item()). All heads share the same pages for decode SWA.
+        max_tk = swa_page_indices.shape[1]
+        unique_pages = set()
+        for h in range(min(N, swa_page_indices.shape[0])):
+            for pid in swa_page_indices[h, :max_tk].tolist():
+                if pid >= 0:
+                    unique_pages.add(pid)
+
+        sorted_pages = sorted(unique_pages)
+        page_to_start = {}
+        flat_indices = []
+        for pid in sorted_pages:
+            page_to_start[pid] = len(flat_indices)
+            flat_indices.extend(range(pid * swa_page_size, (pid + 1) * swa_page_size))
+
+        indices_t = torch.tensor(flat_indices, dtype=torch.int32, device=dev)
+        k_dq = dequantize_dsv4_mxfp4_k_cache_paged(
+            swa_k_cache, indices_t, page_size=swa_page_size
+        )[
+            :, 0, :
+        ]  # [Tkv, 512]
+        k_f32 = k_dq.float()
+
+        # Batched SDPA: all heads share the same K pages in the SWA-only path
+        k_segments = [
+            k_f32[page_to_start[pid] : page_to_start[pid] + swa_page_size]
+            for pid in sorted_pages
+        ]
+        if not k_segments:
+            return torch.zeros(
+                *q_orig_shape[:-1], MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev
+            )
+        k_all = torch.cat(k_segments, dim=0).float()  # [T, 512]
+        q_f32 = q.float()
+        scores = (q_f32 @ k_all.T) * sm_scale  # [N, T]
+        if attn_sink is not None:
+            sink = attn_sink.float().unsqueeze(1)  # [N, 1]
+            scores_aug = torch.cat([scores, sink], dim=1)
+            weights = torch.softmax(scores_aug, dim=1)[:, : scores.shape[1]]
+        else:
+            weights = torch.softmax(scores, dim=1)
+        out = weights @ k_all  # [N, 512]
+
+        return out.view(*q_orig_shape[:-1], -1).to(torch.bfloat16)
+
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -1824,8 +2180,6 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
-            # ``swa_window_size`` on the pool is its storage page size, not
-            # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens.to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
@@ -1878,19 +2232,43 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+        is_mxfp4 = token_to_kv_pool.dsv4_kv_cache_store_mxfp4
+        if is_mxfp4:
+            from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
+                dequantize_dsv4_mxfp4_k_cache_paged,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+
+            if compressed_slice is not None:
+                # C4/C128 extra pool is FP8 (not MXFP4) — the compressor
+                # currently stores FP8 for compressed caches even when
+                # the SWA pool uses MXFP4.
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_dsv4_mxfp4_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
+
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(
