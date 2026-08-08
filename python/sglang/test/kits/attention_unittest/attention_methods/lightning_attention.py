@@ -207,8 +207,6 @@ class TinyLightningModelConfig:
         return self.num_attention_heads
 
     def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
-        # Mirror ModelConfig.get_num_kv_heads: DCP ranks share KV heads, so the
-        # heads are sharded across tp_size // dcp_size groups.
         kv_tp_size = tp_size // dcp_size
         assert self.num_key_value_heads % kv_tp_size == 0
         return self.num_key_value_heads // kv_tp_size
