@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_before_atlas_a5,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -389,6 +390,13 @@ class Fp8Config(QuantizationConfig):
                 ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 return fp8_method
 
+            if self.is_fp4_experts and is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+                    NPUW4A4Fp4MoEMethod,
+                )
+
+                return NPUW4A4Fp4MoEMethod(fp8_method, prefix=prefix)
+
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
@@ -681,6 +689,9 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
+        elif _is_npu and not is_npu_before_atlas_a5():
+            self._process_npu_a5_mxfp8_linear_weights(layer)
+            return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -729,6 +740,70 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+
+    def _process_npu_a5_mxfp8_linear_weights(self, layer: Module) -> None:
+        """Reinterpret DeepSeek [128, 128] block-FP8 scales as A5 MXFP8 scales.
+
+        The checkpoint stores one fp32 scale per 128x128 block. The A5 GEMM
+        (``npu_w8a8_block_fp8_linear``) wants one E8M0 exponent byte per group
+        of ``MXFP8_BLOCK_SIZE`` elements, packed in pairs, with both weight and
+        scale K-major. So: pull the exponent field out of the fp32 bits, expand
+        it back over the block it covered, pair it up, and transpose.
+        """
+        scale_u8 = (layer.weight_scale_inv.data.view(torch.int32) >> 23 & 0xFF).to(
+            torch.uint8
+        )
+        scale_u8 = scale_u8.repeat_interleave(4, dim=1).repeat_interleave(128, dim=0)
+        n_dim, k_dim = scale_u8.shape
+        layer.weight_scale_inv.data = scale_u8.reshape(n_dim, k_dim // 2, 2).transpose(
+            0, 1
+        )
+        layer.weight.data = layer.weight.data.transpose(0, 1)
+
+        if getattr(layer, "_dsv4_a5_mxfp8_wo_a", False):
+            self._batch_npu_a5_wo_a_weights(layer)
+
+    @staticmethod
+    def _batch_npu_a5_wo_a_weights(layer: Module) -> None:
+        """Reshape DSV4's ``wo_a`` into the per-group batched layout that
+        ``npu_transpose_quant_batchmatmul`` expects (matching vllm-ascend):
+        weight ``[D, G*R] -> [G, D, R]``, scale ``[D/64, G*R, 2] -> [G, D/64, R, 2]``.
+        """
+        num_groups = layer._dsv4_num_groups
+        rank = layer._dsv4_o_lora_rank
+        hidden_dim = layer.weight.shape[0]
+        scale_k64 = layer.weight_scale_inv.shape[0]
+        output_dim = num_groups * rank
+
+        if layer.weight.shape != (hidden_dim, output_dim):
+            raise ValueError(
+                "Unexpected A5 wo_a weight layout after FP8 post-processing: "
+                f"got {tuple(layer.weight.shape)}, expected "
+                f"({hidden_dim}, {output_dim})."
+            )
+        if layer.weight_scale_inv.shape != (scale_k64, output_dim, 2):
+            raise ValueError(
+                "Unexpected A5 wo_a scale layout after FP8 post-processing: "
+                f"got {tuple(layer.weight_scale_inv.shape)}, expected "
+                f"({scale_k64}, {output_dim}, 2)."
+            )
+        if scale_k64 * 64 != hidden_dim:
+            raise ValueError(
+                "Unexpected A5 wo_a scale K dimension: "
+                f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
+            )
+
+        layer.weight.data = (
+            layer.weight.data.T.reshape(num_groups, rank, hidden_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        layer.weight_scale_inv.data = (
+            layer.weight_scale_inv.data.transpose(0, 1)
+            .reshape(num_groups, rank, scale_k64, 2)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:

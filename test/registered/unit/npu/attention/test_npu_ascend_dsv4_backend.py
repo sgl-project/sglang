@@ -56,6 +56,7 @@ sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculat
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+    CompressorAscendBackendMixin,
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _get_kv_indices,
@@ -454,6 +455,80 @@ class TestCommonTemplate(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             backend.common_template(forward_batch, call_fn)
         self.assertEqual(call_fn.call_count, 1)
+
+
+class TestCompressorEpilogEmptyWrite(unittest.TestCase):
+    """A verify step that completes no compression block must write nothing.
+
+    On Atlas A5 the compress-KV write runs through the fused
+    ``kv_compress_epilog`` / ``indexer_compress_epilog`` kernels, which reject a
+    zero-row input ("x dimensions must be positive, but got: [0, 512]"). Eager
+    target_verify filters out every row when no request crossed a ratio boundary
+    (``loc`` is then all zeros, the skip sentinel), so the epilog has to skip the
+    write the way the pre-A5 scatter implicitly did.
+    """
+
+    @staticmethod
+    def _backend(*, loc, graph_mode=False):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.graph_mode = graph_mode
+        backend.token_to_kv_pool = MagicMock()
+        backend.forward_metadata = SimpleNamespace(c4_loc=loc, c128_loc=loc)
+        return backend
+
+    @staticmethod
+    def _compressor(*, li_kv_dtype="bf16", is_in_indexer=False):
+        return SimpleNamespace(
+            ratio=128,
+            layer_id=0,
+            is_in_indexer=is_in_indexer,
+            li_kv_dtype=li_kv_dtype,
+        )
+
+    @staticmethod
+    def _verify_batch():
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = True
+        return SimpleNamespace(forward_mode=forward_mode)
+
+    def test_all_slots_masked_skips_compress_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
+        backend._compressor_epilog_npu(
+            self._compressor(), torch.zeros(3, 512), self._verify_batch()
+        )
+        backend.token_to_kv_pool.set_compress_buffer.assert_not_called()
+
+    def test_partially_masked_slots_still_write_surviving_rows(self):
+        backend = self._backend(loc=torch.tensor([0, 7, 0], dtype=torch.int32))
+        kv = torch.arange(3 * 4, dtype=torch.float32).view(3, 4)
+        backend._compressor_epilog_npu(self._compressor(), kv, self._verify_batch())
+
+        backend.token_to_kv_pool.set_compress_buffer.assert_called_once()
+        _, written_loc, written_kv, _, _ = (
+            backend.token_to_kv_pool.set_compress_buffer.call_args.args
+        )
+        self.assertEqual(written_loc.tolist(), [7])
+        self.assertEqual(written_kv.tolist(), [kv[1].tolist()])
+
+    def test_graph_mode_keeps_masked_write_for_static_shapes(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32), graph_mode=True)
+        backend._compressor_epilog_npu(
+            self._compressor(), torch.ones(3, 4), self._verify_batch()
+        )
+
+        backend.token_to_kv_pool.set_compress_buffer.assert_called_once()
+        written_kv = backend.token_to_kv_pool.set_compress_buffer.call_args.args[2]
+        self.assertEqual(written_kv.shape[0], 3)
+        self.assertEqual(written_kv.abs().sum().item(), 0.0)
+
+    def test_all_slots_masked_skips_fused_indexer_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
+        compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            backend._compressor_epilog_npu(
+                compressor, torch.zeros(3, 512), self._verify_batch()
+            )
+        custom_ops.indexer_compress_epilog.assert_not_called()
 
 
 if __name__ == "__main__":
