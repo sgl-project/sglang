@@ -114,34 +114,25 @@ PER_COMMIT_SUITES = {
 # Nightly test suites (run nightly, organized by GPU configuration)
 NIGHTLY_SUITES = {
     HWBackend.CUDA: [
-        "nightly-1-gpu",
-        "nightly-2-gpu",
-        "nightly-4-gpu",
-        "nightly-4-gpu-b200",
-        "nightly-8-gpu",
-        "nightly-8-gpu-h200",
-        "nightly-8-gpu-h20",
-        "nightly-8-gpu-b200",
-        "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
-        "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
-        "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
-        "nightly-kernel-1-gpu",
-        "nightly-kernel-8-gpu-h200",
-        # Eval and perf suites (2-gpu)
-        "nightly-eval-text-2-gpu",
-        "nightly-eval-vlm-2-gpu",
-        "nightly-perf-text-2-gpu",
-        "nightly-perf-vlm-2-gpu",
-        # GB300 (4x GB300 NVL4) nightly suites
-        "nightly-4-gpu-gb300",
-        "nightly-4-gpu-gb300-deepseek-v4-pro-fp4",
-        "nightly-4-gpu-gb300-glm5-nvfp4",
-        "nightly-4-gpu-gb300-kimi-k25",
-        "nightly-4-gpu-gb300-kimi-k25-nvfp4",
-        "nightly-4-gpu-gb300-qwen35-fp8",
-        "nightly-4-gpu-gb300-qwen35-nvfp4",
-        # Nightly precision regression (per-layer hidden state comparison)
-        "nightly-precision-8-gpu-h200",
+        # `stage="nightly"` paired with a runner_config, same shape as the
+        # per-commit `{stage}-test-{runner_config}` suites. The runner_config
+        # is the only axis: everything scheduled onto one machine type shares
+        # a suite and is split by auto_partition, so adding a test never needs
+        # a workflow edit. Machine details (runs-on label, install script, rdma
+        # devices) come from scripts/ci/runner_configs.yml.
+        #
+        # These carry no `nightly=True`: the stage says it, and how often a
+        # suite runs is a property of the workflow that selects it, exactly as
+        # `base-a` being blocking and `extra-a` being label-gated are. The flag
+        # survives only for the legacy single-string suites below, where the
+        # name alone does not identify the cadence.
+        "nightly-test-1-gpu-large",
+        "nightly-test-2-gpu-large",
+        "nightly-test-4-gpu-h100",
+        "nightly-test-4-gpu-b200",
+        "nightly-test-4-gpu-gb300",
+        "nightly-test-8-gpu-h200",
+        "nightly-test-8-gpu-b200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -187,7 +178,11 @@ OTHER_SUITES = {
     ],
     HWBackend.CUDA: [
         "stress",
-        "weekly-8-gpu-h200",
+        # Same `{stage}-test-{runner_config}` shape as the per-commit and
+        # nightly suites; weekly is just another stage. Listed here rather than
+        # in NIGHTLY_SUITES because it is neither per-commit nor nightly -- the
+        # three dicts only differ in which names this backend may declare.
+        "weekly-test-8-gpu-h200",
     ],
 }
 
@@ -237,14 +232,11 @@ def filter_tests(
         if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
-    valid_suites = (
-        NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
-    )
-
-    if suite not in valid_suites:
-        print(
-            f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
-        )
+    # Checked against every declared suite for this backend, not just the
+    # per-commit or nightly half: CUDA nightly suites are selected by name
+    # alone (stage="nightly") and are run without --nightly.
+    if suite not in _valid_suites_by_backend().get(hw, set()):
+        print(f"Warning: Unknown suite {suite} for backend {hw.name}")
 
     enabled_tests = [t for t in ci_tests if t.disabled is None]
     skipped_tests = [t for t in ci_tests if t.disabled is not None]
@@ -362,9 +354,11 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    # None hands the per-file budget over to est_time (see run_unittest_files).
+    timeout = None if args.timeout_from_est_time else args.timeout_per_file
+
     # Add extra timeout when retry is enabled
-    timeout = args.timeout_per_file
-    if args.enable_retry:
+    if timeout is not None and args.enable_retry:
         timeout += args.retry_timeout_increase
 
     return run_unittest_files(
@@ -399,6 +393,16 @@ def main():
         type=int,
         default=1200,
         help="The time limit for running one file in seconds (default: 1200).",
+    )
+    parser.add_argument(
+        "--timeout-from-est-time",
+        action="store_true",
+        help=(
+            "Derive each file's time limit from its own est_time instead of "
+            "applying one flat --timeout-per-file to the whole suite. Needed "
+            "when a suite mixes fast and slow tests, where a single cap is "
+            "either too tight for the slow ones or useless for the fast ones."
+        ),
     )
     parser.add_argument(
         "--continue-on-error",

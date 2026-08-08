@@ -47,7 +47,7 @@ try:
 except Exception:  # pragma: no cover
     _hfs = None
 
-register_cuda_ci(est_time=3600, suite="nightly-precision-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=3600, stage="nightly", runner_config="8-gpu-h200")
 
 DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3

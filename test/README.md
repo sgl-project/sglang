@@ -51,7 +51,7 @@ python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
 python3 test/run_suite.py --hw cuda --suite base-a-test-1-gpu-small
 
 # Nightly tests
-python3 test/run_suite.py --hw cuda --suite nightly-1-gpu --nightly
+python3 test/run_suite.py --hw cuda --suite nightly-test-1-gpu-large --nightly
 
 # With auto-partitioning (for parallel CI jobs)
 python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \

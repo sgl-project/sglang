@@ -1,0 +1,153 @@
+# Reusable workflow for one scheduled CUDA (stage, runner_config) pair. The
+# caller -- nightly-test-nvidia.yml or weekly-test-nvidia.yml -- supplies the
+# stage and runner_config plus a partition layout; everything about the machine
+# (runs-on label, install script, install timeout, rdma devices,
+# Grace-Blackwell flag) is resolved from scripts/ci/runner_configs.yml, and the
+# test list comes from the `{stage}-test-{runner_config}` suite in the registry.
+#
+# Consequence: adding or moving a scheduled test is a registry edit only. A
+# test reaches a machine by declaring `runner_config=`, never by a workflow
+# change.
+name: Scheduled Test Stage (Nvidia)
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: 'Suite stage, e.g. nightly or weekly. Combined with runner_config into the suite name {stage}-test-{runner_config}.'
+        required: true
+        type: string
+      runner_config:
+        description: 'Key in scripts/ci/runner_configs.yml. Resolves the runs-on label, install script, install timeout and rdma devices.'
+        required: true
+        type: string
+      runs_on:
+        description: 'GHA runner label. Passed explicitly because `runs-on` is resolved before any step can run.'
+        required: true
+        type: string
+      partition_ids:
+        description: 'JSON array of auto-partition ids, e.g. [0,1,2,3]. Length must equal partition_count.'
+        required: false
+        type: string
+        default: '[0]'
+      partition_count:
+        description: 'Number of auto-partitions the suite is split into.'
+        required: false
+        type: number
+        default: 1
+      max_parallel:
+        description: 'Concurrent partitions for this runner pool.'
+        required: false
+        type: number
+        default: 1
+      run_timeout_minutes:
+        description: 'timeout-minutes for the test step.'
+        required: false
+        type: number
+        default: 300
+      ref:
+        description: 'Git ref to test. Empty uses the triggering ref.'
+        required: false
+        type: string
+        default: ''
+      force_baseline_update:
+        description: 'Refresh the precision rolling baseline instead of comparing.'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_ENABLE_ASYNC_ASSERT: true
+  SGLANG_CUDA_COREDUMP: "1"
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  # Scheduled runs use the full jit_kernel parameter grids. This used to be set
+  # per job on the kernel-only nightly jobs; it is a property of running on a
+  # schedule rather than per-commit, not of a particular machine, so it lives at
+  # the workflow level. Only sglang.kernels.jit reads it (see
+  # should_run_full_tests), so callers with no kernel tests are unaffected.
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+jobs:
+  run:
+    name: ${{ inputs.runner_config }} (${{ matrix.partition }})
+    runs-on: ${{ inputs.runs_on }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix:
+        partition: ${{ fromJson(inputs.partition_ids) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve runner_config
+        id: rc
+        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+
+      - name: Export runner_config env
+        run: |
+          echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
+          echo "GPU_CONFIG=${{ inputs.runner_config }}" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
+        env:
+          GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '' }}
+        run: |
+          bash ${{ steps.rc.outputs.install }}
+
+      - name: Run test
+        timeout-minutes: ${{ inputs.run_timeout_minutes }}
+        env:
+          RUNNER_LABELS: ${{ inputs.runs_on }}
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          # Consumed only by test_nightly_precision_regression.py. Harmless for
+          # every other test on the same machine, so it is set unconditionally
+          # rather than carving the precision test back out into its own job.
+          SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
+          SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+          SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+          SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+          SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.force_baseline_update && '1' || '0' }}
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda \
+            --suite ${{ inputs.stage }}-test-${{ inputs.runner_config }} \
+            --continue-on-error \
+            --timeout-from-est-time \
+            --auto-partition-id ${{ matrix.partition }} \
+            --auto-partition-size ${{ inputs.partition_count }}
+
+      - name: Collect performance metrics
+        if: always()
+        run: |
+          python3 scripts/ci/utils/save_metrics.py \
+            --gpu-config ${{ inputs.runner_config }} \
+            --partition ${{ matrix.partition }} \
+            --run-id ${{ github.run_id }} \
+            --output test/metrics-${{ inputs.runner_config }}-partition-${{ matrix.partition }}.json \
+            --search-dir test/performance_results_8_gpu \
+            --search-dir test
+
+      - name: Upload partition metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ inputs.runner_config }}-partition-${{ matrix.partition }}
+          path: test/metrics-${{ inputs.runner_config }}-partition-${{ matrix.partition }}.json
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+        with:
+          artifact-suffix: ${{ inputs.runner_config }}-${{ matrix.partition }}
