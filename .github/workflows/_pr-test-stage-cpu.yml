@@ -155,6 +155,16 @@ jobs:
           cd test/
           python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json $CONTINUE_ON_ERROR_FLAG
 
+      - name: Run SGLang Simulator compatibility tests
+        if: matrix.partition == 0
+        timeout-minutes: 10
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "tools/sglang-simulator[aic]"
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
+
       # PRs save only what the base lacks; the implicit if: success() keeps a
       # half-downloaded cache unpublished.
       - name: Decide whether to save the HF cache
