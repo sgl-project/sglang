@@ -53,7 +53,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    _use_aiter_bpreshuffle_gfx95,
+    _use_aiter_bpreshuffle,
+    _use_aiter_bpreshuffle_gfx942,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -719,11 +720,16 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            _use_aiter_bpreshuffle_gfx95
+            _use_aiter_bpreshuffle
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
-            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+            # gfx950 keeps a per-shape Triton-tuned exception list (weights for
+            # those shapes stay unshuffled); gfx942 always uses CK bpreshuffle.
+            if (
+                _use_aiter_bpreshuffle_gfx942
+                or not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+            ):
                 # TODO(1am9trash), to deal with case that this branch chance
                 # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
                 t = shuffle_weight(layer.weight, (16, 16))

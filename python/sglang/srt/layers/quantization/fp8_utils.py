@@ -79,6 +79,24 @@ _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
     (4608, 4096): 512,  # TP4 attn qkv/gate proj: CK NaN at M>=2048 on ROCm 7.0
 }
 
+# --- gfx942 (MI300X) opt-in bpreshuffle --------------------------------------
+# On gfx942 the w8a8 block-scale dense/attn GEMM otherwise always falls back to
+# Triton in aiter_w8a8_block_fp8_linear (below). AITER ships a gfx942 CK
+# bpreshuffle kernel (gemm_a8w8_blockscale_bpreshuffle) with padded-K support for
+# non-128-divisible shards (ROCm/aiter#3611). Routing the block GEMM to it is
+# quality-neutral (unchanged 128x128 block quant) and, measured on a GLM-4.7 MoE
+# FP8 model (TP4), ~2.36x faster decode than Triton. Off by default; opt in with
+# SGLANG_USE_AITER_W8A8_BLOCK_BPRESHUFFLE=1 on a stack whose AITER has #3611.
+_is_gfx942_supported = _is_hip and get_device_capability() == (9, 4)
+_use_aiter_bpreshuffle_gfx942 = (
+    _use_aiter
+    and _is_gfx942_supported
+    and get_bool_env_var("SGLANG_USE_AITER_W8A8_BLOCK_BPRESHUFFLE")
+)
+# True when the block GEMM should use the CK bpreshuffle kernel + transposed scale
+# layout: gfx950 on ROCm>=7.2, or gfx942 opt-in.
+_use_aiter_bpreshuffle = _use_aiter_bpreshuffle_gfx95 or _use_aiter_bpreshuffle_gfx942
+
 
 class _MXFP4QuantizedData(MXFP4QuantizeUtil):
     def __init__(
@@ -1109,6 +1127,10 @@ def aiter_w8a8_block_fp8_linear(
 
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    elif _use_aiter_bpreshuffle_gfx942:
+        # gfx942 opt-in: always route to CK bpreshuffle (no gfx950 per-shape
+        # Triton-tuned exception table applies here).
+        use_triton = False
     elif _use_aiter_gfx95:
         # gfx95 on ROCm < 7.2: keep the (faster) CK path at/below the per-shape
         # CK-safe M bound; above it, ck_gemm_a8w8_blockscale returns NaN, so use
@@ -1124,14 +1146,14 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
+        if _use_aiter_bpreshuffle and not use_triton:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
-        elif use_triton and _use_aiter_bpreshuffle_gfx95:
+        elif use_triton and _use_aiter_bpreshuffle:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
-        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle and not use_triton
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
@@ -1142,7 +1164,7 @@ def aiter_w8a8_block_fp8_linear(
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
-    elif _use_aiter_bpreshuffle_gfx95:
+    elif _use_aiter_bpreshuffle:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
