@@ -809,9 +809,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         assert quant_info.output2_scales_scalar is not None
 
         a_q, _ = scaled_fp8_quant(hidden_states, quant_info.w13_input_scale)
-        routing_bias_cast = (
-            None if correction_bias is None else correction_bias.to(torch.bfloat16)
-        )
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
@@ -832,7 +829,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
             routing_logits=router_logits,
-            routing_bias=routing_bias_cast,
+            routing_bias=correction_bias,
             hidden_states=a_q,
             gemm1_weights=quant_info.w13_weight,
             output1_scales_scalar=quant_info.output1_scales_scalar,
