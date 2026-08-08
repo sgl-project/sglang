@@ -12,7 +12,6 @@ Requires a GPU + model + the load-reporter grpc/protobuf extra (CUDA CI).
 from __future__ import annotations
 
 import asyncio
-import socket
 import threading
 import time
 from typing import Any, AsyncIterator, List, Optional
@@ -24,6 +23,7 @@ import requests
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 from sglang.srt.load_reporter.proto import load_monitor_pb2_grpc as pb_grpc
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -34,14 +34,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=200, stage="base-b", runner_config="1-gpu-small")
-
-
-def pick_free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 class FakeRouterClient:
@@ -129,7 +121,7 @@ class TestLoadReporterMultiOwner(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.reporter_port = pick_free_port()
+        cls.reporter_port = get_free_port()
         cls.process = popen_launch_server(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             cls.base_url,
