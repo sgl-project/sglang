@@ -148,30 +148,6 @@ def _ht_tunings(hidden_size: int, tp_size: int):
     )
 
 
-# Measured with autotune_mnnvl_cutedsl.py at this hidden size; the shipped
-# bounds and presets are GB300 H=8192 numbers that do not transfer.
-_MEASURED_BOUNDS: dict[tuple[int, int], tuple[tuple, tuple]] = {
-    (8, 6144): ((12, 48, 703, None), (64, 192, 1024, None)),
-    (4, 6144): ((32, 48, 703, None), (24, 192, 1024, None)),
-}
-
-
-def _measured_ll_all_reduce(tp_size: int, hidden_size: int):
-    # publish_threads * elements_per_thread sets the publish block count, which
-    # at small M is the only parallelism available: 8 gives H=8192 eight blocks
-    # but H=6144 only six.
-    from flashinfer.comm.mnnvl_cutedsl.kernel_ll import LLAllReduceTuning
-    from flashinfer.comm.mnnvl_cutedsl.kernel_ll.protocol import LLCollectiveTuning
-
-    if hidden_size != 6144 or tp_size not in (4, 8):
-        return None
-    return LLAllReduceTuning(
-        publish_elements_per_thread=4,
-        publish_threads=128,
-        collective=LLCollectiveTuning(cluster_size=8, rank_lanes=1, threads=128),
-    )
-
-
 def _build_config(tp_size: int, hidden_size: int, top_k: int, dtype: torch.dtype):
     """A single-profile routing config for this model's static shape."""
     (
@@ -216,12 +192,6 @@ def _build_config(tp_size: int, hidden_size: int, top_k: int, dtype: torch.dtype
     # because each rank publishes a smaller slice.
     finalize_bounds = (7, 52, 703, None) if wide_tp else (23, 48, 703, None)
     all_reduce_bounds = (5, 512, 959, None) if wide_tp else (15, 256, 1024, None)
-    measured = _MEASURED_BOUNDS.get((tp_size, hidden_size))
-    if measured is not None:
-        finalize_bounds, all_reduce_bounds = measured
-    measured_ll_ar = _measured_ll_all_reduce(tp_size, hidden_size)
-    if measured_ll_ar is not None:
-        ll_all_reduce = measured_ll_ar
 
     def target(protocol, preset):
         return KernelTarget(protocol=protocol, preset=preset)
