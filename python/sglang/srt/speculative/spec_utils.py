@@ -1035,6 +1035,17 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             server_args.max_speculative_num_draft_tokens,
         )
     if batch.spec_algorithm.is_dflash_family():
+        # Mirror eagle_prepare_for_decode: evict out-of-window SWA KV and
+        # advance decode_batch_idx (the eviction gate requires >= 1). Without
+        # this, hybrid-SWA models retain SWA KV for every generated token and
+        # a single request exhausts the SWA pool after
+        # swa_full_tokens_ratio * max_total_num_tokens generated tokens, at
+        # which point the scheduler retracts it. Pool sizing already assumes
+        # this eviction runs (pool_configurator: trailing_tokens =
+        # window + eviction_interval * draft_tokens + page_size).
+        batch.maybe_evict_swa()
+        for r in batch.reqs:
+            r.decode_batch_idx += 1
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
