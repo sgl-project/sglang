@@ -45,3 +45,10 @@ register_kernel(
         target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="memory.memcpy_triton_with_zero_fill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton_with_zero_fill",
+    )
+)
