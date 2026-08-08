@@ -26,6 +26,8 @@ import triton
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
+    qkvzba_split_is_pure_view,
+    qkvzba_split_reshape_cat_contiguous_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -639,7 +641,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+            # Single-token forwards get the split for free: the fused kernel is
+            # an identity copy on this layout, so views give bit-identical
+            # contiguous tensors without a launch (see qkvzba_split_is_pure_view).
+            split_fn = (
+                qkvzba_split_reshape_cat_contiguous_views
+                if not _is_cpu
+                and qkvzba_split_is_pure_view(
+                    projected_states_qkvz, projected_states_ba
+                )
+                else fused_qkvzba_split_reshape_cat_contiguous
+            )
+            mixed_qkv, z, b, a = split_fn(
                 projected_states_qkvz,
                 projected_states_ba,
                 num_k_heads_tp,
