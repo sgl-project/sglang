@@ -973,6 +973,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # side owns the KV cache, so its dtype is authoritative.
         return self.full_attn_backend.data_type
 
+    def prepare_prefill_query(self, q: torch.Tensor) -> torch.Tensor:
+        return self.full_attn_backend.prepare_prefill_query(q)
+
     @property
     def supports_ragged_verify_graph(self) -> bool:
         return (

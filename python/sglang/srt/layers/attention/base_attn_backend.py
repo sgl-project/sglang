@@ -137,6 +137,10 @@ class AttentionBackend(ABC):
         should override this hook for both capture and replay.
         """
 
+    def prepare_prefill_query(self, q: torch.Tensor) -> torch.Tensor:
+        """Convert a prefill query to the backend-native attention dtype."""
+        return q
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()

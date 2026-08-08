@@ -721,9 +721,15 @@ class SarvamMoEMLAAttention(nn.Module):
         accum_output: torch.Tensor,
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
+        kv_a_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         return DeepseekMHAForwardMixin._chunked_prefix_attn_mha(
-            self, q, accum_output, accum_lse, forward_batch
+            self,
+            q,
+            accum_output,
+            accum_lse,
+            forward_batch,
+            kv_a_dtype=kv_a_dtype,
         )
 
     def _get_mla_kv_buffer(

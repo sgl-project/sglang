@@ -113,8 +113,14 @@ def grow_multi_ctas_kv_counter_buffer_if_needed(
     return torch.zeros(required_bytes, dtype=torch.uint8, device=device)
 
 
+def _quantize_fp8_query(q: torch.Tensor) -> torch.Tensor:
+    if q.dtype == torch.float8_e4m3fn:
+        return q
+    return q.to(torch.float8_e4m3fn)
+
+
 def _quantize_fp8_qkv(q, k, v, layer):
-    q = q.to(torch.float8_e4m3fn)
+    q = _quantize_fp8_query(q)
 
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
@@ -890,9 +896,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
     ):
-        """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
-        in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or (output, lse) if return_lse."""
+        """Hook for subclasses to swap the ragged prefill kernel.
+
+        Q may already be quantized for chunked-prefix reuse; K/V arrive in
+        model-native dtype. Subclasses own any remaining kernel-specific
+        quantization. Returns the output tensor or (output, lse) if requested.
+        """
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
@@ -917,6 +926,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+
+    def prepare_prefill_query(self, q: torch.Tensor) -> torch.Tensor:
+        """Quantize a chunked-prefill query once for suffix/prefix reuse."""
+        if self.data_type != torch.float8_e4m3fn:
+            return q
+        return _quantize_fp8_query(q)
 
     def _set_kv_and_concat_q_fused(
         self,
