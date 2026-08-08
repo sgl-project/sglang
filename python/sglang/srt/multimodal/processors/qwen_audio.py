@@ -35,6 +35,53 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.AUDIO})
 
+        # Qwen2-Audio's audio tower requires exactly 3000 mel frames (a fixed
+        # 30s window); its HF feature extractor truncates to that by default.
+        # BaseMultimodalProcessor otherwise passes ``truncation=False`` to audio
+        # processors (needed by chunking encoders), which would feed >3000-frame
+        # mel for clips longer than 30s and make the tower raise. Force
+        # truncation so long clips are capped to the model's window.
+        self.audio_config = {**self.audio_config, "truncation": True}
+
+    # Qwen2-Audio's chat template matches a bare ``audio`` key; the strict instruction
+    # keeps the model from emitting a "The content of this audio is:" preamble
+    # that would otherwise inflate WER.
+    _TRANSCRIPTION_CONVERSATION = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": ""},
+                {
+                    "type": "text",
+                    "text": (
+                        "Transcribe the audio. Output only the exact transcription, "
+                        "with no preamble, prefix, commentary, or quotation marks."
+                    ),
+                },
+            ],
+        }
+    ]
+
+    def _build_transcription_prompt(self, input_text) -> str:
+        """Fall back to a default ASR prompt for audio-only requests.
+
+        The ``/v1/audio/transcriptions`` endpoint sends empty text (and hence
+        empty ``input_ids``), which carries no audio placeholder. Render the
+        Qwen2-Audio chat prompt with one audio span so the encoder features have
+        a slot to fill; otherwise the caller-supplied text is used as-is.
+        """
+        if isinstance(input_text, list):
+            input_text = (
+                self._processor.tokenizer.decode(input_text) if input_text else ""
+            )
+        if input_text and input_text.strip():
+            return input_text
+        return self._processor.apply_chat_template(
+            self._TRANSCRIPTION_CONVERSATION,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
 
@@ -87,8 +134,9 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         input_text,
         **kwargs,
     ):
+        prompt = self._build_transcription_prompt(input_text)
         base_output = await self.load_mm_data(
-            prompt=input_text,
+            prompt=prompt,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
         )
