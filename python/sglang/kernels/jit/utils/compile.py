@@ -177,12 +177,19 @@ def _make_sources(files: List[str], wrappers: List[Tuple[str, str]]) -> List[str
     return sources
 
 
+# NOTE: torch.compiler.disable is not TYPE_CHECKING friendly
+if TYPE_CHECKING:
+    _disable_torch_compiler = lambda f: f  # type: ignore
+else:
+    _disable_torch_compiler = torch.compiler.disable
+
+
 # JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
 # `os.lstat`, etc.) that Dynamo cannot trace. When a lazily-loaded kernel is
 # first reached from inside a `@torch.compile`d region, tracing into it produces
 # spurious "Dynamo does not know how to trace the builtin `posix.lstat`" graph
 # breaks. The load happens once and is memoized, so keep it out of the graph.
-@torch.compiler.disable
+@_disable_torch_compiler
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
