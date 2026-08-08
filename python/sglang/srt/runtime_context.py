@@ -964,12 +964,15 @@ class RuntimeContext:
         dummy-boundary ``ServerArgs`` carrying ``fields`` and returns it;
         ``restore()`` (or exiting) reinstates whatever the slot held before.
 
-        Transitional — to be deprecated: it exists because production code
-        still branches on raw ``server_args`` fields at runtime, so forcing a
-        path needs a full config in the slot. As those readers migrate onto
-        the named runtime tiers (flags / resources / forward), prefer the
-        finer-grained overrides; once they cover the branching surface this
-        override loses its clients and goes away.
+        This is the sanctioned way for a test to get a published context, and
+        it stays. The transitional reason it was introduced for — production
+        code branching on raw ``server_args`` fields at runtime — is gone (the
+        read ratchet pins business reads at zero), but a test that exercises
+        bag readers still needs bags, and the bag tree is projected *from an
+        instance*: something has to publish one. Prefer the finer-grained
+        scoped overrides (``get_exec().override(...)``, the flag groups'
+        ``override``) on top of a published context when a test only needs to
+        force one leaf.
         """
         return _ServerArgsOverride(self, fields)
 
@@ -1189,10 +1192,12 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Audited (record-mode smokes, plain + DP-attention): the DP controller
     # reads only the elastic-EP gate; its module's static read set agrees.
     "dp_controller": frozenset({"exec"}),
-    # Zero bag reads observed (per-instance managers read self.server_args by
-    # design). Keep full: it may need namespaces (e.g. disagg) once tokenizer
-    # paths migrate off self.server_args, and restricting on a zero-read
-    # audit would be guesswork.
+    # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
+    # /v1/models): reads exactly {"serving"} — the per-instance managers read
+    # self.server_args by design. Still declared full, because that run did not
+    # exercise the multimodal processors, LoRA/score endpoints, the disagg
+    # roles, or the gRPC bridge; narrowing needs those shapes audited too, and
+    # a wrong set fails a request rather than a test.
     "tokenizer": None,
     # Deployment shapes not exercised locally; audit before restricting.
     "encoder": None,
@@ -1383,3 +1388,122 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
+
+
+def mamba_extra_buffer_enabled() -> bool:
+    """Whether the mamba radix cache keeps its extra state buffer.
+
+    A predicate over two published leaves (``memory.disable_radix_cache`` and
+    ``exec.mamba.mamba_radix_cache_strategy``), so it reads the bags rather
+    than the startup record — the ``ServerArgs`` member of the same name is the
+    pre-publish equivalent used inside the resolution pipeline.
+    """
+    return (
+        get_memory().disable_radix_cache is False
+        and get_exec().mamba.mamba_radix_cache_strategy
+        in ("extra_buffer", "extra_buffer_lazy")
+    )
+
+
+def mamba_extra_buffer_lazy_enabled() -> bool:
+    """The lazy variant of :func:`mamba_extra_buffer_enabled`."""
+    return (
+        get_memory().disable_radix_cache is False
+        and get_exec().mamba.mamba_radix_cache_strategy == "extra_buffer_lazy"
+    )
+
+
+# --- Derived config accessors ------------------------------------------------
+#
+# A few values are computed from several config fields plus the HF config, so
+# they are ``ServerArgs`` members rather than namespace leaves. Business code
+# must not reach for the startup record to get them: these accessors are the
+# named home, and this module — which owns the slot — is the only place that
+# reads it. Each one keeps the member's exact semantics, including which model
+# config it derives from (always the process's, i.e. the target's).
+
+
+def mamba_cache_chunk_size() -> int:
+    """The caching point granularity for mamba state: ``max(the model's mamba
+    chunk size, page_size)``. Cached on the config after the first call."""
+    return get_server_args().mamba_cache_chunk_size
+
+
+def max_speculative_num_draft_tokens() -> int | None:
+    """The largest draft-token count speculative decoding may use (adaptive
+    spec resolves it from its candidate-step table)."""
+    return get_server_args().max_speculative_num_draft_tokens
+
+
+def uses_mla_backend() -> bool:
+    """Whether this process's model runs the MLA attention path."""
+    return get_server_args().use_mla_backend()
+
+
+def attention_backends() -> tuple:
+    """The configured ``(prefill, decode)`` backend pair, split fields falling
+    back to ``attention_backend``.
+
+    All three inputs are ``exec.kernel`` leaves, so this derives from the bags
+    and follows a post-publish override; ``ServerArgs.get_attention_backends``
+    is the pre-publish equivalent the resolution pipeline uses. A built runner
+    stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
+    read that when there is a runner in hand.
+    """
+    kernel = get_exec().kernel
+    base = kernel.attention_backend
+    return (
+        kernel.prefill_attention_backend or base,
+        kernel.decode_attention_backend or base,
+    )
+
+
+def process_model_config():
+    """The process's ``ModelConfig`` (built once from the published config)."""
+    return get_server_args().get_model_config()
+
+
+def cutedsl_moe_max_num_tokens() -> int:
+    """The CuteDSL A2A per-rank token budget."""
+    return get_server_args().cutedsl_moe_max_num_tokens()
+
+
+# --- Configured (not live) parallel sizes ------------------------------------
+#
+# ``get_parallel()`` shadows these names with the LIVE topology, which is the
+# right answer almost everywhere. A handful of call sites need what was
+# *configured* instead — before the groups exist, in a process that has none,
+# or where the live value is deliberately aliased to another dimension. Each
+# accessor below names that intent so no business call site has to reach for
+# the startup record; the per-site reasons live in the read ratchet.
+
+
+def configured_tp_size() -> int:
+    return get_server_args().tp_size
+
+
+def configured_pp_size() -> int:
+    return get_server_args().pp_size
+
+
+def configured_moe_dp_size() -> int:
+    return get_server_args().moe_dp_size
+
+
+def configured_attn_cp_size() -> int:
+    return get_server_args().attn_cp_size
+
+
+def is_ep_joiner() -> bool:
+    """True in a process launched as an elastic-EP joiner (scale or recover).
+
+    A predicate over the published ``exec.moe.ep_join_mode`` leaf, so it follows
+    a post-publish override; the same-named ``ServerArgs`` property is the
+    pre-publish equivalent.
+    """
+    return get_exec().moe.ep_join_mode in ("scale", "recover")
+
+
+def is_ep_scale_joiner() -> bool:
+    """True in a process launched as an elastic-EP scale-up joiner."""
+    return get_exec().moe.ep_join_mode == "scale"
