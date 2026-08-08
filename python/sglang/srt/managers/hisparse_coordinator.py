@@ -5,10 +5,19 @@ from typing import List, NamedTuple, Union
 
 import torch
 
-from sglang.kernels.ops.kvcache.hisparse import (
-    load_cache_to_device_buffer_dsv4_mla,
-    load_cache_to_device_buffer_mla,
-)
+from sglang.srt.utils import get_device_module, is_hip, is_xpu
+
+if is_xpu():
+    from sgl_kernel.jit.kvcache.hisparse import (
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+    )
+else:
+    from sglang.kernels.ops.kvcache.hisparse import (
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+    )
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -20,7 +29,6 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
 
