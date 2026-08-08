@@ -196,6 +196,10 @@ jobs:
           # copy gsm8k dataset
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
+          # install sglang_router
+          apt-get install -y libssl-dev
+          pip install sglang_router
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
