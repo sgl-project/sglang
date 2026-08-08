@@ -1279,6 +1279,11 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
+    # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
+    # with a per-query CUSTOM block_table
+    SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")

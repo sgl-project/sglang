@@ -241,6 +241,7 @@ def _get_quantization_config(
                         "q_a_proj",
                         "kv_a_proj_with_mqa",
                     ],
+                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
                 },
             }
         )

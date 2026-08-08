@@ -103,6 +103,20 @@ class ModelSlimConfig(QuantizationConfig):
                 for k, v in quant_config.items()
             }
 
+        # Normalize block_sparse_moe -> mlp so quant_description keys
+        # match the model's module names (some checkpoints use the
+        # block_sparse_moe prefix; the model uses mlp).
+        for k in list(quant_config.keys()):
+            if not isinstance(k, str):
+                continue
+            if "block_sparse_moe" in k:
+                v = quant_config.pop(k)
+                quant_config[
+                    k.replace("block_sparse_moe.experts", "mlp.experts").replace(
+                        "block_sparse_moe.shared_experts", "mlp.shared_experts"
+                    )
+                ] = v
+
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
