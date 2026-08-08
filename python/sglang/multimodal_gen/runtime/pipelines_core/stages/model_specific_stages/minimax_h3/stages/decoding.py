@@ -42,6 +42,14 @@ def _required_tensor(value, path: str) -> torch.Tensor:
     return value
 
 
+def _autocast_enabled_for_device(
+    tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
+) -> bool:
+    return tensor.device.type in ("cuda", "xpu") and autocast_enabled(
+        dtype, disable_autocast
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _cached_decode_mean_std(
     mean_values: tuple[float, ...],
@@ -285,9 +293,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
             audio_vae_dtype = resolve_precision(
                 server_args, "audio_vae", precision_attr="audio_vae_precision"
             )
-            audio_autocast_enabled = (
-                audio_latent.device.type == "cuda"
-                and autocast_enabled(audio_vae_dtype, server_args.disable_autocast)
+            audio_autocast_enabled = _autocast_enabled_for_device(
+                audio_latent, audio_vae_dtype, server_args.disable_autocast
             )
             with torch.autocast(
                 device_type=audio_latent.device.type,
@@ -339,9 +346,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 name="video_vae",
             )
             video_vae_dtype = resolve_decode_precision(server_args, "video_vae")
-            visual_autocast_enabled = (
-                visual_latent.device.type == "cuda"
-                and autocast_enabled(video_vae_dtype, server_args.disable_autocast)
+            visual_autocast_enabled = _autocast_enabled_for_device(
+                visual_latent, video_vae_dtype, server_args.disable_autocast
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)

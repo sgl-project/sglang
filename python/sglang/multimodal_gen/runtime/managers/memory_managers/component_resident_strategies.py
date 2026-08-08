@@ -446,9 +446,9 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
             _module_to_local_device(module)
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        param = next(module.parameters(), None)
-        if param is not None and param.device.type == "cuda":
-            module.to("cpu", non_blocking=True)
+        tensor = _module_reference_tensor(module)
+        if tensor is not None and tensor.device.type != "cpu":
+            module.to("cpu", non_blocking=tensor.device.type == "cuda")
 
     def finish_use(
         self,

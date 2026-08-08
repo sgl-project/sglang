@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     is_fsdp_managed_module,
 )
@@ -514,10 +515,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
 
         ctx = _resolve_full_loop_context(batch)
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        device = get_local_torch_device()
+        if device.type not in ("cuda", "xpu"):
+            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or XPU")
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
