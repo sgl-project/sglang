@@ -61,7 +61,7 @@ RUN git clone ${SGLANG_REPO} sglang && \
     git checkout ${VER_SGLANG}
 
 # 7. Compile sgl-kernel (CLANG REQUIRED for RVV)
-WORKDIR /sgl-workspace/sglang/sgl-kernel
+WORKDIR /sgl-workspace/sglang/python/sglang/kernels/aot
 RUN cp pyproject_riscv64.toml pyproject.toml && \
     export CC=clang-${VER_LLVM} CXX=clang++-${VER_LLVM} && \
     uv pip install . --no-build-isolation --index-strategy unsafe-best-match
