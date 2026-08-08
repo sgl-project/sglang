@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+from sglang.srt.dllm.algorithm.base import DllmAlgorithm, argmax_and_softmax_prob
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_npu
@@ -35,12 +35,17 @@ def joint_threshold_update_step_vectorized(
     V = full_logits_2d.shape[1]
 
     input_ids = input_ids_1d.view(B, blk)
-    logits = full_logits_2d.view(B, blk, V)
 
     active = ~finished
 
-    # ---------- penalty ----------
+    # ---------- argmax + confidence ----------
     if penalty_lambda > 0:
+        # The penalty rewrites one logit per position before the argmax, so
+        # this branch cannot use the reduction below and keeps the fp32 path.
+        # ``.float()`` is a no-op on fp32 logits (unchanged behaviour); on
+        # lm_head-dtype logits it is the copy the scatter then mutates,
+        # keeping the rewrite off a buffer the graph owns.
+        logits = full_logits_2d.float().view(B, blk, V)
         prev_ids = input_ids[:, :-1]
         logits[:, 1:, :].scatter_(
             dim=2,
@@ -50,15 +55,15 @@ def joint_threshold_update_step_vectorized(
             ),
             reduce="add",
         )
-
-    # ---------- argmax + confidence ----------
-    # Same ops as the per-row path (argmax over logits, then gather the softmax
-    # probability), just batched: keeps decisions bitwise-aligned with it. On
-    # NPU this also beats a log-domain max+logsumexp variant (fused softmax).
-    x = torch.argmax(logits, dim=-1)
-    p = torch.gather(F.softmax(logits, dim=-1), dim=-1, index=x.unsqueeze(-1)).squeeze(
-        -1
-    )
+        x = torch.argmax(logits, dim=-1)
+        p = torch.gather(
+            F.softmax(logits, dim=-1), dim=-1, index=x.unsqueeze(-1)
+        ).squeeze(-1)
+    else:
+        # No logit rewrite needed: reduction path, no [B*blk, V] fp32 copy.
+        x_flat, p_flat = argmax_and_softmax_prob(full_logits_2d)
+        x = x_flat.view(B, blk)
+        p = p_flat.view(B, blk)
 
     mask_pos = input_ids.eq(mask_id)
     has_mask = mask_pos.any(dim=1)
@@ -259,7 +264,10 @@ class JointThreshold(DllmAlgorithm):
             block_start = i * self.block_size
             block_end = block_start + self.block_size
             curr_input_ids = forward_batch.input_ids[block_start:block_end]
-            curr_logits = full_logits[block_start:block_end]
+            # Row-sized fp32 copy when the caller kept the logits in lm_head
+            # dtype, so this path's softmax numerics are unchanged; a no-op
+            # (and so byte-identical to before) when they are already fp32.
+            curr_logits = full_logits[block_start:block_end].float()
             curr_prompt_mask = state["prompt_mask"]
 
             if self.penalty_lambda > 0:

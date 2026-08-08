@@ -477,6 +477,20 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
 
+    # Scheduler: diffusion LLM (dLLM)
+    # Minimum denoise rows at which the dLLM logits stay in lm_head dtype
+    # instead of being copied into the fp32 logits buffer. Skipping that copy is
+    # what lifts the batch ceiling -- an fp32 [rows, vocab] tensor is 2.1 GiB at
+    # 112 blocks of a 157k vocab -- but the reduction that then consumes the
+    # low-precision logits is launch-bound, so it only pays off once the rows
+    # amortize it. Measured on Ascend 910B3 against the fp32 path, per denoise
+    # step: at 32 rows 1.03 ms vs 0.11 ms, at 512 rows 1.37 vs 1.67, at 4096
+    # rows 13.4 vs 12.4 (and 5.0 with the fused kernel installed). Unset
+    # (default) takes the backend's measured value -- 512 on Ascend, and never
+    # on backends where it has not been measured. Set it to override, or to -1
+    # to keep the fp32 path everywhere (production A/B and quick rollback).
+    SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS = EnvInt(None)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
