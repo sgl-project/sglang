@@ -34,7 +34,14 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    get_device_module,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 Qwen3Config = None
 
@@ -679,8 +686,9 @@ class Qwen3ForCausalLM(nn.Module):
             del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
