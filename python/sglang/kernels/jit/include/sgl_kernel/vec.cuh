@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace sglang {
+
 namespace device {
 
 namespace details {
@@ -116,3 +118,5 @@ struct AlignedVector {
 };
 
 }  // namespace device
+
+}  // namespace sglang

@@ -68,21 +68,24 @@ def maybe_downgrade_dtype_for_legacy_gpu(
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from sglang.srt.runtime_context import get_context
 
-        declare_load_time_override(
-            "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
-        )
+        # Device-driven, so every runner in the process resolves the same way;
+        # the per-runner truth is model_config.dtype, this is the record.
+        get_context().override("ModelRunner._sm80_dtype_fallback", dtype="float16")
         model_config.dtype = torch.float16
         if torch.cuda.get_device_capability()[1] < 5:
             raise RuntimeError("SGLang only supports sm75 and above.")
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, server_args: ServerArgs, tp_rank: int
+    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
+    """``load_format`` is this runner's effective format: a draft loading under
+    ``--speculative-draft-draft-load-format`` needs its own send group, and the
+    target's format cannot answer for it."""
     if (
-        server_args.load_format == LoadFormat.REMOTE_INSTANCE
+        (load_format or server_args.load_format) == LoadFormat.REMOTE_INSTANCE
         and server_args.remote_instance_weight_loader_backend
         == RemoteInstanceWeightLoaderBackend.NCCL
     ):
@@ -184,6 +187,7 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
+    load_format: Optional[str] = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
     draft_model_idx: Optional[int],
@@ -201,7 +205,7 @@ def build_load_config(
     )
 
     return LoadConfig(
-        load_format=server_args.load_format,
+        load_format=load_format or server_args.load_format,
         download_dir=server_args.download_dir,
         model_loader_extra_config=server_args.model_loader_extra_config,
         tp_rank=tp_rank,

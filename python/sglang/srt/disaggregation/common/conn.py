@@ -169,8 +169,8 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = parallel.dcp_rank if self.dcp_size > 1 else 0
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (

@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -14,14 +13,6 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
 
     lora_param_names_mapping: dict = field(default_factory=dict)
-
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.AITER,
-            AttentionBackendEnum.TORCH_SDPA,
-        }
-    )
 
     num_layers: int = 50
     token_refiner_num_layers: int = 2

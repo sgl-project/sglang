@@ -889,6 +889,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["mode"],
         )
+        self.prefill_effective_tokens_total = Counter(
+            name="sglang:prefill_effective_tokens_total",
+            documentation=(
+                "Effective prefill tokens with retracted-request re-counts "
+                "excluded, updated on each log interval. mode: device_hit, "
+                "host_hit, storage_hit, input. Windowed prefix cache hit "
+                "rate = rate(sum of *_hit) / rate(sum of all modes); "
+                "per-tier rate uses a single *_hit mode in the numerator."
+            ),
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+        # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
+        for mode in ("input", "device_hit", "host_hit", "storage_hit"):
+            self.prefill_effective_tokens_total.labels(**labels, mode=mode)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1246,6 +1260,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     **self.labels,
                     mode=mode,
                     **dp_cooperation_info.to_labels(),
+                ).inc(delta)
+
+    def increment_effective_prefill_tokens(
+        self,
+        input_tokens: int,
+        device_hit_tokens: int,
+        host_hit_tokens: int,
+        storage_hit_tokens: int,
+    ) -> None:
+        for mode, delta in [
+            ("input", input_tokens),
+            ("device_hit", device_hit_tokens),
+            ("host_hit", host_hit_tokens),
+            ("storage_hit", storage_hit_tokens),
+        ]:
+            if delta > 0:
+                self.prefill_effective_tokens_total.labels(
+                    **self.labels, mode=mode
                 ).inc(delta)
 
     def increment_forward_execution_seconds(
@@ -1964,6 +1996,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
                 0.2,
                 0.5,
                 1.0,
+                2.0,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
             ]
         bucket_load_back_duration = get_histogram_conf_from_env(
             "SGLANG_BUCKET_LOAD_BACK_DURATION"
@@ -1989,16 +2026,43 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
                 0.5,
                 1.0,
             ]
+        # D->H backups include blocking merged ops issued during eviction under
+        # --hicache-write-policy write_back, which can run for seconds -- hence
+        # the wider default range than load-back.
+        bucket_backup_duration = [
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            60.0,
+        ]
+
         self.eviction_duration_seconds = Histogram(
             name="sglang:eviction_duration_seconds",
-            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            documentation="End-to-end time of a device eviction pass in "
+            "seconds; under --hicache-write-policy write_back this includes "
+            "the blocking D->H backup (see "
+            "sglang:hicache_backup_duration_seconds for the copy alone).",
             labelnames=labels.keys(),
             buckets=bucket_eviction_duration,
         )
 
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
-            documentation="The number of tokens evicted from GPU to CPU.",
+            documentation="The number of device KV token slots freed by "
+            "eviction, regardless of whether the data was backed up to host "
+            "(see sglang:hicache_backup_tokens_total) or destroyed (see "
+            "sglang:hicache_dropped_tokens_total).",
             labelnames=labels.keys(),
         )
 
@@ -2011,21 +2075,86 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.load_back_num_tokens = Counter(
             name="sglang:load_back_tokens_total",
-            documentation="The number of tokens loaded from CPU to GPU.",
+            documentation="The number of tokens loaded back from local host "
+            "DRAM (L2) to GPU, by host pool (kv, swa, mamba, ...).",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
+        self.backup_duration_seconds = Histogram(
+            name="sglang:hicache_backup_duration_seconds",
+            documentation="Time taken to back up KV cache from GPU to local "
+            "host DRAM (L2) in seconds, per merged write op. Covers all D->H "
+            "backups regardless of --hicache-write-policy. Distinct from the "
+            "host-to-storage (L3) sglang:backuped_tokens_total.",
             labelnames=labels.keys(),
+            buckets=bucket_backup_duration,
+        )
+
+        self.backup_num_bytes = Counter(
+            name="sglang:hicache_backup_bytes_total",
+            documentation="Bytes backed up from GPU to local host DRAM (L2), "
+            "all pools combined, including draft/sidecar transfers that the "
+            "token counter excludes. Divided by the rate of "
+            "hicache_backup_duration_seconds_sum, gives the achieved D->H "
+            "bandwidth while transferring.",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_num_bytes = Counter(
+            name="sglang:load_back_bytes_total",
+            documentation="Bytes loaded back from local host DRAM (L2) to "
+            "GPU, all pools combined, including draft/sidecar transfers that "
+            "the token counter excludes. Divided by the rate of "
+            "load_back_duration_seconds_sum, gives the achieved H->D "
+            "bandwidth while transferring.",
+            labelnames=labels.keys(),
+        )
+
+        self.backup_num_tokens = Counter(
+            name="sglang:hicache_backup_tokens_total",
+            documentation="The number of tokens backed up from GPU to local "
+            "host DRAM (L2), by host pool (kv, swa, mamba, ...). Covers all "
+            "D->H backups regardless of --hicache-write-policy. Distinct from "
+            "the host-to-storage (L3) sglang:backuped_tokens_total.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
+        self.hicache_dropped_tokens = Counter(
+            name="sglang:hicache_dropped_tokens_total",
+            documentation="The number of device KV tokens destroyed without a "
+            "host backup, by pool (kv, swa, ...) and reason (e.g. write-back "
+            "backup failure under host memory pressure).",
+            labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
-    def increment_load_back_num_tokens(self, num_tokens: int) -> None:
-        self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
+    def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
+        self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)
 
     def observe_eviction_duration(self, duration_seconds: float) -> None:
         self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def increment_backup_num_tokens(self, num_tokens: int, pool: str) -> None:
+        self.backup_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)
+
+    def increment_backup_num_bytes(self, num_bytes: int) -> None:
+        self.backup_num_bytes.labels(**self.labels).inc(num_bytes)
+
+    def increment_load_back_num_bytes(self, num_bytes: int) -> None:
+        self.load_back_num_bytes.labels(**self.labels).inc(num_bytes)
+
+    def observe_backup_duration(self, duration_seconds: float) -> None:
+        self.backup_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def increment_dropped_tokens(self, num_tokens: int, reason: str, pool: str) -> None:
+        self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
+            num_tokens
+        )
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

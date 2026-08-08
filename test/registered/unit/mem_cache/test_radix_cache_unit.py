@@ -31,6 +31,7 @@ from array import array
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -390,6 +391,57 @@ class TestRadixCache(unittest.TestCase):
             )
         )
         self.assertEqual(cache.total_size(), 5)
+
+    def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
+        class ReqToTokenPool:
+            def __init__(self, row):
+                self.req_to_token = row.unsqueeze(0)
+
+            def write(self, indices, values):
+                self.req_to_token[indices] = values
+
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        token_ids = array("q", [1, 2, 3])
+        tree_indices = allocator.alloc(3)
+        request_indices = allocator.alloc(3)
+        assert tree_indices is not None
+        assert request_indices is not None
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", token_ids)),
+                value=tree_indices,
+            )
+        )
+        cache.req_to_token_pool = ReqToTokenPool(request_indices.clone())
+        req = unittest.mock.Mock(
+            req_pool_idx=0,
+            cache_protected_len=0,
+            extra_key=None,
+            priority=0,
+            last_node=cache.root_node,
+        )
+        req.get_fill_ids.return_value = token_ids
+
+        available_before_free = allocator.available_size()
+        allocator.free_group_begin()
+        cache.cache_unfinished_req(req)
+        allocator.free_group_end()
+
+        self.assertEqual(
+            allocator.available_size(),
+            available_before_free + request_indices.numel(),
+        )
+        torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
+        torch.testing.assert_close(
+            cache.req_to_token_pool.req_to_token[0], tree_indices
+        )
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""
