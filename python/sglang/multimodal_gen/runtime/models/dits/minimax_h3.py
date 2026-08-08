@@ -43,7 +43,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -1178,6 +1181,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             quant_config,
             prefix="final_layer",
         )
+        # Attention setup is deferred until the first forward for breakable
+        # graphs. Preserve a component-scoped override beyond model loading.
+        self._selected_attention_backend = get_component_forced_attn_backend()
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
 
@@ -1187,6 +1193,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
+            selected_attention_backend=self._selected_attention_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         for module in self.modules():
