@@ -102,8 +102,7 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
     const float g = cast<fp32_t>(gate[i]);
     const float u = cast<fp32_t>(up[i]);
 
-    out[i] =
-        cast<TOut>(kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
+    out[i] = cast<TOut>(kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
   }
 
   store_as<out_vec_t>(params.out, out, output_offset);

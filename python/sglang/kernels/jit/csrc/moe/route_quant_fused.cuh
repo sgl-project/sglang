@@ -109,8 +109,7 @@ struct RouteQuantFusedKernel {
             ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
             : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
     RuntimeCheck(
-        quant_params.hidden_size == kQuantHidden_,
-        "route_quant_fused is specialized for a 3584-wide activation row");
+        quant_params.hidden_size == kQuantHidden_, "route_quant_fused is specialized for a 3584-wide activation row");
     RuntimeCheck(
         quant_params.num_tokens == static_cast<uint32_t>(M_.unwrap()),
         "route_quant_fused: scores and activations must have the same token count");
