@@ -50,7 +50,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
-register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="weekly", runner_config="1-gpu-large")
 
 # Use a small model with tie_word_embeddings=True
 BASE_MODEL = "Qwen/Qwen2.5-0.5B"
