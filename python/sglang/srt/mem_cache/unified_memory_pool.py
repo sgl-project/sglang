@@ -33,6 +33,7 @@ import triton
 from torch.profiler import record_function
 
 from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
+from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
@@ -684,12 +685,12 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
         """Zero whole page envelopes (PHYSICAL page ids) on allocator
         hand-out."""
-        if phys_pages.numel() == 0:
-            return
-        env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
-            self._num_pages, self._page_bytes
+        zero_pages(
+            self._unified_buffer._raw,
+            phys_pages,
+            self._num_pages,
+            self._page_bytes,
         )
-        env[phys_pages.to(torch.long)] = 0
 
 
 class UnifiedMambaPool(MambaPool):
