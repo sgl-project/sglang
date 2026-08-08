@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct PlanEntriesParams {
   // Inputs.
@@ -308,4 +308,4 @@ struct PlanEntriesKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
