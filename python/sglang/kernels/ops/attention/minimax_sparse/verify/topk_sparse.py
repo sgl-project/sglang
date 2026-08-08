@@ -1,26 +1,32 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
+#
+# EAGLE3 verify 专用 Step3 kernel: 从 prefill/topk_sparse.py 复制改造.
+#
+# 改造目的 (Path 1 Strategy B, 固定长度版):
+#   prefill Step3 kernel (`_gqa_share_sparse_fwd_kernel`) 通过 topk_idx 选择
+#   K/V block, 用 `pos = c + off_n` (c = topk_idx * BLOCK_SIZE_K) 从
+#   req_to_token[sid, pos] 读 slot. 原版依赖 topk_idx 始终 < valid_blocks (causal),
+#   即 pos < seq_len. 但若 topk_idx 因任何残留边界情况出现越界值 (>= max_seqblock_k),
+#   则 pos >= max_seqblock_k * block_size_k 可能超出 req_to_token 的列范围,
+#   读到非法 slot → k_cache 越界. 原 (slots + max_slots) % max_slots 只防负数.
+#
+#   本 verify 版新增 OOB 双保险: kernel 接受 max_seqblock_k_upper 参数 (Python int,
+#   由 caller 传入 = cdiv(context_len, block_size_k)), 计算 pos_upper =
+#   max_seqblock_k_upper * block_size, 并把 pos_mask 收紧为
+#   (pos < seq_len) & (pos < pos_upper). 这样即使 topk_idx 异常越界, pos 也被
+#   pos_upper 挡住, req_to_token[sid, pos] 不会越界. 注意 max_seqblock_k_upper
+#   作为普通 int arg 传入 (不是 tl.constexpr), 避免 topk 变化触发重编译.
+#
+# kernel 内部仍按真实 seq_len 做 causal (off_q_k >= c), 与 prefill 完全一致,
+# 不引入启发式选块 (区别于 Strategy A 的 decode kernel).
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import (
-    check_sparse_kv_fp8,
-    get_cu_seqblocks,
-    robust_allocator,
-    sparse_out_dtype,
-    unit_scale,
-)
-from sglang.srt.utils import is_hip
-
-# On DCU/ROCm (e.g. Hygon K100_AI, gfx928) the shared-memory budget is 64 KB
-# per workgroup. The multi-stage pipelined configs below (num_stages >= 2)
-# request ~68 KB of shared memory and crash with
-# "OutOfResources: shared memory 69632 > 65536". Restrict to num_stages=1 on
-# HIP so the kernel fits; CUDA keeps the wider autotune grid.
-_PREFILL_NUM_STAGES = (1,) if is_hip() else (2, 3, 4)
+from ..common.utils import get_cu_seqblocks, robust_allocator
 
 
 @triton.heuristics(
@@ -39,12 +45,9 @@ _PREFILL_NUM_STAGES = (1,) if is_hip() else (2, 3, 4)
     }
 )
 @triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
     configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in (2, 4, 8)
-        for ns in _PREFILL_NUM_STAGES
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
     ],
     key=[
         "BLOCK_SIZE_Q",
@@ -55,7 +58,7 @@ _PREFILL_NUM_STAGES = (1,) if is_hip() else (2, 3, 4)
     ],
 )
 @triton.jit
-def _gqa_share_sparse_fwd_kernel(
+def _gqa_share_sparse_fwd_kernel_verify(
     q_ptr,  # Q: n x h x d
     k_cache_ptr,  # K paged: max_slots x kh x d
     v_cache_ptr,  # V paged: max_slots x kh x d
@@ -80,9 +83,13 @@ def _gqa_share_sparse_fwd_kernel(
     num_q_loop,
     # sm_scale
     sm_scale,
-    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
-    k_scale,
-    v_scale,
+    # OOB double-safety: upper bound on K position (= max_seqblock_k_upper * block_size).
+    # Passed as a plain int arg (NOT constexpr) so topk changes don't trigger
+    # recompilation. Guards req_to_token[sid, pos] against a corrupted topk_idx
+    # producing pos >= req_to_token column range. The existing
+    # (slots + max_slots) % max_slots only protects against negative slots.
+    max_seqblock_k_upper,
+    block_size,  # = BLOCK_SIZE_K (constexpr below); used to compute pos_upper
     # stride
     stride_qn,
     stride_qh,
@@ -113,7 +120,6 @@ def _gqa_share_sparse_fwd_kernel(
     # has sink
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
-    IS_FP8: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -152,6 +158,14 @@ def _gqa_share_sparse_fwd_kernel(
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
+    # OOB double-safety: pos_upper bounds the absolute K position the kernel
+    # will read via req_to_token[sid, pos]. pos = topk_idx * BLOCK_SIZE_K + off_n,
+    # and a corrupted topk_idx (>= max_seqblock_k) could push pos beyond
+    # req_to_token's column range. The existing (slots + max_slots) % max_slots
+    # only protects against negative slot values, not pos >= max_slots-equivalent
+    # column overruns. Here we clamp pos < pos_upper so req_to_token[sid, pos]
+    # never reads out of bounds even if topk_idx is garbage.
+    pos_upper = max_seqblock_k_upper * block_size
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         # init topk idx pointer
@@ -202,6 +216,11 @@ def _gqa_share_sparse_fwd_kernel(
             # paged load K via req_to_token: pos -> slot -> k_cache
             pos = c + off_n
             pos_mask = pos < seq_len
+            # OOB double-safety: also require pos < pos_upper so a corrupted
+            # topk_idx (>= max_seqblock_k_upper) cannot push req_to_token reads
+            # out of column range. Combined with pos_mask (pos < seq_len), this
+            # is strictly tighter; for well-formed topk_idx it is a no-op.
+            pos_mask = pos_mask & (pos < pos_upper)
             slots = tl.load(
                 req_to_token_ptr + sid * stride_r2t_b + pos,
                 mask=pos_mask,
@@ -217,12 +236,6 @@ def _gqa_share_sparse_fwd_kernel(
                 mask=kd_mask[:, None] & pos_mask[None, :],
                 other=0.0,
             )
-            if IS_FP8:
-                # fp8 main K cache: widening cast with bf16/fp16 Q (unit-scaled
-                # cache -> exact inverse dequant; k_scale covers calibrated
-                # caches), no-op with fp8 Q (fp8 attn-GEMM mode) so tl.dot runs
-                # fp8x8. Compiled out when the cache is bf16.
-                k = k.to(q.dtype)
             # compute qk
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal mask
@@ -230,7 +243,7 @@ def _gqa_share_sparse_fwd_kernel(
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
             # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
             #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-            qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
+            qk += tl.dot(q, k) * sm_scale_log2e
             # K boundary mask: positions beyond seq_len contribute -inf
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
             # compute m_ij and l_ij
@@ -249,14 +262,8 @@ def _gqa_share_sparse_fwd_kernel(
                 mask=pos_mask[:, None] & vd_mask[None, :],
                 other=0.0,
             )
-            if IS_FP8:
-                # Cast V to the compute dtype: widening with bf16/fp16 Q (so
-                # `p.to(v.dtype)` keeps P in the compute dtype), no-op with fp8
-                # Q where P is quantized to e4m3 for the fp8 PV MMA — the same
-                # accuracy contract as fmha_sm100's fp8 kernel.
-                v = v.to(q.dtype)
             p = p.to(v.dtype)
-            acc_o += tl.dot(p, v) * v_scale
+            acc_o += tl.dot(p, v)
             # update statistics
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -276,7 +283,7 @@ def _gqa_share_sparse_fwd_kernel(
 
 
 @torch.no_grad()
-def flash_prefill_with_gqa_share_sparse(
+def flash_verify_prefill_with_gqa_share_sparse(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -290,18 +297,23 @@ def flash_prefill_with_gqa_share_sparse(
     seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
     max_seqlen_q: int,
+    max_seqblock_k_upper: int,
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
-    cu_seqblocks_q: Optional[torch.Tensor] = None,
-    max_seqblock_q: Optional[int] = None,
-    q_scale: Optional[float] = None,
-    k_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
+    seqlens_cpu: Optional[List[int]] = None,
 ) -> torch.Tensor:
+    """EAGLE3 verify 专用 Step3 (固定长度 score buffer 版的配套 sparse kernel).
+
+    与 flash_prefill_with_gqa_share_sparse 的唯一区别: kernel 额外接受
+    max_seqblock_k_upper (Python int = cdiv(context_len, block_size_k)) 用于
+    OOB 双保险 — 把 req_to_token[sid, pos] 的读位置收紧到 pos <
+    max_seqblock_k_upper * block_size_k, 防止残留的 topk_idx 越界值 (>=
+    max_seqblock_k) 导致 req_to_token 列越界. kernel 内部 causal 语义
+    (off_q_k >= c) 与 prefill 完全一致.
+    """
     triton.set_allocator(robust_allocator)
-    is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
-    k_scale = unit_scale(k_scale)
-    v_scale = unit_scale(v_scale)
+    # dtype check
+    assert k_cache.dtype == q.dtype and v_cache.dtype == q.dtype
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape
@@ -318,29 +330,24 @@ def flash_prefill_with_gqa_share_sparse(
     assert gqa_group_size * block_size_q <= 128
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
-    # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
-    # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
-    sm_scale = sm_scale * unit_scale(q_scale)
-    if cu_seqblocks_q is None or max_seqblock_q is None:
-        cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
-            cu_seqlens, max_seqlen_q, block_size_q, block_size_k
-        )
-    # output tensor
-    o = torch.empty(
-        total_q, num_q_heads, v_head_dim, device=q.device, dtype=sparse_out_dtype(q)
+    cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
+        cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
     )
+    # output tensor — total_q is fixed (bs*D), already graph-safe.
+    o = torch.empty(total_q, num_q_heads, v_head_dim, device=q.device, dtype=q.dtype)
     # launch kernel
     num_q_loop = (
         max_seqblock_q // 131072 + 1
-    )  # calculate multiple queries in one kernel if seqlence length is too long
+    )  # calculate multiple querys in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
     BLOCK_SIZE_K = triton.next_power_of_2(block_size_k)
+    # grid uses max_seqlen_q (which is D, fixed) — graph-safe.
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
         batch_size,
     )
-    _gqa_share_sparse_fwd_kernel[grid](
+    _gqa_share_sparse_fwd_kernel_verify[grid](
         q,
         k_cache,
         v_cache,
@@ -361,8 +368,8 @@ def flash_prefill_with_gqa_share_sparse(
         topk,
         num_q_loop,
         sm_scale,
-        k_scale,
-        v_scale,
+        max_seqblock_k_upper,
+        block_size_k,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -384,6 +391,5 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
-        IS_FP8=is_fp8,
     )
     return o

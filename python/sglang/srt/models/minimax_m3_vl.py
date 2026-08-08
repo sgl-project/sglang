@@ -132,6 +132,45 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
+        # EAGLE3: aux hidden state capture flag (set by
+        # set_eagle3_layers_to_capture). The text-only class
+        # (MiniMaxM3SparseForCausalLM) defines this; the VL class did not, so
+        # EAGLE3 target-side capture silently no-op'd for VL checkpoints.
+        self.capture_aux_hidden_states = False
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """EAGLE3 target-side hook.
+
+        Mirrors MiniMaxM3SparseForCausalLM.set_eagle3_layers_to_capture but also
+        sets the per-layer ``_is_layer_to_capture`` flag that
+        MiniMaxM3Model.forward reads (via getattr) to decide which layers append
+        to ``aux_hidden_states``. Without this setattr the flag is never True,
+        so no aux states are captured and EAGLE3 verify gets no target hidden
+        states to score drafts against.
+        """
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+
+        # VL class: text config lives at self.config.text_config.
+        num_layers = self.config.text_config.num_hidden_layers
+        if layer_ids is None:
+            # [2, N//2, N-3] — matches the draft's 3 aux layers
+            # (FC in_features = 3 * hidden_size).
+            layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        self.model.layers_to_capture = layers_to_capture
+        for layer_id in layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
+    def get_embed_and_head(self):
+        """EAGLE3 draft shares the target's embedding and lm_head."""
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def _determine_num_fused_shared_experts(self) -> None:
         text_config = self.config.text_config
         server_args = get_server_args()
@@ -226,12 +265,20 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        # EAGLE3: MiniMaxM3Model returns (hidden_states, aux_hidden_states) when
+        # the captured layers appended aux states; unpack and forward aux to the
+        # logits processor (mirrors text-only MiniMaxM3SparseForCausalLM.forward).
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank and not get_embedding:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 
