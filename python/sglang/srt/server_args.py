@@ -2675,6 +2675,21 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    hicache_storage_key_scheme: A[
+        str,
+        Arg(
+            help="How L3 storage object keys encode what an object holds. "
+            "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
+            "so only bit-identical topologies can share cache. "
+            "'unified': keys carry topology-free canonical cell "
+            "coordinates (namespace digest + layer/head group indices), so "
+            "any topology whose shards tile the same grid shares cache. "
+            "v1 supports the file and mooncake backends with plain KV pools "
+            "only.",
+            choices=["rank-suffix", "unified"],
+        ),
+        NS("memory"),
+    ] = "rank-suffix"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -7161,6 +7176,10 @@ class ServerArgs:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
+        # Step 0: L3 key-scheme validation. Runs before the early return so
+        # unified flags are never silently inert.
+        self._resolve_hicache_key_scheme()
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -7176,6 +7195,86 @@ class ServerArgs:
 
         # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
+
+    def _resolve_hicache_key_scheme(self):
+        if self.hicache_storage_key_scheme == "rank-suffix":
+            return
+        if not (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ):
+            raise ValueError(
+                "--hicache-storage-key-scheme unified has no effect "
+                "without --enable-hierarchical-cache (or decode KV offload); "
+                "refusing a silently inert flag."
+            )
+        if self.hicache_storage_backend is None:
+            raise ValueError(
+                "--hicache-storage-key-scheme unified requires an L3 "
+                "backend (--hicache-storage-backend)."
+            )
+        if self.hicache_storage_backend not in ("file", "mooncake"):
+            raise NotImplementedError(
+                "the unified key scheme v1 supports --hicache-storage-backend file "
+                f"or mooncake; got {self.hicache_storage_backend!r}. Other "
+                "backends need chunk-granular key support first."
+            )
+        if self.speculative_algorithm is not None:
+            raise NotImplementedError(
+                "the unified key scheme does not cover speculative-decoding draft "
+                "pools yet; use --hicache-storage-key-scheme rank-suffix."
+            )
+        # Topologies whose at-rest KV is not a dense per-rank rectangle of
+        # whole pages cannot be named by unified chunks yet. Checked here
+        # (not only at attach) because the decode-offload attach path has no
+        # CP/DCP group wired into its controller.
+        if self.dcp_size > 1:
+            raise NotImplementedError(
+                "the unified key scheme with --dcp-size > 1 is not supported: each "
+                "DCP rank holds an interleaved token shard (needs the "
+                "token-granule extension)."
+            )
+        # attn_cp_size is resolvable (prefill-CP overrides stash it without
+        # mutating the raw field), so read it through the resolved view.
+        if self._resolved().attn_cp_size > 1:
+            raise NotImplementedError(
+                "the unified key scheme with --attn-cp-size > 1 is not supported: "
+                "CP ranks hold sub-page slices or replicated pages (needs "
+                "token-granule chunks / writer election)."
+            )
+        # Best-effort early check of the partition knobs when the extra
+        # config is inline JSON (the '@file' form is re-validated at attach).
+        # Any knob selects the KV layout adapter: objects use the unified
+        # byte order, so there is no host-layout requirement, but the
+        # per-chunk key fan-out needs a multi-key backend.
+        extra = self.hicache_storage_backend_extra_config
+        if extra and not extra.startswith("@"):
+            try:
+                extra_dict = json.loads(extra)
+                tp_lcm_size = extra_dict.get("tp_lcm_size")
+                head_group = extra_dict.get("head_group")
+                layer_partition = extra_dict.get("layer_partition")
+            except (ValueError, AttributeError):
+                tp_lcm_size = None
+                head_group = None
+                layer_partition = None
+            if tp_lcm_size:
+                raise ValueError(
+                    "tp_lcm_size is the legacy rank-suffix split-heads knob; "
+                    "the unified key scheme uses head_group in the extra "
+                    "config (heads per chunk)."
+                )
+            # head_group is ignored on rank-replicated (MLA-family) pools, so
+            # a shared fleet extra-config must not be rejected for them here.
+            adapter = layer_partition is not None or (
+                head_group and not self.use_mla_backend()
+            )
+            if adapter and self.hicache_storage_backend != "mooncake":
+                raise NotImplementedError(
+                    "unified-scheme partition knobs (head_group / "
+                    "layer_partition) need a multi-key-per-page backend; "
+                    "only mooncake supports them."
+                )
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:

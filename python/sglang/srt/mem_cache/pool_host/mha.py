@@ -597,6 +597,144 @@ class MHATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
 
+    def _page_kv_view_unified(self, index: int):
+        """One page's KV as a (2, head, layer, page_size, dim) strided view.
+
+        The unified byte order — (head, layer, token, dim) per K/V half —
+        is the page_head_layer_direct order, so chunks gathered here
+        stay byte-compatible with a future zero-copy layout. Works for every
+        host layout (layer_first included) because torch handles the strided
+        permute.
+        """
+        if self.layout == "layer_first":
+            page = self.kv_buffer[:, :, index : index + self.page_size]
+            return page.permute(0, 3, 1, 2, 4)
+        if self.layout == "page_first":
+            page = self.kv_buffer[:, index : index + self.page_size]
+            return page.permute(0, 3, 2, 1, 4)
+        if self.layout == "page_first_direct":
+            page = self.kv_buffer[:, index // self.page_size]
+            return page.permute(0, 3, 1, 2, 4)
+        if self.layout == "page_head":
+            page = self.kv_buffer[:, index // self.page_size]
+            return page.permute(0, 1, 3, 2, 4)
+        raise ValueError(
+            f"KV layout adapter does not support the {self.layout!r} layout."
+        )
+
+    def unified_bytes_per_page(self, layer_ranges, head_ranges) -> int:
+        """Staging bytes for one page's chunks (K and V halves)."""
+        layers = sum(end - start for start, end in layer_ranges)
+        heads = sum(end - start for start, end in head_ranges)
+        return 2 * layers * heads * self.page_size * self.head_dim * self.dtype.itemsize
+
+    def _check_adapter_pool(self):
+        if not torch.is_tensor(self.kv_buffer):
+            raise NotImplementedError(
+                "KV layout adapter is not supported for split K/V host pools "
+                "(asymmetric MHA)."
+            )
+
+    def _slab_schedule(self, layer_ranges, head_ranges):
+        """Per-page slab schedule: (l0, l1, h0, h1, kv, nbytes, direct).
+
+        Order: layer-range-major, head-range-minor, K then V — matching the
+        key suffix list. ``direct`` marks slabs whose unified-order view is
+        already contiguous in the pool (same strides on every page), so the
+        adapter can skip the staging copy for them.
+        """
+        sample = self._page_kv_view_unified(0)
+        itemsize = self.dtype.itemsize
+        slabs = []
+        for l0, l1 in layer_ranges:
+            for h0, h1 in head_ranges:
+                nbytes = (
+                    (h1 - h0) * (l1 - l0) * self.page_size * self.head_dim * itemsize
+                )
+                for kv in range(2):
+                    direct = sample[kv, h0:h1, l0:l1].is_contiguous()
+                    slabs.append((l0, l1, h0, h1, kv, nbytes, direct))
+        return slabs
+
+    def unified_zero_copy(self, layer_ranges, head_ranges) -> bool:
+        """True when every chunk slab is pool-contiguous (no staging needed)."""
+        self._check_adapter_pool()
+        return all(s[6] for s in self._slab_schedule(layer_ranges, head_ranges))
+
+    def gather_unified_chunks(self, indices, layer_ranges, head_ranges, staging):
+        """Write-side adapter: unified-order (ptr, size) per chunk slab.
+
+        Direct slabs point straight into the pool; the rest are packed into
+        ``staging`` (pinned, store-registered), with slots reserved for
+        every slab so per-page geometry stays uniform.
+        """
+        self._check_adapter_pool()
+        assert len(indices) % self.page_size == 0
+        slabs = self._slab_schedule(layer_ranges, head_ranges)
+        ptrs, sizes = [], []
+        cursor = 0
+        for index in indices.tolist()[:: self.page_size]:
+            view = self._page_kv_view_unified(index)
+            for l0, l1, h0, h1, kv, nbytes, direct in slabs:
+                src = view[kv, h0:h1, l0:l1]
+                if direct:
+                    ptrs.append(src.data_ptr())
+                else:
+                    dst = staging[cursor : cursor + nbytes].view(self.dtype)
+                    dst.view(h1 - h0, l1 - l0, self.page_size, self.head_dim).copy_(src)
+                    ptrs.append(staging.data_ptr() + cursor)
+                sizes.append(nbytes)
+                cursor += nbytes
+        return ptrs, sizes
+
+    def get_unified_chunk_meta(self, indices, layer_ranges, head_ranges, staging):
+        """Read-side targets in gather's slab order: direct slabs are fetched
+        straight into the pool, the rest into ``staging`` for the scatter."""
+        self._check_adapter_pool()
+        assert len(indices) % self.page_size == 0
+        slabs = self._slab_schedule(layer_ranges, head_ranges)
+        ptrs, sizes = [], []
+        cursor = 0
+        for index in indices.tolist()[:: self.page_size]:
+            view = self._page_kv_view_unified(index)
+            for l0, l1, h0, h1, kv, nbytes, direct in slabs:
+                if direct:
+                    ptrs.append(view[kv, h0:h1, l0:l1].data_ptr())
+                else:
+                    ptrs.append(staging.data_ptr() + cursor)
+                sizes.append(nbytes)
+                cursor += nbytes
+        return ptrs, sizes
+
+    def scatter_unified_chunks(
+        self, indices, layer_ranges, head_ranges, staging, page_ok=None
+    ):
+        """Copy fetched staged slabs of successful pages into the pool.
+
+        Direct slabs already landed in place via get_unified_chunk_meta pointers.
+        ``page_ok`` filters by page position (None means all succeeded).
+        """
+        self._check_adapter_pool()
+        assert len(indices) % self.page_size == 0
+        slabs = self._slab_schedule(layer_ranges, head_ranges)
+        page_bytes = sum(s[5] for s in slabs)
+        cursor = 0
+        for pos, index in enumerate(indices.tolist()[:: self.page_size]):
+            if page_ok is not None and not page_ok[pos]:
+                cursor += page_bytes
+                continue
+            view = self._page_kv_view_unified(index)
+            for l0, l1, h0, h1, kv, nbytes, direct in slabs:
+                if not direct:
+                    src = (
+                        staging[cursor : cursor + nbytes]
+                        .view(self.dtype)
+                        .view(h1 - h0, l1 - l0, self.page_size, self.head_dim)
+                    )
+                    view[kv, h0:h1, l0:l1].copy_(src)
+                cursor += nbytes
+        return cursor
+
     def get_page_buffer_meta(self, indices):
         """
         meta data for zero copy

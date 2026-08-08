@@ -39,7 +39,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -464,20 +464,23 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
-        )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
+            # Inside the rollback try-block: unified attach validation
+            # raises here, and a failed runtime re-attach must leave the
+            # controller consistent (storage_backend_type reset in except).
+            self.storage_config = self._generate_storage_config(
+                model_name, storage_backend_extra_config
+            )
+            # for MLA models, only one rank needs to backup the KV cache
+            self.backup_skip = (
+                self.storage_config.is_mla_model
+                # todo: load balancing
+                and self.storage_config.tp_rank != 0
+            )
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
@@ -629,6 +632,55 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        unified_suffix = None
+        unified_layer_ranges = None
+        unified_head_ranges = None
+        layer_partition = storage_backend_extra_config.pop("layer_partition", None)
+        head_group_knob = storage_backend_extra_config.pop("head_group", None)
+
+        # The knobs arrive from operator JSON: enforce exact integers, or
+        # floats/bools would leak into key coordinates (L30.0-61 forks the
+        # keyspace) and into zero-copy pointer arithmetic.
+        def _is_exact_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        if head_group_knob is not None and not _is_exact_int(head_group_knob):
+            raise ValueError(f"head_group must be an integer, got {head_group_knob!r}.")
+        if layer_partition is not None and (
+            not _is_exact_int(layer_partition) or layer_partition <= 0
+        ):
+            raise ValueError(
+                f"layer_partition must be a positive integer (the layer "
+                f"unit: layers per chunk; the model's trailing remainder "
+                f"forms a short final chunk), got {layer_partition!r}."
+            )
+        if get_memory().hicache_storage_key_scheme == "unified":
+            if tp_lcm_size:
+                raise ValueError(
+                    "tp_lcm_size is the legacy rank-suffix split-heads knob; "
+                    "the unified key scheme uses head_group in the extra "
+                    "config "
+                    "(heads per chunk, e.g. head_group = total_kv_heads / "
+                    "lcm of the fleet's TP sizes)."
+                )
+            (
+                unified_suffix,
+                unified_layer_ranges,
+                unified_head_ranges,
+            ) = self._build_unified_suffix(
+                model_name=model_name,
+                is_rank_replicated=is_rank_replicated,
+                attn_cp_size=attn_cp_size,
+                head_group_knob=head_group_knob,
+                layer_partition=layer_partition,
+            )
+        elif layer_partition is not None or head_group_knob is not None:
+            raise ValueError(
+                "layer_partition / head_group in "
+                "--hicache-storage-backend-extra-config require "
+                "--hicache-storage-key-scheme unified."
+            )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -644,7 +696,93 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            unified_suffix=unified_suffix,
+            unified_layer_ranges=unified_layer_ranges,
+            unified_head_ranges=unified_head_ranges,
         )
+
+    def _build_unified_suffix(
+        self,
+        model_name: Optional[str],
+        is_rank_replicated: bool,
+        attn_cp_size: int,
+        head_group_knob: Optional[int] = None,
+        layer_partition: Optional[int] = None,
+    ):
+        """Attach-time unified planning.
+
+        Controller-only guards live here; the namespace/grid derivation is
+        hicache_key_scheme.plan_unified_kv. Everything unsupported
+        raises with the remedy in the message — nothing degrades silently
+        to rank-suffix keys. Returns (suffix, layer_ranges, head_ranges):
+        a single suffix string without partition knobs, else the
+        owned-chunk suffix list plus the LOCAL grid for the adapter.
+        """
+        from sglang.srt.mem_cache.hicache_key_scheme import (
+            namespace_digest,
+            normalize_dtype,
+            plan_unified_kv,
+        )
+
+        if type(self) is not HiCacheController:
+            raise NotImplementedError(
+                "the unified key scheme is not supported for hybrid/side-pool cache "
+                "controllers yet (per-component grids are the follow-up); use "
+                "--hicache-storage-key-scheme rank-suffix."
+            )
+        if self.storage_backend_type not in ("file", "mooncake"):
+            raise NotImplementedError(
+                f"the unified key scheme v1 supports the file and mooncake backends; "
+                f"got {self.storage_backend_type!r}."
+            )
+        if self.has_draft:
+            raise NotImplementedError(
+                "the unified key scheme does not cover speculative-decoding "
+                "draft pools yet (the draft model needs its own namespace "
+                "identity)."
+            )
+        if (
+            head_group_knob is not None or layer_partition is not None
+        ) and self.storage_backend_type != "mooncake":
+            raise NotImplementedError(
+                "unified-scheme partition knobs (head_group / layer_partition) "
+                "need a multi-key-per-page backend; only mooncake supports "
+                "them (the file backend stores one object per page)."
+            )
+
+        plan = plan_unified_kv(
+            model_id=model_name or "",
+            # Logical KV dtype, not the storage view: fp8 variants all store
+            # as uint8 but must land in distinct keyspaces.
+            dtype=normalize_dtype(self.mem_pool_device.dtype),
+            page_size=self.page_size,
+            rank_replicated=is_rank_replicated,
+            local_kv_heads=0 if is_rank_replicated else self.mem_pool_host.head_num,
+            attn_tp_rank=self.tp_rank,
+            attn_tp_size=self.tp_size,
+            attn_cp_size=attn_cp_size,
+            start_layer=self.mem_pool_host.start_layer,
+            end_layer=self.mem_pool_host.end_layer,
+            is_final_stage=self.pp_rank == self.pp_size - 1,
+            pool_layout=self.mem_pool_host.layout,
+            head_group_knob=head_group_knob,
+            layer_partition=layer_partition,
+        )
+        if plan.adapter and not torch.is_tensor(self.mem_pool_host.kv_buffer):
+            # Fail at attach, not on the first backup — a raise on the
+            # storage threads would silently wedge write-back.
+            raise NotImplementedError(
+                "the KV layout adapter does not support split K/V host pools "
+                "(asymmetric MHA)."
+            )
+
+        logger.info(
+            "HiCache unified L3 keys: namespace=%s chunks=%s",
+            namespace_digest(plan.namespace),
+            plan.suffixes,
+        )
+        suffix = list(plan.suffixes) if plan.adapter else plan.suffixes[0]
+        return suffix, plan.layer_ranges, plan.head_ranges
 
     def reset(self):
         self.storage_stop_event.set()
@@ -897,6 +1035,13 @@ class HiCacheController:
         self.draft_page_set_func = None
         if not self.has_draft or not self.enable_storage:
             return
+        if self.storage_config.unified_suffix is not None:
+            # Draft pools can register after attach, so the attach-time guard
+            # in _build_unified_suffix cannot cover this order.
+            raise NotImplementedError(
+                "the unified key scheme does not cover speculative-decoding draft "
+                "pools yet (the draft model needs its own namespace identity)."
+            )
 
         backend = self.storage_backend_type
 
