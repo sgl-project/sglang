@@ -138,7 +138,7 @@ replace SGLang's pinned Torch version, then enable int4 compression when serving
 a supported LingBot World realtime pipeline:
 
 ```bash
-pip install "sglang[diffusion]"
+pip install "sglang[diffusion,diffusion-qvg]"
 pip install --no-deps quant-videogen==0.1.0
 
 sglang serve \

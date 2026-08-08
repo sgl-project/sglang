@@ -73,6 +73,9 @@ def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
     stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_token_per_frame = 10
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(arch_config=SimpleNamespace())
+    )
 
     server_args = SimpleNamespace(
         kv_cache_quant_config=QVGKVQuantArgs(),
@@ -95,6 +98,9 @@ def test_lingbot_realtime_cache_config_uses_request_overrides():
     stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_token_per_frame = 10
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(arch_config=SimpleNamespace())
+    )
 
     batch = SimpleNamespace(
         realtime_causal_sink_size=4,
@@ -123,6 +129,7 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     stage.num_token_per_frame = 1
     stage.num_frames_per_block = 3
     stage.sliding_window_num_frames = 6
+    stage._kv_quant_args = QVGKVQuantArgs()
     stage.transformer = SimpleNamespace(
         num_attention_heads=1,
         attention_head_dim=1,
@@ -542,6 +549,7 @@ def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
     stage.num_token_per_frame = 10
     stage.num_frames_per_block = 3
     stage.sliding_window_num_frames = 18
+    stage._kv_quant_args = QVGKVQuantArgs()
     stage.transformer = SimpleNamespace(num_attention_heads=1, attention_head_dim=1)
     policy = CausalDMDCachePolicy(
         sequence_shard_enabled=False,

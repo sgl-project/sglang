@@ -47,8 +47,9 @@ def _qvg_functions():
         )
     except ImportError as e:
         raise ImportError(
-            "Quant-VideoGen KV-cache quantization requires the "
-            "'quant-videogen' package. Install it with: "
+            "Quant-VideoGen KV-cache quantization requires its optional "
+            "runtime dependencies. Install them with: "
+            "pip install 'sglang[diffusion-qvg]' && "
             "pip install --no-deps quant-videogen==0.1.0."
         ) from e
     return triton_prq_quantize_tensor, triton_prq_dequantize_tensor
