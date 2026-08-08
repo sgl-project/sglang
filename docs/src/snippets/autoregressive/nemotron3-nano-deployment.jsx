@@ -8,7 +8,8 @@ export const Nemotron3NanoDeployment = () => {
       items: [
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false }
+        { id: 'b300', label: 'B300', default: false },
+        { id: 'Arc B', label: 'BMG', default: false }
       ]
     },
     modelVariant: {
@@ -74,6 +75,11 @@ export const Nemotron3NanoDeployment = () => {
     cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
     if (hardware === 'b300') {
       cmd += `  --attention-backend flashinfer \\\n`;
+    }
+
+    if (hardware === 'Arc B') {
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
+      cmd += `  --device xpu \\\n`;
     }
 
     // Add thinking parser and tool call parser if enabled
@@ -153,7 +159,18 @@ export const Nemotron3NanoDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      if (prev.hardware === 'Arc B' && optionName === 'modelVariant' && value !== 'bf16') {
+        return prev;
+      }
+
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B') {
+        next.modelVariant = 'bf16';
+        next.tp = '4';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -327,7 +344,11 @@ export const Nemotron3NanoDeployment = () => {
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isArcBModelLocked =
+                    values.hardware === 'Arc B' &&
+                    option.name === 'modelVariant' &&
+                    item.id !== 'bf16';
+                  const isDisabled = Boolean(item.disabled || isArcBModelLocked);
                   return (
                     <label
                       key={item.id}
