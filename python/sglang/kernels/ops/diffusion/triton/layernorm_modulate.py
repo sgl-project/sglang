@@ -14,7 +14,9 @@ which ``nn.LayerNorm`` dispatches to for bf16 rows with ``N % 4 == 0`` and
 16-byte-aligned buffers; SASS-level derivation in PR #34008):
 
 - 128 aten threads per row; thread ``t`` serially Welford-pushes the
-  4-element vectors ``t, t+128, ...``, each scalar as
+  4-element vectors ``t, t+128, ... < N/4`` (for ``N % 512 != 0`` the
+  trailing threads stop one iteration early and enter the fold with a
+  smaller count), each scalar as
   ``mean' = fma(delta, rcp(count+1), mean)``,
   ``m2' = fma(delta, val - mean', m2)``, with ``rcp`` being nvcc's
   guarded-reciprocal fast path (``_rcp4``).
@@ -230,14 +232,30 @@ def _layernorm_modulate_kernel(
 
     # pass 1: per-"thread" serial Welford in aten's exact element order.
     # Out-of-range rows compute garbage that is never stored.
-    for i in tl.static_range(D // 512):
+    for i in tl.static_range((D + 511) // 512):
         cols = i * 512 + lanes[:, None] * 4 + tl.arange(0, 4)[None, :]
-        x4 = tl.load(
-            x_ptr + row_base[:, None, None] + cols[None, :, :],
-            mask=row_mask[:, None, None],
-            other=0.0,
-        ).to(tl.float32)
-        mean, m2, cnt = _push_vec4(x4, mean, m2, cnt, row_mask, ROWS, 128, MASKED=False)
+        if (i + 1) * 512 <= D:
+            x4 = tl.load(
+                x_ptr + row_base[:, None, None] + cols[None, :, :],
+                mask=row_mask[:, None, None],
+                other=0.0,
+            ).to(tl.float32)
+            mean, m2, cnt = _push_vec4(
+                x4, mean, m2, cnt, row_mask, ROWS, 128, MASKED=False
+            )
+        else:
+            # partial tail chunk (D % 512 != 0): aten threads whose vector
+            # index i*128+t reaches N/4 skip the iteration, leaving their
+            # Welford state untouched.
+            vec_valid = (i * 128 + lanes < D // 4)[None, :]
+            x4 = tl.load(
+                x_ptr + row_base[:, None, None] + cols[None, :, :],
+                mask=row_mask[:, None, None] & vec_valid[:, :, None],
+                other=0.0,
+            ).to(tl.float32)
+            mean, m2, cnt = _push_vec4(
+                x4, mean, m2, cnt, vec_valid, ROWS, 128, MASKED=True
+            )
 
     # warp fold trees, then the (0,2)/(1,3)/(0,1) inter-warp combines.
     mean = tl.reshape(mean, (ROWS * 4, 32), can_reorder=False)
@@ -256,27 +274,30 @@ def _layernorm_modulate_kernel(
     batch = row_offs // seq_len
 
     # pass 2: normalize + modulate, in aten's rounding order.
-    for i in tl.static_range(D // 512):
+    for i in tl.static_range((D + 511) // 512):
         cols = i * 512 + tl.arange(0, 512)
+        mask = row_mask[:, None]
+        if (i + 1) * 512 > D:
+            mask = mask & (cols < D)[None, :]
         x = tl.load(
             x_ptr + row_base[:, None] + cols[None, :],
-            mask=row_mask[:, None],
+            mask=mask,
             other=0.0,
         ).to(tl.float32)
         y = _round_bf16_to_fp32(rstd * (x - mean))
         sc = tl.load(
             scale_ptr + batch[:, None] * scale_row_stride + cols[None, :],
-            mask=row_mask[:, None],
+            mask=mask,
             other=0.0,
         ).to(tl.float32)
         sh = tl.load(
             shift_ptr + batch[:, None] * scale_row_stride + cols[None, :],
-            mask=row_mask[:, None],
+            mask=mask,
             other=0.0,
         ).to(tl.float32)
         one_plus = _round_bf16_to_fp32(1.0 + sc)
         y = _round_bf16_to_fp32(y * one_plus) + sh
-        tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=row_mask[:, None])
+        tl.store(y_ptr + row_base[:, None] + cols[None, :], y, mask=mask)
 
 
 @triton.jit
@@ -376,7 +397,7 @@ def can_use_fused_layernorm_modulate(
         and x.dim() == 3
         and x.numel() > 0
         and x.is_contiguous()
-        and x.shape[-1] % 512 == 0
+        and x.shape[-1] % 4 == 0
         and x.shape[-1] <= 8192
         and _is_bf16_cuda(scale)
         and _is_bf16_cuda(shift)
@@ -396,16 +417,16 @@ def _fake_ln_modulate(
     return torch.empty_like(x)
 
 
-@register_custom_op(
-    op_name="triton_fused_layernorm_modulate",
-    mutates_args=[],
-    fake_impl=_fake_ln_modulate,
-)
-def fused_layernorm_modulate(
+def fused_layernorm_modulate_raw(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
 ) -> torch.Tensor:
     """``LN(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)``, bit-exact
-    vs the eager aten chain (LayerNorm without affine)."""
+    vs the eager aten chain (LayerNorm without affine).
+
+    Direct-call variant without the ``torch.ops`` dispatch (which costs tens
+    of microseconds per call); use it on CPU-launch-bound eager hot paths
+    (e.g. Sana), and the registered custom op under ``torch.compile``.
+    """
     batch, seq_len, hidden = x.shape
     n_rows = batch * seq_len
     rows = 2
@@ -424,11 +445,20 @@ def fused_layernorm_modulate(
             D=hidden,
             ROWS=rows,
             # H200-tuned: 38.5us at (1, 4096, 4096) vs the 121.8us eager
-            # chain.  ROWS=1 + 4 warps triggers pathological Triton layout
-            # conversions in the fold stage (47-58us).
-            num_warps=4 if hidden >= 4096 else 2,
+            # chain, 14.3us at Sana's (2, 1024, 2240) vs 43.1us.  ROWS=1 +
+            # 4 warps triggers pathological Triton layout conversions in
+            # the fold stage (47-58us).
+            num_warps=4 if hidden >= 2048 else 2,
         )
     return out
+
+
+fused_layernorm_modulate = register_custom_op(
+    fused_layernorm_modulate_raw,
+    op_name="triton_fused_layernorm_modulate",
+    mutates_args=[],
+    fake_impl=_fake_ln_modulate,
+)
 
 
 def can_use_fused_qk_head_layernorm(q: torch.Tensor, k: torch.Tensor) -> bool:
