@@ -712,6 +712,32 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
+                sampling_mask_error = (
+                    self.batch_result_processor.get_sampling_mask_overflow_error(
+                        i, req, logits_output
+                    )
+                )
+                if sampling_mask_error is not None:
+                    prepare_abort(
+                        req,
+                        sampling_mask_error,
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                    req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": sampling_mask_error}
+                    )
+                    req.disagg_kv_sender.abort()
+                    maybe_release_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    req.pending_bootstrap = False
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    advance_logprob_pt(i, req)
+                    continue
+
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)

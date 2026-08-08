@@ -1018,7 +1018,7 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
-        if batch.return_logprob:
+        if batch.return_logprob or any(req.return_sampling_mask for req in batch.reqs):
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
                 **tensor_dict,
@@ -1142,7 +1142,7 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
 
-        if batch.return_logprob:
+        if batch.return_logprob or any(req.return_sampling_mask for req in batch.reqs):
             (
                 logits_output,
                 extend_input_len_per_req,

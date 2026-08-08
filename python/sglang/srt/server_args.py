@@ -3380,6 +3380,12 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit.",
+        NS("exec.features"),
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -8182,6 +8188,12 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
+        if self.sampling_mask_max_tokens <= 0:
+            raise ValueError(
+                "--sampling-mask-max-tokens must be positive "
+                f"(got {self.sampling_mask_max_tokens})."
+            )
+
         if self.default_chat_template_kwargs is not None and not isinstance(
             self.default_chat_template_kwargs, dict
         ):

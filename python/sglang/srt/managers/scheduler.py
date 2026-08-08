@@ -2498,9 +2498,8 @@ class Scheduler(
 
         if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
             error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
+                "return_sampling_mask currently requires finite top_k; "
+                "top-p-only sampling is not supported."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
