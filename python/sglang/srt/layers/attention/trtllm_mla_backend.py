@@ -615,9 +615,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Unified pool: precompute the DENSE KV write loc into the capture-stable
         # buffer (both capture and each replay-prep run this out of the graph),
-        # so the in-graph set_mla_kv_buffer writes a dense loc without capturing a
-        # translate. Only decode writes KV under unified (spec is gated off).
-        if self._unified_mla and forward_mode.is_decode_or_idle():
+        # so the in-graph set_mla_kv_buffer writes a dense loc without capturing
+        # a translate.
+        if self._unified_mla and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
             out_cache_loc = forward_batch.out_cache_loc
             n = out_cache_loc.shape[0]
             dst = self.cuda_graph_out_cache_loc_dense[:n]
@@ -1236,9 +1238,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if self._decode_dense_loc is not None:
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                )
+            else:
+                self.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
 
         # TODO refactor to avoid code duplication
         # Prepare query tensor inline

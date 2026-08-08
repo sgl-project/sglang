@@ -38,7 +38,10 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import (
+    UnifiedKVPool,
+    UnifiedMLATokenToKVPool,
+)
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -136,6 +139,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # once page ids are scaled by layer_num — `translate_kv_loc_dense` emits
         # that space. 1 for sub-pools whose kernels take real physical ids.
         self.kernel_page_multiplier = kernel_page_multiplier
+        # Zero page envelopes on hand-out — see _maybe_zero_pages.
+        self._zero_pages_on_alloc = isinstance(kvcache, UnifiedMLATokenToKVPool)
         # Overlap mode: `free` drops a wait_stream(forward_stream) barrier so its
         # v2p writes + move kernel serialize after the in-flight forward.
         self.forward_stream = forward_stream
@@ -617,6 +622,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
                 if self.lazy_compaction:  # live_page_count tracked only in lazy mode
                     self.live_page_count += N
+                self._maybe_zero_pages(phys_pages)
                 return phys_pages
 
             # SLOW PATH: holes exist — drain them first, then bind.
@@ -624,7 +630,20 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if phys_pages is None:
                 return None
             self.bind(v_pages, phys_pages)
+            self._maybe_zero_pages(phys_pages)
             return phys_pages
+
+    def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
+        """Zero the page ENVELOPES on hand-out (MLA-dense full pool only):
+        the MLA kernels arithmetically mask the rows beyond seq_len, so
+        never-written page bytes must read as finite values. Runs on the
+        schedule stream, ordered before the consuming forward by the
+        run_batch wait_stream fence.
+        """
+        if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
+            return
+        with record_function("MultiEndedAlloc._maybe_zero_pages"):
+            self._kvcache.zero_physical_pages(phys_pages)
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
