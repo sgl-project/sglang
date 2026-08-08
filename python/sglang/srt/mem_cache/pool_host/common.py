@@ -8,8 +8,11 @@ from collections import defaultdict
 import torch
 
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 class HostTensorAllocator:
@@ -174,10 +177,28 @@ def alloc_with_pin_memory(
     return buffer
 
 
+# On ROCm, hipHostRegister maps the pages at a device address that DIFFERS from
+# the host VA -- you are expected to obtain it with hipHostGetDevicePointer. But
+# the host pools store host data_ptr()s in a device-side pointer table that a
+# kernel dereferences (e.g. DSAIndexerPoolHost.index_k_data_ptrs), so a host VA
+# has to be directly dereferenceable from the device. hipHostMalloc, which torch
+# uses for pin_memory=True, returns memory whose device pointer IS the host
+# pointer -- the same property "npu" and "musa" rely on below.
+#
+# ROCm reports its device as "cuda", so it cannot simply be given its own key
+# the way "npu" and "musa" are. The default is switched as well, not just the
+# "cuda" entry: two call sites key this table with a torch.device object rather
+# than a string (memory_pool_host.py, `self.gpu_device = device_buffers[0].device`
+# and `= state_tensor.device`), and torch.device("cuda:0") is not dict-key-equal
+# to "cuda", so those pools always resolve through the default.
+_ALLOC_MEMORY_FUNCS = {
+    "npu": alloc_with_pin_memory,
+    "musa": alloc_with_pin_memory,
+}
+if _is_hip:
+    _ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
+
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
-    {
-        "npu": alloc_with_pin_memory,
-        "musa": alloc_with_pin_memory,
-    },
+    lambda: alloc_with_pin_memory if _is_hip else alloc_with_host_register,
+    _ALLOC_MEMORY_FUNCS,
 )
