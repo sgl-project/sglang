@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -292,10 +292,10 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP swaps in an allocator whose page_size is server_args.page_size *
+    # DCP swaps in an allocator whose page_size is the configured page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
+    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -352,7 +352,7 @@ def alloc_for_extend(
     else:
         # Paged allocation - build last_loc
         last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(
