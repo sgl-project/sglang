@@ -158,7 +158,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self.causal_kv_cache_neg: list | None = None
         self.crossattn_cache_neg: list | None = None
         # KV-cache quantization config (resolved per-forward from ServerArgs)
-        self._kv_quant_args: QVGKVQuantArgs | None = None
+        self._kv_quant_args = QVGKVQuantArgs()
         # Model-dependent constants (aligned with causal_inference.py assumptions)
         self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
         self.num_frames_per_block = (
@@ -423,13 +423,14 @@ class CausalDMDDenoisingStage(DenoisingStage):
             self.sliding_window_num_frames = int(kv_cache_num_frames)
 
         # KV-cache quantization config is fixed for the server lifetime
-        self._kv_quant_args = getattr(server_args, "kv_cache_quant_config", None)
+        self._kv_quant_args = server_args.kv_cache_quant_config
 
     def _resolve_kv_quant_args(self) -> QVGKVQuantArgs:
         """KV-quant config from ServerArgs (disabled by default)."""
-        if self._kv_quant_args is not None:
-            return self._kv_quant_args
-        return QVGKVQuantArgs()
+        return self._kv_quant_args
+
+    def _supports_qvg_kv_cache_quantization(self) -> bool:
+        return False
 
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
         return False
@@ -1132,6 +1133,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
             attention_window_size = kv_cache_size
         quant_args = self._resolve_kv_quant_args()
         if quant_args.enabled:
+            if not self._supports_qvg_kv_cache_quantization():
+                raise ValueError(
+                    f"{type(self).__name__} does not support QVG KV-cache quantization"
+                )
             if global_sink_tokens or allow_growth:
                 raise NotImplementedError(
                     "QVG packed KV cache supports only the LingBot realtime "

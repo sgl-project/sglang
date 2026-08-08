@@ -123,11 +123,6 @@ diffusion = [
   "xatlas",
 ]
 
-diffusion-qvg = [
-  # Quant-VideoGen PRQ KV-cache quantization (optional; import is lazy).
-  "quant-videogen>=0.1.1",
-]
-
 ray = [
   "ray[default]>=2.55.1",
 ]

@@ -48,6 +48,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     Each call processes one chunk (num_frames_per_block frames).
     """
 
+    def _supports_qvg_kv_cache_quantization(self) -> bool:
+        return True
+
     def _get_causal_kv_cache_size(
         self,
         *,

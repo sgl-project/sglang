@@ -51,9 +51,14 @@ class QVGKVQuantArgs:
     def validate(self) -> QVGKVQuantArgs:
         if self.bits not in (None, 2, 4):
             raise ValueError(f"kv-cache-quant bits must be 2 or 4, got {self.bits}")
-        for name in ("centroids", "block_size", "stages", "kmeans_iters"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"kv-cache-quant-{name} must be > 0")
+        if self.centroids <= 0:
+            raise ValueError("kv-cache-quant-centroids must be > 0")
+        if self.block_size <= 0:
+            raise ValueError("kv-cache-quant-block-size must be > 0")
+        if self.stages <= 0:
+            raise ValueError("kv-cache-quant-stages must be > 0")
+        if self.kmeans_iters <= 0:
+            raise ValueError("kv-cache-quant-iters must be > 0")
         if self.keep_recent_chunks < 0 or self.sink_keep_chunks < 0:
             raise ValueError("keep_recent_chunks / sink_keep_chunks must be >= 0")
         return self
@@ -75,20 +80,22 @@ class QVGKVQuantArgs:
         if master is None:
             return cls()
         inst = cls(bits=_parse_bits(master))
-        cli_map = {
-            "kv_cache_quant_centroids": "centroids",
-            "kv_cache_quant_block_size": "block_size",
-            "kv_cache_quant_stages": "stages",
-            "kv_cache_quant_iters": "kmeans_iters",
-            "kv_cache_quant_keep_recent": "keep_recent_chunks",
-            "kv_cache_quant_sink_keep": "sink_keep_chunks",
-            "kv_cache_quant_asymmetric": "asymmetric",
-            "kv_cache_quant_sink": "sink",
-        }
-        for cli_name, field_name in cli_map.items():
-            val = kwargs.get(cli_name)
-            if val is not None:
-                setattr(inst, field_name, val)
+        if kwargs.get("kv_cache_quant_centroids") is not None:
+            inst.centroids = kwargs["kv_cache_quant_centroids"]
+        if kwargs.get("kv_cache_quant_block_size") is not None:
+            inst.block_size = kwargs["kv_cache_quant_block_size"]
+        if kwargs.get("kv_cache_quant_stages") is not None:
+            inst.stages = kwargs["kv_cache_quant_stages"]
+        if kwargs.get("kv_cache_quant_iters") is not None:
+            inst.kmeans_iters = kwargs["kv_cache_quant_iters"]
+        if kwargs.get("kv_cache_quant_keep_recent") is not None:
+            inst.keep_recent_chunks = kwargs["kv_cache_quant_keep_recent"]
+        if kwargs.get("kv_cache_quant_sink_keep") is not None:
+            inst.sink_keep_chunks = kwargs["kv_cache_quant_sink_keep"]
+        if kwargs.get("kv_cache_quant_asymmetric") is not None:
+            inst.asymmetric = kwargs["kv_cache_quant_asymmetric"]
+        if kwargs.get("kv_cache_quant_sink") is not None:
+            inst.sink = kwargs["kv_cache_quant_sink"]
         inst.sink = bool(inst.sink)
         inst.asymmetric = bool(inst.asymmetric)
         return inst.validate()

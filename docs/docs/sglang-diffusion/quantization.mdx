@@ -133,11 +133,13 @@ Quant-VideoGen KV-cache quantization targets long-running autoregressive video
 sessions, where the causal self-attention cache can become comparable to the
 model weights. It does not change or quantize the checkpoint weights.
 
-Install the optional dependency and enable int4 compression when serving a
-supported LingBot World realtime pipeline:
+Install the optional dependency without allowing its stale Torch requirement to
+replace SGLang's pinned Torch version, then enable int4 compression when serving
+a supported LingBot World realtime pipeline:
 
 ```bash
-pip install "sglang[diffusion,diffusion-qvg]"
+pip install "sglang[diffusion]"
+pip install --no-deps quant-videogen==0.1.0
 
 sglang serve \
   --model-path robbyant/lingbot-world-fast-diffusers \

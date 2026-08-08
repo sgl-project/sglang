@@ -49,7 +49,7 @@ def _qvg_functions():
         raise ImportError(
             "Quant-VideoGen KV-cache quantization requires the "
             "'quant-videogen' package. Install it with: "
-            "pip install 'sglang[diffusion-qvg]' (or pip install quant-videogen)."
+            "pip install --no-deps quant-videogen==0.1.0."
         ) from e
     return triton_prq_quantize_tensor, triton_prq_dequantize_tensor
 
@@ -214,15 +214,9 @@ class QVGPackedCausalKVCache:
 
     def _dequant(self, packed: dict) -> torch.Tensor:
         _, triton_prq_dequantize_tensor = _qvg_functions()
-        deq = triton_prq_dequantize_tensor(
+        return triton_prq_dequantize_tensor(
             packed, self.q.block_size, self.q.bits, output_dtype=self.dtype
         )  # [B,H,S,D]
-        return deq.permute(0, 2, 1, 3).contiguous()  # -> [B,S,H,D]
-
-    def _seg_kv(self, seg: _Segment) -> tuple[torch.Tensor, torch.Tensor]:
-        if seg.packed:
-            return self._dequant(seg.packed_k), self._dequant(seg.packed_v)
-        return seg.k, seg.v
 
     def _all_segments(self) -> list[_Segment]:
         segs = list(self._segments)
@@ -357,17 +351,50 @@ class QVGPackedCausalKVCache:
         else:
             ranges = [(0, sink_end), (tail_start, self._global_end)]
 
-        ks, vs = [], []
+        visible_segments: list[tuple[_Segment, int, int]] = []
+        visible_tokens = 0
         for g_lo, g_hi in ranges:
             for seg in self._all_segments():
                 a = max(g_lo, seg.g0)
                 b = min(g_hi, seg.g1)
                 if b <= a:
                     continue
-                sk, sv = self._seg_kv(seg)
-                i0, i1 = a - seg.g0, b - seg.g0
-                ks.append(sk[:, i0:i1])
-                vs.append(sv[:, i0:i1])
-        vk = ks[0] if len(ks) == 1 else torch.cat(ks, dim=1)
-        vv = vs[0] if len(vs) == 1 else torch.cat(vs, dim=1)
+                visible_segments.append((seg, a - seg.g0, b - seg.g0))
+                visible_tokens += b - a
+
+        if len(visible_segments) == 1 and not visible_segments[0][0].packed:
+            seg, i0, i1 = visible_segments[0]
+            return seg.k[:, i0:i1], seg.v[:, i0:i1]
+
+        output_shape = (
+            self.batch_size,
+            visible_tokens,
+            self.num_heads,
+            self.head_dim,
+        )
+        vk = torch.empty(output_shape, dtype=self.dtype, device=self.device)
+        vv = torch.empty_like(vk)
+        output_start = 0
+
+        # Dequantize one tensor at a time so reconstruction needs only the
+        # final dense view plus one segment-sized temporary.
+        for seg, i0, i1 in visible_segments:
+            output_end = output_start + i1 - i0
+            if seg.packed:
+                dequantized = self._dequant(seg.packed_k)
+                vk[:, output_start:output_end].copy_(
+                    dequantized[:, :, i0:i1].permute(0, 2, 1, 3)
+                )
+                del dequantized
+
+                dequantized = self._dequant(seg.packed_v)
+                vv[:, output_start:output_end].copy_(
+                    dequantized[:, :, i0:i1].permute(0, 2, 1, 3)
+                )
+                del dequantized
+            else:
+                vk[:, output_start:output_end].copy_(seg.k[:, i0:i1])
+                vv[:, output_start:output_end].copy_(seg.v[:, i0:i1])
+            output_start = output_end
+
         return vk, vv

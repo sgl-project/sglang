@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
 from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
     QVGPackedCausalKVCache,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
+    CausalDMDDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
+    LingBotWorldCausalDMDDenoisingStage,
+)
 
 _HAS_QVG = importlib.util.find_spec("quant_videogen") is not None
 _HAS_CUDA = torch.cuda.is_available()
@@ -157,10 +163,43 @@ class TestPackedStorageEquivalence(unittest.TestCase):
         self.assertEqual(cache.global_end_index_int, 0)
         self.assertEqual(cache.local_end_index_int, 0)
 
+    def test_quantization_is_rejected_by_unsupported_causal_stages(self):
+        stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+        stage._kv_quant_args = QVGKVQuantArgs(bits=4)
+        stage.num_transformer_blocks = 1
+
+        with self.assertRaisesRegex(ValueError, "does not support QVG"):
+            stage._allocate_causal_kv_cache(
+                batch_size=1,
+                kv_cache_size=8,
+                num_attention_heads=1,
+                attention_head_dim=4,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+
+    def test_quantization_is_available_for_lingbot(self):
+        stage = LingBotWorldCausalDMDDenoisingStage.__new__(
+            LingBotWorldCausalDMDDenoisingStage
+        )
+        stage._kv_quant_args = QVGKVQuantArgs(bits=4)
+        stage.num_transformer_blocks = 1
+
+        caches = stage._allocate_causal_kv_cache(
+            batch_size=1,
+            kv_cache_size=8,
+            num_attention_heads=1,
+            attention_head_dim=4,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        self.assertIsInstance(caches[0], QVGPackedCausalKVCache)
+
 
 @unittest.skipUnless(
     _HAS_CUDA and _HAS_QVG,
-    "needs CUDA + quant-videogen (pip install 'sglang[diffusion-qvg]')",
+    "needs CUDA + quant-videogen",
 )
 class TestPackedQuantMemory(unittest.TestCase):
     def test_saves_memory_and_reconstructs(self):
