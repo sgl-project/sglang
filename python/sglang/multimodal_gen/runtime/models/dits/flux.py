@@ -30,6 +30,7 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
+    fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
 )
@@ -39,14 +40,8 @@ from sglang.kernels.ops.diffusion.fused_ln_modulate import (
     fused_ln_modulate_active,
     mark_fused_ln_modulate_site,
 )
-from sglang.kernels.ops.diffusion.modulate_scale_shift import (
-    can_use_modulate_scale_shift_cuda,
-    modulate_scale_shift_cuda,
-)
-from sglang.kernels.ops.diffusion.residual_gate_add import (
-    can_use_residual_gate_add_cuda,
-    residual_gate_add_cuda,
-)
+from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -96,68 +91,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
-_FLUX_RESIDUAL_GATE_CUDA_DISABLED = False
-
-
-def _flux_residual_gate_add(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-) -> torch.Tensor:
-    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
-
-    Restricted to half dtypes: there the kernel reproduces the eager pair's
-    two-step rounding exactly (verified by ``torch.equal``), while for fp32 it
-    would contract to an fma (one rounding) and stop being bit-exact. The
-    kernel's row-broadcast gate only covers ``[1, ..., 1, D]``; batched
-    ``[B>1, 1, D]`` gates fail ``can_use_residual_gate_add_cuda`` and take the
-    eager fallback below.
-    """
-    global _FLUX_RESIDUAL_GATE_CUDA_DISABLED
-
-    if (
-        not _FLUX_RESIDUAL_GATE_CUDA_DISABLED
-        and residual.dtype in (torch.float16, torch.bfloat16)
-        and can_use_residual_gate_add_cuda(residual, update, gate)
-    ):
-        try:
-            return residual_gate_add_cuda(residual, update, gate)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling FLUX residual-gate CUDA fast path: {exc}")
-            _FLUX_RESIDUAL_GATE_CUDA_DISABLED = True
-
-    return residual + gate * update
-
-
-_FLUX_MODULATE_CUDA_DISABLED = False
-
-
-def _flux_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> torch.Tensor:
-    """``x * (1 + scale[:, None]) + shift[:, None]`` in one CUDA kernel.
-
-    The kernel keeps the eager chain's per-op fp32-opmath/round-to-storage
-    boundaries, so it is bit-exact vs eager and needs no quality gate.
-    Guarded inputs fall back to the eager expression.
-    """
-    global _FLUX_MODULATE_CUDA_DISABLED
-
-    if not _FLUX_MODULATE_CUDA_DISABLED and can_use_modulate_scale_shift_cuda(
-        x, scale, shift
-    ):
-        try:
-            return modulate_scale_shift_cuda(x, scale, shift)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            logger.warning_once(f"Disabling FLUX modulate CUDA fast path: {exc}")
-            _FLUX_MODULATE_CUDA_DISABLED = True
-
-    return x * (1 + scale[:, None]) + shift[:, None]
-
 
 def _flux_norm_modulate(
     site: nn.Module,
@@ -174,7 +107,7 @@ def _flux_norm_modulate(
     """
     if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
-    return _flux_modulate(norm(x), scale, shift)
+    return modulate_scale_shift(norm(x), scale, shift)
 
 
 class FluxAdaLayerNormZero(AdaLayerNormZero):
@@ -412,9 +345,7 @@ class FluxGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -438,9 +369,7 @@ class FluxFusedGELUProj(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -916,7 +845,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            if fused_gelu_active(self) and can_fuse_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(
@@ -936,7 +865,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
             gate = gate.unsqueeze(1)
             proj_out, _ = self.proj_out(hidden_states)
-            hidden_states = _flux_residual_gate_add(residual, proj_out, gate)
+            hidden_states = residual_gate_add(residual, proj_out, gate)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -1074,7 +1003,7 @@ class FluxTransformerBlock(nn.Module):
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
-        hidden_states = _flux_residual_gate_add(
+        hidden_states = residual_gate_add(
             hidden_states, attn_output, gate_msa.unsqueeze(1)
         )
         if self.use_nunchaku_structure:
@@ -1088,14 +1017,14 @@ class FluxTransformerBlock(nn.Module):
             )
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = _flux_residual_gate_add(
+        hidden_states = residual_gate_add(
             hidden_states, ff_output, gate_mlp.unsqueeze(1)
         )
 
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
-        encoder_hidden_states = _flux_residual_gate_add(
+        encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)
         )
 
@@ -1114,7 +1043,7 @@ class FluxTransformerBlock(nn.Module):
             )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = _flux_residual_gate_add(
+        encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, context_ff_output, c_gate_mlp.unsqueeze(1)
         )
         if encoder_hidden_states.dtype == torch.float16:
