@@ -16,6 +16,7 @@ from torch.distributed import barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.environ import envs
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -244,7 +245,12 @@ class SchedulerRequestReceiver:
                     status_code = error_code
                 else:
                     status_code = HTTPStatus(int(error_code))
-                prepare_abort(req, error_msg, status_code=status_code)
+                prepare_abort(
+                    req,
+                    error_msg,
+                    status_code=status_code,
+                    reason=AbortReason.MULTIMODAL_ERROR,
+                )
                 self.stream_output([req], req.return_logprob)
         return recv_reqs
 

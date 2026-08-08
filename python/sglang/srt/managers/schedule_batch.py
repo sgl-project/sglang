@@ -75,6 +75,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
 )
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -99,7 +100,6 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -265,11 +265,19 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message=None, status_code=None, err_type=None):
+    def __init__(
+        self,
+        message=None,
+        status_code=None,
+        err_type=None,
+        *,
+        reason: AbortReason = AbortReason.UNSPECIFIED,
+    ):
         super().__init__()
         self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
+        self.reason = reason
 
     def to_json(self):
         return {
@@ -277,6 +285,7 @@ class FINISH_ABORT(BaseFinishReason):
             "message": self.message,
             "status_code": self.status_code,
             "err_type": self.err_type,
+            "reason": self.reason.value,
         }
 
 
@@ -1573,6 +1582,7 @@ class Req(ReqDllmMixin):
                             f"invalid stop_regex {stop_regex_str!r}: {e}",
                             HTTPStatus.BAD_REQUEST,
                             "BadRequestError",
+                            reason=AbortReason.INVALID_REQUEST,
                         )
                         break
                     if matched:
@@ -1792,7 +1802,11 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_finish_with_abort(self, error_msg: str):
+    def set_finish_with_abort(
+        self,
+        error_msg: str,
+        reason: AbortReason = AbortReason.INVALID_REQUEST,
+    ):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
@@ -1803,7 +1817,10 @@ class Req(ReqDllmMixin):
         self.return_logprob = False
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
-            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+            error_msg,
+            HTTPStatus.BAD_REQUEST,
+            "BadRequestError",
+            reason=reason,
         )
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
@@ -2817,6 +2834,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "Out of memory even after retracting all other requests "
                 "in the decode batch. Aborting the last request.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason=AbortReason.KV_CACHE_EXHAUSTED,
             )
             reqs_to_abort.append(last_req)
             self.release_req(last_idx, 0, server_args)

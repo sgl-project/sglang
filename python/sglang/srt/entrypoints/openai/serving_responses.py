@@ -71,6 +71,7 @@ from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -333,8 +334,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         ):
             return self.create_error_response(
-                "MCP tool server is not supported in background mode and "
-                "streaming mode"
+                "MCP tool server is not supported in background mode and streaming mode"
             )
 
         # Schedule the request and get the result generator
@@ -610,7 +610,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         if request.tool_choice != "auto":
             raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in " "response API"
+                "Only 'auto' tool_choice is supported in response API"
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
@@ -1320,9 +1320,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
                 del prev_msgs[prev_final_msg_idx + 1 :]
                 for msg in recent_turn_msgs:
-                    if (
-                        hasattr(msg, "channel") and msg.channel != "analysis"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
                         prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
@@ -1419,7 +1417,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             response.status = "cancelled"
 
         # The response_id is the same as the rid used when submitting the request
-        self.tokenizer_manager.abort_request(rid=response_id)
+        self.tokenizer_manager.abort_request(
+            rid=response_id,
+            reason=AbortReason.RESPONSES_CANCEL,
+        )
 
         if task := self.background_tasks.get(response_id):
             task.cancel()
@@ -1476,8 +1477,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         current_content_index = 0
@@ -1906,8 +1906,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             event_type = getattr(event, "type", "unknown")
             return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
+                f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
             )
 
         # The streaming Response* event models echo ``tools`` through a

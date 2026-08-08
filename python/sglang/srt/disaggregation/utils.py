@@ -23,6 +23,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -420,7 +421,6 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
@@ -1241,11 +1241,17 @@ def setup_state_kv_args(
             )
 
 
-def prepare_abort(req: Req, error_message: str, status_code=None):
+def prepare_abort(
+    req: Req,
+    error_message: str,
+    status_code=None,
+    *,
+    reason: AbortReason,
+):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finished_reason = FINISH_ABORT(error_message, status_code, reason=reason)
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

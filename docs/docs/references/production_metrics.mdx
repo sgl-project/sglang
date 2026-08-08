@@ -134,6 +134,56 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Abort and request outcome metrics
+
+Use `sglang:num_abort_signals_total` to count cancellation signals by their
+`reason`. A signal is an instruction to abort work; it is not a terminal request
+outcome. For example, one `abort_all` signal can terminate multiple requests, and
+a completion can win a race with an abort signal.
+
+```promql
+sum by (reason) (increase(sglang:num_abort_signals_total[5m]))
+```
+
+Use `sglang:request_outcomes_total` for mutually exclusive terminal outcomes.
+Each metrics-enabled request increments this counter once when its terminal state
+is observed. Completed requests use `outcome="completed"` with `reason="stop"`
+or `reason="length"`. Aborted requests use `outcome="aborted"` and one of the
+bounded abort reasons below.
+
+```promql
+sum by (outcome, reason) (increase(sglang:request_outcomes_total[5m]))
+```
+
+Calculate the terminal abort rate with:
+
+```promql
+sum(increase(sglang:request_outcomes_total{outcome="aborted"}[5m]))
+/
+sum(increase(sglang:request_outcomes_total[5m]))
+```
+
+Abort reason categories are:
+
+- Client disconnects: `http_client_disconnect_waiting`,
+  `http_client_disconnect_running`, and `http_client_disconnect_stream`.
+- Explicit cancellations: `http_abort_request`, `responses_cancel`, `grpc_abort`,
+  and `grpc_backpressure_timeout`.
+- Administrative operations: `pause_generation`, `weight_update`, and
+  `weight_version_update`.
+- Admission and scheduling: `priority_disabled`, `queue_full`,
+  `priority_preempted`, `waiting_timeout`, `running_timeout`, and
+  `kv_cache_exhausted`.
+- Request processing: `invalid_request`, `grammar_error`, `disaggregation_error`,
+  `multimodal_error`, `session_cleanup`, and `request_cleanup`.
+- `unspecified` preserves compatibility for external code that constructs an
+  abort finish reason without a category. All built-in SGLang abort paths emit a
+  specific reason.
+
+`sglang:num_aborted_requests_total` remains available for compatibility. It
+counts tokenizer-manager abort calls and should not be used as a terminal
+failure rate.
+
 ## Setup Guide
 
 This section describes how to set up the monitoring stack (Prometheus + Grafana) provided in the `examples/monitoring` directory.

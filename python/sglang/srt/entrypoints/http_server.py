@@ -113,6 +113,7 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -1416,7 +1417,10 @@ async def update_weight_version(
 ):
     """Update the weight version. This operation requires no active requests."""
     if obj.abort_all_requests:
-        _global_state.tokenizer_manager.abort_request(abort_all=True)
+        _global_state.tokenizer_manager.abort_request(
+            abort_all=True,
+            reason=AbortReason.WEIGHT_VERSION_UPDATE,
+        )
 
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
@@ -1491,9 +1495,12 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -1590,7 +1597,9 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
+            rid=obj.rid,
+            abort_all=obj.abort_all,
+            reason=AbortReason.HTTP_ABORT_REQUEST,
         )
         return Response(status_code=200)
     except Exception as e:
@@ -2289,7 +2298,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            logger.info(f"Start of pd disaggregation warmup ...")
+            logger.info("Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
                     server_args=server_args,
@@ -2342,8 +2351,7 @@ def _wait_and_warmup(
     skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner "
-            "(ep_join_mode=%s)",
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
             server_args.ep_join_mode,
         )
 

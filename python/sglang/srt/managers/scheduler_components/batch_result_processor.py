@@ -16,6 +16,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -587,7 +588,7 @@ class SchedulerBatchResultProcessor:
                 logger.error(
                     f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                 )
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(reason=AbortReason.GRAMMAR_ERROR)
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -728,7 +729,7 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT()
+            req.to_finish = FINISH_ABORT(reason=AbortReason.GRAMMAR_ERROR)
         return retained
 
     def advance_grammar_fsm(

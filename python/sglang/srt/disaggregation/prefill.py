@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.abort_reason import AbortReason
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -363,7 +364,12 @@ class PrefillBootstrapQueue:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
-            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            prepare_abort(
+                req,
+                message,
+                status_code=HTTPStatus.BAD_REQUEST,
+                reason=AbortReason.INVALID_REQUEST,
+            )
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
@@ -761,6 +767,7 @@ class SchedulerDisaggregationPrefillMixin:
                             req,
                             error_message,
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            reason=AbortReason.GRAMMAR_ERROR,
                         )
                     req.grammar.finished = req.finished()
             else:
@@ -950,7 +957,10 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                req,
+                error_message,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                reason=AbortReason.DISAGGREGATION_ERROR,
             )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
@@ -999,7 +1009,12 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        prepare_abort(
+            req,
+            error_message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            reason=AbortReason.DISAGGREGATION_ERROR,
+        )
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
