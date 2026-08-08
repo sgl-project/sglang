@@ -297,8 +297,7 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
+        let load_guard = Self::policy_tracks_worker_load(policy.name())
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
@@ -344,6 +343,14 @@ impl Router {
             }
         }
         worker_url.to_string()
+    }
+
+    #[inline]
+    fn policy_tracks_worker_load(policy_name: &str) -> bool {
+        matches!(
+            policy_name,
+            "cache_aware" | "manual" | "bounded_consistent_hashing"
+        )
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -922,5 +929,15 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn test_bounded_consistent_hashing_tracks_request_load() {
+        assert!(Router::policy_tracks_worker_load(
+            "bounded_consistent_hashing"
+        ));
+        assert!(Router::policy_tracks_worker_load("cache_aware"));
+        assert!(Router::policy_tracks_worker_load("manual"));
+        assert!(!Router::policy_tracks_worker_load("consistent_hashing"));
     }
 }

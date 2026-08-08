@@ -305,6 +305,24 @@ pub enum PolicyConfig {
     #[serde(rename = "consistent_hashing")]
     ConsistentHashing,
 
+    /// Opt-in consistent hashing with bounded load skew for explicit routing keys.
+    ///
+    /// The preferred worker is selected from the consistent hash ring. If it is
+    /// above the configured load bound, the ring is walked clockwise to find the
+    /// first healthy worker within the bound.
+    #[serde(rename = "bounded_consistent_hashing")]
+    BoundedConsistentHashing {
+        /// Maximum worker load relative to the average healthy worker load.
+        /// Defaults to 1.5 (150% of average).
+        #[serde(default = "default_max_load_skew")]
+        max_load_skew: f64,
+
+        /// Minimum active-request gap between the preferred worker and the
+        /// least-loaded healthy worker before spillover is allowed.
+        #[serde(default = "default_min_load_gap")]
+        min_load_gap: usize,
+    },
+
     /// Prefix hash policy for KV cache-aware load balancing.
     /// A lightweight alternative to cache_aware radix tree.
     /// Routes requests based on prefix token hash for cache locality.
@@ -324,6 +342,15 @@ pub enum PolicyConfig {
 
 fn default_prefix_token_count() -> usize {
     256
+}
+
+fn default_max_load_skew() -> f64 {
+    1.5
+}
+
+// Provisional wiring candidate pending placement and HTTP A/B validation.
+fn default_min_load_gap() -> usize {
+    2
 }
 
 fn default_load_factor() -> f64 {
@@ -348,6 +375,7 @@ impl PolicyConfig {
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
+            PolicyConfig::BoundedConsistentHashing { .. } => "bounded_consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
         }
     }
@@ -819,6 +847,12 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        let bounded = PolicyConfig::BoundedConsistentHashing {
+            max_load_skew: 1.5,
+            min_load_gap: 2,
+        };
+        assert_eq!(bounded.name(), "bounded_consistent_hashing");
     }
 
     #[test]
@@ -845,6 +879,28 @@ mod tests {
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
         assert!(json.contains("\"load_check_interval_secs\":60"));
+
+        let bounded = PolicyConfig::BoundedConsistentHashing {
+            max_load_skew: 1.75,
+            min_load_gap: 4,
+        };
+        let json = serde_json::to_string(&bounded).unwrap();
+        assert!(json.contains("\"type\":\"bounded_consistent_hashing\""));
+        assert!(json.contains("\"max_load_skew\":1.75"));
+        assert!(json.contains("\"min_load_gap\":4"));
+
+        let default_bounded: PolicyConfig =
+            serde_json::from_str(r#"{"type":"bounded_consistent_hashing"}"#).unwrap();
+        match default_bounded {
+            PolicyConfig::BoundedConsistentHashing {
+                max_load_skew,
+                min_load_gap,
+            } => {
+                assert!((max_load_skew - 1.5).abs() < f64::EPSILON);
+                assert_eq!(min_load_gap, 2);
+            }
+            _ => panic!("Expected bounded consistent hashing policy"),
+        }
     }
 
     #[test]

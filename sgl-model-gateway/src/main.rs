@@ -147,7 +147,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "bounded_consistent_hashing"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -186,6 +186,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
+    /// Maximum worker load relative to the healthy-worker average for bounded_consistent_hashing
+    #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
+    max_load_skew: f64,
+
+    /// Minimum active-request gap before bounded_consistent_hashing may spill
+    #[arg(long, default_value_t = 2, help_heading = "Routing Policy")]
+    min_load_gap: usize,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
@@ -204,11 +212,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "bounded_consistent_hashing"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "bounded_consistent_hashing"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -773,6 +781,10 @@ impl CliArgs {
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
+            },
+            "bounded_consistent_hashing" => PolicyConfig::BoundedConsistentHashing {
+                max_load_skew: self.max_load_skew,
+                min_load_gap: self.min_load_gap,
             },
             "manual" => PolicyConfig::Manual {
                 eviction_interval_secs: self.eviction_interval,
