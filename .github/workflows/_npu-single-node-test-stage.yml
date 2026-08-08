@@ -37,10 +37,34 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
+      branch_label:
+        required: false
+        type: string
+        default: ''
+        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
+      workflow_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Name of the orchestrating workflow (e.g., "PR Test (NPU)")'
+      create_date:
+        required: false
+        type: string
+        default: ''
+        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
+      timestamp:
+        required: false
+        type: string
+        default: ''
+        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
       skip_pr_test_health_check:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: 'false'
+      nightly:
+        description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
+        type: boolean
+        default: false
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -195,7 +219,6 @@ jobs:
           SGLANG_IS_IN_CI: true
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
-          SGLANG_TEST_METRICS_OUTPUT: /root/.cache/tests/output/metrics/metrics
         shell: bash
         run: |
           sglang_source_path=$(pwd)
@@ -206,6 +229,27 @@ jobs:
           test_suite="${{ inputs.test_suite }}"
           echo "Test mode: suite (${test_suite})"
           tc_name="${test_suite}"
+
+          # run_id / branch_label / workflow_name form the persistence directory prefix.
+          # run_attempt distinguishes re-runs of the same workflow run (1, 2, 3, ...).
+          run_id=${{ github.run_id }}
+          run_attempt=${{ github.run_attempt }}
+          branch_label=$(echo "${{ inputs.branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ inputs.workflow_name }}" | tr ' ' '_' | tr -d '()')
+          # Run creation date/time are recorded ONCE at workflow start and passed in, so a
+          # task spanning midnight still uses the run creation date. Fall back to now for
+          # direct/local invocations that do not pass them.
+          create_date="${{ inputs.create_date }}"
+          if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
+          timestamp="${{ inputs.timestamp }}"
+          if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
+          # Persist results to: .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}-{timestamp}
+          test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
+          mkdir -p ${test_data_output_path}
+          export METRICS_DATA_FILE=${test_data_output_path}
+          # Redirect the test framework's JSONL metrics dump into the new structured directory
+          export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
+          echo "Metrics file path: ${METRICS_DATA_FILE}"
 
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
           PYTHON_FOR_SGLANG="python"
@@ -252,7 +296,8 @@ jobs:
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
           # Set environment of cann
-          log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+          # Persist logs to: .../logs/log/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{tc_name}-{timestamp}/{HOSTNAME}
+          log_path="/root/.cache/tests/logs/log/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${tc_name}-${timestamp}/${HOSTNAME}"
           rm -rf ${log_path}
           mkdir -p ${log_path}
           echo "Log path: ${log_path}"
@@ -260,7 +305,10 @@ jobs:
           echo "Running test: ${tc_name}"
           test_exit_code=0
           cd test
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          # nightly mode: collect nightly-registered tests (--nightly) and keep running
+          # remaining cases even if one fails (--continue-on-error)
+          NIGHTLY_FLAG="$([ "${{ inputs.nightly }}" = "true" ] && echo "--nightly --continue-on-error")"
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log "${log_path}/${tc_name}.log" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
@@ -274,6 +322,12 @@ jobs:
 
           echo "test_status=${test_status}" >> $GITHUB_ENV
           echo "tc_name=${tc_name}" >> $GITHUB_ENV
+          # Persist path prefix vars for later steps (e.g. plog backup)
+          echo "branch_label=${branch_label}" >> $GITHUB_ENV
+          echo "workflow_name=${workflow_name}" >> $GITHUB_ENV
+          echo "create_date=${create_date}" >> $GITHUB_ENV
+          echo "run_id=${run_id}" >> $GITHUB_ENV
+          echo "run_attempt=${run_attempt}" >> $GITHUB_ENV
           export test_status tc_name
 
           echo "## ${tc_name}  ${status_icon} ${test_status}" >> $GITHUB_STEP_SUMMARY
@@ -292,4 +346,60 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          echo "import json, re, os" > /tmp/dump_metrics.py
+          echo "tc = os.environ.get('tc_name', 'unknown')" >> /tmp/dump_metrics.py
+          echo "st = os.environ.get('test_status', 'unknown')" >> /tmp/dump_metrics.py
+          echo "tp = '${{ inputs.test_type }}'" >> /tmp/dump_metrics.py
+          echo "metrics = {}" >> /tmp/dump_metrics.py
+          echo "with open('/tmp/test_output.log') as f:" >> /tmp/dump_metrics.py
+          echo "    for line in f:" >> /tmp/dump_metrics.py
+          echo "        m = re.match(r'\[METRIC\] (\S+)=(\S+)', line)" >> /tmp/dump_metrics.py
+          echo "        if m:" >> /tmp/dump_metrics.py
+          echo "            v = m.group(2)" >> /tmp/dump_metrics.py
+          echo "            try:" >> /tmp/dump_metrics.py
+          echo "                v = float(v)" >> /tmp/dump_metrics.py
+          echo "            except ValueError:" >> /tmp/dump_metrics.py
+          echo "                pass" >> /tmp/dump_metrics.py
+          echo "            metrics[m.group(1)] = v" >> /tmp/dump_metrics.py
+          echo "baselines = {}" >> /tmp/dump_metrics.py
+          echo "for k, v in list(metrics.items()):" >> /tmp/dump_metrics.py
+          echo "    if k.endswith('_baseline'):" >> /tmp/dump_metrics.py
+          echo "        baselines[k[:-9]] = v" >> /tmp/dump_metrics.py
+          echo "        del metrics[k]" >> /tmp/dump_metrics.py
+          echo "with open('/tmp/metrics.json', 'w') as f:" >> /tmp/dump_metrics.py
+          echo "    json.dump({'test_case': tc, 'test_type': tp, 'status': st, 'metrics': metrics, 'baselines': baselines}, f)" >> /tmp/dump_metrics.py
+          python3 /tmp/dump_metrics.py
+
+          # Save metrics and test log to METRICS_DATA_FILE
+          if [ -n "${METRICS_DATA_FILE}" ]; then
+            mkdir -p "${METRICS_DATA_FILE}"
+            cp /tmp/test_output.log "${METRICS_DATA_FILE}/test_output.log"
+            cp /tmp/metrics.json "${METRICS_DATA_FILE}/metrics.json"
+            echo "Metrics saved to ${METRICS_DATA_FILE}"
+          fi
+
           exit ${test_exit_code}
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ inputs.test_suite }}
+          path: /tmp/metrics.json
+          retention-days: 7
+
+      - name: Backup plog
+        if: always()
+        shell: bash
+        run: |
+          plog_path="/root/ascend/log/debug/plog"
+          if [ -d "$plog_path" ];then
+            echo "Plog files found. Begin to backup them."
+            # tc_name is persisted to the environment by the Run test step
+            # Keep plog under the same run prefix as logs/log
+            target_plog_path="/root/.cache/tests/logs/plog/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${tc_name}/${HOSTNAME}"
+            echo "Save path: ${target_plog_path}"
+            rm -rf ${target_plog_path}
+            mkdir -p ${target_plog_path}
+            cp ${plog_path}/* ${target_plog_path}
+          fi

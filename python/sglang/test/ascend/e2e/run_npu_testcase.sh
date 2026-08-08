@@ -114,10 +114,15 @@ fi
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
 tc_name=${tc_name%.*}
-current_date=$(date +%Y%m%d)
-log_path="/root/sglang/debug/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+run_label="${RUN_LABEL:-unknown}"
+# Task creation timestamp (Beijing time, UTC+8). Use the value passed from CI so that
+# it matches the persistence directory even when the task runs across dates; fall back
+# to the current time for local runs.
+timestamp="${TIMESTAMP:-$(date -u -d '+8 hours' +%H%M%S)}"
+log_path="/root/sglang/debug/logs/log/${run_label}/${tc_name}-${timestamp}/${HOSTNAME}"
 if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-    log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+    # In CI, persist logs under /root/.cache/tests/logs so they can be collected
+    log_path="/root/.cache/tests/logs/log/${run_label}/${tc_name}-${timestamp}/${HOSTNAME}"
 fi
 rm -rf "${log_path}"
 mkdir -p "${log_path}"
@@ -134,6 +139,7 @@ echo "Finished test case ${test_case}"
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
+    # Archive the test log into the output directory for result collection
     cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
     echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
 fi

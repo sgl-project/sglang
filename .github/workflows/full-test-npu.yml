@@ -28,6 +28,16 @@ on:
         required: false
         type: string
         default: 'false'
+      create_date:
+        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
+        required: false
+        type: string
+        default: ''
+      timestamp:
+        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: full-test-npu-${{ inputs.ref || github.ref }}
@@ -41,10 +51,18 @@ jobs:
       job_filter: ${{ steps.set-vars.outputs.job_filter }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
+      branch_label: ${{ steps.set-vars.outputs.branch_label }}
+      workflow_name: ${{ steps.set-vars.outputs.workflow_name }}
+      create_date: ${{ steps.set-vars.outputs.create_date }}
+      timestamp: ${{ steps.set-vars.outputs.timestamp }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
         id: set-vars
+        env:
+          # Pass untrusted PR metadata via env vars so it is never interpolated
+          # into the shell script (prevents script injection from fork branch names)
+          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
         run: |
           if [ -z "${{ inputs.ref }}" ]; then
             echo "ref=" >> $GITHUB_OUTPUT
@@ -70,6 +88,28 @@ jobs:
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
 
+          # branch_label identifies the run origin; explicit input > PR head label > ref name.
+          # Only keep safe characters for use as a filesystem path segment.
+          BRANCH_LABEL="$HEAD_LABEL"
+          if [ -z "${BRANCH_LABEL}" ]; then
+            BRANCH_LABEL="${{ github.ref_name }}"
+          fi
+          BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
+          echo "branch_label=${BRANCH_LABEL}" >> $GITHUB_OUTPUT
+          echo "workflow_name=${{ github.workflow }}" >> $GITHUB_OUTPUT
+          # create_date / timestamp are recorded ONCE at workflow start and shared by all
+          # jobs of this run, so a task spanning midnight still uses the run creation date.
+          CREATE_DATE="${{ inputs.create_date }}"
+          if [ -z "${CREATE_DATE}" ]; then
+            CREATE_DATE=$(date -u -d '+8 hours' +%Y%m%d)
+          fi
+          echo "create_date=${CREATE_DATE}" >> $GITHUB_OUTPUT
+          CREATE_TIMESTAMP="${{ inputs.timestamp }}"
+          if [ -z "${CREATE_TIMESTAMP}" ]; then
+            CREATE_TIMESTAMP=$(date -u -d '+8 hours' +%H%M%S)
+          fi
+          echo "timestamp=${CREATE_TIMESTAMP}" >> $GITHUB_OUTPUT
+
   nighly-test-npu:
     needs: [set-image-config]
     name: nightly-test-npu
@@ -80,6 +120,10 @@ jobs:
       job_filter: ${{ needs.set-image-config.outputs.job_filter }}
       image_a3: ${{ needs.set-image-config.outputs.image_a3 }}
       skip_install_flag: ${{ needs.set-image-config.outputs.skip_install_flag }}
+      branch_label: ${{ needs.set-image-config.outputs.branch_label }}
+      workflow_name: ${{ needs.set-image-config.outputs.workflow_name }}
+      create_date: ${{ needs.set-image-config.outputs.create_date }}
+      timestamp: ${{ needs.set-image-config.outputs.timestamp }}
     secrets: inherit
 
   full-1-npu-a3:

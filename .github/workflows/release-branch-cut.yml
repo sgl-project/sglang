@@ -186,6 +186,7 @@ jobs:
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
       run_all_tests: true
+      branch_label: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
   run-pr-tests-xeon:
@@ -223,6 +224,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-npu.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      branch_label: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
   run-nightly-tests-intel:

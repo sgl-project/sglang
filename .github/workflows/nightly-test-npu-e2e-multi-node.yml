@@ -59,6 +59,26 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
+      branch_label:
+        required: false
+        type: string
+        default: ''
+        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
+      workflow_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Name of the orchestrating workflow (e.g., "Nightly Test (NPU)")'
+      create_date:
+        required: false
+        type: string
+        default: ''
+        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
+      timestamp:
+        required: false
+        type: string
+        default: ''
+        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -135,12 +155,22 @@ jobs:
           fi
 
           # prepare for output data
-          current_date=$(date +%Y%m%d)
-          test_data_output_path=/root/.cache/tests/output/${{ inputs.test_type }}/${current_date}
-          mkdir -p ${test_data_output_path}
           tc_name=${test_case##*/}
           tc_name=${tc_name%.*}
-          metrics_data_path=${test_data_output_path}/${tc_name}
+          # run_id / branch_label / workflow_name form the persistence directory prefix.
+          # run_attempt distinguishes re-runs of the same workflow run (1, 2, 3, ...).
+          run_id=${{ github.run_id }}
+          run_attempt=${{ github.run_attempt }}
+          branch_label=$(echo "${{ inputs.branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ inputs.workflow_name }}" | tr ' ' '_' | tr -d '()')
+          # Run creation date/time are recorded ONCE at workflow start and passed in, so a
+          # task spanning midnight still uses the run creation date. Fall back to now for
+          # direct/local invocations that do not pass them.
+          create_date="${{ inputs.create_date }}"
+          if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
+          timestamp="${{ inputs.timestamp }}"
+          if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
+          metrics_data_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
           mkdir -p ${metrics_data_path}
           echo "Metrics file path: ${metrics_data_path}"
 
@@ -162,6 +192,7 @@ jobs:
             --image ${{ inputs.image }} \
             --sglang-source-relative-path ${sglang_source_relative_path} \
             --metrics-data-file ${metrics_data_path} \
+            --timestamp ${timestamp} \
             --test-case ${test_case} \
             --kube-name-space ${NAMESPACE} \
             --kube-job-type ${kube_job_type} \
@@ -189,7 +220,7 @@ jobs:
             echo "Install sglang from source."
             CMD="${CMD} --install-sglang-from-source"
             commit_id=${{ github.sha }}
-            echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+            echo "commit id: ${commit_id}" > "$(dirname "${metrics_data_path}")/commit_id"
           else
             echo "Use sglang from image: ${{ inputs.image }}"
           fi

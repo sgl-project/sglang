@@ -45,6 +45,26 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
+      branch_label:
+        required: false
+        type: string
+        default: ''
+        description: 'Branch label (e.g., "pllimax:pr_branch_plli_for_check_in_2" for PR, or ref_name otherwise)'
+      workflow_name:
+        required: false
+        type: string
+        default: ''
+        description: 'Name of the orchestrating workflow (e.g., "Nightly Test (NPU)")'
+      create_date:
+        required: false
+        type: string
+        default: ''
+        description: 'Run creation date (YYYYMMDD, Beijing time), recorded once at workflow start'
+      timestamp:
+        required: false
+        type: string
+        default: ''
+        description: 'Run creation timestamp (HHMMSS, Beijing time), recorded once at workflow start'
 
 concurrency:
   group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -89,7 +109,6 @@ jobs:
           SGLANG_IS_IN_CI: true
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
-          SGLANG_TEST_METRICS_OUTPUT: /root/.cache/tests/output/metrics/metrics
         shell: bash
         run: |
           sglang_source_path=$(pwd)
@@ -103,14 +122,35 @@ jobs:
           fi
 
           # prepare for output data
-          current_date=$(date +%Y%m%d)
-          test_data_output_path=/root/.cache/tests/output/${{ inputs.test_type }}/${current_date}
-          mkdir -p ${test_data_output_path}
           tc_name=${test_case##*/}
           tc_name=${tc_name%.*}
-          export METRICS_DATA_FILE=${test_data_output_path}/${tc_name}
-          mkdir -p ${METRICS_DATA_FILE}
+          # run_id / branch_label / workflow_name form the persistence directory prefix,
+          # the same prefix is reused in the pod log path via RUN_LABEL.
+          # run_attempt distinguishes re-runs of the same workflow run (1, 2, 3, ...).
+          run_id=${{ github.run_id }}
+          run_attempt=${{ github.run_attempt }}
+          branch_label=$(echo "${{ inputs.branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ inputs.workflow_name }}" | tr ' ' '_' | tr -d '()')
+          # Run creation date/time are recorded ONCE at workflow start and passed in, so a
+          # task spanning midnight still uses the run creation date. Fall back to now for
+          # direct/local invocations that do not pass them.
+          create_date="${{ inputs.create_date }}"
+          if [ -z "${create_date}" ]; then create_date=$(date -u -d '+8 hours' +%Y%m%d); fi
+          timestamp="${{ inputs.timestamp }}"
+          if [ -z "${timestamp}" ]; then timestamp=$(date -u -d '+8 hours' +%H%M%S); fi
+          # Persist results to: .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{test_type}/{tc_name}-{timestamp}
+          test_data_output_path=/root/.cache/tests/output/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}-${timestamp}
+          mkdir -p ${test_data_output_path}
+          export METRICS_DATA_FILE=${test_data_output_path}
           echo "Metrics file path: ${METRICS_DATA_FILE}"
+          # Redirect the test framework's JSONL metrics dump into the new structured directory
+          export SGLANG_TEST_METRICS_OUTPUT=${test_data_output_path}/metrics
+          # Persist path prefix vars for later steps (e.g. plog backup)
+          echo "branch_label=${branch_label}" >> $GITHUB_ENV
+          echo "workflow_name=${workflow_name}" >> $GITHUB_ENV
+          echo "create_date=${create_date}" >> $GITHUB_ENV
+          echo "run_id=${run_id}" >> $GITHUB_ENV
+          echo "run_attempt=${run_attempt}" >> $GITHUB_ENV
 
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -151,7 +191,7 @@ jobs:
           if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
             echo "Install sglang from source"
             commit_id=${{ github.sha }}
-            echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+            echo "commit id: ${commit_id}" > "$(dirname "${test_data_output_path}")/commit_id"
             export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
           else
             echo "Use sglang from image: ${{ inputs.image }}"
@@ -168,14 +208,17 @@ jobs:
           source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
           # Set environment of cann
-          log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+          # Persist logs to: .../logs/log/{branch_label}-{create_date}-{run_id}-{run_attempt}/{workflow_name}/{tc_name}-{timestamp}/{HOSTNAME}
+          log_path="/root/.cache/tests/logs/log/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${tc_name}-${timestamp}/${HOSTNAME}"
           rm -rf ${log_path}
           mkdir -p ${log_path}
           echo "Log path: ${log_path}"
 
           echo "Running test case ${test_case}"
           test_exit_code=0
-          ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          set -o pipefail
+          ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log "${log_path}/${tc_name}.log" || test_exit_code=$?
+          set +o pipefail
           echo "Finished test case ${test_case}"
 
           if [ "${test_exit_code}" = "0" ]; then
@@ -229,6 +272,15 @@ jobs:
           echo "with open('/tmp/metrics.json', 'w') as f:" >> /tmp/dump_metrics.py
           echo "    json.dump({'test_case': tc, 'test_type': tp, 'status': st, 'metrics': metrics, 'baselines': baselines}, f)" >> /tmp/dump_metrics.py
           python3 /tmp/dump_metrics.py
+
+          # Save metrics and test log to METRICS_DATA_FILE
+          if [ -n "${METRICS_DATA_FILE}" ]; then
+            mkdir -p "${METRICS_DATA_FILE}"
+            cp /tmp/test_output.log "${METRICS_DATA_FILE}/test_output.log"
+            cp /tmp/metrics.json "${METRICS_DATA_FILE}/metrics.json"
+            echo "Metrics saved to ${METRICS_DATA_FILE}"
+          fi
+
           exit ${test_exit_code}
 
       - name: Upload metrics
@@ -249,7 +301,8 @@ jobs:
             tc_name=${{ inputs.test_case }}
             tc_name=${tc_name##*/}
             tc_name=${tc_name%.*}
-            target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
+            # Keep plog under the same run prefix as logs/log
+            target_plog_path="/root/.cache/tests/logs/plog/${branch_label}-${create_date}-${run_id}-${run_attempt}/${workflow_name}/${tc_name}/${HOSTNAME}"
             echo "Save path: ${target_plog_path}"
             rm -rf ${target_plog_path}
             mkdir -p ${target_plog_path}
