@@ -43,6 +43,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
@@ -90,4 +93,5 @@ __all__ = [
     "LingBotWorldCausalDMDConfig",
     "LingBotWorldV2CausalDMDConfig",
     "LingBotVideoMoEPipelineConfig",
+    "MiniMaxH3PipelineConfig",
 ]

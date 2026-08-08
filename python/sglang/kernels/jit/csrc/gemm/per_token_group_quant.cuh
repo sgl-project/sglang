@@ -48,14 +48,16 @@ struct WeightTrait<fp8_e4m3_t> {
   using packed2_t = fp8x2_e4m3_t;
   static constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
   // SATFINITE saturates +-inf / out-of-range values, but converts NaN to an
-  // fp8 NaN code. IEEE fminf/fmaxf return the non-NaN operand, so clamping
-  // first quantizes non-finite inputs to +-448 -- matching the v1/v2/Triton
-  // kernels. CUDA-graph capture warmup runs the model on whatever the
-  // (reused, uninitialized) buffers contain, and relies on this: an fp8 NaN
-  // code would poison the downstream GEMM and trip the sampler NaN check.
-  // For finite inputs the clamp is bit-identical to bare SATFINITE.
+  // fp8 NaN code. A single upper clamp is enough to sanitize: IEEE fminf
+  // returns the non-NaN operand, so NaN / +inf quantize to +448, and -inf
+  // passes through for SATFINITE to saturate to -448 -- non-finite inputs
+  // never reach an fp8 NaN code, matching the v1/v2/Triton kernels.
+  // CUDA-graph capture warmup runs the model on whatever the (reused,
+  // uninitialized) buffers contain, and relies on this: an fp8 NaN code would
+  // poison the downstream GEMM and trip the sampler NaN check. For finite
+  // inputs the clamp is bit-identical to bare SATFINITE.
   SGL_DEVICE static packed2_t quant(const float2 v) {
-    return packed2_t{float2{fminf(fmaxf(v.x, -kMaxValue), kMaxValue), fminf(fmaxf(v.y, -kMaxValue), kMaxValue)}};
+    return packed2_t{float2{fminf(v.x, kMaxValue), fminf(v.y, kMaxValue)}};
   }
 };
 
@@ -291,18 +293,19 @@ struct QuantTrait {
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
       // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
-      // clamp only sanitizes non-finite inputs (see WeightTrait<fp8_e4m3_t>);
-      // __hmin2/__hmax2 return the non-NaN operand.
-      const auto lo2 = cast<T2>(float2{-kMaxValue, -kMaxValue});
-      const auto hi2 = cast<T2>(float2{kMaxValue, kMaxValue});
+      // single __hmin2 only sanitizes NaN / +inf (it returns the non-NaN
+      // operand); -inf saturates to -448 via the SATFINITE fp8 cast (see
+      // WeightTrait<fp8_e4m3_t>).
+      const auto max_clip = cast<T>(kMaxValue);
+      const auto max_clip2 = T2{max_clip, max_clip};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = static_cast<Q2>(__hmin2(__hmax2(__hmul2(in[i], scale2), lo2), hi2));
+        out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
-      const float quant_scale = kMaxValue * __frcp_rn(amax);
+      const float quant_scale = kMaxValue / amax;
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
@@ -330,12 +333,12 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_
   const auto global_warp_id = global_tid / kWarpThreads;
   const auto total_work = params.num_tokens * num_groups;
   if (global_warp_id * kWorkPerWarp >= total_work) return;
-  PDLWaitPrimary<kUsePDL>();
   // the last partial warp duplicates the tail work (identical-byte stores)
   const auto work_id = min(global_tid / kNumLanes, total_work - 1);
   const auto lane_id = threadIdx.x % kNumLanes;
   const auto token_idx = work_id / num_groups;
   const auto group_idx = work_id % num_groups;
+  PDLWaitPrimary<kUsePDL>();
   Trait::run(params, 0, token_idx, group_idx, lane_id);
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -351,8 +354,8 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_maske
   constexpr uint32_t kNumLanes = Trait::kNumLanes;
   constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;
   const auto num_groups = params.base.scale.num_groups;
-  PDLWaitPrimary<kUsePDL>();
   const auto expert_idx = blockIdx.y;
+  PDLWaitPrimary<kUsePDL>();
   const auto num_expert_tokens = params.masked_m[expert_idx * params.masked_m_stride];
   for (uint32_t global_tid = blockIdx.x * Trait::kBlockSize + threadIdx.x;;  // initial grid; loop
        global_tid += gridDim.x * Trait::kBlockSize) {
@@ -405,11 +408,22 @@ QuantHostContext<Trait> build_quant_context( //
     TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
+    CHECK_HOST((input.stride(0) * sizeof(T)) % 32 == 0)
+        << "input expert stride must keep rows 32B-aligned for the vectorized loads";
   } else {
     TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
   }
+  // The 32B/lane vectorized loads need every input row to start 32B-aligned
+  // (kMaxVecBytes on Blackwell; over-strict but harmless on Hopper, whose
+  // 16B vectors only need 16). Contiguous allocations always satisfy this; it
+  // only bites hand-made row-strided views, which must keep rows aligned --
+  // rejected loudly here rather than densified silently at the call site.
+  CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % 32 == 0)
+      << "input base pointer must be 32B-aligned for the vectorized loads";
+  CHECK_HOST((input.stride(-2) * sizeof(T)) % 32 == 0)
+      << "input token stride must keep rows 32B-aligned for the vectorized loads";
 
   const uint32_t num_tokens = N.unwrap();
   const uint32_t hidden_size = H.unwrap();

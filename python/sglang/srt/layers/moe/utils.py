@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -36,6 +36,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    PPLX = "pplx"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -73,6 +74,9 @@ class MoeA2ABackend(Enum):
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
+
+    def is_pplx(self):
+        return self == MoeA2ABackend.PPLX
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -209,12 +213,14 @@ class DispatcherOutputDtype(Enum):
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
+    - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
     NVFP4 = "nvfp4"
+    MXFP8 = "mxfp8"
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
@@ -233,8 +239,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
 
     # 0. Parse server argument.
     server_args = get_server_args()
-    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DispatcherOutputDtype(server_args.deepep_dispatcher_output_dtype)
+    if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":
+        return DispatcherOutputDtype(get_exec().moe.deepep_dispatcher_output_dtype)
 
     # 1. Parse deprecated environment variables.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
@@ -382,9 +388,9 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
 
 
 def uses_per_rank_fused_shared_slots() -> bool:
@@ -445,12 +451,18 @@ def should_use_dp_reduce_scatterv():
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
     with EP, replacing the default all-reduce + dp_scatter path.
     Only changes the combine (post-kernel) communication; dispatch is unchanged.
+
+    The reduce_scatterv group is the global TP group, while its variable split
+    sizes are one entry per attention-DP rank. Therefore this optimization is
+    valid only when each attention-DP shard has a single rank (attention TP=1).
+    Configurations with partial attention TP fall back to all-reduce + dp_scatter.
     """
     return (
         not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
         and get_parallel().attn_dp_size > 1
+        and get_parallel().tp_size == get_parallel().attn_dp_size
         and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
@@ -494,13 +506,17 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
-    if get_server_args().dwdp_size > 1:
+    if get_parallel().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
         return True
     if get_moe_a2a_backend().is_flashinfer():
+        return True
+    if get_moe_a2a_backend().is_pplx():
+        # pplx's AllToAll.combine already sums each token's expert outputs back
+        # to the source rank
         return True
     return False
 
