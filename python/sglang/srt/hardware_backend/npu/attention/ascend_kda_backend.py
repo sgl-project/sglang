@@ -11,7 +11,7 @@ from sgl_kernel_npu.fla.kda_prefill import (
     recompute_w_u_fwd_npu,
 )
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-from sgl_kernel_npu.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.mamba.causal_conv1d import (
