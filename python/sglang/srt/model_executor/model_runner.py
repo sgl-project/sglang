@@ -1593,6 +1593,27 @@ class ModelRunner:
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _maybe_warn_decode_cuda_graph_overflow(
+        self, batch_size: int, max_bs: int
+    ) -> None:
+        if getattr(self, "_warned_decode_cuda_graph_overflow", False):
+            return
+
+        if batch_size <= max_bs:
+            return
+
+        logger.warning(
+            "Decode batch size %d exceeds the largest captured CUDA graph "
+            "shape (%d); falling back to eager decode. Per-token latency may "
+            "degrade substantially, and sustained overload can keep the "
+            "running batch above the captured range. Consider raising "
+            "--cuda-graph-max-bs or lowering --max-running-requests toward "
+            "the largest captured shape.",
+            batch_size,
+            max_bs,
+        )
+        self._warned_decode_cuda_graph_overflow = True
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -1631,6 +1652,15 @@ class ModelRunner:
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            if (
+                forward_batch.forward_mode.is_decode()
+                and self.decode_cuda_graph_runner is not None
+            ):
+                self._maybe_warn_decode_cuda_graph_overflow(
+                    forward_batch.batch_size,
+                    self.decode_cuda_graph_runner.max_bs,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
