@@ -1461,7 +1461,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    # q is a column slice of the fused QKV output, so its rows
+                    # are strided over the K/V columns. FA3 takes q_row_stride
+                    # and q_head_stride, so reshape it rather than copy it.
+                    q=q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
