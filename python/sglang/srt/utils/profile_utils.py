@@ -78,7 +78,7 @@ class ProfileManager:
         self.profiler = None
 
     def step(self, forward_mode: ForwardMode):
-        stage = _get_stage_from_forward_mode(forward_mode)
+        stage = get_profile_stage(forward_mode)
         if stage is None:
             return
 
@@ -159,7 +159,9 @@ class ProfileManager:
         self.profiler = None
 
 
-def _get_stage_from_forward_mode(forward_mode: ForwardMode):
+def get_profile_stage(forward_mode: ForwardMode):
+    if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+        return "decode"
     if forward_mode.is_prefill():
         return "prefill"
     elif forward_mode.is_decode():

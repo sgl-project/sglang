@@ -1280,6 +1280,7 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
     # GEMM / kernel fusion
+    SGLANG_DISABLE_QWEN_GDN_NORM_QUANT_FUSION = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
