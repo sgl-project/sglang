@@ -343,9 +343,16 @@ class MiniMaxM3MoE(nn.Module):
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
             shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            # The checkpoint stores the shared expert's gate/up/down weights
+            # unquantized (BF16), as separate gate_proj/up_proj/down_proj
+            # tensors (merged into gate_up_proj via stacked_params_mapping at
+            # load time). Passing the MoE's INT4 quant_config here would create
+            # quantized params (qweight/scales) that never match the BF16
+            # checkpoint names, leaving shared_experts uninitialized and
+            # producing garbage tokens. Load them unquantized.
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
                 intermediate_size=intermediate_size,
@@ -554,13 +561,23 @@ class MiniMaxM3Attention(nn.Module):
         )
 
         if self.is_sparse_attention_layer:
+            # The checkpoint stores the sparse-attention index q/k (and, on
+            # value-enabled layers, v) projections unquantized (BF16), as
+            # separate index_q_proj/index_k_proj/index_v_proj tensors (merged
+            # into index_qkv_proj via stacked_params_mapping at load time).
+            # Passing the MoE's INT4 quant_config here would (1) create
+            # quantized params that never match the BF16 checkpoint names and
+            # (2) trip QKVParallelLinear's "all sub-projections must share one
+            # quantization scheme" check, because value-disabled layers have no
+            # index_v_proj at all. Load them unquantized, matching the
+            # checkpoint.
             self.index_qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.idx_head_dim,
                 self.total_idx_heads,
                 total_num_kv_heads=1,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=None,
                 v_head_size=(0 if self.disable_index_value else self.idx_head_dim),
                 tp_rank=self.idx_head_rank,
                 tp_size=self.idx_head_tp_size,
@@ -1174,11 +1191,21 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        mlp_layer_types = getattr(config, "mlp_layer_types", None)
         # Means "MLP is a sparse MoE", not attention sparsity. Kept as ``is_layer_sparse``
         # because LayerCommunicator / LayerScatterModes / other models read this attr.
-        self.is_layer_sparse = (
-            moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
-        )
+        # MiniMax-M3 ships mlp_layer_types=['dense','dense','dense','sparse',...] but
+        # moe_layer_freq=None. The moe_layer_freq fallback below would force every
+        # layer to sparse, so dense layers 0/1/2 would get a MiniMaxM3MoE with a
+        # router gate whose weight has no checkpoint entry -> torch.empty (NaN on
+        # HIP) -> router_logits NaN -> all-zero output. Prefer mlp_layer_types when
+        # it is set, falling back to moe_layer_freq otherwise.
+        if mlp_layer_types is not None and layer_id < len(mlp_layer_types):
+            self.is_layer_sparse = mlp_layer_types[layer_id] == "sparse"
+        else:
+            self.is_layer_sparse = (
+                moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
+            )
 
         if self.is_layer_sparse:
             self.mlp = MiniMaxM3MoE(
@@ -1216,6 +1243,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
 
         def _is_layer_sparse(lid):
+            if mlp_layer_types is not None and 0 <= lid < len(mlp_layer_types):
+                return mlp_layer_types[lid] == "sparse"
             if moe_layer_freq is None:
                 return True
             if lid < 0 or lid >= config.num_hidden_layers:
