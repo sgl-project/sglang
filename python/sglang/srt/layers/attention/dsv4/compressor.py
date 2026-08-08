@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
