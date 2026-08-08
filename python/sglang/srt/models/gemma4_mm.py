@@ -339,6 +339,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         )
 
         split_images = []
+        # Whether any request actually widened the mask beyond the causal fill
+        # below. If none did, the assembled mask is bit-for-bit the causal
+        # predicate the extend kernel already applies on its own (see the
+        # IS_CAUSAL branch in kernels/ops/attention/extend_attention.py), so
+        # installing it would only add a mask load per tile without changing the
+        # result.
+        wrote_bidirectional = False
 
         for i in range(forward_batch.batch_size):
             extend_seq_len = forward_batch.extend_seq_lens[i]
@@ -374,12 +381,22 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                                     im_begin - prefix_len : im_end + 1 - prefix_len,
                                     im_begin : im_end + 1,
                                 ] = 1
+                                # A single-token span rewrites only the diagonal
+                                # element the causal fill already set.
+                                if im_end > im_begin:
+                                    wrote_bidirectional = True
                             elif (
                                 im_end >= prefix_len
                                 and im_begin < prefix_len + extend_seq_len
                             ):
                                 split_images.append((i, im_begin, im_end))
 
+            # Appended unconditionally: the batch shares one flat mask buffer
+            # addressed by mask_indptr, and USE_CUSTOM_MASK is a whole-launch
+            # tl.constexpr, so a request cannot opt out individually. A
+            # zero-length slot would leave the kernel reading the next request's
+            # bytes with this request's row stride. Skipping is therefore decided
+            # once for the whole batch, after the loop.
             bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
             bidirectional_attn_mask_indptr[i + 1] = (
                 bidirectional_attn_mask_indptr[i] + bidirectional_attn_mask.nelement()
@@ -397,7 +414,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             logger.warning_once(
                 "Those images will receive causal attention. Disable chunked prefill (--chunked-prefill-size=-1) for full bidirectional attention.",
             )
-        if bidirectional_attn_masks_list:
+        if bidirectional_attn_masks_list and wrote_bidirectional:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
             get_attn_backend().forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
