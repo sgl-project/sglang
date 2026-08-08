@@ -59,6 +59,7 @@ _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 
