@@ -101,12 +101,20 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # True for backends that preallocate per-seq extend metadata at req-pool
+    # size (e.g. triton's kv_indptr): dummy extend batches must then keep
+    # batch_size <= req_to_token_pool.size.
+    extend_dummy_seqs_capped_by_req_pool: bool = False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    # Whether prefill metadata initialization finishes all scheduler-shared reads.
+    prefill_shared_reads_end_at_metadata_init: bool = False
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not

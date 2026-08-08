@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +322,12 @@ def initialize_moe_config(server_args: ServerArgs):
     moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
     moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     moe.quantization = server_args.quantization
+    # Seeded with the user's intent; each model's gate refines the ACTIVE
+    # value for its own build (install_shared_experts_fusion_decision).
+    moe.disable_shared_experts_fusion = server_args.disable_shared_experts_fusion
+    moe.speculative_disable_shared_experts_fusion = (
+        server_args.disable_shared_experts_fusion
+    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -355,6 +362,88 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
         )
         moe.speculative_a2a_backend = MoeA2ABackend.NONE
     return moe.speculative_a2a_backend
+
+
+def is_shared_experts_fusion_disabled() -> bool:
+    """The ACTIVE shared-experts-fusion decision for the model being built.
+
+    Written (both ways) by each MoE model's gate before its layers construct;
+    falls back to the config intent when no gate has run (models without an
+    auto-disable gate read the intent directly off the bag instead).
+
+    Construction-time only: a forward reads what its build baked in
+    (``num_fused_shared_experts`` on the layer). During a draft's build this
+    flag holds the DRAFT's decision, so a forward-time read would race the
+    build window — refuse it loudly."""
+    from sglang.srt.model_executor.forward_context import has_forward_context
+
+    if has_forward_context():
+        raise AssertionError(
+            "is_shared_experts_fusion_disabled() called inside a forward: the "
+            "fusion decision is construction-time state (it can hold the draft's "
+            "value while a draft builds). Read the value your build baked in, "
+            "e.g. the layer's num_fused_shared_experts."
+        )
+    moe = get_flags().moe
+    if moe.disable_shared_experts_fusion is None:
+        from sglang.srt.runtime_context import get_exec
+
+        return get_exec().moe.disable_shared_experts_fusion
+    return moe.disable_shared_experts_fusion
+
+
+@contextmanager
+def draft_model_build_scope():
+    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
+    fusion decision on the speculative leaf as well, and the target's ACTIVE
+    value returns on exit.
+
+    Deliberately does not touch ``runner_backend`` — swapping that is
+    ``speculative_moe_backend_context``'s job and has to bracket the draft's
+    whole lifecycle (build + capture + forward), which not every worker does.
+    """
+    moe = get_flags().moe
+    original_fusion = moe.disable_shared_experts_fusion
+    original_scope = moe.in_speculative_scope
+    try:
+        moe.in_speculative_scope = True
+        yield
+    finally:
+        moe.in_speculative_scope = original_scope
+        moe.disable_shared_experts_fusion = original_fusion
+
+
+def install_shared_experts_fusion_decision(
+    model_class, hf_config, quant_config
+) -> None:
+    """Decide whether this runner's model fuses its shared experts, and install
+    the answer for the model it is about to build.
+
+    Called from the loader's single model-instantiation point, so the decision
+    is made once per runner — before any layer exists — and the model classes
+    are pure readers (``is_shared_experts_fusion_disabled``). A model family
+    that can auto-disable exposes the conditions as
+    ``shared_experts_fusion_disable_reason(hf_config, quant_config)``; families
+    without one follow the user's intent.
+
+    Inside ``draft_model_build_scope`` the answer also lands on the speculative
+    leaf, so a flags dump afterwards shows both runners' decisions.
+    """
+    from sglang.srt.runtime_context import get_exec
+
+    disabled = get_exec().moe.disable_shared_experts_fusion
+    if not disabled:
+        gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
+        reason = gate(hf_config, quant_config) if gate is not None else None
+        if reason:
+            log_info_on_rank0(
+                logger, f"{reason} Shared experts fusion optimization is disabled."
+            )
+            disabled = True
+    moe = get_flags().moe
+    moe.disable_shared_experts_fusion = disabled
+    if moe.in_speculative_scope:
+        moe.speculative_disable_shared_experts_fusion = disabled
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -526,6 +615,7 @@ def speculative_moe_backend_context():
     """
     Context manager to temporarily use the speculative MoE backend for draft model operations.
     This ensures that draft models in speculative decoding use the configured speculative backend.
+
     """
     moe = get_flags().moe
     original_backend = moe.runner_backend
