@@ -527,6 +527,18 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def refresh_and_emit_kv_metrics(self):
+        if (
+            not self.current_scheduler_metrics_enabled
+            or not self.enable_kv_cache_events
+        ):
+            return
+
+        self.scheduler.pool_stats_observer.get_pool_stats().update_scheduler_stats(
+            self.stats
+        )
+        self.scheduler.kv_events_publisher.emit_kv_metrics()
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
