@@ -37,7 +37,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _accepts(backend: str, *, use_mla: bool, unified: bool = True) -> bool:
+def _accepts(
+    backend: str,
+    *,
+    use_mla: bool,
+    unified: bool = True,
+    linear_backend: str = "triton",
+) -> bool:
     """Run just `_handle_page_major_kv_layout` against a minimal stand-in.
 
     ServerArgs' real constructor pulls in a model config; this exercises the
@@ -52,7 +58,7 @@ def _accepts(backend: str, *, use_mla: bool, unified: bool = True) -> bool:
         "attention_backend": backend,
         "prefill_attention_backend": None,
         "decode_attention_backend": None,
-        "linear_attn_backend": "triton",
+        "linear_attn_backend": linear_backend,
         "linear_attn_decode_backend": None,
         "linear_attn_prefill_backend": None,
         "mamba_backend": "triton",
@@ -82,6 +88,10 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     def test_triton_always_allowed(self):
         for use_mla in (True, False):
             self.assertTrue(_accepts("triton", use_mla=use_mla))
+
+    def test_cake_linear_attention_is_stride_safe(self):
+        for use_mla in (True, False):
+            self.assertTrue(_accepts("triton", use_mla=use_mla, linear_backend="cake"))
 
     def test_dense_mla_backends_allowed_under_unified_mla(self):
         for backend in self.DENSE_MLA_BACKENDS:

@@ -10,6 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
+from sglang.srt.arg_groups.kimi_k3_hook import (
+    apply_kimi_k3_linear_attn_defaults,
+)
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
@@ -440,6 +443,84 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             server_args._handle_mamba_backend()
+
+
+class TestCakeLinearAttnBackend(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_shared_backend_selects_cake_for_prefill_and_decode(
+        self, _mock_sm100, _mock_is_cuda
+    ):
+        server_args = ServerArgs(model_path="dummy", linear_attn_backend="cake")
+
+        server_args._handle_linear_attn_backend()
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "cake")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_per_phase_override_wins_over_shared_cake_backend(
+        self, _mock_sm100, _mock_is_cuda
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            linear_attn_decode_backend="triton",
+        )
+
+        server_args._handle_linear_attn_backend()
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "triton")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
+    def test_kimi_k3_default_respects_shared_cake_backend(self, _mock_sm100):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+        server_args._handle_linear_attn_backend()
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "cake")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
+    def test_kimi_k3_default_keeps_default_triton_decode(self, _mock_sm100):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "triton")
+
+    @patch(
+        "sglang.srt.utils.is_sm100_supported",
+        return_value=True,
+    )
+    def test_kimi_k3_default_keeps_triton_decode_for_other_shared_backend(
+        self, _mock_sm100
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cutedsl",
+            mamba_ssm_dtype="bfloat16",
+        )
+
+        apply_kimi_k3_linear_attn_defaults(server_args)
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "triton")
 
 
 class TestLoadBalanceMethod(unittest.TestCase):

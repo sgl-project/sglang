@@ -1508,6 +1508,18 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    if model_arch == "KimiK3ForConditionalGeneration":
+        base = view.linear_attn_backend
+        decode = getattr(view, "linear_attn_decode_backend", None) or base
+        prefill = getattr(view, "linear_attn_prefill_backend", None) or base
+        if "cake" in {base, decode, prefill}:
+            # CAKE decode commits active rows before the common KDA tracking
+            # hook snapshots them. Tracked CAKE prefill explicitly falls back
+            # to Triton so the required intermediate states are materialized.
+            return decode in {"triton", "cake"} and prefill in {
+                "triton",
+                "cake",
+            }
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
