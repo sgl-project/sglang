@@ -696,7 +696,8 @@ class Envs:
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
-    # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
+    # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
+    # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
@@ -704,6 +705,8 @@ class Envs:
     # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
     # ABI headers + overlay/). Unset means the path is unavailable, not empty.
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+    # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
+    SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(True)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
