@@ -130,7 +130,7 @@ pub struct Cli {
     /// Enable Router-initiated Worker load reporting and snapshot collection.
     #[arg(long)]
     pub load_monitor: bool,
-    /// Fixed gRPC reporter port paired with each discovered Worker host.
+    /// Fallback reporter port when `/server_info` lacks `load_reporter_port`.
     #[arg(long)]
     pub load_reporter_port: Option<std::num::NonZeroU16>,
 
@@ -973,20 +973,17 @@ mod tests {
         );
     }
 
-    /// Enabling monitoring requires the paired Worker reporter port.
+    /// `--load-monitor` alone is valid; the reporter port resolves per Worker.
     #[test]
-    fn rejects_load_monitor_without_reporter_port() {
-        let err = into_config_owned(with_model(&[
+    fn accepts_load_monitor_without_reporter_port() {
+        let config = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
             "--load-monitor",
         ]))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("--load-monitor requires --load-reporter-port"),
-            "got: {err}"
-        );
+        .unwrap();
+        assert!(config.load_monitor.enabled);
+        assert!(config.load_monitor.reporter_port.is_none());
     }
 
     /// The reporter port cannot be silently ignored while monitoring is disabled.

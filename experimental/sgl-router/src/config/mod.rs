@@ -18,9 +18,6 @@ impl Config {
         if !self.load_monitor.enabled && self.load_monitor.reporter_port.is_some() {
             return Err(anyhow!("--load-reporter-port requires --load-monitor"));
         }
-        if self.load_monitor.enabled && self.load_monitor.reporter_port.is_none() {
-            return Err(anyhow!("--load-monitor requires --load-reporter-port"));
-        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {

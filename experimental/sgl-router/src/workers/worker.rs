@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
@@ -99,6 +99,8 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// `/server_info` load reporter port; `0` = absent.
+    reporter_port: AtomicU16,
 }
 
 impl Worker {
@@ -126,6 +128,7 @@ impl Worker {
             active_requests: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            reporter_port: AtomicU16::new(0),
         }
     }
 
@@ -137,6 +140,18 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    /// Returns the `/server_info` load reporter port, if any.
+    pub fn reporter_port(&self) -> Option<u16> {
+        let port = self.reporter_port.load(Ordering::Relaxed);
+        (port != 0).then_some(port)
+    }
+
+    /// Set the reporter port from `/server_info`.
+    pub(crate) fn set_reporter_port(&self, port: Option<u16>) {
+        self.reporter_port
+            .store(port.unwrap_or(0), Ordering::Relaxed);
     }
 
     /// Returns the current [`WorkerMode`] of this worker.

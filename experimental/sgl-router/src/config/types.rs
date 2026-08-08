@@ -25,7 +25,7 @@ pub struct Config {
 pub struct LoadMonitorConfig {
     /// Enables per-Worker gRPC sessions and immutable load snapshots.
     pub enabled: bool,
-    /// Fixed reporter port paired with every discovered Worker's host.
+    /// Fallback reporter port when `/server_info` omits it; `None` skips those Workers.
     pub reporter_port: Option<NonZeroU16>,
 }
 

@@ -45,12 +45,15 @@ const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(100);
 /// to `KvEventIndex::add_worker` (skipping its own fetch);
 /// `disaggregation_role` lets the worker manager override the discovery
 /// backend's PD classification (and fill in `WorkerSpec.bootstrap_port`
-/// for prefill workers) — see `manager::register_one`.
+/// for prefill workers) — see `manager::register_one`; `load_reporter_port`
+/// feeds the load monitor.
 #[derive(Debug, Clone, Default)]
 pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub event_config: Option<EventConfig>,
     pub disaggregation_role: Option<DisaggregationRole>,
+    /// Worker's `/server_info` load reporter port; absent on older SGLang.
+    pub load_reporter_port: Option<u16>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -145,6 +148,7 @@ impl WorkerIntrospector {
             served_model_name,
             event_config,
             disaggregation_role,
+            load_reporter_port: parsed.load_reporter_port,
         }
     }
 
@@ -330,6 +334,9 @@ struct ServerInfoBody {
     /// bootstrap server binds to exactly this port (no internal offset).
     #[serde(default)]
     disaggregation_bootstrap_port: Option<u16>,
+    /// `ServerArgs.load_reporter_port`; absent on older SGLang.
+    #[serde(default)]
+    load_reporter_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +467,18 @@ mod tests {
         assert_eq!(cfg.topic, "kv");
         assert_eq!(cfg.block_size, 64);
         assert_eq!(cfg.dp_size, 2);
+    }
+
+    /// `/server_info.load_reporter_port` is projected into `ServerInfo`.
+    #[tokio::test]
+    async fn fetch_reads_load_reporter_port() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "load_reporter_port": 31000,
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.load_reporter_port, Some(31000));
     }
 
     #[tokio::test]

@@ -162,11 +162,23 @@ struct WorkerTarget {
 impl WorkerTarget {
     /// Builds the reporting identity and paired reporter endpoint for a Worker.
     ///
+    /// Port: `/server_info` value wins, else `fallback_port`; neither => not
+    /// monitored.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the worker URL has no host or cannot be converted
-    /// to the reporter's h2c endpoint.
-    fn from_worker(worker: &Arc<Worker>, reporter_port: NonZeroU16) -> Result<Self> {
+    /// Missing reporter port or an unparsable worker URL.
+    fn from_worker(worker: &Arc<Worker>, fallback_port: Option<NonZeroU16>) -> Result<Self> {
+        let reporter_port = worker
+            .reporter_port()
+            .and_then(NonZeroU16::new)
+            .or(fallback_port)
+            .ok_or_else(|| {
+                anyhow!(
+                    "worker has no load reporter port (absent from /server_info and no \
+                     --load-reporter-port); load monitoring disabled for this worker"
+                )
+            })?;
         Ok(Self {
             id: worker.id.clone(),
             url: worker.url.clone(),
@@ -314,15 +326,19 @@ impl LoadMonitor {
         if !self.enabled() || self.inner.shutting_down.load(Ordering::Acquire) {
             return;
         }
-        let Some(reporter_port) = self.inner.config.reporter_port else {
-            tracing::error!("load monitor: enabled configuration has no reporter port");
-            return;
-        };
+        let fallback_port = self.inner.config.reporter_port;
         let mut targets = HashMap::new();
         for worker in workers {
-            match WorkerTarget::from_worker(&worker, reporter_port) {
+            match WorkerTarget::from_worker(&worker, fallback_port) {
                 Ok(target) => {
                     targets.insert(target.id.clone(), target);
+                }
+                Err(_error) if worker.reporter_port().is_none() && fallback_port.is_none() => {
+                    tracing::debug!(
+                        worker_id = %worker.id,
+                        worker_url = %worker.url,
+                        "load monitor: Worker has no load reporter port; monitoring disabled for this Worker",
+                    );
                 }
                 Err(error) => tracing::error!(
                     worker_id = %worker.id,

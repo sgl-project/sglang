@@ -458,6 +458,7 @@ async fn register_one(
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
+    let worker_id = spec.id.clone();
     let info = introspector.fetch(&worker_url).await;
     if let Some(name) = info.served_model_name {
         spec.model_ids = vec![ModelId(name)];
@@ -514,6 +515,12 @@ async fn register_one(
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
         idx.add_worker(&worker_url, info.event_config).await;
+    }
+    // Publish the Worker's `/server_info` reporter port for the load monitor.
+    if let Some(port) = info.load_reporter_port {
+        if let Some(worker) = registry.get(&worker_id) {
+            worker.set_reporter_port(Some(port));
+        }
     }
     if let Some(monitor) = load_monitor {
         monitor.reconcile(registry.all()).await;

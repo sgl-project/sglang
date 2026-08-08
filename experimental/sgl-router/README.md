@@ -68,8 +68,11 @@ sgl-router \
   --load-reporter-port 31000
 ```
 
-`--load-reporter-port` is required with `--load-monitor` and must match the
-fixed `--load-reporter-port` configured on every SGLang Worker.
+`--load-reporter-port` is optional. When set, it is the fallback reporter
+port for Workers whose `/server_info` does not advertise a
+`load_reporter_port`; when unset, each Worker's reporter port is resolved
+from its `/server_info` response. Workers with neither (e.g. engines built
+without the load reporter) are simply not monitored.
 The first version uses a fixed 1-second report interval, 3-second freshness
 window, 15-second lease, and 2-second connection timeout. This change keeps
 routing policies unchanged; the immutable snapshot is the read-only boundary

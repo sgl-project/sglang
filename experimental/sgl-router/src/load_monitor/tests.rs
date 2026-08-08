@@ -68,7 +68,7 @@ fn test_monitor(port: u16) -> LoadMonitor {
 /// Installs one Worker in the snapshot store without starting a network task.
 fn install_worker(monitor: &LoadMonitor, worker: Arc<Worker>) -> WorkerId {
     let port = monitor.inner.config.reporter_port.unwrap();
-    let target = WorkerTarget::from_worker(&worker, port).unwrap();
+    let target = WorkerTarget::from_worker(&worker, Some(port)).unwrap();
     let id = target.id.clone();
     monitor.update_store(HashMap::from([(id.clone(), target)]));
     id
@@ -438,8 +438,11 @@ async fn registration_ack_timeout_fails_session() {
         model_ids: vec![ModelId("model".to_string())],
         bootstrap_port: None,
     }));
-    let target =
-        WorkerTarget::from_worker(&worker, NonZeroU16::new(reporter_addr.port()).unwrap()).unwrap();
+    let target = WorkerTarget::from_worker(
+        &worker,
+        Some(NonZeroU16::new(reporter_addr.port()).unwrap()),
+    )
+    .unwrap();
     let cancel = CancellationToken::new();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
@@ -486,4 +489,34 @@ fn unreachable_report_ages_to_stale() {
             .received_at = SystemTime::now() - STALE_AFTER - Duration::from_millis(1);
     }
     assert_eq!(monitor.snapshot().workers[0].freshness, Freshness::Stale);
+}
+
+/// A Worker's own `/server_info` reporter port wins over the global fallback.
+#[test]
+fn worker_advertised_reporter_port_wins_over_fallback() {
+    let worker = test_worker("worker", WorkerMode::Plain);
+    worker.set_reporter_port(Some(32000));
+    let target = WorkerTarget::from_worker(&worker, Some(NonZeroU16::new(31000).unwrap())).unwrap();
+    assert_eq!(target.reporter_endpoint, "http://worker:32000");
+}
+
+/// The global fallback port applies when the Worker advertises none.
+#[test]
+fn fallback_port_used_when_worker_advertises_none() {
+    let worker = test_worker("worker", WorkerMode::Plain);
+    let target = WorkerTarget::from_worker(&worker, Some(NonZeroU16::new(31000).unwrap())).unwrap();
+    assert_eq!(target.reporter_endpoint, "http://worker:31000");
+}
+
+/// A Worker with no reporter port and no fallback is skipped.
+#[tokio::test]
+async fn worker_without_reporter_port_is_skipped() {
+    let monitor = LoadMonitor::new(LoadMonitorConfig {
+        enabled: true,
+        reporter_port: None,
+    });
+    monitor
+        .reconcile(vec![test_worker("worker", WorkerMode::Plain)])
+        .await;
+    assert!(monitor.snapshot().workers.is_empty());
 }
