@@ -5184,13 +5184,6 @@ class ServerArgs:
                         # registry (arg_groups/overrides.py:
                         # _deepseek_family_overrides).
                         self.cuda_graph_config.prefill.backend = Backend.DISABLED
-                    else:
-                        # Pure TP and partial DP Attention mode is active for DSA, logging a warning
-                        if self.dp_size < self.tp_size:
-                            logger.warning(
-                                f"DSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
-                                f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
-                            )
 
                     # The DSA page-size selection moved to the override registry
                     # (arg_groups/overrides.py: _deepseek_family_overrides).
