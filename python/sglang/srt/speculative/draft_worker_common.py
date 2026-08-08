@@ -153,5 +153,22 @@ def make_draft_sampler_capture_hook(draft_sampler):
     return capture_hook
 
 
+def clamp_verify_lens(
+    *,
+    requested_verify_lens,
+    seq_lens,
+    remaining_generation_tokens,
+    max_position_embeddings: int,
+) -> torch.Tensor:
+    """Bound each DSpark verify row to legal generation and context budgets."""
+    context_remaining = (
+        int(max_position_embeddings) - seq_lens.to(torch.int64)
+    ).clamp_min_(0)
+    return torch.minimum(
+        torch.minimum(requested_verify_lens.to(torch.int64), context_remaining),
+        remaining_generation_tokens.to(torch.int64).clamp_min_(0),
+    )
+
+
 def build_block_pos_offsets(*, length: int, device: torch.device) -> torch.Tensor:
     return torch.arange(int(length), device=device, dtype=torch.int64)

@@ -22,6 +22,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
+    clamp_verify_lens,
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
 )
@@ -56,6 +57,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -538,6 +540,36 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
+        requested_verify_lens = torch.full_like(
+            prefix_lens, self.verify_num_draft_tokens, dtype=torch.int64
+        )
+
+        # Guard: max_new_tokens is Optional[int]; None means no generation cap,
+        # so we treat the budget as verify_num_draft_tokens (no clamp from this
+        # dimension).  The scheduler is single-threaded, so this snapshot is
+        # race-free.
+        def _gen_remaining(req) -> int:
+            max_new = req.sampling_params.max_new_tokens
+            if max_new is None:
+                return self.verify_num_draft_tokens
+            return max(max_new - len(req.output_ids), 0)
+
+        remaining_generation_tokens = torch.tensor(
+            [_gen_remaining(req) for req in batch.reqs],
+            dtype=torch.int64,
+            device=device,
+        )
+        actual_verify_lens = clamp_verify_lens(
+            requested_verify_lens=requested_verify_lens,
+            seq_lens=prefix_lens,
+            remaining_generation_tokens=remaining_generation_tokens,
+            max_position_embeddings=self.model_runner.req_to_token_pool.max_context_len,
+        )
+
+        if not bool(torch.all(actual_verify_lens > 0)):
+            raise RuntimeError(
+                "DSpark scheduled a request with no context/generation budget"
+            )
 
         self._observers.begin_step()
 
@@ -550,6 +582,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
+            verify_lens=actual_verify_lens,
+            max_position_embeddings=self.model_runner.req_to_token_pool.max_context_len,
         )
 
         sampling_info = batch.sampling_info
@@ -599,7 +633,37 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        run_compact = self._verify_planner.should_run_compact(layout=layout)
+        # Clamp planner's verify_lens to per-request context/generation budgets.
+        # Safety invariant: every position passed to the target model must be
+        # strictly less than max_position_embeddings.
+        #
+        # TP consistency: batch.seq_lens is already broadcast-synced across TP
+        # ranks by the scheduler before reaching here; req.output_ids lengths
+        # are updated identically on all ranks after each accept step.  Because
+        # the scheduler runs on a single thread, the snapshot below is
+        # race-free — no concurrent path mutates seq_lens or output_ids during
+        # this call.
+        #
+        # The draft window keeps its fixed gamma-wide shape, but its padded tail
+        # positions were already made safe from actual_verify_lens above. A
+        # clipped layout still selects compact target verify below.
+        planned_verify_lens = (
+            requested_verify_lens if layout is None else layout.verify_lens
+        )
+        actual_verify_lens = torch.minimum(
+            planned_verify_lens.to(torch.int64), actual_verify_lens
+        )
+        if not torch.equal(actual_verify_lens, planned_verify_lens):
+            graph_num_tokens = (
+                int(actual_verify_lens.sum().item())
+                if layout is None
+                else layout.graph_num_tokens
+            )
+            layout = RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=actual_verify_lens,
+                graph_num_tokens=graph_num_tokens,
+            )
+        run_compact = layout is not None
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1

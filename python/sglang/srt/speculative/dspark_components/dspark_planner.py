@@ -848,10 +848,24 @@ def alloc_verify_window(
     verify_num_draft_tokens: int,
     block_pos_offsets: torch.Tensor,
     model_runner,
+    verify_lens: torch.Tensor,
+    max_position_embeddings: int,
 ) -> VerifyWindow:
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
-    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
+    max_position = int(max_position_embeddings)
+    if max_position < 1:
+        raise ValueError(
+            f"max_position_embeddings must be positive, got {max_position}"
+        )
+    # The draft model keeps its fixed gamma-wide shape. Rows trimmed by the
+    # per-request verify budget reuse their final legal position in the unused
+    # tail, while cache allocation stays gamma-wide for compatibility.
+    final_legal_offsets = verify_lens.to(torch.int64).sub(1).clamp_min_(0).unsqueeze(1)
+    safe_offsets = torch.minimum(block_pos_offsets, final_legal_offsets)
+    positions_2d = (prefix_lens.unsqueeze(1) + safe_offsets).clamp_max_(
+        max_position - 1
+    )
     verify_cache_loc = assign_extend_cache_locs_func(
         req_pool_indices=batch.req_pool_indices,
         req_to_token=model_runner.req_to_token_pool.req_to_token,
