@@ -64,7 +64,10 @@ jobs:
       stage: weekly
       runner_config: 8-gpu-b200
       runs_on: 8-gpu-b200
-      run_timeout_minutes: 120
+      partition_ids: '[0, 1]'
+      partition_count: 2
+      max_parallel: 2
+      run_timeout_minutes: 180
     secrets: inherit
 
   weekly-8-gpu-h200:
@@ -73,5 +76,9 @@ jobs:
     with:
       stage: weekly
       runner_config: 8-gpu-h200
+      runs_on: 8-gpu-h200
+      partition_ids: '[0, 1]'
+      partition_count: 2
+      max_parallel: 2
       run_timeout_minutes: 180
     secrets: inherit
