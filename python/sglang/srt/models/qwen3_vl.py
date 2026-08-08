@@ -1210,6 +1210,11 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    # Opt in to the optional BCG DeepStack replay slot (see
+    # PrefillCudaGraphRunner). Runtime activation additionally
+    # requires ``num_deepstack_embeddings > 0`` on the instance.
+    supports_bcg_deepstack_replay = True
+
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={

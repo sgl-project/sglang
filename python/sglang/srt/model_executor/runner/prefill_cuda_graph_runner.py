@@ -298,6 +298,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
+        deepstack_replay_width = (
+            self.model_runner.model_config.hidden_size
+            * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
+            if getattr(self.model_runner.model, "supports_bcg_deepstack_replay", False)
+            else 0
+        )
+
         # --- buffers ---------------------------------------------------
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
@@ -308,6 +315,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            deepstack_replay_width=deepstack_replay_width,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -321,6 +329,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
+            deepstack_replay_width=deepstack_replay_width,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
             require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
@@ -668,11 +677,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                extra_kwargs = {}
+                if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                    extra_kwargs["input_deepstack_embeds"] = (
+                        self.buffer_registry.get_slot(
+                            "input_deepstack_embeds"
+                        ).slice_for(1, num_tokens)
+                    )
                 return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
+                    **extra_kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
@@ -1668,6 +1685,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
+            # DeepStack replay slot: same lifecycle as ``input_embeds``
+            # above. The else branch zeros the slice so a stale image
+            # contribution cannot bleed into a text-only or smaller
+            # request that reuses this bucket — the LM applies the
+            # slot via ``add_`` (not through attention), so unmasked
+            # padded rows would corrupt real tokens otherwise.
+            if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                slot = self.buffer_registry.get_slot(
+                    "input_deepstack_embeds"
+                ).slice_for(1, static_num_tokens)
+                de = layer_kwargs.get("input_deepstack_embeds")
+                if (
+                    de is not None
+                    and de.numel() > 0
+                    and de.shape[0] <= static_num_tokens
+                    and de.shape[1:] == slot.shape[1:]
+                    and de.dtype == slot.dtype
+                    and de.device == slot.device
+                ):
+                    slot[: de.shape[0]].copy_(de)
+                    if de.shape[0] < static_num_tokens:
+                        slot[de.shape[0] :].zero_()
+                else:
+                    if de is not None:
+                        logger.warning(
+                            "DeepStack replay slot rejected a non-empty "
+                            "input_deepstack_embeds (shape=%s, dtype=%s, device=%s); "
+                            "replaying with zero contribution.",
+                            tuple(de.shape),
+                            de.dtype,
+                            de.device,
+                        )
+                    slot.zero_()
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
