@@ -173,6 +173,37 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     embedding_padding_modules = []
     supports_lora = True
 
+    @staticmethod
+    def _vision_tower_quant_config(
+        quant_config: Optional[QuantizationConfig],
+    ) -> Optional[QuantizationConfig]:
+        """Quantization config for the Gemma-4 vision tower.
+
+        compressed-tensors Gemma-4 checkpoints exclude every vision-tower
+        linear through `ignore`, but the entries carry the `.linear` suffix of
+        the checkpoint's clip wrapper, which SGLang's fused `qkv_proj` /
+        `gate_up_proj` do not have, so the match fails and the vision tower
+        gets quantized anyway. Drop the config for the vision tower to honour
+        what the checkpoint asked for.
+
+        Other quantization methods are left alone: modelopt's NVFP4 Gemma-4
+        checkpoint already excludes `model.vision_tower*` by glob, and there is
+        no evidence to justify silently de-quantizing the vision tower on the
+        online fp8/awq/gptq paths.
+        """
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+
+        if not isinstance(quant_config, CompressedTensorsConfig):
+            return quant_config
+
+        logger.warning_once(
+            "Gemma-4 vision tower is loaded unquantized; the compressed-tensors "
+            "config does not apply to it."
+        )
+        return None
+
     def __init__(
         self,
         config: Gemma4Config,
@@ -191,9 +222,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
         if self.pp_group.is_first_rank:
+            # NOTE: under compressed-tensors the vision tower loads unquantized,
+            # which is what the checkpoint's `ignore` list asks for; its entries
+            # just do not match SGLang's fused module names. See
+            # `_vision_tower_quant_config`.
+            vision_tower_quant_config = self._vision_tower_quant_config(quant_config)
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
-                quant_config=quant_config,
+                quant_config=vision_tower_quant_config,
                 prefix=add_prefix("vision_tower", prefix),
             )
             self.embed_vision = Gemma4MultimodalEmbedder(
