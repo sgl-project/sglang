@@ -49,7 +49,7 @@ def _make_req(feature):
 
 class TestMMCpuTensorBroadcast(unittest.TestCase):
     def test_source_restores_feature_and_broadcasts_contiguous_payload(self):
-        feature = torch.arange(600_000, dtype=torch.float32).reshape(2, -1).T
+        feature = torch.arange(2_200_000, dtype=torch.float32).reshape(2, -1).T
         self.assertFalse(feature.is_contiguous())
         req = _make_req(feature)
         sent = []
@@ -76,7 +76,7 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
         torch.testing.assert_close(sent[0], feature)
 
     def test_peer_allocates_and_receives_feature(self):
-        expected = torch.arange(300_000, dtype=torch.float32)
+        expected = torch.arange(2_200_000, dtype=torch.float32)
         req = _make_req(torch.empty(1))
         req.mm_inputs = MultimodalProcessorOutput(
             mm_items=[
@@ -108,7 +108,7 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
         torch.testing.assert_close(received, expected)
 
     def test_precomputed_embeddings_are_broadcast_directly(self):
-        embeddings = torch.arange(600_000, dtype=torch.float16)
+        embeddings = torch.arange(5_000_000, dtype=torch.float16)
         req = _make_req(torch.empty(1))
         req.mm_inputs.mm_items[0].feature = None
         req.mm_inputs.mm_items[0].precomputed_embeddings = embeddings
@@ -150,6 +150,23 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
         self.assertIs(result[0].mm_inputs.mm_items[0].feature, feature)
         broadcast.assert_not_called()
 
+    def test_single_large_feature_below_aggregate_threshold_stays_in_metadata(self):
+        # A single image-sized tensor should not pay the fixed Gloo collective
+        # cost. The direct path is reserved for an aggregate scheduler batch.
+        feature = torch.zeros(600_000, dtype=torch.float32)
+        req = _make_req(feature)
+        with (
+            patch(
+                "sglang.srt.managers.mm_transport.broadcast_pyobj",
+                side_effect=lambda data, *args, **kwargs: data,
+            ),
+            patch("sglang.srt.managers.mm_transport.dist.broadcast") as broadcast,
+        ):
+            result = broadcast_mm_cpu_tensors([req], rank=0, src=0)
+
+        self.assertIs(result[0].mm_inputs.mm_items[0].feature, feature)
+        broadcast.assert_not_called()
+
     def test_transport_proxy_stays_on_metadata_path(self):
         # CUDA IPC/VMM proxies are intentionally opaque to this CPU-only
         # optimization.  A proxy-like object must not trigger a tensor
@@ -170,7 +187,7 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
 
     def test_batch_request_preserves_tensor_list_order(self):
         features = [
-            torch.full((300_000,), value, dtype=torch.float32) for value in (1, 2)
+            torch.full((1_200_000,), value, dtype=torch.float32) for value in (1, 2)
         ]
         req = _make_req(features)
         batch = BatchTokenizedGenerateReqInput(batch=[req])

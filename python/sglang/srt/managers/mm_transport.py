@@ -19,6 +19,10 @@ from sglang.srt.utils import broadcast_pyobj
 # not launch many tiny collectives. Image/audio payloads normally exceed this
 # conservative threshold by orders of magnitude.
 _DIRECT_BROADCAST_MIN_BYTES = 1 << 20
+# A tensor collective has a fixed rendezvous cost. Require enough aggregate
+# payload in one scheduler broadcast to amortize it; otherwise retain the
+# original pickle path so low-rate single-request traffic does not regress.
+_DIRECT_BROADCAST_MIN_TOTAL_BYTES = 8 << 20
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,24 @@ def _replace_large_cpu_tensors(value: Any, tensors: List[torch.Tensor]) -> Any:
     return value
 
 
+def _collect_large_cpu_tensors(value: Any, tensors: List[torch.Tensor]) -> None:
+    if isinstance(value, torch.Tensor):
+        if (
+            value.device.type == "cpu"
+            and value.layout == torch.strided
+            and value.numel() * value.element_size() >= _DIRECT_BROADCAST_MIN_BYTES
+        ):
+            tensors.append(value)
+        return
+    if isinstance(value, list) or isinstance(value, tuple):
+        for item in value:
+            _collect_large_cpu_tensors(item, tensors)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _collect_large_cpu_tensors(item, tensors)
+
+
 def _allocate_cpu_tensors(value: Any, tensors: List[torch.Tensor]) -> Any:
     if isinstance(value, _CpuTensorPlaceholder):
         tensor = torch.empty(value.shape, dtype=value.dtype, device="cpu")
@@ -81,6 +103,19 @@ def _allocate_cpu_tensors(value: Any, tensors: List[torch.Tensor]) -> Any:
 
 
 def _detach_mm_tensors(data: Optional[List[Any]]) -> tuple[List[torch.Tensor], List]:
+    candidates: List[torch.Tensor] = []
+    for req in _iter_tokenized_reqs(data):
+        if req.mm_inputs is None:
+            continue
+        for item in req.mm_inputs.mm_items:
+            for field in ("feature", "precomputed_embeddings"):
+                _collect_large_cpu_tensors(getattr(item, field), candidates)
+
+    if sum(t.numel() * t.element_size() for t in candidates) < (
+        _DIRECT_BROADCAST_MIN_TOTAL_BYTES
+    ):
+        return [], []
+
     tensors: List[torch.Tensor] = []
     originals = []
     for req in _iter_tokenized_reqs(data):
