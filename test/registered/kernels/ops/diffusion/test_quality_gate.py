@@ -1,3 +1,6 @@
+import sys
+
+import pytest
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion.quality_gate import QualityGatedFusion
@@ -38,3 +41,7 @@ def test_quality_gate_rejection_is_all_or_nothing():
     )
     assert not any(fusion.is_enabled(site) for site in root)
     assert not fusion.mount(nn.Module())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
