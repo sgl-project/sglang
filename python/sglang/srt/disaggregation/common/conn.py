@@ -293,6 +293,16 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
+    def serves_dcp_relayout_decode(self) -> bool:
+        """True if any registered decode peer needs the token-granular DCP relayout
+        (set on the peer's register info at registration). Used to skip the
+        cached-prefix early-send, whose split transfer the relayout cannot reassemble.
+        """
+        return any(
+            getattr(peer, "requires_dcp_relayout", False)
+            for peer in self.decode_kv_args_table.values()
+        )
+
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size
         src_token_lens = [
@@ -1137,6 +1147,9 @@ class CommonKVSender(BaseKVSender):
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
+
+    def requires_dcp_relayout(self) -> bool:
+        return self.kv_mgr.serves_dcp_relayout_decode()
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum

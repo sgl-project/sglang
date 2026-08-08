@@ -1095,6 +1095,15 @@ class SchedulerDisaggregationPrefillMixin:
         if req.pending_bootstrap:
             return
 
+        # DCP KV relayout (TP-only prefill -> DCP-sharded decode) transfers the full
+        # sequence as one token-granular per-rank plan. The cached-prefix early-send
+        # would split the transfer into chunks the relayout cannot reassemble, dropping
+        # the newly-computed tail on the decode (KV-cache-hit requests then decode
+        # without the fresh suffix). Skip the optional early-send for DCP-sharded
+        # decodes; the regular final send covers the full range.
+        if req.disagg_kv_sender.requires_dcp_relayout():
+            return
+
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
         cached_end = (
             req.early_send_prefix_end

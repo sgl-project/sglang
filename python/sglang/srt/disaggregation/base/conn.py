@@ -149,6 +149,14 @@ class BaseKVSender(ABC):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
+    def requires_dcp_relayout(self) -> bool:
+        """Whether this request's KV transfer goes through the token-granular DCP
+        relayout (TP-only prefill -> DCP-sharded decode). When True the transfer must
+        cover the full sequence as one plan, so the cached-prefix early-send (which
+        splits the transfer into chunks the relayout cannot reassemble) is skipped.
+        Backends/requests without DCP relayout return False."""
+        return False
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""
