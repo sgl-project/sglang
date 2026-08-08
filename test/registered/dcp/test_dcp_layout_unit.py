@@ -20,10 +20,14 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt import runtime_context as rc
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -122,6 +126,67 @@ class TestGetDcpLens(CustomTestCase):
             int((virtual_indices // dcp_size).max()),
             real_kv_size + physical_page_size,
         )
+
+    def test_model_config_uses_non_dcp_tp_size_for_kv_heads(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = SimpleNamespace(model_type="qwen3_5_text")
+        model_config.hf_text_config = SimpleNamespace(num_key_value_heads=8)
+
+        self.assertEqual(model_config.get_num_kv_heads(16), 1)
+        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
+
+    def test_configurator_uses_instantiated_kv_head_layout(self):
+        model = torch.nn.Sequential(
+            RadixAttention(
+                num_heads=4,
+                head_dim=128,
+                scaling=128**-0.5,
+                num_kv_heads=1,
+                layer_id=0,
+            )
+        )
+        configurator = SimpleNamespace(
+            model=model,
+            is_draft_worker=True,
+            model_config=SimpleNamespace(
+                get_num_kv_heads=lambda tp_size, dcp_size=1: 4
+            ),
+        )
+
+        with get_parallel().override(attn_tp_size=4, attn_dcp_size=4):
+            self.assertEqual(
+                KVCacheConfigurator._resolve_mha_kv_head_num(configurator), 1
+            )
+
+    def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
+        hidden_size = 4
+        head_size = 2
+        q_weight = torch.arange(64, dtype=torch.float32).view(16, hidden_size)
+        k_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 100
+        v_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 200
+
+        for tp_rank in range(4):
+            layer = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=head_size,
+                total_num_heads=8,
+                total_num_kv_heads=2,
+                bias=False,
+                params_dtype=torch.float32,
+                tp_rank=tp_rank,
+                tp_size=4,
+                kv_tp_rank=tp_rank // 2,
+                kv_tp_size=2,
+            )
+            layer.weight_loader(layer.weight, q_weight, "q")
+            layer.weight_loader(layer.weight, k_weight, "k")
+            layer.weight_loader(layer.weight, v_weight, "v")
+
+            q, k, v = layer.weight.split([4, 2, 2], dim=0)
+            kv_start = (tp_rank // 2) * 2
+            self.assertTrue(torch.equal(q, q_weight[tp_rank * 4 : (tp_rank + 1) * 4]))
+            self.assertTrue(torch.equal(k, k_weight[kv_start : kv_start + 2]))
+            self.assertTrue(torch.equal(v, v_weight[kv_start : kv_start + 2]))
 
     def test_configurator_scales_only_the_virtual_dcp_allocator(self):
         physical_kv_size = 1024

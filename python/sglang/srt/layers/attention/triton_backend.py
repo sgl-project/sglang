@@ -202,9 +202,7 @@ class TritonAttnBackend(AttentionBackend):
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         ) * self.dcp_size
-        self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
-        )
+        self.num_kv_head = model_runner.kv_cache_configurator.mha_kv_head_num
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
         # differing SWA/full v_head_dim need a second buffer for SWA layers.

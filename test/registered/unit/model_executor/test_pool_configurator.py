@@ -96,7 +96,7 @@ def _make_model_runner(
     )
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
-    mc.get_num_kv_heads = lambda tp_size: num_kv_heads
+    mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
@@ -104,6 +104,7 @@ def _make_model_runner(
     mc.context_len = 8192
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
+    mr.mha_kv_head_num = num_kv_heads
 
     sa = SimpleNamespace()
     sa.max_total_tokens = None
