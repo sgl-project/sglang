@@ -46,7 +46,13 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_server_args,
+    get_spec,
+    mamba_extra_buffer_enabled,
+    mamba_extra_buffer_lazy_enabled,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -250,16 +256,14 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     record_stream_each(candidates, fwd_stream)
 
 
-def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
-    if server_args is None:
-        server_args = get_server_args()
-
+def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    spec = get_spec()
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
-    return not server_args.enable_multi_layer_eagle
+    return not spec.enable_multi_layer_eagle
 
 
 @torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
@@ -762,10 +766,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     inside forward isolation, so it must not mutate req/pool state.
     """
     server_args = get_server_args()
-    if not server_args.enable_mamba_extra_buffer():
+    if not mamba_extra_buffer_enabled():
         return
     track_positions = None
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
             batch.reqs
@@ -1028,7 +1032,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     prep on its draft input -- the dispatcher routes.
     """
     server_args = get_server_args()
-    if server_args.enable_mamba_extra_buffer_lazy():
+    if mamba_extra_buffer_lazy_enabled():
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             get_exec().mamba.mamba_track_interval,

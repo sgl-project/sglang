@@ -855,11 +855,7 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
-    def _can_dual_stream_graph(
-        self, hidden_states: torch.Tensor, server_args=None
-    ) -> bool:
-        if server_args is None:
-            server_args = get_server_args()
+    def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (
             _enable_pcg_dsv2_dual_stream
             and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
@@ -872,7 +868,7 @@ class DeepseekV2MoE(nn.Module):
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
             and not getattr(self, "is_hash", False)
-            and not server_args.enable_eplb
+            and not get_exec().moe.enable_eplb
         )
 
     def forward(
@@ -895,8 +891,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            server_args = get_server_args()
-            if self._can_dual_stream_graph(hidden_states, server_args):
+            if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,

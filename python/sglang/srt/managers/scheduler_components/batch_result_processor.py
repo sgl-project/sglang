@@ -38,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
     get_server_args,
+    mamba_extra_buffer_lazy_enabled,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -1054,7 +1055,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_server_args().enable_mamba_extra_buffer_lazy()
+                    if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -1089,7 +1090,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = mamba_extra_buffer_lazy_enabled()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i
         )
