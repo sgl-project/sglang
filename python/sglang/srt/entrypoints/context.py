@@ -2,7 +2,7 @@
 # Copied from vLLM
 import logging
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Optional, Union
 
 import orjson
 
@@ -80,16 +80,45 @@ class HarmonyContext(ConversationContext):
         self.num_output_tokens = 0
         self.num_reasoning_tokens = 0
         self.finish_reason = None
+        # Logprobs for the tokens that decode to the visible ``final``-channel
+        # answer. Bucketed during append_output by tracking the parser's current
+        # channel, so reasoning / structural tokens are excluded. Parallel lists:
+        # one (logprob, token_id, token_text) per captured token, and (for
+        # top_logprobs requests) one top-k list per captured token.
+        self.final_token_logprobs: list = []
+        self.final_top_logprobs: Optional[list] = None
 
     def append_output(self, output) -> None:
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
-
-            for token_id in output_token_ids:
-                self.parser.process(token_id)
-            output_msgs = self.parser.messages
-
             meta_info = output["meta_info"]
+
+            token_logprobs = None
+            top_logprobs = None
+            if isinstance(meta_info, dict):
+                token_logprobs = meta_info.get("output_token_logprobs")
+                top_logprobs = meta_info.get("output_top_logprobs")
+
+            for i, token_id in enumerate(output_token_ids):
+                self.parser.process(token_id)
+                # Bucket logprobs for the visible answer: only tokens the parser
+                # attributes to the ``final`` channel AND that emit text.
+                # Structural tokens (headers, <|message|>, <|return|>) are
+                # excluded because last_content_delta is empty for them.
+                if (
+                    token_logprobs is not None
+                    and self.parser.current_channel == "final"
+                    and self.parser.last_content_delta
+                ):
+                    self.final_token_logprobs.append(token_logprobs[i])
+                    if top_logprobs is not None:
+                        if self.final_top_logprobs is None:
+                            self.final_top_logprobs = []
+                        self.final_top_logprobs.append(
+                            top_logprobs[i] if i < len(top_logprobs) else None
+                        )
+
+            output_msgs = self.parser.messages
 
             if isinstance(meta_info, dict):
                 if "prompt_token_ids" in meta_info:
@@ -191,6 +220,11 @@ class StreamingHarmonyContext(HarmonyContext):
         self.encoding = get_encoding()
         self.last_tok = None
         self.num_processed_tokens = 0
+        # Logprob of the most recent final-channel content token in the current
+        # chunk, exposed so the streaming delta event can carry it. Reset every
+        # append_output call; None when the chunk added no final-content token.
+        self.last_delta_logprob = None
+        self.last_delta_top_logprob = None
 
     @property
     def messages(self) -> list:
@@ -204,6 +238,8 @@ class StreamingHarmonyContext(HarmonyContext):
             # Check if we need to handle cumulative tokens
             meta_info = output.get("meta_info", {})
             completion_tokens = meta_info.get("completion_tokens")
+            all_token_logprobs = meta_info.get("output_token_logprobs")
+            all_top_logprobs = meta_info.get("output_top_logprobs")
             if (
                 completion_tokens is not None
                 and len(output_token_ids) == completion_tokens
@@ -212,17 +248,53 @@ class StreamingHarmonyContext(HarmonyContext):
                 # The output_ids contains all tokens generated so far.
                 # We only need to process the new tokens.
                 new_token_ids = output_token_ids[self.num_processed_tokens :]
+                new_token_logprobs = (
+                    all_token_logprobs[self.num_processed_tokens :]
+                    if all_token_logprobs is not None
+                    else None
+                )
+                new_top_logprobs = (
+                    all_top_logprobs[self.num_processed_tokens :]
+                    if all_top_logprobs is not None
+                    else None
+                )
                 self.num_processed_tokens = len(output_token_ids)
             else:
                 # Case 2: When --incremental-streaming-output is set.
                 # The output_ids contains only the new tokens.
                 new_token_ids = output_token_ids
+                new_token_logprobs = all_token_logprobs
+                new_top_logprobs = all_top_logprobs
                 self.num_processed_tokens += len(output_token_ids)
 
             self._record_finish_reason(meta_info)
 
-            for token_id in new_token_ids:
+            # Reset per-chunk delta state so last_delta_logprob always describes
+            # the current chunk's last final-channel content token (or None).
+            self.last_delta_logprob = None
+            self.last_delta_top_logprob = None
+            for i, token_id in enumerate(new_token_ids):
                 self.parser.process(token_id)
+                # Bucket final-channel content tokens (see HarmonyContext) and
+                # track the latest one for the streaming delta event.
+                if (
+                    new_token_logprobs is not None
+                    and self.parser.current_channel == "final"
+                    and self.parser.last_content_delta
+                ):
+                    token_lp = new_token_logprobs[i]
+                    self.final_token_logprobs.append(token_lp)
+                    self.last_delta_logprob = token_lp
+                    if new_top_logprobs is not None:
+                        top_lp = (
+                            new_top_logprobs[i]
+                            if i < len(new_top_logprobs)
+                            else None
+                        )
+                        if self.final_top_logprobs is None:
+                            self.final_top_logprobs = []
+                        self.final_top_logprobs.append(top_lp)
+                        self.last_delta_top_logprob = top_lp
 
         else:
             # Handle the case of tool output in direct message format
