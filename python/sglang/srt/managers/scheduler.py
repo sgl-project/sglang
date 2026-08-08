@@ -1295,8 +1295,10 @@ class Scheduler(
                 get_draft_recurrent_hidden_state_spec(draft_runner)
             )
         else:
-            disagg_hidden_size = 16  # minimal padding size for RDMA
-            disagg_hidden_states_dtype = torch.float32
+            # MetadataBuffers is part of the P/D wire schema, so its layout
+            # cannot depend on whether this local node runs speculative decode.
+            disagg_hidden_size = self.model_config.spec_hidden_size
+            disagg_hidden_states_dtype = self.model_config.dtype
 
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
