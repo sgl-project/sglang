@@ -20,15 +20,12 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 pip install -U uv
 uv venv --python 3.12 && source .venv/bin/activate
 
-# MiniMax-M3 ships in SGLang PR #27944, not yet in a tagged release — install from
-# the PR head. The serving runtime is in the base dependencies, so no extra is needed:
-git clone https://github.com/sgl-project/sglang.git
-cd sglang
-git fetch origin pull/27944/head && git checkout FETCH_HEAD
-uv pip install -e python
+# MiniMax-M3 support is in SGLang 0.5.16 — install the release directly
+# (the serving runtime is in the base dependencies, so no extra is needed):
+uv pip install "sglang>=0.5.16"
 ```
 
-Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — its image bundles the CUDA-13 runtime and the #27944 code. Once [PR #27944](https://github.com/sgl-project/sglang/pull/27944) is merged and released, `uv pip install sglang` will pull M3 support directly.
+Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — its image bundles the CUDA-13 runtime. M3 support landed in SGLang **0.5.16**, so `uv pip install sglang` (≥ 0.5.16) pulls it directly.
 
 </Tab>
 
