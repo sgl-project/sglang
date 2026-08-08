@@ -692,6 +692,34 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
                 self.assertIsInstance(loader, ModelOptModelLoader)
 
 
+class TestModelOptStandaloneFp4Config(CustomTestCase):
+    def test_w4a16_nvfp4_flat_config(self):
+        """W4A16_NVFP4 is the weight-only alias used by ModelOpt checkpoints."""
+        cfg = ModelOptFp4Config.from_config(
+            {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16,
+                "ignore": ["*embed_tokens*", "*self_attn*"],
+                "quant_method": "modelopt",
+            }
+        )
+        self.assertTrue(cfg.is_checkpoint_nvfp4_serialized)
+        self.assertEqual(cfg.group_size, 16)
+        self.assertEqual(cfg.get_config_filenames(), ["hf_quant_config.json"])
+        self.assertFalse(cfg.is_awq)
+        self.assertFalse(cfg.use_per_token_activation)
+
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        with patch(
+            "sglang.srt.layers.quantization.modelopt_quant.is_layer_skipped",
+            return_value=False,
+        ):
+            self.assertIsInstance(
+                cfg.get_quant_method(linear, "draft.layers.0.mlp.gate_up_proj"),
+                ModelOptNvFp4A16LinearMethod,
+            )
+
+
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
     def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(

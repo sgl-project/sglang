@@ -327,8 +327,16 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
     if sliding_window is None:
+        # Recent Transformers Qwen3Config versions discard the top-level
+        # ``sliding_window`` key even though it is present in published DFlash
+        # and DSpark config.json files.  NVIDIA's draft schema also carries the
+        # same value as ``dflash_config.swa_window_size``; retain that as the
+        # compatibility source for these checkpoints.
+        sliding_window = _get_dflash_config(config).get("swa_window_size")
+    if sliding_window is None:
         raise ValueError(
-            "DFLASH sliding_attention layers require config.sliding_window."
+            "DFLASH sliding_attention layers require config.sliding_window or "
+            "config.dflash_config.swa_window_size."
         )
 
     # HF sliding windows include the current token; SGLang stores window_left.
