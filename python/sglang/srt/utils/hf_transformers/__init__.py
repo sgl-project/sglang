@@ -22,7 +22,10 @@ path ``sglang.srt.utils.hf_transformers_utils`` is preserved by a
 separate shim module.
 """
 
-from ..hf_transformers_patches import normalize_rope_scaling_compat
+from ..hf_transformers_patches import (
+    normalize_deepseek_v4_compat,
+    normalize_rope_scaling_compat,
+)
 from .common import (
     CONTEXT_LENGTH_KEYS,
     AutoConfig,
@@ -64,5 +67,6 @@ __all__ = [
     "get_sparse_attention_config",
     "get_tokenizer",
     "get_tokenizer_from_processor",
+    "normalize_deepseek_v4_compat",
     "normalize_rope_scaling_compat",
 ]

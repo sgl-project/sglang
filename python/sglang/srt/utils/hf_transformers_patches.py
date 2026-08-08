@@ -76,6 +76,29 @@ def apply_all():
 # ---------------------------------------------------------------------------
 
 
+def normalize_deepseek_v4_compat(config) -> None:
+    """Backfill the DeepSeek V4 ``compress_rates`` -> ``compress_ratios`` rename
+    that landed in transformers >= 4.57 (#34092).
+
+    Downstream sglang code (``configs/model_config.py``,
+    ``models/deepseek_v4.py``, ``hardware_backend/npu/attention/
+    ascend_dsv4_backend.py``) reads ``.compress_ratios`` off the loaded HF
+    config directly. Copying the new-name attribute onto the old name at the
+    config-loading boundary lets every call site keep reading the legacy name,
+    avoiding scattered defensive ``getattr`` fallbacks.
+
+    Note: the sibling ``rope_scaling`` / ``rope_parameters`` rename is already
+    handled inside upstream transformers ``PretrainedConfig`` via a bidirectional
+    alias; no backfill is required here.
+    """
+
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return
+
+    if not hasattr(config, "compress_ratios") and hasattr(config, "compress_rates"):
+        config.compress_ratios = config.compress_rates
+
+
 def normalize_rope_scaling_compat(config) -> None:
     """Ensure rope_scaling dicts have ``"type"`` alongside ``"rope_type"``.
 
