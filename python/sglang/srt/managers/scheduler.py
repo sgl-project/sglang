@@ -3538,9 +3538,15 @@ class Scheduler(
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
-           swap so the forward-only copy gets pinned. The non-overlap (sync) path
-           runs on a single stream and doesn't allocate batch_record_buf, so it
-           passes overlap=False.
+           swap so the forward-only copy gets pinned. On exit (before the
+           restore) the CURRENT SB attr values are pinned into the same ring
+           slot: spec-V2 rebinds SB fields to fresh tensors DURING the forward
+           (after the pre-forward snapshot above), and the restore then drops
+           their only ref while forward-stream kernels may still read them.
+           This must be a lifetime pin, not a fence. vars() (NOT
+           dataclasses.fields): the rebinds include ad-hoc instance attrs.
+           The non-overlap (sync) path runs on a single stream and doesn't
+           allocate batch_record_buf, so it passes overlap=False.
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
@@ -3562,6 +3568,13 @@ class Scheduler(
         try:
             yield
         finally:
+            if overlap:
+                # Pin the CURRENT (post-forward, pre-restore) SB attr values for
+                # the 2-iter window before the restore below drops them (see
+                # docstring item 3).
+                self.batch_record_buf[self.batch_record_ct].append(
+                    list(vars(batch).values())
+                )
             if snapshot_v2_full:
                 for name, value in sched_snapshot.items():
                     setattr(batch, name, value)
