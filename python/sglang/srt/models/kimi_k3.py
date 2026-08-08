@@ -137,11 +137,16 @@ def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
     shared down GEMM call torch directly on raw merged weights, so the
     --bf16-gemm-backend cutedsl selection would silently skip them."""
+    if out is None and out_dtype is not None and out_dtype != x.dtype:
+        out = torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
+        )
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
@@ -155,15 +160,11 @@ def _k3_bf16_gemm(
             if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
-                if out.is_contiguous():
-                    # TGV stores straight into caller memory (same entry the
-                    # UnquantizedLinearMethod out-buffer path uses); no
-                    # staging tensor + copy.
-                    return cutedsl_bf16_gemm_out(x, weight, out)
-                out.copy_(cutedsl_bf16_gemm(x, weight))
-                return out
+                return cutedsl_bf16_gemm_out(x, weight, out)
     if out is None:
         return torch.nn.functional.linear(x, weight)
+    if out.dtype != x.dtype:
+        return torch.mm(x, weight.t(), out=out, out_dtype=out.dtype)
     return torch.mm(x, weight.t(), out=out)
 
 
@@ -478,14 +479,6 @@ class KimiK3MoE(nn.Module):
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
 
-        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
-        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
-        # so the fused-front split view can be consumed as is; other runners
-        # (e.g. marlin) require a dense buffer.
-        self._moe_front_needs_contiguous = (
-            not get_moe_runner_backend().is_flashinfer_mxfp4()
-        )
-
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
@@ -628,6 +621,7 @@ class KimiK3MoE(nn.Module):
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
+            "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
         ):
@@ -652,6 +646,19 @@ class KimiK3MoE(nn.Module):
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
+        )
+
+    @cached_property
+    def _front_fp32(self) -> bool:
+        """Emit the merged front in fp32 so the router reads exact logits.
+
+        The situ activation and the flashinfer_mxfp4 quantizer read the fp32
+        slices directly. Every other runner takes routed_input rounded back to
+        bf16 in _forward_fused, which is bit-identical to the bf16 front."""
+        return (
+            not _is_hip
+            and self._eligible_for_fused_front
+            and self._front_w.dtype == torch.bfloat16
         )
 
     def _forward_mega_experts(
@@ -972,6 +979,28 @@ class KimiK3MoE(nn.Module):
         return out if prefix_sum is None else out + prefix_sum
 
     @cached_property
+    def _moe_front_needs_dense_bf16(self) -> bool:
+        """Whether routed_input must be repaired into a dense bf16 buffer.
+
+        Only the SM100 trtllm-gen mxfp4 runner reads the front slice as it
+        comes: its group quant (route_quant_fused / per_token_group_quant)
+        takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
+        kernels return from apply() before that quant, and precision="bf16"
+        skips it as well, so those keep the bf16 contract even though the
+        runner backend is the same."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = self.experts.quant_method
+        return not (
+            isinstance(method, Mxfp4MoEMethod)
+            and method.use_flashinfer
+            and not method.use_marlin
+            and method._fi_kernel == "trtllm_sm100"
+            and method.flashinfer_mxfp4_moe_precision == "default"
+            and method.hidden_size == self.moe_hidden_size
+        )
+
+    @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
@@ -1051,14 +1080,20 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(hidden_states, self._front_w)
+        fused = _k3_bf16_gemm(
+            hidden_states,
+            self._front_w,
+            out_dtype=torch.float32 if self._front_fp32 else None,
+        )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if num_tokens > 1 and self._moe_front_needs_contiguous:
-            routed_input = routed_input.contiguous()
+        if self._moe_front_needs_dense_bf16:
+            # off an fp32 front the cast allocates the dense buffer, so the
+            # contiguous() behind it is free; off a bf16 front it is the copy
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
