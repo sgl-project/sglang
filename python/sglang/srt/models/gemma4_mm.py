@@ -399,10 +399,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
+            get_attn_backend().forward_metadata.sliding_mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
-            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
+            get_attn_backend().forward_metadata.sliding_custom_mask = (
+                bidirectional_attn_masks
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
