@@ -11,15 +11,13 @@ import sys
 import pytest
 import torch
 import triton
+from sgl_kernel import moe_align_block_size as cuda_moe_align_block_size
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.moe import moe_align_block_size as cuda_moe_align_block_size
+from sglang.kernels.ops.moe import moe_align_block_size as runner_moe_align_block_size
 from sglang.kernels.ops.moe.moe_align_small_numel import (
     SMALL_NUMEL_LIMIT,
     moe_align_small_numel,
-)
-from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-    moe_align_block_size as runner_moe_align_block_size,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -95,7 +93,8 @@ def _run_cuda(topk_ids, block_size, num_experts, ignore_invalid_expert=False):
         num_post_pad,
         cumsum_buffer,
         True,
-        ignore_invalid_expert,
+        # Wheel builds without ignore_invalid_expert bind an 8-arg signature.
+        *((ignore_invalid_expert,) if ignore_invalid_expert else ()),
     )
     return sorted_ids, expert_ids, num_post_pad
 

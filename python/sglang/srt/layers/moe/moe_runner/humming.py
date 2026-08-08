@@ -428,7 +428,7 @@ class HummingRunnerCore(MoeRunnerCore):
     def _prepare_indexed_gemm_kwargs(
         self, topk_ids: torch.Tensor
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+        from sglang.kernels.ops.moe import moe_align_block_size
 
         configs = self.get_humming_gemm_configs(HummingGemmType.INDEXED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)

@@ -9,9 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.moe_align import (
-    moe_align_block_size as jit_moe_align_block_size,
-)
+from sglang.kernels.ops.moe import moe_align_block_size
 
 
 @triton.jit
@@ -302,202 +300,6 @@ def _invoke_moe_lora_shrink_splitk(
     )
 
 
-def _align_block_size_jit(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
-
-    Uses the v2 kernel from moe_align_kernel.cu which supports large expert
-    counts via per-thread multi-expert processing and a two-level warp scan,
-    replacing the previous pure-PyTorch fallback that had excessive CPU overhead
-    from 15+ individual kernel launches and torch.argsort.
-
-    The JIT kernel uses a +1 offset convention: topk_ids are shifted by +1 so
-    that the EP sentinel value (-1) maps to bucket 0. The kernel internally
-    handles histogram, padded prefix-sum, expert_ids assignment, and token
-    scattering in just 2–3 CUDA kernel launches.
-    """
-    assert num_experts <= 8191, (
-        f"_align_block_size_jit supports at most 8191 experts "
-        f"(num_moe_experts * max_loras), got {num_experts}"
-    )
-
-    device = topk_ids.device
-    flat_topk_ids = topk_ids.reshape(-1)
-    if flat_topk_ids.dtype == torch.int64:
-        flat_topk_ids = flat_topk_ids.to(torch.int32)
-    num_total_tokens = flat_topk_ids.numel()
-
-    if num_total_tokens == 0:
-        empty = torch.empty(0, dtype=torch.int32, device=device)
-        return empty, empty, torch.zeros(1, dtype=torch.int32, device=device)
-
-    # JIT kernel uses +1 offset convention: -1 -> bucket 0 (sentinel),
-    # expert i -> bucket i+1. So pass num_experts + 1 as the bucket count.
-    jit_num_experts = num_experts + 1
-
-    if num_total_tokens < jit_num_experts:
-        max_num_tokens_padded = num_total_tokens * block_size
-    else:
-        max_num_tokens_padded = num_total_tokens + jit_num_experts * (block_size - 1)
-
-    # Align every sub-buffer offset to a multiple of 4 (VEC_SIZE). The CUDA
-    # kernel fills sorted_token_ids with vectorized int4 writes whose last
-    # store can spill up to 3 int32s past the logical end. With a fused
-    # allocation the spill would corrupt the adjacent sub-buffer.
-    _A4 = lambda n: (n + 3) & ~3  # noqa: E731
-    max_num_tokens_padded = _A4(max_num_tokens_padded)
-    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
-    max_num_m_blocks_padded = _A4(max_num_m_blocks)
-    num_post_pad_size = _A4(1)  # 1 element, padded to 4
-    cumsum_size = _A4(jit_num_experts + 1)
-
-    # Single allocation sliced into 4 views (zero-copy) to avoid
-    # per-call Python overhead of 4 separate torch.empty calls.
-    total_buf = (
-        max_num_tokens_padded
-        + max_num_m_blocks_padded
-        + num_post_pad_size
-        + cumsum_size
-    )
-    buf = torch.empty(total_buf, dtype=torch.int32, device=device)
-    off = 0
-    sorted_token_ids = buf[off : off + max_num_tokens_padded]
-    off += max_num_tokens_padded
-    expert_ids = buf[off : off + max_num_m_blocks]
-    off += max_num_m_blocks_padded
-    num_tokens_post_padded = buf[off : off + 1]
-    off += num_post_pad_size
-    cumsum_buffer = buf[off : off + jit_num_experts + 1]
-
-    jit_moe_align_block_size(
-        flat_topk_ids,
-        jit_num_experts,
-        block_size,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        cumsum_buffer,
-        True,  # pad_sorted_token_ids
-    )
-
-    return sorted_token_ids, expert_ids, num_tokens_post_padded
-
-
-@torch.compile(dynamic=True)
-def _align_block_size_torch(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch align_block_size for num_experts > 1024, compiled via torch.compile.
-
-    Fallback for platforms where the CUDA JIT kernel is unavailable (e.g. AMD/ROCm).
-
-    Out-of-range topk_ids (negative sentinels left by EP dispatch, or virtual-
-    expert IDs >= num_experts produced when those sentinels are combined with
-    a per-adapter offset) are routed into a dedicated sentinel bucket. Without
-    this, indexing ``padded_offsets[sorted_expert_ids]`` would wrap (-1) or
-    OOB-read, and the bad expert ids would propagate into the downstream LoRA
-    GEMM as real expert slots.
-    """
-    device = topk_ids.device
-    flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
-    num_total_tokens = flat_topk_ids.numel()
-
-    sentinel = num_experts
-    valid_mask = (flat_topk_ids >= 0) & (flat_topk_ids < num_experts)
-    safe_topk_ids = torch.where(
-        valid_mask,
-        flat_topk_ids,
-        torch.full_like(flat_topk_ids, sentinel),
-    )
-
-    bucket_count = num_experts + 1
-    max_total_padded_tokens = (
-        (num_total_tokens + bucket_count * (block_size - 1) + block_size - 1)
-        // block_size
-    ) * block_size
-    max_num_blocks = max_total_padded_tokens // block_size
-
-    sorted_token_ids = torch.full(
-        (max_total_padded_tokens,),
-        num_total_tokens,
-        dtype=torch.int32,
-        device=device,
-    )
-    expert_ids = torch.full(
-        (max_num_blocks,),
-        -1,
-        dtype=torch.int32,
-        device=device,
-    )
-
-    if num_total_tokens == 0:
-        num_tokens_post_padded = torch.zeros((1,), dtype=torch.int32, device=device)
-        return sorted_token_ids, expert_ids, num_tokens_post_padded
-
-    sorted_order = torch.argsort(safe_topk_ids)
-    sorted_expert_ids = safe_topk_ids[sorted_order]
-    expert_range = torch.arange(bucket_count, device=device, dtype=torch.int64)
-    counts_offsets = torch.searchsorted(sorted_expert_ids, expert_range, right=False)
-    counts_end = torch.searchsorted(sorted_expert_ids, expert_range, right=True)
-    counts = counts_end - counts_offsets
-    padded_counts = ((counts + block_size - 1) // block_size) * block_size
-    total_padded_tokens = padded_counts.sum().to(torch.int32).reshape(1)
-    padded_offsets = torch.cumsum(padded_counts, dim=0) - padded_counts
-
-    token_ranks = (
-        torch.arange(num_total_tokens, device=device, dtype=torch.int64)
-        - counts_offsets[sorted_expert_ids]
-    )
-    output_positions = padded_offsets[sorted_expert_ids] + token_ranks
-    sorted_token_ids.scatter_(
-        0,
-        output_positions.to(torch.int64),
-        sorted_order.to(torch.int32),
-    )
-
-    block_counts = padded_counts // block_size
-    real_block_counts = block_counts.clone()
-    real_block_counts[sentinel] = 0
-    actual_num_blocks = real_block_counts.sum()
-
-    if max_num_blocks <= 0:
-        return sorted_token_ids, expert_ids, total_padded_tokens
-
-    block_offsets = torch.cumsum(real_block_counts, dim=0)
-    all_block_positions = torch.arange(max_num_blocks, device=device, dtype=torch.int64)
-    assigned_experts = torch.searchsorted(
-        block_offsets, all_block_positions, right=True
-    ).to(torch.int32)
-    expert_ids.copy_(
-        torch.where(
-            all_block_positions < actual_num_blocks,
-            assigned_experts,
-            torch.full_like(assigned_experts, -1),
-        )
-    )
-
-    return sorted_token_ids, expert_ids, total_padded_tokens
-
-
-def _align_block_size_large(
-    topk_ids: torch.Tensor,
-    block_size: int,
-    num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Dispatch to the CUDA JIT kernel when available, otherwise fall back to
-    the pure-PyTorch torch.compile path (needed on AMD/ROCm or when the JIT
-    module fails to load)."""
-    try:
-        return _align_block_size_jit(topk_ids, block_size, num_experts)
-    except Exception:
-        return _align_block_size_torch(topk_ids, block_size, num_experts)
-
-
 def _merged_experts_fused_moe_lora_add_fake(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -577,21 +379,6 @@ def _merged_experts_fused_moe_lora_add_impl(
             }
         return cfg
 
-    def _align_block_size(
-        topk_ids: torch.Tensor,
-        block_size: int,
-        num_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The native align kernel consumes num_experts + 1 internally for its
-        # sentinel bucket, so the 1024-expert boundary must use the fallback path.
-        if num_experts < 1024:
-            from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-                moe_align_block_size as native_moe_align_block_size,
-            )
-
-            return native_moe_align_block_size(topk_ids, block_size, num_experts)
-        return _align_block_size_large(topk_ids, block_size, num_experts)
-
     def _get_routing(
         topk_ids: torch.Tensor,
         token_lora_mapping: torch.Tensor,
@@ -611,12 +398,12 @@ def _merged_experts_fused_moe_lora_add_impl(
                 topk_ids, token_lora_mapping, num_experts, shared_outer, max_loras
             )
         )
-        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             virtual_topk_ids,
             block_size=block_size,
             num_experts=virtual_num_experts,
         )
-        # _align_block_size uses a worst-case padded allocation. Trim the routing buffers
+        # moe_align_block_size uses a worst-case padded allocation. Trim the routing buffers
         # to a tighter upper bound so we keep the real routed work but drop unused padding
         num_tokens = topk_ids.numel()
         max_nonempty = min(num_tokens, virtual_num_experts)

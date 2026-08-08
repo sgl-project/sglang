@@ -6,7 +6,6 @@ from sglang.srt.layers.moe.moe_runner.triton_utils import (
     fused_experts,
     get_config,
     get_config_file_name,
-    moe_align_block_size,
     override_config,
     try_get_optimal_moe_config,
 )
@@ -18,6 +17,5 @@ __all__ = [
     "get_config",
     "fused_experts",
     "get_config_file_name",
-    "moe_align_block_size",
     "try_get_optimal_moe_config",
 ]

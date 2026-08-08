@@ -6,8 +6,8 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.kernels.ops.moe import moe_align_block_size
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
-from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,

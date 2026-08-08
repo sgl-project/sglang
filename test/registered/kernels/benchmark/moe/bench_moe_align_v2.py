@@ -1,6 +1,6 @@
 """moe_align + count&sort, over batch size for a few fixed (topk, num_experts).
 
-    aot     sglang.kernels.ops.moe.moe_align_block_size -- the sgl_kernel wheel
+    aot     sgl_kernel.moe_align_block_size -- the sgl_kernel wheel
             path, the same baseline the in-tree JIT copy is measured against
     v2      kernels/jit/csrc/moe/moe_align_v2.cuh -- drop-in for that same
             signature. Small batches take one fused launch; above its capacity a
@@ -20,15 +20,17 @@ about atomic contention.
 
 import torch
 import triton
+from sgl_kernel import moe_align_block_size as aot_moe_align_block_size
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.moe import moe_align_block_size as aot_moe_align_block_size
 from sglang.kernels.ops.moe.moe_align_small_numel import (
     SMALL_NUMEL_LIMIT,
     moe_align_small_numel,
 )
 from sglang.kernels.ops.moe.moe_align_v2 import CTA_SIZE as V2_CTA_SIZE
-from sglang.kernels.ops.moe.moe_align_v2 import moe_align_block_size as v2_moe_align_block_size
+from sglang.kernels.ops.moe.moe_align_v2 import (
+    moe_align_block_size_out as v2_moe_align_block_size,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -87,7 +89,9 @@ def _run_v2(ids, num_buckets, block_size, sorted_ids, expert_ids, post_pad, cums
 
 
 def _run_triton(ids, num_buckets, block_size, sorted_ids, expert_ids, post_pad, cumsum):
-    moe_align_small_numel(ids, num_buckets, block_size, sorted_ids, expert_ids, post_pad)
+    moe_align_small_numel(
+        ids, num_buckets, block_size, sorted_ids, expert_ids, post_pad
+    )
 
 
 FN_MAP = {
@@ -101,9 +105,7 @@ FN_MAP = {
 @marker.parametrize("topk,num_experts", SHAPES, [SHAPES[-1]])
 @marker.parametrize("batch_size", BATCH_SIZES, [1, 4096])
 @marker.benchmark("impl", ["aot", "v2", "triton"])
-def benchmark(
-    block_size: int, topk: int, num_experts: int, batch_size: int, impl: str
-):
+def benchmark(block_size: int, topk: int, num_experts: int, batch_size: int, impl: str):
     num_buckets = num_experts + 1
     numel = batch_size * topk
 

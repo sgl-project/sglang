@@ -1,6 +1,6 @@
 """moe_align with two paths behind one entry point.
 
-Drop-in for ``sglang.kernels.ops.moe.moe_align.moe_align_block_size``: same
+Drop-in for ``sglang.kernels.ops.moe.moe_align.moe_align_block_size_out``: same
 argument list, same buffer contract, same "+1 offset" convention, plus the AOT
 kernel's ``ignore_invalid_expert``. Small batches run one fused launch; above its
 capacity a two-launch histogram/scan + scatter path takes over. See
@@ -45,7 +45,7 @@ def _jit_moe_align_v2_module(use_pdl: bool) -> Module:
     )
 
 
-def moe_align_block_size(
+def moe_align_block_size_out(
     topk_ids: torch.Tensor,
     num_experts: int,
     block_size: int,

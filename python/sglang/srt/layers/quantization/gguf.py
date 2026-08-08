@@ -41,7 +41,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -52,6 +52,7 @@ if _is_cuda:
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.moe import moe_align_block_size
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -233,6 +234,10 @@ def fused_moe_gguf(
         top_k = topk_ids.shape[1]
         BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
 
+        # FIXME: ggml_moe_a8 derives its block-row count as
+        # sorted_token_ids.size(0) / mmq_x (floor), so the VEC_SIZE tail of that
+        # buffer can add one row whose expert_ids entry the align kernel never
+        # wrote. Pre-existing UB -- this call path only became live again here.
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
         )
