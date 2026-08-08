@@ -104,7 +104,6 @@ def _make_model_runner(
     mc.context_len = 8192
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
-    mr.mha_kv_head_num = num_kv_heads
 
     sa = SimpleNamespace()
     sa.max_total_tokens = None
