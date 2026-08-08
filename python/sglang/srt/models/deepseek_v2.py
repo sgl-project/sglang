@@ -190,12 +190,12 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_device,
     get_exec,
     get_forward,
     get_model,
     get_parallel,
-    get_server_args,
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1994,8 +1994,7 @@ class DeepseekV2AttentionMLA(
         # Determine attention backend name for current forward batch: prefer the
         # name stamped per-runner on the backend object, else resolve from server args.
         backend = get_attn_backend()
-        server_args = get_server_args()
-        default_prefill_str, default_decode_str = server_args.get_attention_backends()
+        default_prefill_str, default_decode_str = attention_backends()
         prefill_backend_str = (
             backend.prefill_attention_backend_str or default_prefill_str
         )

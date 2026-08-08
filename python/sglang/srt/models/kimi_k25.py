@@ -49,7 +49,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_parallel,
-    get_server_args,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -732,12 +731,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
             recyclable.
             """
             parallel = get_parallel()
-            server_args = get_server_args()
             # Match MmItemMemoryPool.try_to_recycle(), which waits for the
             # server TP size rather than the attention subgroup size.
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            ipc_consumer_count = max(parallel.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

@@ -467,14 +467,11 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
         "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
         return_value=sharded_embeddings,
     ) as run_dp, mock_patch(
-        "sglang.srt.models.kimi_k3.get_server_args",
-        return_value=SimpleNamespace(tp_size=1),
-    ), mock_patch(
         "sglang.srt.models.kimi_k3.get_parallel",
-        return_value=SimpleNamespace(attn_tp_size=1),
+        return_value=SimpleNamespace(attn_tp_size=1, tp_size=1),
     ):
         output = model.get_image_feature(items)
-        # exercise the loader inside the patch scope: it reads server args
+        # exercise the loader inside the patch scope: it reads the topology
         loader_in_scope = run_dp.call_args.kwargs["load_local_pixel_values"]
         local = loader_in_scope([1])
         both = loader_in_scope([0, 1])

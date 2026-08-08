@@ -3052,10 +3052,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             size rather than the attention subgroup size.
             """
             parallel = get_parallel()
-            server_args = get_server_args()
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            ipc_consumer_count = max(parallel.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

@@ -48,6 +48,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
+    configured_moe_dp_size,
     get_exec,
     get_model,
     get_parallel,
@@ -1776,14 +1777,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         parallel = get_parallel()
-        server_args = get_server_args()
         return {
             "tp": _safe(lambda: parallel.tp_size),
             "dp": _safe(lambda: parallel.moe_dp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
             "moe_dense_tp_size": parallel.moe_dense_tp_size,
-            "moe_dp_size": server_args.moe_dp_size,
+            "moe_dp_size": configured_moe_dp_size(),
             "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
