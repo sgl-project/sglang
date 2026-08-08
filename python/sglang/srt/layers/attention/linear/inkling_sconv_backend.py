@@ -564,6 +564,10 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         # one (KV write locs, the SWA loc translate).
         return self.full_attn_backend.forward_metadata
 
+    @forward_metadata.setter
+    def forward_metadata(self, value):
+        self.full_attn_backend.forward_metadata = value
+
     @property
     def supports_ragged_verify_graph(self) -> bool:
         return self.full_attn_backend.supports_ragged_verify_graph
