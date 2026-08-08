@@ -2747,13 +2747,13 @@ class ServerArgs:
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         "Transport multimodal features through CPU memory, a bounded CUDA IPC "
-        "pool, or a bounded CUDA VMM pool. CUDA VMM must be selected explicitly "
-        "and is available only to models that opt in. "
+        "pool, or a bounded CUDA VMM pool. "
         "Unset resolves automatically: multimodal models on single-node CUDA "
-        "deployments (without disaggregation) use cuda_ipc, everything else uses "
-        "cpu. Both CUDA transports reserve SGLANG_MM_FEATURE_CACHE_MB (default "
-        "1024 MiB) on the base GPU across tokenizer workers and fall back to CPU "
-        "transport per tensor when full.",
+        "deployments (without disaggregation) use cuda_ipc; validated multi-node "
+        "GB200/GB300 MNNVL models use cuda_vmm when an IMEX channel is available; "
+        "all other deployments use cpu. GPU transports reserve "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
+        "back to CPU transport when the pool is full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -7591,10 +7591,10 @@ class ServerArgs:
     def _handle_multimodal_feature_transport(self):
         """Resolve multimodal feature transport before tokenizer workers start.
 
-        CUDA IPC is deliberately opt-in: its fixed pool lives on ``base_gpu_id``
-        and reduces the memory left for model/KV-cache allocations.  The legacy
-        flag and environment variable remain supported so existing deployments
-        continue to work, but both map to this single policy.
+        GPU transports use a fixed pool on ``base_gpu_id`` and therefore reduce
+        the memory left for model/KV-cache allocations. The legacy CUDA IPC flag
+        and environment variable remain supported so existing deployments map
+        to this single policy.
         """
         requested_transport = self.mm_feature_transport
         legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
@@ -7631,20 +7631,48 @@ class ServerArgs:
             elif (
                 self.get_model_config().is_multimodal
                 and is_cuda()
-                and self.nnodes == 1
                 and self.disaggregation_mode == "null"
             ):
-                # Auto policy: single-node CUDA serving defaults to the bounded
-                # CUDA-IPC pool for multimodal models. Text-only deployments do
-                # not need feature transport. Multi-node (IPC handles are
-                # intra-node) and PD-disaggregated deployments keep CPU transport.
-                # A full pool degrades to CPU transport per tensor.
-                requested_transport = "cuda_ipc"
-                logger.info(
-                    "Multimodal feature transport auto-resolved to cuda_ipc "
-                    "(single-node CUDA). Pass --mm-feature-transport=cpu to "
-                    "opt out."
-                )
+                # A full GPU pool always degrades to CPU transport per tensor.
+                # CUDA IPC is intra-node; multi-node auto-selection is limited
+                # to GB200/GB300 systems where the runtime already enables the
+                # MNNVL/IMEX communication stack.
+                if self.nnodes == 1:
+                    requested_transport = "cuda_ipc"
+                    logger.info(
+                        "Multimodal feature transport auto-resolved to cuda_ipc "
+                        "(single-node CUDA). Pass --mm-feature-transport=cpu to "
+                        "opt out."
+                    )
+                elif is_mnnvl_fabric_device() and os.path.exists(
+                    "/dev/nvidia-caps-imex-channels/channel0"
+                ):
+                    from sglang.srt.model_loader.utils import (
+                        supports_cuda_vmm_feature_transport,
+                    )
+
+                    if supports_cuda_vmm_feature_transport(self.get_model_config()):
+                        requested_transport = "cuda_vmm"
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to "
+                            "cuda_vmm (multi-node GB200/GB300 MNNVL). Pass "
+                            "--mm-feature-transport=cpu to opt out."
+                        )
+                    else:
+                        requested_transport = "cpu"
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to cpu: "
+                            "the model has not opted into CUDA VMM transport."
+                        )
+                else:
+                    requested_transport = "cpu"
+                    if is_mnnvl_fabric_device():
+                        logger.info(
+                            "Multimodal feature transport auto-resolved to cpu: "
+                            "GB200/GB300 was detected but no IMEX channel is "
+                            "mounted. Configure the MNNVL compute domain or pass "
+                            "--mm-feature-transport=cuda_vmm after doing so."
+                        )
             else:
                 requested_transport = "cpu"
         elif legacy_ipc_is_set and legacy_ipc_enabled != (
@@ -7681,6 +7709,18 @@ class ServerArgs:
                     "--mm-feature-transport=cuda_vmm is not supported with "
                     "SGLANG_RUST_SERVER."
                 )
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            handle_kind = "CUDA FABRIC" if self.nnodes > 1 else "POSIX FD"
+            logger.info(
+                "Using CUDA VMM for multimodal features with %s sharing: "
+                "reserving up to %d MiB on base GPU %d across %d tokenizer "
+                "worker(s). This reduces KV cache headroom; a full pool falls "
+                "back to inline CPU transport.",
+                handle_kind,
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
+            )
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
