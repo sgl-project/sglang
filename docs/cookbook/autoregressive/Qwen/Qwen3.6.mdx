@@ -1,11 +1,104 @@
 ---
 title: Qwen3.6
-metatags:
-    description: "Deploy Qwen3.6 with SGLang - open-weight multimodal series with a 35B MoE (3B active) variant and a 27B dense variant, hybrid reasoning, tool calling, MTP, and long-context support."
+description: "Deploy Qwen3.6 with SGLang - open-weight multimodal series with a 35B MoE (3B active) variant and a 27B dense variant, hybrid reasoning, tool calling, MTP, and long-context support."
 tag: NEW
 ---
 
-import { Qwen36Deployment } from '/src/snippets/autoregressive/qwen36-deployment.jsx';
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+The recipes on this page were validated on **SGLang 0.5.15–0.5.16** (each benchmark cell records its exact `sglang_version`); use a recent release. For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). For SGLang CPU installation, see the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+# Install from PyPI
+uv pip install sglang
+
+# Or install from source
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the command generator below produces):
+
+**NVIDIA GPUs** (H100 / H200 / B200 / B300; also serves the NVFP4 variants) — `lmsysorg/sglang:latest`.
+
+```bash Command
+docker pull lmsysorg/sglang:latest
+
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    sglang serve <use args below>
+```
+
+**Xeon CPU** — `lmsysorg/sglang:v0.5.16-xeon` (there is no rolling `latest-xeon` tag, and `:latest` is CUDA-only; Xeon needs ≥ 0.5.15, see [#29497](https://github.com/sgl-project/sglang/pull/29497)).
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. The three serving strategies cover the common operating points:
+
+- **Low-Latency** — MTP (EAGLE speculative decoding) on; fastest reply for a single user. Pick for chat.
+- **Balanced** — good speed with several users at once. Use for typical multi-user serving.
+- **High-Throughput** — MTP off; most tokens per second across many users. Best for batch jobs.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/qwen/qwen3.6.jsx";
+import { benchmarks } from "/src/snippets/configs/qwen/qwen3.6-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Python / Docker</strong> — bare <code>sglang serve …</code> for an existing SGLang env, or a <code>docker run … sglang serve …</code> wrap against the per-hardware image from the <a href="#install">Install SGLang</a> panel above.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+  </ul>
+</div>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+
+The knobs come in two flavors:
+
+- **Built-in SGLang features** — parallelism overrides (TP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding (MTP) presets, prefill/decode disaggregation, and HiCache tiers.
+- **Qwen3.6-specific** — the **Mamba Radix Cache** strategy (V1 vs V2 `extra_buffer`).
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> reuse <strong>Python / Docker</strong> · <strong>⧉ Copy</strong> · <strong>$ cURL</strong> · <strong>⚙ Env</strong> from the Deploy panel, plus one extra:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li><strong>Submit ↗</strong> — opens a pre-filled GitHub issue so you can land your override combo as a new verified cookbook cell. Shown only while the badge says <strong>Not Verified</strong>; click it once you've actually run the command on your hardware and confirmed it works.</li>
+  </ul>
+</div>
 
 ## 1. Model Introduction
 
@@ -72,42 +165,12 @@ Both variants share the same hybrid reasoning, tool-calling, and multimodal inte
 
 **License:** Apache 2.0
 
-## 2. SGLang Installation
-
-SGLang `>=0.5.10` is required for Qwen3.6. You can install from PyPI, from source, or use a Docker image:
-
-```bash Command
-# Install from PyPI
-uv pip install sglang
-
-# Or install from source
-uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
-
-# Or use Docker (NVIDIA GPUs; also serves the NVFP4 variants)
-docker pull lmsysorg/sglang:latest
-```
-
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
-
-For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
-
-## 3. Model Deployment
-
-This section provides deployment configurations optimized for different hardware platforms and use cases.
-
-### 3.1 Basic Configuration
-
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
-
-
-<Qwen36Deployment />
-
-### 3.2 Configuration Tips
+## 2. Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
 - **Mamba Radix Cache**: Qwen3.6's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-radix-cache-strategy`:
   - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage.
-  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-radix-cache-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput.
+  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-radix-cache-strategy extra_buffer` (the recipe the benchmarks were measured with). Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput.
 - The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
 - Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
 - **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
@@ -120,6 +183,15 @@ This section provides deployment configurations optimized for different hardware
     - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
     - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
     - **27B NVFP4**: ~22GB for weights. TP=1 fits on B200/B300.
+- **NVFP4 is memory-oriented, not a throughput win.** In the `nvidia/Qwen3.6-*-NVFP4`
+  checkpoints the MoE expert + shared-expert layers are quantized as **W4A16** (4-bit
+  weights, 16-bit activations, group_size 16; attention stays FP8) — a `MIXED_PRECISION`
+  config. W4A16 roughly **halves the weight VRAM** but the matmuls still run in 16-bit, so
+  it does **not** engage the NVFP4 (W4A4) tensor-core fast path. Expect NVFP4 to let the
+  model fit on fewer/smaller GPUs, **not** to beat FP8/BF16 on throughput — the expert
+  layers (the bulk of MoE FLOPs) get no 4-bit compute acceleration in this checkpoint. On
+  35B-A3B NVFP4, also pass `--moe-runner-backend flashinfer_cutlass` (the default runner
+  rejects NVFP4-MoE on recent releases).
 
 All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. NVFP4 is available on B200/B300:
 
@@ -165,38 +237,150 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. 
   </tbody>
 </table>
 
-
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
-## 4. Model Invocation
+## 3. Advanced Usage
 
-Deploy Qwen3.6 with the following command (H200, all features enabled). Swap `--model-path` to `Qwen/Qwen3.6-27B-FP8` for the dense 27B variant — all other flags carry over:
+### 3.1 Reasoning
 
-```shell Command
-sglang serve \
-  --model-path Qwen/Qwen3.6-35B-A3B-FP8 \
-  --reasoning-parser qwen3 \
-  --tool-call-parser qwen3_coder \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --mem-fraction-static 0.8 \
-  --host 0.0.0.0 \
-  --port 30000
+Qwen3.6 supports Thinking mode **by default**. Enable the `qwen3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate the thinking and content sections — the thinking process is then returned via `reasoning_content` in the streaming response.
+
+To disable thinking and use Instruct mode, pass `{"enable_thinking": false}` via `chat_template_kwargs` at request time:
+
+- **Thinking mode** (default): The model performs step-by-step reasoning before answering. No extra parameters needed.
+- **Instruct mode** (`{"enable_thinking": false}`): The model responds directly without a thinking process.
+
+<Accordion title="Thinking Mode — default (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
 ```
 
-### 4.1 Basic Usage
+</Accordion>
 
-For basic API usage and request examples, please refer to:
+<Accordion title="Instruct Mode — thinking off (Python)">
 
-- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
 
-### 4.2 Vision Input
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "What is 15% of 240?"}
+    ],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    max_tokens=2048,
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+</Accordion>
+
+**Thinking Preservation.** Qwen3.6 has been trained to preserve and leverage thinking traces from historical messages. Enable this for agent scenarios where maintaining full reasoning context improves decision consistency, by passing `{"preserve_thinking": true}` via `chat_template_kwargs`:
+
+<Accordion title="Thinking Preservation (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "Help me plan a web app architecture."}
+    ],
+    extra_body={"chat_template_kwargs": {"preserve_thinking": True}},
+    max_tokens=2048,
+    stream=True
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+</Accordion>
+
+### 3.2 Vision Input
 
 Qwen3.6 supports image and video inputs as a unified vision-language model.
 
-**Image Input Example:**
+<Accordion title="Image Input (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -253,7 +437,9 @@ for chunk in response:
 print()
 ```
 
-**Video Input Example:**
+</Accordion>
+
+<Accordion title="Video Input (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -310,140 +496,13 @@ for chunk in response:
 print()
 ```
 
-### 4.3 Advanced Usage
+</Accordion>
 
-#### 4.3.1 Reasoning Parser
+### 3.3 Tool Calling
 
-Qwen3.6 supports Thinking mode **by default**. Enable the reasoning parser during deployment to separate the thinking and content sections. The thinking process is returned via `reasoning_content` in the streaming response.
+Qwen3.6 supports tool calling. Enable the `qwen3_coder` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
 
-To disable thinking and use Instruct mode, pass `chat_template_kwargs` at request time:
-
-- **Thinking mode** (default): The model performs step-by-step reasoning before answering. No extra parameters needed.
-- **Instruct mode** (`{"enable_thinking": false}`): The model responds directly without a thinking process.
-
-**Example 1: Thinking Mode (Default)**
-
-```python Example
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:30000/v1",
-    api_key="EMPTY"
-)
-
-response = client.chat.completions.create(
-    model="Qwen/Qwen3.6-35B-A3B-FP8",
-    messages=[
-        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
-    ],
-    max_tokens=2048,
-    stream=True
-)
-
-has_thinking = False
-has_answer = False
-thinking_started = False
-
-for chunk in response:
-    if chunk.choices and len(chunk.choices) > 0:
-        delta = chunk.choices[0].delta
-
-        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-            if not thinking_started:
-                print("=============== Thinking =================", flush=True)
-                thinking_started = True
-            has_thinking = True
-            print(delta.reasoning_content, end="", flush=True)
-
-        if delta.content:
-            if has_thinking and not has_answer:
-                print("\n=============== Content =================", flush=True)
-                has_answer = True
-            print(delta.content, end="", flush=True)
-
-print()
-```
-
-**Example 2: Instruct Mode (Thinking Off)**
-
-To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
-
-```python Example
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:30000/v1",
-    api_key="EMPTY"
-)
-
-response = client.chat.completions.create(
-    model="Qwen/Qwen3.6-35B-A3B-FP8",
-    messages=[
-        {"role": "user", "content": "What is 15% of 240?"}
-    ],
-    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-    max_tokens=2048,
-    stream=True
-)
-
-for chunk in response:
-    if chunk.choices and len(chunk.choices) > 0:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            print(delta.content, end="", flush=True)
-
-print()
-```
-
-#### 4.3.2 Thinking Preservation
-
-Qwen3.6 has been trained to preserve and leverage thinking traces from historical messages. Enable this for agent scenarios where maintaining full reasoning context improves decision consistency:
-
-```python Example
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:30000/v1",
-    api_key="EMPTY"
-)
-
-response = client.chat.completions.create(
-    model="Qwen/Qwen3.6-35B-A3B-FP8",
-    messages=[
-        {"role": "user", "content": "Help me plan a web app architecture."}
-    ],
-    extra_body={"chat_template_kwargs": {"preserve_thinking": True}},
-    max_tokens=2048,
-    stream=True
-)
-
-thinking_started = False
-has_thinking = False
-has_answer = False
-
-for chunk in response:
-    if chunk.choices and len(chunk.choices) > 0:
-        delta = chunk.choices[0].delta
-
-        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-            if not thinking_started:
-                print("=============== Thinking =================", flush=True)
-                thinking_started = True
-            has_thinking = True
-            print(delta.reasoning_content, end="", flush=True)
-
-        if delta.content:
-            if has_thinking and not has_answer:
-                print("\n=============== Content =================", flush=True)
-                has_answer = True
-            print(delta.content, end="", flush=True)
-
-print()
-```
-
-#### 4.3.3 Tool Calling
-
-Qwen3.6 supports tool calling capabilities. Enable the tool call parser during deployment.
+<Accordion title="Tool Calling (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -516,3 +575,5 @@ for chunk in response:
 
 print()
 ```
+
+</Accordion>
