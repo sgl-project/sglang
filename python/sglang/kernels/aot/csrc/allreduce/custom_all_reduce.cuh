@@ -224,14 +224,101 @@ DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank)
 #endif
 }
 
+#ifdef USE_ROCM
+// Global cache-bypassing 128-bit load/store, modeled on RCCL's op128.h
+// load128/store128
+// (https://github.com/ROCm/rocm-systems/blob/develop/projects/rccl/src/device/op128.h).
+// The custom all-reduce reads every peer's buffer over xGMI and writes results
+// that peers consume once; routing this traffic around the caches avoids
+// polluting L2 with single-use data and keeps peer reads/writes going straight
+// to HBM.
+//
+// Primary path (gfx942/gfx950): the __builtin_amdgcn_global_{load,store}_b128
+// builtins with a system syncscope ("") lower to global_{load,store}_dwordx4
+// with the sc0 and sc1 cache-bypass bits set. Fallback path: nontemporal
+// (streaming) 64-bit accesses, which set the SLC bit -- op128.h's builtin-free
+// path -- for toolchains/arches without the b128 builtins.
+#ifndef ROCM_HAVE_GLOBAL_DWORDX4_BUILTINS
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_global_load_b128) && \
+    __has_builtin(__builtin_amdgcn_global_store_b128)
+#define ROCM_HAVE_GLOBAL_DWORDX4_BUILTINS 1
+#else
+#define ROCM_HAVE_GLOBAL_DWORDX4_BUILTINS 0
+#endif
+#endif
+
+#if ROCM_HAVE_GLOBAL_DWORDX4_BUILTINS
+typedef unsigned int sgl_v4u __attribute__((ext_vector_type(4)));
+typedef __attribute__((address_space(1))) sgl_v4u* sgl_v4u_gptr;
+// An empty syncscope string denotes system scope in the AMDGPU backend, which
+// is what forces both cache-bypass bits (sc0 + sc1) on the dwordx4 access.
+#define SGL_SYSTEM_SYNCSCOPE ""
+#endif
+
+template <typename P>
+DINLINE P load_bypass(const P* ptr) {
+  static_assert(sizeof(P) == 16, "load_bypass expects a 16-byte packed type");
+#if ROCM_HAVE_GLOBAL_DWORDX4_BUILTINS
+  union {
+    P p;
+    sgl_v4u v;
+  } u;
+  u.v = __builtin_amdgcn_global_load_b128((sgl_v4u_gptr)ptr, SGL_SYSTEM_SYNCSCOPE);
+  return u.p;
+#else
+  union {
+    P p;
+    uint64_t u64[2];
+  } u;
+  const uint64_t* addr = reinterpret_cast<const uint64_t*>(ptr);
+  u.u64[0] = __builtin_nontemporal_load(addr);
+  u.u64[1] = __builtin_nontemporal_load(addr + 1);
+  return u.p;
+#endif
+}
+
+template <typename P>
+DINLINE void store_bypass(P* ptr, const P& val) {
+  static_assert(sizeof(P) == 16, "store_bypass expects a 16-byte packed type");
+#if ROCM_HAVE_GLOBAL_DWORDX4_BUILTINS
+  union {
+    P p;
+    sgl_v4u v;
+  } u;
+  u.p = val;
+  __builtin_amdgcn_global_store_b128((sgl_v4u_gptr)ptr, u.v, SGL_SYSTEM_SYNCSCOPE);
+#else
+  union {
+    P p;
+    uint64_t u64[2];
+  } u;
+  u.p = val;
+  uint64_t* addr = reinterpret_cast<uint64_t*>(ptr);
+  __builtin_nontemporal_store(u.u64[0], addr);
+  __builtin_nontemporal_store(u.u64[1], addr + 1);
+#endif
+}
+#endif
+
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P* ptrs[], int idx) {
+#ifdef USE_ROCM
+  // Read each peer's packed element with a cache-bypassing load so the reduction
+  // consumes fresh remote data without allocating it in L2 (see load_bypass).
+  A tmp = upcast(load_bypass(&ptrs[0][idx]));
+#pragma unroll
+  for (int i = 1; i < ngpus; i++) {
+    packed_assign_add(tmp, upcast(load_bypass(&ptrs[i][idx])));
+  }
+  return downcast<P>(tmp);
+#else
   A tmp = upcast(ptrs[0][idx]);
 #pragma unroll
   for (int i = 1; i < ngpus; i++) {
     packed_assign_add(tmp, upcast(ptrs[i][idx]));
   }
   return downcast<P>(tmp);
+#endif
 }
 
 template <typename T, int ngpus>
@@ -245,7 +332,11 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1s
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
+#ifdef USE_ROCM
+    store_bypass(&((P*)result)[idx], packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx));
+#else
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+#endif
   }
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
@@ -402,7 +493,13 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2s
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   // stage 1: reduce scatter
   for (int idx = start + tid; idx < end; idx += stride) {
+#ifdef USE_ROCM
+    // tmp_out lives in this rank's IPC-shared buffer and is read by peers in
+    // stage 2, so bypass the cache on the write as well.
+    store_bypass(&tmp_out[idx - start], packed_reduce<P, ngpus, A>(ptrs, idx));
+#else
     tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+#endif
   }
   multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
 
@@ -417,7 +514,13 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2s
       int gather_from_rank = ((rank + i) % ngpus);
       if (gather_from_rank == ngpus - 1 || idx < part) {
         int dst_idx = gather_from_rank * part + idx;
+#ifdef USE_ROCM
+        // Gather each peer's reduced chunk with a cache-bypassing load and write
+        // the local result with a cache-bypassing store.
+        store_bypass(&((P*)result)[dst_idx], load_bypass(&tmps[i][idx]));
+#else
         ((P*)result)[dst_idx] = tmps[i][idx];
+#endif
       }
     }
   }
