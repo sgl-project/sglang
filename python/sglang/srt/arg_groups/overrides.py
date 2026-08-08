@@ -2436,10 +2436,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
-    shared-experts fusion disabled; declared at the legacy write slots in
-    _handle_moe_kernel_config (before the deprecated cutlass env override, so
-    the runner value observed is the pre-override one)."""
+    """FlashInfer CuteDSL, TRT-LLM, TRT-LLM-routed, and AlphaMoE runners
+    require shared-experts fusion disabled; declared at the legacy write slots
+    in _handle_moe_kernel_config (before the deprecated cutlass env override,
+    so the runner value observed is the pre-override one)."""
     runner = view.moe_runner_backend
     if runner == "flashinfer_cutedsl":
         logger.warning(
@@ -2454,6 +2454,13 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     if runner == "flashinfer_trtllm_routed":
         logger.warning(
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
+    if runner == "flashinfer_alphamoe":
+        logger.warning(
+            "FlashInfer AlphaMoE is enabled. --disable-shared-experts-fusion "
+            "is automatically set because the fused router supports at most "
+            "512 experts."
         )
         return {"disable_shared_experts_fusion": True}
     return {}

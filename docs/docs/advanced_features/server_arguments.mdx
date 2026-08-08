@@ -1572,7 +1572,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-moe-runner-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MOE backend for EAGLE speculative decoding, see `--moe-runner-backend` for options. Same as moe runner backend if unset.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_alphamoe</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-moe-a2a-backend`</td>
@@ -1752,7 +1752,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-runner-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the runner backend for MoE.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_alphamoe</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-mxfp4-moe-precision`</td>

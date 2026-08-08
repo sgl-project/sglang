@@ -252,6 +252,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
     "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
+    "flashinfer_alphamoe",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
@@ -6579,6 +6580,63 @@ class ServerArgs:
                 "nvfp4_online",
                 None,
             ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+
+        if view.speculative_algorithm is not None and (
+            view.moe_runner_backend == "flashinfer_alphamoe"
+            or view.speculative_moe_runner_backend == "flashinfer_alphamoe"
+        ):
+            raise ValueError(
+                "flashinfer_alphamoe does not support speculative decoding; "
+                "the draft model backend and raw-logit TopK contract must remain "
+                "identical across build and execution"
+            )
+
+        if view.moe_runner_backend == "flashinfer_alphamoe":
+            effective_quantization = (
+                view.quantization or self.get_model_config().quantization
+            )
+            if effective_quantization != "fp8":
+                raise ValueError(
+                    "flashinfer_alphamoe supports only native W8A8 fine-grained "
+                    "FP8 checkpoints (--quantization fp8) with FP32 128x128 "
+                    "block scales. NVFP4/ModelOpt global scales are not "
+                    "representable by this kernel API. Got effective "
+                    f"quantization={effective_quantization!r}."
+                )
+            if self.tp_size != 4:
+                raise ValueError("flashinfer_alphamoe requires --tp-size 4")
+            if view.enable_torch_compile:
+                raise ValueError(
+                    "flashinfer_alphamoe does not support --enable-torch-compile; "
+                    "the fused router requires the raw-logit TopK bypass"
+                )
+            if not is_sm100_supported():
+                raise ValueError(
+                    "flashinfer_alphamoe requires an exact SM100/SM103 GPU "
+                    "(B200/B300) with CUDA >= 12.8."
+                )
+            device_sm = get_device_sm()
+            if device_sm not in {100, 103}:
+                raise ValueError(
+                    "flashinfer_alphamoe requires compute capability 10.0 or "
+                    f"10.3, got SM{device_sm}."
+                )
+            if view.ep_size != 1:
+                raise ValueError("flashinfer_alphamoe requires --ep-size 1")
+            if view.moe_a2a_backend != "none":
+                raise ValueError("flashinfer_alphamoe requires --moe-a2a-backend none")
+            if view.ep_num_redundant_experts != 0 or view.enable_eplb:
+                raise ValueError(
+                    "flashinfer_alphamoe does not support redundant experts or EPLB"
+                )
+            if view.init_expert_location != "trivial":
+                raise ValueError(
+                    "flashinfer_alphamoe requires --init-expert-location trivial"
+                )
+            if view.enable_lora or view.lora_paths:
+                raise ValueError("flashinfer_alphamoe does not support MoE LoRA")
+            if view.enable_waterfill:
+                raise ValueError("flashinfer_alphamoe does not support Waterfill")
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
