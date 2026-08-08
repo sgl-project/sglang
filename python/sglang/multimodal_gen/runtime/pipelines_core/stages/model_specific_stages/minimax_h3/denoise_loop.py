@@ -16,6 +16,10 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
+    get_ulysses_ctx,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -44,30 +48,6 @@ def _minimax_h3_update_target_rows_(
     torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
     torch.mul(sigma_ratio, state, out=state)
     torch.add(state, velocity, out=state)
-
-
-def _ulysses_ctx() -> tuple[int, int]:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ulysses_parallel_rank,
-        get_ulysses_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1, 0
-    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
-
-
-def _ring_ctx() -> tuple[int, int]:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ring_parallel_rank,
-        get_ring_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1, 0
-    return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
 def _build_local_embedding_layout(
@@ -192,8 +172,8 @@ class MiniMaxH3DenoiseBranch:
             1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device
         )
         text_pos_dev = text_pos.to(device)
-        ulysses_world_size, ulysses_rank = _ulysses_ctx()
-        ring_world_size, ring_rank = _ring_ctx()
+        ulysses_world_size, ulysses_rank = get_ulysses_ctx()
+        ring_world_size, ring_rank = get_ring_ctx()
         # Combined SP-local rank/world size: the group coordinator lays out
         # ring as the outer (slower-varying) dimension and Ulysses as the
         # inner one (see set_seq_parallel_pg_by_sp_groups), so this matches

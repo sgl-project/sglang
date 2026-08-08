@@ -11,11 +11,16 @@ from torch.distributed.tensor.experimental._attention import _cp_options
 from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
     pack_qkv_destination_major,
 )
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
     get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    flash_attn as _fa_backend,
 )
 from sglang.srt.utils.common import torch_release
 
@@ -832,15 +837,6 @@ def _ring_attention_varlen(
     downstream, but must not be corrupted by attending across the padding
     boundary), and a chunk that is entirely padding is skipped outright.
     """
-    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ring_ctx,
-        get_sp_group,
-    )
-    from sglang.multimodal_gen.runtime.layers.attention.backends import (
-        flash_attn as _fa_backend,
-    )
-
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."
     ring_chunk_len = q.shape[0]
