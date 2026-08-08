@@ -173,6 +173,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
     ):
         return False
     return owner.__class__.__name__ in {
+        "Lfm2VlForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
@@ -310,11 +311,17 @@ def _batch_encode_per_image_misses(
         for _idx, item, start, end in overlapping:
             if item.hash in hash_to_embedding:
                 continue
+            token_count = end - start + 1
             cached = embedding_cache.get_single(item.hash)
-            if cached is not None:
+            if cached is not None and cached.embedding.shape[0] == token_count:
                 hash_to_embedding[item.hash] = cached.embedding
-            elif item.hash not in unique_misses:
-                token_count = end - start + 1
+                continue
+            if cached is not None:
+                # A wrong-length entry would fail chunk assembly; evict it so
+                # the set() below can install the recompute (set() never
+                # overwrites an existing hash).
+                embedding_cache.free(item.hash, None)
+            if item.hash not in unique_misses:
                 unique_misses[item.hash] = (item, token_count)
 
     # Phase 1b: single ViT call for all unique cache misses
@@ -508,9 +515,11 @@ def _get_chunked_prefill_embedding(
 
         is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
         if is_per_image:
-            if _is_hip or _is_npu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP while CUDA uses batching.
+            if _is_npu or (
+                _is_hip and not _can_skip_pre_embed_feature_move(data_embedding_func)
+            ):
+                # NPU and HIP models without an encoder-side batching path keep
+                # the previous per-request fallback.
                 chunk = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
