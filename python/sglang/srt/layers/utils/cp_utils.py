@@ -83,6 +83,40 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
     )
 
 
+def mla_prefill_cp_use_mha_one_shot(forward_batch, backend_name: str) -> bool:
+    """Whether this CP prefill step can run the MHA one-shot formulation.
+
+    Absorbed MLA attends in the (kv_lora_rank + rope) latent space, which
+    costs ~3.4x the flops per query-key pair of the MHA formulation
+    (qk_head_dim + v_head_dim space). The non-CP prefill path therefore
+    prefers MHA whenever the materialized K/V fits; contiguous-strategy CP
+    can do the same: queries are already rank-local and the latent pool is
+    fully populated by materialize_full_mla_kv, so each rank up-projects its
+    causal window [0, prefix + blocks <= rank) and runs the same one-shot
+    varlen kernel. Zigzag keeps absorbed MLA (its per-rank queries are two
+    disjoint blocks, which the single-call one-shot geometry cannot express).
+    """
+    from sglang.srt.layers.cp.base import ContextParallelStrategyKind, get_cp_strategy
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    if backend_name != "fa3":
+        return False
+    if not is_cp_v2_active(forward_batch):
+        return False
+    strategy = get_cp_strategy()
+    if strategy is None or strategy.kind != ContextParallelStrategyKind.CONTIGUOUS:
+        return False
+    meta = forward_batch.attn_cp_metadata
+    if not meta.kv_len_prev_list:
+        return False
+    # Bound by the full (prefix + extend) window — the last rank's
+    # materialized K/V size — so every rank makes the same choice; a rank's
+    # actual window (sum of kv_len_prev) never exceeds it.
+    if forward_batch.seq_lens_cpu is None:
+        return False
+    return sum(forward_batch.seq_lens_cpu) <= forward_batch.get_max_chunk_capacity()
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # Base conditions: CP must be enabled, size > 1, and this must be a
     # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures

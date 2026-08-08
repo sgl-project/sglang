@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -17,6 +18,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -298,9 +300,26 @@ class DeepseekMHAForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if forward_batch.mha_one_shot and mla_use_prefill_cp(forward_batch):
+            # Contiguous prefill CP: kv_a/k_pe cover only this rank's block.
+            # Gather the full extend latent into the pool (the same
+            # collective the absorbed path runs in the backend), then fetch
+            # this rank's causal window back for the MHA up-projection.
+            # Always fetch, even with no prefix: the window spans other
+            # ranks' blocks, which the local tensors don't hold.
+            get_cp_strategy().materialize_full_mla_kv(
+                forward_batch, self.attn_mha, kv_a.unsqueeze(1), k_pe
+            )
+            kv_a, k_pe = self._get_mla_kv_buffer(
+                forward_batch.fetch_mha_one_shot_kv_indices_cp(),
+                q.dtype,
+                forward_batch,
+            )
+        else:
+            self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
-            forward_batch.mha_one_shot
+            not mla_use_prefill_cp(forward_batch)
+            and forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
             if (

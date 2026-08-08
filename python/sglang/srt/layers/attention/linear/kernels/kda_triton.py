@@ -225,8 +225,14 @@ class TritonKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         return_intermediate_states: bool = False,
+        cp_context=None,
         **kwargs,
     ) -> torch.Tensor:
+        # Context parallel (cp_context active): q/k/v/g/beta are this rank's
+        # contiguous shard, query_start_loc is shard-local and compacted, and
+        # cache_indices are the GLOBAL pool slots — chunk_kda's CP pre-process
+        # consumes them for the cross-rank state merge and hands the main
+        # kernel a scratch h0 instead. Only this Triton path supports CP.
         return chunk_kda(
             q=q,
             k=k,
@@ -241,4 +247,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             output_intermediate_states=return_intermediate_states,
+            cp_context=cp_context,
         )

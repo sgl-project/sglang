@@ -1107,8 +1107,8 @@ class ServerArgs:
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode.",
-            choices=("zigzag", "interleave"),
+            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode; 'contiguous' gives each rank one contiguous block per sequence (required by hybrid linear-attention models, e.g. KDA).",
+            choices=("zigzag", "interleave", "contiguous"),
         ),
         NS("parallel"),
     ] = None
@@ -6274,6 +6274,8 @@ class ServerArgs:
         strategy_to_legacy_mode = {
             "zigzag": "in-seq-split",
             "interleave": "round-robin-split",
+            # contiguous postdates the legacy mode names; it is its own alias.
+            "contiguous": "contiguous",
         }
 
         if (

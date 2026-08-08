@@ -20,7 +20,11 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.base import (
+    ContextParallelStrategyKind,
+    CPAttentionBackendKind,
+    get_cp_strategy,
+)
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
@@ -1546,6 +1550,42 @@ class FlashAttentionBackend(AttentionBackend):
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
+                elif is_cp_mode and forward_batch.mha_one_shot:
+                    # Contiguous-CP MHA one-shot: rank-local queries against
+                    # this rank's materialized causal window (K/V rows match
+                    # cu_seqlens_kv_prev exactly; causal=True bottom-right
+                    # aligns each query block to its window's end). The
+                    # metadata cu_seqlens are batch-global under CP, so the
+                    # geometry comes from the strategy metadata instead.
+                    cp_strategy = get_cp_strategy()
+                    assert (
+                        cp_strategy is not None
+                        and cp_strategy.kind == ContextParallelStrategyKind.CONTIGUOUS
+                    ), "MHA one-shot under CP requires the contiguous strategy"
+                    meta_cp = forward_batch.attn_cp_metadata
+                    n_logical = meta_cp.total_q_prev_tokens
+                    q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                    pad_size = q_all.shape[0] - n_logical
+                    assert pad_size >= 0
+                    output = flash_attn_varlen_func(
+                        q=q_all[:n_logical],
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        cu_seqlens_q=meta_cp.cu_seqlens_q_prev_tensor,
+                        cu_seqlens_k=meta_cp.cu_seqlens_kv_prev_tensor,
+                        max_seqlen_q=meta_cp.max_seqlen_q_prev,
+                        max_seqlen_k=max(meta_cp.kv_len_prev_list),
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        return_softmax_lse=forward_batch.mha_return_lse,
+                        ver=self.fa_impl_ver,
+                        **kwargs,
+                    )
+                    if pad_size > 0:
+                        output = torch.cat(
+                            [output, output.new_zeros(pad_size, *output.shape[1:])],
+                            dim=0,
+                        )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
                     cu_seqlens_k = (

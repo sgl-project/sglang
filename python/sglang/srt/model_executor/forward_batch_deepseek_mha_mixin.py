@@ -223,3 +223,29 @@ class ForwardBatchDeepSeekMHAMixin:
         )
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices
+
+    def fetch_mha_one_shot_kv_indices_cp(self):
+        """Per-rank causal-window kv indices for MHA one-shot under
+        contiguous prefill CP: sequence i contributes its first
+        ``kv_len_prev[i]`` pool slots (prefix + every block up to and
+        including this rank's), matching ``cu_seqlens_kv_prev_tensor``."""
+        if self.mha_one_shot_kv_indices is not None:
+            return self.mha_one_shot_kv_indices
+        meta = self.attn_cp_metadata
+        kv_indices = torch.empty(
+            sum(meta.kv_len_prev_list),
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        req_to_token = get_req_to_token_pool().req_to_token
+        create_flashinfer_kv_indices_triton[(meta.bs,)](
+            req_to_token,
+            self.req_pool_indices,
+            meta.kv_len_prev_tensor,
+            meta.cu_seqlens_kv_prev_tensor,
+            None,
+            kv_indices,
+            req_to_token.shape[1],
+        )
+        self.mha_one_shot_kv_indices = kv_indices
+        return kv_indices
