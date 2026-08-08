@@ -7,6 +7,7 @@ the post-init _handle_load_reporter_config check.
 from __future__ import annotations
 
 import argparse
+import sys
 
 import pytest
 
@@ -62,3 +63,7 @@ class TestLoadReporterPortValidation:
     def test_negative_is_rejected(self):
         with pytest.raises((ValueError, SystemExit)):
             _parse(["--load-reporter-port", "-1"])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

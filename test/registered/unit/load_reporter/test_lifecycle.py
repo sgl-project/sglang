@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 import types
 from typing import Any, AsyncIterator, List, Optional
 
@@ -615,3 +616,7 @@ class TestLifecycleShadowRestoration:
         handle._restore()
 
         assert owner.__dict__["generate_request"] is original
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

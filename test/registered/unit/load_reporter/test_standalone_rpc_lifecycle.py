@@ -371,3 +371,7 @@ class TestServeGrpcCleanup:
             uninstall_fake_smg()
         assert port_is_free(port)
         assert "generate_request" not in rm.__dict__
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

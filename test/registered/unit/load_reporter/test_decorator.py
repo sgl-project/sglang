@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import sys
 import weakref
 from typing import Any, Optional
 
@@ -722,3 +723,7 @@ class TestBoundRequestLifecycle:
         collected = [x async for x in owner.generate_request()]
         assert collected == [("x", 0), ("x", 1)]
         assert events == []
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
