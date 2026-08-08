@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -391,6 +392,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # Fused-accept spec path (flashinfer recurrent_kda only): the next
+        # verify seeds itself in-kernel from the accepted checkpoint slot
+        # (num_accepted_tokens), so the per-round SSM commit scatter is
+        # skipped and the committed pool goes stale between verifies — hence
+        # the radix-off requirement (nothing may read the committed SSM state
+        # mid-stream). accept_lens_pool holds last round's accept length per
+        # mamba slot; extend stages fresh requests with 1 (read slot 0).
+        if envs.SGLANG_OPT_KDA_FUSED_ACCEPT_STATE.get():
+            if not decode_backend.is_flashinfer():
+                raise ValueError(
+                    "SGLANG_OPT_KDA_FUSED_ACCEPT_STATE requires the flashinfer "
+                    "KDA decode backend (recurrent_kda)."
+                )
+            if not model_runner.server_args.disable_radix_cache:
+                raise ValueError(
+                    "SGLANG_OPT_KDA_FUSED_ACCEPT_STATE requires "
+                    "--disable-radix-cache: the committed SSM pool is stale "
+                    "between verifies under the fused-accept path."
+                )
+            if model_runner.server_args.enable_linear_replayssm_spec:
+                raise ValueError(
+                    "SGLANG_OPT_KDA_FUSED_ACCEPT_STATE is mutually exclusive "
+                    "with --enable-linear-replayssm-spec: both mechanisms own "
+                    "the verify-round SSM state commitment."
+                )
+            self.accept_lens_pool = torch.ones(
+                self.req_to_token_pool.size + 1,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -688,6 +719,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch, h, ssm_states, self.forward_metadata
             )
 
+        if (
+            self.accept_lens_pool is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Fused-accept staging: the extend kernel just wrote this request's
+            # committed state; copy it into scratch slot 0 and reset the accept
+            # length to 1 so the first verify reads slot 0. Runs once per KDA
+            # layer (the nat write is idempotent; the scratch copy is per-layer).
+            slots = cache_indices.to(torch.int64)
+            intermediate_ssm = mamba_cache_params.intermediate_ssm
+            intermediate_ssm[slots, 0] = ssm_states[slots].to(intermediate_ssm.dtype)
+            self.accept_lens_pool[slots] = 1
+
         return core_attn_out
 
     def _forward_target_verify(
@@ -855,6 +899,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
             **ring_kwargs,
+            **(
+                {"accept_lens_pool": self.accept_lens_pool}
+                if self.accept_lens_pool is not None
+                else {}
+            ),
         )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the

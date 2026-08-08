@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Per-slot accept lengths for the KDA fused-accept spec path; allocated only
+    # by KDAAttnBackend under SGLANG_OPT_KDA_FUSED_ACCEPT_STATE. None everywhere
+    # else — commit_mamba_states_after_verify keys the fused branch on it.
+    accept_lens_pool: Optional[torch.Tensor] = None
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID

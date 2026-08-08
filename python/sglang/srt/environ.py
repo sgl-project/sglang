@@ -938,6 +938,12 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # KDA MTP (flashinfer recurrent_kda only): seed each verify from the
+    # accepted checkpoint slot in the intermediate scratch (in-kernel
+    # num_accepted_tokens) instead of committing the SSM state back to the
+    # persistent pool every round. Skips the per-round SSM commit scatter.
+    # Requires --disable-radix-cache (the committed pool goes stale).
+    SGLANG_OPT_KDA_FUSED_ACCEPT_STATE = EnvBool(False)
 
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).

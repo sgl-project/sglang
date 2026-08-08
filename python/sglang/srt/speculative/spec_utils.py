@@ -1001,6 +1001,65 @@ def commit_mamba_states_after_verify(
         )
         return
 
+    # KDA fused-accept spec path (SGLANG_OPT_KDA_FUSED_ACCEPT_STATE, flashinfer
+    # recurrent_kda): the next verify seeds itself in-kernel from the accepted
+    # checkpoint slot (num_accepted_tokens gathered from accept_lens_pool), so
+    # the SSM scatter into `temporal` is skipped entirely. Only the conv windows
+    # still need the accept rollback, plus recording this round's accept lengths
+    # for the next verify's seed selection. Startup gates enforce radix off and
+    # mutual exclusion with --enable-linear-replayssm-spec (both mechanisms own
+    # the verify-round SSM state commitment).
+    linear_attn_backend = getattr(
+        model_runner.attn_backend, "linear_attn_backend", None
+    )
+    accept_lens_pool = (
+        linear_attn_backend.accept_lens_pool
+        if linear_attn_backend is not None
+        else None
+    )
+    if accept_lens_pool is not None:
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+
+        assert batch.mamba_track_indices is None, (
+            "KDA fused-accept requires mamba radix tracking off "
+            "(enforced at startup via --disable-radix-cache)"
+        )
+        bs = accept_lens.shape[0]
+        accept_indices_offset = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+        # The SAME slots the verify kernel wrote its checkpoints under.
+        state_batch_indices = linear_attn_backend.forward_metadata.mamba_cache_indices[
+            :bs
+        ]
+        accept_lens_pool[state_batch_indices.to(torch.int64)] = accept_lens.to(
+            torch.int32
+        )
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        for conv_states, intermediate_conv_window_cache in zip(
+            spec_state.conv, spec_state.intermediate_conv_window
+        ):
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_batch_indices,
+                last_correct_step_indices,
+            )
+        return
+
     attn_backend = model_runner.attn_backend
 
     bs = accept_lens.shape[0]
