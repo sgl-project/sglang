@@ -1558,6 +1558,7 @@
                 "pages": [
                   "docs/sglang-diffusion/api/cli",
                   "docs/sglang-diffusion/api/openai_api",
+                  "docs/sglang-diffusion/realtime_models",
                   "docs/sglang-diffusion/models_with_ar",
                   "docs/sglang-diffusion/models_with_pe",
                   "docs/sglang-diffusion/api/post_processing"
