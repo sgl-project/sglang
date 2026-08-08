@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import json
 import os
@@ -80,6 +81,17 @@ class TestPrepareServerArgs(CustomTestCase):
                 model_path="dummy",
                 return_hidden_states_mode="lst",
             )
+
+    def test_draft_quantization_explicitness_survives_asdict_round_trip(self):
+        inherited = ServerArgs(model_path="dummy", quantization="modelopt_fp4")
+        inherited._handle_missing_default_values()
+        self.assertEqual(inherited.speculative_draft_model_quantization, "modelopt_fp4")
+        self.assertFalse(inherited._speculative_draft_quantization_explicitly_set)
+
+        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
+        reconstructed._handle_missing_default_values()
+
+        self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -245,6 +257,32 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_vmm_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_rust_server(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
+        ):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_vmm_rejects_pipeline_parallelism(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_vmm", pp_size=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
             server_args._handle_multimodal_feature_transport()
 
 

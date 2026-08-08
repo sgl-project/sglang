@@ -13,7 +13,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
@@ -71,7 +71,7 @@ def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
     if (
-        runner.server_args.dcp_size > 1
+        get_parallel().dcp_enabled
         and runner.server_args.speculative_algorithm is not None
     ):
         _, decode_backend = runner.server_args.get_attention_backends()

@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     USPAttention,
     build_varlen_mask_meta,
+    build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
@@ -768,7 +769,9 @@ class QwenImageCrossAttention(nn.Module):
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
         seg_qkv = None
-        if sp_text_sharded:
+        # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
+        # the join_seqs path and exchanges inside the attention instead.
+        if sp_text_sharded and self.attn.sp_attention_mode == "ulysses":
             from sglang.multimodal_gen.runtime.layers.usp import (
                 _ipc_input_a2a_qkv_segmented,
             )
@@ -1563,6 +1566,26 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # once, so build varlen metadata replay-locally from the current
                 # static mask instead of closing over stale cu_seqlens/indices.
                 block_attention_kwargs["attn_mask_meta"] = DynamicVarlenMaskMeta()
+            elif (
+                txt_seq_lens is not None
+                and len(txt_seq_lens) == batch_size
+                and all(0 <= n <= encoder_hidden_states.shape[1] for n in txt_seq_lens)
+            ):
+                # txt_seq_lens already carries each row's valid text prefix
+                # (the mask is built from it), so the varlen metadata can be
+                # assembled host-side; the mask-based builder costs a GPU
+                # nonzero plus a device sync on every denoising step.
+                txt_len = encoder_hidden_states.shape[1]
+                block_attention_kwargs["attn_mask_meta"] = (
+                    build_varlen_mask_meta_from_ranges(
+                        [
+                            [(0, int(n)), (txt_len, txt_len + image_seq_len)]
+                            for n in txt_seq_lens
+                        ],
+                        max_seqlen=txt_len + image_seq_len,
+                        device=hidden_states.device,
+                    )
+                )
             else:
                 # Precompute varlen metadata once per request so every block
                 # reuses the same cu_seqlens / indices instead of rebuilding.

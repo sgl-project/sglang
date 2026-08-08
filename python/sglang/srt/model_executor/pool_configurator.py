@@ -182,13 +182,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
+                    draft_num_layers=int(draft_num_layers)
+                    * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=(
                         compute_dflash_draft_kv_cell_size_per_token(
                             draft_model_config=kvc.spec_aux_config.dflash_draft_model_config,
                             kv_cache_dtype=kvc.kv_cache_dtype,
                             draft_num_layers=int(draft_num_layers)
-                            * kvc.server_args.dcp_size,
+                            * get_parallel().attn_dcp_size,
                             tp_size=get_parallel().attn_tp_size,
                         )
                     ),
