@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     set_weight_attrs,
@@ -59,6 +60,21 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _fp8_proj_gemm_enabled(layer: torch.nn.Module) -> bool:
+    return (
+        envs.SGLANG_DSA_FP8_PROJ_GEMM.get()
+        and _use_aiter
+        and getattr(layer, "_fp8_proj_gemm", False)
+        and is_gfx95_supported()
+    )
+
+
+def fp8_proj_gemm_active(layer: torch.nn.Module) -> bool:
+    """Whether a marked BF16 projection was repacked for the PTPC FP8 path."""
+    return getattr(layer, "_fp8_proj_ready", False)
+
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -198,8 +214,29 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _fp8_proj_gemm_enabled(layer):
+            self._repack_bf16_to_fp8_ptpc(layer)
+            return
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+
+    @staticmethod
+    def _repack_bf16_to_fp8_ptpc(layer: torch.nn.Module) -> None:
+        """Keep the BF16 parameter and cache a shuffled PTPC FP8 weight copy."""
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
+
+        weight = layer.weight.data
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            return
+
+        fp8_weight, weight_scale = aiter.pertoken_quant(
+            weight, quant_dtype=aiter.dtypes.fp8
+        )
+        fp8_weight = shuffle_weight(fp8_weight, (16, 16))
+        layer._fp8_proj_weight = fp8_weight.contiguous()
+        layer._fp8_proj_weight_scale = weight_scale.contiguous()
+        layer._fp8_proj_ready = True
 
     def apply(
         self,
@@ -207,6 +244,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if fp8_proj_gemm_active(layer):
+            bf16_max_m = getattr(layer, "_fp8_proj_gemm_bf16_max_m", 0)
+            use_bf16 = (
+                bf16_max_m > 0
+                and isinstance(x, torch.Tensor)
+                and x.numel() // x.shape[-1] <= bf16_max_m
+            )
+            if not use_bf16:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    apply_fp8_ptpc_linear,
+                )
+
+                return apply_fp8_ptpc_linear(
+                    x,
+                    layer._fp8_proj_weight,
+                    layer._fp8_proj_weight_scale,
+                    bias=bias,
+                )
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

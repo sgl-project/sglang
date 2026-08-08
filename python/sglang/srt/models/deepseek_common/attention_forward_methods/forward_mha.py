@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple, Union
 
 import torch
 
@@ -17,6 +17,7 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -56,6 +57,10 @@ if _use_aiter_gfx95:
 
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+    from sglang.srt.models.deepseek_common.utils import (
+        flatten_fp8_per_token_quant,
+        fused_rms_fp8_per_token_quant,
+    )
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
@@ -63,6 +68,18 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
+
+
+def _maybe_quant_o_proj_input(
+    self: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if not fp8_proj_gemm_active(self.o_proj):
+        return attn_output
+    attn_output = attn_output.contiguous()
+    return flatten_fp8_per_token_quant(
+        attn_output,
+        dtype_quant=torch.float8_e4m3fn,
+    )
 
 
 def _forward_dsa_indexer_for_mha(
@@ -177,7 +194,22 @@ class DeepseekMHAForwardMixin:
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
-                if (
+                if _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                    q_quanted, q_lora, _, _ = fused_rms_fp8_per_token_quant(
+                        q,
+                        self.q_a_layernorm.weight,
+                        self.q_a_layernorm.variance_epsilon,
+                        None,
+                        None,
+                        None,
+                        dtype_quant=torch.float8_e4m3fn,
+                        res1=None,
+                        output_unquantized_inp1=True,
+                    )
+                    q = self.q_b_proj(q_quanted)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
+                elif (
                     _use_aiter_gfx95
                     and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                 ):
@@ -224,7 +256,22 @@ class DeepseekMHAForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                q, _, _, _ = fused_rms_fp8_per_token_quant(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=None,
+                    output_unquantized_inp1=False,
+                )
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            elif _use_aiter_gfx95 and (
+                self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+            ):
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -369,6 +416,7 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        attn_output = _maybe_quant_o_proj_input(self, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -423,6 +471,7 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        attn_output = _maybe_quant_o_proj_input(self, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
