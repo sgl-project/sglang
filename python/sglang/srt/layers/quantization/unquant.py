@@ -172,6 +172,25 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
+
+# Decode-optimised GEMM (gfx942/gfx950): loaded lazily on first use.
+# Enabled by SGLANG_DECODE_GEMM=1.  Disabled silently if unavailable.
+_decode_gemm_enabled = _is_hip and __import__("os").environ.get("SGLANG_DECODE_GEMM", "0") == "1"
+_decode_gemm_fn = None  # sglang.kernels.ops.kimi_k3.gemm_decode.gemm_decode
+
+def _try_load_decode_gemm() -> None:
+    global _decode_gemm_fn
+    if not _decode_gemm_enabled or _decode_gemm_fn is not None:
+        return
+    try:
+        from sglang.kernels.ops.kimi_k3.gemm_decode import gemm_decode, is_available
+        if is_available():
+            _decode_gemm_fn = gemm_decode
+            import logging as _lg
+            _lg.getLogger(__name__).info("decode GEMM kernel loaded")
+    except Exception:
+        pass
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -200,6 +219,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if _decode_gemm_enabled and isinstance(getattr(layer, "weight", None), torch.Tensor):
+            N = layer.weight.shape[0]
+            layer._decode_gemm_out = torch.empty(
+                512, N, dtype=torch.bfloat16, device=layer.weight.device
+            )
 
     def apply(
         self,
@@ -222,6 +246,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if bias is None and hasattr(layer, "_decode_gemm_out"):
+                _try_load_decode_gemm()
+                if _decode_gemm_fn is not None:
+                    out = _decode_gemm_fn(x, layer.weight)
+                    if out is not None:
+                        return out
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
