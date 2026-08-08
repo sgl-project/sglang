@@ -53,9 +53,12 @@ SGL_DEVICE packed_t rms(float2 valf, packed_t& weight, float rsqrt_square_sum) {
       make_float2(valf.x * weightf.x * rsqrt_square_sum, valf.y * weightf.y * rsqrt_square_sum));
 }
 
-template <bool kCastXBeforeOutMul, typename T, int VEC_SIZE_IN_BYTE>
+// clang-format off
+template <bool kCastXBeforeOutMul, bool kScaleInput, typename T, int VEC_SIZE_IN_BYTE>
 __global__ void fused_add_rmsnorm_reg_kernel(
-    T* __restrict__ input, T* __restrict__ residual, const T* __restrict__ weight, int vec_hidden_size, float eps) {
+    T* __restrict__ input, T* __restrict__ residual, const T* __restrict__ weight, int vec_hidden_size, float eps,
+    float input_scale) {
+  // clang-format on
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
 
   __shared__ float shared_memory[32];  // Used for CTA reduce
@@ -85,10 +88,22 @@ __global__ void fused_add_rmsnorm_reg_kernel(
     for (int i = 0; i < inner_loop; i++) {
       float2 val = device::cast<fp32x2_t, packed_t>(v[i]);
       float2 res = device::cast<fp32x2_t, packed_t>(v_res[i]);
-      float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-      acc_square.x += inp_res.x * inp_res.x;
-      acc_square.y += inp_res.y * inp_res.y;
-      v[i] = device::cast<packed_t, fp32x2_t>(inp_res);
+      float2 inp_res;
+      if constexpr (kScaleInput) {
+        // Match the unfused scale -> add -> RMSNorm dtype-rounding boundaries.
+        auto scaled = device::cast<packed_t, fp32x2_t>(make_float2(val.x * input_scale, val.y * input_scale));
+        val = device::cast<fp32x2_t, packed_t>(scaled);
+        inp_res = make_float2(val.x + res.x, val.y + res.y);
+        v[i] = device::cast<packed_t, fp32x2_t>(inp_res);
+        inp_res = device::cast<fp32x2_t, packed_t>(v[i]);
+        acc_square.x += inp_res.x * inp_res.x;
+        acc_square.y += inp_res.y * inp_res.y;
+      } else {
+        inp_res = make_float2(val.x + res.x, val.y + res.y);
+        acc_square.x += inp_res.x * inp_res.x;
+        acc_square.y += inp_res.y * inp_res.y;
+        v[i] = device::cast<packed_t, fp32x2_t>(inp_res);
+      }
       if constexpr (kCastXBeforeOutMul) {
         inp_res_cache[i] = inp_res;
       }
@@ -136,13 +151,14 @@ __global__ void fused_add_rmsnorm_reg_kernel(
   }
 }
 
-template <bool kCastXBeforeOutMul, typename DType>
+template <bool kCastXBeforeOutMul, bool kScaleInput, typename DType>
 struct FusedAddRMSNormKernel {
   static void
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView residual,
       const tvm::ffi::TensorView weight,
-      float eps) {
+      float eps,
+      float input_scale) {
     using namespace host;
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden_size"};
@@ -179,7 +195,7 @@ struct FusedAddRMSNormKernel {
           elements_in_vec);
 
       // Launch kernel
-      auto kernel = fused_add_rmsnorm_reg_kernel<kCastXBeforeOutMul, DType, device::kMaxVecBytes>;
+      auto kernel = fused_add_rmsnorm_reg_kernel<kCastXBeforeOutMul, kScaleInput, DType, device::kMaxVecBytes>;
       LaunchKernel(static_cast<uint>(N.unwrap()), threads, device.unwrap())
           .enable_pdl(false)(
               kernel,
@@ -187,7 +203,8 @@ struct FusedAddRMSNormKernel {
               reinterpret_cast<DType*>(residual.data_ptr()),
               reinterpret_cast<DType*>(weight.data_ptr()),
               vec_hidden_size,
-              eps);
+              eps,
+              input_scale);
     } else {
       host::RuntimeCheck(false, "Large hidden_sizes are not supported for now.");
     }
