@@ -84,7 +84,12 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
-    assert seq_lens.shape == (batch_size,)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.shape == (batch_size,), (
+        f"seq_lens must be one entry per sequence, got {tuple(seq_lens.shape)} "
+        f"for batch_size={batch_size}"
+    )
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
