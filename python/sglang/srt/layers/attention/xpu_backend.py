@@ -102,6 +102,15 @@ class XPUAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+
+        # If num_splits == 0, the kernel uses a heuristic to automatically
+        # determine the number of splits. Split-KV reduces across a
+        # non-deterministic number of partitions, so we pin num_splits to 1
+        # when deterministic inference is enabled to keep attention reduction
+        # order fixed. This mirrors the flash-attention (fa3) backend.
+        self.num_splits = (
+            1 if model_runner.server_args.enable_deterministic_inference else 0
+        )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -556,6 +565,10 @@ class XPUAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
+            # The MLA branch passes num_splits explicitly per call site, since the
+            # chunked-prefix varlen kernels there keep their own default.
+            kwargs["num_splits"] = self.num_splits
+
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -719,6 +732,7 @@ class XPUAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -740,6 +754,7 @@ class XPUAttentionBackend(AttentionBackend):
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
+                            num_splits=self.num_splits,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -845,6 +860,10 @@ class XPUAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
+
+            # Only the MHA kernels below take num_splits; the MLA path uses
+            # flash_mla_decode, which has no such argument.
+            kwargs["num_splits"] = self.num_splits
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
