@@ -27,8 +27,6 @@ What legitimately remains:
     the short circuit is the point: with PP off the group is never touched, which
     is what lets the ``Indexer`` be constructed before distributed init. The live
     property would demand the group either way.
-  - ``cuda_ipc_transport_utils.tp_size`` runs in the tokenizer process, which has
-    no groups at all (the call site already guards for "not published yet").
   - ``dp_attention.attn_cp_size`` / ``moe_dp_size``: the configuration the
     predicate detects (``attn_cp_size > moe_dp_size``) is the one where
     ``initialize_model_parallel`` aliases ``_MOE_DP`` to ``_ATTN_CP``, so the live
@@ -74,7 +72,6 @@ _CONFIG_INTENT_SIZES = frozenset(
         ("srt/layers/dp_attention.py", "attn_cp_size"),
         ("srt/layers/dp_attention.py", "moe_dp_size"),
         ("srt/model_loader/loader.py", "moe_dp_size"),
-        ("srt/utils/cuda_ipc_transport_utils.py", "tp_size"),
     }
 )
 

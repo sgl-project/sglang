@@ -20,6 +20,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    MmItemMemoryPool,
+    get_mm_feature_pool_size_per_worker,
+)
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     envs,
@@ -30,13 +36,6 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
-)
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-    get_mm_feature_pool_size_per_worker,
 )
 
 _is_cpu = is_cpu()
@@ -364,6 +363,7 @@ class BaseMultimodalProcessor(ABC):
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
                 self.server_args.base_gpu_id,
+                self.server_args.tp_size,
             )
 
     @property
@@ -1368,24 +1368,11 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
-        sync_flag, available_slice, byte_offset = (
-            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
+        proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
+            tensor,
+            use_pool_handle_cache=self.use_ipc_pool_handle_cache,
         )
-        if isinstance(available_slice, torch.Tensor):
-            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
-            return CudaIpcTensorTransportProxy(
-                data=available_slice,
-                info_data=tensor,
-                sync_buffer_meta=sync_flag,
-                pool_ipc_handle=(
-                    self.cudaipc_mmfeature_pool._pool_ipc_handle
-                    if self.use_ipc_pool_handle_cache
-                    else None
-                ),
-                pool_byte_offset=byte_offset,
-                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-            )
-        return tensor.cpu()
+        return proxy if proxy is not None else tensor.cpu()
 
     @staticmethod
     def _move_feature_to_cpu(value):
