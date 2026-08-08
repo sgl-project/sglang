@@ -208,12 +208,42 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
 def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
     """Write fields on behalf of the pipeline (bypasses the strict bare-
     assignment guard that protects post-resolution mutation)."""
-    object.__setattr__(server_args, "_in_override", True)
+    object.__setattr__(server_args, "_internal_write", True)
     try:
         for field, value in fields.items():
             setattr(server_args, field, value)
     finally:
-        object.__setattr__(server_args, "_in_override", False)
+        object.__setattr__(server_args, "_internal_write", False)
+
+
+def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
+    """Resolve fields on a config that is **not published yet**.
+
+    Some resolution rules need values unavailable during ``__post_init__``, such
+    as a loaded tokenizer's chat template. They may write only an unpublished
+    config; publishing roles use their runtime or control-plane overlays.
+
+    Refuses to touch the published instance: after publish the bags exist and a
+    field write would desync them, which is what ``get_context().override`` is
+    for.
+    """
+    from sglang.srt.runtime_context import get_context
+
+    try:
+        published = get_context().server_args
+    except ValueError:
+        published = None
+    if published is server_args:
+        raise ValueError(
+            f"declare_late_resolution({source!r}) called on the published config; "
+            "post-publish changes go to the bags via get_context().override(...)"
+        )
+    log = getattr(server_args, "_runtime_mutations", None)
+    if log is None:
+        log = []
+        object.__setattr__(server_args, "_runtime_mutations", log)
+    log.append((source, dict(fields)))
+    _apply_fields(server_args, fields)
 
 
 def materialize_declarations(server_args: Any) -> None:
@@ -260,18 +290,6 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
         "extra_buffer",
         "extra_buffer_lazy",
     )
-
-
-def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
-    """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes): validated against the resolvable whitelist, then
-    written to the config bags via ``get_context().override``; ``server_args``
-    stays the pristine startup record."""
-    from sglang.srt.runtime_context import get_context
-
-    context = get_context()
-    validate_declarations(context.server_args, [(source, dict(declared))])
-    context.override(source, **declared)
 
 
 def collect_model_override_declarations(
@@ -327,8 +345,10 @@ def _dspark_verify_on_decode_backend(
     if backend == "tokenspeed_mla":
         return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
-        # The cute-dsl kernel rejects q_len >= 5 with no fallback.
-        return q_len <= 4
+        # cute-dsl monolithic MLA decode folds the verify tokens into the head
+        # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer
+        # >= 0.6.15 (older builds reject q_len >= 5).
+        return True
     return False
 
 
@@ -1200,7 +1220,29 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
 
-    if (is_modelopt or model_config.quantization is None) and (
+    has_w4a16_moe_layers = False
+    if is_modelopt and quantization == "modelopt_mixed":
+        has_w4a16_moe_layers = any(
+            info.get("quant_algo") == "W4A16_NVFP4" and ".experts." in name
+            for name, info in hf_config.quantization_config.get(
+                "quantized_layers", {}
+            ).items()
+        )
+
+    if has_w4a16_moe_layers:
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
+        if server_args.moe_runner_backend not in ("auto", "marlin"):
+            raise ValueError(
+                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+            )
+        if server_args.moe_runner_backend == "auto":
+            overrides["moe_runner_backend"] = "marlin"
+            logger.info(
+                "Use marlin as MoE runner backend for "
+                f"{model_arch} with W4A16_NVFP4 MoE layers"
+            )
+    elif (is_modelopt or model_config.quantization is None) and (
         server_args.moe_runner_backend == "auto"
     ):
         if is_sm100_supported() and server_args.moe_a2a_backend == "none":
@@ -1233,6 +1275,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -1261,6 +1304,14 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         "attention_backend": sm100_default_attn_backend,
         "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
     }
+
+
+@_register_for("InternS2MobiusForConditionalGeneration")
+def _interns2_mobius_baseline_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Select the only MoE runner validated for the 2,560-expert baseline."""
+    if server_args.moe_runner_backend == "auto":
+        return {"moe_runner_backend": "triton_kernel"}
+    return {}
 
 
 @_register_for("Qwen3VLForConditionalGeneration")
@@ -1411,6 +1462,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
+        "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
@@ -1725,6 +1777,9 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
         if (
             view.moe_a2a_backend == "none"
             and view.moe_runner_backend == "auto"
+            # LongCat top-k spans the zero-expert logits, which trtllm-gen's
+            # fused routing cannot see.
+            and not model_arch.startswith("LongcatFlash")
             and (
                 quantization
                 in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]

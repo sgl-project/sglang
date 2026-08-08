@@ -365,7 +365,6 @@ class TestCreateGrammarBackend(unittest.TestCase):
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser="auto")
         tokenizer = MagicMock()
-        # encode must return a single-token list for think_start/end tokens
         tokenizer.encode.return_value = [42]
 
         result = create_grammar_backend(

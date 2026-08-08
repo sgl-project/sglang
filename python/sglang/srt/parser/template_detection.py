@@ -22,12 +22,14 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import jinja2
 import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
+
+from sglang.srt.arg_groups.overrides import declare_late_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -625,6 +627,22 @@ def detect_inline_system_support(chat_template: Optional[str]) -> bool:
         return False
 
 
+def _detect_auto_parser(
+    attr: str,
+    ctx: TemplateDetectionContext,
+    rules: Tuple[DetectionRule, ...],
+    label: str,
+) -> Optional[str]:
+    detected = match_rules(ctx, rules, label)
+    if detected:
+        logger.info(
+            f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
+        )
+        return detected
+    _log_undetected_parser(attr, label)
+    return None
+
+
 def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[str]:
     if not chat_template_arg or not isinstance(chat_template_arg, str):
         return None
@@ -636,9 +654,14 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
         return f.read().replace("\\n", "\n")
 
 
-def _detect_architecture_auto_parsers(
-    server_args,
-) -> Tuple[Optional[str], Optional[str], str]:
+def _log_undetected_parser(attr: str, label: str) -> None:
+    logger.warning(
+        f"--{attr.replace('_', '-')}=auto specified but could not detect "
+        f"{label} from chat template. Disabling {label}."
+    )
+
+
+def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     config = get_config(
@@ -658,22 +681,35 @@ def _detect_architecture_auto_parsers(
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
     else:
-        return None, None, arch
+        return {}
 
-    return reasoning_parser, tool_call_parser, arch
+    resolved = {}
+    for attr, detected in (
+        ("reasoning_parser", reasoning_parser),
+        ("tool_call_parser", tool_call_parser),
+    ):
+        if attr in needs:
+            resolved[attr] = detected
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
+                f"from model architecture '{arch}'"
+            )
+    return resolved
 
 
 def resolve_auto_parsers(
     server_args,
     tokenizer,
     *,
-    config_override: Optional[Callable[..., None]] = None,
+    config_writer: Optional[Callable[..., None]] = None,
 ) -> None:
     """Resolve auto parsers using a tokenizer already owned by the caller."""
-    needs_reasoning = server_args.reasoning_parser == "auto"
-    needs_tool_call = server_args.tool_call_parser == "auto"
-
-    if not needs_reasoning and not needs_tool_call:
+    needs = tuple(
+        attr
+        for attr in ("reasoning_parser", "tool_call_parser")
+        if getattr(server_args, attr) == "auto"
+    )
+    if not needs:
         return
 
     chat_template_arg = getattr(server_args, "chat_template", None)
@@ -694,9 +730,7 @@ def resolve_auto_parsers(
     ctx = build_detection_context(
         template, tokenizer, reasoning_config, force_reasoning
     )
-    architecture = ""
-    reasoning_parser = None
-    tool_call_parser = None
+    detected: Dict[str, Optional[str]] = {}
     if ctx is None:
         if has_explicit_template_without_detection:
             logger.warning(
@@ -706,49 +740,29 @@ def resolve_auto_parsers(
             )
         else:
             try:
-                reasoning_parser, tool_call_parser, architecture = (
-                    _detect_architecture_auto_parsers(server_args)
-                )
+                detected.update(_architecture_auto_parsers(server_args, needs))
             except Exception as e:
                 logger.warning(
                     "Failed to load model config for architecture-based auto-detection: %s",
                     e,
                 )
+        for attr, label in (
+            ("reasoning_parser", "reasoning parser"),
+            ("tool_call_parser", "tool-call parser"),
+        ):
+            if attr in needs and attr not in detected:
+                _log_undetected_parser(attr, label)
+                detected[attr] = None
     else:
-        if needs_reasoning:
-            reasoning_parser = match_rules(
-                ctx, REASONING_PARSER_RULES, "reasoning parser"
-            )
-        if needs_tool_call:
-            tool_call_parser = match_rules(
-                ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"
-            )
+        for attr, rules, label in (
+            ("reasoning_parser", REASONING_PARSER_RULES, "reasoning parser"),
+            ("tool_call_parser", TOOL_CALL_PARSER_RULES, "tool-call parser"),
+        ):
+            if attr in needs:
+                detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
-    updates = {}
-    for attr, needed, detected, label in (
-        ("reasoning_parser", needs_reasoning, reasoning_parser, "reasoning parser"),
-        ("tool_call_parser", needs_tool_call, tool_call_parser, "tool-call parser"),
-    ):
-        if not needed:
-            continue
-        updates[attr] = detected
-        if detected:
-            detection_source = (
-                f"model architecture '{architecture}'"
-                if architecture
-                else "chat template"
-            )
-            logger.info(
-                f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
-                f"from {detection_source}"
-            )
+    if detected:
+        if config_writer is None:
+            declare_late_resolution(server_args, "template-detection", **detected)
         else:
-            logger.warning(
-                f"--{attr.replace('_', '-')}=auto specified but could not detect "
-                f"{label} from chat template. Disabling {label}."
-            )
-
-    if config_override is None:
-        server_args.override(source="template-detection", **updates)
-    else:
-        config_override(source="template-detection", **updates)
+            config_writer("template-detection", **detected)

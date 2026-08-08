@@ -90,24 +90,15 @@ class DecodeStatus:
 
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
-    """DetokenizerManager is a process that detokenizes the token ids."""
-
     def __init__(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        # Init inter-process communication
         self.init_ipc_channels(port_args, server_args)
-
-        # Init tokenizer
         self.init_tokenizer(server_args)
-        self.init_auto_parsers(server_args)
-
-        # Init running status
+        resolve_auto_parsers(server_args, self.tokenizer)
         self.init_running_status(server_args)
-
-        # Init dispatcher
         self.init_request_dispatcher()
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):
@@ -139,9 +130,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 self.vocab_size = len(self.tokenizer)
             except TypeError:
                 self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
-
-    def init_auto_parsers(self, server_args: ServerArgs) -> None:
-        resolve_auto_parsers(server_args, self.tokenizer)
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)

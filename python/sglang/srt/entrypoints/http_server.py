@@ -163,6 +163,7 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -214,12 +215,6 @@ def get_global_state() -> _GlobalState:
 
 
 async def init_multi_tokenizer() -> ServerArgs:
-    """
-    Initialization function for multi-process tokenizer mode.
-    It read args information from shm and inits tokenizer manager for current process.
-    """
-
-    # Read configuration from shared memory
     main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
@@ -227,12 +222,10 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
-    # API key authentication is not supported in multi-tokenizer mode
     assert (
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
-    # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
@@ -241,12 +234,16 @@ async def init_multi_tokenizer() -> ServerArgs:
         f"ipc_name={port_args.tokenizer_ipc_name}"
     )
 
-    # Launch multi-tokenizer manager process
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
     tokenizer_manager, template_manager = init_tokenizer_manager(
         server_args,
         port_args,
         TokenizerManagerClass=tokenizer_worker_class,
+    )
+    resolve_auto_parsers(
+        server_args,
+        tokenizer_manager.tokenizer,
+        config_writer=tokenizer_manager.record_config_updates,
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
@@ -2038,8 +2035,10 @@ async def vertex_generate(
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
-    if isinstance(ret, Response):
-        return ret
+    if isinstance(ret, Response) and ret.status_code == 200 and hasattr(ret, "body"):
+        return ORJSONResponse({"predictions": orjson.loads(ret.body)})
+    return ret
+
     return ORJSONResponse({"predictions": ret})
 
 
