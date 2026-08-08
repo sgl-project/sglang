@@ -27,7 +27,10 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
 )
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
-from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
+from sglang.srt.utils.hf_transformers_patches import (
+    normalize_deepseek_v4_compat,
+    normalize_rope_scaling_compat,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -150,6 +153,47 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         cfg.rope_scaling = {"factor": 4.0}
         normalize_rope_scaling_compat(cfg)
         self.assertNotIn("type", cfg.rope_scaling)
+
+
+# ---------------------------------------------------------------------------
+# normalize_deepseek_v4_compat (issue #34092)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeDeepseekV4Compat(unittest.TestCase):
+    """Guard #34092: transformers >= 4.57 renamed ``compress_ratios`` to
+    ``compress_rates`` on ``DeepseekV4Config``. Every sglang reader uses the
+    legacy name, so the loader must backfill it at the config-load boundary.
+    Before the fix, a config with only ``compress_rates`` raised
+    ``AttributeError`` at ``ModelConfig.__init__`` (model_config.py:
+    ``self.compress_ratios = self.hf_config.compress_ratios``)."""
+
+    def test_backfills_compress_ratios_from_compress_rates(self):
+        cfg = PretrainedConfig()
+        cfg.model_type = "deepseek_v4"
+        cfg.compress_rates = [4, 128, 4]
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.compress_ratios, [4, 128, 4])
+
+    def test_preserves_existing_legacy_name(self):
+        # Older-transformers config already carries the legacy name; the
+        # helper must not clobber it with the (absent) new name.
+        cfg = PretrainedConfig()
+        cfg.model_type = "deepseek_v4"
+        cfg.compress_ratios = [128]
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.compress_ratios, [128])
+
+    def test_no_op_for_non_deepseek_v4_model_type(self):
+        # Negative-branch contract: unrelated model types with a
+        # coincidentally-named ``compress_rates`` attribute must not be
+        # touched. A regression that drops the model_type gate would silently
+        # affect every model whose HF config carries this attribute.
+        cfg = PretrainedConfig()
+        cfg.model_type = "llama"
+        cfg.compress_rates = [4]
+        normalize_deepseek_v4_compat(cfg)
+        self.assertFalse(hasattr(cfg, "compress_ratios"))
 
 
 # ---------------------------------------------------------------------------
