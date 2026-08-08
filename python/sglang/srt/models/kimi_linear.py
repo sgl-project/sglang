@@ -16,11 +16,9 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
-from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -35,9 +33,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -223,9 +223,7 @@ class KimiDeltaAttention(nn.Module):
 
         # TODO: support fusion with quant
         # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
-        self.do_fuse_qkvbfg = (
-            quant_config is None and self.attn_tp_size == self.tp_size
-        )
+        self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.do_fuse_qkvbfg:
             # Fuse: q, k, v, beta (column parallel) + f_a, g_a (replicated)
@@ -534,9 +532,10 @@ class KimiDecoderLayer(nn.Module):
         )
         if is_mla_prefill_cp_enabled():
             # Prefill CP keeps the whole layer in the CP-scattered token
-            # layout and gathers only around the (full-TP) MLP region. The
-            # current implementation requires attn_tp == 1, i.e.
-            # --attention-context-parallel-size equal to tp_size.
+            # layout and gathers only around the (full-TP) MLP region.
+            # Supports attn_tp x cp splits of the TP group: attention runs
+            # TP-partial on its head shard and the communicator completes
+            # the attn-TP reduction in the pre-MLP transition.
             self.layer_communicator = DSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
