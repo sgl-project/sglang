@@ -199,7 +199,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-2
+      runner: linux-aarch64-a3-800t-2
       test_type: 'perf'
       test_suite: nightly-perf-2-npu-a3
       nightly: true
@@ -218,7 +218,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-4
+      runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
       test_suite: nightly-perf-4-npu-a3
       nightly: true
@@ -237,7 +237,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-16
+      runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
       test_suite: nightly-perf-16-npu-a3
       nightly: true
@@ -256,7 +256,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-2
+      runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
       test_suite: nightly-acc-2-npu-a3
       nightly: true
@@ -275,7 +275,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-4
+      runner: linux-aarch64-a3-4-
       test_type: 'accuracy'
       test_suite: nightly-acc-4-npu-a3
       nightly: true
@@ -294,7 +294,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-16
+      runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
       test_suite: nightly-acc-16-npu-a3
       nightly: true
