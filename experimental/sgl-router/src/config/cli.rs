@@ -12,8 +12,9 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    DiscoveryBackend, K8sDiscoveryConfig, LoadMonitorConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -124,6 +125,14 @@ pub struct Cli {
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+
+    // ---- engine-reported load monitor ----
+    /// Enable Router-initiated Worker load reporting and snapshot collection.
+    #[arg(long)]
+    pub load_monitor: bool,
+    /// Fallback reporter port when `/server_info` lacks `load_reporter_port`.
+    #[arg(long)]
+    pub load_reporter_port: Option<std::num::NonZeroU16>,
 
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
@@ -274,6 +283,10 @@ impl Cli {
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
+            },
+            load_monitor: LoadMonitorConfig {
+                enabled: self.load_monitor,
+                reporter_port: self.load_reporter_port,
             },
         };
         config.validate()?;
@@ -958,5 +971,50 @@ mod tests {
             err.contains("--sticky-idle-secs must be greater than 0"),
             "got: {err}"
         );
+    }
+
+    /// `--load-monitor` alone is valid; the reporter port resolves per Worker.
+    #[test]
+    fn accepts_load_monitor_without_reporter_port() {
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--load-monitor",
+        ]))
+        .unwrap();
+        assert!(config.load_monitor.enabled);
+        assert!(config.load_monitor.reporter_port.is_none());
+    }
+
+    /// The reporter port cannot be silently ignored while monitoring is disabled.
+    #[test]
+    fn rejects_load_monitor_address_knob_while_disabled() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--load-reporter-port",
+            "12345",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--load-reporter-port requires --load-monitor"),
+            "got: {err}"
+        );
+    }
+
+    /// Non-load-scored policies keep their legacy behavior while disabled.
+    #[test]
+    fn accepts_non_load_scored_policies_without_monitor() {
+        for policy in ["round_robin", "random"] {
+            let config = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                policy,
+            ]))
+            .unwrap();
+            assert!(!config.load_monitor.enabled, "policy {policy}");
+        }
     }
 }

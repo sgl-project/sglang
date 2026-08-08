@@ -54,6 +54,7 @@ fn config() -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        load_monitor: Default::default(),
     }
 }
 

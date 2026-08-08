@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -16,6 +16,27 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+    /// Engine-reported load monitoring and scheduling configuration.
+    pub load_monitor: LoadMonitorConfig,
+}
+
+/// Configuration for Router-initiated connections to Worker load reporters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadMonitorConfig {
+    /// Enables per-Worker gRPC sessions and immutable load snapshots.
+    pub enabled: bool,
+    /// Fallback reporter port when `/server_info` omits it; `None` skips those Workers.
+    pub reporter_port: Option<NonZeroU16>,
+}
+
+impl Default for LoadMonitorConfig {
+    /// Returns the disabled load-monitor configuration.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reporter_port: None,
+        }
+    }
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /

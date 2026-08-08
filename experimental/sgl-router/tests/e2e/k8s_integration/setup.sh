@@ -68,7 +68,7 @@ else
     docker build \
         -f "${SCRIPT_DIR}/Dockerfile.fake_worker" \
         -t sgl-router-fake-worker:e2e \
-        "${SCRIPT_DIR}"
+        "${REPO_ROOT}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -113,8 +113,16 @@ spec:
         - name: worker
           image: sgl-router-fake-worker:e2e
           imagePullPolicy: Never
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - containerPort: 30000
+              name: http
+            - containerPort: 31000
+              name: load-reporter
           readinessProbe:
             httpGet:
               path: /health

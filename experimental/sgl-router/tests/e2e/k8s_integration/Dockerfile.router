@@ -16,6 +16,7 @@ WORKDIR /build
 
 # Copy just the sgl-router crate (context is the repo root)
 COPY experimental/sgl-router /build/experimental/sgl-router
+COPY proto/sglang/router/loadmonitor/v1/load_monitor.proto /build/proto/sglang/router/loadmonitor/v1/load_monitor.proto
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

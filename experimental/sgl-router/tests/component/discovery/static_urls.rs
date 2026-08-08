@@ -139,6 +139,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        load_monitor: Default::default(),
     };
 
     let registry = Arc::new(WorkerRegistry::default());
@@ -147,6 +148,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg)),
+        None,
         None,
         None,
     ));
