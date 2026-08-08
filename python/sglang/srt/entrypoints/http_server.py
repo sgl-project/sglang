@@ -649,8 +649,14 @@ async def health_generate(request: Request) -> Response:
     """
     Check the health of the inference server by sending a special request to generate one token.
 
-    If the server is running something, this request will be ignored, so it creates zero overhead.
-    If the server is not running anything, this request will be run, so we know whether the server is healthy.
+    Without ``dp_rank``: if the server is running something, this request will be
+    ignored, so it creates zero overhead. If the server is not running anything,
+    this request will be run, so we know whether the server is healthy.
+
+    With an explicit ``dp_rank`` query parameter: the probe is routed to that
+    data-parallel rank and succeeds only when this exact probe request completes;
+    unrelated scheduler output cannot satisfy the check. This lets external
+    monitors detect a single wedged rank that the aggregate path cannot see.
     """
 
     if _global_state.tokenizer_manager.gracefully_exit:
@@ -660,8 +666,20 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    routed_dp_rank = None
+    raw_dp_rank = request.query_params.get("dp_rank")
+    if raw_dp_rank is not None:
+        try:
+            routed_dp_rank = int(raw_dp_rank)
+        except ValueError:
+            return Response(status_code=400)
+        dp_size = _global_state.tokenizer_manager.elastic_worker_count
+        if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+            return Response(status_code=400)
+
     if (
-        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
+        routed_dp_rank is None
+        and not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
     ):
         return Response(status_code=200)
@@ -689,34 +707,87 @@ async def health_generate(request: Request) -> Response:
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
         )
 
-    async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
+    if routed_dp_rank is not None:
+        gri.routed_dp_rank = routed_dp_rank
+        gri.no_logs = True
 
-    task = asyncio.create_task(gen())
+    if routed_dp_rank is None:
+        # Aggregate probe: keep the long-standing semantics untouched. Any
+        # detokenizer output within the timeout marks the server healthy, so
+        # concurrent aggregate probes stay cheap and cannot starve each other.
+        async def gen():
+            async for _ in _global_state.tokenizer_manager.generate_request(
+                gri, request
+            ):
+                break
 
-    # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+        task = asyncio.create_task(gen())
+
+        # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
+        tic = time.time()
+        while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+            await asyncio.sleep(1)
+            if _global_state.tokenizer_manager.last_receive_tstamp > tic:
+                task.cancel()
+                _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+                _global_state.tokenizer_manager.server_status = ServerStatus.Up
+                return Response(status_code=200)
+
+        task.cancel()
+        tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
+        last_receive_time = time.strftime(
+            "%H:%M:%S",
+            time.localtime(_global_state.tokenizer_manager.last_receive_tstamp),
+        )
+        logger.error(
+            f"Health check failed. Server couldn't get a response from detokenizer for last "
+            f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
+            f"last_heartbeat time: {last_receive_time}"
+        )
+        _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+        _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+        return Response(status_code=503)
+
+    # Rank-targeted probe: wait for this exact rid so a wedged rank cannot be
+    # masked by output that other ranks produce.
     tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
 
-    task.cancel()
+    async def wait_for_exact_probe() -> bool:
+        async for result in _global_state.tokenizer_manager.generate_request(
+            gri, request
+        ):
+            meta_info = result.get("meta_info", {}) if isinstance(result, dict) else {}
+            if meta_info.get("id") == rid:
+                return True
+        return False
+
+    try:
+        completed = await asyncio.wait_for(
+            wait_for_exact_probe(), timeout=HEALTH_CHECK_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        completed = False
+    except Exception:
+        logger.exception("Health check generation failed for rid=%s", rid)
+        completed = False
+    finally:
+        # A timed-out probe may still be queued in a scheduler. Removing its
+        # local state prevents a leak; late health-check output is ignored by
+        # TokenizerManager using HEALTH_CHECK_RID_PREFIX.
+        _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+
+    if completed:
+        return Response(status_code=200)
+
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
+        f"Health check failed. Exact probe rid={rid} dp_rank={routed_dp_rank} "
+        f"did not complete within {HEALTH_CHECK_TIMEOUT} seconds. "
+        f"tic start time: {tic_time}. last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
 
