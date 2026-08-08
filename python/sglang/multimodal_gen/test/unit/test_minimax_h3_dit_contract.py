@@ -25,8 +25,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -97,6 +99,132 @@ def test_native_weight_names_and_grouped_qkv_reorder():
             assert torch.equal(
                 param.view(torch.int16), expected_shard.view(torch.int16)
             )
+
+
+class _KwargIdentity(torch.nn.Module):
+    def forward(self, x, **_kwargs):
+        return x
+
+
+def test_cache_dit_compat_flag_only_spares_the_block_input():
+    block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.preserve_input_for_cache_dit = False
+    block.norm1 = torch.nn.Identity()
+    block.norm2 = torch.nn.Identity()
+    block.attn = _KwargIdentity()
+    block.mlp = torch.nn.Identity()
+
+    x = torch.zeros(2, 4)
+    adaln_params = tuple(torch.zeros(1, 4) for _ in range(6))
+    gate_modes = []
+
+    def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
+        gate_modes.append(allow_inplace)
+        return residual.to(dtype)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            side_effect=lambda value, *_args, **_kwargs: value,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_gate",
+            side_effect=fake_gate,
+        ),
+    ):
+        block(
+            x,
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params=adaln_params,
+        )
+        assert gate_modes == [True, True]
+        # Without the flag both gated residuals may reuse their input buffer.
+
+        gate_modes.clear()
+        block.preserve_input_for_cache_dit = True
+        block(
+            x,
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params=adaln_params,
+        )
+        # Only the first gated residual touches the block input, so only it
+        # has to be out-of-place; the second keeps the fused kernel.
+        assert gate_modes == [False, True]
+
+
+def test_cache_dit_preserves_only_fn_and_mn_inputs():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=2,
+        bn_compute_blocks=1,
+    )
+    assert [block.preserve_input_for_cache_dit for block in model.blocks] == [
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]
+
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=4,
+        bn_compute_blocks=1,
+    )
+    assert [block.preserve_input_for_cache_dit for block in model.blocks] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+    model.configure_cache_dit_input_preservation(
+        fn_compute_blocks=None,
+        bn_compute_blocks=0,
+    )
+    assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cache_dit_out_of_place_gate_preserves_cuda_input():
+    x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
+    original = x.clone()
+    gate = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+    other = torch.randn_like(x)
+    indices = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
+    expected = _modulate_gate(
+        x.clone(),
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=True,
+    )
+
+    output = _modulate_gate(
+        x,
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=False,
+    )
+
+    assert output.data_ptr() != x.data_ptr()
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():

@@ -246,6 +246,18 @@ def _make_transformer(class_name, layers=None):
     return transformer
 
 
+def _attach_cache_compat_recorder(transformer):
+    calls = []
+
+    def configure_cache_dit_input_preservation(*, fn_compute_blocks, bn_compute_blocks):
+        calls.append((fn_compute_blocks, bn_compute_blocks))
+
+    transformer.configure_cache_dit_input_preservation = (
+        configure_cache_dit_input_preservation
+    )
+    return calls
+
+
 class TestBuildCustomBlockAdapter(unittest.TestCase):
     def test_builds_adapter_for_registered_class(self):
         module = _import_module_with_stub()
@@ -310,18 +322,59 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = False
         transformer = _make_transformer("MiniMaxH3DiTModel")
-        transformer.blocks = ["block_0"]
-        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+        transformer.blocks = [types.SimpleNamespace()]
+        cache_compat_calls = _attach_cache_compat_recorder(transformer)
+        config = module.CacheDitConfig(
+            enabled=True,
+            num_inference_steps=50,
+            Fn_compute_blocks=2,
+            Bn_compute_blocks=1,
+        )
 
         returned = module.enable_cache_on_transformer(transformer, config)
 
         self.assertIs(returned, transformer)
+        self.assertEqual(cache_compat_calls, [(2, 1)])
         adapter = transformer._sglang_cache_dit_adapter
         self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
 
         self.assertIs(module.disable_cache_on_transformer(transformer), transformer)
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
+        self.assertEqual(cache_compat_calls, [(2, 1), (None, 0)])
+
+    def test_minimax_h3_compat_rolls_back_when_cache_enable_fails(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = [types.SimpleNamespace()]
+        cache_compat_calls = _attach_cache_compat_recorder(transformer)
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        def fail_enable(*_args, **_kwargs):
+            raise RuntimeError("cache enable failed")
+
+        module.cache_dit.enable_cache = fail_enable
+        with self.assertRaisesRegex(RuntimeError, "cache enable failed"):
+            module.enable_cache_on_transformer(transformer, config)
+
+        self.assertEqual(cache_compat_calls, [(1, 0), (None, 0)])
+
+    def test_minimax_h3_compat_also_applies_to_registered_adapter(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = True
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = [types.SimpleNamespace()]
+        cache_compat_calls = _attach_cache_compat_recorder(transformer)
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=50)
+
+        module.enable_cache_on_transformer(transformer, config)
+
+        self.assertIs(module.cache_dit.enable_calls[0]["target"], transformer)
+        self.assertEqual(cache_compat_calls, [(1, 0)])
+
+        module.disable_cache_on_transformer(transformer)
+        self.assertEqual(cache_compat_calls, [(1, 0), (None, 0)])
 
 
 if __name__ == "__main__":
