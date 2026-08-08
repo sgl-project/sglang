@@ -140,6 +140,8 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 src_tensor=src_tensor,
             )
             self.remote_layer_id = layer_id
+        if self.pool._is_layer_owned(layer_id):
+            return self.buffer[layer_id - self.pool.start_layer]
         return self.remote_buffer
 
     def state_buf_infos(self):
@@ -276,8 +278,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         owner_rank = self._get_layer_owner_rank(layer_id)
         if self.layer_shard_rank == owner_rank:
             assert src_tensor is not None
-            if tensor.data_ptr() != src_tensor.data_ptr():
-                tensor.copy_(src_tensor)
+            broadcast_tensor = src_tensor
+        else:
+            broadcast_tensor = tensor
 
         cp_group = get_parallel().attn_cp_group
         comm = (
@@ -292,12 +295,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             # stale remote buffers, corrupting layer-split attention. Mirror the
             # standard usage in parallel_state.py.
             with comm.change_state(enable=True):
-                comm.broadcast(tensor, src=owner_rank)
+                comm.broadcast(broadcast_tensor, src=owner_rank)
         else:
             torch.distributed.broadcast(
-                tensor, src=owner_rank, group=cp_group.cpu_group
+                broadcast_tensor, src=owner_rank, group=cp_group.cpu_group
             )
-        return tensor
+        return broadcast_tensor
 
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
@@ -518,6 +521,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 use_layer_broadcast_comm=True,
             )
             self.remote_kv_layer_id = layer_id
+        if self._is_layer_owned(layer_id):
+            return self.kv_buffer[self._local_layer_idx(layer_id)]
         return self.remote_kv_buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
