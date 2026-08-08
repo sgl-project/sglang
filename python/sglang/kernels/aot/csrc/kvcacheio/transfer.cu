@@ -16,6 +16,7 @@
 #include "utils.h"  // WARP_SIZE
 #endif
 
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
@@ -24,17 +25,50 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 
 #pragma unroll
   for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
     uint64_t tmp;
     asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
-
-#else
-    uint64_t tmp = __builtin_nontemporal_load(src + j);
-    __builtin_nontemporal_store(tmp, dst + j);
-#endif
   }
 }
+#else
+// ROCm: use 128-bit streaming load/store when 16B-aligned, so fewer CUs are
+// needed to saturate the host fabric; falls back to 64-bit otherwise.
+typedef uint32_t sgl_u32x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ void
+transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
+  const uintptr_t addr_or = reinterpret_cast<uintptr_t>(src_addr) | reinterpret_cast<uintptr_t>(dst_addr);
+  if ((addr_or & 0xF) == 0) {
+    const sgl_u32x4* __restrict__ src = static_cast<const sgl_u32x4*>(src_addr);
+    sgl_u32x4* __restrict__ dst = static_cast<sgl_u32x4*>(dst_addr);
+    const int chunks16 = item_size_bytes / 16;
+    for (int j = lane_id; j < chunks16; j += WARP_SIZE) {
+      sgl_u32x4 tmp = __builtin_nontemporal_load(src + j);
+      __builtin_nontemporal_store(tmp, dst + j);
+    }
+    // Trailing bytes: item_size_bytes % 8 == 0 is guaranteed by the launcher,
+    // so the remainder is at most one 8B word.
+    const int done_bytes = chunks16 * 16;
+    const int rem8 = static_cast<int>(item_size_bytes - done_bytes) / 8;
+    if (rem8) {
+      const uint64_t* __restrict__ src8 =
+          reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + done_bytes);
+      uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + done_bytes);
+      for (int j = lane_id; j < rem8; j += WARP_SIZE) {
+        uint64_t tmp = __builtin_nontemporal_load(src8 + j);
+        __builtin_nontemporal_store(tmp, dst8 + j);
+      }
+    }
+  } else {
+    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+    const int total_chunks = item_size_bytes / sizeof(uint64_t);
+    for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+      uint64_t tmp = __builtin_nontemporal_load(src + j);
+      __builtin_nontemporal_store(tmp, dst + j);
+    }
+  }
+}
+#endif
 
 template <typename T>
 __device__ __forceinline__ T* get_global_offset_lf(
@@ -793,6 +827,63 @@ inline void transfer_kv_page_first_direct_impl(
   };
 
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+#if defined(USE_ROCM)
+  // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); disabled by
+  // default, falls back to per-page copy below.
+  constexpr bool kEnableHipBatch = false;
+  if (kEnableHipBatch) {
+    std::vector<void*> b_srcs, b_dsts;
+    std::vector<size_t> b_sizes;
+    auto batch_append = [&](const at::Tensor& s, const at::Tensor& d, int64_t si, int64_t di, int64_t ps) {
+      const int64_t esz = s.element_size();
+      b_srcs.push_back(static_cast<char*>(s.data_ptr()) + si * s.stride(0) * esz);
+      b_dsts.push_back(static_cast<char*>(d.data_ptr()) + di * d.stride(0) * esz);
+      b_sizes.push_back(static_cast<size_t>(ps) * static_cast<size_t>(s.stride(0)) * static_cast<size_t>(esz));
+    };
+    if constexpr (IsLf2Pf) {
+      const bool is_mla = dst_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size];
+        const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
+        for (int64_t j = 0; j < num_layers; ++j) {
+          batch_append(src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+          if (!is_mla) {
+            batch_append(
+                src_ptrs[j + num_layers], dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j), s_index, 0,
+                page_size);
+          }
+        }
+      }
+    } else {
+      const bool is_mla = src_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
+        const int64_t d_index = dst_indices_ptr[i * page_size];
+        for (int64_t j = 0; j < num_layers; ++j) {
+          batch_append(src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+          if (!is_mla) {
+            batch_append(
+                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j + num_layers], 0, d_index,
+                page_size);
+          }
+        }
+      }
+    }
+    if (!b_srcs.empty()) {
+      size_t fail_idx = std::numeric_limits<size_t>::max();
+      hipError_t err = hipMemcpyBatchAsync(
+          b_dsts.data(), b_srcs.data(), b_sizes.data(), b_srcs.size(), nullptr, nullptr, 0, &fail_idx,
+          at::cuda::getCurrentCUDAStream().stream());
+      if (err != hipSuccess) {
+        TORCH_WARN_ONCE("hipMemcpyBatchAsync failed (", hipGetErrorString(err), "), falling back to per-page copy");
+        fallback_to_page_copy();
+      }
+    }
+    return;
+  }
+#endif
   fallback_to_page_copy();
   return;
 
