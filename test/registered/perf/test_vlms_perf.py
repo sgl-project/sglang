@@ -25,9 +25,6 @@ MODEL_DEFAULTS = [
         "google/gemma-3-27b-it",
     ),
     ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]),
-    # "OpenGVLab/InternVL2_5-2B",
-    # buggy in official transformers impl
-    # "openbmb/MiniCPM-V-2_6",
 ]
 
 

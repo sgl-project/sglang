@@ -1,161 +1,72 @@
-import json
 import unittest
 import warnings
-from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_URL_FOR_TEST,
-    ModelEvalMetrics,
-    ModelLaunchSettings,
-    check_evaluation_test_results,
-    popen_launch_server,
-    write_results_to_json,
-)
-
-# Nightly eval tests run large models that may need downloading on cache miss.
-# Use a longer timeout than the default 600s.
-NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
+from sglang.test.kits.multi_model_eval_kit import run_multi_model_accuracy_eval
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="2-gpu-large")
 
-MODEL_THRESHOLDS = {
-    # Accuracy floors are conservative, on 100 MMMU samples.
-    #
-    # Every latency ceiling is 1.2x the slowest of five nightly runs, so the
-    # guard means the same thing for each model. They are calibrated against
-    # max_tokens=1024: #27327 raised it from 30 for CoT prompts without touching
-    # these, which left a thinking model measured under the old cap comparing
-    # against a ceiling it could no longer meet. Recalibrate here whenever
-    # max_tokens changes.
-    ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(
-        0.320, 25.5
-    ),
-    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 37.5),
-    ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
-        0.270, 30.0
-    ),
-    ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
-        0.270, 13.0
-    ),
-    ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 22.5),
-    ModelLaunchSettings(
-        "google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.27, 30.5),
-    ModelLaunchSettings(
-        "google/gemma-4-31B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.28, 44.0),
-    # CoT lifted every other model's score; pixtral is the one it did not help,
-    # sitting at a steady 0.3399 across five runs.
-    ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.330, 28.0),
-    ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
-        0.330, 21.0
-    ),
-    # temporarily disabled: NaN in next_token_logits
-    # ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
-    # ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
-    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 15.0),
-    ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 27.0),
-    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.330, 26.0),
-    ModelLaunchSettings(
-        "Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.29, 34.5),
-    ModelLaunchSettings(
-        "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
-    ): ModelEvalMetrics(0.30, 42.5),
-    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 33.0),
-    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 35.5),
-    ModelLaunchSettings(
-        "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.26, 165.0),
+MODELS = [
+    ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"),
+    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"),
+    ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"),
+    ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"),
+    ModelLaunchSettings("google/gemma-4-E4B-it"),
+    ModelLaunchSettings("google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]),
+    ModelLaunchSettings("google/gemma-4-31B-it", extra_args=["--tp=2"]),
+    ModelLaunchSettings("mistral-community/pixtral-12b"),
+    ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"),
+    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"),
+    ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"),
+    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"),
+    ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]),
+    ModelLaunchSettings("unsloth/Mistral-Small-3.1-24B-Instruct-2503"),
+    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"),
+    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"),
+    ModelLaunchSettings("zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]),
+]
+
+# Conservative floors on 100 MMMU samples. CoT (max_tokens=1024, see #27327)
+# lifted most of these well clear of their floor; pixtral is the one it did not
+# help, sitting at a steady 0.3399.
+MODEL_SCORE_THRESHOLDS = {
+    "deepseek-ai/deepseek-vl2-small": 0.320,
+    "deepseek-ai/Janus-Pro-7B": 0.285,
+    "Efficient-Large-Model/NVILA-8B-hf": 0.270,
+    "Efficient-Large-Model/NVILA-Lite-2B-hf": 0.270,
+    "google/gemma-4-E4B-it": 0.26,
+    "google/gemma-4-26B-A4B-it": 0.27,
+    "google/gemma-4-31B-it": 0.28,
+    "mistral-community/pixtral-12b": 0.330,
+    "moonshotai/Kimi-VL-A3B-Instruct": 0.330,
+    "OpenGVLab/InternVL2_5-2B": 0.300,
+    "Qwen/Qwen2-VL-7B-Instruct": 0.310,
+    "Qwen/Qwen2.5-VL-7B-Instruct": 0.330,
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": 0.29,
+    "unsloth/Mistral-Small-3.1-24B-Instruct-2503": 0.30,
+    "XiaomiMiMo/MiMo-VL-7B-RL": 0.28,
+    "zai-org/GLM-4.1V-9B-Thinking": 0.280,
+    "zai-org/GLM-4.5V-FP8": 0.26,
 }
 
 
 class TestNightlyVLMMmmuEval(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.models = list(MODEL_THRESHOLDS.keys())
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
     def test_mmmu_vlm_models(self):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
-        is_first = True
-        all_results = []
-
-        for model in self.models:
-            model_path = model.model_path
-            with self.subTest(model=model_path):
-                process = None
-                try:
-                    process = popen_launch_server(
-                        model=model_path,
-                        base_url=self.base_url,
-                        other_args=model.extra_args,
-                        timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
-                    )
-
-                    args = SimpleNamespace(
-                        base_url=self.base_url,
-                        model=model_path,
-                        eval_name="mmmu",
-                        num_examples=100,
-                        num_threads=64,
-                        max_tokens=1024,
-                    )
-
-                    args.return_latency = True
-
-                    metrics, latency = run_eval(args)
-
-                    metrics["score"] = round(metrics["score"], 4)
-                    metrics["latency"] = round(latency, 4)
-                    print(
-                        f"{'=' * 42}\n{model_path} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
-                    )
-
-                    write_results_to_json(model_path, metrics, "w" if is_first else "a")
-                    is_first = False
-
-                    all_results.append(
-                        (
-                            model_path,
-                            metrics["score"],
-                            metrics["latency"],
-                            None,
-                        )
-                    )
-                except Exception as e:
-                    error_message = str(e)
-                    all_results.append((model_path, None, None, error_message))
-                    print(f"Error evaluating {model_path}: {error_message}")
-                finally:
-                    if process is not None:
-                        kill_process_tree(process.pid)
-
-        try:
-            with open("results.json", "r") as f:
-                print("\nFinal Results from results.json:")
-                print(json.dumps(json.load(f), indent=2))
-        except Exception as e:
-            print(f"Error reading results: {e}")
-
-        model_accuracy_thresholds = {
-            model.model_path: threshold.accuracy
-            for model, threshold in MODEL_THRESHOLDS.items()
-        }
-        model_latency_thresholds = {
-            model.model_path: threshold.eval_time
-            for model, threshold in MODEL_THRESHOLDS.items()
-        }
-        check_evaluation_test_results(
-            all_results,
-            self.__class__.__name__,
-            model_accuracy_thresholds=model_accuracy_thresholds,
-            model_latency_thresholds=model_latency_thresholds,
+        run_multi_model_accuracy_eval(
+            self,
+            MODELS,
+            eval_args=dict(
+                eval_name="mmmu",
+                num_examples=100,
+                num_threads=64,
+                max_tokens=1024,
+            ),
+            accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
+            base_url=DEFAULT_URL_FOR_TEST,
         )
 
 
