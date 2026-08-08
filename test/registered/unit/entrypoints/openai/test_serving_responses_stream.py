@@ -108,6 +108,45 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         seqs = [p["sequence_number"] for p in event_payloads(events)]
         self.assertEqual(seqs, list(range(len(seqs))))
 
+    def test_extended_reasoning_effort_is_preserved_in_response_snapshots(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+
+        for effort in ("none", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    stream=True,
+                    store=False,
+                    reasoning={"effort": effort},
+                )
+                events = _StreamFixture(serving, request).run(
+                    [_engine_chunk("done", 1, finish=True)]
+                )
+                snapshots = [
+                    payload
+                    for payload in event_payloads(events)
+                    if payload["type"]
+                    in {
+                        "response.created",
+                        "response.in_progress",
+                        "response.completed",
+                    }
+                ]
+
+                self.assertEqual(len(snapshots), 3)
+                # Keep the SDK-generated response shape, including optional fields.
+                self.assertIn("service_tier", snapshots[0]["response"])
+                self.assertEqual(
+                    [
+                        payload["response"]["reasoning"]["effort"]
+                        for payload in snapshots
+                    ],
+                    [effort, effort, effort],
+                )
+
     def test_required_tool_choice_emits_function_call_events(self):
         serving = make_serving()
         serving.reasoning_parser = None

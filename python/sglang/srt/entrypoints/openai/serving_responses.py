@@ -79,9 +79,52 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_RESPONSE_SNAPSHOT_EVENT_CLASSES = {
+    "response.created": openai_responses_types.ResponseCreatedEvent,
+    "response.in_progress": openai_responses_types.ResponseInProgressEvent,
+    "response.failed": openai_responses_types.ResponseFailedEvent,
+    "response.completed": openai_responses_types.ResponseCompletedEvent,
+}
+_OPENAI_SDK_REASONING_EFFORTS = {None, "minimal", "low", "medium", "high"}
+
 
 class _MediaInputValidationError(ValueError):
     pass
+
+
+def _serialize_response_snapshot_event(
+    event_type: str, sequence_number: int, response: dict[str, Any]
+) -> str:
+    """Serialize an SSE event whose payload contains a full response snapshot.
+
+    The OpenAI SDK response model can lag behind the request schema supported by
+    SGLang. In particular, some SDK versions reject ``none``, ``xhigh``, and
+    ``max`` reasoning effort while SGLang accepts and forwards them. Use a value
+    accepted by the SDK while it builds the standard event shape, then restore
+    the original value in the serialized payload.
+    """
+    reasoning = response.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    response_for_sdk = response
+    restore_effort = effort not in _OPENAI_SDK_REASONING_EFFORTS
+    if restore_effort:
+        response_for_sdk = {
+            **response,
+            "reasoning": {**reasoning, "effort": "high"},
+        }
+
+    event = _RESPONSE_SNAPSHOT_EVENT_CLASSES[event_type](
+        type=event_type,
+        sequence_number=sequence_number,
+        response=response_for_sdk,
+    )
+    if not restore_effort:
+        data = event.model_dump_json(indent=None)
+    else:
+        payload = json.loads(event.model_dump_json(indent=None))
+        payload["response"]["reasoning"]["effort"] = effort
+        data = orjson.dumps(payload).decode()
+    return f"event: {event_type}\ndata: {data}\n\n"
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -1350,6 +1393,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 f"data: {event.model_dump_json(indent=None)}\n\n"
             )
 
+        def _send_response_snapshot(event_type: str, response: dict[str, Any]):
+            nonlocal sequence_number
+            event = _serialize_response_snapshot_event(
+                event_type, sequence_number, response
+            )
+            sequence_number += 1
+            return event
+
         current_content_index = 0
         current_output_index = 0
         current_item_id = f"item_{random_uuid()}"
@@ -1364,20 +1415,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             status="in_progress",
             usage=None,
         ).model_dump()
-        yield _send_event(
-            openai_responses_types.ResponseCreatedEvent(
-                type="response.created",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
-        yield _send_event(
-            openai_responses_types.ResponseInProgressEvent(
-                type="response.in_progress",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
+        yield _send_response_snapshot("response.created", initial_response)
+        yield _send_response_snapshot("response.in_progress", initial_response)
 
         async for ctx in result_generator:
 
@@ -1757,13 +1796,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
-            )
-        )
+        yield _send_response_snapshot("response.completed", response_dict)
 
     async def responses_stream_generator_non_harmony(
         self,
@@ -1797,6 +1830,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 f"data: {event.model_dump_json(indent=None)}\n\n"
             )
 
+        def _send_response_snapshot(event_type: str, response: dict[str, Any]):
+            nonlocal sequence_number
+            event = _serialize_response_snapshot_event(
+                event_type, sequence_number, response
+            )
+            sequence_number += 1
+            return event
+
         # The streaming Response* event models echo ``tools`` through a
         # narrower OpenAI SDK Tool union; strip it to avoid pydantic
         # validation failures on extended tool types.
@@ -1815,20 +1856,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 usage=None,
             ).model_dump()
         )
-        yield _send_event(
-            openai_responses_types.ResponseCreatedEvent(
-                type="response.created",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
-        yield _send_event(
-            openai_responses_types.ResponseInProgressEvent(
-                type="response.in_progress",
-                sequence_number=-1,
-                response=initial_response,
-            )
-        )
+        yield _send_response_snapshot("response.created", initial_response)
+        yield _send_response_snapshot("response.in_progress", initial_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
         is_required = request.tool_choice == "required"
@@ -2297,13 +2326,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     usage=None,
                 ).model_dump()
             )
-            yield _send_event(
-                openai_responses_types.ResponseFailedEvent(
-                    type="response.failed",
-                    sequence_number=-1,
-                    response=failed,
-                )
-            )
+            yield _send_response_snapshot("response.failed", failed)
             return
 
         for ev in _close_reasoning_item():
@@ -2358,13 +2381,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
-            )
-        )
+        yield _send_response_snapshot("response.completed", response_dict)
 
     async def _generate_with_builtin_tools(
         self,
