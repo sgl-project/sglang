@@ -1,5 +1,8 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.utils.cp_utils import (
+    mla_prefill_cp_use_mha_one_shot,
+    mla_use_prefill_cp,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -103,10 +106,14 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
-    # MLA prefill CP forces absorbed MLA regardless of prefix length: the
-    # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
-    # backend's absorbed-MLA kernel.
+    # MLA prefill CP: contiguous-strategy fa3 runs the MHA one-shot
+    # formulation (~3.4x fewer attention flops per pair than absorbed MLA;
+    # each rank up-projects its causal KV window from the gathered latent
+    # pool). Other strategies/backends keep absorbed MLA: the CP path
+    # gathers latent KV and feeds the backend's absorbed-MLA kernel.
     if mla_use_prefill_cp(forward_batch):
+        if mla_prefill_cp_use_mha_one_shot(forward_batch, backend_name):
+            return AttnForwardMethod.MHA_ONE_SHOT
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
