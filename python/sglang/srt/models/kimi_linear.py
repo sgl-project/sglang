@@ -17,6 +17,10 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -48,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
@@ -177,7 +181,9 @@ class KimiMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -343,9 +349,9 @@ class KimiDeltaAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=get_parallel().attn_tp_rank,
             tp_size=self.attn_tp_size,
-            # Reduce within the attn-TP group: at attn_tp < tp (CP /
-            # DP-attention) the default full-TP collective is the wrong group.
-            use_dp_attention_reduce=True,
+            # Partial output: the decoder layer's LayerCommunicator fuses the
+            # attn-TP reduce into its allreduce+layernorm transition.
+            reduce_results=False,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -488,14 +494,10 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
                 skip_rope=True,
+                reduce_results=False,
             )
 
-        if (
-            self.is_moe
-            and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        ):
+        if self._is_layer_sparse(config, layer_idx):
             self.block_sparse_moe = KimiMoE(
                 config=config,
                 quant_config=quant_config,
@@ -517,6 +519,52 @@ class KimiDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # The communicator owns the norm/residual/collective sequencing across
+        # the attn-TP and full-TP regions, which is what makes DP-attention
+        # and prefill CP layouts (attn_tp < tp) come out correct: attention
+        # returns TP-partial outputs and prepare_mlp fuses the attn-TP reduce
+        # (+ any DP/CP gather to the full token set) into the layernorm
+        # transition; postprocess_layer scatters back.
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_idx,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self._is_layer_sparse(config, layer_idx),
+            is_previous_layer_sparse=self._is_layer_sparse(config, layer_idx - 1),
+            is_next_layer_sparse=self._is_layer_sparse(config, layer_idx + 1),
+        )
+        if is_mla_prefill_cp_enabled():
+            # Prefill CP keeps the whole layer in the CP-scattered token
+            # layout and gathers only around the (full-TP) MLP region. The
+            # current implementation requires attn_tp == 1, i.e.
+            # --attention-context-parallel-size equal to tp_size.
+            self.layer_communicator = DSACPLayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                # The CP postprocess reduce-scatters the MLP output; the MLP
+                # must therefore keep its output TP-partial (the decoder
+                # publishes mlp_reduce_scatter, which RowParallelLinear and
+                # the fused-MoE reduce both honor).
+                allow_reduce_scatter=True,
+                is_last_layer=(layer_idx == config.num_hidden_layers - 1),
+            )
+        else:
+            self.layer_communicator = LayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                is_last_layer=(layer_idx == config.num_hidden_layers - 1),
+            )
+
+    @staticmethod
+    def _is_layer_sparse(config: KimiLinearConfig, layer_idx: int) -> bool:
+        return (
+            config.is_moe
+            and config.num_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -525,12 +573,9 @@ class KimiDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -539,9 +584,21 @@ class KimiDecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        # Under CP prefill the postprocess reduce-scatter completes the MLP's
+        # TP reduction; publish the flag so RowParallelLinear / the MoE skip
+        # their own all-reduce (False outside CP: everything reduces as before).
+        with get_forward().scoped(
+            mlp_reduce_scatter=self.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
+        ):
+            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
         return hidden_states, residual
 
 
@@ -601,12 +658,12 @@ class KimiLinearModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+            if input_embeds is not None:
+                hidden_states = input_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual = None

@@ -175,12 +175,14 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
-        from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
+    # After pad_logical_token_to_physical, per_rank_actual_token is the uniform
+    # physical shard length, so the sum is exactly the cp_size * shard geometry
+    # the CP hidden-state gather buffer needs. Set it unconditionally: at
+    # dp_size == 1 there is no DP sync step to size the buffer, and at
+    # dp_size > 1 this matches the previous behavior.
+    from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
-        set_local_dp_buffer_len(
-            sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
-        )
+    set_local_dp_buffer_len(sum(forward_batch.attn_cp_metadata.per_rank_actual_token))
 
     if getattr(forward_batch, "out_cache_loc", None) is not None:
         forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
