@@ -24,7 +24,6 @@ from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -55,6 +54,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
+    deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -611,7 +612,9 @@ class LayerCommunicator:
                             )
                         )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    # Fusion was published but this shape can't use the kernel,
+                    # so run the deferred reduction inline.
+                    hidden_states = deferred_post_experts_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -814,6 +817,21 @@ class LayerCommunicator:
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
         if is_enable_moe_cp_allgather():
+            return False
+
+        # The next layer's residual+LN absorbs the post-experts reduction, and
+        # that fused kernel reduces over a single group. Hybrid EP+TP produces
+        # two reductions over disjoint groups; post_experts_all_reduce() merges
+        # them into one _TP reduction when moe_dp_size == 1, which the fused
+        # kernel can absorb. When it can't merge, there is no single group that
+        # covers both, so fusion has to stay off -- otherwise the fused reduce
+        # covers half the peers and silently under-reduces the activations.
+        parallel = get_parallel()
+        if (
+            parallel.moe_ep_size > 1
+            and parallel.moe_tp_size > 1
+            and not can_merge_post_experts_all_reduce()
+        ):
             return False
 
         if (

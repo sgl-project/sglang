@@ -610,6 +610,84 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     return False
 
 
+def can_merge_post_experts_all_reduce() -> bool:
+    """Whether the EP and MoE-TP reductions can be served by one _TP all-reduce.
+
+    ``moe_tp_size = tp_size // moe_ep_size // moe_dp_size``, and both groups are
+    built inside each TP group, so with ``moe_dp_size == 1`` they are an
+    orthogonal decomposition of ``_TP``: reducing over one and then the other is
+    the same sum as reducing over ``_TP`` directly. With ``moe_dp_size > 1``
+    they cover only part of ``_TP`` and merging would incorrectly sum across DP
+    replicas, which hold different tokens.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.moe_ep_size > 1
+        and parallel.moe_tp_size > 1
+        and parallel.moe_dp_size == 1
+    )
+
+
+def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Reduce the post-experts MoE output across the EP and MoE-TP groups.
+
+    Single entry point for what every MoE module used to open-code as two
+    guarded all-reduces. When both are live and mergeable it issues one ``_TP``
+    all-reduce instead, which is one collective and one round trip rather than
+    two sequential ones over half-sized groups.
+
+    Merging also restores the invariant the fused residual+LN path depends on --
+    that the deferred post-experts reduction spans exactly ``_TP`` -- which
+    hybrid EP+TP was the only configuration to break.
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    parallel = get_parallel()
+    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=False
+    )
+    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    )
+
+    if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+
+    if reduce_ep:
+        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+    if reduce_tp:
+        hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run inline a post-experts reduction that was deferred to allreduce fusion.
+
+    ``should_skip_post_experts_all_reduce`` hands the reduction to the next
+    layer's fused residual+LN. When that kernel cannot service the shape, the
+    caller runs it here instead, and it has to span exactly the peers
+    ``post_experts_all_reduce`` would have covered -- the same group
+    ``resolve_fusion_group`` builds the workspace on. ``_MOE_TP`` is a single
+    rank under pure EP, so reducing over it unconditionally would silently drop
+    the reduction rather than perform it.
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    if can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+    if get_parallel().moe_ep_size > 1:
+        return moe_expert_parallel_all_reduce(hidden_states)
+    return moe_tensor_model_parallel_all_reduce(hidden_states)
+
+
 @contextmanager
 def speculative_moe_backend_context():
     """
