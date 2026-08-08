@@ -445,17 +445,73 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(self.tree_core.end_insert())
 
     def evict(self, params: EvictParams) -> EvictResult:
+        return self._evict(params)
+
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict until the requested component allocations become feasible.
+
+        ``params`` contains allocator shortfalls, not absolute eviction quotas.
+        A component eviction can cascade to its peers; with a shared memory pool,
+        those collateral frees can satisfy the original allocation before the
+        triggering component's requested count is reached.
+        """
+        if self.disable:
+            return EvictResult()
+
+        request_by_type = self._evict_request_by_type(params)
+        available_size_targets = {
+            ct: self._component_available_size(ct) + request_cnt
+            for ct, request_cnt in request_by_type.items()
+            if request_cnt > 0
+        }
+        return self._evict(params, available_size_targets)
+
+    @staticmethod
+    def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
+        return {
+            ComponentType.FULL: params.num_tokens,
+            ComponentType.SWA: params.swa_num_tokens,
+            ComponentType.MAMBA: params.mamba_num,
+        }
+
+    def _component_available_size(self, component_type: ComponentType) -> int:
+        """Return capacity usable by the component's next allocation.
+
+        Shared allocators expose schedulable capacity, which includes peer holes
+        that an urgent allocator flush can reclaim without further eviction.
+        """
+        if component_type == ComponentType.FULL:
+            if self.supports_swa():
+                return self.token_to_kv_pool_allocator.full_available_size()
+            return self.token_to_kv_pool_allocator.available_size()
+        if component_type == ComponentType.SWA:
+            return self.token_to_kv_pool_allocator.swa_available_size()
+        if component_type == ComponentType.MAMBA:
+            allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+            if allocator is None:
+                allocator = self.req_to_token_pool.mamba_pool
+            schedulable_available_size = getattr(
+                allocator, "schedulable_available_size", allocator.available_size
+            )
+            return schedulable_available_size()
+        raise ValueError(f"Unsupported cache component: {component_type}")
+
+    def _evict(
+        self,
+        params: EvictParams,
+        available_size_targets: Optional[dict[ComponentType, int]] = None,
+    ) -> EvictResult:
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
-        request_by_type = {
-            ComponentType.FULL: params.num_tokens,
-            ComponentType.SWA: params.swa_num_tokens,
-            ComponentType.MAMBA: params.mamba_num,
-        }
-        self._evict_components(request_by_type, tracker)
+        request_by_type = self._evict_request_by_type(params)
+        self._evict_components(
+            request_by_type,
+            tracker,
+            available_size_targets=available_size_targets,
+        )
 
         if (
             self.cache_controller is not None
@@ -530,17 +586,31 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
+        available_size_targets: Optional[dict[ComponentType, int]] = None,
     ) -> None:
+        def target_reached(component_type: ComponentType) -> bool:
+            if available_size_targets is None:
+                return False
+            target = available_size_targets.get(component_type)
+            # Do not compact on every eviction step. Shared allocators include
+            # drainable peer holes here and flush the peer once in alloc().
+            return (
+                target is not None
+                and self._component_available_size(component_type) >= target
+            )
+
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
-            # Skip eviction walk if request is already met
-            if tracker[ct] >= request_cnt:
+            # A preceding component may have cascade-evicted this component or,
+            # on a shared pool, released enough bytes to satisfy its allocation.
+            if tracker[ct] >= request_cnt or target_reached(ct):
                 continue
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
-                while (
-                    node_id := self._evict_device_next_node(ct, tracker)
-                ) is not None:
+                while not target_reached(ct):
+                    node_id = self._evict_device_next_node(ct, tracker)
+                    if node_id is None:
+                        break
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
@@ -1071,14 +1141,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
+        avail = self._component_available_size(ComponentType.FULL)
         if avail < kv_tokens:
             needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+            self.evict_for_alloc(EvictParams(num_tokens=needed))
+            if self._component_available_size(ComponentType.FULL) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False

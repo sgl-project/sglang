@@ -1554,7 +1554,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_to_evict = (
                 required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
             )
-            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            result = self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_to_evict)
+            )
             if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
