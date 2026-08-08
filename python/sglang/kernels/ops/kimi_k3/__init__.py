@@ -5,13 +5,14 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     import torch
 
+from sglang.kernels.jit.utils.common import is_hip_runtime
+
 _K3_N_GEMM_DISPATCH_MAP = {
     (144, 7168): 16,
     (896, 7168): 8,
 }
-_K3_K_GEMM_DISPATCH_MAP = {
-    (1536, 128): 12,
-}
+# tiny_k_gemm is 2.5x slower than torch.linear for (1536, 128) on AMD gfx950
+_K3_K_GEMM_DISPATCH_MAP: dict = {} if is_hip_runtime() else {(1536, 128): 12}
 
 
 def situ_and_mul(
