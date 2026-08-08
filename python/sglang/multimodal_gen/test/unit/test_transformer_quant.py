@@ -119,6 +119,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             quantization_ignored_layers=None,
             tp_size=1,
             dit_cpu_offload=False,
+            direct_gpu_weight_loading=False,
             text_encoder_cpu_offload=False,
         )
         defaults.update(overrides)
@@ -254,6 +255,17 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(plan.checkpoint_load_device, device)
         self.assertEqual(plan.weight_postprocess_device, device)
         self.assertTrue(plan.defer_component_cpu_offload)
+        self.assertFalse(plan.load_full_state_dict_on_device)
+
+    def test_weight_load_plan_can_keep_full_state_dict_on_device(self):
+        plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=torch.device("cuda:0"),
+            needs_device_weight_postprocess=False,
+            component_cpu_offload=False,
+            load_full_state_dict_on_device=True,
+        )
+
+        self.assertTrue(plan.load_full_state_dict_on_device)
 
     def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
         device = _resolve_checkpoint_load_device(

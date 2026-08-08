@@ -327,7 +327,8 @@ def maybe_load_fsdp_model(
     preconverted_state_dict = None
     is_bnb_quantized = _is_bitsandbytes_quant_config(init_params.get("quant_config"))
     if (
-        use_fsdp
+        not weight_load_plan.load_full_state_dict_on_device
+        and use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
         and not is_bnb_quantized
@@ -340,7 +341,8 @@ def maybe_load_fsdp_model(
             )
         )
     elif (
-        not use_fsdp
+        not weight_load_plan.load_full_state_dict_on_device
+        and not use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
         and not is_bnb_quantized
@@ -354,7 +356,13 @@ def maybe_load_fsdp_model(
         )
 
     if preconverted_state_dict is None:
-        weight_iterator = safetensors_weights_iterator(weight_dir_list)
+        if weight_load_plan.load_full_state_dict_on_device:
+            weight_iterator = safetensors_weights_iterator(
+                weight_dir_list,
+                weight_load_plan=weight_load_plan,
+            )
+        else:
+            weight_iterator = safetensors_weights_iterator(weight_dir_list)
         if preprocess_loaded_state_dict is not None:
             weight_iterator = preprocess_loaded_state_dict(weight_iterator)
         if is_bnb_quantized:

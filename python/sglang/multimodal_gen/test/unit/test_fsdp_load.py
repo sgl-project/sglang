@@ -11,6 +11,7 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.loader import fsdp_load, rank_local_checkpoint
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 
 
 class _UniformDtypeModel(nn.Module):
@@ -105,6 +106,42 @@ class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
 
 
 class TestOrdinaryWeightLoading(unittest.TestCase):
+    def test_direct_device_loading_skips_rank_local_cpu_checkpoint(self):
+        load_plan = WeightLoadPlan(
+            checkpoint_load_device=torch.device("cuda:0"),
+            load_full_state_dict_on_device=True,
+        )
+        with (
+            patch.object(fsdp_load.current_platform, "is_mps", return_value=False),
+            patch.object(
+                rank_local_checkpoint,
+                "try_load_rank_local_tp_state_dict",
+            ) as rank_local_load,
+            patch.object(
+                fsdp_load,
+                "safetensors_weights_iterator",
+                return_value=iter(()),
+            ) as weight_iterator,
+            patch.object(fsdp_load, "load_model_from_full_model_state_dict"),
+        ):
+            fsdp_load.maybe_load_fsdp_model(
+                model_cls=_UniformDtypeModel,
+                init_params={},
+                weight_dir_list=["model.safetensors"],
+                device=torch.device("cuda:0"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                weight_load_plan=load_plan,
+            )
+
+        rank_local_load.assert_not_called()
+        weight_iterator.assert_called_once_with(
+            ["model.safetensors"],
+            weight_load_plan=load_plan,
+        )
+
     def test_tp1_unquantized_linear_assigns_checkpoint_tensor_without_copy(self):
         with torch.device("meta"):
             model = _ReplicatedLinearModel()

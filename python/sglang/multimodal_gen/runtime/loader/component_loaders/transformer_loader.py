@@ -214,11 +214,25 @@ class TransformerLoader(ComponentLoader):
             component_cpu_offload=bool(component_server_args.dit_cpu_offload),
             runtime_quant_config=quant_spec.runtime_quant_config,
         )
+        direct_gpu_weight_loading = bool(
+            component_server_args.direct_gpu_weight_loading
+        )
+        if direct_gpu_weight_loading and quant_spec.runtime_quant_config is not None:
+            raise ValueError(
+                "--direct-gpu-weight-loading supports only unquantized DiT checkpoints"
+            )
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
             component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            load_full_state_dict_on_device=direct_gpu_weight_loading,
         )
+        if direct_gpu_weight_loading:
+            logger.warning(
+                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
+                "state dict and materialized model weights may coexist on GPU during startup",
+                component_name,
+            )
 
         quantized_attn_backend = _default_quantized_attention_backend(
             quant_spec, component_server_args
