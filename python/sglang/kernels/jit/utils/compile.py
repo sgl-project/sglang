@@ -162,11 +162,94 @@ def _tvm_ffi_version() -> str:
         return "unknown"
 
 
+def _ensure_cuda_home_link(link: pathlib.Path, target: pathlib.Path) -> None:
+    try:
+        link.symlink_to(target)
+    except FileExistsError:
+        if not link.is_symlink() or link.resolve() != target.resolve():
+            raise RuntimeError(
+                f"CUDA compatibility link {link} already exists and does not "
+                f"point to {target}."
+            )
+
+
+def _prepare_cuda_runtime_home(
+    cuda_home: pathlib.Path, cache_dir: pathlib.Path
+) -> Tuple[pathlib.Path | None, str | None]:
+    """Normalize nonstandard CUDA runtime layouts for TVM-FFI's linker."""
+    standard_runtime = cuda_home / "lib64" / "libcudart.so"
+    if standard_runtime.is_file():
+        return None, None
+
+    runtime_dirs = (cuda_home / "lib", cuda_home / "lib64")
+    for runtime_dir in runtime_dirs:
+        runtime_link = runtime_dir / "libcudart.so"
+        if runtime_link.is_file():
+            runtime = runtime_link.resolve()
+            tag = hashlib.sha256(str(runtime).encode()).hexdigest()[:12]
+            break
+    else:
+        # NVIDIA's pip CUDA runtime ships only a versioned shared library under
+        # ``lib/``. TVM-FFI currently searches ``lib64/`` and can silently
+        # resolve a system libcudart from another CUDA major instead.
+        runtimes = {
+            runtime.resolve()
+            for runtime_dir in runtime_dirs
+            for runtime in runtime_dir.glob("libcudart.so.*")
+            if runtime.is_file()
+        }
+        if not runtimes:
+            return None, None
+        if len(runtimes) > 1:
+            raise RuntimeError(
+                f"Found multiple CUDA runtime libraries under {cuda_home}; "
+                "add an unversioned libcudart.so link to select one."
+            )
+
+        runtime = runtimes.pop()
+        tag = hashlib.sha256(str(runtime).encode()).hexdigest()[:12]
+
+    compat_home = cache_dir / "sglang-cuda-home" / tag
+    compat_home.mkdir(parents=True, exist_ok=True)
+    for entry in cuda_home.iterdir():
+        if entry.name != "lib64":
+            _ensure_cuda_home_link(compat_home / entry.name, entry)
+
+    compat_lib64 = compat_home / "lib64"
+    compat_lib64.mkdir(exist_ok=True)
+    source_lib64 = cuda_home / "lib64"
+    if source_lib64.is_dir():
+        for entry in source_lib64.iterdir():
+            if entry.name != "libcudart.so":
+                _ensure_cuda_home_link(compat_lib64 / entry.name, entry)
+    _ensure_cuda_home_link(compat_lib64 / "libcudart.so", runtime)
+    return compat_home, tag
+
+
+def _cuda_runtime_link_config() -> Tuple[pathlib.Path | None, str | None]:
+    if os.name == "nt" or is_hip_runtime():
+        return None, None
+
+    # Keep CUDA_HOME resolution identical to the pinned TVM-FFI compiler that
+    # consumes this configuration.
+    from tvm_ffi.cpp.extension import _find_cuda_home
+
+    cuda_home = pathlib.Path(_find_cuda_home()).expanduser().resolve()
+    cache_dir = pathlib.Path(
+        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+    ).expanduser()
+    return _prepare_cuda_runtime_home(cuda_home, cache_dir)
+
+
 def _jit_build_dir_name(module_name: str) -> str:
     # Key on arch + tvm-ffi ABI too (module_name only hashes sources), so a
     # shared cache volume never reuses a cross-arch/ABI .so.
     arch = get_jit_cuda_arch().target_name
-    return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
+    name = f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
+    _, cuda_runtime_tag = _cuda_runtime_link_config()
+    if cuda_runtime_tag is not None:
+        name += f"__cudart_{cuda_runtime_tag}"
+    return name
 
 
 # JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
@@ -327,13 +410,24 @@ def _jit_compile_context():
     if is_hip_runtime():
         yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
         return
-    env_key = "TVM_FFI_CUDA_ARCH_LIST"
-    old_value = os.environ.get(env_key, None)
-    os.environ[env_key] = get_jit_cuda_arch().target_name
+    compat_cuda_home, _ = _cuda_runtime_link_config()
+    env_updates = {"TVM_FFI_CUDA_ARCH_LIST": get_jit_cuda_arch().target_name}
+    if compat_cuda_home is not None:
+        env_updates["CUDA_HOME"] = str(compat_cuda_home)
+
+    old_values = {key: os.environ.get(key) for key in env_updates}
+    os.environ.update(env_updates)
+    if compat_cuda_home is not None:
+        from tvm_ffi.cpp.extension import _find_cuda_home
+
+        _find_cuda_home.cache_clear()
     try:
         yield
     finally:
-        if old_value is None:
-            os.environ.pop(env_key, None)
-        else:
-            os.environ[env_key] = old_value
+        for key, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+        if compat_cuda_home is not None:
+            _find_cuda_home.cache_clear()
