@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -27,6 +27,53 @@ class SchedulerDllmMixin:
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
+
+    def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
+        if self.dllm_config is None or self.dllm_config.algorithm != "Gemma4Renoise":
+            return None
+
+        sp = req.sampling_params
+        unsupported = [
+            name
+            for name, value, default in (
+                ("frequency_penalty", sp.frequency_penalty, 0.0),
+                ("presence_penalty", sp.presence_penalty, 0.0),
+                ("repetition_penalty", sp.repetition_penalty, 1.0),
+                ("min_new_tokens", sp.min_new_tokens, 0),
+                ("min_p", sp.min_p, 0.0),
+                ("sampling_seed", sp.sampling_seed, None),
+            )
+            if value != default
+        ]
+        if sp.logit_bias:
+            unsupported.append("logit_bias")
+        unsupported.extend(
+            name
+            for name in ("json_schema", "regex", "ebnf", "structural_tag")
+            if getattr(sp, name) is not None
+        )
+        unsupported.extend(
+            name
+            for name, value in (
+                ("return_logprob", req.return_logprob),
+                ("top_logprobs_num", req.logprob.top_logprobs_num),
+                ("token_ids_logprob", req.logprob.token_ids_logprob),
+                (
+                    "return_flat_raw_top_logprobs",
+                    req.return_flat_raw_top_logprobs,
+                ),
+                ("custom_logit_processor", req.custom_logit_processor),
+                ("return_sampling_mask", req.return_sampling_mask),
+            )
+            if value
+        )
+        if not unsupported:
+            return None
+        return (
+            "DiffusionGemma with Gemma4Renoise does not support request-level "
+            + ", ".join(unsupported)
+            + "; sampling is governed by the renoise schedule."
+        )
 
     def get_new_batch_dllm(
         self: Scheduler, running_batch: ScheduleBatch
@@ -74,6 +121,17 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        if self.dllm_config.is_uniform and all(
+            req.is_dllm_prefill() for req in batch.reqs
+        ):
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+            return
+
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         assert (
             not fdfo_mode or result.accept_length_per_req_cpu is not None
@@ -101,9 +159,18 @@ class SchedulerDllmMixin:
 
                     req.output_ids.extend(next_token_ids)
                     req.update_finish_state(new_accepted_len=new_tokens)
+                    if (
+                        not req.finished()
+                        and req.seqlen + block_size > self.model_config.context_len
+                    ):
+                        req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not self.dllm_config.is_uniform,
+                        )
                         req.time_stats.set_completion_time()
                     continue
 
@@ -142,9 +209,18 @@ class SchedulerDllmMixin:
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
+                if (
+                    not req.finished()
+                    and req.seqlen + block_size > self.model_config.context_len
+                ):
+                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
 
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(
+                        req,
+                        self.tree_cache,
+                        is_insert=not self.dllm_config.is_uniform,
+                    )
                     req.time_stats.set_completion_time()
 
             self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -156,6 +232,27 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _stash_completed_uniform_canvas(self: Scheduler, req: Req) -> None:
+        context_len = req.dllm_block_offset
+        block_size = self.dllm_config.block_size
+        assert req.extend_range.end == context_len + block_size
+        assert req.kv is not None and req.req_pool_idx is not None
+
+        allocated_len = req.kv.kv_allocated_len
+        page_size = self.token_to_kv_pool_allocator.page_size
+        free_start = -(-context_len // page_size) * page_size
+        if free_start < allocated_len:
+            slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, free_start:allocated_len
+            ]
+            self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
+
+        req.kv_committed_len = context_len
+        req.kv.kv_allocated_len = context_len
+        assert req.kv.swa_evicted_seqlen <= context_len
+        req.set_extend_range(context_len, context_len)
+        self.stash_chunked_request(req)
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager

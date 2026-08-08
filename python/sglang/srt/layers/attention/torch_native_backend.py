@@ -47,6 +47,19 @@ class TorchNativeAttnBackend(AttentionBackend):
         k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
         return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
 
+    @staticmethod
+    def _make_diffusion_window_mask(
+        *,
+        q_len: int,
+        kv_len: int,
+        prefix_len: torch.Tensor,
+        sliding_window_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        start = (prefix_len - sliding_window_size).clamp_min(0)
+        allowed = torch.arange(kv_len, device=device) >= start
+        return allowed.unsqueeze(0).expand(q_len, -1)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -75,6 +88,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
+        diffusion_bidir=False,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -148,12 +162,21 @@ class TorchNativeAttnBackend(AttentionBackend):
             attn_mask = None
             is_causal = causal
             if sliding_window_size is not None and sliding_window_size > -1:
-                attn_mask = self._make_sliding_window_mask(
-                    q_len=seq_len_kv,
-                    kv_len=seq_len_kv,
-                    sliding_window_size=sliding_window_size,
-                    device=per_req_query.device,
-                )
+                if diffusion_bidir:
+                    attn_mask = self._make_diffusion_window_mask(
+                        q_len=seq_len_kv,
+                        kv_len=seq_len_kv,
+                        prefix_len=prefill_seq_len_q,
+                        sliding_window_size=sliding_window_size,
+                        device=per_req_query.device,
+                    )
+                else:
+                    attn_mask = self._make_sliding_window_mask(
+                        q_len=seq_len_kv,
+                        kv_len=seq_len_kv,
+                        sliding_window_size=sliding_window_size,
+                        device=per_req_query.device,
+                    )
                 is_causal = False
 
             per_req_out_redudant = (
@@ -305,8 +328,16 @@ class TorchNativeAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        diffusion_bidir = (
+            layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
+            and forward_batch.dllm_is_encoder is False
+        )
         causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+        if (
+            layer.is_cross_attention
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+            or diffusion_bidir
+        ):
             causal = False
 
         self._run_sdpa_forward_extend(
@@ -326,12 +357,13 @@ class TorchNativeAttnBackend(AttentionBackend):
             is_cross_attn=layer.is_cross_attention,
             sliding_window_size=(
                 layer.sliding_window_size
-                if causal
+                if (causal or diffusion_bidir)
                 and not layer.is_cross_attention
                 and layer.sliding_window_size is not None
                 and layer.sliding_window_size > -1
                 else None
             ),
+            diffusion_bidir=diffusion_bidir,
         )
         return o
 

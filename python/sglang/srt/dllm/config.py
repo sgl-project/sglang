@@ -13,6 +13,7 @@ class DllmConfig:
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
+        is_uniform: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -20,6 +21,7 @@ class DllmConfig:
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
+        self.is_uniform = is_uniform
 
     @staticmethod
     def from_server_args(
@@ -37,13 +39,25 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DiffusionGemmaForBlockDiffusion": {
+                "block_size": getattr(model_config.hf_config, "canvas_length", 256),
+                "mask_id": -1,
+                "is_uniform": True,
+            },
         }
 
         arch = model_config.hf_config.architectures[0]
+        if (arch == "DiffusionGemmaForBlockDiffusion") != (
+            server_args.dllm_algorithm == "Gemma4Renoise"
+        ):
+            raise ValueError(
+                "Gemma4Renoise is only valid for DiffusionGemmaForBlockDiffusion"
+            )
         if arch in DLLM_PARAMS:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]
             mask_id = params["mask_id"]
+            is_uniform = params.get("is_uniform", False)
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
@@ -75,4 +89,5 @@ class DllmConfig:
             mask_id=mask_id,
             max_running_requests=max_running_requests,
             first_done_first_out_mode=server_args.dllm_fdfo,
+            is_uniform=is_uniform,
         )

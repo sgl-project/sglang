@@ -512,6 +512,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For uniform-state diffusion
+    dllm_is_encoder: Optional[bool] = None
+    dllm_self_conditioning_embeds: Optional[torch.Tensor] = None
+
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # For hidden states before normal
@@ -884,17 +888,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
-            block_size = batch.dllm_config.block_size
-            # Use int64 for AMD rotary embedding kernel compatibility
-            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            if batch.dllm_config.is_uniform:
+                ret.dllm_is_encoder = all(req.is_dllm_prefill() for req in batch.reqs)
+            if not ret.dllm_is_encoder:
+                block_size = batch.dllm_config.block_size
+                positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+                ret.positions = torch.tensor(
+                    [
+                        i
+                        for block_offset in (
+                            req.dllm_block_offset for req in batch.reqs
+                        )
+                        for i in range(block_offset, block_offset + block_size)
+                    ],
+                    dtype=positions_dtype,
+                ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

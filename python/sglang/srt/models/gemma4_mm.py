@@ -331,7 +331,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "Falling back to causal attention, which may degrade image quality."
             )
             return
-        assert forward_batch.forward_mode == ForwardMode.EXTEND
+        assert forward_batch.forward_mode.is_extend()
 
         bidirectional_attn_masks_list = []
         bidirectional_attn_mask_indptr = torch.zeros(
