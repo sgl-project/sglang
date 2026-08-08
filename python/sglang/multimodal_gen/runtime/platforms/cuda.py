@@ -160,7 +160,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
         except ImportError as e:
             logger.info(e)
             logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
+                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
             )
             return AttentionBackendEnum.FA
 
