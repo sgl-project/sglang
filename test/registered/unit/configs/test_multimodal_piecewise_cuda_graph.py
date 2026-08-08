@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     is_multimodal_piecewise_cuda_graph_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -80,42 +81,49 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
         args._cuda_graph_config_locked = set()
 
-        with (
-            patch.object(
-                ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
-            ) as disable_if_incompatible,
-            patch.object(
-                args, "_resolved_attention_backends", return_value=("fa3", "fa3")
-            ),
-        ):
+        with patch.object(
+            ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
+        ) as disable_if_incompatible:
             args._apply_cuda_graph_compatibility()
 
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
         disable_if_incompatible.assert_called_once()
 
-    def test_trtllm_mla_stays_on_breakable_and_is_disabled_by_compatibility(self):
+    def test_kimi_k25_auto_trtllm_mla_disables_piecewise_prefill(self):
         args = ServerArgs(model_path="dummy")
-        # The MLA rule reads hf_config to exempt DSA models, so the stub needs
-        # an architecture that is MLA but not DSA.
         args.model_config = SimpleNamespace(
-            is_multimodal_piecewise_cuda_graph_supported=True,
-            hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+            hf_config=SimpleNamespace(
+                architectures=["KimiK25ForConditionalGeneration"],
+                model_type="kimi_k25",
+                quantization_config=None,
+            ),
+            attention_arch=AttentionArch.MLA,
+            is_encoder_decoder=False,
         )
         args.cuda_graph_config = CudaGraphConfig(
-            prefill=PhaseConfig(backend=Backend.BREAKABLE)
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
         )
         args._cuda_graph_config_locked = set()
+        args._quantization_explicitly_unset = False
 
         with (
-            patch.object(
-                args,
-                "_resolved_attention_backends",
-                return_value=("trtllm_mla", "trtllm_mla"),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=False,
             ),
-            patch.object(args, "use_mla_backend", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_sm100_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_blackwell_supported",
+                return_value=True,
+            ),
         ):
-            args._apply_cuda_graph_compatibility()
+            args._handle_model_specific_adjustments()
+            args._handle_attention_backend_compatibility()
 
+        self.assertEqual(args._resolved_attention_backends()[0], "trtllm_mla")
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
     def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
@@ -131,6 +139,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             return_value=("trtllm_mla", "trtllm_mla"),
         ):
             args._apply_cuda_graph_compatibility()
+            args._disable_piecewise_prefill_cuda_graph_for_trtllm_mla()
 
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
 
