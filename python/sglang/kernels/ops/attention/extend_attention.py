@@ -1035,10 +1035,11 @@ def _fwd_kernel_unified(
     # XAI temperature handling
     if xai_temperature_len > 0:
         offs_qidx = cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
         xai_temperature_reg = tl.where(
-            offs_qidx < xai_temperature_len,
+            offs_qidx > xai_temperature_len,
+            tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale,
             1.0,
-            xai_temperature_len / (offs_qidx + 1.0),
         )
 
     # Load Q
