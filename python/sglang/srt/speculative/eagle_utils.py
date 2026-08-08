@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.eagle_target_verify import prepare_eagle_verify_logits
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -659,15 +660,12 @@ def eagle_sample(
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
-    from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
+    from sglang.srt.utils.async_probe import maybe_detect_nan
 
     device = batch.device
     if batch.forward_mode.is_idle():
@@ -678,37 +676,9 @@ def eagle_sample(
 
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
-    next_token_logits = logits_output.next_token_logits
-
-    sanitize_nan_logits(next_token_logits, "verify: target model logits")
-
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
-
-    # Apply grammar mask if provided
-    if grammar_mask is not None:
-        grammar_mask.apply(next_token_logits)
+    next_token_logits = prepare_eagle_verify_logits(
+        verify_input, batch, logits_output, grammar_mask
+    )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
