@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -356,6 +357,12 @@ class ServerArgs(DisaggServerArgsMixin):
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
+    )
+
+    # KV-cache quantization (Quant-VideoGen PRQ). Off by default; mirrors the
+    # SRT --kv-cache-dtype pattern (typed config, not a pile of env vars).
+    kv_cache_quant_config: QVGKVQuantArgs = field(
+        default_factory=QVGKVQuantArgs, repr=False
     )
 
     # Master port for distributed inference
@@ -1814,6 +1821,67 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        # KV-cache quantization (Quant-VideoGen PRQ)
+        parser.add_argument(
+            "--kv-cache-quant",
+            type=str,
+            default=None,
+            choices=["off", "int4", "int2"],
+            help="Enable Quant-VideoGen PRQ KV-cache quantization (off|int4|int2). "
+            "Defaults reproduce the tuned per-chunk config (stages=1, "
+            "centroids=128, block=64, symmetric, iters=2, recent=1, "
+            "per-chunk sink).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-centroids",
+            type=int,
+            default=None,
+            help="PRQ k-means centroids per stage (default 128).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-block-size",
+            type=int,
+            default=None,
+            help="PRQ residual scale block size (default 64).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-stages",
+            type=int,
+            default=None,
+            help="PRQ k-means stages (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-iters",
+            type=int,
+            default=None,
+            help="PRQ k-means iterations (default 2).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-asymmetric",
+            action="store_true",
+            default=None,
+            help="Use KIVI-style asymmetric residual quantization.",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-keep-recent",
+            type=int,
+            default=None,
+            help="Completed chunks kept bf16 before quantizing (default 1).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink",
+            type=int,
+            default=None,
+            choices=[0, 1],
+            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+        )
+        parser.add_argument(
+            "--kv-cache-quant-sink-keep",
+            type=int,
+            default=None,
+            help="Leading sink chunks kept bf16 forever (default 0).",
+        )
+
         # quantization
         parser.add_argument(
             "--quantization",
@@ -2311,6 +2379,19 @@ class ServerArgs(DisaggServerArgsMixin):
             elif attr == "nunchaku_config":
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
+            elif attr == "kv_cache_quant_config":
+                kv_quant_config = kwargs.get("kv_cache_quant_config")
+                if kv_quant_config is None:
+                    kv_quant_config = QVGKVQuantArgs.from_dict(kwargs)
+                elif isinstance(kv_quant_config, dict):
+                    kv_quant_config = QVGKVQuantArgs(**kv_quant_config).validate()
+                elif isinstance(kv_quant_config, QVGKVQuantArgs):
+                    kv_quant_config.validate()
+                else:
+                    raise TypeError(
+                        "kv_cache_quant_config must be QVGKVQuantArgs or a dict"
+                    )
+                server_args_kwargs["kv_cache_quant_config"] = kv_quant_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
