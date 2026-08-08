@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     is_fsdp_managed_module,
 )
@@ -35,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -515,9 +517,20 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        if current_platform.is_npu():
+            device = get_local_torch_device()
+            required_backend = "Ascend NPU"
+        elif current_platform.is_cuda() or current_platform.is_rocm():
+            device = torch.device(current_platform.device_type)
+            required_backend = "ROCm" if current_platform.is_rocm() else "CUDA"
+        else:
+            raise RuntimeError(
+                "MiniMax H3 full-loop denoise requires CUDA, ROCm, or Ascend NPU"
+            )
+        if not torch.get_device_module(device).is_available():
+            raise RuntimeError(
+                f"MiniMax H3 full-loop denoise requires {required_backend}"
+            )
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,

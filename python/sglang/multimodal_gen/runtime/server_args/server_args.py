@@ -793,6 +793,33 @@ class ServerArgs(DisaggServerArgsMixin):
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "laser_attn"
+            and "text_encoder" not in self.component_attention_backends
+        ):
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; laser_attn applies to the transformer"
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
+
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "laser_attn"
+            and "text_encoder" not in self.component_attention_backends
+        ):
+            logger.info(
+                "Automatically set torch_sdpa backend for the MiniMax H3 text "
+                "encoder; laser_attn applies to the transformer"
+            )
+            self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
             if (

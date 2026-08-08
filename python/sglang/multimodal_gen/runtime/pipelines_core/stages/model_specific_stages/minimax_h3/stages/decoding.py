@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
@@ -40,6 +41,20 @@ def _required_tensor(value, path: str) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise ValueError(f"{path} must be a torch.Tensor")
     return value
+
+
+def _autocast_enabled_for_device(
+    tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
+) -> bool:
+    supported_backend = (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_npu()
+    )
+    supported_device = (
+        supported_backend and tensor.device.type == current_platform.device_type
+    )
+    return supported_device and autocast_enabled(dtype, disable_autocast)
 
 
 @functools.lru_cache(maxsize=None)
@@ -285,9 +300,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
             audio_vae_dtype = resolve_precision(
                 server_args, "audio_vae", precision_attr="audio_vae_precision"
             )
-            audio_autocast_enabled = (
-                audio_latent.device.type == "cuda"
-                and autocast_enabled(audio_vae_dtype, server_args.disable_autocast)
+            audio_autocast_enabled = _autocast_enabled_for_device(
+                audio_latent, audio_vae_dtype, server_args.disable_autocast
             )
             with torch.autocast(
                 device_type=audio_latent.device.type,
@@ -339,9 +353,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 name="video_vae",
             )
             video_vae_dtype = resolve_decode_precision(server_args, "video_vae")
-            visual_autocast_enabled = (
-                visual_latent.device.type == "cuda"
-                and autocast_enabled(video_vae_dtype, server_args.disable_autocast)
+            visual_autocast_enabled = _autocast_enabled_for_device(
+                visual_latent, video_vae_dtype, server_args.disable_autocast
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)

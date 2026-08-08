@@ -19,6 +19,7 @@ apt update -y && apt install -y \
     clang \
     locales \
     ccache \
+    ffmpeg \
     libgl1-mesa-glx \
     libgl1-mesa-dri \
     ca-certificates \

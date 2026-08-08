@@ -168,6 +168,25 @@ transfer overhead. This exact recipe was validated on
 2× RTX 5090 (32 GB each) and a 377 GiB host; use a 384 GiB-class machine. The
 latency and memory comparison is collected in the benchmark section below.
 
+For Ascend NPU, follow the
+[NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+before starting the server.
+
+On an 8-NPU server, the validated topology is TP2 + SP4 with Laser Attention.
+Use Ascend Flash Attention by replacing `laser_attn` with `fa`.
+
+```bash 8-NPU
+HCCL_BUFFSIZE=256 sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-type diffusion \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --tp-size 2 \
+  --sp-degree 4 \
+  --attention-backend laser_attn \
+  --port 30088
+```
+
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
 server environment.

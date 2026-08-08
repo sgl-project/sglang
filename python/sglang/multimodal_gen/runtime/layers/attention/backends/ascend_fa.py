@@ -102,3 +102,59 @@ class AscendFAImpl(AttentionImpl):
         if return_softmax_lse:
             return output, lse
         return output
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        if self.causal:
+            output = torch.empty_like(query)
+            for start, stop in zip(bounds[:-1], bounds[1:]):
+                if start == stop:
+                    continue
+                segment = self.forward(
+                    query[start:stop].unsqueeze(0),
+                    key[start:stop].unsqueeze(0),
+                    value[start:stop].unsqueeze(0),
+                    None,
+                )
+                output[start:stop].copy_(segment[0])
+            return output
+
+        del max_seqlen
+        actual_seq_lengths = [
+            stop for start, stop in zip(bounds[:-1], bounds[1:]) if stop > start
+        ]
+        if not actual_seq_lengths:
+            return torch.empty_like(query)
+
+        if not (
+            query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+        ):
+            # Packed Ulysses Q/K/V are adjacent strided views. Repack them with
+            # one allocation instead of launching three large contiguous copies.
+            qkv = torch.stack((query, key, value), dim=0)
+            query, key, value = qkv.unbind(0)
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            key,
+            value,
+            num_heads=query.shape[1],
+            num_key_value_heads=key.shape[1],
+            scale=self.softmax_scale,
+            input_layout="TND",
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths,
+        )
+        return output

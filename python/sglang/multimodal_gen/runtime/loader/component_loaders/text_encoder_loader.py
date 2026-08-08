@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import init_device_mesh
+from torch.distributed.fsdp import register_fsdp_forward_method
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
@@ -489,6 +490,8 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+                    if callable(getattr(model, "encode_ids", None)):
+                        register_fsdp_forward_method(model, "encode_ids")
                 else:
                     model = model.to("cpu")
             else:
