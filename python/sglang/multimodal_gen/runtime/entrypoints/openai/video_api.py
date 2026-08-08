@@ -986,6 +986,11 @@ async def download_video_content(
         )
 
     file_path = _select_video_variant_path(job, variant)
+    if job.get("status") == "cancelled":
+        raise HTTPException(
+            status_code=404,
+            detail="Video content is unavailable for a cancelled generation",
+        )
     if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):

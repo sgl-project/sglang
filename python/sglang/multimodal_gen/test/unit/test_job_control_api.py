@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _dispatch_job_async,
     _require_trackable_video_batch,
     delete_video,
+    download_video_content,
 )
 from sglang.multimodal_gen.runtime.managers.job_registry import (
     CancelReq,
@@ -272,6 +273,16 @@ class TestVideoDelete(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "cancelled")
         for field in ("url", "file_path", "file_paths", "num_outputs"):
             self.assertIsNone(job[field])
+
+    async def test_cancelled_content_is_not_reported_as_in_progress(self):
+        await VIDEO_STORE.update_fields("video-id", {"status": "cancelled"})
+        with self.assertRaises(HTTPException) as raised:
+            await download_video_content("video-id")
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(
+            raised.exception.detail,
+            "Video content is unavailable for a cancelled generation",
+        )
 
 
 class TestConflictResponse(unittest.IsolatedAsyncioTestCase):
