@@ -1,5 +1,7 @@
 # Weekly CUDA tests. Same organisation as nightly, one stage down: a test joins
-# the weekly run by declaring `stage="weekly"` plus a runner_config.
+# the weekly run by declaring `stage="weekly"` plus a runner_config. The jobs go
+# through the same _pr-test-stage.yml the per-commit suites use, so rust-ext
+# reuse, runner resolution and shard sizing are shared rather than reimplemented.
 name: Weekly Test (Nvidia)
 
 on:
@@ -25,14 +27,35 @@ concurrency:
   group: weekly-test-nvidia-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 jobs:
-  weekly-8-gpu-h200:
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
-    uses: ./.github/workflows/_scheduled-test-stage.yml
+  # run_all_tests skips the paths-filter entirely, so main_package is 'true' and
+  # sgl_kernel stays empty -- exactly right here: every test runs, and no job
+  # waits on a wheel this workflow never builds.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
-      stage: weekly
+      pr_test_yml: '.github/workflows/weekly-test-nvidia.yml'
+      run_all_tests: true
+      force_continue_on_error: true
+    secrets: inherit
+
+  weekly-test-8-gpu-h200:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: weekly-test-8-gpu-h200
       runner_config: 8-gpu-h200
-      runs_on: 8-gpu-h200
-      run_timeout_minutes: 240
-      full_parallel: ${{ inputs.full_parallel || false }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '240'
+      job_timeout_minutes: '300'
+      scheduled: true
     secrets: inherit
