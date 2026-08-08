@@ -1733,11 +1733,16 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-if is_cuda() or is_hip():
+if is_cuda():
     from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:
+    # clamp_position_cuda is a tvm_ffi JIT kernel that compiles via nvcc
+    # (load_inline drives nvcc + -gencode=arch=compute_70,...). It has no
+    # ROCm/hipcc backend, so on HIP it fails to compile (no nvcc; sm_70 is not
+    # a valid GCN arch) and crashes the first forward. Use the native torch
+    # fallback on HIP until the JIT gains a ROCm compile path.
     clamp_position = _clamp_position_native
 
 
