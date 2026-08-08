@@ -11,7 +11,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(
+    est_time=900,
+    stage="nightly",
+    runner_config="4-gpu-b200",
+    nightly=True,
+)
 
 GLM52_FP4_MODEL = "nvidia/GLM-5.2-NVFP4"
 

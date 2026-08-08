@@ -39,7 +39,9 @@ SIMILARITY_THRESHOLD = 0.9999
 
 register_cuda_ci(
     est_time=150,
-    suite="nightly-1-gpu",
+    stage="nightly",
+    runner_config="1-gpu-large",
+    nightly=True,
 )
 
 

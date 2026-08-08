@@ -35,7 +35,12 @@ from sglang.test.lora_utils import (
 
 CHUNK_SIZE = 16
 
-register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(
+    est_time=60,
+    stage="nightly",
+    runner_config="1-gpu-large",
+    nightly=True,
+)
 
 
 def reset_kernel_cache():

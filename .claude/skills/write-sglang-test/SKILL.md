@@ -56,7 +56,7 @@ A per-commit suite name is **generated** from registration metadata as `{stage}-
 - **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
 
-> Legacy single-string `suite=` is only for suites that don't fit that shape — nightly/stress/weekly and some AMD/CPU/NPU pools (e.g. `suite="nightly-kernel-1-gpu", nightly=True`). Per-commit tests always use `stage=` + `runner_config=`.
+> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large", nightly=True` → `nightly-test-1-gpu-large`). Legacy single-string `suite=` is left only for stress/weekly and some AMD/CPU/NPU pools.
 
 ### All CI Suites
 
@@ -115,11 +115,13 @@ A per-commit suite name is **generated** from registration metadata as `{stage}-
 
 Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`. Examples:
 
-- `nightly-1-gpu` (CUDA)
-- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
-- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
-- `nightly-8-gpu-h200` (CUDA)
-- `nightly-eval-vlm-2-gpu` (CUDA)
+CUDA nightly suites are named `nightly-test-{runner_config}` — one per machine type, holding everything that runs nightly on it. There is no per-purpose split (kernel / eval / perf / precision all share their machine's suite), and `auto_partition` splits the work:
+
+- `nightly-test-1-gpu-large` (CUDA)
+- `nightly-test-2-gpu-large` (CUDA)
+- `nightly-test-8-gpu-h200` (CUDA)
+- `nightly-test-4-gpu-gb300` (CUDA)
+- `nightly-amd` (AMD)
 - `nightly-amd` (AMD)
 - `nightly-amd-8-gpu-mi35x` (AMD)
 - `nightly-1-npu-a3` (NPU)

@@ -11,7 +11,12 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)
+register_cuda_ci(
+    est_time=3600,
+    stage="nightly",
+    runner_config="8-gpu-b200",
+    nightly=True,
+)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 SERVER_LAUNCH_TIMEOUT = 1000

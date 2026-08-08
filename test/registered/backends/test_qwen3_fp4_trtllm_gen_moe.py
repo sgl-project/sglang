@@ -12,7 +12,12 @@ from sglang.test.test_utils import (
 )
 
 # modelopt_fp4 requires SM 100+ (Blackwell)
-register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(
+    est_time=300,
+    stage="nightly",
+    runner_config="1-gpu-large",
+    nightly=True,
+)
 
 
 @unittest.skipIf(

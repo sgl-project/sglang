@@ -4,7 +4,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
-register_cuda_ci(est_time=600, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(
+    est_time=600,
+    stage="nightly",
+    runner_config="4-gpu-b200",
+    nightly=True,
+)
 
 RESULT_DIR = "performance_results_gpt_oss_4gpu"
 

@@ -7,7 +7,12 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Kimi-K2.5 NVFP4 + EAGLE3 (MLA draft) speculative decoding on 4x B200, tp=4.
-register_cuda_ci(est_time=3000, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(
+    est_time=3000,
+    stage="nightly",
+    runner_config="4-gpu-b200",
+    nightly=True,
+)
 
 MODEL_PATH = "nvidia/Kimi-K2.5-NVFP4"
 DRAFT_MODEL_PATH = "lightseekorg/kimi-k2.5-eagle3-mla"

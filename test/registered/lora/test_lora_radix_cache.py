@@ -21,7 +21,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(
+    est_time=200,
+    stage="nightly",
+    runner_config="1-gpu-large",
+    nightly=True,
+)
 register_amd_ci(est_time=200, suite="nightly-amd-1-gpu", nightly=True)
 
 PROMPTS = [

@@ -36,7 +36,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=360,
-    suite="nightly-8-gpu-b200",
+    stage="nightly",
+    runner_config="8-gpu-b200",
+    nightly=True,
 )
 
 BASE_MODEL = "moonshotai/Kimi-K2.5"
