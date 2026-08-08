@@ -8880,6 +8880,13 @@ class ServerArgs:
             self.mm_processor_worker_num >= 0
         ), "Multimodal processor worker num must >= 0"
         assert self.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
+        if self.tokenizer_worker_num > 1:
+            # Multi-tokenizer workers bypass the HTTP auth middleware.
+            assert not self.api_key and not self.admin_api_key, (
+                "API key authentication (--api-key / --admin-api-key) is not "
+                "supported in multi-tokenizer mode (tokenizer_worker_num > 1). "
+                "Set tokenizer_worker_num=1 to enable API key authentication."
+            )
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )

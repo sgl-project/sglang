@@ -2140,5 +2140,39 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestMultiTokenizerApiKeyRejected(CustomTestCase):
+    """Test API-key validation for multi-tokenizer mode."""
+
+    def test_admin_api_key_rejected_with_multiple_tokenizer_workers(self):
+        args = ServerArgs(
+            model_path="dummy", tokenizer_worker_num=2, admin_api_key="admin"
+        )
+        with self.assertRaisesRegex(AssertionError, "multi-tokenizer mode"):
+            args.check_server_args()
+
+    def test_api_key_rejected_with_multiple_tokenizer_workers(self):
+        args = ServerArgs(model_path="dummy", tokenizer_worker_num=2, api_key="user")
+        with self.assertRaisesRegex(AssertionError, "multi-tokenizer mode"):
+            args.check_server_args()
+
+    def test_empty_keys_allowed_with_multiple_tokenizer_workers(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tokenizer_worker_num=2,
+            api_key="",
+            admin_api_key="",
+        )
+        args.check_server_args()
+
+    def test_keys_allowed_with_single_tokenizer_worker(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tokenizer_worker_num=1,
+            api_key="user",
+            admin_api_key="admin",
+        )
+        args.check_server_args()
+
+
 if __name__ == "__main__":
     unittest.main()
