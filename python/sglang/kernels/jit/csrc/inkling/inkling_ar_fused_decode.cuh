@@ -49,7 +49,7 @@
 #include <cuda_bf16.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 constexpr int kPadSlot = -1;
 constexpr uint32_t kVecElems = 8;  // bf16x8 = 16 B
@@ -827,4 +827,4 @@ struct ArSconvNormVerifyKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

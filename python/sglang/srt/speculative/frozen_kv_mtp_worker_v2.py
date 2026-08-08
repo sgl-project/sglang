@@ -30,6 +30,7 @@ import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -127,7 +128,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         with (
             empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
             # Both base classes own initialization, so initialize TpModelWorker
             # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
@@ -138,6 +139,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                # The draft runs at absolute target positions.
+                context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
