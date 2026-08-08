@@ -403,6 +403,7 @@ class FusedMoE(torch.nn.Module):
             )
 
             validate_alphamoe_runner_contract(
+                tp_size=self.moe_tp_size,
                 ep_size=self.moe_ep_size,
                 a2a_is_none=get_moe_a2a_backend().is_none(),
                 num_fused_shared_experts=num_fused_shared_experts,

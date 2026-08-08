@@ -6593,6 +6593,8 @@ class ServerArgs:
                     "representable by this kernel API. Got effective "
                     f"quantization={effective_quantization!r}."
                 )
+            if self.tp_size != 4:
+                raise ValueError("flashinfer_alphamoe requires --tp-size 4")
             if not is_sm100_supported():
                 raise ValueError(
                     "flashinfer_alphamoe requires an exact SM100/SM103 GPU "

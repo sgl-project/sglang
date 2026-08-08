@@ -46,6 +46,7 @@ ALPHAMOE_VALIDATED_TOP_K = 10
 
 def validate_alphamoe_runner_contract(
     *,
+    tp_size: int,
     ep_size: int,
     a2a_is_none: bool,
     num_fused_shared_experts: int,
@@ -63,6 +64,8 @@ def validate_alphamoe_runner_contract(
 ) -> None:
     """Reject runner features outside the frozen AlphaMoE kernel contract."""
 
+    if tp_size != 4:
+        raise ValueError("flashinfer_alphamoe requires moe_tp_size=4")
     if ep_size != 1 or not a2a_is_none:
         raise ValueError(
             "flashinfer_alphamoe requires ep_size=1 and moe_a2a_backend=none"

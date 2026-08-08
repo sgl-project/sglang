@@ -57,6 +57,7 @@ def _valid_tensors(
 class TestFlashInferAlphaMoeContract(CustomTestCase):
     def _valid_runner_kwargs(self):
         return {
+            "tp_size": 4,
             "ep_size": 1,
             "a2a_is_none": True,
             "num_fused_shared_experts": 0,
@@ -125,6 +126,12 @@ class TestFlashInferAlphaMoeContract(CustomTestCase):
         kwargs = self._valid_runner_kwargs()
         kwargs["num_fused_shared_experts"] = 1
         with self.assertRaisesRegex(ValueError, "shared-expert fusion"):
+            validate_alphamoe_runner_contract(**kwargs)
+
+    def test_runner_contract_rejects_non_tp4(self):
+        kwargs = self._valid_runner_kwargs()
+        kwargs["tp_size"] = 2
+        with self.assertRaisesRegex(ValueError, "moe_tp_size=4"):
             validate_alphamoe_runner_contract(**kwargs)
 
     def test_deinterleave_rejects_nonrepresentable_row_count(self):
