@@ -1846,6 +1846,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_queue_sizes = (
                 (
                     cc.prefetch_hit_queue.qsize(),
+                    cc.ack_prefetch_queue.qsize(),
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
                     *(extra_release_queues[name].qsize() for name in extra_pool_names),
@@ -2051,16 +2052,19 @@ class UnifiedRadixCache(BasePrefixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
+                n_storage_hit, n_ack_prefetch, n_backup, n_release = (
+                    storage_queue_sizes[:4]
+                )
                 extra_release_counts = {
                     pool_name: count
                     for pool_name, count in zip(
                         extra_pool_names,
-                        storage_queue_sizes[3:],
+                        storage_queue_sizes[4:],
                     )
                 }
                 self._drain_storage_control_queues_impl(
                     n_storage_hit=n_storage_hit,
+                    n_ack_prefetch=n_ack_prefetch,
                     n_backup=n_backup,
                     n_release=n_release,
                     extra_release_counts=extra_release_counts,
