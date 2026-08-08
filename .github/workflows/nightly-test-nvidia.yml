@@ -57,8 +57,9 @@ jobs:
   # type the pool can give us at once.
   nightly-1-gpu-large:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 1-gpu-large
       runs_on: 1-gpu-h100
       partition_ids: '[0, 1]'
@@ -70,8 +71,9 @@ jobs:
 
   nightly-2-gpu-large:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-large')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 2-gpu-large
       runs_on: 2-gpu-h100
       # Two 2h tests (VLM eval + VLM perf) dominate; 3 partitions splits them
@@ -85,8 +87,9 @@ jobs:
 
   nightly-4-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-h100')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 4-gpu-h100
       runs_on: 4-gpu-h100
       run_timeout_minutes: 120
@@ -95,8 +98,9 @@ jobs:
 
   nightly-4-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-b200')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 4-gpu-b200
       runs_on: 4-gpu-b200
       run_timeout_minutes: 300
@@ -105,8 +109,9 @@ jobs:
 
   nightly-4-gpu-gb300:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 4-gpu-gb300
       # Nightly keeps its own GB300 pool, separate from the per-commit
       # `4-gpu-gb300` label used by base-c.
@@ -120,8 +125,9 @@ jobs:
 
   nightly-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 8-gpu-h200
       runs_on: 8-gpu-h200
       partition_ids: '[0, 1, 2, 3]'
@@ -134,8 +140,9 @@ jobs:
 
   nightly-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-b200')
-    uses: ./.github/workflows/_nightly-test-stage.yml
+    uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
+      stage: nightly
       runner_config: 8-gpu-b200
       runs_on: 8-gpu-b200
       partition_ids: '[0, 1, 2, 3]'
