@@ -370,13 +370,29 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if gamma is not None:
-        verify_window = int(gamma) + 1
+        # Mask-filling heads (slot 0 = anchor -> gamma-1 real drafts) serve a
+        # faithful verify width of gamma; upstream AR heads use gamma + 1.
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            read_draft_checkpoint_is_mask_filling,
+        )
+
+        try:
+            mask_filling = read_draft_checkpoint_is_mask_filling(
+                server_args=server_args
+            )
+        except Exception:
+            mask_filling = False
+        # The runtime convention global is set by DSparkWorkerV2.__init__ in the
+        # scheduler process (the only process whose model runners consult it);
+        # here we only validate the user-facing width arithmetic.
+        verify_window = int(gamma) if mask_filling else int(gamma) + 1
         if (
             server_args.speculative_num_draft_tokens is not None
             and int(server_args.speculative_num_draft_tokens) != verify_window
         ):
             raise ValueError(
-                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
+                "DSpark speculative_num_draft_tokens must equal "
+                f"{'gamma (mask-filling head)' if mask_filling else 'gamma + 1'} "
                 f"(= {verify_window} for gamma={gamma}), but got "
                 f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}."
             )

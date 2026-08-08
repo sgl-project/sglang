@@ -107,6 +107,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
+        # Set the draft block-row convention BEFORE the draft runner exists:
+        # its CG capture widths / logits buffers derive from
+        # get_num_tokens_per_req_for_target_verify at construction. The
+        # server-args hook also sets this, but scheduler actor processes may
+        # receive an already-resolved ServerArgs without re-running hooks.
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            read_draft_checkpoint_is_mask_filling,
+        )
+        from sglang.srt.speculative.spec_info import (
+            set_dspark_mask_filling_convention,
+        )
+
+        # No fallback: a draft config that cannot be read here would silently
+        # serve the wrong verify geometry (bs*(gamma-1) rows reshaped as
+        # (-1, gamma)); fail at startup instead.
+        set_dspark_mask_filling_convention(
+            read_draft_checkpoint_is_mask_filling(server_args=server_args)
+        )
+
         with self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -255,7 +274,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
-            gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
@@ -601,6 +619,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
+        # Contract joint: anchor + drafts must equal the verify width every
+        # site downstream (CG buffers, ragged layout, result rail) is sized to.
+        assert draft_tokens.shape[1] + 1 == self.verify_num_draft_tokens, (
+            draft_tokens.shape,
+            self.verify_num_draft_tokens,
+            self.gamma,
+        )
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()

@@ -244,8 +244,14 @@ class DraftBlockProposer:
                         .clamp_min(1e-5)
                     )
                 corrected_logits = None
+            # Mask-filling heads emit gamma-1 drafts per gamma-row block.
+            n_drafts = (
+                self.gamma - 1
+                if getattr(self.draft_model.markov_head, "mask_filling", False)
+                else self.gamma
+            )
             draft_block = DraftBlockResult(
-                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
+                draft_tokens=draft_sampler.out[: bs * n_drafts].view(bs, n_drafts),
                 corrected_logits=corrected_logits,
                 greedy_mask=greedy_mask,
                 temperatures=temperatures,

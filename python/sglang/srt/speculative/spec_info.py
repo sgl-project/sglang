@@ -27,6 +27,19 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
+# DSpark draft block-row convention. Legacy AR heads run gamma = verify-1
+# block rows; mask-filling heads (slot 0 = anchor) run gamma = verify width.
+# Set from server-args resolution (speculative_hook) BEFORE any model runner
+# is constructed -- decode CG capture widths and logits buffers derive from
+# get_num_tokens_per_req_for_target_verify at runner init.
+_DSPARK_DRAFT_BLOCK_ROWS_EQUAL_VERIFY = False
+
+
+def set_dspark_mask_filling_convention(mask_filling: bool) -> None:
+    global _DSPARK_DRAFT_BLOCK_ROWS_EQUAL_VERIFY
+    _DSPARK_DRAFT_BLOCK_ROWS_EQUAL_VERIFY = bool(mask_filling)
+
+
 class SpeculativeAlgorithm(Enum):
     """Builtin speculative decoding algorithms. Plugin-registered ones are
     ``CustomSpecAlgo`` instances; ``from_string`` returns either type, and
@@ -239,6 +252,10 @@ class SpeculativeAlgorithm(Enum):
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
         if self.is_dspark() and is_draft_worker:
+            # Mask-filling drafts: block rows == verify width (see
+            # set_dspark_mask_filling_convention); legacy AR drafts: verify-1.
+            if _DSPARK_DRAFT_BLOCK_ROWS_EQUAL_VERIFY:
+                return num_draft_tokens
             return num_draft_tokens - 1
         return num_draft_tokens
 

@@ -75,7 +75,6 @@ class TargetVerifyExecutor:
         self,
         *,
         target_worker,
-        gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
@@ -83,7 +82,12 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
-        self.gamma = int(gamma)
+        # Drafts per request. Verify rows = [anchor, drafts...] under BOTH
+        # conventions, so drafts = verify width - 1; the block-row gamma
+        # param equals this only for legacy AR heads (mask-filling blocks
+        # carry one extra prediction slot). The accept/out-token kernels all
+        # take the DRAFTS width.
+        self.gamma = int(verify_num_draft_tokens) - 1
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
