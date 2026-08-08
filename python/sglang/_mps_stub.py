@@ -139,10 +139,15 @@ def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG
     """Return the properties of the MPS device. Results are cached after first call."""
     global _cached_props
     if _cached_props is None:
-        import psutil
+        # Metal cannot use all of system RAM: allocations are only safe up
+        # to recommendedMaxWorkingSetSize (~65-75% of RAM). Advertising the
+        # full RAM size lets callers overcommit the GPU working set (#21443).
+        # The helper asks the active Apple Silicon runtime (MLX or torch-MPS)
+        # and falls back to total system RAM when the limit is unknown.
+        from sglang._apple_silicon_memory import apple_gpu_total_memory
 
         _cached_props = _MPSDeviceProperties(
-            total_memory=psutil.virtual_memory().total,
+            total_memory=apple_gpu_total_memory(),
         )
     return _cached_props
 
