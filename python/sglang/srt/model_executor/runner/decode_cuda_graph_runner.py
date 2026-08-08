@@ -386,6 +386,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            pp_proxy_v_first_size=self.model_runner.get_pp_proxy_v_first_size(),
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),

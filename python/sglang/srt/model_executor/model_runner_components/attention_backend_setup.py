@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.configs.hybrid_arch import rwkv7_config
 from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import (
@@ -252,4 +253,13 @@ def _build_full_attention_backend_from_str(
     if backend_str not in ATTENTION_BACKENDS:
         raise ValueError(f"Invalid attention backend: {backend_str}")
     model_runner.init_new_workspace = init_new_workspace
+    if rwkv7_config(model_runner.model_config) is not None:
+        # RWKV-7 is all-linear (zero full-attention layers). Do not construct a
+        # real full-attn backend (they probe the empty full KV pool or reject
+        # fp32); HybridLinearAttnBackend only needs a no-op stub here.
+        from sglang.srt.layers.attention.linear.rwkv7_backend import (
+            Rwkv7NoOpFullAttnBackend,
+        )
+
+        return Rwkv7NoOpFullAttnBackend(model_runner)
     return ATTENTION_BACKENDS[backend_str](model_runner)

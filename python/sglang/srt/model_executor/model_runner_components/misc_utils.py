@@ -74,6 +74,26 @@ def resolve_pp_proxy_topk_size(
     return getattr(hf_config, "index_topk", None)
 
 
+def resolve_pp_proxy_v_first_size(
+    *, model_config: ModelConfig, pp_size: int, pp_rank: int
+) -> Optional[int]:
+    """Return the RWKV-7 layer-0 value-projection width carried across a PP boundary.
+
+    RWKV-7 hands layer 0's value projection (``v_first``) to every later layer, so a
+    stage that does not own layer 0 receives it through ``PPProxyTensors`` and needs a
+    stable decode cuda-graph slot for it. The full hidden width is reserved; the
+    receiving stage slices its own tp head range inside ``forward``.
+    """
+    if pp_size <= 1 or pp_rank == 0:
+        return None
+
+    hf_config = model_config.hf_text_config
+    architectures = getattr(hf_config, "architectures", None) or []
+    if not any(a in ("RWKV7ForCausalLM", "Rwkv7ForCausalLM") for a in architectures):
+        return None
+    return getattr(hf_config, "hidden_size", None)
+
+
 def resolve_pp_proxy_residual_num_blocks(
     *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
 ) -> Optional[int]:

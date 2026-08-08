@@ -20,6 +20,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Rwkv7Config,
     ZayaConfig,
 )
 
@@ -108,6 +109,13 @@ def kimi_linear_config(model_config: ModelConfig):
     return None
 
 
+def rwkv7_config(model_config: ModelConfig):
+    config = model_config.hf_config
+    if isinstance(config, Rwkv7Config):
+        return config
+    return None
+
+
 def linear_attn_model_spec(model_config: ModelConfig):
     result = _get_linear_attn_registry_result(model_config)
     return result[0] if result else None
@@ -119,6 +127,7 @@ def mambaish_config(model_config: ModelConfig):
         or hybrid_gdn_config(model_config)
         or kimi_linear_config(model_config)
         or hybrid_lightning_config(model_config)
+        or rwkv7_config(model_config)
     )
     if existing:
         return existing

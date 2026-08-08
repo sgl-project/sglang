@@ -776,6 +776,13 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_v_first_size(self) -> Optional[int]:
+        return misc_utils.resolve_pp_proxy_v_first_size(
+            model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+        )
+
     def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,

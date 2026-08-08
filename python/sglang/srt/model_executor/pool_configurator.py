@@ -138,11 +138,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             and bool(mambaish.full_attention_layer_ids)
             and kvc.ps.pp_size > 1
         )
-        self._zero_kv_max_tokens = (
-            torch.iinfo(torch.int64).max
-            if has_kv_on_another_pp_stage
-            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+        # ALL-LINEAR (e.g. RWKV-7): cell_size == 0 not because this PP stage
+        # happens to hold no full-attention layer, but because the architecture
+        # has none at all. Token capacity is then bounded by the linear-state
+        # pool's concurrency rather than by full-attention KV memory, so
+        # falling back to context_len would cap an all-linear server at a
+        # single context's worth of tokens.
+        is_all_linear = (
+            self._cell_size == 0
+            and mambaish is not None
+            and not mambaish.full_attention_layer_ids
         )
+        if is_all_linear:
+            assert kvc.server_args.max_mamba_cache_size is not None, (
+                "all-linear model needs max_mamba_cache_size resolved before "
+                "pool sizing (handle_max_mamba_cache runs in _profile_available_bytes)"
+            )
+            self._zero_kv_max_tokens = min(
+                kvc.server_args.max_mamba_cache_size * kvc.model_config.context_len,
+                1 << 20,  # keep the token allocator index tensor reasonable
+            )
+            logger.info(
+                "All-linear model: token capacity capped at %d "
+                "(max_mamba_cache_size=%d x context_len=%d, clamp 1<<20).",
+                self._zero_kv_max_tokens,
+                kvc.server_args.max_mamba_cache_size,
+                kvc.model_config.context_len,
+            )
+        else:
+            self._zero_kv_max_tokens = (
+                torch.iinfo(torch.int64).max
+                if has_kv_on_another_pp_stage
+                else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+            )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
