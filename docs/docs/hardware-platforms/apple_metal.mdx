@@ -30,8 +30,12 @@ You can install SGLang using one of the methods below.
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-# Create and activate a virtual environment
-uv venv -p 3.12 sglang-metal
+# Create and activate a virtual environment (Python 3.11; matches MLX CI).
+# Prefer an arm64 interpreter: on machines with both Homebrew installs,
+# `uv venv -p 3.11` can resolve to Intel Python, where torch has no wheel.
+uv venv --python 3.11 sglang-metal
+# If uv picks the wrong arch, pin explicitly:
+# uv venv -p /opt/homebrew/bin/python3.11 sglang-metal
 source sglang-metal/bin/activate
 
 # (Optional) Compile sgl-kernel

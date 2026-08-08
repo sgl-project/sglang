@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -186,11 +187,14 @@ def run_unittest_files(
 
             full_path = os.path.join(os.getcwd(), filename)
             logger.info(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
+                f".\n.\nBegin ({i}/{len(files) - 1}):\n{sys.executable} {full_path}\n.\n.\n"
             )
             file_tic = time.perf_counter()
 
-            cmd = ["python3", full_path, "-f"]
+            # Use the current interpreter so `python run_suite.py` from an
+            # unactivated venv still hands children the venv's packages.
+            # Bare `python3` follows PATH and often hits system Python.
+            cmd = [sys.executable, full_path, "-f"]
 
             if capture_output:
                 # Capture output for retry decision
