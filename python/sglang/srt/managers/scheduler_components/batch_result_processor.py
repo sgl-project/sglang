@@ -841,15 +841,6 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
-        if not batch.spec_algorithm.is_none():
-            mamba_track_mask_cpu = None
-            mamba_track_mask_next_cpu = None
-            mamba_decode_batch_idx_cpu = None
-        else:
-            mamba_track_mask_cpu = batch.mamba_track_mask_cpu
-            mamba_track_mask_next_cpu = batch.mamba_track_mask_next_cpu
-            mamba_decode_batch_idx_cpu = batch.mamba_decode_batch_idx_cpu
-
         self.token_to_kv_pool_allocator.free_group_begin()
 
         for i, req in enumerate(batch.reqs):
@@ -874,25 +865,12 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            known_mamba_boundary = None
-            if mamba_track_mask_cpu is not None:
-                lookahead = req.decode_batch_idx - mamba_decode_batch_idx_cpu[i]
-                assert lookahead in (0, 1), (
-                    f"mamba result lookahead={lookahead} for req {req.rid}; "
-                    "overlap advanced more than one decode batch"
-                )
-                if lookahead == 0:
-                    known_mamba_boundary = bool(mamba_track_mask_cpu[i])
-                else:
-                    known_mamba_boundary = bool(mamba_track_mask_next_cpu[i])
-
             self._handle_finish_state_updated_req(
                 req,
                 batch,
                 result,
                 i,
                 logits_output,
-                known_mamba_boundary=known_mamba_boundary,
             )
 
             if req.return_logprob:
@@ -1042,8 +1020,19 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
-        known_mamba_boundary: Optional[bool] = None,
     ):
+        known_mamba_boundary = None
+        if batch.mamba_track_mask_cpu is not None:
+            lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
+            assert lookahead in (0, 1), (
+                f"mamba result lookahead={lookahead} for req {req.rid}; "
+                "overlap advanced more than one decode batch"
+            )
+            if lookahead == 0:
+                known_mamba_boundary = bool(batch.mamba_track_mask_cpu[i])
+            else:
+                known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
+
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
         if known_mamba_boundary is None or known_mamba_boundary:
