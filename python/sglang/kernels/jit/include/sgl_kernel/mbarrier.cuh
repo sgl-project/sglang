@@ -4,8 +4,8 @@
 // kimi_k3/comm/gemm_ar.cuh and kimi_k3/attn_res/fused_tma.cuh both defined these
 // with identical bodies.
 //
-// The enclosing namespace is the same global `ptx` both files already open, so
-// existing `::ptx::mbar_*` call sites need no change.
+// The enclosing namespace is the same `sglang::ptx` both files already open, so
+// existing `ptx::mbar_*` call sites need no change.
 //
 // gemm_ar.cuh keeps mbar_arrive_cluster_release: only it uses that one.
 // attention/kda_prefill.cu duplicates a different set (MMA / ldmatrix) but is
@@ -14,6 +14,8 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
+
+namespace sglang {
 
 namespace ptx {
 
@@ -66,3 +68,5 @@ static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
 }
 
 }  // namespace ptx
+
+}  // namespace sglang

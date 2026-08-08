@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import safe_open, save_file
 from torch import nn
 
-from sglang.multimodal_gen.runtime.loader import fsdp_load
+from sglang.multimodal_gen.runtime.loader import fsdp_load, rank_local_checkpoint
 
 
 class _UniformDtypeModel(nn.Module):
@@ -92,3 +95,129 @@ class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
         self.assertEqual(policy.param_dtype, torch.bfloat16)
         self.assertEqual(state_kwargs["param_dtype"], torch.bfloat16)
         shard_model.assert_not_called()
+
+
+class TestRankLocalSafetensorsRead(unittest.TestCase):
+    def _source(
+        self,
+        file_path: str,
+        param_name: str,
+        shape: tuple[int, ...],
+        merge_index: int | None = None,
+        num_params_to_merge: int | None = None,
+    ) -> rank_local_checkpoint.SafetensorsSource:
+        return rank_local_checkpoint.SafetensorsSource(
+            file_path=file_path,
+            param_name=param_name,
+            shape=shape,
+            dtype="BF16",
+            merge_index=merge_index,
+            num_params_to_merge=num_params_to_merge,
+        )
+
+    def test_reads_rank_local_slice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            weight = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+            save_file({"weight": weight}, file_path)
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                tensor = rank_local_checkpoint.read_rank_local_tensor(
+                    [self._source(file_path, "weight", (6, 4))],
+                    {file_path: handle},
+                    local_shape=(2, 4),
+                    global_offset=(2, 0),
+                )
+
+            torch.testing.assert_close(tensor, weight[2:4])
+
+    def test_reads_rank_local_slice_across_merged_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            first = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+            second = torch.arange(12, 24, dtype=torch.bfloat16).reshape(3, 4)
+            save_file({"first": first, "second": second}, file_path)
+            sources = [
+                self._source(file_path, "first", (3, 4), 0, 2),
+                self._source(file_path, "second", (3, 4), 1, 2),
+            ]
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                tensor = rank_local_checkpoint.read_rank_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    local_shape=(4, 4),
+                    global_offset=(1, 0),
+                )
+
+            torch.testing.assert_close(tensor, torch.cat((first, second))[1:5])
+
+    def test_reads_zero_sized_rank_local_shard(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            weight = torch.ones((1, 4), dtype=torch.bfloat16)
+            save_file({"weight": weight}, file_path)
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                tensor = rank_local_checkpoint.read_rank_local_tensor(
+                    [self._source(file_path, "weight", (1, 4))],
+                    {file_path: handle},
+                    local_shape=(0, 4),
+                    global_offset=(1, 0),
+                )
+
+            self.assertEqual(tensor.shape, (0, 4))
+            self.assertEqual(tensor.dtype, torch.bfloat16)
+            self.assertEqual(tensor.numel(), 0)
+
+    def test_reads_tp_local_merged_column_slice_per_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            first = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+            second = torch.arange(16, 32, dtype=torch.bfloat16).reshape(4, 4)
+            save_file({"first": first, "second": second}, file_path)
+            sources = [
+                self._source(file_path, "first", (4, 4), 0, 2),
+                self._source(file_path, "second", (4, 4), 1, 2),
+            ]
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                tensor = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=1,
+                    tp_size=2,
+                )
+
+            expected = torch.cat((first[2:4], second[2:4]))
+            torch.testing.assert_close(tensor, expected)
+            self.assertEqual(
+                rank_local_checkpoint.tp_local_shape(sources, 0, 2), (4, 4)
+            )
+
+    def test_reads_tp_local_merged_row_slice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            first = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+            second = torch.arange(16, 32, dtype=torch.bfloat16).reshape(4, 4)
+            save_file({"first": first, "second": second}, file_path)
+            sources = [
+                self._source(file_path, "first", (4, 4), 0, 2),
+                self._source(file_path, "second", (4, 4), 1, 2),
+            ]
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                tensor = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=1,
+                    tp_rank=1,
+                    tp_size=2,
+                )
+
+            expected = torch.cat((first[:, 2:4], second[:, 2:4]))
+            torch.testing.assert_close(tensor, expected)
+            self.assertEqual(
+                rank_local_checkpoint.tp_local_shape(sources, 1, 2), (8, 2)
+            )

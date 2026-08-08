@@ -57,8 +57,6 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
   }
 }
 
-}  // namespace sglang
-
 template <bool kUsePDL>
 struct RouteQuantFusedKernel {
   static void
@@ -75,7 +73,7 @@ struct RouteQuantFusedKernel {
       bool renormalize,
       bool apply_scale) {
     using namespace host;
-    using Trait = sglang::RouteQuantTrait;
+    using Trait = RouteQuantTrait;
 
     auto M_ = SymbolicSize{"num_tokens"};
     auto N_ = SymbolicSize{"num_experts"};
@@ -95,7 +93,7 @@ struct RouteQuantFusedKernel {
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_strides({-1, 1}).with_device(device).verify(out_packed);
 
     RuntimeCheck(
-        N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
+        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
         "route_quant_fused is specialized for N=896, K=16");
     RuntimeCheck(scores.stride(0) % 4 == 0, "route_quant_fused: scores row stride must be a multiple of 4");
 
@@ -103,8 +101,7 @@ struct RouteQuantFusedKernel {
     // with the standalone flat kernel.
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(x, out_q, out_s);
     RuntimeCheck(
-        ctx.params.hidden_size == sglang::kQuantHidden_,
-        "route_quant_fused is specialized for a 3584-wide activation row");
+        ctx.params.hidden_size == kQuantHidden_, "route_quant_fused is specialized for a 3584-wide activation row");
     RuntimeCheck(
         ctx.params.num_tokens == static_cast<uint32_t>(M_.unwrap()),
         "route_quant_fused: scores and activations must have the same token count");
@@ -112,7 +109,7 @@ struct RouteQuantFusedKernel {
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
-    const auto params = sglang::RouteQuantFusedParams{
+    const auto params = RouteQuantFusedParams{
         .route =
             {scores.data_ptr(),
              static_cast<const fp32_t*>(bias.data_ptr()),
@@ -132,11 +129,13 @@ struct RouteQuantFusedKernel {
     };
 
     if (score_dtype.is_type<fp32_t>()) {
-      LaunchKernel(2 * M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-          .enable_pdl(kUsePDL)(sglang::route_quant_fused_kernel<kUsePDL, fp32_t>, params);
+      LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(route_quant_fused_kernel<kUsePDL, fp32_t>, params);
     } else {
-      LaunchKernel(2 * M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-          .enable_pdl(kUsePDL)(sglang::route_quant_fused_kernel<kUsePDL, bf16_t>, params);
+      LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(route_quant_fused_kernel<kUsePDL, bf16_t>, params);
     }
   }
 };
+
+}  // namespace sglang
