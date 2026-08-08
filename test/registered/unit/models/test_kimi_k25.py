@@ -547,6 +547,9 @@ def test_kimi_lazy_vmm_cache_hit_uses_proxy_consumer_count():
 
 
 class _Tokenizer:
+    def __init__(self, vocabulary=None):
+        self._vocabulary = vocabulary or {}
+
     def encode(self, text, allowed_special=None):
         tokens = {
             "<|media_begin|>image 1536x1024<|media_content|>": [10, 11],
@@ -555,10 +558,13 @@ class _Tokenizer:
         }
         return tokens.get(text, [])
 
+    def get_vocab(self):
+        return self._vocabulary
+
 
 class _HFProcessor:
-    def __init__(self):
-        self.tokenizer = _Tokenizer()
+    def __init__(self, vocabulary=None):
+        self.tokenizer = _Tokenizer(vocabulary)
         self.image_processor = SimpleNamespace()
         self.media_processor = SimpleNamespace(
             media_proc_cfg={
@@ -575,13 +581,19 @@ class _HFProcessor:
 
 
 @pytest.mark.parametrize(
-    ("processor_cls", "wrapper_cls"),
+    ("processor_cls", "wrapper_cls", "vocabulary", "expected_media_token_id"),
     [
-        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper),
-        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper),
+        (KimiK2_5VLImageProcessor, KimiGPUProcessorWrapper, {}, 42),
+        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper, {"<|media_pad|>": 99}, 99),
+        (KimiK3ImageProcessor, KimiK3GPUProcessorWrapper, {}, 42),
     ],
 )
-def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
+def test_kimi_processor_workers_share_the_placeholder_contract(
+    processor_cls, wrapper_cls, vocabulary, expected_media_token_id
+):
+    """Runtime vocabulary overrides stale checkpoint IDs, while missing entries
+    fall back to checkpoint metadata; cloned workers must retain the chosen ID.
+    """
     server_args = SimpleNamespace(
         mm_feature_transport="cpu",
         disable_fast_image_processor=False,
@@ -595,7 +607,7 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
     processor = processor_cls(
         hf_config=SimpleNamespace(media_placeholder_token_id=42),
         server_args=server_args,
-        _processor=_HFProcessor(),
+        _processor=_HFProcessor(vocabulary),
         transport_mode=None,
     )
     try:
@@ -605,6 +617,9 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         assert isinstance(processor._processor, wrapper_cls)
         assert isinstance(worker_processor, wrapper_cls)
         assert worker_processor is not processor._processor
+        assert processor.mm_tokens.image_token_id == expected_media_token_id
+        assert processor._processor._image_token_id == expected_media_token_id
+        assert worker_processor._image_token_id == expected_media_token_id
     finally:
         processor.mm_processor_executor.shutdown()
         processor.io_executor.shutdown()

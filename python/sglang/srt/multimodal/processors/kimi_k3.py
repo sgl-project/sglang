@@ -8,6 +8,7 @@ images onto the checkpoint-configured background
 at load time.
 """
 
+import logging
 import re
 from typing import Dict, List, Union
 
@@ -33,6 +34,30 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+
+logger = logging.getLogger(__name__)
+K3_MEDIA_PLACEHOLDER = "<|media_pad|>"
+
+
+def _build_k3_multimodal_tokens(processor, configured_token_id):
+    tokenizer_token_id = processor.tokenizer.get_vocab().get(K3_MEDIA_PLACEHOLDER)
+    image_token_id = (
+        configured_token_id if tokenizer_token_id is None else tokenizer_token_id
+    )
+    if image_token_id != configured_token_id:
+        logger.warning(
+            "The Kimi-K3 tokenizer assigns %s to token ID %d, overriding the "
+            "checkpoint-configured ID %d.",
+            K3_MEDIA_PLACEHOLDER,
+            image_token_id,
+            configured_token_id,
+        )
+
+    return MultimodalSpecialTokens(
+        image_token=K3_MEDIA_PLACEHOLDER,
+        image_token_id=image_token_id,
+        image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
+    ).build(processor)
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -304,11 +329,10 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     preserve_processor_input_ids = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        mm_tokens = MultimodalSpecialTokens(
-            image_token="<|media_pad|>",
-            image_token_id=hf_config.media_placeholder_token_id,
-            image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
-        ).build(_processor)
+        mm_tokens = _build_k3_multimodal_tokens(
+            processor=_processor,
+            configured_token_id=hf_config.media_placeholder_token_id,
+        )
 
         media_proc_cfg = _processor.media_processor.media_proc_cfg
 
