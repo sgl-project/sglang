@@ -33,6 +33,7 @@ from .schemes import (
     AWQLinearScheme,
     AWQMarlinLinearScheme,
     AWQMoEScheme,
+    AWQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -211,6 +212,34 @@ class AWQCPUConfig(AWQConfig):
 
         assert isinstance(layer, FusedMoE)
         return AWQIntelAMXMoEScheme(self)
+
+
+class AWQXPUConfig(AWQConfig):
+    """AWQ int4 dense linear on Intel XPU.
+
+    Lowers to torch's native ``_weight_int4pack_mm`` op. MoE is out of scope
+    for the dense phase (mirrors ``GPTQXPUConfig``).
+    """
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "AWQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return super().get_quant_method(layer, prefix)
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        from sglang.srt.layers.linear import LinearBase
+
+        assert isinstance(layer, LinearBase)
+        return AWQXPULinearScheme(self)
 
 
 class AWQMarlinConfig(QuantizationConfig):
