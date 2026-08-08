@@ -662,11 +662,21 @@ class Qwen3VLModel(nn.Module):
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
-    def __init__(self, config, *, use_tensor_parallel: bool = False):
+    def __init__(
+        self,
+        config,
+        *,
+        use_tensor_parallel: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        use_weight_only_fp8: bool = False,
+    ):
         super().__init__()
+        # FP8 releases list every visual submodule under `ignored_layers`.
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLTextModel(
             config.text_config,
+            quant_config=quant_config,
+            use_weight_only_fp8=use_weight_only_fp8,
             use_tensor_parallel=use_tensor_parallel,
         )
         self.rope_deltas = None  # cache rope_deltas here

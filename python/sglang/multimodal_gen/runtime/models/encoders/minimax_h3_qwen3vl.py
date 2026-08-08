@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from itertools import chain
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 _LAYER_WEIGHT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
@@ -59,7 +61,12 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL config must be trimmed to "
                 f"{selected_layer} language layers before construction"
             )
-        self.model = Qwen3VLModel(arch, use_tensor_parallel=True)
+        self.quant_config = getattr(config, "quant_config", None)
+        self.model = Qwen3VLModel(
+            arch,
+            use_tensor_parallel=True,
+            quant_config=self.quant_config,
+        )
         # H3 consumes the unnormalized output immediately after layer 49.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
@@ -194,7 +201,41 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                     f"parameter={tuple(param.shape)}"
                 ) from exc
             loaded.add(name)
+        self._process_weights_after_loading()
         return loaded
+
+    @staticmethod
+    def _module_param_device(module: nn.Module) -> torch.device | None:
+        """Where this module's own tensors currently live, if it has any."""
+
+        for tensor in chain(module.parameters(), module.buffers()):
+            return tensor.device
+        return None
+
+    def _process_weights_after_loading(self) -> None:
+        """Repack quantized layers; the loader bypasses the FSDP path that would.
+
+        Marlin and the DeepGEMM ue8m0 requant are CUDA kernels picked by platform
+        rather than by parameter device, so offloaded weights are staged on the
+        accelerator one module at a time and handed straight back.
+        """
+
+        if self.quant_config is None:
+            return
+        device = None if current_platform.is_cpu() else get_local_torch_device()
+        for module in self.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None or not hasattr(
+                quant_method, "process_weights_after_loading"
+            ):
+                continue
+            origin = self._module_param_device(module)
+            relocate = device is not None and origin is not None and origin != device
+            if relocate:
+                module.to(device)
+            quant_method.process_weights_after_loading(module)
+            if relocate:
+                module.to(origin)
 
 
 EntryClass = MiniMaxH3Qwen3VLEncoder
