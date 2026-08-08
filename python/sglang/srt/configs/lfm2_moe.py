@@ -22,7 +22,11 @@ from typing import List, Optional
 from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -175,11 +179,10 @@ class Lfm2MoeConfig(PretrainedConfig):
             conv_kernel=conv_kernel,
         )
 
-        # Uses default mamba2_state_dtype() which reads SGLANG_MAMBA_CONV_DTYPE env var
-        # (defaults to bfloat16). Set SGLANG_MAMBA_CONV_DTYPE=float16 for fp16 inference.
         return Mamba2CacheParams(
             shape=shape,
             layers=conv_layer_ids,
+            dtype=mamba2_state_dtype(self),
         )
 
 
