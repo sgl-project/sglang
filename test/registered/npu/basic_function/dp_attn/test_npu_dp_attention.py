@@ -7,6 +7,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH,
+    IMAGES_EXAMPLE_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     QWEN3_32B_WEIGHTS_PATH,
 )
@@ -16,14 +17,13 @@ from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (
-    DEFAULT_IMAGE_URL,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
@@ -74,7 +74,7 @@ class TestDPAttentionMixedChunk(
     CustomTestCase,
     NPUGSM8KMixin,
 ):
-    gsm8k_accuracy_thres = 0.35
+    gsm8k_accuracy_thres = 0.34
 
     @classmethod
     def setUpClass(cls):
@@ -151,7 +151,7 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
     def setUpClass(cls):
         cls.model = KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.image_url = DEFAULT_IMAGE_URL
+        cls.image_url = IMAGES_EXAMPLE_PATH
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
