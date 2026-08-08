@@ -108,7 +108,10 @@ class ExpertDistributionRecorder(ABC):
         pass
 
     def on_deepep_dispatch_low_latency(
-        self, local_physical_count_of_layer: torch.Tensor
+        self,
+        local_physical_count_of_layer: torch.Tensor,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         pass
 
@@ -225,11 +228,15 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         )
 
     def on_deepep_dispatch_low_latency(
-        self, local_physical_count_of_layer: torch.Tensor
+        self,
+        local_physical_count_of_layer: torch.Tensor,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         self._on_hook(
             "on_deepep_dispatch_low_latency",
             local_physical_count_of_layer=local_physical_count_of_layer,
+            num_trailing_shared_slots=num_trailing_shared_slots,
         )
 
     def _on_hook(self, hook_name: str, **kwargs):
@@ -363,7 +370,11 @@ class _SinglePassGatherer(ABC):
         pass
 
     def on_deepep_dispatch_low_latency(
-        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: torch.Tensor,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
         pass
 
@@ -581,12 +592,35 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._elastic_ep_enabled = elastic_ep_enabled
 
     def on_deepep_dispatch_low_latency(
-        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: torch.Tensor,
+        *,
+        num_trailing_shared_slots: int = 0,
     ):
+        if isinstance(num_trailing_shared_slots, bool) or not isinstance(
+            num_trailing_shared_slots, int
+        ):
+            raise TypeError("num_trailing_shared_slots must be an int")
+
+        num_slots = local_physical_count_of_layer.shape[0]
+        if not 0 <= num_trailing_shared_slots <= num_slots:
+            raise ValueError(
+                "num_trailing_shared_slots must be between 0 and the number "
+                f"of reported slots ({num_slots}), got {num_trailing_shared_slots}"
+            )
+        if num_trailing_shared_slots:
+            local_physical_count_of_layer = local_physical_count_of_layer[
+                :-num_trailing_shared_slots
+            ]
+
         if local_physical_count_of_layer.shape[0] != self._data.shape[1]:
             if not self._elastic_ep_enabled:
-                self._data[layer_idx, :] += local_physical_count_of_layer
-                return
+                raise RuntimeError(
+                    "DeepEP reported an unexpected number of routed expert "
+                    f"slots: expected {self._data.shape[1]}, got "
+                    f"{local_physical_count_of_layer.shape[0]}"
+                )
 
             n = self._data.shape[1]
             if local_physical_count_of_layer.shape[0] > n:

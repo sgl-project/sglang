@@ -654,7 +654,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
-    def __init__(self, return_recv_hook: bool, **kwargs):
+    def __init__(
+        self, return_recv_hook: bool, num_trailing_shared_slots: int, **kwargs
+    ):
         super().__init__(**kwargs)
 
         """
@@ -662,6 +664,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
+        self.num_trailing_shared_slots = num_trailing_shared_slots
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
@@ -705,7 +708,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
+            masked_m,
+            num_trailing_shared_slots=self.num_trailing_shared_slots,
         )
 
         if isinstance(hidden_states, tuple):
@@ -878,6 +882,8 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        *,
+        num_trailing_shared_slots: int,
     ):
         super().__init__()
 
@@ -897,6 +903,7 @@ class DeepEPDispatcher(BaseDispatcher):
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
+                num_trailing_shared_slots=num_trailing_shared_slots,
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():
