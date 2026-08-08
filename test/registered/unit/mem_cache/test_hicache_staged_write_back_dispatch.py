@@ -12,7 +12,11 @@ from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheO
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    LayerShardInfo,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
@@ -50,11 +54,13 @@ def _ptr_key_from_tensor(ptrs: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(ptr) for ptr in ptrs.cpu().tolist())
 
 
-def _device_pool_stub(*, layer_num: int, **fields) -> SimpleNamespace:
+def _device_pool_stub(
+    *, layer_num: int, layer_shard_enabled: bool = False, **fields
+) -> SimpleNamespace:
     """Minimal device-pool stand-in with layer-split fields real pools expose."""
     return SimpleNamespace(
         layer_num=layer_num,
-        layer_shard_enabled=False,
+        layer_shard_enabled=layer_shard_enabled,
         **fields,
     )
 
@@ -138,6 +144,23 @@ def _cpu_per_layer_pf_lf_copy(
     dst[dst_indices] = src[src_indices, layer_id]
 
 
+def _cpu_all_layer_direct_lf_pf_copy(
+    *, src_ptrs, dst_ptrs, src_indices, dst_indices, page_size
+):
+    assert len(dst_ptrs) == 1
+    src_indices = src_indices.to(dtype=torch.int64, device="cpu")
+    dst_indices = dst_indices.to(dtype=torch.int64, device="cpu")
+    dst = dst_ptrs[0]
+    for offset in range(0, len(src_indices), page_size):
+        src_index = int(src_indices[offset])
+        dst_page = int(dst_indices[offset]) // page_size
+        for local_layer, src in enumerate(src_ptrs):
+            dst_page_layer = dst[dst_page, local_layer]
+            dst_page_layer.copy_(
+                src[src_index : src_index + page_size].reshape_as(dst_page_layer)
+            )
+
+
 class _FakeEvent:
     def __init__(self, enable_timing=False):
         self.enable_timing = enable_timing
@@ -167,6 +190,26 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
     def tearDown(self):
         manager_cache_controller._timing_events_supported.cache_clear()
+
+    def test_layer_shard_selects_one_writer_per_attention_tp_group(self):
+        shard = LayerShardInfo(rank=1, size=2)
+
+        self.assertTrue(
+            manager_cache_controller._is_storage_writer(
+                is_mla_model=True,
+                layer_shard=shard,
+                tp_rank=2,
+                attn_tp_rank=0,
+            )
+        )
+        self.assertFalse(
+            manager_cache_controller._is_storage_writer(
+                is_mla_model=True,
+                layer_shard=shard,
+                tp_rank=3,
+                attn_tp_rank=1,
+            )
+        )
 
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
@@ -664,6 +707,137 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 torch.equal(
                     host.index_k_with_scale_buffer[host_page_indices, layer_id],
                     expected[layer_id],
+                )
+            )
+
+    def test_layer_sharded_mla_direct_page_first_backup(self):
+        full_layer_num = 4
+        owned_start, owned_end = 2, 4
+        page_size = 2
+        kv_cache_dim = 5
+        host_indices = torch.tensor([0, 1, 4, 5], dtype=torch.int64)
+        device_indices = torch.tensor([2, 3, 6, 7], dtype=torch.int64)
+        device_layers = [
+            torch.empty(0, 1, kv_cache_dim, dtype=torch.uint8),
+            torch.empty(0, 1, kv_cache_dim, dtype=torch.uint8),
+            torch.arange(8 * kv_cache_dim, dtype=torch.uint8).reshape(
+                8, 1, kv_cache_dim
+            ),
+            (torch.arange(8 * kv_cache_dim, dtype=torch.uint8) + 80).reshape(
+                8, 1, kv_cache_dim
+            ),
+        ]
+        device_pool = _device_pool_stub(
+            layer_num=full_layer_num,
+            layer_shard_enabled=True,
+            layer_shard_size=2,
+            kv_buffer=device_layers,
+            _owned_local_layer_range=lambda: (owned_start, owned_end),
+        )
+
+        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        host.device_pool = device_pool
+        host.layout = "page_first_direct"
+        host.page_size = page_size
+        host.layer_num = owned_end - owned_start
+        host.kv_cache_dim = kv_cache_dim
+        host.kv_buffer = torch.zeros(
+            4,
+            host.layer_num,
+            page_size,
+            1,
+            kv_cache_dim,
+            dtype=torch.uint8,
+        )
+
+        with mock.patch(
+            f"{MLA_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_lf_pf",
+            side_effect=_cpu_all_layer_direct_lf_pf_copy,
+        ) as direct_copy:
+            host.backup_from_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="direct",
+            )
+
+        direct_copy.assert_called_once()
+        copied_src_ptrs = direct_copy.call_args.kwargs["src_ptrs"]
+        self.assertEqual(len(copied_src_ptrs), owned_end - owned_start)
+        for copied, device_layer in zip(
+            copied_src_ptrs, range(owned_start, owned_end), strict=True
+        ):
+            self.assertIs(copied, device_layers[device_layer])
+        for host_layer, device_layer in enumerate(range(owned_start, owned_end)):
+            expected = device_layers[device_layer][device_indices].reshape(
+                2, page_size, 1, kv_cache_dim
+            )
+            self.assertTrue(torch.equal(host.kv_buffer[[0, 2], host_layer], expected))
+
+    def test_layer_sharded_dsa_indexer_direct_page_first_backup(self):
+        full_layer_num = 4
+        owned_start, owned_end = 2, 4
+        page_size = 2
+        indexer_page_stride_size = 8
+        host_indices = torch.tensor([0, 1, 4, 5], dtype=torch.int64)
+        device_indices = torch.tensor([2, 3, 6, 7], dtype=torch.int64)
+        device_layers = [
+            torch.empty(0, 1, indexer_page_stride_size, dtype=torch.uint8),
+            torch.empty(0, 1, indexer_page_stride_size, dtype=torch.uint8),
+            torch.arange(5 * indexer_page_stride_size, dtype=torch.uint8).reshape(
+                5, 1, indexer_page_stride_size
+            ),
+            (
+                torch.arange(5 * indexer_page_stride_size, dtype=torch.uint8) + 80
+            ).reshape(5, 1, indexer_page_stride_size),
+        ]
+        device_pool = _device_pool_stub(
+            layer_num=full_layer_num,
+            layer_shard_enabled=True,
+            layer_shard_size=2,
+            index_k_with_scale_buffer=device_layers,
+            _owned_local_layer_range=lambda: (owned_start, owned_end),
+        )
+
+        host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host.device_pool = device_pool
+        host.layout = "page_first_direct"
+        host.page_size = page_size
+        host.layer_num = owned_end - owned_start
+        host.indexer_page_stride_size = indexer_page_stride_size
+        host.index_k_with_scale_buffer = torch.zeros(
+            4,
+            host.layer_num,
+            1,
+            indexer_page_stride_size,
+            dtype=torch.uint8,
+        )
+
+        with mock.patch(
+            f"{MEMORY_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_lf_pf",
+            side_effect=_cpu_all_layer_direct_lf_pf_copy,
+        ) as direct_copy:
+            host.backup_from_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="direct",
+            )
+
+        direct_copy.assert_called_once()
+        copied_src_ptrs = direct_copy.call_args.kwargs["src_ptrs"]
+        self.assertEqual(len(copied_src_ptrs), owned_end - owned_start)
+        for copied, device_layer in zip(
+            copied_src_ptrs, range(owned_start, owned_end), strict=True
+        ):
+            self.assertIs(copied, device_layers[device_layer])
+        host_page_indices = torch.tensor([0, 2], dtype=torch.int64)
+        device_page_indices = torch.tensor([1, 3], dtype=torch.int64)
+        for host_layer, device_layer in enumerate(range(owned_start, owned_end)):
+            self.assertTrue(
+                torch.equal(
+                    host.index_k_with_scale_buffer[host_page_indices, host_layer],
+                    device_layers[device_layer][device_page_indices],
                 )
             )
 

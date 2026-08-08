@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    LayerShardInfo,
     PoolName,
     PoolTransfer,
 )
@@ -45,6 +46,30 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+def _get_layer_shard_info(mem_pool_device) -> Optional[LayerShardInfo]:
+    if not getattr(mem_pool_device, "layer_shard_enabled", False):
+        return None
+    return LayerShardInfo(
+        rank=mem_pool_device.layer_shard_rank,
+        size=mem_pool_device.layer_shard_size,
+    )
+
+
+def _is_storage_writer(
+    *,
+    is_mla_model: bool,
+    layer_shard: Optional[LayerShardInfo],
+    tp_rank: int,
+    attn_tp_rank: int,
+) -> bool:
+    if not is_mla_model:
+        return True
+    # Layer shards are distributed over CP but remain replicated over the
+    # attention-TP ranks within each shard.
+    replica_rank = attn_tp_rank if layer_shard is not None else tp_rank
+    return replica_rank == 0
 
 
 @cache
@@ -467,12 +492,7 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
+        self.backup_skip = not self.storage_config.is_storage_writer
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -608,11 +628,16 @@ class HiCacheController:
         # data. storage only needs rank 0 to write it back.
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
-        is_compressed_mla_model = isinstance(
-            self.mem_pool_device, DeepSeekV4TokenToKVPool
+        is_mla_model = isinstance(
+            self.mem_pool_device, (MLATokenToKVPool, DeepSeekV4TokenToKVPool)
         )
-        is_rank_replicated = is_mla_model or is_compressed_mla_model
+        layer_shard = _get_layer_shard_info(self.mem_pool_device)
+        is_storage_writer = _is_storage_writer(
+            is_mla_model=is_mla_model,
+            layer_shard=layer_shard,
+            tp_rank=self.tp_rank,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+        )
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
@@ -622,7 +647,7 @@ class HiCacheController:
                 tp_lcm_size % self.tp_size == 0
             ), "tp_lcm_size must be divisible by tp_size."
             should_split_heads = (
-                not is_rank_replicated
+                not is_mla_model
                 and self.mem_pool_host.layout == "page_head"
                 and tp_lcm_size > self.tp_size
             )
@@ -636,14 +661,15 @@ class HiCacheController:
             pp_size=self.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
-            # TODO(hzh): Rename is_mla_model to is_rank_replicated.
-            is_mla_model=is_rank_replicated,
+            is_mla_model=is_mla_model,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            layer_shard=layer_shard,
+            is_storage_writer=is_storage_writer,
         )
 
     def reset(self):

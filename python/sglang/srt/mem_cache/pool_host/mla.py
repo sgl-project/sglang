@@ -400,7 +400,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(
-                    "Layer-sharded direct HiCache backup only supports "
+                    "Layer-sharded direct HiCache per-layer backup only supports "
                     f"layer_first layout, got {self.layout}"
                 )
         else:
@@ -419,7 +419,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_indices = self.dcp_kernel_indices(host_indices)
         device_indices = self.dcp_kernel_indices(device_indices)
         if self._is_device_layer_sharded(device_pool):
-            for layer_id in self._owned_device_layer_ids(device_pool):
+            owned_layer_ids = self._owned_device_layer_ids(device_pool)
+            if not owned_layer_ids:
+                return
+            if io_backend == "direct" and self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[device_pool.kv_buffer[i] for i in owned_layer_ids],
+                    dst_ptrs=[self.kv_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+                return
+            for layer_id in owned_layer_ids:
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )
