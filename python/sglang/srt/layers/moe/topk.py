@@ -1264,6 +1264,10 @@ def biased_topk_jit_kernel_impl(
     else:
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
+        # DeepSeek-V4 stores e_score_correction_bias in bf16 (for the aiter
+        # sqrtsoftplus topk path). moe_fused_gate upcasts the bias to fp32
+        # in-register, so pass it through directly rather than allocating a fresh
+        # fp32 copy of this static routing bias on every MoE invocation.
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,

@@ -1188,6 +1188,8 @@ def _fused_append_shared_experts_kernel(
     scale_factor,  # runtime scalar
     K: tl.constexpr,
     S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1205,20 +1207,25 @@ def _fused_append_shared_experts_kernel(
     out_ids_row_ptr = pid * (K + S)
     out_w_row_ptr = pid * (K + S)
 
-    offs_k = tl.arange(0, K)
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
-    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k)
+    # tl.arange requires a power-of-2 range, but K (topk) and S (num shared
+    # experts) need not be pow2 -- DeepSeek-V4 uses top-6. Iterate over the
+    # next-pow2 block and mask the tail (mirrors the _with_weights sibling).
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
 
-    offs_s = tl.arange(0, S)
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
-    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
@@ -1244,6 +1251,8 @@ def fused_append_shared_experts(
         scale_factor=scale_factor,
         K=k,
         S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1260,6 +1269,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     scale_factor,  # runtime scalar: shared-expert weight
     K: tl.constexpr,
     S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1277,23 +1288,29 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     ids_row_ptr = pid * K
     out_ids_row_ptr = pid * (K + S)
 
-    offs_k = tl.arange(0, K)
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
-    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k)
+    # tl.arange requires a power-of-2 range, but K (topk) and S (num shared
+    # experts) need not be pow2 -- DeepSeek-V4 uses top-6. Iterate over the
+    # next-pow2 block and mask the tail (mirrors the _append/_with_weights
+    # siblings), otherwise K=6 fails with "arange's range must be a power of 2".
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k, mask=mask_k)
 
     # DeepEP interleaved layout: shift each routed id past the shared slots that
     # precede it. Matches `routed + routed // num_local_routed` exactly.
     ids = ids + ids // num_local_routed
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
-    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
 
-    offs_s = tl.arange(0, S)
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
     shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
-    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
-    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_remap_shared_experts_deepep(
@@ -1330,6 +1347,8 @@ def fused_append_remap_shared_experts_deepep(
         scale_factor,
         K=k,
         S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights
