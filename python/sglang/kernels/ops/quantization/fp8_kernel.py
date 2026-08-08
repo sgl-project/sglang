@@ -156,6 +156,7 @@ def _per_token_group_quant_8bit(
     bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     """A Triton-accelerated function to perform per-token-group quantization on a
     tensor.
@@ -175,6 +176,8 @@ def _per_token_group_quant_8bit(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / bit8_max
+    if SCALE_UE8M0:
+        y_s = tl.exp2(tl.ceil(tl.log2(tl.abs(y_s))))
     y_s_inv = 1.0 / y_s
     y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -261,7 +264,7 @@ def _per_token_group_quant_8bit_raw(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    if _is_hip:
+    if is_fp8_fnuz():
         if dtype == torch.int8:
             bit8_max = 127.0
         else:
@@ -309,7 +312,6 @@ def _per_token_group_quant_8bit_raw(
             SCALE_UE8M0=scale_ue8m0,
         )
     else:
-        assert not scale_ue8m0
         _per_token_group_quant_8bit[(M,)](
             x,
             x_q,
@@ -322,9 +324,13 @@ def _per_token_group_quant_8bit_raw(
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
+            SCALE_UE8M0=scale_ue8m0,
         )
 
-    if scale_ue8m0:
+    if scale_ue8m0 and column_major_scales:
+        # Only the column-major (DeepGEMM/TMA) layout needs DeepGEMM's packing.
+        # Row-major UE8M0 scales are plain float32 powers of two and are consumed
+        # directly, so this path must stay importable on backends without DeepGEMM.
         from deep_gemm import transform_sf_into_required_layout
 
         x_s = transform_sf_into_required_layout(

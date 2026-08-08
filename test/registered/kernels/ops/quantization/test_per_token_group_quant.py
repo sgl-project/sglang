@@ -247,6 +247,44 @@ def test_fp32_scale(dtype, column_major, hidden):
     assert _dequant_rel_err(x_q, x_s, x, G) < 0.05
 
 
+@pytest.mark.parametrize("hidden", [4096, 768, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_ue8m0_row_major_fp32_container(dtype, hidden):
+    """Row-major UE8M0: the scale is stored as an fp32 power-of-two value.
+
+    Unlike the column-major path there is no E8M0 packing here -- the allocator
+    returns an fp32 buffer and the kernel writes 2^ceil(log2(amax/FMAX)) into it
+    directly. This is the layout consumed by backends without DeepGEMM (e.g. the
+    AITER blockscale GEMMs on ROCm, which take plain fp32 block scales).
+
+    Power-of-two scales are what make the quantizer reproducible across
+    implementations: independent kernels compute amax/FMAX ~1 ULP apart, but
+    rounding the exponent up maps both to the same value."""
+    torch.manual_seed(3 + (dtype == torch.float16))
+    num_tokens = 128
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+
+    x_q = torch.zeros_like(x, dtype=fp8_dtype)
+    x_s = _alloc_scale((num_tokens, hidden), column_major=False, scale_ue8m0=True)
+    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
+    torch.cuda.synchronize()
+
+    # fp32 container, not a packed int32 buffer
+    assert x_s.dtype == torch.float32
+    assert x_s.shape == (num_tokens, hidden // G)
+
+    # every stored scale is an exact power of two
+    finite = x_s[x_s > 0]
+    assert torch.all(torch.exp2(torch.log2(finite).round()) == finite)
+
+    # matches the ue8m0 reference decoded to fp32 (2^(e-127))
+    _, exp_ref = ref_fp8_ue8m0(x, G)
+    scale_ref = torch.exp2(exp_ref.to(torch.float32) - 127.0)
+    torch.testing.assert_close(x_s, scale_ref, rtol=0, atol=0)
+
+    assert _dequant_rel_err(x_q, x_s, x, G) < 0.05
+
+
 @pytest.mark.parametrize("column_major", [False, True])
 def test_int8_scale(column_major):
     """int8 output (row-major / col-major fp32 scale): exact stored scale
