@@ -5057,8 +5057,20 @@ class ServerArgs:
             self._resolved_overrides = []
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch == "InternS2MobiusForConditionalGeneration":
+            unsupported = []
+            if self.pp_size != 1:
+                unsupported.append("pipeline parallelism (--pp-size must be 1)")
+            if self.ep_size != 1:
+                unsupported.append("expert parallelism (--ep-size must be 1)")
+            if unsupported:
+                raise ValueError(
+                    "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
+                )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
