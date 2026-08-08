@@ -10,9 +10,11 @@ pub mod power_of_two;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
+pub mod scoring;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -255,6 +257,32 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// `ActiveLoadRegistry::attach_metrics`: the registry is built after the
     /// policies, so it is injected here rather than passed to the constructor.
     fn attach_metrics(&self, _metrics: Arc<MetricsRegistry>) {}
+
+    /// Per-worker preference view, `None` when the decision cannot reduce to
+    /// one (rotation, sampling, a veto); opt in by implementing
+    /// [`ScoringPolicy`].
+    fn as_scoring(&self) -> Option<&dyn ScoringPolicy> {
+        None
+    }
+
+    /// Per-worker eligibility view, `None` when this policy imposes no hard
+    /// constraint. A scoring policy opts in via [`ScoringPolicy::as_filter`];
+    /// a filter-only policy overrides this directly.
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        None
+    }
+
+    /// Whether this policy can be a term of a fused sum. DERIVED and never
+    /// hand-written, so it cannot claim a capability the policy lacks.
+    fn can_fuse(&self) -> bool {
+        self.as_scoring().is_some()
+    }
+
+    /// Whether this policy can be a `--filter` entry. DERIVED, same reasoning
+    /// as [`Self::can_fuse`].
+    fn can_filter(&self) -> bool {
+        self.as_filter().is_some()
+    }
 }
 
 #[derive(Debug, Default)]

@@ -72,6 +72,8 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            fused: None,
+            eligibility: None,
         },
         discovery: sgl_router::config::DiscoveryBackend::StaticUrls(
             sgl_router::config::StaticUrlsDiscoveryConfig {
