@@ -56,6 +56,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         hisparse_staging=False,
         staging=False,
         inflight_middle_chunks=0,
+        pd_rebootstrap_in_progress=False,
     )
     req.finished = lambda: req.finished_reason is not None
     req.set_extend_range = lambda start, end: setattr(

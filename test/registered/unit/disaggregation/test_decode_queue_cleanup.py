@@ -42,6 +42,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
+                pd_rebootstrap_in_progress=False,
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)

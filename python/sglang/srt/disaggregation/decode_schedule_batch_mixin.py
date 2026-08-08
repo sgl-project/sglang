@@ -72,7 +72,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
-            if getattr(req, "pd_rebootstrap_in_progress", False):
+            if req.pd_rebootstrap_in_progress:
                 req.pd_rebootstrap_in_progress = False
             pre_lens.append(pre_len)
 

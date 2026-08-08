@@ -1476,8 +1476,14 @@ class PrefillAdder:
                     self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
+                # Priority-preempted requests re-enter the normal scheduling
+                # path and rebuild/receive their KV rather than resuming from a
+                # synchronous CPU copy.
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i,
+                    len(self.running_batch.reqs) - release_counter,
+                    server_args,
+                    offload_kv=False,
                 )
             else:
                 keep_indices.append(i)

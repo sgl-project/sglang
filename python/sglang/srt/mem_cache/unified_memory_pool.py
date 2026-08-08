@@ -504,6 +504,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
+    def supports_cpu_copy(self) -> bool:
+        return False
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # tgt_loc/src_loc are PHYSICAL slot ids; native move only (strided views).
         if tgt_loc.numel() == 0:

@@ -257,10 +257,12 @@ class DecodeKVCacheOffloadManager:
 
     def _release_finished_req(self, req: Req, start_offset: int):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
-        # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (e.g. tree_cache.protected_size_
-        # double-decrement, host pool double-free).
+        # so a previously-released request must skip resource release here to
+        # avoid non-idempotent side effects. Once all asynchronous writes have
+        # completed, its per-request bookkeeping can still be discarded.
         if req.req_pool_idx is None or req.req_pool_idx == -1:
+            if not self._has_inflight_offload(req.rid):
+                self.offloaded_state.pop(req.rid, None)
             return
 
         kv_committed_len = req.effective_kv_committed_len()
@@ -338,8 +340,12 @@ class DecodeKVCacheOffloadManager:
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
         # ReqToTokenPool.free sets req_pool_idx to None on release, so
-        # guard against both sentinels here.
+        # guard against both sentinels here. Retain state while an asynchronous
+        # write is outstanding because its acknowledgement still needs the
+        # previous hash to continue the backup chain.
         if req.req_pool_idx is None or req.req_pool_idx == -1:
+            if not self._has_inflight_offload(req.rid):
+                self.offloaded_state.pop(req.rid, None)
             return
         state = self.offloaded_state.get(req.rid)
         if state is None:

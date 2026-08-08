@@ -149,7 +149,9 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
-        running_batch.release_req.assert_called_once()
+        running_batch.release_req.assert_called_once_with(
+            0, 2, mock_server_args, offload_kv=False
+        )
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
@@ -181,7 +183,9 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 125)  # 50 + 75 + 100 - 100 = 125
-        running_batch.release_req.assert_called_once()
+        running_batch.release_req.assert_called_once_with(
+            2, 2, mock_server_args, offload_kv=False
+        )
 
     def test_preempt_fail_low_priority_values_first(self):
         params = [

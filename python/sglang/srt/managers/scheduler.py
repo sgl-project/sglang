@@ -73,6 +73,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    prepare_pd_rebootstrap,
 )
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
@@ -3424,6 +3425,29 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _finalize_retraction_abort(self, req: Req) -> None:
+        abort_reason: FINISH_ABORT = req.to_finish
+        prepare_abort(req, abort_reason.message, status_code=abort_reason.status_code)
+        req.finished_reason = abort_reason
+        req.to_finish = None
+        req.time_stats.trace_ctx.abort(abort_info=abort_reason)
+        req.time_stats.set_completion_time()
+
+        if self.decode_offload_manager is not None:
+            self.decode_offload_manager.finalize_release_on_finish(req)
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason=req.finished_reason.to_json(),
+                rid=req.rid,
+            ),
+            req,
+        )
+
+    def _enqueue_pd_rebootstrap(self, req: Req) -> None:
+        prepare_pd_rebootstrap(req)
+        self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -3447,9 +3471,13 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            (
+                retracted_reqs,
+                rebootstrap_reqs,
+                new_token_ratio,
+                reqs_to_abort,
+            ) = batch.retract_decode(self.server_args)
+            all_retracted_reqs = retracted_reqs + rebootstrap_reqs
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3458,34 +3486,27 @@ class Scheduler(
                 else None
             )
 
-            self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
-            if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
+            self.metrics_reporter.num_retracted_reqs = len(all_retracted_reqs)
+            if self.metrics_reporter.enable_metrics and all_retracted_reqs:
                 self.metrics_reporter.metrics_collector.increment_retracted_reqs(
-                    num_retracted_reqs=len(retracted_reqs),
+                    num_retracted_reqs=len(all_retracted_reqs),
                     num_retracted_input_tokens=sum(
-                        len(r.origin_input_ids) for r in retracted_reqs
+                        len(r.origin_input_ids) for r in all_retracted_reqs
                     ),
                     num_retracted_output_tokens=sum(
-                        len(r.output_ids) for r in retracted_reqs
+                        len(r.output_ids) for r in all_retracted_reqs
                     ),
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason=abort_reason.to_json(),
-                        rid=req.rid,
-                    ),
-                    req,
-                )
+                self._finalize_retraction_abort(req)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
                 if kv_full_retract_flag
                 else "Testing retraction. "
             )
-            msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
+            msg_details = f"#retracted_reqs: {len(all_retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
             if mamba_num_gained is not None:
                 msg_details += f", #mamba_num_gained: {mamba_num_gained}"
             if kv_full_retract_flag:
@@ -3496,6 +3517,8 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
+            for req in rebootstrap_reqs:
+                self._enqueue_pd_rebootstrap(req)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -4572,10 +4595,7 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if req.output_ids:
-                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                req.pd_rebootstrap_in_progress = True
-                req.time_stats.set_retract_time()
+                prepare_pd_rebootstrap(req)
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)

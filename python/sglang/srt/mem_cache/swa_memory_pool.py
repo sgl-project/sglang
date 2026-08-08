@@ -252,6 +252,12 @@ class SWAKVPool(BaseSWAKVPool):
             filtered.append(filtered_layer)
         return filtered
 
+    def supports_cpu_copy(self) -> bool:
+        return (
+            self.full_kv_pool.supports_cpu_copy()
+            and self.swa_kv_pool.supports_cpu_copy()
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices

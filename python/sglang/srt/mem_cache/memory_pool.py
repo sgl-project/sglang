@@ -1009,6 +1009,10 @@ class MambaPool:
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
+    def supports_cpu_copy(self) -> bool:
+        """Whether the Mamba state supports a CPU save/restore round trip."""
+        return True
+
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         # Accept both the legacy 2-tuple (conv, temporal) and the 3-tuple that also
         # carries the ReplaySSM spec-verify cursors.
@@ -1709,6 +1713,10 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def supports_cpu_copy(self) -> bool:
+        """Whether get_cpu_copy/load_cpu_copy form a supported round trip."""
+        return False
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
@@ -1837,6 +1845,11 @@ class MHATokenToKVPool(KVCache):
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
         )
 
+        # Subclasses may provide their own buffer layout without using the base
+        # _create_buffers implementation. Keep the optional scale-buffer state
+        # defined so the inherited CPU-copy capability check remains safe.
+        self.k_scale_buffer = None
+        self.v_scale_buffer = None
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -1860,6 +1873,17 @@ class MHATokenToKVPool(KVCache):
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.v_row_dim = self.head_num * self.v_head_dim
+
+    def supports_cpu_copy(self) -> bool:
+        # get_cpu_copy/load_cpu_copy index the leading dimension with logical
+        # token ids and only transfer k_buffer/v_buffer. Therefore they are a
+        # complete round trip only for token-major NHD pools without separate
+        # per-token scale buffers.
+        return (
+            self.kv_cache_layout == "nhd"
+            and self.k_scale_buffer is None
+            and self.v_scale_buffer is None
+        )
 
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2910,6 +2934,9 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
             device=self.device,
         )
 
+    def supports_cpu_copy(self) -> bool:
+        return False
+
     def _finalize_allocation_log(self, num_tokens: int):
         self.mem_usage = 0.0
         placeholder_bytes = (
@@ -2957,6 +2984,10 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
+    def supports_cpu_copy(self) -> bool:
+        # The inherited copy path does not transfer k/v scale buffers.
+        return False
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -3237,6 +3268,9 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     # strided envelope views have no per-layer contiguous region (their bytes are
     # interleaved layer-major within each page) and index page-major, not
     # token-major. Inheriting them would silently mis-index; fail loudly instead.
+
+    def supports_cpu_copy(self) -> bool:
+        return False
 
     def get_contiguous_buf_infos(self):
         raise NotImplementedError(
@@ -3520,6 +3554,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
     # These paths copy k/v buffers without the scale buffers; fail loudly
     # instead of silently corrupting dequantization.
+    def supports_cpu_copy(self) -> bool:
+        return False
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("CPU offloading is unsupported for MXFP8 KV cache.")
 
@@ -3850,6 +3887,12 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
+    def supports_cpu_copy(self) -> bool:
+        return (
+            self.full_kv_pool.supports_cpu_copy()
+            and self.mamba_pool.supports_cpu_copy()
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
         # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
@@ -4155,6 +4198,9 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def supports_cpu_copy(self) -> bool:
+        return True
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
         kv_cache_cpu = []
@@ -4184,6 +4230,10 @@ class MLATokenToKVPool(KVCache):
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
+    def supports_cpu_copy(self) -> bool:
+        # The inherited copy path does not transfer kv_scale_buffer.
+        return False
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (

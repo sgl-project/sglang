@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -78,7 +79,7 @@ class _FinishedEvent:
         pass
 
 
-class TestReleaseFinishedReq(unittest.TestCase):
+class TestReleaseFinishedReq(CustomTestCase):
     """Tests for _release_finished_req overallocation cleanup."""
 
     def test_no_overallocation(self):
@@ -341,6 +342,47 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
         self.assertIn(req.rid, manager.offloaded_state)
+
+    def test_finalize_already_released_req_drops_state(self):
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=None,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            rid="released",
+        )
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=8, last_hash="hash"
+        )
+
+        manager.finalize_release_on_finish(req)
+
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+        self.assertNotIn(req.rid, manager.offloaded_state)
+
+    def test_released_req_keeps_state_until_last_offload_finishes(self):
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=None,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            rid="released-inflight",
+        )
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=8, last_hash="hash"
+        )
+        manager.offload_inflight[req.rid] = 1
+
+        manager.finalize_release_on_finish(req)
+        self.assertIn(req.rid, manager.offloaded_state)
+
+        manager._mark_offload_finished(req.rid)
+        manager._release_finished_req(req, start_offset=4)
+
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+        self.assertNotIn(req.rid, manager.offloaded_state)
 
     def test_finished_offload_ack_waits_for_other_inflight_writes(self):
         manager, freed = _make_manager(pool_size=32)

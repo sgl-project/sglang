@@ -60,6 +60,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
+    def supports_cpu_copy(self) -> bool:
+        """Whether the backing KV pool supports a CPU save/restore round trip."""
+        return self._kvcache.supports_cpu_copy()
+
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []

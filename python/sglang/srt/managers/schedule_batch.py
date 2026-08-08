@@ -69,7 +69,11 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
+    _is_fake_transfer,
+)
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -1145,9 +1149,11 @@ class Req(ReqDllmMixin):
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         # Decode-local: the already-emitted boundary token to replay when a
-        # retracted request is rebootstrapped. Set in pause_generation(retract)
-        # and consumed in the decode transfer commit; never plumbed to prefill.
+        # retracted request is rebootstrapped. Set by the generic rebootstrap
+        # preparation step and consumed in the decode transfer commit; never
+        # plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        self.pd_rebootstrap_in_progress: bool = False
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -1769,6 +1775,20 @@ class Req(ReqDllmMixin):
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
+
+    def supports_pd_rebootstrap(self, server_args: ServerArgs) -> bool:
+        """Whether token-only prefill recomputation can reproduce this request."""
+        return (
+            server_args.disaggregation_transfer_backend != "fake"
+            and not _is_fake_transfer(self, server_args)
+            and self.multimodal_inputs is None
+            and self.input_embeds is None
+            and self.positional_embed_overrides is None
+            and self.token_type_ids is None
+            and self.lora_id is None
+            and self.session is None
+            and self.session_id is None
+        )
 
     def log_time_stats(self):
         # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
@@ -2785,11 +2805,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def retract_decode(
         self, server_args: ServerArgs
-    ) -> Tuple[List[Req], float, List[Req]]:
+    ) -> Tuple[List[Req], List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
+        retracted_reqs_use_cpu_copy = (
+            server_args.disaggregation_mode != "decode"
+            or self.token_to_kv_pool_allocator.supports_cpu_copy()
+        )
         retracted_reqs = []
+        rebootstrap_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2801,11 +2827,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                offload_kv=retracted_reqs_use_cpu_copy,
+            )
+            if retracted_reqs_use_cpu_copy:
+                retracted_reqs.append(req)
+            elif req.supports_pd_rebootstrap(server_args):
+                rebootstrap_reqs.append(req)
+            else:
+                req.to_finish = FINISH_ABORT(
+                    "Request was retracted due to out-of-memory and cannot be "
+                    "resumed because this KV cache does not support synchronous "
+                    "CPU save and restore and this request cannot be safely "
+                    "recomputed by PD rebootstrap.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    err_type="InternalServerError",
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s (KV cache does not "
+                    "support synchronous CPU save and restore)",
+                    req.rid,
+                )
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2814,12 +2862,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
             last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
+                "Out of memory even after releasing all other requests "
                 "in the decode batch. Aborting the last request.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                err_type="InternalServerError",
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2831,7 +2880,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
         )
 
-        return retracted_reqs, new_estimate_ratio, reqs_to_abort
+        return retracted_reqs, rebootstrap_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod
     def _get_decode_retraction_order(
@@ -2874,7 +2923,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        offload_kv: bool = True,
+    ):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -2883,6 +2938,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=offload_kv,
         )
 
     def prepare_encoder_info_decode(self):
