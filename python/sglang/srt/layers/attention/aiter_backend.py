@@ -211,6 +211,14 @@ class AiterAttnBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
+        # Constant fp32 1.0 descale reused by the fp8 MLA prefill kernel: with
+        # BF16 absorb the real scales are folded into the weights, so q/k/v
+        # descale are all 1.0. Cache it once here to avoid a per-call
+        # torch.ones((), ...) allocation + FillFunctor launch on the attention
+        # critical path.
+        self._one_scale = torch.ones(
+            (), dtype=torch.float32, device=model_runner.device
+        )
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -795,7 +803,7 @@ class AiterAttnBackend(AttentionBackend):
             k = k.to(fp8_dtype)
         if v.dtype != fp8_dtype:
             v = v.to(fp8_dtype)
-        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
+        one_scale = self._one_scale
 
         tile_q = 256
         reduce_indptr = self.forward_metadata.reduce_indptr
