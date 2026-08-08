@@ -4,14 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _round_bf16_to_fp32(value):
-    # force the eager BF16 kernel boundary so Triton cannot contract the next add
-    bits = value.to(tl.int32, bitcast=True)
-    rounding_bias = 0x7FFF + ((bits >> 16) & 1)
-    rounded_bits = (bits + rounding_bias) & -65536
-    return rounded_bits.to(tl.float32, bitcast=True)
+from sglang.kernels.ops.diffusion.triton.numerics import round_bf16_to_fp32
 
 
 @triton.jit
@@ -43,8 +36,8 @@ def _indexed_scale_shift_bf16_kernel(
         scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0
     ).to(tl.float32)
 
-    one_plus_scale = _round_bf16_to_fp32(1.0 + scale)
-    scaled = _round_bf16_to_fp32(x * one_plus_scale)
+    one_plus_scale = round_bf16_to_fp32(1.0 + scale)
+    scaled = round_bf16_to_fp32(x * one_plus_scale)
     tl.store(
         output_ptr + row * stride_x_row + columns,
         scaled + shift,
@@ -81,7 +74,7 @@ def _indexed_gate_bf16_kernel(
         other_ptr + row * stride_other_row + columns, mask=mask, other=0.0
     ).to(tl.float32)
 
-    gated = _round_bf16_to_fp32(gate * other)
+    gated = round_bf16_to_fp32(gate * other)
     tl.store(
         output_ptr + row * stride_x_row + columns,
         x + gated,

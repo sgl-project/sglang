@@ -389,7 +389,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # that assignment is known: one tokenizer/scheduler crossing per
         # image instead of one per rank. K2.5 gates this on
         # --mm-enable-dp-encoder; K3 needs no flag.
-        if getattr(self, "use_cuda_ipc", False):
+        if self.keep_mm_features_on_device:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True

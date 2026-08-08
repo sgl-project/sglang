@@ -20,6 +20,7 @@ from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -656,7 +657,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             **joint_attention_kwargs,
         )
 
-        hidden_states = hidden_states + mod_gate * attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, mod_gate)
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -741,15 +742,21 @@ class Flux2TransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
-        (shift_msa, scale_msa, gate_msa), (
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
+        (
+            (shift_msa, scale_msa, gate_msa),
+            (
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ),
         ) = temb_mod_params_img
-        (c_shift_msa, c_scale_msa, c_gate_msa), (
-            c_shift_mlp,
-            c_scale_mlp,
-            c_gate_mlp,
+        (
+            (c_shift_msa, c_scale_msa, c_gate_msa),
+            (
+                c_shift_mlp,
+                c_scale_mlp,
+                c_gate_mlp,
+            ),
         ) = temb_mod_params_txt
 
         # Img stream
@@ -774,18 +781,18 @@ class Flux2TransformerBlock(nn.Module):
         attn_output, context_attn_output = attention_outputs
 
         # Process attention outputs for the image stream (`hidden_states`).
-        attn_output = gate_msa * attn_output
-        hidden_states = hidden_states + attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
 
         norm_hidden_states = self.norm2(hidden_states)
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
 
         # Process attention outputs for the text stream (`encoder_hidden_states`).
-        context_attn_output = c_gate_msa * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_attn_output, c_gate_msa
+        )
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         norm_encoder_hidden_states = (
@@ -793,7 +800,9 @@ class Flux2TransformerBlock(nn.Module):
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, context_ff_output, c_gate_mlp
+        )
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 

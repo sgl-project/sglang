@@ -1422,7 +1422,27 @@ def build_qwen2_decoder_as_encoder(
     return decoder_as_encoder
 
 
+def _is_ocr2(config: DeepseekVLV2Config) -> bool:
+    return (
+        str(getattr(config.vision_config, "model_name", "")).lower() == "deepencoderv2"
+        or getattr(config.projector_config, "input_dim", None) == 896
+    )
+
+
 class DeepseekOCRForCausalLM(nn.Module):
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        text_config = hf_config.text_config
+        if _is_ocr2(hf_config) or not (
+            text_config.topk_method == "noaux_tc" or text_config.use_mla
+        ):
+            # Those branches build the dense DeepseekForCausalLM, which has no
+            # shared experts to fuse.
+            return None
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            text_config, quant_config
+        )
+
     def __init__(
         self,
         *,
@@ -1437,11 +1457,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
         self.text_config = config.text_config
-        self.is_ocr2 = (
-            str(getattr(self.vision_config, "model_name", "")).lower()
-            == "deepencoderv2"
-            or getattr(self.projector_config, "input_dim", None) == 896
-        )
+        self.is_ocr2 = _is_ocr2(config)
         n_embed = getattr(self.projector_config, "n_embed", 1280)
 
         self.tile_tag = config.tile_tag
