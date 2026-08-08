@@ -1013,6 +1013,9 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # Set in run_event_loop's stream setup; None until then and on MLX
+        # (no torch streams).
+        self.schedule_stream = None
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1659,6 +1662,9 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        # Wire the staging fence now that the schedule stream exists (call-site
+        # contract: FutureMap.run_staging_fence).
+        self.future_map.set_staging_fence(self._fence_relay_staging)
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1677,6 +1683,20 @@ class Scheduler(
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
+    def _fence_relay_staging(self):
+        # Order scheduler-thread relay staging writes (PD-disagg decode
+        # bootstrap publish/stash, hisparse rebuild stash) behind the in-flight
+        # forward: the forward's tail relay writes may target the SAME
+        # req_pool rows (freed by the result just processed, reallocated here)
+        # and would otherwise land after the staging writes -- in-range, silent,
+        # wrong payload for the bootstrapped request. Call-site placement
+        # contract: FutureMap.run_staging_fence.
+        if not self.enable_overlap:
+            return
+        # None before run_event_loop's stream setup and on MLX (no torch streams).
+        if self.schedule_stream is not None:
             self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
@@ -2942,6 +2962,10 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
+        # Same staging race as the disagg decode bootstrap: these rows may still
+        # be targeted by the in-flight forward's tail relay writes. All H2D
+        # materialization is above (see _fence_relay_staging).
+        self._fence_relay_staging()
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
         )

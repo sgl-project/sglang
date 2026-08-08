@@ -153,6 +153,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         else:
             # Non-spec: stash last token into the relay so the first DECODE's
             # resolve_forward_inputs gathers it like any other decode iter.
+            # Staging fence AFTER the H2D materialization above and
+            # immediately before the relay write -- see
+            # FutureMap.run_staging_fence for the placement contract.
+            future_map.run_staging_fence()
             future_map.stash(
                 self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
             )

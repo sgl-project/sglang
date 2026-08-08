@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import msgspec
 import torch
@@ -293,6 +293,30 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+
+        # Staging fence (Scheduler._fence_relay_staging), wired by the scheduler
+        # in run_event_loop once its schedule stream exists. Unwired (direct
+        # FutureMap construction, MLX's stream-free loop) it is a no-op.
+        self._staging_fence: Optional[Callable[[], None]] = None
+
+    def set_staging_fence(self, fence: Optional[Callable[[], None]]) -> None:
+        """Wire the scheduler's staging fence (Scheduler._fence_relay_staging).
+
+        Called once from Scheduler.run_event_loop after the schedule stream
+        exists. Left unwired, staging is unordered (tests, MLX)."""
+        self._staging_fence = fence
+
+    def run_staging_fence(self) -> None:
+        """Order a scheduler-thread staging publish/stash behind the in-flight
+        forward's tail relay writes (see Scheduler._fence_relay_staging).
+
+        Call AFTER the staged payload is fully materialized on device and
+        immediately BEFORE the publish/stash pair: a pageable H2D copy on the
+        fenced stream host-blocks until the forward drains, while the
+        publish/stash scatter writes are enqueue-only."""
+        if self._staging_fence is None:
+            return
+        self._staging_fence()
 
     def _lazy_init_forward_buf(self, payload: RelayPayload):
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
