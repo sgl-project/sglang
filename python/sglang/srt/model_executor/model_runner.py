@@ -1238,9 +1238,10 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
-            return self.max_total_num_tokens
+            capacity = self.max_total_num_tokens
+        return self.req_to_token_pool.schedulable_token_capacity(capacity)
 
     def _load_format_scope(self, load_format: Optional[str]):
         """Make this runner's load format the published one while it loads.

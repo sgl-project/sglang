@@ -440,7 +440,7 @@ class StreamingSession(BasePrefixCache):
                     slot.req_pool_idx, start:end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+            self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
 

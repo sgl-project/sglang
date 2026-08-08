@@ -1068,6 +1068,50 @@ def _moss_vl_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM")
+def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
+    has_sparse_attention = getattr(hf_config, "has_minicpm_sparse_attention", False)
+    has_hybrid_attention = has_sparse_attention or getattr(
+        hf_config, "has_lightning_layers", False
+    )
+    overrides: Dict[str, Any] = {}
+    if has_hybrid_attention:
+        overrides["disable_radix_cache"] = True
+    if envs.SGLANG_MINICPM_FORCE_DENSE.get():
+        dense_backends = {
+            "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
+            "minicpm_flashinfer": "flashinfer",
+        }
+        for backend_field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            dense_backend = dense_backends.get(getattr(server_args, backend_field))
+            if dense_backend is not None:
+                overrides[backend_field] = dense_backend
+    elif has_sparse_attention:
+        uses_sparse_backend = server_args.is_attention_backend_not_set() or any(
+            backend in ("minicpm_flashattn", "minicpm_flashinfer")
+            for backend in (
+                server_args.attention_backend,
+                server_args.prefill_attention_backend,
+                server_args.decode_attention_backend,
+            )
+        )
+        if uses_sparse_backend and server_args.disaggregation_mode != "null":
+            raise ValueError(
+                "MiniCPM sparse attention does not support PD disaggregation"
+            )
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = (
+                "minicpm_flashinfer"
+                if is_blackwell_supported()
+                else "minicpm_flashattn"
+            )
+    return overrides
+
+
 @_register_for("MiniCPMV4_6ForConditionalGeneration")
 def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_sm100_supported() and server_args.attention_backend is None:
