@@ -10,11 +10,18 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DENSE_ATOL,
+    DENSE_RTOL,
     DenseAttentionCase,
+    build_dense_attention_fixture,
+    expected_dense_fixture_output,
     make_dense_cases,
+    replace_backend,
     run_dense_attention_case,
+    run_dense_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
@@ -321,6 +328,104 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(15, 16, 17),
         ),
     )
+
+    # Regression cases for #33915: FlashInfer treats logits_soft_cap (and
+    # window_left on the ragged wrapper) as plan-time state that selects the
+    # compiled kernel module, but the backend passed them only to the
+    # deprecated per-call forward(), which silently ignores them — so capped
+    # models (gemma-2, grok) ran uncapped and SWA layers ran full attention
+    # within a ragged extend chunk. logit_cap=0.5 is far below the typical
+    # logit magnitude of these fixtures so capping visibly changes the output.
+    LOGIT_CAP_CASES = (
+        DenseAttentionCase(
+            name="logit_cap_extend_ragged_no_prefix",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(15, 8, 1),
+            logit_cap=0.1,
+        ),
+        DenseAttentionCase(
+            name="logit_cap_extend_ragged_paged_merge",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(8, 16),
+            extend_lens=(8, 15),
+            logit_cap=0.1,
+        ),
+        DenseAttentionCase(
+            name="logit_cap_decode",
+            backend="flashinfer",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+            logit_cap=0.1,
+        ),
+    )
+    SWA_RAGGED_WINDOW_CASES = (
+        DenseAttentionCase(
+            name="swa_window_extend_ragged_no_prefix_beyond_window",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(7, 9),
+            sliding_window_size=4,
+        ),
+        DenseAttentionCase(
+            name="swa_window_extend_ragged_merge_beyond_window",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(6, 5),
+            extend_lens=(6, 7),
+            sliding_window_size=4,
+        ),
+    )
+
+    def _run_case_with_model_wired_backend(self, case: DenseAttentionCase):
+        fixture = build_dense_attention_fixture(
+            self,
+            case,
+            head_dim=self.HEAD_DIM,
+            hidden_size=self.HIDDEN_SIZE,
+        )
+        # The kit's MockModelRunner carries an empty nn.Module as the model;
+        # the FlashInfer backend reads the plan-time logit cap off the model's
+        # RadixAttention layers at construction, so rebuild the backend with
+        # the real attention module wired into the runner.
+        fixture.runner.model = fixture.actual_module
+        replace_backend(fixture, ATTENTION_BACKENDS["flashinfer"](fixture.runner))
+        actual = run_dense_fixture_eager(fixture)
+        expected = expected_dense_fixture_output(fixture)
+        torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+
+    def test_logit_cap_cases(self):
+        """Bug regression (#33915): plan() never requested logits_soft_cap, so
+        the kernels ran uncapped and the per-call forward() cap was dropped."""
+        for case in self.LOGIT_CAP_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                self._run_case_with_model_wired_backend(case)
+
+    def test_swa_ragged_window_cases(self):
+        """Bug regression (#33915): the ragged prefill wrapper was planned
+        without window_left, so SWA layers attended past the window whenever an
+        extend chunk was longer than the window."""
+        for case in self.SWA_RAGGED_WINDOW_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                self._run_case_with_model_wired_backend(case)
 
     def test_layout_robustness_cases(self):
         for case in self.LAYOUT_ROBUSTNESS_CASES:
