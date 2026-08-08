@@ -152,6 +152,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             out_cache_loc=torch.arange(7),
             seq_lens_sum=7,
             positions=torch.tensor([0, 1, 2, 0, 1, 2, 3]),
+            token_type_ids=torch.tensor([0, 1, 1, 0, 1, 0, 1]),
             seq_lens_cpu=torch.tensor([3, 4]),
             lora_ids=[None, None],
         )
@@ -160,11 +161,18 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=10, bs=2)
 
         self.assertEqual(fb.positions.shape[0], 10)
+        torch.testing.assert_close(
+            fb.token_type_ids,
+            torch.tensor([0, 1, 1, 0, 1, 0, 1, 0, 0, 0]),
+        )
 
         logits_output = _logits_output(10)
         fb.post_forward_mlp_sync_batch(logits_output)
 
         torch.testing.assert_close(fb.positions, torch.tensor([0, 1, 2, 0, 1, 2, 3]))
+        torch.testing.assert_close(
+            fb.token_type_ids, torch.tensor([0, 1, 1, 0, 1, 0, 1])
+        )
         torch.testing.assert_close(fb.seq_lens, torch.tensor([3, 4]))
         # sample() derives prefill sampling positions from seq_lens - 1, so the
         # row count must match the real request count.
