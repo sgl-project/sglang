@@ -113,9 +113,12 @@ class ComponentLoader(ABC):
         return {}
 
     def should_raise_customized_load_error(
-        self, _server_args: ServerArgs, _component_name: str
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return False
+        native_only_components = getattr(
+            server_args.pipeline_config, "native_only_components", ()
+        )
+        return component_name in native_only_components
 
     @staticmethod
     def _is_component_set_as_layerwise_load(
@@ -417,6 +420,9 @@ class ComponentLoader(ABC):
             component_name == "scheduler"
             and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
         ):
+            transformers_or_diffusers = "diffusers"
+
+        if transformers_or_diffusers.startswith("lingbot_video"):
             transformers_or_diffusers = "diffusers"
 
         return transformers_or_diffusers

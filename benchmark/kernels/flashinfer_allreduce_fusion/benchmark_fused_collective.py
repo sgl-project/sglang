@@ -28,6 +28,8 @@ from typing import Optional
 import torch  # type: ignore
 import torch.distributed as dist  # type: ignore
 
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
@@ -36,18 +38,16 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.layernorm import RMSNorm  # noqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as SGLANG_FP8_DTYPE
-from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
 
 try:
     from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
     from sgl_kernel import rmsnorm as SGL_RMS_NORM
 
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize as SGL_FP4_QUANT
 except Exception:  # pragma: no cover - fallback on non-supported platforms
     SGL_FUSED_ADD_RMS_NORM = None
     SGL_RMS_NORM = None
-    SGL_SCALED_FP4_QUANT = None
+    SGL_FP4_QUANT = None
 
 FP8_DTYPE = SGLANG_FP8_DTYPE
 
@@ -386,9 +386,9 @@ def standard_allreduce_rmsnorm_fp4_quant(
         residual_out = allreduce_out
 
     # Finally FP4 quantization
-    if SGL_SCALED_FP4_QUANT is None:
-        raise RuntimeError("scaled_fp4_quant is not available on this platform")
-    quant_res, output_scale_res = SGL_SCALED_FP4_QUANT(quant_input, input_global_scale)
+    if SGL_FP4_QUANT is None:
+        raise RuntimeError("fp4_quantize is not available on this platform")
+    quant_res, output_scale_res = SGL_FP4_QUANT(quant_input, input_global_scale)
     if residual is not None:
         return quant_res, residual_out, output_scale_res
     else:
@@ -464,9 +464,9 @@ def standard_allreduce_rmsnorm_fp4_quant_native(
         residual_out = allreduce_out
 
     # Apply FP4 quantization (still using fused CUDA op as there's no native FP4)
-    if SGL_SCALED_FP4_QUANT is None:
-        raise RuntimeError("scaled_fp4_quant is not available on this platform")
-    quant_res, output_scale_res = SGL_SCALED_FP4_QUANT(quant_input, input_global_scale)
+    if SGL_FP4_QUANT is None:
+        raise RuntimeError("fp4_quantize is not available on this platform")
+    quant_res, output_scale_res = SGL_FP4_QUANT(quant_input, input_global_scale)
 
     if residual is not None:
         return quant_res, residual_out, output_scale_res

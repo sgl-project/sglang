@@ -45,6 +45,7 @@ class _MiniForwardBatch:
     encoder_lens: Optional[torch.Tensor] = None
     mrope_positions: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
+    num_token_non_padded_cpu: Optional[int] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     ngram_embedding_info: Optional[object] = None
@@ -1058,6 +1059,50 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertTrue(torch.all(ids[3:8] == 0))  # padded tail reset
         self.assertTrue(torch.all(ids[8:] == 7))  # beyond the bucket: untouched
 
+    def test_num_token_non_padded_scalar_copy(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        src = self._src(num_token_non_padded=torch.zeros((1,), dtype=torch.int32))
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=16,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            source=src,
+        )
+        self.assertTrue(reg.has_slot("num_token_non_padded"))
+        self.assertEqual(
+            reg.get_slot("num_token_non_padded").buffer.data_ptr(),
+            src.num_token_non_padded.data_ptr(),
+        )
+
+        fb = _MiniForwardBatch(
+            input_ids=torch.tensor([1, 2, 3], dtype=torch.int64),
+            positions=torch.tensor([4, 5, 6], dtype=torch.int64),
+            out_cache_loc=torch.tensor([8, 9, 10], dtype=torch.int64),
+            num_token_non_padded=torch.tensor([3], dtype=torch.int32),
+        )
+        reg.fill_from(fb, raw_bs=1, padded_bs=1, raw_num_tokens=3, padded_num_tokens=8)
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("num_token_non_padded").buffer,
+                torch.tensor([3], dtype=torch.int32),
+            )
+        )
+
+        static_fb = reg.extract_buffer(
+            padded_bs=1,
+            padded_num_tokens=8,
+            forward_batch_template=fb,
+        )
+        self.assertEqual(
+            static_fb.num_token_non_padded.data_ptr(),
+            src.num_token_non_padded.data_ptr(),
+        )
+
     def test_multimodal_input_embeds_reset_only(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_prefill_registry,
@@ -1202,6 +1247,80 @@ class TestBuildPrefillRegistry(unittest.TestCase):
             padded_bs=1, padded_num_tokens=3, forward_batch_template=fb
         )
         self.assertIs(fb_view.input_embeds, embeds)
+
+
+class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
+    """The prefill registry must re-derive the attn-TP-local pad boundary from
+    the CAPTURE BUCKET, not trust the FB tensor.
+
+    Bug regression: breakable-graph replay pads ``raw`` tokens up to the
+    capture bucket, moving the attn-TP shard boundary to ``bucket/attn_tp``
+    rows — but the FB ``num_token_non_padded`` tensor was localized against
+    the RAW length on the eager prep path. Copying it verbatim made every
+    ``raw < bucket`` replay mask the last ``(bucket - raw)/attn_tp`` shard
+    rows of attn-TP rank 0 — REAL tokens — zeroing their MoE output
+    in-graph. The slot's post_fill must instead recompute the local count
+    against ``ctx.padded_num_tokens`` from the batch's un-adjusted global
+    count (``num_token_non_padded_cpu``), exactly like the decode registry's
+    post_fill does.
+    """
+
+    def _fill(self, *, attn_tp_rank, attn_tp_size, require_gathered_buffer=True):
+        from unittest import mock
+
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=2048,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            require_gathered_buffer=require_gathered_buffer,
+        )
+        # FB tensor carries the RAW-length-localized (stale) value; the CPU
+        # field carries the un-adjusted global count.
+        fb = _MiniForwardBatch(
+            batch_size=1,
+            num_token_non_padded=torch.tensor([509], dtype=torch.int32),
+            num_token_non_padded_cpu=1018,
+        )
+        with mock.patch(
+            "sglang.srt.model_executor.forward_batch_info.get_parallel",
+            return_value=SimpleNamespace(
+                attn_tp_rank=attn_tp_rank, attn_tp_size=attn_tp_size
+            ),
+        ):
+            reg.fill_from(
+                fb,
+                raw_bs=1,
+                padded_bs=1,
+                raw_num_tokens=1018,
+                padded_num_tokens=1024,
+            )
+        return int(reg.get_slot("num_token_non_padded").buffer.item())
+
+    def test_rank0_uses_bucket_shard_not_raw_localized_value(self):
+        # bucket 1024 / attn_tp 2 -> 512-row shards. Rank 0's shard is fully
+        # real (global rows [0, 512)); the raw-localized FB value (509) would
+        # mask 3 real rows.
+        self.assertEqual(self._fill(attn_tp_rank=0, attn_tp_size=2), 512)
+
+    def test_rank1_masks_exactly_the_true_pads(self):
+        # Rank 1's shard holds global rows [512, 1024): 506 real + 6 bucket
+        # pads. local = clamp(1018 - 512, 0, 512).
+        self.assertEqual(self._fill(attn_tp_rank=1, attn_tp_size=2), 506)
+
+    def test_non_gathered_keeps_plain_fb_copy(self):
+        # Without a gathered buffer there is no attn-TP scatter; the plain FB
+        # copy must be preserved (post_fill no-op), mirroring the decode
+        # registry's contract.
+        self.assertEqual(
+            self._fill(attn_tp_rank=0, attn_tp_size=2, require_gathered_buffer=False),
+            509,
+        )
 
 
 class TestFillOncePolicy(unittest.TestCase):

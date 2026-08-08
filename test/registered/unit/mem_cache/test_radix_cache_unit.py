@@ -31,6 +31,7 @@ from array import array
 import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.utils import get_device
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
@@ -390,6 +392,57 @@ class TestRadixCache(unittest.TestCase):
         )
         self.assertEqual(cache.total_size(), 5)
 
+    def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
+        class ReqToTokenPool:
+            def __init__(self, row):
+                self.req_to_token = row.unsqueeze(0)
+
+            def write(self, indices, values):
+                self.req_to_token[indices] = values
+
+        allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        token_ids = array("q", [1, 2, 3])
+        tree_indices = allocator.alloc(3)
+        request_indices = allocator.alloc(3)
+        assert tree_indices is not None
+        assert request_indices is not None
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", token_ids)),
+                value=tree_indices,
+            )
+        )
+        cache.req_to_token_pool = ReqToTokenPool(request_indices.clone())
+        req = unittest.mock.Mock(
+            req_pool_idx=0,
+            cache_protected_len=0,
+            extra_key=None,
+            priority=0,
+            last_node=cache.root_node,
+        )
+        req.get_fill_ids.return_value = token_ids
+
+        available_before_free = allocator.available_size()
+        allocator.free_group_begin()
+        cache.cache_unfinished_req(req)
+        allocator.free_group_end()
+
+        self.assertEqual(
+            allocator.available_size(),
+            available_before_free + request_indices.numel(),
+        )
+        torch.testing.assert_close(allocator.free_pages[-3:], request_indices)
+        torch.testing.assert_close(
+            cache.req_to_token_pool.req_to_token[0], tree_indices
+        )
+
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""
         test_cases = [
@@ -589,8 +642,8 @@ class TestRadixCache(unittest.TestCase):
             f"evicted {result.num_tokens_evicted} tokens, expected at least 2",
         )
 
-        # Should have called free and reduced size
-        mock_allocator.free.assert_called()
+        # Should have called free_segment and reduced size
+        mock_allocator.free_segment.assert_called()
         self.assertLess(cache.total_size(), initial_size)
 
     def test_page_alignment_boundary(self):
@@ -774,7 +827,7 @@ class TestRadixCache(unittest.TestCase):
         base_prefix_len = 10000
         suffix_len = 100
 
-        torch_allocated_before = torch.cuda.memory_allocated()
+        torch_allocated_before = torch.get_device_module().memory_allocated()
 
         # build dataset with common prefix
         common_prefix = [
@@ -784,7 +837,7 @@ class TestRadixCache(unittest.TestCase):
             suffix = [random.randint(1, vocab_size - 1) for _ in range(suffix_len)]
             seq = common_prefix + suffix
             keys.append(seq)
-            values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))
+            values.append(torch.zeros(len(seq), device=get_device(), dtype=torch.int32))
 
         cache: RadixCache = RadixCache.create_simulated()
 
@@ -793,7 +846,9 @@ class TestRadixCache(unittest.TestCase):
 
         del values
 
-        torch_allocated = torch.cuda.memory_allocated() - torch_allocated_before
+        torch_allocated = (
+            torch.get_device_module().memory_allocated() - torch_allocated_before
+        )
         cache_size_bytes = cache.total_size() * 4
         print(f"\nCache size (MB): {cache_size_bytes / (1024 * 1024)}")
         print(f"Torch allocated (MB): {torch_allocated / (1024 * 1024)}")

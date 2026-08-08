@@ -43,6 +43,7 @@
 
 import copy
 import logging
+import math
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -50,7 +51,6 @@ import torch
 from torch import nn
 from transformers.activations import GELUActivation
 
-from sglang.srt.configs import KimiVLConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
@@ -73,6 +73,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -112,7 +114,21 @@ class KimiVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
+def _language_model_config(config: KimiVLConfig):
+    text_config = copy.deepcopy(config.text_config)
+    text_config.architectures = ["DeepseekV2ForCausalLM"]
+    return text_config
+
+
 class KimiVLForConditionalGeneration(nn.Module):
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            _language_model_config(hf_config), quant_config
+        )
+
     def __init__(
         self,
         config: KimiVLConfig,
@@ -124,17 +140,20 @@ class KimiVLForConditionalGeneration(nn.Module):
         self.config = config
         assert isinstance(config.vision_config, MoonViTConfig)
 
-        self.vision_tower = MoonVitPretrainedModel(config.vision_config)
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        self.vision_tower = MoonVitPretrainedModel(
+            config.vision_config,
+            prefix=add_prefix("vision_tower", prefix),
+            use_data_parallel=self.use_data_parallel,
+        )
 
         self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
         self.quant_config = quant_config
 
         self.language_model = None
         if not config.encoder_only:
-            text_config = copy.deepcopy(config.text_config)
-            text_config.architectures = ["DeepseekV2ForCausalLM"]
             self.language_model = DeepseekV2ForCausalLM(
-                config=text_config,
+                config=_language_model_config(config),
                 quant_config=quant_config,
                 prefix=add_prefix("language_model", prefix),
             )
@@ -152,13 +171,26 @@ class KimiVLForConditionalGeneration(nn.Module):
         ):
             return pixel_values
 
-        image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
-            self.vision_tower.device
-        )
-        image_features = self.vision_tower(pixel_values, image_grid_hws)
-        assert isinstance(image_features, list)
-        # lengths = [x.shape[0] for x in image_features]
-        res = self.multi_modal_projector(torch.cat(image_features))  # .split(lengths)
+        image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0)
+        image_grid_hws_list = image_grid_hws.tolist()
+        if self.use_data_parallel:
+            image_features = run_dp_sharded_mrope_vision_model(
+                self.vision_tower,
+                pixel_values,
+                image_grid_hws_list,
+                rope_type="rope_2d",
+            )
+        else:
+            image_grid_hws = image_grid_hws.to(self.vision_tower.device)
+            image_features = self.vision_tower(
+                pixel_values,
+                image_grid_hws,
+                max_seqlen=max(math.prod(grid) for grid in image_grid_hws_list),
+            )
+            assert isinstance(image_features, list)
+            image_features = torch.cat(image_features)
+
+        res = self.multi_modal_projector(image_features)
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -242,8 +274,12 @@ class KimiVLForConditionalGeneration(nn.Module):
             use_default_weight_loading = False
             if "vision" in name:
                 if self.vision_tower is not None:
-                    # We only do sharding for language model and
-                    # not vision model for now.
+                    # MoonViT's attention is wrapped in sglang's VisionAttention,
+                    # whose sub-modules are named qkv_proj/proj instead of the
+                    # checkpoint's wqkv/wo.
+                    name = name.replace("wqkv.", "attn.qkv_proj.").replace(
+                        "wo.", "attn.proj."
+                    )
                     use_default_weight_loading = True
             else:
                 for param_name, weight_name, shard_id in stacked_params_mapping:

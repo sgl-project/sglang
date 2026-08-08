@@ -18,6 +18,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
+from sglang.kernels.ops.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
+)
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    can_use_fused_qk_head_layernorm,
+    fused_layernorm_modulate,
+    fused_qk_head_layernorm,
+    is_plain_layer_norm,
+)
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
@@ -51,10 +67,154 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
 _is_cuda = current_platform.is_cuda()
+
+_GLM_FUSED_LN_MOD_DISABLED = False
+_GLM_FUSED_LN_MOD_VERIFIED = False
+_GLM_FUSED_QK_LN_DISABLED = False
+_GLM_FUSED_QK_LN_VERIFIED = False
+_GLM_RESIDUAL_GATE_CUDA_DISABLED = False
+
+
+def _eager_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return norm(x).to(dtype=dtype) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def _glm_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs eager.
+
+    Bit-exactness depends on which LayerNorm kernel aten dispatches to, so
+    the first call verifies ``torch.equal`` against the eager chain and
+    disables the fast path permanently on any mismatch.
+    """
+    global _GLM_FUSED_LN_MOD_DISABLED, _GLM_FUSED_LN_MOD_VERIFIED
+
+    if (
+        not _GLM_FUSED_LN_MOD_DISABLED
+        and _is_cuda
+        and dtype is x.dtype
+        and is_plain_layer_norm(norm, x.shape[-1])
+        and can_use_fused_layernorm_modulate(x, scale, shift)
+        and (_GLM_FUSED_LN_MOD_VERIFIED or not torch.compiler.is_compiling())
+    ):
+        try:
+            out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling GLM fused LN+modulate fast path: {exc}")
+            _GLM_FUSED_LN_MOD_DISABLED = True
+        else:
+            if _GLM_FUSED_LN_MOD_VERIFIED:
+                return out
+            ref = _eager_ln_modulate(norm, x, scale, shift, dtype)
+            if torch.equal(out, ref):
+                _GLM_FUSED_LN_MOD_VERIFIED = True
+                return out
+            logger.warning_once(
+                "GLM fused LN+modulate fast path is not bit-exact against "
+                "this platform's LayerNorm dispatch; falling back to eager"
+            )
+            _GLM_FUSED_LN_MOD_DISABLED = True
+            return ref
+
+    return _eager_ln_modulate(norm, x, scale, shift, dtype)
+
+
+def _glm_qk_layernorm(
+    norm_q: nn.LayerNorm,
+    norm_k: nn.LayerNorm,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-head LayerNorm over q and k in one launch, bit-exact vs eager.
+
+    First call verifies ``torch.equal`` against the eager pair and falls
+    back permanently on any mismatch.
+    """
+    global _GLM_FUSED_QK_LN_DISABLED, _GLM_FUSED_QK_LN_VERIFIED
+
+    if (
+        not _GLM_FUSED_QK_LN_DISABLED
+        and _is_cuda
+        and dtype is query.dtype
+        and dtype is key.dtype
+        and is_plain_layer_norm(norm_q, query.shape[-1])
+        and is_plain_layer_norm(norm_k, key.shape[-1])
+        and norm_q.eps == norm_k.eps
+        and can_use_fused_qk_head_layernorm(query, key)
+        and (_GLM_FUSED_QK_LN_VERIFIED or not torch.compiler.is_compiling())
+    ):
+        try:
+            q_out, k_out = fused_qk_head_layernorm(query, key, norm_q.eps)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling GLM fused qk-LayerNorm fast path: {exc}")
+            _GLM_FUSED_QK_LN_DISABLED = True
+        else:
+            if _GLM_FUSED_QK_LN_VERIFIED:
+                return q_out, k_out
+            q_ref = norm_q(query).to(dtype=dtype)
+            k_ref = norm_k(key).to(dtype=dtype)
+            if torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref):
+                _GLM_FUSED_QK_LN_VERIFIED = True
+                return q_out, k_out
+            logger.warning_once(
+                "GLM fused qk-LayerNorm fast path is not bit-exact against "
+                "this platform's LayerNorm dispatch; falling back to eager"
+            )
+            _GLM_FUSED_QK_LN_DISABLED = True
+            return q_ref, k_ref
+
+    return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
+
+
+def _glm_residual_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel ``residual + gate * update``, bit-exact vs the eager pair.
+
+    Half dtypes only: for fp32 the kernel would contract to an fma (one
+    rounding) and stop being bit-exact.
+    """
+    global _GLM_RESIDUAL_GATE_CUDA_DISABLED
+
+    if (
+        not _GLM_RESIDUAL_GATE_CUDA_DISABLED
+        and residual.dtype in (torch.float16, torch.bfloat16)
+        and can_use_residual_gate_add_cuda(residual, update, gate)
+    ):
+        try:
+            return residual_gate_add_cuda(residual, update, gate)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling GLM residual-gate CUDA fast path: {exc}")
+            _GLM_RESIDUAL_GATE_CUDA_DISABLED = True
+
+    return residual + gate * update
 
 
 class GlmImageLayerKVCache:
@@ -201,10 +361,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
 
-        crop_coords_proj = self.condition_proj(crop_coords.flatten()).view(
+        crop_coords_proj = self.condition_proj(crop_coords.flatten()).reshape(
             crop_coords.size(0), -1
         )
-        target_size_proj = self.condition_proj(target_size.flatten()).view(
+        target_size_proj = self.condition_proj(target_size.flatten()).reshape(
             target_size.size(0), -1
         )
 
@@ -270,10 +430,6 @@ class GlmImageAdaLayerNormZero(nn.Module):
         temb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dtype = hidden_states.dtype
-        norm_hidden_states = self.norm(hidden_states).to(dtype=dtype)
-        norm_encoder_hidden_states = self.norm_context(encoder_hidden_states).to(
-            dtype=dtype
-        )
 
         emb, _ = self.linear(temb)
         (
@@ -291,12 +447,12 @@ class GlmImageAdaLayerNormZero(nn.Module):
             c_gate_mlp,
         ) = emb.chunk(12, dim=1)
 
-        hidden_states = norm_hidden_states * (
-            1 + scale_msa.unsqueeze(1)
-        ) + shift_msa.unsqueeze(1)
-        encoder_hidden_states = norm_encoder_hidden_states * (
-            1 + c_scale_msa.unsqueeze(1)
-        ) + c_shift_msa.unsqueeze(1)
+        hidden_states = _glm_ln_modulate(
+            self.norm, hidden_states, scale_msa, shift_msa, dtype
+        )
+        encoder_hidden_states = _glm_ln_modulate(
+            self.norm_context, encoder_hidden_states, c_scale_msa, c_shift_msa, dtype
+        )
 
         return (
             hidden_states,
@@ -330,8 +486,17 @@ class GlmImageGELU(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
+        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
         hidden_states, _ = self.proj(hidden_states)
         return F.gelu(hidden_states, approximate="tanh")
 
@@ -500,10 +665,13 @@ class GlmImageAttention(torch.nn.Module):
         value = value.unflatten(2, (self.num_local_kv_heads, -1))
 
         # 2. QK normalization
-        if self.norm_q is not None:
-            query = self.norm_q(query).to(dtype=dtype)
-        if self.norm_k is not None:
-            key = self.norm_k(key).to(dtype=dtype)
+        if self.norm_q is not None and self.norm_k is not None:
+            query, key = _glm_qk_layernorm(self.norm_q, self.norm_k, query, key, dtype)
+        else:
+            if self.norm_q is not None:
+                query = self.norm_q(query).to(dtype=dtype)
+            if self.norm_k is not None:
+                key = self.norm_k(key).to(dtype=dtype)
 
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
@@ -669,9 +837,11 @@ class GlmImageTransformerBlock(nn.Module):
 
         ff_output = self.ff(norm_hidden_states)
         ff_output_context = self.ff(norm_encoder_hidden_states)
-        hidden_states = hidden_states + ff_output * gate_mlp.unsqueeze(1)
-        encoder_hidden_states = (
-            encoder_hidden_states + ff_output_context * c_gate_mlp.unsqueeze(1)
+        hidden_states = _glm_residual_gate_add(
+            hidden_states, ff_output, gate_mlp.unsqueeze(1)
+        )
+        encoder_hidden_states = _glm_residual_gate_add(
+            encoder_hidden_states, ff_output_context, c_gate_mlp.unsqueeze(1)
         )
 
         return hidden_states, encoder_hidden_states
@@ -762,6 +932,8 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
         # *** NO SiLU here ***
         emb = self.linear(conditioning_embedding.to(x.dtype))
         scale, shift = torch.chunk(emb, 2, dim=1)
+        if is_plain_layer_norm(self.norm, x.shape[-1]):
+            return _glm_ln_modulate(self.norm, x, scale, shift, x.dtype)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
         return x
 
@@ -908,10 +1080,49 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         batch_size, num_channels, height, width = hidden_states.shape
 
-        timestep = timestep - 1.0
-
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+
+        if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
+
+            def slice_batch(value, index):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.dim() > 0
+                    and value.shape[0] == batch_size
+                ):
+                    return value[index : index + 1]
+                return value
+
+            outputs = []
+            for index in range(batch_size):
+                sample_encoder_hidden_states = encoder_hidden_states[index : index + 1]
+                sample_attention_mask = slice_batch(attention_mask, index)
+                if isinstance(sample_attention_mask, torch.Tensor):
+                    valid_text_length = int(sample_attention_mask.sum().item())
+                    sample_encoder_hidden_states = sample_encoder_hidden_states[
+                        :, :valid_text_length
+                    ]
+                    sample_attention_mask = None
+
+                outputs.append(
+                    self.forward(
+                        hidden_states=hidden_states[index : index + 1],
+                        encoder_hidden_states=sample_encoder_hidden_states,
+                        prior_token_id=prior_token_id[index : index + 1],
+                        prior_token_drop=prior_token_drop[index : index + 1],
+                        timestep=slice_batch(timestep, index),
+                        target_size=slice_batch(target_size, index),
+                        crop_coords=slice_batch(crop_coords, index),
+                        attention_kwargs=attention_kwargs,
+                        attention_mask=sample_attention_mask,
+                        freqs_cis=freqs_cis,
+                        guidance=slice_batch(guidance, index),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        timestep = timestep - 1.0
 
         # 1. RoPE
         image_rotary_emb = freqs_cis
@@ -924,8 +1135,15 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         hidden_states = self.image_projector(hidden_states)
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
+
         prior_embedding = self.prior_token_embedding(prior_token_id)
-        prior_embedding = prior_embedding.masked_fill(prior_token_drop.unsqueeze(-1), 0)
+        if is_in_breakable_cuda_graph():
+            prior_embedding = prior_embedding.masked_fill(
+                prior_token_drop.unsqueeze(-1), 0
+            )
+        else:
+            prior_embedding[prior_token_drop] *= 0.0
+
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
         # Shard prior_hidden_states along seq dim to match (prior is row-major, same as latent patches).
