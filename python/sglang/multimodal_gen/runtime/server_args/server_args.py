@@ -1705,9 +1705,9 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.direct_gpu_weight_loading,
             help="Load the full unquantized DiT checkpoint state dict directly "
-            "onto GPU before assigning model parameters. This can substantially "
-            "reduce startup time but temporarily requires checkpoint weights and "
-            "model weights to coexist on GPU. Disabled by default.",
+            "onto GPU before assigning model parameters. This may reduce startup "
+            "time depending on the model, but temporarily requires checkpoint "
+            "weights and model weights to coexist on GPU. Disabled by default.",
         )
         parser.add_argument(
             "--dit-layerwise-offload",
