@@ -19,12 +19,9 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from .dots_omni_vision_attention import (
+    VisionAttention,
     VisionRotaryEmbedding,
     apply_vision_attention_residual,
-    attn_uses_seqlens,
-    build_vision_attention,
-    prepare_seqlens_for_attention,
-    resolve_attn_implementation,
 )
 
 
@@ -46,7 +43,7 @@ class DotsMoEVitConfig(PretrainedConfig):
         rms_norm_eps: float = 1e-5,
         use_bias: bool = False,
         use_qk_norm: bool = True,
-        attn_implementation="flash_attention_3",  # "eager","eager_v2","sdpa","flash_attention_2","flash_attention_3"
+        attn_implementation="flash_attention_3",
         initializer_range=0.02,
         is_causal=False,
         post_norm=True,
@@ -558,11 +555,7 @@ class DotsPatchEmbed(nn.Module):
 class MoEVisionBlock(nn.Module):
     def __init__(self, config: DotsMoEVitConfig, layer_number: int):
         super().__init__()
-        attn_impl = resolve_attn_implementation(
-            config.attn_implementation, eager_fallback="eager_v2"
-        )
-        self.attn = build_vision_attention(attn_impl, config, eager_fallback="eager_v2")
-        self._attn_uses_seqlens = attn_uses_seqlens(attn_impl)
+        self.attn = VisionAttention(config)
         self.norm_1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
         self.norm_2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
 
@@ -586,7 +579,6 @@ class MoEVisionBlock(nn.Module):
         cu_seqlens,
         rotary_pos_emb,
         max_seqlen: int,
-        seqlens: list[int] | None = None,
     ) -> torch.Tensor:
         hidden_states = apply_vision_attention_residual(
             self.attn,
@@ -595,8 +587,6 @@ class MoEVisionBlock(nn.Module):
             cu_seqlens,
             max_seqlen,
             rotary_pos_emb,
-            seqlens=seqlens,
-            uses_seqlens=self._attn_uses_seqlens,
         )
         hidden_states = hidden_states + self.mlp(self.norm_2(hidden_states))
         return hidden_states
@@ -837,12 +827,6 @@ class DotsMoEVitModel(PreTrainedModel):
         else:
             cu_seqlens, max_seqlen = self._build_cu_seqlens_from_grid(grid_thw)
 
-        seqlens = prepare_seqlens_for_attention(
-            self.config.attn_implementation,
-            cu_seqlens,
-            eager_fallback="eager_v2",
-        )
-
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
@@ -851,7 +835,6 @@ class DotsMoEVitModel(PreTrainedModel):
                     cu_seqlens,
                     rotary_pos_emb,
                     max_seqlen,
-                    seqlens,
                 )
             else:
                 hidden_states = blk(
@@ -859,7 +842,6 @@ class DotsMoEVitModel(PreTrainedModel):
                     cu_seqlens,
                     rotary_pos_emb,
                     max_seqlen,
-                    seqlens=seqlens,
                 )
 
         if self.config.post_norm:
