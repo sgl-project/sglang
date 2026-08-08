@@ -41,19 +41,18 @@ def minimax_h3_time_shift_sigmas(
 
     import torch
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].
+    # The rectified-flow sigma range is fixed at [1.0, 0.0].  The Euler
+    # denoise loop performs ``len(sigmas) - 1`` updates, so the schedule must
+    # hold exactly ``num_steps + 1`` points to honor the requested step count.
+    # torch.linspace already includes both endpoints, and the time-shift
+    # mapping is strictly monotonic, so no post-hoc deduplication is needed
+    # (it could only ever shrink the schedule and break the N+1 contract).
     base = torch.linspace(
         1.0,
         0.0,
-        int(num_steps),
+        int(num_steps) + 1,
         device="cpu",
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
-    # A one-point request is still exactly one point.  Normal serving uses
-    # multiple points, but preserving the requested cardinality keeps
-    # ``num_inference_steps`` the sole schedule-size control.
-    if num_steps > 1 and shifted[-1].item() > 0.0:
-        shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
     return [float(value) for value in shifted.tolist()]
