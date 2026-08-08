@@ -1,11 +1,12 @@
 use std::{
     borrow::Cow,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use dashmap::DashMap;
+use http::{HeaderMap, HeaderName};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use once_cell::sync::Lazy;
@@ -49,6 +50,104 @@ pub(crate) fn intern_string(s: &str) -> Arc<str> {
 #[allow(dead_code)]
 pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
+}
+
+// =============================================================================
+// SOURCE LABEL
+// =============================================================================
+//
+// Optional `source` label derived from a configured request header. Unset (the
+// default) leaves the existing label set unchanged.
+
+/// Longer values are rejected rather than truncated: truncating would merge
+/// two callers sharing a prefix into one series.
+const SOURCE_LABEL_MAX_LEN: usize = 128;
+
+/// The value is client-supplied and no series is ever reclaimed, so the number
+/// of distinct values has to be bounded. Matches the OpenTelemetry SDK's
+/// default cardinality limit.
+const SOURCE_LABEL_MAX_DISTINCT: usize = 2000;
+
+/// Set from `--source-label-header`; unset disables the label.
+static SOURCE_LABEL_HEADER: OnceLock<HeaderName> = OnceLock::new();
+
+/// Kept separate from [`STRING_INTERNER`], whose other inputs are all
+/// operator-controlled, so a client cannot grow the shared interner.
+static SOURCE_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
+
+/// Shared so collapsing onto a sentinel neither spends a slot nor takes a
+/// write lock on every over-cap request.
+static SOURCE_UNKNOWN_LABEL: Lazy<Arc<str>> =
+    Lazy::new(|| Arc::from(metrics_labels::SOURCE_UNKNOWN));
+static SOURCE_OVERFLOW_LABEL: Lazy<Arc<str>> =
+    Lazy::new(|| Arc::from(metrics_labels::SOURCE_OVERFLOW));
+
+/// Returns `false` if a *different* header is already active: the metrics
+/// recorder is process-global, so the first router in the process wins.
+#[must_use]
+pub fn set_source_label_header(header: HeaderName) -> bool {
+    match SOURCE_LABEL_HEADER.set(header) {
+        Ok(()) => true,
+        Err(rejected) => SOURCE_LABEL_HEADER.get() == Some(&rejected),
+    }
+}
+
+/// Non-conforming values, empty and over-long included, map to
+/// [`metrics_labels::SOURCE_UNKNOWN`].
+fn sanitize_source_value(raw: &str) -> &str {
+    let conforming = !raw.is_empty()
+        && raw.len() <= SOURCE_LABEL_MAX_LEN
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+    if conforming {
+        raw
+    } else {
+        metrics_labels::SOURCE_UNKNOWN
+    }
+}
+
+/// The cap is approximate under concurrent inserts: a growth bound, not a quota.
+fn intern_source_value(
+    interner: &DashMap<String, Arc<str>>,
+    max_distinct: usize,
+    value: &str,
+) -> Arc<str> {
+    if value == metrics_labels::SOURCE_UNKNOWN {
+        return Arc::clone(&SOURCE_UNKNOWN_LABEL);
+    }
+    if value == metrics_labels::SOURCE_OVERFLOW {
+        return Arc::clone(&SOURCE_OVERFLOW_LABEL);
+    }
+    if let Some(entry) = interner.get(value) {
+        return Arc::clone(entry.value());
+    }
+    if interner.len() >= max_distinct {
+        return Arc::clone(&SOURCE_OVERFLOW_LABEL);
+    }
+    interner
+        .entry(value.to_string())
+        .or_insert_with(|| Arc::from(value))
+        .clone()
+}
+
+/// `None` disables the label; a missing or unreadable header yields `unknown`.
+fn source_label_value(
+    header: Option<&HeaderName>,
+    headers: Option<&HeaderMap>,
+) -> Option<Arc<str>> {
+    let header = header?;
+    // Last value, not first: a fronting proxy that appends its own attribution
+    // header must win over a client-supplied one.
+    let value = headers
+        .and_then(|h| h.get_all(header).iter().next_back())
+        .and_then(|v| v.to_str().ok())
+        .map_or(metrics_labels::SOURCE_UNKNOWN, sanitize_source_value);
+    Some(intern_source_value(
+        &SOURCE_INTERNER,
+        SOURCE_LABEL_MAX_DISTINCT,
+        value,
+    ))
 }
 
 // =============================================================================
@@ -175,7 +274,7 @@ pub(crate) fn init_metrics() {
     // Layer 2: Router metrics
     describe_counter!(
         "smg_router_requests_total",
-        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming"
+        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming (plus source when configured)"
     );
     describe_histogram!(
         "smg_router_request_duration_seconds",
@@ -414,6 +513,10 @@ pub mod metrics_labels {
     pub const RESULT_TIMEOUT: &str = "timeout";
     pub const RESULT_NOT_FOUND: &str = "not_found";
 
+    // Client source attribution
+    pub const SOURCE_UNKNOWN: &str = "unknown";
+    pub const SOURCE_OVERFLOW: &str = "overflow";
+
     // Discovery sources
     pub const DISCOVERY_STATIC: &str = "static";
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
@@ -536,6 +639,7 @@ impl Metrics {
     ///
     /// # Arguments
     /// * `streaming` - Use `bool_to_static_str(request.stream)` or the constants
+    /// * `headers` - Incoming request headers; source of the optional `source` label
     pub fn record_router_request(
         router_type: &'static str,
         backend_type: &'static str,
@@ -543,18 +647,32 @@ impl Metrics {
         model_id: &str,
         endpoint: &'static str,
         streaming: &'static str,
+        headers: Option<&HeaderMap>,
     ) {
         let model = intern_string(model_id);
-        counter!(
-            "smg_router_requests_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "endpoint" => endpoint,
-            "streaming" => streaming
-        )
-        .increment(1);
+        // Two arms rather than a Vec<Label>: the macro form avoids a per-request allocation.
+        let counter = match source_label_value(SOURCE_LABEL_HEADER.get(), headers) {
+            Some(source) => counter!(
+                "smg_router_requests_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "connection_mode" => connection_mode,
+                "model" => model,
+                "endpoint" => endpoint,
+                "streaming" => streaming,
+                "source" => source
+            ),
+            None => counter!(
+                "smg_router_requests_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "connection_mode" => connection_mode,
+                "model" => model,
+                "endpoint" => endpoint,
+                "streaming" => streaming
+            ),
+        };
+        counter.increment(1);
     }
 
     /// Record router request duration.
@@ -1197,6 +1315,8 @@ impl Metrics {
 mod tests {
     use std::net::TcpListener;
 
+    use http::HeaderValue;
+
     use super::*;
 
     #[test]
@@ -1429,6 +1549,155 @@ mod tests {
         let socket_addr = SocketAddr::new(ip_addr, config.port);
 
         assert_eq!(socket_addr.to_string(), "127.0.0.1:29000");
+    }
+
+    // ========================================================================
+    // Source label tests
+    // ========================================================================
+
+    #[test]
+    fn test_sanitize_source_value() {
+        assert_eq!(sanitize_source_value("my-service"), "my-service");
+        assert_eq!(
+            sanitize_source_value("team_a.batch:v1-2"),
+            "team_a.batch:v1-2"
+        );
+
+        assert_eq!(sanitize_source_value(""), metrics_labels::SOURCE_UNKNOWN);
+        assert_eq!(
+            sanitize_source_value("has space"),
+            metrics_labels::SOURCE_UNKNOWN
+        );
+        assert_eq!(
+            sanitize_source_value("semi;colon"),
+            metrics_labels::SOURCE_UNKNOWN
+        );
+        assert_eq!(
+            sanitize_source_value("non-ascii-é"),
+            metrics_labels::SOURCE_UNKNOWN
+        );
+
+        let at_limit = "a".repeat(SOURCE_LABEL_MAX_LEN);
+        assert_eq!(sanitize_source_value(&at_limit), at_limit);
+        assert_eq!(
+            sanitize_source_value(&"a".repeat(SOURCE_LABEL_MAX_LEN + 1)),
+            metrics_labels::SOURCE_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn test_intern_source_value_caps_distinct_values() {
+        let interner = DashMap::new();
+        let cap = 4;
+        for i in 0..cap {
+            intern_source_value(&interner, cap, &format!("caller-{i}"));
+        }
+        assert_eq!(interner.len(), cap);
+
+        // Over-cap is reported distinctly from a missing or malformed header.
+        assert_eq!(
+            intern_source_value(&interner, cap, "one-too-many").as_ref(),
+            metrics_labels::SOURCE_OVERFLOW
+        );
+        assert_eq!(
+            intern_source_value(&interner, cap, "caller-0").as_ref(),
+            "caller-0"
+        );
+        // Neither an over-cap value nor a sentinel spends a slot.
+        assert_eq!(interner.len(), cap);
+        intern_source_value(&interner, cap, metrics_labels::SOURCE_UNKNOWN);
+        intern_source_value(&interner, cap, metrics_labels::SOURCE_OVERFLOW);
+        assert_eq!(interner.len(), cap);
+    }
+
+    fn source_header() -> HeaderName {
+        HeaderName::from_static("x-request-source")
+    }
+
+    #[test]
+    fn test_source_label_value_disabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert(source_header(), HeaderValue::from_static("my-service"));
+
+        assert!(source_label_value(None, Some(&headers)).is_none());
+        assert!(source_label_value(None, None).is_none());
+    }
+
+    #[test]
+    fn test_source_label_value_enabled() {
+        let header = source_header();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(source_header(), HeaderValue::from_static("my-service"));
+        assert_eq!(
+            source_label_value(Some(&header), Some(&headers)).as_deref(),
+            Some("my-service")
+        );
+
+        // Absent header, and no headers at all
+        assert_eq!(
+            source_label_value(Some(&header), Some(&HeaderMap::new())).as_deref(),
+            Some(metrics_labels::SOURCE_UNKNOWN)
+        );
+        assert_eq!(
+            source_label_value(Some(&header), None).as_deref(),
+            Some(metrics_labels::SOURCE_UNKNOWN)
+        );
+
+        let mut opaque = HeaderMap::new();
+        opaque.insert(source_header(), HeaderValue::from_bytes(&[0xFF]).unwrap());
+        assert_eq!(
+            source_label_value(Some(&header), Some(&opaque)).as_deref(),
+            Some(metrics_labels::SOURCE_UNKNOWN)
+        );
+
+        // An appended proxy value wins over the client-supplied one
+        let mut appended = HeaderMap::new();
+        appended.append(source_header(), HeaderValue::from_static("client-claim"));
+        appended.append(source_header(), HeaderValue::from_static("proxy-truth"));
+        assert_eq!(
+            source_label_value(Some(&header), Some(&appended)).as_deref(),
+            Some("proxy-truth")
+        );
+    }
+
+    #[test]
+    fn test_set_source_label_header_rejects_a_different_header() {
+        // Process-global, so this test owns it for the whole test binary; the
+        // resolution tests above pass the header explicitly and are unaffected.
+        assert!(set_source_label_header(source_header()));
+        assert!(set_source_label_header(source_header()));
+        assert!(!set_source_label_header(HeaderName::from_static("x-other")));
+    }
+
+    /// The label reaching the exposition output, not just the resolver. Shares
+    /// the process-global header with the test above, which sets the same one.
+    #[test]
+    fn test_record_router_request_emits_source_label() {
+        let _ = set_source_label_header(source_header());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(source_header(), HeaderValue::from_static("my-service"));
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_router_request(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                "test-model",
+                metrics_labels::ENDPOINT_CHAT,
+                STREAMING_FALSE,
+                Some(&headers),
+            );
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"source="my-service""#),
+            "expected a source label in:\n{rendered}"
+        );
     }
 
     // ========================================================================

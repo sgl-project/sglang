@@ -800,6 +800,15 @@ Configure headers for request ID extraction:
 ```
 Responses include `x-request-id` header for correlation.
 
+### Client Source Attribution
+Optionally attribute router request metrics to callers via a client-declared header:
+```bash
+--source-label-header x-request-source
+```
+When set, `smg_router_requests_total` gains a `source` label carrying the sanitized header value. Values are limited to `[A-Za-z0-9._:-]`, 128 characters, and 2000 distinct values per process (the OpenTelemetry SDK's default cardinality limit), so a client cannot grow cardinality without bound. Missing, malformed or over-long values record `unknown`; values past the distinct-value limit record `overflow`. Disabled by default.
+
+The value is self-reported, so treat it as attribution rather than authentication. When callers are untrusted, have a trusted hop set the header, replacing rather than appending it.
+
 ### CORS
 Set `--cors-allowed-origins` for browser access.
 
