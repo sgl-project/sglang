@@ -519,14 +519,17 @@ class RMSNorm(BaseFusedOp):
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
             return self.forward_native(x, residual, post_residual_addition)
-        # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
-        # already-safe layout as a zero-copy path, and only normalize strided or
-        # higher-rank views such as Q/K slices from packed QKV projections.
+        # Aiter's rmsnorm2d_fwd is row-wise, so a 2D view whose last dim is
+        # unit-stride (contiguous rows, possibly strided row pitch — e.g. Q/KV
+        # slices split from a packed QKV projection) is consumed correctly as
+        # is. Only clone when the last dim itself is strided, or the view is
+        # higher-rank and must be densely reshaped first. This avoids a
+        # contiguous copy of the row-strided Q/KV slices on the MLA prefill path.
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
             x = x.contiguous().reshape(-1, original_shape[-1])
-        elif not x.is_contiguous():
+        elif not x.is_contiguous() and x.stride(-1) != 1:
             x = x.contiguous()
         if is_batch_invariant_mode_enabled():
             if (
