@@ -12,12 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(
-    est_time=900,
-    stage="nightly",
-    runner_config="8-gpu-b200",
-    nightly=True,
-)
+register_cuda_ci(est_time=900, stage="nightly", runner_config="8-gpu-b200")
 
 MIMO_V2_MODEL_PATH = "XiaomiMiMo/MiMo-V2.5"
 GSM8K_BASELINE_ACCURACY = 0.93

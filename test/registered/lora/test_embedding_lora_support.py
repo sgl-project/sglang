@@ -37,12 +37,7 @@ LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"
 LORA_BACKEND = "triton"
 SIMILARITY_THRESHOLD = 0.9999
 
-register_cuda_ci(
-    est_time=150,
-    stage="nightly",
-    runner_config="1-gpu-large",
-    nightly=True,
-)
+register_cuda_ci(est_time=150, stage="nightly", runner_config="1-gpu-large")
 
 
 class TestEmbeddingLoraSupport(unittest.TestCase):

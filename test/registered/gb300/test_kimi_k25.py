@@ -10,7 +10,6 @@ register_cuda_ci(
     est_time=7200,
     stage="nightly",
     runner_config="4-gpu-gb300",
-    nightly=True,
     disabled="not needed",
 )
 

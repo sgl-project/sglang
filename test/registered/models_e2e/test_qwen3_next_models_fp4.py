@@ -5,12 +5,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(
-    est_time=500,
-    stage="nightly",
-    runner_config="4-gpu-b200",
-    nightly=True,
-)
+register_cuda_ci(est_time=500, stage="nightly", runner_config="4-gpu-b200")
 
 QWEN3_NEXT_MODEL_FP4 = "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4"
 

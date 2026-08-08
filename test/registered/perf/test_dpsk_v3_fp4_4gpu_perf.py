@@ -7,12 +7,7 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on B200 via the 4-gpu-b200 runner_config
-register_cuda_ci(
-    est_time=2000,
-    stage="nightly",
-    runner_config="4-gpu-b200",
-    nightly=True,
-)
+register_cuda_ci(est_time=2000, stage="nightly", runner_config="4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 

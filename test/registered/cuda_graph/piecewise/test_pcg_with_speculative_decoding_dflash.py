@@ -15,12 +15,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(
-    est_time=531,
-    stage="nightly",
-    runner_config="1-gpu-large",
-    nightly=True,
-)
+register_cuda_ci(est_time=531, stage="nightly", runner_config="1-gpu-large")
 
 
 class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):

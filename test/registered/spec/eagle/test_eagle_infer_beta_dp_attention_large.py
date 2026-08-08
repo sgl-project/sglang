@@ -17,12 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # 16 GPU test (4 TP x 4 DP), runs on 2x 8-GPU B200 nodes
-register_cuda_ci(
-    est_time=600,
-    stage="nightly",
-    runner_config="8-gpu-b200",
-    nightly=True,
-)
+register_cuda_ci(est_time=600, stage="nightly", runner_config="8-gpu-b200")
 
 
 def test_gsm8k(base_url: str, model: str):

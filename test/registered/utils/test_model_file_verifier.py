@@ -28,12 +28,7 @@ from sglang.test.test_utils import (
 )
 
 # Note: AMD registration removed - test_model_file_verifier fails on AMD
-register_cuda_ci(
-    est_time=120,
-    stage="nightly",
-    runner_config="1-gpu-large",
-    nightly=True,
-)
+register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
 register_cpu_ci(est_time=540, suite="base-c-test-cpu")
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"

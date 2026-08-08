@@ -7,12 +7,7 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Kimi-K2.6 NVFP4 (pure-MLA target, fp8 KV) + DFlash speculative decoding on 8x B200, tp=8.
-register_cuda_ci(
-    est_time=3600,
-    stage="nightly",
-    runner_config="8-gpu-b200",
-    nightly=True,
-)
+register_cuda_ci(est_time=3600, stage="nightly", runner_config="8-gpu-b200")
 
 MODEL_PATH = "nvidia/Kimi-K2.6-NVFP4"
 DRAFT_MODEL_PATH = "nvidia/Kimi-K2.6-DFlash"

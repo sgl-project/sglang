@@ -50,12 +50,7 @@ from sglang.test.test_utils import (
     run_distributed_test,
 )
 
-register_cuda_ci(
-    est_time=30,
-    stage="nightly",
-    runner_config="2-gpu-large",
-    nightly=True,
-)
+register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
 
 

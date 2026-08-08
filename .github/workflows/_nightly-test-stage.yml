@@ -116,7 +116,6 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda \
             --suite nightly-test-${{ inputs.runner_config }} \
-            --nightly \
             --continue-on-error \
             --timeout-from-est-time \
             --auto-partition-id ${{ matrix.partition }} \

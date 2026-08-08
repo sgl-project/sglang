@@ -120,6 +120,12 @@ NIGHTLY_SUITES = {
         # a suite and is split by auto_partition, so adding a test never needs
         # a workflow edit. Machine details (runs-on label, install script, rdma
         # devices) come from scripts/ci/runner_configs.yml.
+        #
+        # These carry no `nightly=True`: the stage says it, and how often a
+        # suite runs is a property of the workflow that selects it, exactly as
+        # `base-a` being blocking and `extra-a` being label-gated are. The flag
+        # survives only for the legacy single-string suites below, where the
+        # name alone does not identify the cadence.
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
@@ -222,14 +228,11 @@ def filter_tests(
         if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
-    valid_suites = (
-        NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
-    )
-
-    if suite not in valid_suites:
-        print(
-            f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
-        )
+    # Checked against every declared suite for this backend, not just the
+    # per-commit or nightly half: CUDA nightly suites are selected by name
+    # alone (stage="nightly") and are run without --nightly.
+    if suite not in _valid_suites_by_backend().get(hw, set()):
+        print(f"Warning: Unknown suite {suite} for backend {hw.name}")
 
     enabled_tests = [t for t in ci_tests if t.disabled is None]
     skipped_tests = [t for t in ci_tests if t.disabled is not None]

@@ -18,12 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=120,
-    stage="nightly",
-    runner_config="1-gpu-large",
-    nightly=True,
-)
+register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 
 TEST_ROUTING_KEY = "test-routing-key-12345"
