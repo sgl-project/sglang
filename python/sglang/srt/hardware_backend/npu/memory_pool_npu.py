@@ -321,6 +321,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         from sgl_kernel_npu.mem_cache.kv_cache_store import (
             store_kv_cache_prefix_valid_npu_triton,
         )
+
         store_kv_cache_prefix_valid_npu_triton(
             k_buffer_layer.view(-1, self.head_num, self.head_dim),
             v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
