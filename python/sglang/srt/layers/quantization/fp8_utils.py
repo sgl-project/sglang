@@ -1129,15 +1129,24 @@ def aiter_w8a8_block_fp8_linear(
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # OPT (bpreshuffle scale, no-copy): ask the quant kernel to emit the scale
+        # already in bpreshuffle byte-order (transpose_scale=True) and reinterpret
+        # its strides to the materialized column-major layout via a zero-copy view
+        # (view_aiter_fused_rms_transposed_fp8_scale), replacing the
+        # .t().contiguous().t() relayout copy. Bit-identical for M>=2 (validated);
+        # keep the cheap copy for the degenerate single-row case.
+        _emit_bpreshuffle = materialize_bpreshuffle_scale and input_2d.shape[0] >= 2
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=_emit_bpreshuffle,
         )
-        if materialize_bpreshuffle_scale:
+        if _emit_bpreshuffle:
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
+        elif materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
