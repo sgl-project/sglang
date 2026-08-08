@@ -411,7 +411,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         if self._mask_buffer is not None:
             buffer.query_mask_buffer(self._mask_buffer)
 
-            n = ElasticEPStateManager.get_effective_ep_size()
+            n = ElasticEPStateManager.get_data_plane_ep_size()
             self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
 
         self.packed_recv_count = self.handle = None

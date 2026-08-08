@@ -29,6 +29,7 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
@@ -193,6 +194,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
         self._verify_mask = None
+        server_args = model_runner.server_args
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
@@ -283,17 +285,34 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
+        attention_tp_size = model_runner.ps.attn_tp_size
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.ps.tp_size
+            // attention_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.ps.tp_size
+            attention_tp_size
+        )
+        self.mla_qk_rope_head_dim = getattr(
+            model_runner.model_config, "qk_rope_head_dim", self.head_dim
+        )
+        self.mla_kv_lora_rank = getattr(
+            model_runner.model_config,
+            "kv_lora_rank",
+            getattr(model_runner.model_config, "v_head_dim", self.head_dim),
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
         )
         self.has_softcap = _softcapping is not None and _softcapping > 0.0
+        self._use_fa3_mla_cuda_graph_metadata = bool(
+            server_args.elastic_ep_backend is not None
+            and server_args.max_ep_size is not None
+            and server_args.max_ep_size > server_args.tp_size
+            and server_args.cuda_graph_config.decode.backend == Backend.FULL
+            and self.use_mla
+            and self.fa_impl_ver == 3
+        )
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
         # We set nums splits to 1 if deterministic inference is enabled.
@@ -304,6 +323,8 @@ class FlashAttentionBackend(AttentionBackend):
             if model_runner.server_args.enable_deterministic_inference or fa4_no_splitkv
             else 0
         )
+        if self._use_fa3_mla_cuda_graph_metadata:
+            self.num_splits = 1
         # Set (never getattr'd) so forward_extend can identity-check "is this the
         # full-CG prefill metadata?" to disable the pointer-keyed shear-bias
         # block-schedule cache (see forward_extend rel_bias handling).
@@ -317,7 +338,6 @@ class FlashAttentionBackend(AttentionBackend):
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
-        server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
             server_args.is_embedding
             and server_args.chunked_prefill_size == -1
@@ -335,13 +355,40 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def _compute_scheduler_metadata(
-        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
+        self,
+        batch_size,
+        max_seq_len_k,
+        cache_seqlens,
+        cu_seqlens_q,
+        *,
+        is_mla: bool = False,
     ):
         """Compute FA3 scheduler metadata for decode.
 
         Returns the scheduler_metadata tensor, or None if not applicable.
         """
-        if self._get_scheduler_metadata is None or self.use_mla:
+        if self._get_scheduler_metadata is None:
+            return None
+        if is_mla:
+            if not self._use_fa3_mla_cuda_graph_metadata:
+                return None
+            return self._get_scheduler_metadata(
+                batch_size=batch_size,
+                max_seqlen_q=1,
+                max_seqlen_k=max(max_seq_len_k, 1),
+                num_heads=self.num_attention_heads,
+                num_heads_k=1,
+                headdim=self.mla_qk_rope_head_dim,
+                headdim_v=self.mla_kv_lora_rank,
+                cache_seqlens=cache_seqlens,
+                qkv_dtype=self.kv_cache_dtype,
+                cu_seqlens_q=cu_seqlens_q,
+                page_size=self.page_size,
+                causal=True,
+                has_softcap=self.has_softcap,
+                num_splits=self.num_splits,
+            )
+        if self.use_mla:
             return None
         if self._disable_scheduler_metadata_precompute:
             return None
@@ -362,6 +409,12 @@ class FlashAttentionBackend(AttentionBackend):
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
+
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        if self.use_mla and not self._use_fa3_mla_cuda_graph_metadata:
+            raise ValueError(
+                "Elastic EP CUDA graph recapture with MLA requires FlashAttention 3."
+            )
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -513,6 +566,7 @@ class FlashAttentionBackend(AttentionBackend):
                         max(metadata.max_seq_len_k, 1),
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_q,
+                        is_mla=self.use_mla,
                     )
                     if sched is not None:
                         n = sched.shape[0]
@@ -2006,6 +2060,11 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
+            sched_meta = (
+                metadata.scheduler_metadata
+                if metadata.scheduler_metadata is not None and not use_cascade_attn
+                else None
+            )
 
             result = flash_attn_with_kvcache(
                 q=q_rope,
@@ -2025,6 +2084,7 @@ class FlashAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
                 ver=self.fa_impl_ver,
+                scheduler_metadata=sched_meta,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -2091,7 +2151,9 @@ class FlashAttentionBackend(AttentionBackend):
         }
         # Pre-allocate scheduler_metadata buffer for CUDA graph
         # Size: 1 (semaphore) + round_up(max_bs, 4) * 4 (causal decode vectors)
-        if self._get_scheduler_metadata is not None and not self.use_mla:
+        if self._get_scheduler_metadata is not None and (
+            not self.use_mla or self._use_fa3_mla_cuda_graph_metadata
+        ):
             b_rounded = ((max_bs + 3) // 4) * 4
             self._sched_meta_buf = torch.zeros(
                 1 + b_rounded * 4, dtype=torch.int32, device=self.device
@@ -2811,6 +2873,7 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_k,
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_q,
+                        is_mla=self.use_mla,
                     )
                     if sched is not None:
                         n = sched.shape[0]

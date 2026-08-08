@@ -6982,16 +6982,6 @@ class ServerArgs:
                 f"(got pp_size={self.pp_size}); WORLD must not span PP stages."
             )
 
-            decode_cuda_graph_disabled = (
-                self.cuda_graph_config.decode.backend == Backend.DISABLED
-            )
-            prefill_cuda_graph_disabled = (
-                self.cuda_graph_config.prefill.backend == Backend.DISABLED
-            )
-            assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-                "Elastic EP runtime scale-up requires decode and prefill CUDA "
-                "graphs to be disabled."
-            )
             assert resolved.enable_dp_attention, (
                 "Elastic EP scale-up requires --enable-dp-attention; without it "
                 "the TP group is not equivalent to WORLD and the post-scale "
@@ -7022,6 +7012,43 @@ class ServerArgs:
                 "Elastic EP scale-up requires --moe-a2a-backend nixl "
                 f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
             )
+
+            decode_backend = self.cuda_graph_config.decode.backend
+            assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+                "Elastic EP runtime scale-up supports decode CUDA graph backend "
+                f"'full' or 'disabled' (got {decode_backend!r})."
+            )
+            assert self.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+                "Elastic EP runtime scale-up requires prefill CUDA graph to be "
+                "disabled."
+            )
+            if decode_backend == Backend.FULL:
+                assert self.device == "cuda", (
+                    "Elastic EP CUDA graph recapture requires CUDA "
+                    f"(got device={self.device!r})."
+                )
+                assert self.speculative_algorithm is None, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "speculative decoding."
+                )
+                assert not self.is_embedding, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "embedding models."
+                )
+                assert self.dllm_algorithm is None, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "diffusion models."
+                )
+                assert not self.encoder_only, (
+                    "Elastic EP CUDA graph recapture does not support "
+                    "encoder-only models."
+                )
+                assert (
+                    not self.forward_hooks
+                ), "Elastic EP CUDA graph recapture does not support forward hooks."
+                assert (
+                    not self.enable_pdmux
+                ), "Elastic EP CUDA graph recapture does not support PDMux."
 
     def _validate_experimental_sgl_marlin(self):
         view = self._resolved()
