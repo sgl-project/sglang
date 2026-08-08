@@ -25,7 +25,7 @@ use std::time::Duration;
 /// variant here without bumping this constant would break, which is exactly
 /// the failure mode we want (versus a silent OOB or a HashMap re-alloc under
 /// contention). Update alongside every new variant.
-pub(crate) const ABORT_REASON_COUNT: usize = 8;
+pub(crate) const ABORT_REASON_COUNT: usize = 9;
 
 /// Why the router is telling an engine to stop generating a specific request.
 ///
@@ -79,6 +79,12 @@ pub(crate) enum AbortReason {
     /// client problem — surface it so it doesn't get lumped with the
     /// normal disconnect volume.
     StreamPumpPanicked = 7,
+    /// Unary/pre-headers guard: the SOCKET timed out under us
+    /// (`io::ErrorKind::TimedOut`) while the router's own `request_timeout`
+    /// still had room. Split out from [`UpstreamTimeout`](Self::UpstreamTimeout)
+    /// so a broken network path stops masquerading as an exhausted budget —
+    /// see `ApiError::UpstreamSocketTimeout`.
+    UpstreamSocketTimeout = 8,
 }
 
 impl AbortReason {
@@ -96,6 +102,7 @@ impl AbortReason {
             AbortReason::StreamClientGone => "stream_client_gone",
             AbortReason::StreamDownstreamStall => "stream_downstream_stall",
             AbortReason::StreamPumpPanicked => "stream_pump_panicked",
+            AbortReason::UpstreamSocketTimeout => "upstream_socket_timeout",
         }
     }
 
@@ -119,6 +126,7 @@ impl AbortReason {
             5 => AbortReason::StreamClientGone,
             6 => AbortReason::StreamDownstreamStall,
             7 => AbortReason::StreamPumpPanicked,
+            8 => AbortReason::UpstreamSocketTimeout,
             other => {
                 debug_assert!(
                     false,
@@ -133,7 +141,7 @@ impl AbortReason {
     /// Contiguous index in `0..ABORT_REASON_COUNT`. Used by the metrics
     /// registry to index its fixed-length per-reason counter array without a
     /// hash lookup or lock. Guaranteed in-range by the `#[repr(u8)]` +
-    /// explicit-discriminant layout (0..=7 for the current 8 variants) and
+    /// explicit-discriminant layout (0..=8 for the current 9 variants) and
     /// the `ABORT_REASON_COUNT` constant kept in sync above.
     pub(crate) fn as_index(&self) -> usize {
         *self as usize
@@ -156,7 +164,8 @@ const _: () = {
     assert!((AbortReason::StreamClientGone as u8) < ABORT_REASON_COUNT as u8);
     assert!((AbortReason::StreamDownstreamStall as u8) < ABORT_REASON_COUNT as u8);
     assert!((AbortReason::StreamPumpPanicked as u8) < ABORT_REASON_COUNT as u8);
-    assert!((AbortReason::StreamPumpPanicked as u8) == (ABORT_REASON_COUNT as u8) - 1);
+    assert!((AbortReason::UpstreamSocketTimeout as u8) < ABORT_REASON_COUNT as u8);
+    assert!((AbortReason::UpstreamSocketTimeout as u8) == (ABORT_REASON_COUNT as u8) - 1);
 };
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
@@ -481,6 +490,59 @@ pub struct Proxy {
     metrics: OnceLock<Arc<MetricsRegistry>>,
 }
 
+/// Which timeout — if any — a forward error's source chain describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutKind {
+    /// The KERNEL gave up on the socket: an `io::ErrorKind::TimedOut` that the
+    /// OS itself raised (`ETIMEDOUT`). Not caused by any budget we set.
+    Socket,
+    /// One of OUR budgets elapsed — `.timeout(request_timeout)` or
+    /// `connect_timeout`. Actionable by changing that budget.
+    Budget,
+    /// Not a timeout at all.
+    None,
+}
+
+/// Classify the timeout in an error chain: OS-raised socket give-up vs. a
+/// budget of ours running out.
+///
+/// Two traps make this fiddlier than it looks, and both are load-bearing:
+///
+/// 1. **Ask the `io` question first.** `reqwest::Error::is_timeout()` walks
+///    the chain itself and answers `true` for BOTH reqwest's own
+///    (crate-private) timeout marker and a wrapped `io::ErrorKind::TimedOut`,
+///    so asking it first collapses the two cases unconditionally.
+/// 2. **`io::ErrorKind::TimedOut` alone does NOT mean the kernel timed out.**
+///    `connect_timeout` — our own budget — is implemented in hyper-util as
+///    `io::Error::new(ErrorKind::TimedOut, tokio::time::error::Elapsed)`
+///    (`connect/http.rs`), so a plain `kind()` test files every connect-budget
+///    expiry under `Socket`. The discriminator is `raw_os_error()`: a genuine
+///    `ETIMEDOUT` carries an OS errno, a synthesized one wraps `Elapsed` and
+///    has none.
+///
+/// Unrecognized shapes fall through to `Budget`/`None` rather than `Socket`,
+/// so an unexpected error can only degrade to the pre-split behaviour — it can
+/// never invent a spurious "the network broke" verdict.
+///
+/// Pure and `&anyhow::Error`-shaped so both invariants can be pinned by unit
+/// tests without provoking a real kernel `ETIMEDOUT`.
+fn timeout_kind(source: &anyhow::Error) -> TimeoutKind {
+    if source.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::TimedOut && io.raw_os_error().is_some()
+        })
+    }) {
+        return TimeoutKind::Socket;
+    }
+    if source.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_timeout())
+    }) {
+        return TimeoutKind::Budget;
+    }
+    TimeoutKind::None
+}
+
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
 /// across protocols. The h2c variant pins HTTP/2 prior knowledge so it
 /// speaks cleartext h2c to Granian engines (no ALPN on plaintext); the
@@ -626,23 +688,33 @@ impl Proxy {
     /// methods, which carry per-request worker URLs (not a single proxy-level
     /// URL).
     ///
-    /// Walks the full source chain to detect timeouts, because reqwest wraps
-    /// hyper which wraps `std::io::Error` — a top-level `is_timeout()` check
-    /// misses both the wrapped reqwest timeout and the `io::ErrorKind::TimedOut`
-    /// cases.
+    /// Walks the full source chain, because reqwest wraps hyper which wraps
+    /// `std::io::Error`, and splits the two timeouts that chain can carry:
+    ///
+    /// * `UpstreamTimeout` — OUR budget (`.timeout(request_timeout)` /
+    ///   `connect_timeout`) expired. Actionable by changing the budget.
+    /// * `UpstreamSocketTimeout` — the SOCKET gave up under us (kernel
+    ///   `ETIMEDOUT` surfacing as `io::ErrorKind::TimedOut`). A broken network
+    ///   path; no budget change helps.
+    ///
+    /// The split itself lives in [`timeout_kind`] — see there for the two
+    /// non-obvious traps (chain-walk order, and why `io::ErrorKind::TimedOut`
+    /// on its own does not mean the kernel timed out). Worth recording why the
+    /// pre-split code could not tell them apart: it asked
+    /// `is_timeout() || <io::TimedOut in chain>`, whose second arm was
+    /// unreachable — `reqwest::Error::is_timeout()` already returns `true` for
+    /// a wrapped `io::TimedOut` — so every socket give-up was reported as
+    /// `upstream_timeout`.
     fn classify_reqwest_error_for(worker: Url, e: reqwest::Error, path: &str) -> ApiError {
         let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
-        let is_timeout = source.chain().any(|c| {
-            c.downcast_ref::<reqwest::Error>()
-                .is_some_and(|r| r.is_timeout())
-        }) || source.chain().any(|c| {
-            c.downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        });
-        if is_timeout {
-            ApiError::UpstreamTimeout { worker }
-        } else {
-            ApiError::UpstreamUnreachable { worker, source }
+        match timeout_kind(&source) {
+            // `source` moves into the variant so the concrete OS error survives
+            // to `into_response`, which logs it once — same shape as the
+            // `None` arm below. Logging here too would double every line of
+            // the loudest failure mode this split exists to diagnose.
+            TimeoutKind::Socket => ApiError::UpstreamSocketTimeout { worker, source },
+            TimeoutKind::Budget => ApiError::UpstreamTimeout { worker },
+            TimeoutKind::None => ApiError::UpstreamUnreachable { worker, source },
         }
     }
 
@@ -1963,6 +2035,156 @@ mod tests {
             1,
             "a response timeout must count as a breaker failure, same as the streaming arm"
         );
+    }
+
+    /// Errno for a kernel `ETIMEDOUT`, which is what separates a real socket
+    /// give-up from a timer we started ourselves.
+    #[cfg(test)]
+    const ETIMEDOUT: i32 = if cfg!(target_os = "linux") { 110 } else { 60 };
+
+    /// Build a REAL `reqwest::Error` whose source chain carries a kernel-shaped
+    /// `ETIMEDOUT`, by failing the connector rather than waiting on a socket.
+    ///
+    /// A hand-built `anyhow` chain cannot test this: with no `reqwest::Error`
+    /// in it, the reqwest branch matches nothing and BOTH branch orders return
+    /// the same answer. Only a genuine reqwest error — whose `is_timeout()`
+    /// answers `true` through its io arm — can discriminate the ordering.
+    #[cfg(test)]
+    async fn reqwest_error_with_injected_io(kind_err: std::io::Error) -> reqwest::Error {
+        use std::task::{Context, Poll};
+        type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+        #[derive(Clone)]
+        struct FailWith<S>(S, Arc<std::io::Error>);
+        impl<S, Req> tower::Service<Req> for FailWith<S>
+        where
+            S: tower::Service<Req, Error = BoxErr>,
+        {
+            type Response = S::Response;
+            type Error = S::Error;
+            type Future = futures::future::Ready<Result<S::Response, S::Error>>;
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _: Req) -> Self::Future {
+                let e = match self.1.raw_os_error() {
+                    Some(code) => std::io::Error::from_raw_os_error(code),
+                    None => std::io::Error::new(self.1.kind(), "synthesized, no errno"),
+                };
+                futures::future::ready(Err(Box::new(e) as BoxErr))
+            }
+        }
+
+        let injected = Arc::new(kind_err);
+        let client = Client::builder()
+            .connector_layer(tower::layer::layer_fn(move |s| {
+                FailWith(s, Arc::clone(&injected))
+            }))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+
+        client
+            .post("http://127.0.0.1:1/v1/chat/completions")
+            .send()
+            .await
+            .expect_err("the injected connector always fails")
+    }
+
+    /// A kernel `ETIMEDOUT` must classify as `Socket` even though reqwest's own
+    /// `is_timeout()` also answers `true` for it.
+    ///
+    /// THIS is the test that pins the branch ORDER. Reverse the two arms in
+    /// `timeout_kind` and this fails with `Budget` — reproducing the original
+    /// bug where every socket give-up was reported as `upstream_timeout`.
+    #[tokio::test]
+    async fn kernel_etimedout_classifies_socket_despite_reqwest_is_timeout() {
+        let e = reqwest_error_with_injected_io(std::io::Error::from_raw_os_error(ETIMEDOUT)).await;
+        // Precondition: this is exactly the shape reqwest collapses. If this
+        // ever stops holding, the ordering trap is gone and so is this test's
+        // reason to exist.
+        assert!(
+            e.is_timeout(),
+            "precondition: reqwest must report an io-TimedOut chain as a timeout"
+        );
+
+        let worker = Url::parse("http://127.0.0.1:1/").unwrap();
+        let source = anyhow::Error::new(e).context("worker http://127.0.0.1:1/: post /p");
+        assert_eq!(
+            timeout_kind(&source),
+            TimeoutKind::Socket,
+            "a kernel ETIMEDOUT under a reqwest::Error must be Socket, not Budget"
+        );
+
+        // And the classifier must actually construct the new variant — without
+        // this, the whole split can be a silent no-op end to end.
+        let e = reqwest_error_with_injected_io(std::io::Error::from_raw_os_error(ETIMEDOUT)).await;
+        assert!(
+            matches!(
+                Proxy::classify_reqwest_error_for(worker, e, "/v1/chat/completions"),
+                ApiError::UpstreamSocketTimeout { .. }
+            ),
+            "classify_reqwest_error_for must map a kernel ETIMEDOUT to UpstreamSocketTimeout"
+        );
+    }
+
+    /// Our OWN `connect_timeout` must NOT be reported as a broken network path.
+    ///
+    /// hyper-util implements it as
+    /// `io::Error::new(ErrorKind::TimedOut, tokio::time::error::Elapsed)`
+    /// (`connect/http.rs`), i.e. `ErrorKind::TimedOut` with NO errno — so a
+    /// `kind()`-only test files every connect-budget expiry under `Socket` and
+    /// tells the operator "the network broke" when the fix is a bigger budget.
+    /// Drop the `raw_os_error().is_some()` guard and this fails.
+    #[tokio::test]
+    async fn our_own_connect_timeout_shape_is_not_a_socket_timeout() {
+        let e = reqwest_error_with_injected_io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "deadline has elapsed",
+        ))
+        .await;
+        assert!(e.is_timeout(), "precondition: still a reqwest timeout");
+
+        let source = anyhow::Error::new(e).context("worker http://127.0.0.1:1/: post /p");
+        assert_eq!(
+            timeout_kind(&source),
+            TimeoutKind::Budget,
+            "an errno-less TimedOut is one of OUR timers, not the kernel's"
+        );
+    }
+
+    /// A chain with no timeout at all stays `None` → `UpstreamUnreachable`.
+    /// Guards against a socket check so loose it swallows connection-refused.
+    #[test]
+    fn timeout_kind_reports_none_for_a_non_timeout_chain() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ))
+        .context("worker http://w:1/: post /v1/chat/completions");
+        assert_eq!(timeout_kind(&err), TimeoutKind::None);
+
+        // Non-io, non-reqwest chains are not timeouts either.
+        assert_eq!(
+            timeout_kind(&anyhow::anyhow!("some unrelated failure")),
+            TimeoutKind::None
+        );
+    }
+
+    /// The new abort reason round-trips through the discriminant map that the
+    /// metrics registry uses to index its fixed-length array. A variant added
+    /// without extending `from_u8` would silently fold into `Unknown` and
+    /// mislabel the counter.
+    #[test]
+    fn upstream_socket_timeout_abort_reason_round_trips() {
+        let r = AbortReason::UpstreamSocketTimeout;
+        assert_eq!(r.as_label(), "upstream_socket_timeout");
+        assert_eq!(AbortReason::from_u8(r as u8), r);
+        assert!(r.as_index() < ABORT_REASON_COUNT);
+        // Distinct from the budget timeout it was split out of — if these
+        // ever collapse, the whole split is cosmetic.
+        assert_ne!(r.as_label(), AbortReason::UpstreamTimeout.as_label());
+        assert_ne!(r as u8, AbortReason::UpstreamTimeout as u8);
     }
 
     /// The headers-await timeout must NOT cap the body-streaming phase that

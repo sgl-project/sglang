@@ -43,6 +43,10 @@ fn worker_url_for_error(url: &str) -> reqwest::Url {
 fn abort_reason_from_api_error(err: &ApiError) -> AbortReason {
     match err {
         ApiError::UpstreamTimeout { .. } => AbortReason::UpstreamTimeout,
+        // Deliberately NOT folded into UpstreamTimeout: the abort label is the
+        // only fleet-wide signal that separates "our budget ran out" from "the
+        // network path broke", and those need opposite remedies.
+        ApiError::UpstreamSocketTimeout { .. } => AbortReason::UpstreamSocketTimeout,
         // The per-attempt deadline elapsed on a slow/wedged worker — a
         // timeout in the same family as UpstreamTimeout (the router gave up
         // on THIS worker), so it shares that label rather than falling
@@ -2130,6 +2134,13 @@ mod tests {
                 AbortReason::UpstreamTimeout,
             ),
             (
+                ApiError::UpstreamSocketTimeout {
+                    worker: worker_url.clone(),
+                    source: anyhow!("kernel ETIMEDOUT"),
+                },
+                AbortReason::UpstreamSocketTimeout,
+            ),
+            (
                 ApiError::StaleRequestExpired {
                     model: "m".into(),
                     worker: Url::parse("http://test-worker/").unwrap(),
@@ -2214,19 +2225,62 @@ mod tests {
                 expected, got,
             );
         }
-        // Coverage check: the table above must cover every ApiError
-        // variant. If someone adds a new variant without adding a row,
-        // this count assertion catches it — a coarse but effective net.
-        // Keep the expected count in sync with the ApiError enum.
-        const EXPECTED_APIERROR_VARIANTS: usize = 15;
+        // Coverage check. The net is `variant_tag`'s wildcard-free match, NOT
+        // the count below: adding an `ApiError` variant fails to COMPILE until
+        // someone adds an arm there, and whoever does is then looking straight
+        // at the table that needs a row.
+        //
+        // The previous net was `assert_eq!(cases.len(), <hand-written const>)`,
+        // which a forgotten update leaves stale on BOTH sides — it passed
+        // silently when `UpstreamSocketTimeout` was added, the exact case it
+        // was written to catch. Deduping tags keeps the count honest even if a
+        // row is duplicated instead of added.
+        let mut tags: Vec<u8> = cases.iter().map(|(e, _)| variant_tag(e)).collect();
+        tags.sort_unstable();
+        tags.dedup();
         assert_eq!(
+            tags.len(),
             cases.len(),
-            EXPECTED_APIERROR_VARIANTS,
-            "abort_reason_from_api_error test table has {} rows; \
-             ApiError has {} variants — add or remove rows to match.",
-            cases.len(),
-            EXPECTED_APIERROR_VARIANTS,
+            "the table has duplicate rows for the same ApiError variant",
         );
+        assert_eq!(
+            tags.len(),
+            APIERROR_VARIANTS,
+            "abort_reason_from_api_error test table covers {} distinct ApiError \
+             variants; the enum has {} — add the missing row(s).",
+            tags.len(),
+            APIERROR_VARIANTS,
+        );
+    }
+
+    /// Number of `ApiError` variants. Kept honest by [`variant_tag`], whose
+    /// exhaustive match cannot compile if the enum grows.
+    const APIERROR_VARIANTS: usize = 16;
+
+    /// Wildcard-free variant tag, existing purely so the COMPILER enforces
+    /// coverage of `abort_reason_from_api_error`'s test table. `_ =>` here
+    /// would defeat the entire point — `abort_reason_from_api_error` itself
+    /// ends in a catch-all, so this match is the only thing that forces a new
+    /// variant to be consciously classified.
+    fn variant_tag(e: &ApiError) -> u8 {
+        match e {
+            ApiError::BadRequest(_) => 0,
+            ApiError::ModelNotFound(_) => 1,
+            ApiError::UpstreamUnreachable { .. } => 2,
+            ApiError::UpstreamStatus { .. } => 3,
+            ApiError::UpstreamTimeout { .. } => 4,
+            ApiError::UpstreamSocketTimeout { .. } => 5,
+            ApiError::NoHealthyWorkers { .. } => 6,
+            ApiError::NoPrefillWorkersAvailable { .. } => 7,
+            ApiError::NoDecodeWorkersAvailable { .. } => 8,
+            ApiError::StaleRequestExpired { .. } => 9,
+            ApiError::AttemptTimeout { .. } => 10,
+            ApiError::PolicySelectionFailed { .. } => 11,
+            ApiError::BreakerOpen { .. } => 12,
+            ApiError::WorkerMisconfigured { .. } => 13,
+            ApiError::ServiceOverloaded { .. } => 14,
+            ApiError::Internal(_) => 15,
+        }
     }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The

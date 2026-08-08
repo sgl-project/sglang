@@ -2069,14 +2069,31 @@ mod tests {
         // with a zero-init default guarantees this, but pin it in a test so
         // a future refactor to a dynamic map doesn't silently lose the
         // "series exist even at zero" property.
-        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="handler_cancelled"} 0"#));
-        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="upstream_timeout"} 0"#));
-        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="transport_error"} 0"#));
-        assert!(
-            out.contains(r#"sgl_router_engine_aborts_total{reason="stream_downstream_stall"} 0"#)
+        //
+        // Derived from the enum rather than hand-listed: the previous list
+        // enumerated 6 of the then-8 labels and silently drifted when a
+        // variant was added. Looping means a new `AbortReason` is covered the
+        // moment it exists.
+        let bumped = ["stream_client_gone", "stale_request_expired"];
+        for reason in (0..ABORT_REASON_COUNT).map(|i| AbortReason::from_u8(i as u8)) {
+            let label = reason.as_label();
+            if bumped.contains(&label) {
+                continue;
+            }
+            assert!(
+                out.contains(&format!(
+                    r#"sgl_router_engine_aborts_total{{reason="{label}"}} 0"#
+                )),
+                "missing zero-valued series for reason={label}",
+            );
+        }
+        // …and every reason has exactly one series, so the exposition can
+        // never silently drop one.
+        assert_eq!(
+            out.matches(r#"sgl_router_engine_aborts_total{reason="#)
+                .count(),
+            ABORT_REASON_COUNT,
         );
-        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="stream_pump_panicked"} 0"#));
-        assert!(out.contains(r#"sgl_router_engine_aborts_total{reason="unknown"} 0"#));
     }
 
     /// The per-reason counter must not serialise increments on a shared

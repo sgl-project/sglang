@@ -128,6 +128,31 @@ pub enum ApiError {
     #[error("upstream timed out: worker {worker}")]
     UpstreamTimeout { worker: reqwest::Url },
 
+    /// The SOCKET timed out, not our budget: the error chain carried an
+    /// `io::ErrorKind::TimedOut` while `request_timeout` still had room.
+    /// The kernel (or a middlebox) gave up on the connection under us.
+    ///
+    /// Shares 504 with [`UpstreamTimeout`](Self::UpstreamTimeout) — same
+    /// class, deliberately distinct `error_code` — because the two demand
+    /// opposite responses: `upstream_timeout` means "raise the budget or
+    /// shorten the ask", this one means "the network path broke" and no
+    /// budget change will help. They were indistinguishable until 2026-08-07,
+    /// when a fleet-wide population of 504s quantized at N × ~15.35 s (N ≥ 2)
+    /// turned out to be arriving through this branch while the engine was
+    /// healthy and mid-generation — invisible because both branches reported
+    /// `upstream_timeout`.
+    ///
+    /// Carries `source` — like `UpstreamUnreachable`, and unlike
+    /// `UpstreamTimeout` — because the concrete OS error is the whole
+    /// diagnostic value here, and this is the one variant where nothing else
+    /// records it. Logged exactly once, in `into_response`.
+    #[error("upstream socket timed out: worker {worker}")]
+    UpstreamSocketTimeout {
+        worker: reqwest::Url,
+        #[source]
+        source: anyhow::Error,
+    },
+
     /// No healthy worker is available for `model`: either none were ever
     /// registered, or every candidate's circuit breaker is open.  Clients
     /// should retry; operators should check discovery + worker health.
@@ -227,6 +252,7 @@ impl ApiError {
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
             ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
             ApiError::UpstreamTimeout { .. } => ErrorClass::Timeout,
+            ApiError::UpstreamSocketTimeout { .. } => ErrorClass::Timeout,
             ApiError::NoHealthyWorkers { .. } => ErrorClass::NoTarget,
             ApiError::NoPrefillWorkersAvailable { .. } => ErrorClass::NoTarget,
             ApiError::NoDecodeWorkersAvailable { .. } => ErrorClass::NoTarget,
@@ -254,6 +280,7 @@ impl ApiError {
             // `x-router-upstream-status` (see `into_response`).
             ApiError::UpstreamStatus { .. } => "upstream_body_incomplete",
             ApiError::UpstreamTimeout { .. } => "upstream_timeout",
+            ApiError::UpstreamSocketTimeout { .. } => "upstream_socket_timeout",
             ApiError::NoHealthyWorkers { .. } => "no_healthy_workers",
             ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
             ApiError::NoDecodeWorkersAvailable { .. } => "no_decode_workers_available",
@@ -306,6 +333,7 @@ impl ApiError {
     ///   ([`UpstreamUnreachable`](ApiError::UpstreamUnreachable),
     ///   [`UpstreamStatus`](ApiError::UpstreamStatus),
     ///   [`UpstreamTimeout`](ApiError::UpstreamTimeout),
+    ///   [`UpstreamSocketTimeout`](ApiError::UpstreamSocketTimeout),
     ///   [`AttemptTimeout`](ApiError::AttemptTimeout),
     ///   [`StaleRequestExpired`](ApiError::StaleRequestExpired) — the
     ///   stale-cancel token only exists once admission has already granted a
@@ -330,6 +358,7 @@ impl ApiError {
             ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamStatus { .. }
             | ApiError::UpstreamTimeout { .. }
+            | ApiError::UpstreamSocketTimeout { .. }
             | ApiError::AttemptTimeout { .. }
             | ApiError::StaleRequestExpired { .. } => Stage::Dispatch,
         }
@@ -348,6 +377,15 @@ impl ApiError {
     /// * [`UpstreamTimeout`](Self::UpstreamTimeout) — no response within the
     ///   per-request budget; the failed attempt's abort guard tells that engine
     ///   to stop before we try elsewhere.
+    /// * [`UpstreamSocketTimeout`](Self::UpstreamSocketTimeout) — the path to
+    ///   that worker died, so a different worker is the natural recovery. Note
+    ///   the abort mitigation is WEAKER here than for the neighbours above: the
+    ///   abort POST rides the same pool to the same peer whose socket just
+    ///   timed out, so it is the least likely to land, and unlike
+    ///   `UpstreamUnreachable` the engine may well have received the request
+    ///   and be mid-generation. Retrying can therefore strand a generation.
+    ///   Judged acceptable because retry is opt-in, capped at one attempt, and
+    ///   the cost is wasted compute rather than a double-served client.
     /// * [`BreakerOpen`](Self::BreakerOpen) — the worker's breaker was open at
     ///   dispatch (a race with `healthy_workers_for`); a different worker is
     ///   almost certainly eligible.
@@ -379,6 +417,11 @@ impl ApiError {
         match self {
             ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
+            // A broken network path to THIS worker is the textbook case for
+            // failing over to a different one — same reasoning as
+            // `UpstreamUnreachable`, and like both neighbours here no bytes
+            // reached the client.
+            | ApiError::UpstreamSocketTimeout { .. }
             | ApiError::AttemptTimeout { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. } => true,
@@ -408,6 +451,7 @@ impl ApiError {
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
+            | ApiError::UpstreamSocketTimeout { .. }
             | ApiError::NoHealthyWorkers { .. }
             | ApiError::NoPrefillWorkersAvailable { .. }
             | ApiError::NoDecodeWorkersAvailable { .. }
@@ -470,6 +514,19 @@ impl IntoResponse for ApiError {
             }
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
+                "upstream request timed out".to_string()
+            }
+            ApiError::UpstreamSocketTimeout { worker, source } => {
+                tracing::warn!(
+                    upstream = %worker,
+                    error = %format_args!("{source:#}"),
+                    "upstream socket timed out before the router's request budget",
+                );
+                // Same client-facing wording as `UpstreamTimeout` on purpose:
+                // the distinction is an operator signal (`x-router-error-code`
+                // + the abort label), and a client can act on neither variant
+                // differently. Keeping the prose identical also means the split
+                // is not a client-visible behaviour change.
                 "upstream request timed out".to_string()
             }
             ApiError::NoHealthyWorkers { model } => {
@@ -773,6 +830,66 @@ mod tests {
             !body.contains(worker_str),
             "client body must NOT leak worker URL; got: {body}",
         );
+    }
+
+    /// The socket-timeout split is an OPERATOR signal, not a client-visible
+    /// change: same 504, same client prose, distinct `x-router-error-code`.
+    ///
+    /// Pinning both halves matters. If the status drifted to 502 the split
+    /// would silently change client retry behaviour; if the code collapsed
+    /// back to `upstream_timeout` the split would stop distinguishing "raise
+    /// the budget" from "the network path broke" — which is its entire point.
+    #[test]
+    fn upstream_socket_timeout_shares_504_but_not_the_error_code() {
+        let worker_str = "http://10.0.0.42:30000/";
+        let worker = reqwest::Url::parse(worker_str).unwrap();
+
+        let socket_resp = ApiError::UpstreamSocketTimeout {
+            worker: worker.clone(),
+            source: anyhow::anyhow!("kernel ETIMEDOUT"),
+        }
+        .into_response();
+        assert_eq!(socket_resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            socket_resp
+                .headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream_socket_timeout"),
+        );
+        let socket_body = collect_body(socket_resp);
+        assert!(
+            socket_body.contains("\"code\":\"upstream_socket_timeout\""),
+            "{socket_body}"
+        );
+        assert!(
+            !socket_body.contains(worker_str),
+            "client body must NOT leak worker URL; got: {socket_body}",
+        );
+
+        // Same client-facing message as the budget timeout — the operator
+        // signal rides the code header, not the prose.
+        let budget_body = collect_body(
+            ApiError::UpstreamTimeout {
+                worker: worker.clone(),
+            }
+            .into_response(),
+        );
+        let msg_of = |b: &str| {
+            serde_json::from_str::<serde_json::Value>(b).unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(msg_of(&socket_body), msg_of(&budget_body));
+
+        // A broken path to THIS worker is worth failing over, like its
+        // transport-error neighbours.
+        assert!(ApiError::UpstreamSocketTimeout {
+            worker,
+            source: anyhow::anyhow!("kernel ETIMEDOUT"),
+        }
+        .is_retryable_upstream());
     }
 
     #[test]
