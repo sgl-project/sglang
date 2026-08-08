@@ -4,6 +4,10 @@ This backend is deliberately narrow.  It consumes native fine-grained FP8
 checkpoints with 128x128 FP32 block scales, a gated SiLU expert, raw FP32
 router logits, and ``ep_size == 1``.  Gate/up rows are converted once from the
 checkpoint's canonical ``[gate; up]`` layout to AlphaMoE's 8-row interleave.
+The admission gate is currently frozen to the validated
+Qwen3-Next-80B-A3B-Instruct-FP8 TP4 expert geometry.  The exported kernel's
+long-K source coordinate does not satisfy the strict FP8 error contract, so a
+broader model-facing dispatch would risk silent numerical errors.
 
 NVFP4/ModelOpt checkpoints are not accepted.  Their global activation and
 weight scales are part of the quantization contract, while the AlphaMoE W8A8
@@ -34,6 +38,10 @@ ALPHAMOE_BLOCK_M = 8
 ALPHAMOE_WEIGHT_BLOCK = (128, 128)
 ALPHAMOE_MAX_EXPERTS = 512
 ALPHAMOE_MAX_TOP_K = 16
+ALPHAMOE_VALIDATED_EXPERTS = 512
+ALPHAMOE_VALIDATED_HIDDEN_SIZE = 2048
+ALPHAMOE_VALIDATED_INTERMEDIATE_SIZE = 128
+ALPHAMOE_VALIDATED_TOP_K = 10
 
 
 def validate_alphamoe_runner_contract(
@@ -84,6 +92,17 @@ def validate_alphamoe_runner_contract(
     if top_k > num_experts:
         raise ValueError(
             f"flashinfer_alphamoe top_k={top_k} exceeds experts={num_experts}"
+        )
+    if (
+        top_k != ALPHAMOE_VALIDATED_TOP_K
+        or num_experts != ALPHAMOE_VALIDATED_EXPERTS
+    ):
+        raise ValueError(
+            "flashinfer_alphamoe is currently admitted only for the validated "
+            "Qwen3-Next TP4 routing geometry: "
+            f"experts={ALPHAMOE_VALIDATED_EXPERTS}, "
+            f"top_k={ALPHAMOE_VALIDATED_TOP_K}; got experts={num_experts}, "
+            f"top_k={top_k}"
         )
 
 
@@ -276,6 +295,24 @@ def validate_alphamoe_w8a8_weights(
             "flashinfer_alphamoe requires hidden_size and the TP-sharded "
             "intermediate_size to be divisible by 128; got "
             f"hidden_size={hidden_size}, intermediate_size={intermediate_size}"
+        )
+    if (
+        num_experts != ALPHAMOE_VALIDATED_EXPERTS
+        or hidden_size != ALPHAMOE_VALIDATED_HIDDEN_SIZE
+        or intermediate_size != ALPHAMOE_VALIDATED_INTERMEDIATE_SIZE
+        or top_k != ALPHAMOE_VALIDATED_TOP_K
+    ):
+        raise ValueError(
+            "flashinfer_alphamoe is currently admitted only for the validated "
+            "Qwen3-Next-80B-A3B-Instruct-FP8 TP4 expert geometry "
+            f"(experts={ALPHAMOE_VALIDATED_EXPERTS}, "
+            f"hidden_size={ALPHAMOE_VALIDATED_HIDDEN_SIZE}, "
+            f"TP-sharded intermediate_size="
+            f"{ALPHAMOE_VALIDATED_INTERMEDIATE_SIZE}, "
+            f"top_k={ALPHAMOE_VALIDATED_TOP_K}); got experts={num_experts}, "
+            f"hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
+            f"top_k={top_k}. Broader/long-K dispatch remains disabled until "
+            "the exported kernel passes the strict FP8 error gate."
         )
 
     expected_w2 = (num_experts, hidden_size, intermediate_size)

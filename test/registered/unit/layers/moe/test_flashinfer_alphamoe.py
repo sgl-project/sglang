@@ -145,6 +145,28 @@ class TestFlashInferAlphaMoeContract(CustomTestCase):
         )
         self.assertEqual(result, (512, 2048, 128))
 
+    def test_known_long_k_geometry_is_not_admitted(self):
+        # The exported W8A8 kernel's K=7168 source coordinate fails the strict
+        # FP8 error gate; keep model-facing dispatch on the verified Qwen TP4
+        # geometry until that kernel issue is fixed and independently retested.
+        tensors = _valid_tensors(
+            num_experts=512, hidden_size=7168, intermediate_size=128
+        )
+        with self.assertRaisesRegex(ValueError, "long-K dispatch remains disabled"):
+            validate_alphamoe_w8a8_weights(
+                *tensors,
+                block_shape=[128, 128],
+                top_k=10,
+                use_mxfp8=False,
+                is_fp4_expert=False,
+            )
+
+    def test_non_qwen_routing_geometry_is_not_admitted(self):
+        kwargs = self._valid_runner_kwargs()
+        kwargs["top_k"] = 8
+        with self.assertRaisesRegex(ValueError, "Qwen3-Next TP4 routing geometry"):
+            validate_alphamoe_runner_contract(**kwargs)
+
     def test_fused_shared_expert_slot_is_rejected_at_513(self):
         tensors = _valid_tensors(num_experts=513)
         with self.assertRaisesRegex(ValueError, "at most 512 experts"):
