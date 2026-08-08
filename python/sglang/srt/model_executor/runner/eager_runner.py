@@ -371,9 +371,19 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
-        )
+        stream = torch.cuda.current_stream()
+        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        # DSpark aux tensors ride the same CP token split; gather them the same way.
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
