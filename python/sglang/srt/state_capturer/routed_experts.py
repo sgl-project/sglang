@@ -15,7 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
-    get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 

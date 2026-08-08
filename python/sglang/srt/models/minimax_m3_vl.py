@@ -134,7 +134,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
-        
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
