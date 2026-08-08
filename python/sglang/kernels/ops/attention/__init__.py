@@ -43,6 +43,17 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+register_kernel(
+    KernelSpec(
+        op="attention.expand_uniform_verify",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels:"
+            "expand_uniform_verify_triton"
+        ),
+    )
+)
+
 __all__ = []
 
 
