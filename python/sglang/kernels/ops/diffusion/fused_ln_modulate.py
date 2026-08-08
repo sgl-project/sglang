@@ -42,10 +42,6 @@ def fused_ln_modulate_active(module: nn.Module) -> bool:
     return _FUSION.is_enabled(module)
 
 
-def iter_fused_ln_modulate_sites(root: nn.Module):
-    return _FUSION.iter_sites(root)
-
-
 def mount_fused_ln_modulate(root: nn.Module) -> bool:
     return _FUSION.mount(root)
 

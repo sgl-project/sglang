@@ -107,11 +107,6 @@ def fused_gate_rmsnorm_active(module: nn.Module) -> bool:
     return _FUSION.is_enabled(module)
 
 
-def iter_fused_gate_rmsnorm_sites(root: nn.Module):
-    """Yield every marked site under ``root`` (including ``root``)."""
-    return _FUSION.iter_sites(root)
-
-
 def mount_fused_gate_rmsnorm(root: nn.Module) -> bool:
     """Enable the fused kernels on every marked site under ``root``.
 

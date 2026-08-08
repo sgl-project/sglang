@@ -152,11 +152,6 @@ def fused_gelu_active(module: nn.Module) -> bool:
     return _FUSION.is_enabled(module)
 
 
-def iter_fused_gelu_sites(root: nn.Module):
-    """Yield every marked fusion site under ``root`` (including ``root``)."""
-    return _FUSION.iter_sites(root)
-
-
 def _site_reject_reason(site: nn.Module) -> str | None:
     linear = getattr(site, _FUSION.metadata(site), None)
     return "missing linear" if linear is None else _static_reject_reason(linear)
