@@ -573,7 +573,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        (_is_cuda or _is_musa or _is_xpu)
+                        (_is_cuda or _is_musa or _is_xpu or _is_npu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
