@@ -23,7 +23,12 @@ from torch.cuda import Stream as CudaStream
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader, LoRAOverlapLoadStatus
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
@@ -32,6 +37,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=380, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=120, suite="stage-a-test-1-gpu-xpu")
+
+DEVICE = get_device(0)
 
 
 class TestLoRAOverlapLoading(CustomTestCase):
@@ -57,6 +65,8 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.mock_stream = MagicMock(spec=CudaStream)
         self.mock_stream_context = MagicMock()
         self.mock_event = MagicMock(spec=CudaEvent)
+        # Default to an in-flight copy; cases needing completion flip query().
+        self.mock_event.query.return_value = False
 
         self.mock_device_module.Stream.return_value = self.mock_stream
         self.mock_device_module.stream.return_value = self.mock_stream_context
@@ -65,7 +75,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.mock_torch.cuda.current_stream.return_value = MagicMock(spec=CudaStream)
 
         self.mock_lora_manager = MagicMock(spec=LoRAManager)
-        self.mock_lora_manager.device = "cuda:0"
+        self.mock_lora_manager.device = DEVICE
         self.mock_lora_manager.memory_pool = MagicMock()
         self.mock_lora_manager.memory_pool.uid_to_buffer_id = {}
         self.mock_lora_manager.validate_lora_batch.return_value = True
@@ -167,7 +177,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
     def test_pending_load_is_synchronized_before_unload(self):
         manager = LoRAManager.__new__(LoRAManager)
-        manager.device = torch.device("cuda:0")
+        manager.device = torch.device(DEVICE)
         manager.pending_lora_load_events = {}
         manager.memory_pool = MagicMock()
         manager.configs = {"lora_A": object()}

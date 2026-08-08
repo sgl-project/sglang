@@ -85,7 +85,7 @@ class TestEmbeddingLoraSupport(unittest.TestCase):
         tokenized = TokenizedEmbeddingReqInput(
             input_text="Hello",
             input_ids=[1, 2, 3],
-            image_inputs={},
+            mm_inputs=None,
             token_type_ids=[],
             sampling_params=SamplingParams(),
             lora_id="my-lora-id",

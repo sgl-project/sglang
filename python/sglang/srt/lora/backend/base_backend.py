@@ -420,10 +420,8 @@ def _compute_moe_lora_info(
     adapter_enabled.zero_()
 
     has_segments = weight_indices.numel() != 0
-    use_cuda_kernel = (
-        num_tokens != 0 and has_segments and seg_indptr.device.type == "cuda"
-    )
-    if use_cuda_kernel:
+    needs_launch = num_tokens != 0 and has_segments
+    if needs_launch:
         block_size = 256
         tiles_per_segment = triton.cdiv(max_len, block_size)
         grid_size = tiles_per_segment * weight_indices.numel()
@@ -431,6 +429,10 @@ def _compute_moe_lora_info(
             f"MoE LoRA token-mapping launch under-covers tokens: "
             f"{grid_size=} {block_size=} {num_tokens=}"
         )
+
+    # Triton kernel on CUDA only; every other device (e.g. XPU) falls through to
+    # the native torch path below, which yields the same mapping.
+    if needs_launch and seg_indptr.device.type == "cuda":
         _compute_moe_lora_info_kernel[(grid_size,)](
             seg_indptr,
             lora_ranks,

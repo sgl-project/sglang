@@ -1520,6 +1520,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    if is_xpu():
+        return False
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
