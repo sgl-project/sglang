@@ -52,6 +52,11 @@ class KimiK2Detector(BaseFormatDetector):
     <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
 
+    Format Structure (prefixed counter — multi-turn conversations):
+    ```
+    <|tool_call_begin|>call{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+    ```
+
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
 
@@ -86,6 +91,10 @@ class KimiK2Detector(BaseFormatDetector):
         )
         # Bare call counter: "0", "3" (model uses auto-incrementing counter)
         self.tool_call_id_counter_regex = re.compile(r"^\d+$")
+        # Prefixed call counter: "call00003" (model uses this format in
+        # multi-turn conversations when previous assistant messages contain
+        # tool_calls). See https://github.com/sgl-project/sglang/issues/25358
+        self.tool_call_id_prefixed_counter_regex = re.compile(r"^call(?P<index>\d+)$")
 
     def _parse_tool_call_id(
         self, function_id: str, tools: List[Tool], function_args: str = None
@@ -94,10 +103,11 @@ class KimiK2Detector(BaseFormatDetector):
 
         Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
         Bare counter:    "3" → call_index=3, infer name from arguments.
+        Prefixed counter: "call00003" → call_index=3, infer name from arguments.
 
-        The bare counter is a conversation-level auto-increment, NOT an index
-        into the tools list. The function name is inferred by matching argument
-        keys against tool parameter schemas.
+        The bare and prefixed counters are conversation-level auto-increments,
+        NOT an index into the tools list. The function name is inferred by
+        matching argument keys against tool parameter schemas.
         """
         m = self.tool_call_id_regex.match(function_id)
         if m:
@@ -105,6 +115,14 @@ class KimiK2Detector(BaseFormatDetector):
 
         if self.tool_call_id_counter_regex.match(function_id):
             call_index = int(function_id)
+            name = self._infer_tool_name(tools, function_args)
+            if name:
+                return name, call_index
+            return None, call_index
+
+        m = self.tool_call_id_prefixed_counter_regex.match(function_id)
+        if m:
+            call_index = int(m.group("index"))
             name = self._infer_tool_name(tools, function_args)
             if name:
                 return name, call_index
@@ -404,14 +422,8 @@ class KimiK2Detector(BaseFormatDetector):
         if not function_id:
             return self._infer_tool_name(tools, function_args)
 
-        m = self.tool_call_id_regex.match(function_id)
-        if m:
-            return m.group("name")
-
-        if self.tool_call_id_counter_regex.match(function_id):
-            return self._infer_tool_name(tools, function_args)
-
-        return None
+        function_name, _ = self._parse_tool_call_id(function_id, tools, function_args)
+        return function_name
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
