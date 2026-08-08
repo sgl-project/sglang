@@ -1345,7 +1345,12 @@ class ModelRunner:
 
     def init_threads_binding(self):
         self.local_omp_cpuid = numa_utils.init_threads_binding(
-            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
+            numa_index=self.gpu_id,
+            world_size=(
+                self.server_args.dp_size
+                * self.server_args.tp_size
+                * self.server_args.pp_size
+            ),
         )
 
     def apply_torch_tp(self):
