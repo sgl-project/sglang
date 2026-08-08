@@ -2013,6 +2013,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm4MoeLiteForCausalLM",
         ]
     except Exception:
         return False
