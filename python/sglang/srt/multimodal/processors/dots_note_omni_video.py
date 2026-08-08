@@ -13,7 +13,6 @@ import hashlib
 import os
 import re
 import threading
-from contextlib import contextmanager
 from typing import Any
 
 from sglang.srt.utils import VideoData, get_video_bytes
@@ -30,10 +29,6 @@ def _build_cfg(
     audio_sr: int,
     max_new_tokens: int,
 ) -> dict[str, Any]:
-    from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-        preprocess as pp,
-    )
-
     if seq <= 0:
         raise ValueError(f"seq must be positive, got {seq}")
     if max_new_tokens < 0:
@@ -52,47 +47,13 @@ def _build_cfg(
 
     process_audio = audio_cap > 0
     return {
-        "max_fps": float(os.environ.get("XHS_VIDEO_MAX_FPS", "1.0")),
         "process_audio": process_audio,
-        "audio_ratio": 1.0 if process_audio else 0.0,
-        "pack_algo": "v2",
         "seq_length": seq - effective_reserve,
         "reserve_interleave": True,
         "audio_token_ratio_cap": float(audio_cap),
         "audio_sample_rate": int(audio_sr),
-        "video_min_pixels": int(
-            os.environ.get("XHS_VIDEO_MIN_PIXELS", pp.DEFAULT_VIDEO_MIN_PIXELS)
-        ),
-        "video_max_pixels": int(
-            os.environ.get("XHS_VIDEO_MAX_PIXELS", pp.DEFAULT_VIDEO_MAX_PIXELS)
-        ),
-        "video_total_pixels": int(
-            os.environ.get("XHS_VIDEO_TOTAL_PIXELS", pp.DEFAULT_VIDEO_TOTAL_PIXELS)
-        ),
         "video_jpeg_quality": int(os.environ.get("XHS_VIDEO_JPEG_QUALITY", "85")),
     }
-
-
-@contextmanager
-def _flatten_environment(k_mode: str, process_audio: bool, audio_sr: int):
-    if not k_mode:
-        raise ValueError("k_mode must not be empty")
-    values = {
-        "DOTS_FLATTEN_AI_K_MODE": k_mode,
-        "DOTS_FLATTEN_AUDIO_INTERLEAVE": "1" if process_audio else "0",
-        "DOTS_FLATTEN_AI_SAMPLE_RATE": str(audio_sr),
-        "DOTS_FLATTEN_TIME_FORMAT": "hms",
-    }
-    old = {key: os.environ.get(key) for key in values}
-    os.environ.update(values)
-    try:
-        yield
-    finally:
-        for key, value in old.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 def _video_payload(raw_video) -> tuple[bytes, str]:
@@ -105,39 +66,11 @@ def _video_payload(raw_video) -> tuple[bytes, str]:
 
 def _cfg_for_pure_visual(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg = dict(cfg)
-    cfg.update(process_audio=False, audio_ratio=0.0)
+    cfg["process_audio"] = False
     return cfg
 
 
-def _audio_would_overflow(video_b64: str, cfg: dict[str, Any]) -> bool:
-    from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-        preprocess as pp,
-    )
-    from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-        v2core as vc,
-    )
-
-    try:
-        wav_b64, duration = pp.extract_audio_wav(
-            base64.b64decode(video_b64), sample_rate=cfg["audio_sample_rate"]
-        )
-    except Exception:  # noqa: BLE001 - missing/invalid audio means visual-only
-        return False
-    if not wav_b64 or not duration or duration <= 0:
-        return False
-    audio_tokens = pp.audio_block_tokens(duration, sr=cfg["audio_sample_rate"])
-    if cfg.get("reserve_interleave"):
-        frame_upper_bound = max(1, int(duration * vc.V2_FPS_CAP))
-        k_max = min(
-            frame_upper_bound,
-            max(1, int(duration // vc.INTERLEAVE_SEG_MIN_SEC)),
-        )
-        audio_tokens += 3 * k_max
-    min_visual = vc.FPS_MIN_FRAMES * (vc.V2_PF_FLOOR + vc.V2_OVH)
-    return audio_tokens + min_visual + vc.V2_OVERHEAD > cfg["seq_length"]
-
-
-def _flat_to_content(flat: dict[str, Any], question: str) -> list[dict[str, Any]]:
+def _flat_to_content(flat: dict[str, Any]) -> list[dict[str, Any]]:
     meta = flat.get("meta", {})
     user_value = next(
         (
@@ -171,8 +104,6 @@ def _flat_to_content(flat: dict[str, Any], question: str) -> list[dict[str, Any]
         last = match.end()
     if last < len(user_value):
         content.append({"type": "text", "text": user_value[last:]})
-    if question:
-        content.append({"type": "text", "text": question})
     return content
 
 
@@ -189,6 +120,8 @@ def preprocess_dots_video(
     max_new_tokens: int = 0,
 ) -> list[dict[str, Any]]:
     """Return in-memory timestamp/image/audio content using the server tokenizer."""
+    if not k_mode:
+        raise ValueError("k_mode must not be empty")
     with _PREPROCESS_LOCK:
         video_bytes, video_id = _video_payload(raw_video)
         cfg = _build_cfg(
@@ -198,37 +131,36 @@ def preprocess_dots_video(
             audio_sr=audio_sr,
             max_new_tokens=max_new_tokens,
         )
-        with _flatten_environment(k_mode, cfg["process_audio"], audio_sr):
-            from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-                flatten_runner,
+        from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
+            flatten_runner,
+        )
+        from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
+            preprocess as pp,
+        )
+
+        pp.set_tokenizer(tokenizer)
+        video_b64 = base64.b64encode(video_bytes).decode()
+        sample = {
+            "meta": {"video_0": video_b64},
+            "conversations": [{"from": "user", "value": f"<video_0>{question}"}],
+        }
+        record_key = hashlib.sha1(f"{video_id}|{question}".encode()).hexdigest()
+
+        def run(run_cfg):
+            new_meta, conversations = pp.process_sample_video(sample, run_cfg)
+            plan = flatten_runner.build_plan(
+                new_meta,
+                conversations,
+                record_key,
+                k_mode=k_mode,
+                process_audio=run_cfg["process_audio"],
+                audio_sample_rate=audio_sr,
             )
-            from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-                preprocess as pp,
-            )
+            return _flat_to_content(flatten_runner.render_flat(plan))
 
-            pp.set_tokenizer(tokenizer)
-            # The flattener reads request-scoped settings when it is built.
-            flatten_runner.reset_flattener()
-
-            video_b64 = base64.b64encode(video_bytes).decode()
-            sample = {
-                "audiovisual_type": "visual_only",
-                "meta": {"video_0": video_b64},
-                "conversations": [{"from": "user", "value": "<video_0>"}],
-            }
-            record_key = hashlib.sha1(f"{video_id}|{question}".encode()).hexdigest()
-
-            def run(run_cfg):
-                new_meta, conversations, _, _ = pp.process_sample_video(sample, run_cfg)
-                plan = flatten_runner.build_plan(new_meta, conversations, record_key)
-                return _flat_to_content(flatten_runner.render_flat(plan), question)
-
-            force_visual = cfg["process_audio"] and _audio_would_overflow(
-                video_b64, cfg
-            )
-            try:
-                return run(_cfg_for_pure_visual(cfg) if force_visual else cfg)
-            except getattr(pp, "SkipSample", Exception) as exc:
-                if "audio_token_ratio_exceed" not in str(exc):
-                    raise
-                return run(_cfg_for_pure_visual(cfg))
+        try:
+            return run(cfg)
+        except pp.SkipSample as exc:
+            if "audio_token_ratio_exceed" not in str(exc):
+                raise
+            return run(_cfg_for_pure_visual(cfg))
