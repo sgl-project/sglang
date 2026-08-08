@@ -1586,7 +1586,9 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int]):
+        if new_accepted_tokens is None:
+            return False
         for i, token_id in enumerate(new_accepted_tokens):
             if token_id < 0 or (
                 self.vocab_size is not None and token_id >= self.vocab_size
