@@ -145,9 +145,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # carries no tracking metadata must still LAUNCH the track scatter
         # (all rows masked off), or the python-level `if` specializes the
         # scatter out of the captured graph.
-        self._graph_track_inert_mask = torch.zeros(
-            max_bs, dtype=torch.bool, device=dev
-        )
+        self._graph_track_inert_mask = torch.zeros(max_bs, dtype=torch.bool, device=dev)
         self._graph_track_inert_indices = torch.zeros(
             max_bs, dtype=torch.int64, device=dev
         )
@@ -440,12 +438,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             # buffers in __init__).
             rows = forward_batch.batch_size
             forward_batch.mamba_track_mask = self._graph_track_inert_mask[:rows]
-            forward_batch.mamba_track_indices = self._graph_track_inert_indices[
-                :rows
-            ]
-            forward_batch.mamba_track_seqlens = self._graph_track_inert_seqlens[
-                :rows
-            ]
+            forward_batch.mamba_track_indices = self._graph_track_inert_indices[:rows]
+            forward_batch.mamba_track_seqlens = self._graph_track_inert_seqlens[:rows]
         rows = forward_batch.batch_size
         query_start_loc = self.sconv_metadata.query_start_loc
         live = min(
