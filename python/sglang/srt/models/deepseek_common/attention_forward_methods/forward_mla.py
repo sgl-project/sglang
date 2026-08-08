@@ -1284,8 +1284,8 @@ class DeepseekMLAForwardMixin:
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                get_exec().kernel.dsa_decode_backend == "tilelang"
-                or get_exec().kernel.dsa_prefill_backend == "tilelang"
+                get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")
+                or get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton")
             )
         )
 
