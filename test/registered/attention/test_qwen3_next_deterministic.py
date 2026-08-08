@@ -12,7 +12,7 @@ from sglang.test.test_deterministic_utils import (
     TestDeterministicBase,
 )
 
-register_cuda_ci(est_time=200, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=200, suite="nightly-4-gpu", nightly=True)
 
 QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
