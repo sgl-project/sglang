@@ -59,24 +59,20 @@ logger = logging.getLogger(__name__)
 _SWA_DBG_CHECKSUM = os.environ.get("SGLANG_SWA_DBG_CHECKSUM") == "1"
 
 
-# ----------------------------------------------------------------------
-# c4 / c4-indexer overlap compress-state riding (Phase C, I8').
+# c4 / c4-indexer overlap compress-state riding.
 #
-# In strict mode a captured SWA window is only bit-exact on reuse if the c4
-# overlap state at the reuse page boundary [B-ratio, B) is ALSO restored: c4
-# compression reads ``pre_kv_state`` (the prior group's raw KV/score) at each
-# boundary, and the small device state ring only holds the latest few groups, so
-# a reusing request would otherwise read a prior request's stale slot -- the
-# dirty read the non-strict path masks via tail reprefill but the strict path
-# cannot. So each SWA carrier atomically co-owns the state tiles (attn + indexer)
-# captured at the same (rid, B); they ride the SWA window's full lifetime:
+# A captured SWA window is only bit-exact on reuse if the c4 overlap state at the
+# reuse page boundary [B-ratio, B) is restored along with it: c4 compression reads
+# the prior group's raw KV/score at every boundary, and the device state ring only
+# holds the latest few groups, so a reusing request would otherwise read another
+# request's slot. The non-strict path masks that with tail reprefill; the strict
+# path cannot. So each SWA carrier co-owns the attn + indexer state tiles captured
+# at the same (rid, B), and they ride the window's whole lifetime:
 # bind -> BACKUP_HOST promote -> LOAD_BACK restore -> free.
 #
-# These are module-level functions (not methods) taking the SWA component as
-# first arg, so they can be unit-tested against duck-typed fakes without a full
-# component instance. Each ride tuple is
+# Module-level functions taking the component as first arg so fakes can drive them
+# in unit tests. Each ride tuple is
 #   (host_pool, device_state_pools, node_host_value_attr, node_pending_attr, li_map)
-# ----------------------------------------------------------------------
 
 # (host_pool attr, device state-pool list attr, node host-value attr,
 #  node pending attr)
@@ -148,6 +144,9 @@ def _bind_state_rides(component, node, rid: int, B: int) -> bool:
                 )
             return False
         popped.append((hp, h.to(torch.int64)))
+    # The boundary the tiles were captured at; restore needs it to address the
+    # reusing request's ring rows by position.
+    node._swa_state_B = int(B)
     for (hp, v), (_hp, _pools, host_value_attr, pending_attr, li_map) in zip(
         popped, rides
     ):
@@ -232,7 +231,7 @@ def _promote_state_pending(component, node) -> None:
         setattr(node, pending_attr, None)
 
 
-def _attach_state_durable_row(component, node, swa_slice) -> None:
+def _attach_state_durable_row(component, node, swa_slice, B: int) -> None:
     """L3 reuse: the c4/indexer state page rode this window's key family
     (independent-pool sidecar, ``indices_from_pool=SWA``) and was written into the
     coupled durable row by ``set_from_flat_data_page`` on prefetch. Point the
@@ -256,6 +255,7 @@ def _attach_state_durable_row(component, node, swa_slice) -> None:
     if not durable:
         return
     swa_row = int(swa_slice[0].item()) // hp0.slot_page_size
+    node._swa_state_B = int(B)
     for hp, host_value_attr in durable:
         setattr(node, host_value_attr, _state_durable_indices(hp, swa_row))
 
@@ -263,6 +263,7 @@ def _attach_state_durable_row(component, node, swa_slice) -> None:
 def _free_state_bindings(component, node) -> None:
     """Release both pending and durable state tiles back to their host pools (SWA
     carrier dropped without a durable host backup, or node removed)."""
+    node._swa_state_B = None
     for hp, _pools, host_value_attr, pending_attr, _li in _state_rides(component):
         for attr in (pending_attr, host_value_attr):
             v = getattr(node, attr, None)
@@ -280,20 +281,35 @@ def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
     """Restore the c4 / c4-indexer overlap state for the reused window onto the
     device state ring, so the reusing request's boundary read is bit-exact.
 
-    swa_chunk are the SWA slots just restored for this window; its trailing ratio
-    slots are the boundary group [B-ratio, B). Each slot's device state row is
-    translate_from_swa_loc_to_state_loc(slot) and its host tile offset is
-    slot % ring_size (the device state ring is indexed by slot % ring_size, a pure
-    function of the slot),
-    so the captured window lands on the exact rows the compressor will read,
-    regardless of the reusing request's slot base.
+    swa_chunk is the whole restored ring block for this request, in ring order:
+    swa_chunk[j] is the slot holding every position p with p % swa_ring == j. The
+    host tile packs the boundary group [B-ratio, B) in token order at off0=0, so
+    the destination rows must be looked up by position, not taken from the tail of
+    the block -- those coincide only when B % swa_ring == 0, which speculative
+    decode breaks (it sizes the ring as sliding_window + num_draft_tokens - 1, so
+    the ring no longer divides the page). Each slot's device state row is
+    translate_from_swa_loc_to_state_loc(slot), so the captured window lands on the
+    exact rows the compressor will read regardless of the reusing request's base.
     """
     rides = _state_rides(component)
     if not rides:
         return
+    swa_ring = swa_chunk.numel()
+    B = getattr(node, "_swa_state_B", None)
     for hp, pools, host_value_attr, _pending_attr, li_map in rides:
         host_value = getattr(node, host_value_attr, None)
         if host_value is None:
+            continue
+        if B is None:
+            # Cannot address the destination rows without the boundary; restoring
+            # to a guessed row would be a silent bit-exactness break, so leave the
+            # ring alone and let the boundary recompute.
+            logger.warning(
+                "[SWA-HiCache] state restore skipped: no boundary recorded for "
+                "node %s (attr=%s); boundary will recompute.",
+                getattr(node, "id", id(node)),
+                host_value_attr,
+            )
             continue
         ring = hp.slot_page_size
         slot_bytes = hp.item_bytes // ring
@@ -303,7 +319,10 @@ def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
             if sp is None:
                 continue
             ratio = sp.ratio
-            win = swa_chunk[-ratio:]
+            if B < ratio:
+                continue
+            pos = torch.arange(B - ratio, B, dtype=torch.int64, device=swa_chunk.device)
+            win = swa_chunk[pos % swa_ring]
             state_locs = sp.translate_from_swa_loc_to_state_loc(win)
             off0 = 0  # pack at tile start; must match capture off0=0
             dev = sp.kv_score_buffer.kv_score
@@ -526,22 +545,12 @@ class SWAComponent(TreeComponent):
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         strict_bit_exact = self._strict_bit_exact
-        # stride model (I2-inv): sparse-SWA reuse correctness relies on THIS
-        # runtime clamp -- the reuse validator rejects pages without a durable
-        # SWA host copy so the boundary clamps to the nearest page that has a
-        # window -- NOT on an insert-time SWA>=Full superset guard (former S5,
-        # retired). Under stride>1 non-stride pages legitimately have a Full-host
-        # copy but no SWA window; that is a normal, expected non-reuse boundary.
-        #
-        # Strict state-ride gate (regression fix, step 2): a reuse boundary is
-        # only bit-exact if its c4/c4-indexer overlap state also survives -- else
-        # restore cannot rebuild the boundary and reuse would read a dirty state
-        # ring (§12). So on the REUSE match a node whose durable state host value
-        # is missing is treated like a missing SWA window: it resets the running
-        # window length, letting the accumulate-reset logic clamp the boundary
-        # back to the nearest page that has BOTH a window and its state -- instead
-        # of dropping such windows at bind time (which zeroed partial reuse).
-        # Empty when state riding is unwired -> no gating (unchanged behavior).
+        # Reuse correctness comes from this runtime clamp rather than an
+        # insert-time SWA>=Full guard: a node without a durable SWA host copy, or
+        # without its c4/c4-indexer overlap state, resets the running window
+        # length so the boundary clamps to the nearest page that has both. Under
+        # stride>1 a page can hold a Full host copy but no SWA window, which is a
+        # normal non-reuse boundary. Empty when state riding is unwired.
         state_ride_attrs = tuple(
             hv_attr for (_hp, _pools, hv_attr, _pend, _li) in _state_rides(self)
         )
@@ -561,37 +570,25 @@ class SWAComponent(TreeComponent):
                 state["len"] = 0
                 if swa_device_only_hicache and (node.backuped or not node.evicted):
                     return True
-                # Bit-exact device-anchor path: the SWA device ring only keeps
-                # the last `sliding_window_size` tokens, so an out-of-window
-                # node's SWA slot (cd.value) is recycled to None even though its
-                # SWA truth is durably host-backed and its FULL KV is still
-                # device resident. On the device-anchor lookup (match_device_only)
-                # such a node must NOT truncate the FULL device anchor:
-                # cache_unfinished_req's self-match needs device_indices to cover
-                # the whole FULL-resident prefix (else cache_protected_len can
-                # exceed len(new_indices)), and the SWA window is restored
-                # positionally from host on reuse. The FULL validator still gates
-                # FULL device residency, and reuse over-reach is reclamped to the
-                # host-gated boundary via for_reuse, so this is safe both ways.
-                # Strict-only: best-effort mode keeps the upstream anchor, which
-                # stops at the last node holding an SWA device value.
-                if strict_bit_exact and match_device_only and cd.host_value is not None:
-                    return True
-                return False
-            # I2-prime: strict bit-exact never trusts the per-request device SWA
-            # ring as a cross-request truth source for the REUSE boundary (the
-            # device ring is recycled when the owner's req_pool_idx is reused).
-            # Only a durable host copy counts for the device-or-host reuse match;
-            # a node with device value but no host copy truncates the reuse match
-            # so it restores from host (LOAD_BACK) or recomputes (I6) instead of
-            # serving a stale device ring. This is scoped to the reuse match
-            # (``not match_device_only``): the device-only match must still report
-            # a request's own freshly-computed, not-yet-backed-up nodes as device
-            # resident, else cache_unfinished_req's self-match returns empty
-            # device indices (new_prefix_len > len(new_indices)). Stale device
-            # residency across requests is instead closed by the deferred
-            # owner-release tombstone, which nulls the device value once the host
-            # copy is durable.
+                # The SWA ring only keeps the last sliding_window_size tokens, so
+                # an out-of-window node has cd.value recycled to None while its
+                # window is durably host-backed and its Full KV is still device
+                # resident. Such a node must not truncate the Full device anchor:
+                # cache_unfinished_req's self-match needs device_indices to span
+                # the whole Full-resident prefix, else cache_protected_len can
+                # exceed len(new_indices). Reuse over-reach is reclamped to the
+                # host-gated boundary via for_reuse. Best-effort mode keeps the
+                # upstream anchor, which stops at the last SWA device value.
+                return bool(
+                    strict_bit_exact and match_device_only and cd.host_value is not None
+                )
+            # The device SWA ring is per-request and is recycled when the owner's
+            # req_pool_idx is reused, so it is not cross-request truth: on the
+            # reuse match only a durable host copy counts, and a device-only node
+            # truncates the match so it reloads from host or recomputes instead of
+            # serving a stale ring. The device-only match must still report the
+            # request's own freshly-computed nodes as resident, else the self-match
+            # returns empty device indices.
             missing_state = bool(state_ride_attrs) and any(
                 getattr(node, a, None) is None for a in state_ride_attrs
             )
@@ -619,15 +616,12 @@ class SWAComponent(TreeComponent):
         swa_host_hit = 0
         node = result.best_match_node
         root = self.tree_core.root_node
-        # Mine 2 (warm reuse): on the reuse path in strict mode, the per-request
-        # device SWA ring is not a durable cross-request truth (I2'), so a node
-        # that is BOTH device-resident and host-backed must still be counted as
-        # a host hit -- otherwise swa_host_hit_length stays 0 and the load_back
-        # gate never opens for it. This uses the SAME host-backed predicate as
-        # build_hicache_transfers(LOAD_BACK) below. Self-match (for_reuse=False)
-        # keeps the OLD behavior: cd.value is trusted first, since the request's
-        # own freshly-computed nodes aren't host-backed yet and
-        # cache_unfinished_req relies on this not falsely opening the gate.
+        # On the reuse path the device SWA ring is not durable cross-request truth,
+        # so a node that is both device-resident and host-backed still counts as a
+        # host hit -- otherwise swa_host_hit_length stays 0 and the load_back gate
+        # never opens. Same host-backed predicate as build_hicache_transfers below.
+        # Self-match trusts cd.value first, since a request's own fresh nodes
+        # aren't host-backed yet.
         strict_reuse = self._strict_bit_exact and params.for_reuse
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
@@ -780,28 +774,24 @@ class SWAComponent(TreeComponent):
             )
             assert action is None, "new leaf cannot be write-through-pending"
         if tombstone_parent is not None:
-            # Stride model: the out-of-window tombstone span
-            # [node_start, swa_evicted_seqlen) also carries prefill-captured
-            # windows at the interior stride page boundaries. Claim them as
-            # host-only carrier nodes so cross-request reuse clamps to the
-            # nearest stride page instead of the coarse chunk end. These carriers
-            # have no device SWA value, so this needs no rebuilt value and can
-            # run inline.
+            # The out-of-window tombstone span [node_start, swa_evicted_seqlen)
+            # also carries prefill-captured windows at the interior stride page
+            # boundaries. Claim them as host-only carriers so cross-request reuse
+            # clamps to the nearest stride page instead of the coarse chunk end.
+            # They hold no device SWA value, so this can run inline.
             self._bind_interior_captured_swa_hosts(
                 tombstone_parent, node_start, params.swa_evicted_seqlen
             )
         swa_start = max(node_start, params.swa_evicted_seqlen)
         interior_carriers: list[UnifiedTreeNode] = []
         if self._strict_bit_exact and split_pos <= 0:
-            # Stride reuse (in-window leaf): the capture stages a host window at
-            # EVERY stride page boundary of this leaf, but only the leaf-end one
-            # is claimed by the bind action below; the interior ones would be
-            # freed unused at cleanup_after_caching_req and cross-request reuse
-            # would clamp to the coarse leaf end. Claim them as host carriers.
-            # This runs inline (not as an action) because it keys off tree
-            # geometry only — unlike the leaf-end bind, it needs no SWA value —
-            # and it must precede the window cap, whose split would otherwise
-            # put the earlier stride boundaries outside `node`.
+            # The capture stages a host window at every stride page boundary of
+            # this leaf, but the bind action below only claims the leaf-end one;
+            # the interior ones would be freed unused at cleanup_after_caching_req
+            # and reuse would clamp to the coarse leaf end. Claim them as host
+            # carriers. Inline rather than an action because it keys off tree
+            # geometry only, and it must precede the window cap, whose split would
+            # otherwise put the earlier stride boundaries outside `node`.
             interior_carriers = self._bind_interior_captured_swa_hosts(
                 node, swa_start, leaf_end
             )
@@ -893,7 +883,20 @@ class SWAComponent(TreeComponent):
             split_len = len(new_parent.key)
             full_span = split_len + len(child.key)
             host_lru = self.tree_core.host_lru_lists[self.component_type]
-            if len(child_swa_host_value) == full_span:
+            hp = self._swa_kv_pool_host
+            ring = hp.slot_page_size if hp is not None else None
+            if (
+                self._strict_bit_exact
+                and ring is not None
+                and len(child_swa_host_value) == ring
+            ):
+                # Strict host_value is always exactly one ring page (the window at
+                # the child's end), so it belongs whole to the child even when the
+                # node happens to span exactly `ring` tokens -- splitting it by key
+                # length would hand the pool a half page and break the page
+                # alignment that page_row = host_value[0] // ring depends on.
+                new_parent.component_data[self.component_type].host_value = None
+            elif len(child_swa_host_value) == full_span:
                 # Common case: host_value spans the whole node; split by key len.
                 new_parent.component_data[self.component_type].host_value = (
                     child_swa_host_value[:split_len].clone()
@@ -947,17 +950,16 @@ class SWAComponent(TreeComponent):
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
-            # Co-lifetime: a captured page not yet promoted to host_value must
-            # not outlive its device SWA; free it (node degrades to recompute).
+            # A captured page not yet promoted to host_value must not outlive its
+            # device SWA; free it and let the node degrade to recompute.
             #
-            # R1 exemption: interior stride carriers are out-of-window by
-            # construction, so this device SWA tombstone (SWA pool pressure)
-            # always fires before the finish-time coordinated BACKUP_HOST. Their
-            # pending page is a standalone bit-exact host copy whose lifetime
-            # tracks the Full (base) component (the node survives here because
-            # base is still resident), not the SWA device ring. Keep it so the
-            # coordinated base backup can still promote it (I3 preserved). It is
-            # freed only at true node removal (_remove_leaf_from_parent).
+            # Interior stride carriers are exempt: they are out-of-window by
+            # construction, so this tombstone always fires before the finish-time
+            # coordinated BACKUP_HOST. Their pending page is a standalone host copy
+            # whose lifetime tracks the Full component (the node survives here
+            # because base is still resident), not the SWA device ring, so keep it
+            # for the coordinated backup to promote. It is freed only at true node
+            # removal (_remove_leaf_from_parent).
             pending = getattr(node, "_swa_pending_host", None)
             if pending is not None and not getattr(
                 node, "_swa_interior_carrier", False
@@ -1270,15 +1272,13 @@ class SWAComponent(TreeComponent):
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
         if self._strict_bit_exact:
-            # I4' trailing-window prefetch. Window granularity is the host SWA
-            # pool slot_page_size (ring): unified_kv packs one full sliding
-            # window per page (ring == sliding_window -> window_pages == 1),
+            # Trailing-window prefetch. Window granularity is the host SWA pool's
+            # slot_page_size (the ring), not page_size: unified_kv packs one full
+            # sliding window per page (ring == sliding_window, so window_pages == 1)
             # whereas a per-page ring would need ceil(window / ring) *contiguous*
-            # pages. The ring stride (not page_size) is what forces
-            # window_pages == 1 under unified_kv, which is required because
-            # `_sync_trailing_keys` hands back contiguous Full-page hashes --
-            # only 1 maps cleanly onto a ring-spaced carrier; N contiguous KV
-            # hashes would not.
+            # pages. window_pages must be 1 because `_sync_trailing_keys` hands
+            # back contiguous Full-page hashes, and only one maps cleanly onto a
+            # ring-spaced carrier.
             ring = self._swa_kv_pool_host.slot_page_size
             window_pages = max(1, (self.sliding_window_size + ring - 1) // ring)
             # Not worth a partial window: need at least one ring of freshly
@@ -1325,14 +1325,13 @@ class SWAComponent(TreeComponent):
                 return None
             pending = getattr(node, "_swa_pending_host", None)
             if pending is not None:
-                # Co-lifetime: adopt the prefill-captured host page (already on
-                # host) through the coordinated backup, so SWA host_value is set
-                # together with Full host_value (never before). device_indices is
-                # None -> write_backup skips the (redundant) device->host copy.
-                # This also covers interior stride carrier nodes, which have no
-                # device SWA value (out of the sliding window) but do hold a
-                # captured window; the pending check must precede the
-                # ``cd.value is None`` guard below so they are not skipped.
+                # Adopt the prefill-captured host page through the coordinated
+                # backup, so SWA host_value is set together with Full host_value
+                # and never before. device_indices is None -> write_backup skips
+                # the redundant device->host copy. This also covers interior stride
+                # carriers, which hold a captured window but no device SWA value;
+                # the pending check must precede the ``cd.value is None`` guard
+                # below so they are not skipped.
                 return [
                     PoolTransfer(
                         name=PoolName.SWA,
@@ -1346,7 +1345,7 @@ class SWAComponent(TreeComponent):
                 # Strict: SWA host pages are allocated only at prefill capture
                 # time. With no captured page (host pool full / window missed),
                 # emit no SWA host_value; the node falls back to recompute on
-                # reuse (I6). Never back up the device ring here -- it holds only
+                # reuse. Never back up the device ring here -- it holds only
                 # the latest window per slot (older windows byte-stale) and
                 # allocating host at backup can exhaust the small SWA pool.
                 return None
@@ -1372,14 +1371,12 @@ class SWAComponent(TreeComponent):
                 cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
                 if self._strict_bit_exact and cd.host_value is not None:
-                    # Mine 2 (warm reuse): the per-request device SWA ring is
-                    # not a durable cross-request truth in strict mode, even
-                    # when `cd.value` is still set (stale, recycled slot from
-                    # a prior request). Collect the host copy so it is loaded
-                    # and commit_hicache_transfer's _restore_device_value
-                    # overwrites the stale slot with host truth. Same
-                    # host-backed predicate as finalize_match_result's
-                    # for_reuse=True gate above.
+                    # The device SWA ring is not durable cross-request truth even
+                    # when `cd.value` is still set -- it may be a recycled slot
+                    # from a prior request. Collect the host copy so
+                    # _restore_device_value overwrites the stale slot on commit.
+                    # Same host-backed predicate as finalize_match_result's
+                    # for_reuse gate above.
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
                     n_swa += len(cd.host_value)
@@ -1414,13 +1411,12 @@ class SWAComponent(TreeComponent):
             if cd.host_value is None or not node.hash_value:
                 return None
             if self._strict_bit_exact:
-                # I4' (SWA-L3 => Full-L3): persist the captured window under the
-                # carrier node's own Full page hash so the SWA window and its
-                # Full page share one L3 operation/key-family lifetime. A strict
-                # carrier holds exactly one window page (== slot_page_size); it
-                # is stored as a single trailing page keyed by hash_value[-1],
-                # mirroring the mamba sidecar pattern. Windows that are not a
-                # whole page (partial / mis-sized) are skipped, not truncated.
+                # Persist the captured window under the carrier node's own Full page
+                # hash so the SWA window and its Full page share one L3 key-family
+                # lifetime. A strict carrier holds exactly one window page (==
+                # slot_page_size), stored as a single trailing page keyed by
+                # hash_value[-1], mirroring the mamba sidecar. Windows that are not
+                # a whole page are skipped, not truncated.
                 ring = self._swa_kv_pool_host.slot_page_size
                 if len(cd.host_value) != ring:
                     return None
@@ -1496,13 +1492,12 @@ class SWAComponent(TreeComponent):
                 # durable host values together with the SWA host_value (never
                 # before), so the state and its window share one host lifetime.
                 _promote_state_pending(self, node)
-            # Deferred owner-release tombstone: if the owning request finished
-            # while this host backup was still in flight (host_value was None at
-            # cache_finished_req, so evict_device_on_owner_release deferred the
-            # device free), drop the now-recycled per-request device SWA value
-            # now that the host copy is durable and no holder remains. This
-            # closes the async write_through race where the device ring would
-            # otherwise stay alive and be trusted on cross-request reuse.
+            # If the owning request finished while this host backup was still in
+            # flight (host_value was None at cache_finished_req, so
+            # evict_device_on_owner_release deferred the device free), drop the
+            # now-recycled device SWA value now that the host copy is durable and
+            # no holder remains. Otherwise the async write_through leaves the
+            # device ring alive to be trusted on cross-request reuse.
             if getattr(node, "_swa_release_pending", False):
                 cd = node.component_data[ct]
                 if (
@@ -1543,15 +1538,14 @@ class SWAComponent(TreeComponent):
                 n_tokens = len(cd_n.host_value)
                 swa_chunk = device_indices[offset : offset + n_tokens].clone()
                 self._restore_device_value(nid, swa_chunk)
-                # host_value holds the sliding window [B-n_tokens, B). Map its
-                # full indices to the restored SWA slots (out-of-window full
-                # tokens keep sentinel 0, never read under the SWA mask). The
-                # window may extend before this node own start when the node was
-                # split shorter than the window (its host_value still spans the
-                # whole window); gather the window full indices across the node
-                # and its ancestors, in token order, so full<->swa lengths
-                # match. In the common (unsplit) case the node own full value
-                # already has >= n_tokens and no ancestor is touched.
+                # host_value holds the sliding window [B-n_tokens, B). Map its full
+                # indices to the restored SWA slots; out-of-window full tokens keep
+                # sentinel 0 and are never read under the SWA mask. The window can
+                # start before the node's own start when the node was split shorter
+                # than the window (host_value still spans the whole window), so
+                # gather the window's full indices across the node and its ancestors
+                # in token order to keep full<->swa lengths matched. Unsplit nodes
+                # already have >= n_tokens and touch no ancestor.
                 window_full = self._gather_window_full_indices(n, n_tokens)
                 # Diagnostic guard (S2/S3): the full<->swa mapping must feed
                 # equal-length index tensors. If the restored SWA device
@@ -1667,15 +1661,13 @@ class SWAComponent(TreeComponent):
             return
         # Defer attach to the coordinated BACKUP_HOST (co-lifetime with Full host).
         node._swa_pending_host = host_value
-        # Decoupled co-lifetime (regression fix): claim the c4/c4-indexer overlap
-        # -state tiles at the same (rid, node_end) IF present, but NEVER drop the
-        # SWA window when they are missing. The window rides on its own; a
-        # boundary that lacks its state is instead excluded from the strict REUSE
-        # boundary by create_match_validator (graceful clamp to the nearest
-        # window+state boundary). This avoids both (a) the hard clamp-to-0 that
-        # dropping every state-less interior window caused (partial-prefix reuse
-        # regression) and (b) the §12 dirty read (a state-less boundary is simply
-        # not crossed on reuse). No-op when strict state offload is unwired.
+        # Claim the c4/c4-indexer overlap-state tiles at the same (rid, node_end)
+        # when present, but never drop the SWA window when they are missing: the
+        # window rides on its own, and create_match_validator keeps a state-less
+        # boundary out of the strict reuse boundary, clamping to the nearest
+        # window+state boundary instead. Dropping every state-less interior window
+        # here collapsed partial-prefix reuse to zero. No-op when strict state
+        # offload is unwired.
         _bind_state_rides(self, node, rid, int(node_end))
         if _SWA_DBG_CHECKSUM:
             crc_map = getattr(hp, "_capture_crc", None)
@@ -1747,17 +1739,16 @@ class SWAComponent(TreeComponent):
                 action is None
             ), "interior SWA carrier cannot be write-through-pending"
             new_parent._swa_pending_host = host_value
-            # Decoupled co-lifetime (regression fix): claim the interior carrier's
-            # state tiles at (rid, B) IF present, but keep the SWA window even on a
-            # miss. A state-less interior boundary is excluded from the strict
-            # reuse boundary by the match validator (graceful clamp), instead of
-            # dropping the window here -- which zeroed partial-prefix reuse because
-            # interior state gets evicted/exhausted far more than the chunk tail.
+            # Claim the interior carrier's state tiles at (rid, B) when present, but
+            # keep the SWA window even on a miss: the match validator excludes a
+            # state-less interior boundary from the strict reuse boundary. Dropping
+            # the window here zeroed partial-prefix reuse, since interior state is
+            # evicted or exhausted far more often than the chunk tail.
             _bind_state_rides(self, new_parent, rid, B)
-            # R1: mark interior stride carrier. Its captured page lifetime tracks
-            # the Full (base) component (dropped only at true node removal), NOT
-            # the SWA device ring (which is always recycled out-of-window before
-            # the finish-time coordinated BACKUP_HOST). See evict_component and
+            # Mark as an interior stride carrier: its captured page lifetime tracks
+            # the Full component and is dropped only at true node removal, not the
+            # SWA device ring, which is always recycled out-of-window before the
+            # finish-time coordinated BACKUP_HOST. See evict_component and
             # unified_tree_core._remove_leaf_from_parent.
             new_parent._swa_interior_carrier = True
             carriers.append(new_parent)
@@ -1792,10 +1783,9 @@ class SWAComponent(TreeComponent):
     def _swa_l3_key(self, node) -> str:
         """L3 key for a carrier node's captured SWA window.
 
-        I4' couples SWA-L3 to Full-L3: the window is keyed by the carrier's own
-        Full page hash (hash_value[-1]), so it lives and dies with that Full
-        page in the storage backend. Centralized here so a future namespace
-        change touches one place.
+        Keyed by the carrier's own Full page hash (hash_value[-1]), so the window
+        lives and dies with that Full page in the storage backend. Centralized
+        here so a future namespace change touches one place.
         """
         return node.hash_value[-1]
 
@@ -1823,15 +1813,13 @@ class SWAComponent(TreeComponent):
         if cd.value is None:
             return
         if cd.host_value is None or cd.lock_ref > 0:
-            # Host copy not durable yet (async write_through backup still in
-            # flight) or another request still holds the SWA lock, so we cannot
-            # free the device ring value right now. But once this owner is gone
-            # the per-request ring slot is recycled and its bytes become stale,
-            # so the value MUST NOT be trusted for cross-request reuse. Defer:
-            # mark the node so the coordinated BACKUP_HOST commit drops the
-            # device value the instant the host copy becomes durable and no
-            # holder remains. Without this the device ring is never invalidated
-            # and reuse would keep a stale device slot alive (I1/I2 violation).
+            # Host copy not durable yet (async write_through still in flight) or
+            # another request still holds the SWA lock, so the device ring value
+            # cannot be freed right now. Once this owner is gone the ring slot is
+            # recycled and its bytes go stale, so it must not be trusted for
+            # cross-request reuse. Mark the node so the coordinated BACKUP_HOST
+            # commit drops the device value as soon as the host copy is durable and
+            # no holder remains.
             node._swa_release_pending = True
             return
         # Cache-level entry point (cache_finished_req), so the freed slots are
@@ -1874,32 +1862,38 @@ class SWAComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
-        # Release any capture staging owned by this request that no node claimed
-        # (interior / out-of-window windows), then drop the stashed rid.
-        # Key off the request's own req_pool_idx (not the stashed _capture_rid):
-        # on the retract/abort path caching runs with is_insert=False, so
-        # prepare_for_caching_req -- and thus _capture_rid -- never ran. Decode
-        # capture (Task B0) stages (req_pool_idx, B) across many steps, so relying
-        # on _capture_rid would leak those windows here and, once req_pool_idx is
-        # recycled, risk mis-binding a stale window to a new request. For the
-        # is_insert=True path req.req_pool_idx == _capture_rid, so behavior is
-        # unchanged. Fall back to the stashed rid only if the slot is already gone.
-        hp = self._swa_kv_pool_host
+        # Release any capture staging this request owns that no node claimed
+        # (interior / out-of-window windows), then drop the stashed rid. Key off
+        # req.req_pool_idx rather than _capture_rid: on the retract/abort path
+        # caching runs with is_insert=False, so prepare_for_caching_req never ran
+        # and _capture_rid is unset, while decode capture stages (req_pool_idx, B)
+        # across many steps -- those windows would leak here and could later
+        # mis-bind to a new request once req_pool_idx is recycled. The two agree on
+        # the is_insert=True path. Fall back to the stashed rid only if the slot is
+        # already gone.
         rid = req.req_pool_idx if req.req_pool_idx is not None else self._capture_rid
         self._capture_rid = None
-        if hp is None or rid is None:
+        if rid is None:
             return
-        staging = getattr(hp, "_capture_staging", None)
-        if not staging:
-            return
-        leftover = [k for k in staging if k[0] == rid]
-        for k in leftover:
-            hp.free(staging.pop(k))
-        if _SWA_DBG_CHECKSUM:
-            crc_map = getattr(hp, "_capture_crc", None)
-            if crc_map:
-                for k in [k for k in crc_map if k[0] == rid]:
-                    crc_map.pop(k, None)
+        # Sweep the SWA pool and every state ride pool: each owns its own staging
+        # dict, and most staged state tiles are never claimed (only page
+        # boundaries that become node boundaries get bound), so skipping the ride
+        # pools here exhausts their slack region and silently drops every boundary
+        # out of strict reuse.
+        pools = [self._swa_kv_pool_host]
+        pools += [hp for hp, _p, _hv, _pend, _li in _state_rides(self)]
+        for hp in pools:
+            if hp is None:
+                continue
+            staging = getattr(hp, "_capture_staging", None)
+            if staging:
+                for k in [k for k in staging if k[0] == rid]:
+                    hp.free(staging.pop(k))
+            for crc_attr in ("_capture_crc", "_capture_state_crc"):
+                crc_map = getattr(hp, crc_attr, None)
+                if crc_map:
+                    for k in [k for k in crc_map if k[0] == rid]:
+                        crc_map.pop(k, None)
 
     # ---- Strict bit-exact SWA: deferred positional restore ----
 
@@ -1929,15 +1923,27 @@ class SWAComponent(TreeComponent):
         # ring size == host SWA pool page size (slot_page_size=swa_ring_size);
         # avoids depending on a pool handle the cache does not expose.
         ring = hp.slot_page_size
-        host_idx = torch.cat([hv.to(torch.int64) for _, hv in windows])
-        # Only the trailing `ring` tokens fit the per-request ring block; a
-        # page-aligned reuse window is exactly one host page (== ring tokens).
+        # Only the trailing `ring` tokens fit the per-request ring block, and any
+        # earlier window maps onto the same ring rows and would just be overwritten,
+        # so restore the trailing window rather than concatenating all of them.
+        # build_hicache_transfer reverses the leaf->root walk, so windows are
+        # ordered root->leaf and the trailing one is last.
+        host_idx = windows[-1][1].to(torch.int64)
         if host_idx.numel() != ring:
-            if _SWA_DBG_CHECKSUM:
-                logger.warning(
-                    "[LB-RESTORE] skip non-single-page window: host_tokens=%s ring=%s",
+            # Not restorable: the request will read whatever the previous occupant
+            # of this ring block left behind, so this is a correctness hole rather
+            # than a missed optimization. Never silent -- rate-limited so a
+            # pathological shape cannot flood the log.
+            _n = getattr(hp, "_lb_restore_skip_dbg", 0) + 1
+            hp._lb_restore_skip_dbg = _n
+            if _n & (_n - 1) == 0:
+                logger.error(
+                    "[LB-RESTORE] skipped non-single-page window #%d: "
+                    "host_tokens=%s ring=%s windows=%d",
+                    _n,
                     int(host_idx.numel()),
                     ring,
+                    len(windows),
                 )
             return
         r = int(req_pool_idx)
@@ -1946,33 +1952,28 @@ class SWAComponent(TreeComponent):
             base, base + ring, dtype=torch.int64, device=hp.gpu_device
         )
         host_idx = host_idx.to(hp.gpu_device)
-        # H2 gate: the host page for this window was written by a capture D2H
-        # (prefill window capture or decode-source capture), enqueued
-        # non_blocking on the forward/compute stream and followed by a recorded
-        # capture-completion event. Make this restore H2D wait on it before
-        # reading the host page so a cross-stream / cross-batch reuse never
-        # restores a half-written window. This no longer relies on the consumer
-        # happening to share the producer's stream (the previous decode "ordered
-        # by construction" assumption, which silently broke under the scheduler
-        # overlap when producer and consumer could differ). No-op when no capture
-        # has run on this pool yet.
+        # The host page for this window was written by a capture D2H (prefill window
+        # or decode source) enqueued non_blocking on the compute stream, followed by
+        # a recorded completion event. Wait on it before reading the host page, so a
+        # cross-stream or cross-batch reuse never restores a half-written window;
+        # under scheduler overlap the producer and consumer streams can differ.
+        # No-op when no capture has run on this pool yet.
         if hasattr(hp, "wait_capture_done"):
             hp.wait_capture_done()
-        # B1.3: restore every layer in one fused transfer instead of a Python
-        # loop of `layer_num` per-layer copies (61 launches -> 1). Byte-for-byte
-        # identical device landing (same transfer primitive + page indices); it
-        # only removes launch/Python overhead on the prefill reuse hot path.
+        # Restore every layer in one fused transfer instead of a Python loop of
+        # `layer_num` per-layer copies (61 launches -> 1). Same transfer primitive
+        # and page indices, so the device landing is byte-for-byte identical; this
+        # only removes launch overhead on the prefill reuse hot path.
         if hasattr(hp, "load_to_device_all_layer"):
             hp.load_to_device_all_layer(None, host_idx, device_idx, io_backend)
         else:
             for li in range(hp.layer_num):
                 hp.load_to_device_per_layer(None, host_idx, device_idx, li, io_backend)
-        # Phase C: ride the c4/c4-indexer overlap state back onto the device
-        # state ring for this reused window (device_idx is the restored ring
-        # block; its trailing `ratio` slots are the boundary group). Gate each
-        # state pool's own capture-done event first (hazard H2, cross-stream H2D
-        # safety), mirroring the SWA wait above. No-op when state offload is
-        # unwired or the node carries no state host value.
+        # Ride the c4/c4-indexer overlap state back onto the device state ring for
+        # this reused window; device_idx is the restored ring block and its trailing
+        # `ratio` slots are the boundary group. Wait on each state pool's own
+        # capture-done event first, mirroring the SWA wait above. No-op when state
+        # offload is unwired or the node carries no state host value.
         for _shp, _spools, _shv, _spend, _sli in _state_rides(self):
             if hasattr(_shp, "wait_capture_done"):
                 _shp.wait_capture_done()
@@ -2146,26 +2147,22 @@ class SWAComponent(TreeComponent):
             else 0
         )
         if self._strict_bit_exact and host_indices is not None:
-            # I4' coupling guard: one window covers ``stride // page_size`` Full
-            # pages, all of which must be present in L3 (kv_hit_pages). If Full
-            # was evicted under the window (SWA outlived Full), drop the whole
-            # buffer and fall back to recompute -- never attach a desynced
-            # window. Fail-safe (drop), not assert, so a benign eviction race
-            # cannot crash the server.
+            # One window covers ``stride // page_size`` Full pages, all of which must
+            # be present in L3. If Full was evicted under the window, drop the whole
+            # buffer and recompute rather than attach a desynced window. Drop instead
+            # of assert, so a benign eviction race cannot crash the server.
             stride_pages = max(1, stride // page_size)
             full_hit = pool_storage_result.kv_hit_pages if pool_storage_result else 0
             if loaded_pages * stride_pages > full_hit:
                 self._release_swa_host(host_indices, cache_actions)
                 return
-            # Co-lifetime STATE coupling guard (defense-in-depth): the sidecar
-            # c4 / indexer state pools ride the SWA window key family, so under
-            # co-lifetime state_hit == loaded_pages. The file backend's
-            # batch_exists MIN coupling already enforces this (no-op here), but
-            # other backends (e.g. flexkv) or a partially-failing per-pool get can
-            # load SWA while a coupled state page is missing -- attaching state
-            # would then restore a desynced (dirty) window. Drop the whole window
-            # (recompute) if a registered state pool loaded fewer pages than SWA;
-            # only enforced when the pool key is present.
+            # The sidecar c4 / indexer state pools ride the SWA window key family,
+            # so state_hit should equal loaded_pages. The file backend's
+            # batch_exists MIN coupling already guarantees that, but other backends
+            # (e.g. flexkv) or a partially-failing per-pool get can load SWA while a
+            # coupled state page is missing, which would restore a desynced window.
+            # Drop the whole window (recompute) if a registered state pool loaded
+            # fewer pages than SWA. Only enforced when the pool key is present.
             extra_hit = (
                 pool_storage_result.extra_pool_hit_pages if pool_storage_result else {}
             )
@@ -2191,21 +2188,22 @@ class SWAComponent(TreeComponent):
             return
 
         if self._strict_bit_exact:
-            # Ring-paged window model (symmetric with offload): BACKUP_HOST /
-            # BACKUP_STORAGE attach one whole ``ring`` page to the carrier node,
-            # and PREFETCH forces ``window_pages == 1``. So the prefetched buffer
-            # is exactly one SWA ring page (== one window == ``stride`` tokens)
-            # and attaches WHOLE to the window's carrier node (the inserted host
-            # node, keyed by its trailing Full page hash -- same node offload
-            # stored it under). Never carve token sub-ranges out of a page_size
-            # radix node via ``_split_node``: ``child_key(page_size)`` assumes
-            # >= page_size logical units, but a ring (e.g. 131) < page_size (256)
-            # window has none -> IndexError. ``restore_pending_swa_windows``
-            # copies this page positionally into the request ring block later.
+            # BACKUP_HOST / BACKUP_STORAGE attach one whole ``ring`` page to the
+            # carrier node and PREFETCH forces ``window_pages == 1``, so the
+            # prefetched buffer is exactly one SWA ring page (one window) and
+            # attaches whole to the window's carrier -- the inserted host node,
+            # keyed by its trailing Full page hash, the same node offload stored it
+            # under. Never carve token sub-ranges out of a page_size radix node via
+            # ``_split_node``: ``child_key(page_size)`` assumes >= page_size logical
+            # units, and a ring (e.g. 131) smaller than page_size (256) has none, so
+            # it raises IndexError. ``restore_pending_swa_windows`` copies this page
+            # positionally into the request ring block later.
             cd_t = target.component_data[ct]
             if window_require_pages == 1 and cd_t.host_value is None:
                 self._attach_swa_host_value(target, host_indices)
-                _attach_state_durable_row(self, target, host_indices)
+                _attach_state_durable_row(
+                    self, target, host_indices, insert_result.total_len
+                )
             else:
                 # Already present, or an unexpected multi-window buffer: fail-safe
                 # (recompute) -- never crash, never attach a desynced window.
@@ -2238,7 +2236,7 @@ class SWAComponent(TreeComponent):
                 # Independent-pool sidecar: the c4/indexer state rode this
                 # window's coupled key family into the SAME durable row; point the
                 # carrier at it so the reuse restores state (bit-exact boundary).
-                _attach_state_durable_row(self, cur, slice_)
+                _attach_state_durable_row(self, cur, slice_, pos)
             else:
                 # Already has SWA (or empty overlap): drop this slice.
                 self._release_swa_host(slice_, cache_actions)

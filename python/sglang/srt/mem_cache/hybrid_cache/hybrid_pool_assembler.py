@@ -524,16 +524,12 @@ def _check_swa_host_pool_upper_bound(
         )
 
 
-def _swa_host_num_pages(
-    *, server_args, full_host_pages, device_ring_pages, page_bytes, page_size
-):
-    """SWA-ring host pool size in pages (stride model, Task A3): one SWA window
-    every ``stride`` full pages, plus a small tail allowance (one extra tail
-    window per in-flight request, bounded by the device ring).     Floored at the
-    device ring. Delegates the startup budget guard to
-    _check_swa_host_pool_upper_bound: above _SWA_HICACHE_SLOW_LAUNCH_GB warns,
-    above the DRAM-derived hard ceiling (_swa_host_hard_limit_gb) fails fast
-    (never clamps)."""
+def _swa_host_num_pages(*, server_args, full_host_pages, device_ring_pages, page_bytes):
+    """SWA-ring host pool size in pages: one SWA window every ``stride`` full
+    pages, plus one tail window per in-flight request (bounded by the device
+    ring), floored at the device ring. _check_swa_host_pool_upper_bound warns
+    above _SWA_HICACHE_SLOW_LAUNCH_GB and fails fast above the DRAM-derived hard
+    ceiling; it never clamps."""
     stride = max(1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1)))
     strided = -(-full_host_pages // stride)  # ceil(full_host_pages / stride)
     tail_pages = device_ring_pages  # <= max in-flight tail windows
@@ -690,7 +686,6 @@ def build_deepseek_v4_hicache_stack(
             full_host_pages=num_host_pages,
             device_ring_pages=device_ring_pages,
             page_bytes=page_bytes,
-            page_size=page_size,
         )
         logger.info(
             "[SWA-HiCache] SWA host pool: %d pages (%.2f GB), full_host_pages=%d, "
@@ -713,9 +708,9 @@ def build_deepseek_v4_hicache_stack(
         # both the model forward (window capture) and swa_component insert
         # (binding) can reach them.
         kvcache._swa_host_pool = swa_host_pool
-        # stride knob for sparse SWA offload (Task A1). Default 1 == per-page
-        # (S-plan behavior, zero regression). N>1 keeps one window every N pages
-        # plus the sequence tail window; read by capture_swa_windows.
+        # Stride knob for sparse SWA offload, read by capture_swa_windows. Default
+        # 1 == one window per page; N>1 keeps one window every N pages plus the
+        # sequence tail window.
         kvcache._swa_offload_page_stride = max(
             1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1))
         )
@@ -725,31 +720,24 @@ def build_deepseek_v4_hicache_stack(
             swa_host_pool._capture_crc = {}
             swa_host_pool._dbg_restore_verified = 0
 
-        # Phase C (I8'): c4 / c4-indexer overlap compress-state riding pools.
-        # MANDATORY for strict correctness whenever c4 state layers exist -- there
-        # is NO "SWA only" mode. A captured SWA window is only bit-exact on reuse
-        # if the boundary overlap state [B-ratio, B) rides the SAME coupled
-        # lifetime (bind/promote/offload/restore/free); offloading a window
-        # without its state would reintroduce the boundary dirty read this whole
-        # mechanism exists to prevent. State lives in its OWN independent L3 pool,
-        # coupled to the SWA window by key family + positional durable row.
+        # c4 / c4-indexer overlap compress-state riding pools. Required whenever c4
+        # state layers exist -- there is no "SWA only" mode, because a captured SWA
+        # window is bit-exact on reuse only if the boundary overlap state
+        # [B-ratio, B) shares its bind/promote/offload/restore/free lifetime.
+        # State lives in its own L3 pool, coupled to the SWA window by key family
+        # plus positional durable row.
         _state_ride = bool(c4_state_global_layers)
         if _state_ride:
             _ring_size = kvcache.compress_state_pools[
                 c4_state_global_layers[0]
             ].ring_size
-            # Staging slack: transient capture landing rows for in-flight
-            # (rid, B) tiles not yet promoted to their window's durable row.
-            # State capture stages a tile at EXACTLY the strided SWA window
-            # boundaries (every `stride`-th page + the true tail; see
-            # capture_c4_state_windows_unified),
-            # NOT at every page boundary, so per-request in-flight tiles track the
-            # (already strided) durable SWA window budget. Size the slack at 1.5x
-            # the durable capacity as concurrency headroom for boundaries captured
-            # but not yet promoted; each page is tiny (ring_size * slot_bytes *
-            # layers), so this is cheap. Exhaustion is correctness-safe: the
-            # boundary is simply excluded from reuse (recomputed), never a dirty
-            # read.
+            # Staging slack holds the transient landing rows for in-flight (rid, B)
+            # tiles not yet promoted to their window's durable row. State capture
+            # stages a tile at exactly the strided SWA window boundaries (see
+            # capture_c4_state_windows_unified), so in-flight tiles track the
+            # already-strided durable window budget; 1.5x gives concurrency headroom
+            # and each page is tiny (ring_size * slot_bytes * layers). Running out
+            # only excludes that boundary from reuse, never causes a dirty read.
             _staging_slack = (unified_swa_host_pages * 3 + 1) // 2
             kvcache._c4_state_host_pool = _dsv4_unified_state_paged_pool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
@@ -772,20 +760,19 @@ def build_deepseek_v4_hicache_stack(
             kvcache._c4_state_layer_index = {
                 gl: i for i, gl in enumerate(c4_state_global_layers)
             }
-            # INDEPENDENT-POOL L3 (replaces the old A-gather single-blob packing):
-            # each state pool is registered below as a first-class HiCache pool and
-            # persisted/prefetched by the storage backend via its OWN page
-            # (get_data_page / set_from_flat / get_page_buffer_meta), coupled to the
-            # SWA window purely by KEY (sidecar C4_STATE->SWA + TRAILING_PAGES +
-            # batch_exists_v2 min-across-pools). No blob packing, so ALL L3 backends
-            # (flat-copy AND zero-copy) move the state with zero backend changes.
-            #   * _l3_page_size: L3 addresses the DURABLE row by the coupled SWA
-            #     window page (index // swa_ring_size == durable row), NOT the state
-            #     pool's own ring_size slot -- the sidecar hands SWA host indices.
-            #   * _manual_device_ride: L1<->L2 (device<->host) stays owned by the
-            #     manual bit-exact capture/restore ride (the unified path overwrites
-            #     the state ring mid-prefill, so a controller-driven device read
-            #     would be a dirty read); the controller device transfer is a no-op.
+            # Each state pool is registered below as a first-class HiCache pool and
+            # persisted/prefetched through its own page (get_data_page /
+            # set_from_flat / get_page_buffer_meta), coupled to the SWA window by
+            # key alone (sidecar C4_STATE->SWA + TRAILING_PAGES + batch_exists_v2
+            # min-across-pools). Nothing is blob-packed, so every L3 backend moves
+            # the state unchanged.
+            #   * _l3_page_size: L3 addresses the durable row by the coupled SWA
+            #     window page (index // swa_ring_size), not the state pool's own
+            #     ring_size slot -- the sidecar hands over SWA host indices.
+            #   * _manual_device_ride: device<->host stays owned by the manual
+            #     capture/restore ride, because the unified path overwrites the state
+            #     ring mid-prefill and a controller-driven device read would pick up
+            #     a dirty row. The controller device transfer becomes a no-op.
             for _hp in (
                 kvcache._c4_state_host_pool,
                 kvcache._c4_indexer_state_host_pool,

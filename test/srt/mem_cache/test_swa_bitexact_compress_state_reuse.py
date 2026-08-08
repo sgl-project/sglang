@@ -189,6 +189,7 @@ class TestCaptureRestoreRoundTrip(unittest.TestCase):
         node = types.SimpleNamespace(
             _c4_state_host_value=host_indices,
             _c4_indexer_state_host_value=None,
+            _swa_state_B=256,
         )
         restorer = types.SimpleNamespace(
             _c4_state_layer_index={0: 0},
@@ -199,11 +200,86 @@ class TestCaptureRestoreRoundTrip(unittest.TestCase):
         )
         _RESTORE(restorer, node, swa_chunk)
 
-        # device ring slots for [B-ratio, B) == captured buffer window
-        state_locs = _TRANSLATE(fake_sp, swa_chunk[-ratio:])
+        # Rows the compressor will actually read at B: position p lives in SWA
+        # slot swa_base + p % swa_ring.
+        B = 256
+        pos = torch.arange(B - ratio, B, dtype=torch.int64)
+        state_locs = _TRANSLATE(fake_sp, swa_base + pos % swa_ring)
         got = dev[state_locs]
         want = buf.kv_score[valid_kv_len - ratio : valid_kv_len]
         self.assertTrue(torch.equal(got, want))
+
+    def test_roundtrip_byte_exact_ring_not_dividing_page(self):
+        """Same round-trip with a SWA ring that does not divide the page size.
+
+        Speculative decode sizes the ring as sliding_window + num_draft_tokens - 1
+        (e.g. 128 + 3), so B % ring != 0 and the boundary group [B-ratio, B) is no
+        longer the tail of the restored ring block. State ring is 16, as
+        get_compress_state_ring_size(4) returns under speculation.
+        """
+        page, swa_ring, ring_size, ratio = 256, 131, 16, 4
+        last_dim, dtype = 16, torch.bfloat16
+        slot_bytes = last_dim * torch.tensor([], dtype=dtype).element_size()
+
+        hp = _fake_host_pool(ring_size=ring_size, slot_bytes=slot_bytes, num_pages=8)
+        backend = _fake_backend(hp, page=page, swa_ring=swa_ring)
+        valid_kv_len = 256
+        buf = types.SimpleNamespace(
+            kv_score=torch.randint(
+                1, 255, (valid_kv_len, last_dim), dtype=torch.int32
+            ).to(dtype)
+        )
+        _CAPTURE(
+            _fake_self(),
+            kv_and_score_buffer=buf,
+            valid_kv_len=valid_kv_len,
+            prefix_len=0,
+            extend_len=256,
+            rid=7,
+            backend=backend,
+        )
+        host_indices = hp._capture_staging[(7, 256)]
+
+        # Reusing request occupies ring block r, so its slots are
+        # [r*swa_ring, (r+1)*swa_ring).
+        r = 2
+        swa_base = r * swa_ring
+        swa_chunk = torch.arange(swa_base, swa_base + swa_ring, dtype=torch.int64)
+
+        dev = torch.zeros((64, last_dim), dtype=dtype)
+        fake_sp = types.SimpleNamespace(
+            ring_size=ring_size,
+            swa_page_size=swa_ring,
+            ratio=ratio,
+            kv_score_buffer=types.SimpleNamespace(kv_score=dev),
+        )
+        fake_sp.translate_from_swa_loc_to_state_loc = types.MethodType(
+            _TRANSLATE, fake_sp
+        )
+        node = types.SimpleNamespace(
+            _c4_state_host_value=host_indices,
+            _c4_indexer_state_host_value=None,
+            _swa_state_B=256,
+        )
+        restorer = types.SimpleNamespace(
+            _c4_state_layer_index={0: 0},
+            _c4_state_host_pool=hp,
+            _c4_indexer_state_host_pool=None,
+            _compress_state_pools=[fake_sp],
+            _indexer_compress_state_pools=None,
+        )
+        _RESTORE(restorer, node, swa_chunk)
+
+        B = 256
+        pos = torch.arange(B - ratio, B, dtype=torch.int64)
+        state_locs = _TRANSLATE(fake_sp, swa_base + pos % swa_ring)
+        got = dev[state_locs]
+        want = buf.kv_score[valid_kv_len - ratio : valid_kv_len]
+        self.assertTrue(
+            torch.equal(got, want),
+            f"state landed on the wrong ring rows: want rows {state_locs.tolist()} "
+            f"to hold positions {pos.tolist()}",
+        )
 
     def test_restore_noop_without_host_value(self):
         dev = torch.zeros((16, 8), dtype=torch.bfloat16)
@@ -300,6 +376,7 @@ class TestDirtyReadWithoutRestore(unittest.TestCase):
         node = types.SimpleNamespace(
             _c4_state_host_value=hp._capture_staging[(7, 256)],
             _c4_indexer_state_host_value=None,
+            _swa_state_B=256,
         )
         restorer = types.SimpleNamespace(
             _c4_state_layer_index={0: 0},
@@ -388,7 +465,9 @@ class TestDecodeSourceCapture(unittest.TestCase):
             r2 * swa_ring, r2 * swa_ring + swa_ring, dtype=torch.int64
         )
         node = types.SimpleNamespace(
-            _c4_state_host_value=hidx, _c4_indexer_state_host_value=None
+            _c4_state_host_value=hidx,
+            _c4_indexer_state_host_value=None,
+            _swa_state_B=B,
         )
         restorer = types.SimpleNamespace(
             _c4_state_layer_index={0: 0},
@@ -398,7 +477,8 @@ class TestDecodeSourceCapture(unittest.TestCase):
             _indexer_compress_state_pools=None,
         )
         _RESTORE(restorer, node, swa_chunk)
-        locs2 = _TRANSLATE(sp2, swa_chunk[-ratio:])
+        pos2 = torch.arange(B - ratio, B, dtype=torch.int64)
+        locs2 = _TRANSLATE(sp2, swa_chunk[pos2 % swa_ring])
         self.assertTrue(torch.equal(dev2[locs2], truth))
 
     def test_decode_no_boundary_no_capture(self):
@@ -540,7 +620,10 @@ class TestStateRestoreChecksum(unittest.TestCase):
         s = self._capture_bind_promote()
         # host round-trip + device-landing asserts run inside; must not raise
         _RESTORE(s["restorer"], s["node"], s["swa_chunk"])
-        state_locs = _TRANSLATE(s["fake_sp"], s["swa_chunk"][-s["ratio"] :])
+        pos = torch.arange(256 - s["ratio"], 256, dtype=torch.int64)
+        state_locs = _TRANSLATE(
+            s["fake_sp"], s["swa_chunk"][pos % s["swa_chunk"].numel()]
+        )
         self.assertTrue(
             torch.equal(
                 s["dev"][state_locs],
@@ -646,8 +729,9 @@ class TestSwaStatePromoteWiring(unittest.TestCase):
         comp = self._component(p, swa_ring=swa_ring)
         node = types.SimpleNamespace(_c4_state_host_value=None)
         swa_slice = torch.arange(swa_row * swa_ring, swa_row * swa_ring + swa_ring)
-        SC._attach_state_durable_row(comp, node, swa_slice)
+        SC._attach_state_durable_row(comp, node, swa_slice, 256)
         self.assertEqual(int(node._c4_state_host_value[0].item()) // ring, swa_row)
+        self.assertEqual(node._swa_state_B, 256)
 
     def test_attach_noop_without_durable_reserve(self):
         # _attach_state_durable_row activates for any state ride whose pool
@@ -660,7 +744,7 @@ class TestSwaStatePromoteWiring(unittest.TestCase):
         p._durable_reserve_slots = 0  # no durable region
         comp = self._component(p, swa_ring=swa_ring)
         node = types.SimpleNamespace(_c4_state_host_value=None)
-        SC._attach_state_durable_row(comp, node, torch.arange(0, swa_ring))
+        SC._attach_state_durable_row(comp, node, torch.arange(0, swa_ring), 256)
         self.assertIsNone(node._c4_state_host_value)
 
     def test_promote_drops_binding_when_no_swa_row(self):

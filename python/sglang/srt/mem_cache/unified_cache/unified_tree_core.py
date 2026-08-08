@@ -1491,10 +1491,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
-        # R1: free any interior stride carrier's not-yet-promoted SWA capture
-        # page here -- the single true node-removal chokepoint. Pending tracks
-        # the Full (base) lifetime, so it is dropped only on real removal (not on
-        # a device tombstone) and independent of per-component eviction order.
+        # Free any interior stride carrier's not-yet-promoted SWA capture page
+        # here, the single node-removal chokepoint. Pending tracks the Full (base)
+        # lifetime, so it is dropped only on real removal -- not on a device
+        # tombstone -- and independently of per-component eviction order.
         swa_comp = self.components_by_type.get(ComponentType.SWA)
         if swa_comp is not None:
             swa_comp.free_pending_host_on_remove(node)

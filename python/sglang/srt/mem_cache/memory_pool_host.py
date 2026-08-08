@@ -882,7 +882,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         """Make ``stream`` (default: current) wait until all enqueued SWA-capture
         D2H copies have completed, so a cross-batch host-page read sees finished
         bytes. No-op when no capture has run on this pool yet."""
-        ev = self._capture_done_event
+        ev = getattr(self, "_capture_done_event", None)
         if ev is None:
             return
         s = (
@@ -891,6 +891,17 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             else torch.cuda.current_stream(device=self.gpu_device)
         )
         s.wait_event(ev)
+
+    def sync_capture_done(self) -> None:
+        """Block the CPU until all enqueued capture D2H copies have landed.
+
+        wait_capture_done only orders a GPU stream, which does nothing for a
+        host-side read: the capture writes pinned pages with non_blocking=True, so
+        any CPU touch of those bytes (host->host promote, L3 page read) must wait
+        on the event itself. No-op when no capture has run on this pool yet."""
+        ev = getattr(self, "_capture_done_event", None)
+        if ev is not None:
+            ev.synchronize()
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
@@ -999,6 +1010,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         (== the coupled SWA window host page row) for every layer, then release
         the staging page. After this, ``get_data_page``/restore address the tile
         by the SWA window row, so the state and its window share one L3 slot."""
+        # host->host copy runs on the CPU, so it must wait on the capture D2H that
+        # filled the staging page rather than just ordering a GPU stream.
+        self.sync_capture_done()
         staged_row = int(staged_indices[0].item()) // self.slot_page_size
         for li in range(self.layer_num):
             self.data_refs[li][durable_row].copy_(self.data_refs[li][staged_row])
@@ -1214,6 +1228,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def get_data_page(self, index, flat=True):
         # `_l3_page_size` (unified state pools): address the durable row by the
         # coupled SWA window page; None => plain slot paging (SWA / C4 / C128).
+        # Reading the page on the CPU must wait on the capture D2H that filled it,
+        # else a half-written window/tile gets persisted to L3.
+        self.sync_capture_done()
         _ps = getattr(self, "_l3_page_size", None) or self.slot_page_size
         page_row = int(index) // _ps
         if self.layout == "layer_first":

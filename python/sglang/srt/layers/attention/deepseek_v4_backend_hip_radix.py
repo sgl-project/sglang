@@ -1380,6 +1380,12 @@ class DeepseekV4HipRadixBackend(
             return
         if kv is None or not forward_batch.forward_mode.is_extend():
             return
+        # DP max-len padding rewrites an idle rank into a one-request EXTEND with
+        # fabricated seq lens and req_pool_indices padded to 0. Capturing that
+        # would stage garbage under (rid=0, B) and make the real request 0 skip
+        # its own window. A rewritten forward_mode is the marker.
+        if getattr(forward_batch, "_original_forward_mode", None) is not None:
+            return
 
         swa_layer = layer_id - pool.start_layer
 
@@ -1589,7 +1595,7 @@ class DeepseekV4HipRadixBackend(
                 continue
             hidx = host_pool.alloc(ring)
             if hidx is None:
-                # Host pool full: skip -> reuse recomputes this boundary (I6).
+                # Host pool full: skip, and reuse recomputes this boundary.
                 if _SWA_DBG_CHECKSUM:
                     logger.warning(
                         "[CAP-DBG] decode SWA host pool FULL, skip key=%s", key
@@ -1626,18 +1632,15 @@ class DeepseekV4HipRadixBackend(
                     )
             captured_any = True
 
-        # H2 (overlap-schedule safety): the D2H copies above were enqueued
-        # non_blocking on the CURRENT stream. Under the overlap scheduler that is
-        # the worker's forward_stream -- the SAME stream that ran the decode
-        # forward (which wrote the ring) and that will run the next forward
-        # (which overwrites ring slot 0), so the ring read is same-stream-ordered
-        # between the two writes (hazard H1 holds by construction, overlap on or
-        # off). But a later consumer of these host pages (restore H2D, L3
-        # write-through, device-landing check) may run on a DIFFERENT stream;
-        # record the capture-completion event on this stream so those consumers
-        # can order strictly after the page is fully written via
-        # wait_capture_done() (hazard H2). Recorded once per step, only when a
-        # window was actually staged, so no-op decode steps stay free.
+        # The D2H copies above were enqueued non_blocking on the current stream,
+        # which under the overlap scheduler is the worker's forward_stream -- the
+        # same stream that ran the decode forward and that will run the next one, so
+        # the ring read is same-stream-ordered between the two ring writes. But a
+        # later consumer of these host pages (restore H2D, L3 write-through,
+        # device-landing check) may run on a different stream, so record the
+        # capture-completion event here for wait_capture_done() to order against.
+        # Once per step and only when a window was staged, so idle decode steps
+        # stay free.
         if captured_any:
             _rec = getattr(host_pool, "record_capture_done", None)
             if _rec is not None:
@@ -1709,7 +1712,7 @@ class DeepseekV4HipRadixBackend(
                 ring_size = hp.slot_page_size
                 hidx = hp.alloc(ring_size)
                 if hidx is None:
-                    continue  # host pool full -> reuse recomputes (I6)
+                    continue  # host pool full: reuse recomputes this boundary
                 staging[key] = hidx
                 slot_bytes = hp.item_bytes // ring_size
                 page_row = int(hidx[0].item()) // ring_size

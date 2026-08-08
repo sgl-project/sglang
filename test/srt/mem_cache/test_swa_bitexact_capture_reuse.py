@@ -834,10 +834,15 @@ class TestSwaStagingCleanupRobustToRetract(unittest.TestCase):
         }
         return hp
 
-    def _call(self, hp, capture_rid, req_pool_idx):
+    def _call(self, hp, capture_rid, req_pool_idx, state_hp=None):
         fake_self = types.SimpleNamespace(
             _swa_kv_pool_host=hp,
             _capture_rid=capture_rid,
+            _c4_state_layer_index={0: 0} if state_hp is not None else None,
+            _c4_state_host_pool=state_hp,
+            _c4_indexer_state_host_pool=None,
+            _compress_state_pools=[object()] if state_hp is not None else None,
+            _indexer_compress_state_pools=None,
         )
         req = types.SimpleNamespace(req_pool_idx=req_pool_idx)
         SWAComponent.cleanup_after_caching_req(fake_self, req, is_finished=True)
@@ -857,6 +862,21 @@ class TestSwaStagingCleanupRobustToRetract(unittest.TestCase):
         self._call(hp, capture_rid=7, req_pool_idx=7)
         self.assertNotIn((7, 4), hp._capture_staging)
         self.assertIn((9, 4), hp._capture_staging)
+
+    def test_sweeps_state_ride_staging_too(self):
+        # The c4 / c4-indexer state pools keep their own staging dicts. Most
+        # staged tiles are never claimed (only page boundaries that become node
+        # boundaries get bound), so leaving them behind exhausts the slack region
+        # and silently drops every boundary out of strict reuse.
+        hp = self._hp()
+        state_hp = self._hp()
+        state_hp._capture_state_crc = {(7, 4, 0): 1, (9, 4, 0): 2}
+        self._call(hp, capture_rid=7, req_pool_idx=7, state_hp=state_hp)
+        self.assertNotIn((7, 4), state_hp._capture_staging)
+        self.assertNotIn((7, 8), state_hp._capture_staging)
+        self.assertIn((9, 4), state_hp._capture_staging)
+        self.assertNotIn((7, 4, 0), state_hp._capture_state_crc)
+        self.assertIn((9, 4, 0), state_hp._capture_state_crc)
 
 
 class _FakeDecodePool:

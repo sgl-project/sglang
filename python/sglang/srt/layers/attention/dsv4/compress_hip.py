@@ -83,6 +83,10 @@ def capture_c4_state_windows_unified(
     extend_lens = forward_batch.extend_seq_lens_cpu
     if extend_lens is None or prefix_lens is None:
         return
+    # Same dummy-batch guard as the SWA window capture: a DP-padded idle rank
+    # looks like a real EXTEND but its rid/seq lens are fabricated.
+    if getattr(forward_batch, "_original_forward_mode", None) is not None:
+        return
 
     req_pool_indices = forward_batch.req_pool_indices
     req_to_token = backend.req_to_token_pool.req_to_token

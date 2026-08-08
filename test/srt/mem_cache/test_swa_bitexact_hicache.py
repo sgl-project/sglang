@@ -53,14 +53,12 @@ class TestSwaHostSizing(unittest.TestCase):
         full_host_pages=100_000,
         device_ring_pages=65,
         page_bytes=1,
-        page_size=256,
     ):
         return A._swa_host_num_pages(
             server_args=_sargs(stride),
             full_host_pages=full_host_pages,
             device_ring_pages=device_ring_pages,
             page_bytes=page_bytes,
-            page_size=page_size,
         )
 
     def test_stride1_covers_all_pages(self):

@@ -415,7 +415,6 @@ class TestSwaHostSizingByStride(unittest.TestCase):
             full_host_pages=full_host_pages,
             device_ring_pages=device_ring_pages,
             page_bytes=131072,
-            page_size=256,
         )
 
     def test_stride1_covers_all_full_pages(self):
@@ -766,7 +765,6 @@ class TestSwaHostHardLimitFromDram(unittest.TestCase):
                     full_host_pages=32_000,
                     device_ring_pages=1024,
                     page_bytes=9_054_720,  # ~9.05 MB/page (DSv4-Pro SWA window)
-                    page_size=256,
                 )
         self.assertIn("--hicache-swa-offload-page-stride", str(ctx.exception))
 
@@ -791,7 +789,6 @@ class TestSwaHostHardLimitFromDram(unittest.TestCase):
                     full_host_pages=32_000,
                     device_ring_pages=1024,
                     page_bytes=9_054_720,
-                    page_size=256,
                 )
         self.assertGreater(pages, 0)
         self.assertTrue(any("SWA host pool" in m for m in cm.output))
@@ -811,7 +808,6 @@ class TestSwaHostHardLimitFromDram(unittest.TestCase):
                 full_host_pages=32_000,
                 device_ring_pages=1024,
                 page_bytes=9_054_720,
-                page_size=256,
             )
         # stride=64 keeps the pool well under the DRAM ceiling -> no raise.
         self.assertGreater(pages, 0)

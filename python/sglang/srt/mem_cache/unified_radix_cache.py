@@ -724,7 +724,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Strict SWA: the request is done — drop its per-request device SWA
         # ring values along the finished prefix so any later cross-request
-        # reuse restores the true window from host (I1) rather than trusting
+        # reuse restores the true window from host rather than trusting
         # the recycled device ring. Per-node gates (SWA lock_ref==0, host copy
         # committed) are enforced inside evict_device_on_owner_release; nodes
         # still held by another active request (lock_ref>0) are left intact.
