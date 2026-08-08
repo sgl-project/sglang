@@ -86,6 +86,42 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
+# Community EAGLE / EAGLE3 drafts are published under the architecture of the
+# model they were trained against rather than under an Eagle-specific one:
+# yuhuili/EAGLE-LLaMA3.1-Instruct-8B and linborui/EAGLE-Llama-3.2-3B-Instruct
+# both report ["LlamaForCausalLM"], yuhuili/EAGLE-Qwen2-7B-Instruct reports
+# ["Qwen2ForCausalLM"]. Loaded as the base architecture they miss the Eagle
+# class whose load_weights() prepends "model." to their unprefixed checkpoint
+# keys. The repackaged lmsys/sglang-EAGLE-* checkpoints already name the Eagle
+# class and are unaffected.
+#
+# base architecture -> (EAGLE arch, EAGLE3 arch or None if the family has none)
+EAGLE_DRAFT_BASE_ARCHS = {
+    "LlamaForCausalLM": ("LlamaForCausalLMEagle", "LlamaForCausalLMEagle3"),
+    "Qwen2ForCausalLM": ("Qwen2ForCausalLMEagle", None),
+}
+
+
+def resolve_eagle_draft_arch(architecture: str, hf_config) -> Optional[str]:
+    """Eagle architecture for a draft published under its base architecture.
+
+    Returns None when ``architecture`` is not a known EAGLE base architecture,
+    or when the checkpoint is an EAGLE3 draft of a family that has no Eagle3
+    class; in both cases the caller leaves the architecture untouched.
+
+    EAGLE3 drafts are distinguished by carrying ``draft_vocab_size`` (the
+    reduced output vocabulary). Layer count is deliberately not used:
+    yuhuili/EAGLE3-Vicuna1.3-13B reports num_hidden_layers=40.
+    """
+    entry = EAGLE_DRAFT_BASE_ARCHS.get(architecture)
+    if entry is None:
+        return None
+    eagle_arch, eagle3_arch = entry
+    if getattr(hf_config, "draft_vocab_size", None) is not None:
+        return eagle3_arch
+    return eagle_arch
+
+
 def _hf_arch(config) -> Optional[str]:
     """First architecture from a HF config dict or PretrainedConfig (or None)."""
     archs = (
@@ -709,6 +745,19 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.speculative_algorithm in ("EAGLE", "EAGLE3"):
+            base_arch = self.hf_config.architectures[0]
+            eagle_arch = resolve_eagle_draft_arch(base_arch, self.hf_config)
+            if eagle_arch is not None:
+                logger.info(
+                    "Draft checkpoint reports architecture %s; loading it as %s "
+                    "for %s speculative decoding.",
+                    base_arch,
+                    eagle_arch,
+                    self.speculative_algorithm,
+                )
+                self.hf_config.architectures[0] = eagle_arch
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
