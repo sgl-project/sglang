@@ -2269,6 +2269,11 @@ _check_all_req_types()
 def wrap_as_pickle(obj: object) -> object:
     if obj is None:
         return None
+    # Only materialize at the pickle boundary. Internal tensor views are
+    # intentionally preserved.
+    materialize_cpu_views = getattr(obj, "materialize_cpu_views_for_pickle", None)
+    if callable(materialize_cpu_views):
+        materialize_cpu_views()
     if _USE_PICKLE_IPC:
         return obj
     return PickleWrapper(pickle.dumps(obj))

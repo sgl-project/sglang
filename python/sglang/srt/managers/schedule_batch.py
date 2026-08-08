@@ -305,6 +305,35 @@ class MultimodalInputFormat(Enum):
     PRECOMPUTED_EMBEDDING = auto()
 
 
+def _materialize_cpu_tensor_views(value, memo):
+    """Clone CPU tensor views whose storage is larger than their logical data."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu" or value.layout != torch.strided:
+            return value
+
+        value_id = id(value)
+        cached = memo.get(value_id)
+        if cached is not None:
+            return cached
+
+        logical_nbytes = value.numel() * value.element_size()
+        if value.untyped_storage().nbytes() > logical_nbytes:
+            value = value.clone()
+        memo[value_id] = value
+        return value
+
+    if isinstance(value, dict):
+        return {
+            key: _materialize_cpu_tensor_views(item, memo)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_materialize_cpu_tensor_views(item, memo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_materialize_cpu_tensor_views(item, memo) for item in value)
+    return value
+
+
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
@@ -407,6 +436,18 @@ class MultimodalDataItem:
 
     def is_precomputed_embedding(self):
         return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+
+    def materialize_cpu_views_for_pickle(self, memo=None):
+        """Detach sliced CPU tensors from oversized parent pickle storages."""
+        if memo is None:
+            memo = {}
+        self.feature = _materialize_cpu_tensor_views(self.feature, memo)
+        self.precomputed_embeddings = _materialize_cpu_tensor_views(
+            self.precomputed_embeddings, memo
+        )
+        self.model_specific_data = _materialize_cpu_tensor_views(
+            self.model_specific_data, memo
+        )
 
     @staticmethod
     def from_dict(obj: dict):
@@ -531,6 +572,12 @@ class MultimodalProcessorOutput:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
+    def materialize_cpu_views_for_pickle(self, memo=None):
+        if memo is None:
+            memo = {}
+        for item in self.mm_items:
+            item.materialize_cpu_views_for_pickle(memo)
+
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
@@ -611,6 +658,12 @@ class MultimodalInputs:
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+
+    def materialize_cpu_views_for_pickle(self, memo=None):
+        if memo is None:
+            memo = {}
+        for item in self.mm_items:
+            item.materialize_cpu_views_for_pickle(memo)
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""

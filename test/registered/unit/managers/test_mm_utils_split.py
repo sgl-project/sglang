@@ -11,13 +11,19 @@ recognize both keys, fall back cleanly when no usable grid is present, and not
 mis-split a degenerate flat grid. No server / GPU / weight loading involved.
 """
 
+import pickle
 import unittest
 
 import numpy as np
 import torch
 
+from sglang.srt.managers.io_struct import PickleWrapper, wrap_as_pickle
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +47,91 @@ def _bundled_item(grid_key=None, grid=None, feature_len=10, num_images=2):
 
 
 class TestGetNewExpandedMMItems(CustomTestCase):
+    def test_pickle_transport_materializes_split_cpu_views(self):
+        num_images, rows, width = 64, 8, 64
+        feature = torch.zeros((num_images * rows, width), dtype=torch.float32)
+        grids = torch.tensor([[1, 1, rows]] * num_images, dtype=torch.int64)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=feature,
+            offsets=[(i, i) for i in range(num_images)],
+            model_specific_data={"image_grid_thw": grids},
+        )
+        output = MultimodalProcessorOutput(mm_items=get_new_expanded_mm_items([item]))
+
+        logical_nbytes = sum(
+            split.feature.numel() * split.feature.element_size()
+            for split in output.mm_items
+        )
+        wrapped = wrap_as_pickle(output)
+        payload = (
+            wrapped.data
+            if isinstance(wrapped, PickleWrapper)
+            else pickle.dumps(wrapped, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+
+        self.assertLess(len(payload), logical_nbytes * 2)
+        for split in output.mm_items:
+            self.assertEqual(
+                split.feature.untyped_storage().nbytes(),
+                split.feature.numel() * split.feature.element_size(),
+            )
+            split_grid = split.model_specific_data["image_grid_thw"]
+            self.assertEqual(
+                split_grid.untyped_storage().nbytes(),
+                split_grid.numel() * split_grid.element_size(),
+            )
+
+    def test_pickle_transport_materializes_precomputed_embedding_view(self):
+        parent = torch.arange(128, dtype=torch.float32).view(32, 4)
+        embedding_view = parent[4:8]
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 0)],
+            precomputed_embeddings=embedding_view,
+        )
+        output = MultimodalProcessorOutput(mm_items=[item])
+
+        wrap_as_pickle(output)
+
+        self.assertTrue(torch.equal(item.precomputed_embeddings, embedding_view))
+        self.assertEqual(
+            item.precomputed_embeddings.untyped_storage().nbytes(),
+            item.precomputed_embeddings.numel()
+            * item.precomputed_embeddings.element_size(),
+        )
+
+    def test_pickle_transport_keeps_owned_cpu_tensor(self):
+        feature = torch.arange(16, dtype=torch.float32).view(4, 4)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 0)],
+            feature=feature,
+        )
+        output = MultimodalProcessorOutput(mm_items=[item])
+
+        wrap_as_pickle(output)
+
+        self.assertIs(item.feature, feature)
+
+    def test_pickle_transport_reuses_materialized_shared_tensor(self):
+        parent = torch.arange(128, dtype=torch.float32).view(32, 4)
+        shared_view = parent[4:8]
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(0, 0)],
+                feature=shared_view,
+            )
+            for _ in range(2)
+        ]
+        output = MultimodalProcessorOutput(mm_items=items)
+
+        wrap_as_pickle(output)
+
+        self.assertIs(items[0].feature, items[1].feature)
+        self.assertIsNot(items[0].feature, shared_view)
+
     def test_image_grid_hws_splits_per_image(self):
         # grid rows [[2,3],[4,1]] -> prod = [6, 4] patches -> feature_len 10.
         item = _bundled_item(
