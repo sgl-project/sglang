@@ -36,6 +36,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -416,6 +417,12 @@ class Phi4MMForCausalLM(nn.Module):
         self.embed_tokens_extend = AudioEmbedding(config, **embedding_config)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            return torch.cat(
+                [item.feature.view(-1, item.feature.shape[-1]) for item in items],
+                dim=0,
+            )
+
         dtype = next(self.vision_encoder.parameters()).dtype
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(dtype)
         image_attention_mask = torch.cat(
