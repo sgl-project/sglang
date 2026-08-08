@@ -442,8 +442,13 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        # Gated on `is_multimodal` because this flag is advertised via /model_info
+        # and drives the VLM warmup request, while the OpenAI serving layer rejects
+        # media input for models that are not `is_multimodal`. A text-only model
+        # with an auto-populated `vision_config` (see above) would otherwise warm up
+        # with an image request that its own serving layer answers with 400.
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
+        self.is_image_understandable_model = self.is_multimodal and hasattr(
             self.hf_config, "vision_config"
         )
 
