@@ -32,6 +32,43 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+
+def _disable_runai_streamer_rank_discovery_collective() -> None:
+    """RunAI Model Streamer's ``find_local_ranks()`` fires a full-world
+    collective on the first ``stream_files()`` of every streamer instance even
+    when the caller passes ``is_distributed=False`` — it only populates an env
+    var for the library's distributed-streaming path, which this loader never
+    uses (each rank loads its own full copy). Ranks reach it with divergent
+    timing, so it can fire out of lockstep and hang
+    (https://github.com/run-ai/runai-model-streamer/issues/84).
+
+    Patch it to the single-process early return it already has; the only
+    behavior lost is the collective this loader never wanted.
+    """
+    try:
+        from runai_model_streamer.distributed_streamer.distributed_streamer import (
+            _distributedStreamerParams,
+        )
+    except ImportError:
+        return
+    if not hasattr(_distributedStreamerParams, "find_local_ranks"):
+        logger.warning(
+            "runai_model_streamer find_local_ranks not found; skipping the "
+            "rank-discovery-collective workaround (multi-rank loads may hang, "
+            "see run-ai/runai-model-streamer#84)."
+        )
+        return
+
+    def _find_local_ranks_no_collective(self):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return 1, rank, [[rank]]
+
+    _distributedStreamerParams.find_local_ranks = _find_local_ranks_no_collective
+
+
+if HAS_RUNAI_MODEL_STREAMER:
+    _disable_runai_streamer_rank_discovery_collective()
+
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the
