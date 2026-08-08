@@ -95,8 +95,11 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
     def test_trtllm_mla_stays_on_breakable_and_is_disabled_by_compatibility(self):
         args = ServerArgs(model_path="dummy")
+        # The MLA rule reads hf_config to exempt DSA models, so the stub needs
+        # an architecture that is MLA but not DSA.
         args.model_config = SimpleNamespace(
-            is_multimodal_piecewise_cuda_graph_supported=True
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         )
         args.cuda_graph_config = CudaGraphConfig(
             prefill=PhaseConfig(backend=Backend.BREAKABLE)
