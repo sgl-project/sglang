@@ -50,6 +50,32 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+## Docker
+
+Build the image from the repository root:
+
+```bash
+docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
+```
+
+The image uses the same CLI-only configuration as the native binary. Bind the
+router to `0.0.0.0` so its port is reachable outside the container, and pass a
+worker URL that the container can resolve and reach:
+
+```bash
+docker run --rm -p 30000:30000 \
+  sgl-router:dev \
+  --host 0.0.0.0 --port 30000 \
+  --model-id Qwen/Qwen3-0.6B \
+  --worker-urls http://worker.example.com:30000
+```
+
+Replace `worker.example.com` with the worker's DNS name or IP address. If the
+worker also runs in Docker, attach both containers to the same Docker network
+and use the worker container name. Add `--tokenizer-path` and mount a local
+`tokenizer.json` when the router should not download the tokenizer from
+HuggingFace.
+
 ## License
 
 Apache-2.0.

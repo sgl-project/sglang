@@ -20,10 +20,11 @@
 #
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
-# Run:
-#   docker run --rm -p 8090:8090 \
-#       -v $(pwd)/docker/sgl-router.sample.yaml:/etc/sgl-router/sgl-router.yaml \
-#       sgl-router:dev --config /etc/sgl-router/sgl-router.yaml
+# Run (replace worker.example.com with a worker reachable from the container):
+#   docker run --rm -p 30000:30000 sgl-router:dev \
+#       --host 0.0.0.0 --port 30000 \
+#       --model-id Qwen/Qwen3-0.6B \
+#       --worker-urls http://worker.example.com:30000
 #
 # Image budget: < 100 MB stripped (M6 acceptance). Verify with
 #   `docker image inspect sgl-router:dev --format '{{.Size}}'`.
@@ -82,9 +83,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /work/target/release/sgl-router /usr/local/bin/sgl-router
 
-# Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
-ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml
-EXPOSE 8090
+EXPOSE 30000
 
 # distroless `nonroot` runs as uid 65532. The router doesn't need root.
 USER nonroot:nonroot
