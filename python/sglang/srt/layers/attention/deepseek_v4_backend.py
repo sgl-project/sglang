@@ -68,9 +68,9 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
+    VerifyExtendLengths,
     compute_ragged_extend_lengths,
     compute_target_verify_graph_key,
-    compute_uniform_extend_lengths,
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
@@ -591,10 +591,6 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
 
-    def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
-        return pin_tensor.to(self.device, non_blocking=True)
-
     def _resolve_verify_layout(
         self,
         forward_batch: ForwardBatch,
@@ -910,12 +906,11 @@ class DeepseekV4AttnBackend(
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> DSV4Metadata:
         if ragged_layout is None:
-            lengths = compute_uniform_extend_lengths(
+            lengths, extend_seq_lens = self._uniform_extend_lengths(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 extend_len=self.speculative_num_draft_tokens,
             )
-            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
         else:
             lengths = compute_ragged_extend_lengths(
                 seq_lens=seq_lens,
@@ -945,6 +940,28 @@ class DeepseekV4AttnBackend(
             online_c128_state_slot_offset=online_c128_state_slot_offset,
         )
 
+    def _uniform_extend_lengths(
+        self, *, seq_lens: torch.Tensor, seq_lens_cpu: List[int], extend_len: int
+    ) -> Tuple[VerifyExtendLengths, torch.Tensor]:
+        # Uniform verify / draft-block geometry off the preallocated graph
+        # buffers (allocated only under spec decoding; both callers are
+        # spec-only). The returned slices are shared per backend instance;
+        # callers must not mutate them.
+        assert self.speculative_num_draft_tokens is not None
+        bs = int(seq_lens.shape[0])
+        extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+        extend_seq_lens.fill_(extend_len)
+        extend_start_loc = self.extend_start_loc_buffer[:bs]
+        torch.arange(0, bs * extend_len, extend_len, out=extend_start_loc)
+        lengths = VerifyExtendLengths(
+            seq_lens_extended=seq_lens + extend_len,
+            seq_lens_cpu_extended=[x + extend_len for x in seq_lens_cpu],
+            extend_seq_lens_cpu=[extend_len] * bs,
+            num_tokens=extend_len * bs,
+            extend_start_loc=extend_start_loc,
+        )
+        return lengths, extend_seq_lens
+
     def init_forward_metadata_dspark_draft_block(
         self,
         max_seq_len: int,
@@ -958,12 +975,11 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu_list = seq_lens.tolist()
         else:
             seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
-        lengths = compute_uniform_extend_lengths(
+        lengths, extend_seq_lens = self._uniform_extend_lengths(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu_list,
             extend_len=block_size,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
