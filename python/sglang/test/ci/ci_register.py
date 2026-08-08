@@ -2,12 +2,15 @@ import ast
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 __all__ = [
     "HWBackend",
     "CIRegistry",
+    "CIBundle",
     "collect_tests",
+    "bundle_in_process_groups",
+    "validate_in_process_groups",
     "auto_partition",
     "register_cpu_ci",
     "register_cuda_ci",
@@ -22,11 +25,17 @@ __all__ = [
 
 # `suite` stays in positional slot 2 for backward compat with existing
 # `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
-# (`stage`, `runner_config`) are kwarg-only.
+# (`stage`, `runner_config`, `in_process_group`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
-_KWARG_ONLY = ("stage", "runner_config")
+_KWARG_ONLY = ("stage", "runner_config", "in_process_group")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
+
+# Approximate wall-clock cost of `import sglang.*` + CUDA init for one fresh
+# `python3` invocation. Used as a heuristic when summing `est_time` across
+# members of an `in_process_group` whose grouped runtime hasn't yet been
+# measured into `live_est`. Picked empirically (~10s observed on H200).
+_BUNDLE_IMPORT_COST_SEC = 10.0
 
 
 class HWBackend(Enum):
@@ -51,12 +60,74 @@ class CIRegistry:
     suite: Optional[str] = None
     nightly: bool = False
     disabled: Optional[str] = None
+    # Files sharing the same `in_process_group` value run in a single
+    # `python3 -m unittest <mod1> <mod2> ...` invocation (per partition
+    # when partitioned; still one process on full-suite runs), amortizing
+    # the ~10s `import sglang` startup cost. Members must:
+    #   - be safe to share a Python interpreter (no global monkey-patching,
+    #     no env-var mutation other members depend on, etc.)
+    #   - live on importable module paths (every path segment a Python
+    #     identifier; JIT paths under python/ map to sglang.*)
+    #   - define unittest.TestCase subclasses (pytest function tests are
+    #     rejected at bundle run time — unittest would skip them silently)
+    #   - not import sibling modules by bare name. `python3 file.py` puts the
+    #     file's own directory on sys.path[0]; `-m unittest` puts cwd (test/)
+    #     there instead. `conftest.py` does not rescue this — it's a pytest
+    #     hook unittest never loads.
+    #   - tolerate every other member's module-level code running first:
+    #     unittest imports all named modules before executing any test.
+    #   - tolerate shared GPU/host state across members — one CUDA context
+    #     and one caching allocator for the whole bundle, and leaked server
+    #     processes or ports are no longer reclaimed by process exit.
+    # Files without this set keep the existing per-file `python3 file.py -f`
+    # behavior. Group identity must be uniform in (backend, suite, nightly);
+    # `validate_in_process_groups` enforces that over the unfiltered registry.
+    in_process_group: Optional[str] = None
 
     @property
     def effective_suite(self) -> Optional[str]:
         if self.stage is not None and self.runner_config is not None:
             return f"{self.stage}-test-{self.runner_config}"
         return self.suite
+
+
+@dataclass
+class CIBundle:
+    """A bundle of `CIRegistry` entries that share the same
+    `in_process_group` and run together in one `python3 -m unittest`
+    invocation. Produced by `bundle_in_process_groups` as an atomic
+    bin-pack unit so the whole group lands in a single partition (and
+    still runs as one process when the suite is not partitioned).
+
+    `est_time` is the bundle's wall-clock budget: either from a
+    grouped `live_est` entry keyed `"group:<group_key>"`, or, on first
+    rollout, `sum(member_est) - (N-1) * _BUNDLE_IMPORT_COST_SEC` where
+    each member_est prefers per-file `live_est` over in-source
+    `est_time`.
+
+    Kept as a dataclass (not msgspec.Struct) so this module stays
+    stdlib-only: `scripts/ci/utils/compute_partitions.py` loads it via
+    importlib on bare ubuntu-latest check-changes runners.
+    """
+
+    group_key: str
+    members: List["CIRegistry"]
+    est_time: float
+
+    @property
+    def filename(self) -> str:
+        """Display key, also the `live_est` key for grouped timings."""
+        return f"group:{self.group_key}"
+
+    @property
+    def effective_suite(self) -> Optional[str]:
+        return self.members[0].effective_suite
+
+    @property
+    def disabled(self) -> Optional[str]:
+        # Disabled members are filtered out before bundling, so a
+        # surviving bundle is always enabled.
+        return None
 
 
 def register_cpu_ci(
@@ -67,6 +138,7 @@ def register_cpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    in_process_group: Optional[str] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -80,6 +152,7 @@ def register_cuda_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    in_process_group: Optional[str] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -93,6 +166,7 @@ def register_amd_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    in_process_group: Optional[str] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -119,6 +193,7 @@ def register_npu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    in_process_group: Optional[str] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -132,6 +207,7 @@ def register_xpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
+    in_process_group: Optional[str] = None,
 ):
     """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -277,6 +353,14 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: disabled must be a string in {func_call.func.id}()"
             )
 
+        in_process_group = (
+            args["in_process_group"] if args["in_process_group"] is not _UNSET else None
+        )
+        if in_process_group is not None and not isinstance(in_process_group, str):
+            raise ValueError(
+                f"{self.filename}: in_process_group must be a string in {func_call.func.id}()"
+            )
+
         return {
             "est_time": float(est_time),
             "stage": stage,
@@ -284,6 +368,7 @@ class RegistryVisitor(ast.NodeVisitor):
             "suite": suite,
             "nightly": nightly,
             "disabled": disabled,
+            "in_process_group": in_process_group,
         }
 
     def _collect_ci_registry(self, func_call: ast.Call):
@@ -350,39 +435,146 @@ def ut_parse_one_file(filename: str) -> Tuple[List[CIRegistry], bool]:
     return visitor.registries, visitor.has_main_entry
 
 
+def _member_est_time(member: CIRegistry, live_est: Optional[dict]) -> float:
+    """Per-file estimate: prefer `live_est[filename]`, else in-source `est_time`."""
+    if live_est is not None and member.filename in live_est:
+        return float(live_est[member.filename])
+    return float(member.est_time)
+
+
+def validate_in_process_groups(all_tests: List[CIRegistry]) -> None:
+    """Every `in_process_group` must be uniform in (backend, suite, nightly).
+
+    `bundle_in_process_groups` only ever sees a list the caller already
+    narrowed to one backend/suite/nightly triple (`filter_tests` in
+    run_suite, the per-suite `suite_tests[suite]` grouping in
+    compute_partitions), so its own uniformity check can't fire: a
+    non-uniform group silently splits into one partial bundle per triple
+    instead of erroring. Validate over the unfiltered registry, where the
+    split is still visible -- called from `collect_tests` so both
+    run_suite and check-changes reject it pre-flight.
+    """
+    by_key: dict = {}
+    for t in all_tests:
+        if not t.in_process_group:
+            continue
+        by_key.setdefault(t.in_process_group, []).append(t)
+
+    errors = []
+    for key, members in sorted(by_key.items()):
+        triples = {(m.backend.name, m.effective_suite, m.nightly) for m in members}
+        if len(triples) > 1:
+            detail = ", ".join(
+                sorted(f"{b}/{s or '<none>'}/nightly={n}" for b, s, n in triples)
+            )
+            errors.append(f"  in_process_group={key!r} spans: {detail}")
+    if errors:
+        raise ValueError(
+            "in_process_group members must share one (backend, suite, nightly) "
+            "triple; otherwise the group silently splits into partial bundles "
+            "that each pay their own cold import:\n" + "\n".join(errors)
+        )
+
+
+def bundle_in_process_groups(
+    files: List[CIRegistry], live_est: Optional[dict] = None
+) -> List[Union[CIRegistry, CIBundle]]:
+    """Roll up CIRegistry entries that share an `in_process_group` value
+    into atomic `CIBundle` bin-pack units. Ungrouped files pass through.
+
+    Call this before `run_unittest_files` (and before LPT partitioning)
+    so `in_process_group` is honored on both partitioned and full-suite
+    runs.
+
+    Per-bundle est_time prefers a grouped `live_est[f"group:{key}"]`
+    entry recorded by a prior partition run; absent that, falls back
+    to `sum(member_est) - (N-1) * _BUNDLE_IMPORT_COST_SEC` where each
+    member_est prefers per-file `live_est` over in-source `est_time`
+    (each additional member avoids one cold `import sglang`).
+    """
+    grouped: dict[str, List[CIRegistry]] = {}
+    singletons: List[CIRegistry] = []
+    for f in files:
+        if f.in_process_group:
+            grouped.setdefault(f.in_process_group, []).append(f)
+        else:
+            singletons.append(f)
+
+    units: List[Union[CIRegistry, CIBundle]] = list(singletons)
+    for key, members in grouped.items():
+        # Defensive only -- callers pass an already-filtered list, so this
+        # can't fire in practice. `validate_in_process_groups` (run from
+        # `collect_tests`) is the authoritative check.
+        suites = {m.effective_suite for m in members}
+        if len(suites) > 1:
+            raise ValueError(
+                f"in_process_group={key!r} members map to multiple suites "
+                f"({sorted(s or '<none>' for s in suites)}); each group must be "
+                f"suite-uniform so bundling is unambiguous."
+            )
+        live_key = f"group:{key}"
+        if live_est is not None and live_key in live_est:
+            est = float(live_est[live_key])
+        else:
+            member_ests = [_member_est_time(m, live_est) for m in members]
+            est = sum(member_ests) - max(0, len(members) - 1) * _BUNDLE_IMPORT_COST_SEC
+            # Amortization assumes each member_est contains one cold import,
+            # which is false for members cheaper than that (20 files x 2s ->
+            # 40 - 190 = -150). Floor at the two hard lower bounds: a bundle
+            # can't beat one cold `import sglang`, nor its slowest member.
+            # Without this the bundle bin-packs as the cheapest unit in the
+            # suite while really costing ~50s, so the shard it lands on
+            # overruns its stage timeout.
+            est = max(est, _BUNDLE_IMPORT_COST_SEC, max(member_ests))
+        # Stable, filename-sorted member order so dotted-module argv is
+        # deterministic between partition runs.
+        ordered = sorted(members, key=lambda m: m.filename)
+        units.append(CIBundle(group_key=key, members=ordered, est_time=est))
+    return units
+
+
 def auto_partition(
     files: List[CIRegistry],
     rank: int,
     size: int,
     live_est: Optional[dict] = None,
-) -> List[CIRegistry]:
+) -> List[Union[CIRegistry, CIBundle]]:
     """Partition files into `size` sublists with approximately equal sums of
     estimated times using a greedy algorithm (LPT heuristic), and return the
     partition for the specified rank.
 
+    Files sharing an `in_process_group` are rolled up into a single
+    `CIBundle` bin-pack unit so the whole group lands in one partition
+    and runs as one `python3 -m unittest <mod1> <mod2> ...` invocation.
+
     `live_est`: optional `filename -> est seconds` overrides; missing
-    files fall back to in-source `est_time`.
+    files fall back to in-source `est_time`. Grouped runs are keyed
+    `"group:<group_key>"`.
     """
     if not files or size <= 0:
         return []
 
-    def est_of(f: CIRegistry) -> float:
-        if live_est is not None and f.filename in live_est:
-            return live_est[f.filename]
-        return f.est_time
+    units = bundle_in_process_groups(files, live_est=live_est)
 
-    # Sort by estimated_time descending; filename as tie-breaker for
-    # deterministic partitioning regardless of glob ordering.
-    sorted_files = sorted(files, key=lambda f: (-est_of(f), f.filename))
+    def est_of(u: Union[CIRegistry, CIBundle]) -> float:
+        if isinstance(u, CIBundle):
+            return u.est_time
+        if live_est is not None and u.filename in live_est:
+            return live_est[u.filename]
+        return u.est_time
 
-    partitions: List[List[CIRegistry]] = [[] for _ in range(size)]
+    # Sort by est descending; bundle/file `.filename` is tie-breaker so
+    # partitioning is deterministic regardless of glob ordering.
+    sorted_units = sorted(units, key=lambda u: (-est_of(u), u.filename))
+
+    partitions: List[List[Union[CIRegistry, CIBundle]]] = [[] for _ in range(size)]
     partition_sums = [0.0] * size
 
-    # Greedily assign each file to the partition with the smallest current total time
-    for file in sorted_files:
+    # Greedily assign each unit to the partition with the smallest current total time
+    for unit in sorted_units:
         min_sum_idx = min(range(size), key=partition_sums.__getitem__)
-        partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += est_of(file)
+        partitions[min_sum_idx].append(unit)
+        partition_sums[min_sum_idx] += est_of(unit)
 
     if rank < size:
         return partitions[rank]
@@ -416,5 +608,9 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
             )
 
         ci_tests.extend(registries)
+
+    # Cross-file check: needs the unfiltered set, so it can't live in
+    # `bundle_in_process_groups` (see its docstring).
+    validate_in_process_groups(ci_tests)
 
     return ci_tests

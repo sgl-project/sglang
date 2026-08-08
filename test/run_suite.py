@@ -8,9 +8,11 @@ from typing import Dict, List, Optional
 import tabulate
 
 from sglang.test.ci.ci_register import (
+    CIBundle,
     CIRegistry,
     HWBackend,
     auto_partition,
+    bundle_in_process_groups,
     collect_tests,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
@@ -252,9 +254,7 @@ def filter_tests(
     return enabled_tests, skipped_tests
 
 
-def pretty_print_tests(
-    args, ci_tests: List[CIRegistry], skipped_tests: List[CIRegistry]
-):
+def pretty_print_tests(args, ci_tests, skipped_tests: List[CIRegistry]):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
     nightly = args.nightly
@@ -282,11 +282,23 @@ def pretty_print_tests(
         msg += "This is expected during incremental migration. Skipping.\n"
     else:
         total_est_time = sum(t.est_time for t in ci_tests)
+        n_members = sum(
+            len(t.members) if isinstance(t, CIBundle) else 1 for t in ci_tests
+        )
         msg += (
-            f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):\n"
+            f"✅ Enabled {len(ci_tests)} unit(s) / {n_members} file(s) "
+            f"(est total {total_est_time:.1f}s):\n"
         )
         for t in ci_tests:
-            msg += f"  - {t.filename} (est_time={t.est_time})\n"
+            if isinstance(t, CIBundle):
+                msg += (
+                    f"  - {t.filename} (bundle, {len(t.members)} files, "
+                    f"est_time={t.est_time})\n"
+                )
+                for m in t.members:
+                    msg += f"      · {m.filename}\n"
+            else:
+                msg += f"  - {t.filename} (est_time={t.est_time})\n"
 
     print(msg, flush=True)
 
@@ -308,8 +320,17 @@ def load_live_est(
     suite_est = partition_model.get("est", {}).get(suite)
     if not isinstance(suite_est, dict) or not suite_est:
         return None
+    # Per-file keys are repo-relative paths -> absolute (matches
+    # `CIRegistry.filename` shape produced by the suite glob). Bundle
+    # keys (`group:<key>` recorded by `_run_one_bundle`) are not
+    # filesystem paths and must be preserved verbatim so the bundle
+    # lookup in `bundle_in_process_groups` can find them.
     return {
-        os.path.join(repo_root, relpath): float(elapsed)
+        (
+            relpath
+            if relpath.startswith("group:")
+            else os.path.join(repo_root, relpath)
+        ): float(elapsed)
         for relpath, elapsed in suite_est.items()
     }
 
@@ -344,8 +365,10 @@ def run_a_suite(args):
     validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
+    # Live est is useful for both LPT partitioning and first-run bundle
+    # wall estimates (per-file live_est preferred over in-source est_time).
+    live_est = load_live_est(args.partition_model_file, suite, repo_root)
     if auto_partition_size:
-        live_est = load_live_est(args.partition_model_file, suite, repo_root)
         if live_est is not None:
             print(
                 f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
@@ -356,9 +379,16 @@ def run_a_suite(args):
                 f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
                 flush=True,
             )
+        # auto_partition rolls in_process_group members into CIBundle
+        # units before LPT so the whole group lands in one partition.
         ci_tests = auto_partition(
             ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
         )
+    else:
+        # Full-suite (non-partitioned) runs must still honor
+        # in_process_group; without this roll-up, grouped files would
+        # silently fall back to one python3 process each.
+        ci_tests = bundle_in_process_groups(ci_tests, live_est=live_est)
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 

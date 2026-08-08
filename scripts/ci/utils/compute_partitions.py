@@ -30,6 +30,8 @@ _spec = importlib.util.spec_from_file_location("ci_register", _CI_REGISTER_PATH)
 _ci_register = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ci_register)
 collect_tests = _ci_register.collect_tests
+bundle_in_process_groups = _ci_register.bundle_in_process_groups
+CIBundle = _ci_register.CIBundle
 HWBackend = _ci_register.HWBackend
 
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
@@ -146,11 +148,29 @@ def compute_partitions(
 
     result = {}
     for suite, group in suite_tests.items():
-        live_est = est_table.get(suite, {})
+        live_est_raw = est_table.get(suite, {}) or {}
+        # model.json keys are repo-relative paths (or group:<key>).
+        # CIRegistry.filename is absolute under repo_root — remap so
+        # bundle_in_process_groups / per-file live_est lookups match.
+        live_est = {}
+        for key, elapsed in live_est_raw.items():
+            if key.startswith("group:"):
+                live_est[key] = float(elapsed)
+            else:
+                live_est[os.path.join(repo_root, key)] = float(elapsed)
+
+        # Roll in_process_group members into atomic CIBundle units so
+        # suite total and the ideal_size vs unit-count guard match what
+        # auto_partition will actually bin-pack (one large bundle, not
+        # N independent files that inflate shard count).
+        units = bundle_in_process_groups(group, live_est=live_est)
         total = 0.0
-        for t in group:
-            relpath = os.path.relpath(t.filename, repo_root)
-            total += live_est.get(relpath, t.est_time)
+        for u in units:
+            if isinstance(u, CIBundle):
+                total += u.est_time
+            else:
+                relpath = os.path.relpath(u.filename, repo_root)
+                total += live_est_raw.get(relpath, u.est_time)
 
         fit = fit_table.get(suite) or {}
         coeff = fit.get("coeff", 1.0)
@@ -174,13 +194,16 @@ def compute_partitions(
                     "Investigate the fit or raise the stage's run_timeout_minutes."
                 )
             ideal_size = math.ceil(coeff * total / budget)
-            # ideal_size > len(group) -> slowest single file alone exceeds
+            # ideal_size > len(units) -> slowest single unit alone exceeds
             # the per-shard budget; surface via raise instead of empty shard.
-            if ideal_size > len(group):
+            # Count is over bin-pack units (bundles + singletons), not raw
+            # files — a 27-file in_process_group is one unit.
+            if ideal_size > len(units):
                 raise RuntimeError(
                     f"Suite {suite!r}: needs {ideal_size} shards but has only "
-                    f"{len(group)} test file(s). target={target:.0f}s, "
-                    f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
+                    f"{len(units)} bin-pack unit(s) ({len(group)} file(s)). "
+                    f"target={target:.0f}s, coeff={coeff}, bias={bias}s, "
+                    f"total_est={total:.0f}s."
                 )
             size = max(1, ideal_size)
             # The throttle rations scarce self-hosted GPU runners; hosted
