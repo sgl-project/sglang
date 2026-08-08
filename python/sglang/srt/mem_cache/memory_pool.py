@@ -316,6 +316,19 @@ class ReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def alloc_raw(self, need_size: int) -> Optional[List[int]]:
+        """Allocate bare row slots with no Req binding (beam member rows);
+        release with free_raw."""
+        if need_size > len(self.free_slots):
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        self.req_generation[select_index] += 1
+        return select_index
+
+    def free_raw(self, indices: List[int]) -> None:
+        self.free_slots.extend(indices)
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)

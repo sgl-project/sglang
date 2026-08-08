@@ -44,6 +44,7 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -91,6 +92,7 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
+    beam_coordinator: BeamCoordinator
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -264,12 +266,20 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
+                    if req.beam_group is not None:
+                        # Beam leader: the joint selection already replaced the
+                        # sampled-token append at the forward's relay point,
+                        # and the group owns all finish semantics.
+                        self.beam_coordinator.commit_prefill(
+                            req, up_to_tick=batch.forward_iter
+                        )
+                    else:
+                        # req output_ids are set here
+                        req.output_ids.append(next_token_id)
 
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
+                        self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                    req.update_finish_state()
+                        req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -843,8 +853,31 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Deferred commit: folds the relay point's selection into the DAG and
+        # sets the group-atomic finish states the loop below observes.
+        # (Beam + spec is rejected at admission.)
+        newly_finished_beam_groups = set()
+        if batch.spec_algorithm.is_none() and logits_output is not None:
+            newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
+
         for i, req in enumerate(batch.reqs):
             req: Req
+
+            if req.beam_group is not None:
+                # The commit pre-pass owns tokens and finish state; only the
+                # shared finish machinery (KV release, completion time) runs
+                # here. Under overlap a finished row reappears for one
+                # overshoot tick, so gate on the tick that finished the group
+                # to run this exactly once.
+                if req.finished() and (
+                    id(req.beam_group) not in newly_finished_beam_groups
+                ):
+                    continue
+                req.time_stats.set_last_decode_finish_time()
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
+                continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted

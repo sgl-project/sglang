@@ -16,7 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -58,6 +58,9 @@ from sglang.srt.utils.common import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +199,10 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+
+    # Beam search only: raw pre-sample logits for the scheduler-side joint
+    # selection; see beam_search.logits_capture.
+    beam: Optional["BeamLogitsCapture"] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
