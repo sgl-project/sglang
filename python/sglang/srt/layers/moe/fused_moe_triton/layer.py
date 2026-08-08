@@ -379,6 +379,45 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        if get_moe_runner_backend().is_flashinfer_alphamoe():
+            if not isinstance(self.quant_method, Fp8MoEMethod):
+                raise ValueError(
+                    "flashinfer_alphamoe supports only native fine-grained FP8 "
+                    "MoE weights. NVFP4/ModelOpt global scales cannot be "
+                    "represented by the AlphaMoE W8A8 API."
+                )
+            if (
+                not self.quant_method.block_quant
+                or tuple(self.quant_method.weight_block_size) != (128, 128)
+                or not self.quant_method.quant_config.is_checkpoint_fp8_serialized
+                or self.quant_method.use_mxfp8
+                or self.quant_method.is_fp4_expert
+            ):
+                raise ValueError(
+                    "flashinfer_alphamoe requires a serialized W8A8 checkpoint "
+                    "with FP32 128x128 block scales; MXFP8 and NVFP4/ModelOpt "
+                    "formats are unsupported."
+                )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                validate_alphamoe_runner_contract,
+            )
+
+            validate_alphamoe_runner_contract(
+                ep_size=self.moe_ep_size,
+                a2a_is_none=get_moe_a2a_backend().is_none(),
+                num_fused_shared_experts=num_fused_shared_experts,
+                with_bias=with_bias,
+                is_gated=is_gated,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                no_combine=no_combine,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_clamp_limit=gemm1_clamp_limit,
+                swiglu_limit=swiglu_limit,
+                params_dtype=params_dtype,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
@@ -416,10 +455,11 @@ class FusedMoE(torch.nn.Module):
         if (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_alphamoe()
         ):
             if self.moe_runner_config.inplace:
                 print_info_once(
-                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
+                    "Setting inplace to False for fused FlashInfer MoE backend."
                 )
             self.moe_runner_config.inplace = False
 
@@ -1082,6 +1122,11 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
+        elif (
+            isinstance(method, Fp8MoEMethod)
+            and get_moe_runner_backend().is_flashinfer_alphamoe()
+        ):
+            method.maybe_restore_alphamoe_weights_for_load(self)
         elif isinstance(method, Fp8MoEMethod) and (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
@@ -1314,6 +1359,11 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
+        elif (
+            isinstance(method, Fp8MoEMethod)
+            and get_moe_runner_backend().is_flashinfer_alphamoe()
+        ):
+            method.maybe_restore_alphamoe_weights_for_load(self)
 
         if (
             self.quant_config is not None

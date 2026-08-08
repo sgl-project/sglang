@@ -119,6 +119,7 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or backend.is_hpc_ops()
+            or backend.is_flashinfer_alphamoe()
             or self.enable_flashinfer_mxfp4_moe
         )
         self.num_experts = moe_runner_config.num_experts

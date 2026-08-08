@@ -1061,6 +1061,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
+        self._alphamoe_weights_interleaved = False
+        self._alphamoe_route_plan_cache = None
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
@@ -1704,6 +1706,66 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         weight_shape=weight.shape[-2:],
                     )
 
+        if get_moe_runner_backend().is_flashinfer_alphamoe():
+            self._prepare_alphamoe_weights(layer)
+
+    def _prepare_alphamoe_weights(self, layer: Module) -> None:
+        if self._alphamoe_weights_interleaved:
+            return
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+            interleave_alphamoe_fp8_weights_for_runtime,
+            validate_alphamoe_w8a8_weights,
+            warmup_alphamoe_jit_modules,
+        )
+
+        validate_alphamoe_w8a8_weights(
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            block_shape=self.weight_block_size,
+            top_k=self.moe_runner_config.top_k,
+            use_mxfp8=self.use_mxfp8,
+            is_fp4_expert=self.is_fp4_expert,
+        )
+        if layer.w13_weight.device.type != "cuda":
+            raise ValueError("flashinfer_alphamoe weights must reside on CUDA")
+        capability = torch.cuda.get_device_capability(layer.w13_weight.device)
+        if capability not in {(10, 0), (10, 3)}:
+            raise ValueError(
+                "flashinfer_alphamoe requires compute capability 10.0 or "
+                f"10.3, got {capability}"
+            )
+        if (
+            layer.w13_weight_scale_inv.format_ue8m0
+            or layer.w2_weight_scale_inv.format_ue8m0
+        ):
+            raise ValueError(
+                "flashinfer_alphamoe requires ordinary FP32 block scales, not "
+                "UE8M0-encoded or backend-swizzled scales"
+            )
+
+        interleave_alphamoe_fp8_weights_for_runtime(
+            layer.w13_weight, layer.w13_weight_scale_inv
+        )
+        self._alphamoe_weights_interleaved = True
+        warmup_alphamoe_jit_modules()
+
+    def maybe_restore_alphamoe_weights_for_load(self, layer: Module) -> None:
+        """Undo the device layout once before writing a new checkpoint."""
+
+        if not self._alphamoe_weights_interleaved:
+            return
+        from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+            restore_alphamoe_fp8_weights_for_loading,
+        )
+
+        restore_alphamoe_fp8_weights_for_loading(
+            layer.w13_weight, layer.w13_weight_scale_inv
+        )
+        self._alphamoe_weights_interleaved = False
+
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (
             convert_mxfp8_weight_to_block_fp8,
@@ -2298,10 +2360,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_flashinfer_alphamoe()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
         ):
+            if moe_runner_backend.is_flashinfer_alphamoe():
+                from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                    AlphaMoeRoutePlanCache,
+                )
+
+                self._alphamoe_route_plan_cache = AlphaMoeRoutePlanCache()
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -2494,6 +2563,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
+            )
+        elif self.runner.runner_backend.is_flashinfer_alphamoe():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                FlashInferAlphaMoeFp8QuantInfo,
+            )
+
+            if self._alphamoe_route_plan_cache is None:
+                raise RuntimeError("AlphaMoE route-plan cache was not initialized")
+            quant_info = FlashInferAlphaMoeFp8QuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale_inv=layer.w13_weight_scale_inv,
+                w2_weight_scale_inv=layer.w2_weight_scale_inv,
+                route_plan_cache=self._alphamoe_route_plan_cache,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()
