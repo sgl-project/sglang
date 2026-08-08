@@ -121,6 +121,11 @@ Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only supp
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Blackwell with TRT-LLM.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>flashinfer_alphamoe</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental opt-in FlashInfer backend that fuses selected-logit softmax routing with the AlphaMoE W8A8 expert path. It currently accepts only the validated Qwen3-Next-80B-A3B-Instruct-FP8 TP4 geometry: 512 experts, hidden size 2048, TP-sharded intermediate size 128, top-k 10, native FP8 128x128 block weights, BF16 activations, EP1, and no all-to-all or fused shared experts. NVFP4/ModelOpt is not supported because its global scale contract is not represented by the AlphaMoE W8A8 API.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>B200 or B300 with the required FlashInfer AlphaMoE APIs.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`flashinfer_cutlass`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer combined with CUTLASS for high-performance grouped GEMMs in MoE layers, handling FP4/FP8 quantization efficiently.  Compatible with flashinfer all-to-all.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Blackwell with FP4/FP8 models.</td>
@@ -145,6 +150,17 @@ Launch with DeepEP and DeepGEMM for DeepSeek-V3:
 ```bash Command
 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --moe-a2a-backend deepep --moe-runner-backend deep_gemm --tp 8 --ep 8
 ```
+
+Launch the experimental AlphaMoE backend for its validated Qwen3-Next FP8
+configuration:
+
+```bash Command
+python -m sglang.launch_server --model-path Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 --tp 4 --ep 1 --moe-a2a-backend none --moe-runner-backend flashinfer_alphamoe
+```
+
+The backend fails closed for every other model geometry, quantization format,
+or GPU architecture. It requires an exact SM100/SM103 GPU and a FlashInfer
+build containing the AlphaMoE fused-router and W8A8 APIs.
 
 ## Extensible EP Framework
 
