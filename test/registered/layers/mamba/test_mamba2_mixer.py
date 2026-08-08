@@ -10,6 +10,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     update_environment_variables,
 )
 from sglang.srt.distributed.parallel_state import (
+    get_default_distributed_backend,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -96,9 +97,14 @@ def mixer2_gated_norm_tensor_parallel(
         }
     )
 
-    # initialize distributed
+    # initialize distributed; select the device-appropriate backend (nccl on
+    # CUDA, xccl on XPU, ...) instead of the "nccl" default so this runs on
+    # non-CUDA multi-device hosts.
     init_distributed_environment(
-        world_size=world_size, rank=local_rank, local_rank=local_rank
+        world_size=world_size,
+        rank=local_rank,
+        local_rank=local_rank,
+        backend=get_default_distributed_backend(device.type),
     )
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
