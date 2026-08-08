@@ -349,17 +349,36 @@ def handle_tag_run_ci(
     return True
 
 
+def _latest_run_per_workflow(runs):
+    """
+    Collapse a head_sha's workflow runs to the newest run per workflow.
+
+    GitHub can have several runs of the *same* workflow at one commit — a
+    `synchronize` run superseded by a `labeled` run, or a run cancelled by
+    `cancel-in-progress` (pr-test.yml sets it) while its replacement is
+    already in flight. Only the newest one reflects current state; rerunning
+    the older ones spawns duplicates that fight the live run for runners.
+    """
+    latest = {}
+    for run in runs:
+        current = latest.get(run.workflow_id)
+        if current is None or run.id > current.id:
+            latest[run.workflow_id] = run
+    return list(latest.values())
+
+
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' or 'skipped' conclusions.
+    Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
+    'timed_out'.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed or skipped workflows.")
+    print("Permission granted. Triggering rerun of unsuccessful workflows.")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -405,7 +424,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 f"Failed to check kernel wheel status: {e} - falling back to full rerun"
             )
 
-    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    # Rerun workflows that ended in failure, skipped, cancelled or timed_out.
     #
     # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
     #   dependent jobs* (GitHub API). Fast-fail cascades call
@@ -420,22 +439,29 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   label-gated workflow, add the missing label (the `labeled` event
     #   dispatches a fresh run with the current label set); this function
     #   cannot recover those by rerun alone.
+    # - cancelled / timed_out: also full run.rerun(). rerun_failed_jobs()
+    #   rejects a run whose jobs were all cancelled ("no failed jobs"), and
+    #   for a run holding both a failed job and cancelled ones it would
+    #   restart only the failed job, leaving the cancelled stages unrun.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = gh_repo.get_workflow_runs(head_sha=head_sha)
+    runs = _latest_run_per_workflow(gh_repo.get_workflow_runs(head_sha=head_sha))
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
+            # A newer attempt is still in flight - nothing to recover.
             continue
-        if run.conclusion not in ("failure", "skipped"):
+        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+            # action_required (fork PR awaiting approval) is deliberately left
+            # out: it needs an approval, not a rerun.
             continue
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
-            if run.conclusion == "skipped" or (
+            if run.conclusion != "failure" or (
                 sgl_kernel_changes and not kernel_wheel_built
             ):
                 print("  Full rerun")
@@ -453,7 +479,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed or skipped workflows found to rerun.")
+        print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
         return False
 
 
