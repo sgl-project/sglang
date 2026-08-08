@@ -44,6 +44,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    inplace_update: bool = True,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -68,6 +69,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        inplace_update=inplace_update,
     )
     o = chunk_fwd_o(
         q=q,
@@ -101,6 +103,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        inplace_update: bool = True,
     ):
         q_orig = q
         k_orig = k
@@ -125,6 +128,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            inplace_update=inplace_update,
         )
         return o.to(q.dtype), h
 
@@ -142,6 +146,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    inplace_update: bool = True,
 ):
     r"""
     Args:
@@ -170,6 +175,8 @@ def chunk_gated_delta_rule(
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
             Default: `False`.
+        inplace_update (Optional[bool]):
+            Whether to write final states back to `initial_state`. Default: `True`.
 
     Returns:
         o (torch.Tensor):
@@ -256,6 +263,7 @@ def chunk_gated_delta_rule(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        inplace_update,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
