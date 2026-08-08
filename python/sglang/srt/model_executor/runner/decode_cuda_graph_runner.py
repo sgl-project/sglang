@@ -82,7 +82,10 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.model_executor.runner_utils import WarReadDonePolicy
+from sglang.srt.model_executor.runner_utils import (
+    WarReadDonePolicy,
+    resolve_war_read_done_policy,
+)
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
@@ -441,20 +444,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _war_read_done_policy(self, attn_backend, forward_mode) -> WarReadDonePolicy:
         """Whether and where this replay records its WAR read-done event."""
         if forward_mode.is_target_verify():
-            if (
-                not self.model_runner.spec_algorithm.supports_target_verify_war_read_done()
-            ):
+            if not self.model_runner.spec_algorithm.is_war_publish_phase(forward_mode):
                 return WarReadDonePolicy.NONE
-            if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph:
-                return WarReadDonePolicy.POST_REPLAY
-            if self._war_read_done_node_planted:
-                return WarReadDonePolicy.IN_GRAPH
-            return WarReadDonePolicy.PRE_REPLAY
-        elif forward_mode.is_decode():
-            if self._war_read_done_node_planted:
-                return WarReadDonePolicy.IN_GRAPH
-            return WarReadDonePolicy.PRE_REPLAY
-        return WarReadDonePolicy.NONE
+        elif not forward_mode.is_decode():
+            return WarReadDonePolicy.NONE
+        return resolve_war_read_done_policy(
+            attn_backend.shared_read_boundary(forward_mode),
+            node_planted=self._war_read_done_node_planted,
+        )
 
     def _publish_war_read_done(self, in_graph: bool):
         """Publish the read-done event the scheduler's WAR barrier waits on."""

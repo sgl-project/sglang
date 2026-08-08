@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -19,14 +20,19 @@ class _SpecAlgorithm:
     def __init__(self, target_verify_war: bool = False):
         self._target_verify_war = target_verify_war
 
-    def supports_target_verify_war_read_done(self) -> bool:
-        return self._target_verify_war
+    def is_war_publish_phase(self, forward_mode) -> bool:
+        return self._target_verify_war and forward_mode.is_target_verify()
 
 
 def _attn_backend(*, breakable_metadata=False):
-    return SimpleNamespace(
-        use_captured_forward_metadata_for_breakable_cuda_graph=breakable_metadata,
-    )
+    def shared_read_boundary(forward_mode):
+        if breakable_metadata and forward_mode.is_target_verify():
+            return SharedReadBoundary.POST_REPLAY
+        if forward_mode.is_decode() or forward_mode.is_target_verify():
+            return SharedReadBoundary.IN_REPLAY
+        return SharedReadBoundary.UNKNOWN
+
+    return SimpleNamespace(shared_read_boundary=shared_read_boundary)
 
 
 def _runner(*, target_verify_war: bool = False, planted: bool = False):

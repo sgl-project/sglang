@@ -7,22 +7,36 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
 
-# Whether and where the WAR read-done record lands for a replay.
+# Where the WAR read-done record lands; derived from a SharedReadBoundary
+# by resolve_war_read_done_policy.
 class WarReadDonePolicy(Enum):
-    # This forward mode or algorithm does not publish a read-done event.
     NONE = auto()
-    # Snapshot backends finish all shared reads before launch.
     PRE_REPLAY = auto()
-    # Captured metadata initialization finishes all shared reads.
     IN_GRAPH = auto()
-    # Captured-metadata replays keep reading shared buffers throughout the graph.
     POST_REPLAY = auto()
+
+
+def resolve_war_read_done_policy(
+    boundary: SharedReadBoundary, *, node_planted: bool
+) -> WarReadDonePolicy:
+    """IN_REPLAY without a planted node falls back to a pre-replay record
+    (non-capturing runs / no external-event support; pre-existing behavior)."""
+    if boundary is SharedReadBoundary.PRE_REPLAY:
+        return WarReadDonePolicy.PRE_REPLAY
+    if boundary is SharedReadBoundary.IN_REPLAY:
+        if node_planted:
+            return WarReadDonePolicy.IN_GRAPH
+        return WarReadDonePolicy.PRE_REPLAY
+    if boundary is SharedReadBoundary.POST_REPLAY:
+        return WarReadDonePolicy.POST_REPLAY
+    return WarReadDonePolicy.NONE
 
 
 def make_war_read_done_event(device_module) -> Optional[torch.cuda.Event]:
@@ -47,7 +61,11 @@ def maybe_publish_prefill_war_read_done(
     # WAR boundaries are validated.
     if not model_runner.spec_algorithm.is_none():
         return
-    if not model_runner.attn_backend.prefill_shared_reads_end_at_metadata_init:
+    # The record lands right after replay prep, so PRE_REPLAY only.
+    boundary = model_runner.attn_backend.shared_read_boundary(
+        forward_batch.forward_mode
+    )
+    if boundary is not SharedReadBoundary.PRE_REPLAY:
         return
     logger.info_once(
         "Prefill WAR read-done fastpath active (%s)",
