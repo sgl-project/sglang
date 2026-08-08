@@ -2341,6 +2341,12 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.global_forward_mode.is_extend_without_speculative()
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
+            # The non-EP path gathers variable-length metadata across the full
+            # TP group and is only valid when each DP shard has one attention
+            # rank. EP/Mori TBO uses a different communication strategy.
+            and (
+                not get_moe_a2a_backend().is_none() or get_parallel().attn_tp_size == 1
+            )
         )
 
     def _forward_layers_tbo(
