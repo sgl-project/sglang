@@ -1033,6 +1033,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        assert (
+            seq_lens_expanded.shape[0] == q_offset
+        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        assert (
+            topk_result.shape[0] >= q_offset
+        ), f"topk_result too short: {topk_result.shape[0]} < {q_offset}"
+        if topk_result.shape[0] > q_offset:
+            topk_result[q_offset:].fill_(-1)
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
@@ -1086,9 +1094,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if global_topk_offset is None:
             cu_seqlens_q_full = torch.ones(q_offset, dtype=torch.int32, device=device)
 
-        assert (
-            seq_lens_expanded.shape[0] == q_offset
-        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
         if global_topk_offset is not None:
             assert (
                 global_topk_offset.shape[0] >= q_offset
@@ -1220,8 +1225,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not return_indices:
             return None
 
-        # MLA: use dummy logits with topk kernel's fast path to generate indices
-        # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
+        # MLA K-only: PAGED metadata can write page-table-mapped prefix indices
+        # directly. Other metadata/backend combinations fall back to dummy logits.
+        fast_topk_result = metadata.try_only_k_topk_paged_fused(
+            self.index_topk,
+            output=topk_result,
+        )
+        if fast_topk_result is not None:
+            return fast_topk_result if topk_result is None else None
+
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
@@ -1233,6 +1245,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
+            topk_result.fill_(-1)
             topk_result[: raw_topk_result.shape[0]] = raw_topk_result
             return None
         return raw_topk_result
@@ -1584,15 +1597,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             if return_indices:
-                topk_result = torch.full(
-                    (x.shape[0], self.index_topk),
-                    -1,
-                    device=x.device,
+                # The split op decides whether this replay is K-only from the
+                # real forward metadata. Allocate without clearing here so a
+                # capture-time dummy shape cannot force a redundant fill on the
+                # K-only path. The split op must write all valid rows and reset
+                # padded rows to -1 before the downstream graph reads this.
+                topk_result = torch.empty(
+                    (x_meta.shape[0], self.index_topk),
+                    device=x_meta.device,
                     dtype=torch.int32,
                 )
             else:
                 topk_result = torch.empty(
-                    (0, self.index_topk), device=x.device, dtype=torch.int32
+                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             graph_dispatch_fn = (
                 bcg_dsa_indexer_prefill_split
