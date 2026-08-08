@@ -1518,6 +1518,7 @@ class ServerArgs:
         "Port on which this worker listens for load reporter gRPC connections. "
         "None (default) disables load reporting with zero socket, task, or "
         "optional-dependency overhead.",
+        NS("observability"),
     ] = None
     tokenizer_metrics_custom_labels_header: A[
         str,

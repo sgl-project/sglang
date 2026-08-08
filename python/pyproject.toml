@@ -172,6 +172,7 @@ test = [
   "polars",
   "pytest",
   "pytest-cov",
+  "pytest-asyncio",
   "sentence_transformers",
   "sglang[fastokens]",
   "sglang[load-reporter]",
