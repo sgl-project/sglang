@@ -133,6 +133,10 @@ Quant-VideoGen KV-cache quantization targets long-running autoregressive video
 sessions, where the causal self-attention cache can become comparable to the
 model weights. It does not change or quantize the checkpoint weights.
 
+See [Realtime and Causal Video Models](./realtime_models) for the session
+lifecycle, supported pipelines, and the distinction between realtime and
+request-based causal generation.
+
 Install the optional dependency without allowing its stale Torch requirement to
 replace SGLang's pinned Torch version, then enable int4 compression when serving
 a supported LingBot World realtime pipeline:
