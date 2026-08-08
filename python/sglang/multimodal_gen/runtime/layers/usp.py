@@ -164,7 +164,8 @@ def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
     IPC_A2A.signal()
     out = local[slot].narrow(0, 0, n_out).view(b, my_len, 2 * h_local, d)
     out[:, :, r * h_local : (r + 1) * h_local].copy_(x.narrow(1, off[r], my_len))
-    IPC_A2A.wait()
+    if IPC_A2A.wait_and_check():
+        return None
     return out
 
 
@@ -196,7 +197,9 @@ def _ipc_input_a2a_qkv(q, k, v):
         out = t.new_empty(b, 2 * s_local, half, d)
         out.narrow(1, r * s_local, s_local).copy_(t[:, :, r * half : (r + 1) * half])
         outs.append(out)
-    IPC_A2A.signal_and_wait()
+    IPC_A2A.signal()
+    if IPC_A2A.wait_and_check():
+        return None
     for i, out in enumerate(outs):
         theirs = local[slot].narrow(0, i * n, n).view(b, s_local, half, d)
         out.narrow(1, (1 - r) * s_local, s_local).copy_(theirs)
@@ -257,7 +260,8 @@ def _ipc_input_a2a_qkv_segmented(txt_q, img_q, txt_k, img_k, txt_v, img_v, local
     # overlap with the peer's wait
     IPC_A2A.signal()
     torch._foreach_copy_(loc_dsts, loc_srcs)
-    IPC_A2A.wait()
+    if IPC_A2A.wait_and_check():
+        return None
     return tuple(outs)
 
 
