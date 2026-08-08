@@ -64,6 +64,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import compile_in_capture_mode
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
@@ -1159,10 +1160,19 @@ class DeepseekV4AttnBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+
+            def translate_full_to_swa_int32(full_to_swa_mapping, full_locs):
+                return full_to_swa_mapping[full_locs].to(torch.int32)
+
+            full_to_swa_mapping = self.token_to_kv_pool.full_to_swa_index_mapping
+            assert full_to_swa_mapping is not None
+            if out_cache_loc.is_cuda:
+                translate_full_to_swa_int32 = compile_in_capture_mode(
+                    translate_full_to_swa_int32
                 )
+            metadata.core_attn_metadata.swa_out_cache_loc = translate_full_to_swa_int32(
+                full_to_swa_mapping,
+                out_cache_loc,
             )
 
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
