@@ -65,6 +65,14 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
+    def test_session_params_forwarded(self):
+        # Regression test for #23579: session_params was silently dropped.
+        req = CompletionRequest(
+            model="x", prompt="Hello", max_tokens=100, session_params={"id": "s1"}
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.session_params, {"id": "s1"})
+
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(
