@@ -161,37 +161,75 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
 
 
 class TestNormalizeDeepseekV4Compat(unittest.TestCase):
-    """Guard #34092: transformers >= 4.57 renamed ``compress_ratios`` to
-    ``compress_rates`` on ``DeepseekV4Config``. Every sglang reader uses the
-    legacy name, so the loader must backfill it at the config-load boundary.
-    Before the fix, a config with only ``compress_rates`` raised
-    ``AttributeError`` at ``ModelConfig.__init__`` (model_config.py:
-    ``self.compress_ratios = self.hf_config.compress_ratios``)."""
+    """Guard #34092: transformers >= 4.57 renamed the DeepSeek V4 field *and*
+    reshaped it — ``compress_ratios: list[int]`` became
+    ``compress_rates: dict[str, int]`` paired with
+    ``layer_types: list[str]``. sglang readers still index ``compress_ratios``
+    by layer id (e.g. ``config.compress_ratios[layer_id]`` in
+    ``models/deepseek_v4.py``), so the loader must rebuild a per-layer list
+    from the two new fields. A naive rename-only backfill would give
+    downstream a dict and swap the original AttributeError for a KeyError."""
 
-    def test_backfills_compress_ratios_from_compress_rates(self):
+    _LT_CSA = "compressed_sparse_attention"
+    _LT_HCA = "heavily_compressed_attention"
+
+    def _make_new_transformers_config(self):
         cfg = PretrainedConfig()
         cfg.model_type = "deepseek_v4"
-        cfg.compress_rates = [4, 128, 4]
-        normalize_deepseek_v4_compat(cfg)
-        self.assertEqual(cfg.compress_ratios, [4, 128, 4])
+        cfg.compress_rates = {self._LT_CSA: 4, self._LT_HCA: 128}
+        cfg.layer_types = [self._LT_HCA, self._LT_CSA, self._LT_HCA]
+        return cfg
 
-    def test_preserves_existing_legacy_name(self):
-        # Older-transformers config already carries the legacy name; the
-        # helper must not clobber it with the (absent) new name.
+    def test_expands_compress_rates_dict_by_layer_types(self):
+        cfg = self._make_new_transformers_config()
+        normalize_deepseek_v4_compat(cfg)
+        # Legacy shape: list[int] indexable by layer id, values from the dict
+        # resolved via layer_types.
+        self.assertEqual(cfg.compress_ratios, [128, 4, 128])
+        self.assertEqual(cfg.compress_ratios[0], 128)  # ``config.compress_ratios[layer_id]`` works
+
+    def test_preserves_existing_legacy_list(self):
+        # Older-transformers config already carries the legacy list; the
+        # helper must not clobber it.
         cfg = PretrainedConfig()
         cfg.model_type = "deepseek_v4"
-        cfg.compress_ratios = [128]
+        cfg.compress_ratios = [128, 4]
         normalize_deepseek_v4_compat(cfg)
-        self.assertEqual(cfg.compress_ratios, [128])
+        self.assertEqual(cfg.compress_ratios, [128, 4])
 
     def test_no_op_for_non_deepseek_v4_model_type(self):
-        # Negative-branch contract: unrelated model types with a
-        # coincidentally-named ``compress_rates`` attribute must not be
+        # Negative-branch contract: unrelated model types with coincidentally
+        # named ``compress_rates`` / ``layer_types`` attributes must not be
         # touched. A regression that drops the model_type gate would silently
-        # affect every model whose HF config carries this attribute.
+        # affect every model whose HF config happens to carry them.
         cfg = PretrainedConfig()
         cfg.model_type = "llama"
-        cfg.compress_rates = [4]
+        cfg.compress_rates = {self._LT_CSA: 4}
+        cfg.layer_types = [self._LT_CSA]
+        normalize_deepseek_v4_compat(cfg)
+        self.assertFalse(hasattr(cfg, "compress_ratios"))
+
+    def test_raises_clear_error_on_unknown_layer_type(self):
+        # An unknown ``layer_types`` entry would surface as a bare
+        # ``KeyError: '<layer-type>'`` from the list-comprehension. Wrap it in
+        # a ValueError that names both the missing key and the available
+        # ones, so downstream operators can diagnose a config drift without
+        # reading the stack.
+        cfg = PretrainedConfig()
+        cfg.model_type = "deepseek_v4"
+        cfg.compress_rates = {self._LT_CSA: 4}
+        cfg.layer_types = [self._LT_CSA, "mystery_layer"]
+        with self.assertRaisesRegex(ValueError, r"mystery_layer.*compress_rates"):
+            normalize_deepseek_v4_compat(cfg)
+
+    def test_no_op_when_only_one_of_the_new_fields_is_present(self):
+        # When the loaded config is malformed or partially populated (e.g. a
+        # future upstream rename), leave attributes alone rather than
+        # guessing — the downstream AttributeError is the clearer signal.
+        cfg = PretrainedConfig()
+        cfg.model_type = "deepseek_v4"
+        cfg.compress_rates = {self._LT_CSA: 4}
+        # layer_types deliberately absent
         normalize_deepseek_v4_compat(cfg)
         self.assertFalse(hasattr(cfg, "compress_ratios"))
 

@@ -77,26 +77,51 @@ def apply_all():
 
 
 def normalize_deepseek_v4_compat(config) -> None:
-    """Backfill the DeepSeek V4 ``compress_rates`` -> ``compress_ratios`` rename
-    that landed in transformers >= 4.57 (#34092).
+    """Rebuild the DeepSeek V4 legacy ``compress_ratios`` list from the new
+    ``compress_rates`` mapping + ``layer_types`` schedule introduced in
+    transformers >= 4.57 (#34092).
 
-    Downstream sglang code (``configs/model_config.py``,
-    ``models/deepseek_v4.py``, ``hardware_backend/npu/attention/
-    ascend_dsv4_backend.py``) reads ``.compress_ratios`` off the loaded HF
-    config directly. Copying the new-name attribute onto the old name at the
-    config-loading boundary lets every call site keep reading the legacy name,
-    avoiding scattered defensive ``getattr`` fallbacks.
+    Upstream renamed the field *and reshaped it*:
 
-    Note: the sibling ``rope_scaling`` / ``rope_parameters`` rename is already
-    handled inside upstream transformers ``PretrainedConfig`` via a bidirectional
-    alias; no backfill is required here.
+    - old (transformers < 4.57): ``compress_ratios: list[int]``, indexed by
+      layer id, values in ``{4, 128}``.
+    - new (>= 4.57): ``compress_rates: dict[str, int]`` keyed by layer-type
+      label, paired with ``layer_types: list[str]`` giving the per-layer
+      schedule.
+
+    sglang readers still consume the legacy ``list[int]`` shape
+    (``models/deepseek_v4.py`` does ``config.compress_ratios[layer_id]``;
+    ``configs/model_config.py`` filters it by ``== 4``; the NPU backend
+    checks ``4 in ...`` / ``128 in ...``). Copying the new dict onto the
+    legacy name unchanged would swap the container type and turn the
+    original ``AttributeError`` into a ``KeyError`` — the same crash in a
+    new location. Expand the mapping into the legacy list here so every
+    downstream reader keeps its indexing semantics.
+
+    sglang currently aliases the ``deepseek_v4`` model_type onto upstream's
+    ``DeepseekV3Config`` (see ``hf_transformers/common.py``), so upstream's
+    own ``DeepseekV4Config.__post_init__`` legacy-input path does not run
+    and the reconstruction has to happen here.
     """
 
     if getattr(config, "model_type", None) != "deepseek_v4":
         return
+    if hasattr(config, "compress_ratios"):
+        return
 
-    if not hasattr(config, "compress_ratios") and hasattr(config, "compress_rates"):
-        config.compress_ratios = config.compress_rates
+    rates = getattr(config, "compress_rates", None)
+    layer_types = getattr(config, "layer_types", None)
+    if not isinstance(rates, dict) or not isinstance(layer_types, (list, tuple)):
+        return
+
+    try:
+        config.compress_ratios = [rates[lt] for lt in layer_types]
+    except KeyError as exc:
+        missing = exc.args[0]
+        raise ValueError(
+            f"DeepseekV4Config layer_type {missing!r} has no entry in "
+            f"compress_rates {sorted(rates)}"
+        ) from exc
 
 
 def normalize_rope_scaling_compat(config) -> None:
