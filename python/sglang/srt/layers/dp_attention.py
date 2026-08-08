@@ -13,6 +13,7 @@ import triton.language as tl
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
+    get_attn_dp_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -504,6 +505,14 @@ def _dp_gather_via_all_gather(
             )
         else:
             get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+        return
+
+    # Replicated inputs have already been reduced inside each attention-TP
+    # group. Gather one full local batch directly across matching TP ranks in
+    # the attention-DP groups instead of emulating it with RS(attn-TP) +
+    # AG(full-TP). For TP32/DP2 this replaces RS32 + AG64 with one AG2.
+    if not is_partial and not use_world and get_attn_cp_group().world_size == 1:
+        get_attn_dp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
