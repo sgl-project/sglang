@@ -236,7 +236,8 @@ class SchedulerBatchResultProcessor:
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if (
-                    batch.return_hidden_states
+                    logits_output is not None
+                    and batch.return_hidden_states
                     and logits_output.hidden_states is not None
                 ):
                     assert extend_input_len_per_req is not None
@@ -505,17 +506,24 @@ class SchedulerBatchResultProcessor:
         extend_input_len: int,
         store: bool = True,
     ) -> int:
+        """Rows are laid out per req in batch order, extend_input_len rows each:
+        every processed req advances the offset, only returning reqs keep
+        their slice, so batched context forwards stay aligned."""
         if capture_hidden_mode.is_full():
             start = hidden_state_offset
             hidden_state_offset += extend_input_len
             if not store or not req.return_hidden_states:
                 return hidden_state_offset
 
-            req_hidden_states = logits_output.hidden_states[start:hidden_state_offset]
-            if req.return_hidden_states is True:
-                req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
-            elif req.return_hidden_states == "last":
-                req.hidden_states.append(req_hidden_states[-1].cpu().tolist())
+            span = logits_output.hidden_states[start:hidden_state_offset].cpu()
+            if req.return_hidden_states == "last":
+                req.hidden_states.append(span[-1].tolist())
+                return hidden_state_offset
+
+            if req.hidden_states_buffer is not None:
+                req.hidden_states.append(span.clone())
+            else:
+                req.hidden_states.append(span.tolist())
         elif capture_hidden_mode.is_last():
             index = hidden_state_offset
             hidden_state_offset += 1

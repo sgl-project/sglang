@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -23,6 +24,7 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     BaseFinishReason,
     Req,
 )
@@ -30,12 +32,35 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.shm_transport_utils import package_hidden_states
 
 if TYPE_CHECKING:
     from sglang.srt.managers.rust_server import RustServer
 
 
 logger = logging.getLogger(__name__)
+
+
+def _write_hidden_states_buffer(
+    req: Req, hidden_states: List[torch.Tensor]
+) -> Optional[dict]:
+    try:
+        return package_hidden_states(
+            hidden_states,
+            output_buffer=req.hidden_states_buffer,
+        )
+    except (OSError, ValueError, BufferError) as error:
+        logger.warning(
+            "Failed to write caller-owned hidden_states_buffer for rid=%s: %s",
+            req.rid,
+            error,
+        )
+        req.finished_reason = FINISH_ABORT(
+            f"failed to write hidden_states_buffer: {error}",
+            HTTPStatus.BAD_REQUEST,
+            "BadRequestError",
+        )
+        return None
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
@@ -573,9 +598,14 @@ class _GenerationStreamAccumulator:
                 else:
                     # Mirror output_ids_through_stop: spec verify steps can
                     # overshoot finished_len.
+                    # Prefill-only requests (finished_len == 0) keep their prefill entry.
                     hs = req.hidden_states
-                    if req.finished_len is not None:
+                    if req.finished_len is not None and not req.is_prefill_only:
                         hs = hs[: req.finished_len]
+                    if req.hidden_states_buffer is not None and hs:
+                        hs = _write_hidden_states_buffer(req, hs)
+                        if hs is None:
+                            self.finished_reasons[-1] = req.finished_reason.to_json()
                     self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)

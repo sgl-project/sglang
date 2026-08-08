@@ -48,7 +48,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import PlainValidator, StrictFloat
 
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
@@ -173,8 +173,18 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Embeddings for input_ids, or a shm TensorRef dict (requires input_ids).
+    input_embeds: Optional[
+        Union[
+            List[List[List[StrictFloat]]],
+            List[List[StrictFloat]],
+            Dict[str, Any],
+        ]
+    ] = None
+    # None (causal) or "bidirectional" for the extend span.
+    query_attention: Optional[str] = None
+    # Explicit extend-span positions: [n] or [dims][n].
+    token_positions: Optional[List] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -227,6 +237,10 @@ class GenerateReqInput:
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
     ] = False
+    # Caller-owned shm TensorRef for prefill hidden states.
+    hidden_states_buffer: Optional[Dict[str, Any]] = None
+    # Rejected legacy field; retained so old clients cannot silently fall back inline.
+    hidden_states_transport: Optional[str] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -380,6 +394,11 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        if self.hidden_states_transport is not None:
+            raise ValueError(
+                "hidden_states_transport is no longer supported; supply a "
+                "caller-owned hidden_states_buffer"
+            )
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -426,14 +445,25 @@ class GenerateReqInput:
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
-            self.input_embeds = None
+            if self.query_attention is None:
+                self.input_embeds = None
         else:
-            if isinstance(self.input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.input_embeds)
+            if isinstance(self.input_embeds, dict):
+                raise ValueError("shm input_embeds refs require input_ids")
+            if not self.input_embeds or not isinstance(self.input_embeds[0], list):
+                raise ValueError("input_embeds must be a non-empty 2D or 3D array")
+            self.is_single = not self.input_embeds[0] or not isinstance(
+                self.input_embeds[0][0], list
+            )
+            self.batch_size = 1 if self.is_single else len(self.input_embeds)
+        if not self.is_single and self.hidden_states_buffer is not None:
+            raise ValueError("hidden_states_buffer supports single requests only")
+        if not self.is_single and (
+            self.query_attention is not None or self.token_positions is not None
+        ):
+            raise ValueError(
+                "query_attention and token_positions support single requests only"
+            )
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -450,6 +480,12 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        if self.parallel_sample_num != 1:
+            if self.query_attention is not None:
+                raise ValueError("query_attention requires n=1")
+            if self.hidden_states_buffer is not None:
+                raise ValueError("hidden_states_buffer requires n=1")
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -848,8 +884,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
     input_ids: Optional[array]  # Optional[array[int]]
-    # The input embeds
-    input_embeds: Optional[List[List[float]]]
+    # Inline rows or shm TensorRef dict.
+    input_embeds: Optional[Union[List[List[float]], Dict[str, Any]]]
+    query_attention: Optional[str] = None
+    token_positions: Optional[List] = None
     # The multimodal inputs
     mm_inputs: Optional[PickleWrapper]  # Pickled Optional[MultimodalProcessorOutput]
     token_type_ids: Optional[List[int]]
@@ -874,6 +912,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
+    hidden_states_buffer: Optional[Dict[str, Any]] = None
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -1265,7 +1304,10 @@ TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
-OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
+# Inline chunks, or a caller-owned shm TensorRef.
+OutputHiddenStates = Optional[
+    List[Optional[Union[List[HiddenStateChunk], Dict[str, Any]]]]
+]
 CachedTokensDetails = Dict[str, Union[int, str]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]

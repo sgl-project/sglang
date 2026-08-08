@@ -802,12 +802,15 @@ class Req(ReqDllmMixin):
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
+        query_attention: Optional[str] = None,
+        token_positions: Optional[List] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: ReturnHiddenStatesMode = False,
+        hidden_states_buffer: Optional[Dict[str, Any]] = None,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
@@ -857,6 +860,8 @@ class Req(ReqDllmMixin):
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
+        self.query_attention = query_attention
+        self.token_positions = token_positions
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
@@ -899,6 +904,7 @@ class Req(ReqDllmMixin):
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states
         )
+        self.hidden_states_buffer = hidden_states_buffer
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1132,7 +1138,10 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Context-forward scratch KV is not radix-inserted.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST or query_attention is not None
+        )
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1316,6 +1325,13 @@ class Req(ReqDllmMixin):
         if self.positional_embed_overrides is not None:
             token_ids_to_match = array("q")
             key_limit = None
+
+        # Tail embeds must not radix-match (same ids, different values).
+        if self.input_embeds is not None and self.query_attention is not None:
+            embeds_start = max(0, len(self.origin_input_ids) - len(self.input_embeds))
+            key_limit = (
+                embeds_start if key_limit is None else min(key_limit, embeds_start)
+            )
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1786,6 +1802,8 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
+        self.return_hidden_states = False
+        self.hidden_states_buffer = None
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -1961,6 +1979,14 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def _resolve_query_attention(reqs: List[Req]) -> Optional[str]:
+    """All reqs in a batch must share one extend-span attention mode."""
+    modes = {req.query_attention for req in reqs}
+    if len(modes) > 1:
+        raise ValueError(f"Mixed query_attention modes in one batch: {modes}")
+    return modes.pop() if modes else None
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2092,6 +2118,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # None or "bidirectional". Shared by all reqs in the batch.
+    query_attention: Optional[str] = None
+
+    # Explicit positions [n] or [dims, n] from prepare_for_extend.
+    token_positions: Optional[torch.Tensor] = None
+
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
@@ -2172,6 +2204,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=return_hidden_states_mode.need_capture(),
             return_hidden_states_mode=return_hidden_states_mode,
             is_prefill_only=all(req.is_prefill_only for req in reqs),
+            query_attention=_resolve_query_attention(reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
@@ -2373,6 +2406,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Set fields
         input_embeds = []
+        token_positions: List[List[int]] = []
         all_replace_embeds: List[torch.Tensor] = []
         all_replace_positions: List[int] = []
         has_replace_embeds = False
@@ -2399,9 +2433,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
                 # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                # Embeds may cover only the sequence tail.
+                embeds_start = len(req.origin_input_ids) - len(req.input_embeds)
+                if pre_len < embeds_start:
+                    raise ValueError(
+                        "input_embeds cover the sequence tail starting at "
+                        f"{embeds_start} but the cached prefix ends at {pre_len}; "
+                        "the session prefix was evicted"
+                    )
+                embeds_offset = pre_len - embeds_start
                 input_embeds.extend(
-                    req.input_embeds[pre_len : pre_len + req.extend_range.length]
+                    req.input_embeds[
+                        embeds_offset : embeds_offset + req.extend_range.length
+                    ]
                 )
+
+            if req.token_positions is not None:
+                # Same tail-coverage as input_embeds. [n] or [dims][n].
+                dims = (
+                    req.token_positions
+                    if isinstance(req.token_positions[0], list)
+                    else [req.token_positions]
+                )
+                start = pre_len - (len(req.origin_input_ids) - len(dims[0]))
+                if start < 0:
+                    raise ValueError("token_positions do not cover the extend span")
+                while len(token_positions) < len(dims):
+                    token_positions.append([])
+                for dim_idx, dim in enumerate(dims):
+                    token_positions[dim_idx].extend(
+                        dim[start : start + req.extend_range.length]
+                    )
 
             if req.positional_embed_overrides is not None:
                 # Override positions are absolute in the full sequence.
@@ -2527,11 +2589,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
-        self.input_embeds = (
-            torch.tensor(input_embeds, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
-            if input_embeds
+        if input_embeds:
+            # np.asarray handles list/ndarray rows. Pin after (numpy tensors).
+            embeds_tensor = torch.from_numpy(np.asarray(input_embeds, dtype=np.float32))
+            if _pin:
+                embeds_tensor = embeds_tensor.pin_memory()
+            self.input_embeds = embeds_tensor.to(self.device, non_blocking=True)
+        else:
+            self.input_embeds = None
+        self.token_positions = (
+            torch.tensor(token_positions, dtype=torch.int64, pin_memory=_pin)
+            .to(self.device, non_blocking=True)
+            .squeeze(0)
+            if token_positions
             else None
         )
         self.replace_embeds = replace_embeds_tensor
