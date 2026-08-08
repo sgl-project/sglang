@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Set
 
 import numpy as np
 import torch
@@ -220,6 +220,10 @@ class FlashAttentionBackend(AttentionBackend):
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.speculative_step_id = speculative_step_id
+        # bs values whose target-verify metadata rebuild is captured inside the
+        # decode cuda graph (init_forward_metadata_in_graph); replay-prep skips
+        # the eager rebuild for them.
+        self._verify_metadata_in_graph_bs: Set[int] = set()
 
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
@@ -388,6 +392,17 @@ class FlashAttentionBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Single-CG has no Python between steps, so one capturable kernel updates
         # the persistent metadata.
+        if forward_batch.forward_mode.is_target_verify():
+            if not self._can_capture_verify_metadata_in_graph(forward_batch):
+                return
+            bs = forward_batch.batch_size
+            self._set_target_verify_device_metadata(
+                self.target_verify_metadata[bs],
+                forward_batch.seq_lens[:bs],
+                forward_batch.req_pool_indices[:bs],
+            )
+            self._verify_metadata_in_graph_bs.add(bs)
+            return
         if not forward_batch.forward_mode.is_draft_extend_v2():
             return
         bs = forward_batch.batch_size
@@ -425,6 +440,51 @@ class FlashAttentionBackend(AttentionBackend):
         return (
             not self.use_sliding_window_kv_pool
             or self.token_to_kv_pool.full_to_swa_index_mapping is not None
+        )
+
+    def _can_capture_verify_metadata_in_graph(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        # Ragged verify carries per-iter host geometry, and v2p-table SWA pools
+        # have no raw mapping tensor; both must stay on the eager rebuild path.
+        return (
+            self.topk <= 1
+            and getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None
+            and (
+                not self.use_sliding_window_kv_pool
+                or self.token_to_kv_pool.full_to_swa_index_mapping is not None
+            )
+        )
+
+    def _set_target_verify_device_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        # Device-only rebuild of the topk<=1 target-verify metadata. Every op is
+        # graph-recordable (no D2H), so it serves both the eager replay-prep and
+        # the in-graph capture path.
+        metadata.cache_seqlens_int32.copy_(seq_lens + self.speculative_num_draft_tokens)
+        self._finish_target_verify_ktable(metadata, req_pool_indices)
+
+    def _finish_target_verify_ktable(
+        self, metadata: FlashAttentionMetadata, req_pool_indices: torch.Tensor
+    ) -> None:
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+        has_swa = self.use_sliding_window_kv_pool
+        build_trtllm_mha_page_table(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            page_table=metadata.page_table,
+            page_size=self.page_size,
+            swa_page_table=metadata.swa_page_table if has_swa else None,
+            full_to_swa=(
+                self.token_to_kv_pool.full_to_swa_index_mapping if has_swa else None
+            ),
         )
 
     def init_forward_metadata_out_graph(
@@ -500,6 +560,7 @@ class FlashAttentionBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
+                in_capture=True,
             )
 
             if forward_mode.is_decode_or_idle() and spec_info is None:
@@ -2614,6 +2675,7 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
+        in_capture: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -2819,40 +2881,29 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
+                # Page table built on-device (self-guards on cache_seqlens);
+                # max_seq_len_k left unset -- unread here (scheduler_metadata is
+                # normal-decode-only).
                 metadata = self.target_verify_metadata[bs]
                 ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
                 if ragged_layout is not None:
+                    # A captured in-graph rebuild would overwrite this geometry
+                    # at replay; _can_capture_verify_metadata_in_graph gates it off.
+                    assert bs not in self._verify_metadata_in_graph_bs
                     padded = ragged_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(
                         seq_lens=seq_lens, layout=padded
                     )
                     metadata.cache_seqlens_int32.copy_(geometry.cache_seqlens_int32)
                     metadata.cu_seqlens_q.copy_(geometry.cu_seqlens_q)
-                else:
-                    metadata.cache_seqlens_int32.copy_(
-                        (seq_lens + self.speculative_num_draft_tokens)
+                    self._finish_target_verify_ktable(metadata, req_pool_indices)
+                elif in_capture or bs not in self._verify_metadata_in_graph_bs:
+                    # Eager rebuild: capture warmup, and replay for graphs that
+                    # did not capture the rebuild in-graph.
+                    self._set_target_verify_device_metadata(
+                        metadata, seq_lens, req_pool_indices
                     )
-
-                # Page table built on-device (self-guards on cache_seqlens);
-                # max_seq_len_k left unset -- unread here (scheduler_metadata is
-                # normal-decode-only).
-                metadata.cu_seqlens_k[1:].copy_(
-                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-                )
-                has_swa = self.use_sliding_window_kv_pool
-                build_trtllm_mha_page_table(
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=req_pool_indices,
-                    cache_seqlens=metadata.cache_seqlens_int32,
-                    page_table=metadata.page_table,
-                    page_size=self.page_size,
-                    swa_page_table=metadata.swa_page_table if has_swa else None,
-                    full_to_swa=(
-                        self.token_to_kv_pool.full_to_swa_index_mapping
-                        if has_swa
-                        else None
-                    ),
-                )
+                # else: the replayed graph rebuilds this metadata in-graph.
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
