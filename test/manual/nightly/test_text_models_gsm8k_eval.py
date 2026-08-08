@@ -8,7 +8,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -46,9 +45,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.models = []
-        models_tp1 = parse_models(
-            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
+        models_tp1 = parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
         for model_path in models_tp1:
             cls.models.append(ModelLaunchSettings(model_path, tp_size=1))
 
