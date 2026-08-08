@@ -337,8 +337,6 @@ void int8_scaled_mm_kernel_impl(
 }  // anonymous namespace
 
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A) {
-  RECORD_FUNCTION("sgl-kernel::per_token_quant_int8_cpu", std::vector<c10::IValue>({A}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(A);
   CHECK_DIM(2, A);
 
@@ -378,8 +376,6 @@ at::Tensor int8_scaled_mm_cpu(
     // Declaration uses is_vnni for API consistency with x86 backend;
     // renamed here because RVV has no VNNI hardware — is_vnni is misleading.
     bool is_packed) {
-  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales1, scales2, bias}));
-
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales1);
@@ -480,8 +476,6 @@ at::Tensor int8_scaled_mm_with_quant(
     // Declaration uses is_vnni for API consistency with x86 backend;
     // renamed here because RVV has no VNNI hardware — is_vnni is misleading.
     bool is_packed) {
-  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_with_quant", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);
