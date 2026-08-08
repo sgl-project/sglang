@@ -1,0 +1,208 @@
+name: PR Test (sgl-kv-indexer)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "experimental/sgl-kv-indexer/**"
+      - ".github/workflows/pr-test-sgl-kv-indexer.yml"
+  pull_request:
+    branches: [main]
+    # `labeled` is required for the run-ci gate below: without it, applying the
+    # label after the last push would never re-trigger the cluster tier.
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "experimental/sgl-kv-indexer/**"
+      - ".github/workflows/pr-test-sgl-kv-indexer.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must match experimental/sgl-kv-indexer/rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.97.0"
+
+jobs:
+  gate:
+    name: run-ci label gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.label.outputs.has_run_ci }}
+    steps:
+      # Only the six-node cluster tier is gated. `default-build` and `test` are
+      # cheap enough to always run, so a PR without the label still gets the
+      # crate compiled, linted, and tested against a single Redis.
+      - name: Check run-ci label
+        id: label
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${{ github.event_name }}); label gate bypassed."
+            exit 0
+          fi
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}" == "true" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "PR has run-ci label; the Redis Cluster tier will run."
+          else
+            echo "has_run_ci=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR is missing the 'run-ci' label; skipping the six-node Redis Cluster tier. Apply the label to opt in."
+          fi
+
+  default-build:
+    name: default features build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: experimental/sgl-kv-indexer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-kv-indexer -> target
+
+      # Every other job enables `redis-backend`, so without this one the default
+      # feature set -- what a plain `cargo build` produces -- is never compiled.
+      - name: Run Clippy without optional features
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests without optional features
+        run: cargo test
+
+  test:
+    name: fmt, clippy, and Redis tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+
+    defaults:
+      run:
+        working-directory: experimental/sgl-kv-indexer
+
+    env:
+      KV_INDEXER_REDIS_URL: redis://127.0.0.1:6379
+      # Turn a store that failed to come up into a red job rather than a green
+      # one in which every Redis test quietly skipped itself.
+      KV_INDEXER_REQUIRE_REDIS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-kv-indexer -> target
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --features redis-backend -- -D warnings
+
+      - name: Run Redis-enabled tests
+        run: cargo test --features redis-backend
+
+  redis-cluster:
+    name: Redis Cluster routing and ASK redirects
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KV_INDEXER_REQUIRE_REDIS: "1"
+    defaults:
+      run:
+        working-directory: experimental/sgl-kv-indexer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-kv-indexer -> target
+
+      - name: Start six-node Redis Cluster
+        run: |
+          set -euo pipefail
+          docker network create kvidx-cluster
+          for i in 1 2 3 4 5 6; do
+            docker run -d --name "kvidx-c$i" --network kvidx-cluster \
+              --tmpfs /data:rw,size=16m redis:7-alpine \
+              redis-server --port 6379 --cluster-enabled yes \
+              --cluster-config-file /data/nodes.conf \
+              --cluster-node-timeout 1000 --appendonly no \
+              --protected-mode no
+          done
+          docker exec kvidx-c1 redis-cli --cluster create \
+            kvidx-c1:6379 kvidx-c2:6379 kvidx-c3:6379 \
+            kvidx-c4:6379 kvidx-c5:6379 kvidx-c6:6379 \
+            --cluster-replicas 1 --cluster-yes
+          ip1=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kvidx-c1)
+          ip2=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kvidx-c2)
+          ip3=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kvidx-c3)
+          echo "KV_INDEXER_REDIS_CLUSTER_NODES=redis://$ip1:6379,redis://$ip2:6379,redis://$ip3:6379" >> "$GITHUB_ENV"
+
+      - name: Run full Redis Cluster integration suite
+        run: cargo test --features redis-backend --test redis_integration -- --test-threads=1
+
+      # Only ASK redirects are exercised here. This build has no fault tolerance,
+      # so there is nothing to assert about master failover.
+
+      - name: Exercise ASK redirect
+        run: |
+          set -euo pipefail
+          slot=$(docker exec kvidx-c1 redis-cli cluster keyslot ask-hash)
+          source_id=$(docker exec kvidx-c1 redis-cli cluster myid)
+          target_id=$(docker exec kvidx-c2 redis-cli cluster myid)
+          docker exec kvidx-c1 redis-cli cluster setslot "$slot" migrating "$target_id"
+          docker exec kvidx-c2 redis-cli cluster setslot "$slot" importing "$source_id"
+          KV_INDEXER_ASK_HASH=ask-hash \
+            cargo test --features redis-backend --test redis_integration \
+              cluster_client_follows_ask_redirect -- --exact --nocapture --test-threads=1
+          for i in 1 2 3; do docker exec "kvidx-c$i" redis-cli flushall; done
+          docker exec kvidx-c1 redis-cli cluster setslot "$slot" stable
+          docker exec kvidx-c2 redis-cli cluster setslot "$slot" stable
+
+      - name: Clean up Redis Cluster
+        if: always()
+        working-directory: .
+        run: |
+          docker rm -f kvidx-c1 kvidx-c2 kvidx-c3 kvidx-c4 kvidx-c5 kvidx-c6 || true
+          docker network rm kvidx-cluster || true

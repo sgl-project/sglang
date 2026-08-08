@@ -58,6 +58,7 @@ jobs:
           filters: |
             sgl_router:
               - 'experimental/sgl-router/**'
+              - 'experimental/sgl-kv-indexer/**'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
