@@ -6581,6 +6581,16 @@ class ServerArgs:
                 None,
             ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
 
+        if view.speculative_algorithm is not None and (
+            view.moe_runner_backend == "flashinfer_alphamoe"
+            or view.speculative_moe_runner_backend == "flashinfer_alphamoe"
+        ):
+            raise ValueError(
+                "flashinfer_alphamoe does not support speculative decoding; "
+                "the draft model backend and raw-logit TopK contract must remain "
+                "identical across build and execution"
+            )
+
         if view.moe_runner_backend == "flashinfer_alphamoe":
             effective_quantization = (
                 view.quantization or self.get_model_config().quantization
@@ -6595,6 +6605,11 @@ class ServerArgs:
                 )
             if self.tp_size != 4:
                 raise ValueError("flashinfer_alphamoe requires --tp-size 4")
+            if view.enable_torch_compile:
+                raise ValueError(
+                    "flashinfer_alphamoe does not support --enable-torch-compile; "
+                    "the fused router requires the raw-logit TopK bypass"
+                )
             if not is_sm100_supported():
                 raise ValueError(
                     "flashinfer_alphamoe requires an exact SM100/SM103 GPU "
