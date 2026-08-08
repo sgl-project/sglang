@@ -978,6 +978,32 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
+
+            # dp_attention stamps the GLOBAL is_extend_in_batch, so a rank
+            # whose LOCAL batch is not an extend can be diverted into this
+            # target-prefill branch. Under the default spec+dp-attention
+            # scheduling that shape is only the staggered-IDLE rank
+            # (prepare_for_idle product: empty tensors, spec_info=None), which
+            # flows through the target forward and the is_idle() guards in the
+            # draft-extend path unchanged. A NON-empty locally-DECODE divert is
+            # only reachable when the pre-merge no-mix sync is skipped via
+            # --speculative-skip-dp-mlp-sync: the scheduler relays that batch's
+            # next-iteration input_ids through spec_info and leaves
+            # batch.input_ids=None, and the multi-layer draft-extend path has
+            # no divert synthesis for it. Fail loud here, before the target
+            # forward, instead of forwarding input_ids=None into the model
+            # while peer ranks are blocked in the dp gather.
+            if not batch.forward_mode.is_extend() and batch.seq_lens.numel() > 0:
+                raise RuntimeError(
+                    "multi-layer EAGLE received a diverted locally-DECODE/"
+                    f"globally-EXTEND dp batch (bs={batch.seq_lens.numel()}, "
+                    f"forward_mode={batch.forward_mode}); its input_ids are "
+                    "relayed via spec_info and are not materialized. This "
+                    "shape is only reachable with --speculative-skip-dp-mlp-sync "
+                    "together with --enable-multi-layer-eagle, a combination "
+                    "the multi-layer draft-extend path does not support."
+                )
+
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=target_capture_mode
             )
