@@ -73,6 +73,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+checkpoint-engine = ["checkpoint-engine @ git+https://github.com/MoonshotAI/checkpoint-engine.git@f772d1858204fa82bdb0436fdfec137f5de2972c"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
