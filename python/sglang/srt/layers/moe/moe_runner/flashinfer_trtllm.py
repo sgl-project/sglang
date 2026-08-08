@@ -1097,7 +1097,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         top_k,
         None,  # n_group      # TODO: support n_group
         None,  # topk_group   # TODO: support topk_group
-        quant_info.intermediate_size_per_partition,  # padded to multiple of 256
+        quant_info.intermediate_size_per_partition,  # padded to multiple of 128
         quant_info.local_expert_offset,
         quant_info.local_num_experts,
         None,  # routed_scaling_factor

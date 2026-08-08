@@ -268,6 +268,7 @@ def test_apply_trtllm_gen_matches_flashinfer_direct(
         tokens, num_experts, dtype=torch.float32, device="cuda", generator=g
     )
     layer = _build_mock_layer(num_experts, hidden, inter, fixtures)
+    layer.moe_runner_config = method.moe_runner_config
 
     # Convert via the production path so the fixtures can't drift from it.
     method.process_weights_after_loading(layer)
