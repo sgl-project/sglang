@@ -7911,8 +7911,12 @@ class ServerArgs:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
                     self.disable_custom_all_reduce = True
+                    # should_torch_symm_mem_allreduce() takes the
+                    # symmetric-memory path only below a byte threshold, so
+                    # which reduce runs would follow the token count.
+                    self.enable_torch_symm_mem = False
                     logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                        "NCCL_ALGO is set to 'allreduce:tree', and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
                     )
 
     def _handle_unified_memory_pool(self):

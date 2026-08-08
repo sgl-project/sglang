@@ -277,7 +277,7 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = self.server_args.dcp_size
+        dcp_size = get_parallel().attn_dcp_size
         return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
 
     @property
@@ -1550,7 +1550,7 @@ class KVCacheConfigurator:
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         )
                     elif (
-                        get_schedule().page_size == 1 and self.server_args.dcp_size == 1
+                        get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
                         token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
@@ -1561,9 +1561,9 @@ class KVCacheConfigurator:
                         )
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens * self.server_args.dcp_size,
+                            sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
-                            * self.server_args.dcp_size,
+                            * get_parallel().attn_dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,
