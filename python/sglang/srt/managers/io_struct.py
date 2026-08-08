@@ -59,7 +59,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import CustomParamValue, SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
@@ -105,9 +105,9 @@ class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     """Wraps an arbitrary Python object as pickle-serialized bytes for msgpack IPC.
 
     In msgpack mode, fields that carry opaque or non-msgspec-typed payloads
-    (e.g. multimodal inputs, time stats, customized info) are stored as
-    PickleWrapper so the outer struct can still be msgpack-encoded.  In pickle
-    mode (_USE_PICKLE_IPC=True), wrap_as_pickle / unwrap_from_pickle are no-ops
+    (e.g. multimodal inputs, time stats) are stored as PickleWrapper so the
+    outer struct can still be msgpack-encoded.  In pickle mode
+    (_USE_PICKLE_IPC=True), wrap_as_pickle / unwrap_from_pickle are no-ops
     and this class is not used on the wire.
     """
 
@@ -1284,6 +1284,7 @@ TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
 OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
 CachedTokensDetails = Dict[str, Union[int, str]]
+CustomizedInfo = Optional[Dict[str, List[List[CustomParamValue]]]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
@@ -1385,8 +1386,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
-    # Customized info
-    customized_info: Optional[PickleWrapper] = None
+    customized_info: CustomizedInfo = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
@@ -1476,8 +1476,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
-    # Customized info
-    customized_info: Optional[PickleWrapper] = None
+    customized_info: CustomizedInfo = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request

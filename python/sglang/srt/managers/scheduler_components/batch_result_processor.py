@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     List,
     Optional,
@@ -70,6 +71,25 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+_CUSTOMIZED_INFO_SCALAR_TYPES = (type(None), bool, int, float, str)
+_USE_PICKLE_IPC = envs.SGLANG_USE_PICKLE_IPC.get()
+
+
+def _is_customized_info_value(value: Any) -> bool:
+    value_type = type(value)
+    if value_type in _CUSTOMIZED_INFO_SCALAR_TYPES:
+        return True
+    if value_type is list:
+        for item in value:
+            if type(item) not in _CUSTOMIZED_INFO_SCALAR_TYPES:
+                return False
+        return True
+    if value_type is dict:
+        for key, item in value.items():
+            if type(key) is not str or type(item) not in _CUSTOMIZED_INFO_SCALAR_TYPES:
+                return False
+        return True
+    return False
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -180,9 +200,16 @@ class SchedulerBatchResultProcessor:
             for k, v in logits_output.customized_info.items():
                 if k not in req.customized_info:
                     req.customized_info[k] = []
+                elem = v[i]
+                if not _USE_PICKLE_IPC and not _is_customized_info_value(elem):
+                    raise TypeError(
+                        f"customized_info[{k!r}][{i}] must be a JSON scalar, "
+                        "a list of JSON scalars, or a string-keyed map of JSON "
+                        "scalars for msgpack IPC; "
+                        f"got {type(elem).__name__}"
+                    )
                 # Copy the element so it doesn't retain the entire batch
                 # tensor/array via a view reference.
-                elem = v[i]
                 if isinstance(elem, torch.Tensor):
                     elem = elem.clone()
                 elif hasattr(elem, "copy") and callable(elem.copy):

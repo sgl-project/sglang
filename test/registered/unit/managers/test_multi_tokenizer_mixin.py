@@ -5,7 +5,11 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import BatchStrOutput
+from sglang.srt.managers.io_struct import (
+    BatchStrOutput,
+    unwrap_from_pickle,
+    wrap_as_pickle,
+)
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
@@ -38,9 +42,10 @@ class InvalidServerArgs:
         return NotAWorker
 
 
-def _make_batch_str_output() -> BatchStrOutput:
+def _make_batch_str_output(customized_info=None) -> BatchStrOutput:
     return BatchStrOutput(
         rids=["rid-0", "rid-1"],
+        customized_info=customized_info,
         spec_verify_ct=[0, 0],
         spec_num_correct_drafts=[0, 0],
         spec_correct_drafts_histogram=[[], []],
@@ -104,6 +109,28 @@ class TestMultiTokenizerMixin(unittest.TestCase):
     def test_get_tokenizer_worker_class_rejects_non_worker(self):
         with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
             get_tokenizer_worker_class(InvalidServerArgs())
+
+    def test_batch_str_output_keeps_customized_info_rows(self):
+        output = _make_batch_str_output(
+            customized_info={"probe": [[100], [200, 201]], "short": [[300]]}
+        )
+
+        single_output = _handle_output_by_index(output, 1)
+
+        self.assertEqual(
+            single_output.customized_info,
+            {"probe": [[200, 201]], "short": [[]]},
+        )
+
+    def test_batch_str_output_keeps_time_stats_wrapped(self):
+        output = _make_batch_str_output()
+        output.time_stats = wrap_as_pickle({"probe": [100]})
+
+        single_output = _handle_output_by_index(output, 1)
+
+        self.assertEqual(
+            unwrap_from_pickle(single_output.time_stats), {"probe": [None]}
+        )
 
 
 if __name__ == "__main__":

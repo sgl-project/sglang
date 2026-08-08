@@ -315,6 +315,18 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
         self.assertIn(rid, tm.rid_to_state)
 
+    def test_batch_output_accumulates_unwrapped_customized_info(self):
+        tm = _make_tokenizer_manager()
+        rid = "batch_customized_info_rid"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(rid)
+        batch_output.customized_info = {"probe": [[1, "tag"]]}
+
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertEqual(state.out_list[0]["meta_info"]["probe"], [1, "tag"])
+
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
     """Test that _init_req_state raises ValueError for duplicate rids."""
