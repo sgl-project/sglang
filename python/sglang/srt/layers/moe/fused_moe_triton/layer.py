@@ -186,6 +186,7 @@ class FusedMoeWeightScaleSupported(Enum):
     GROUP = "group"
     BLOCK = "block"
 
+
 def _validate_hpc_ops_quant_method(quant_method) -> None:
     """--moe-runner-backend hpc_ops makes the standard dispatcher keep global
     expert ids for every MoE layer, so the resolved quant method must be the
@@ -202,6 +203,7 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
             f"{type(quant_method).__name__}. Remove --moe-runner-backend "
             "hpc_ops for this model."
         )
+
 
 class FuseEPActivationType(IntEnum):
     SWIGLU = 0
@@ -1461,7 +1463,7 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        fuseep_normal_mode: Optional[bool] = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
@@ -1471,7 +1473,6 @@ class FusedMoE(torch.nn.Module):
                 hidden_states,
                 topk_output,
                 fuseep_activation=self.fuseep_activation,
-                fuseep_normal_mode=fuseep_normal_mode,
             )
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):

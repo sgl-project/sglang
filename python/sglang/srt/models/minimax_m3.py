@@ -43,10 +43,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import (
-    get_is_extend_in_batch,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -57,9 +54,9 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
     FuseEPActivationConfig,
     FuseEPActivationType,
-    FusedMoE,
 )
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -457,19 +454,7 @@ class MiniMaxM3MoE(nn.Module):
         # DeepEPMoE returns the complete per-token routed result (no TP all-reduce
         # here, unlike forward_normal), and the shared experts are replicated
         # (tp_size=1, see __init__), so both are complete per token and add directly.
-        is_extend_in_batch = forward_batch.forward_mode.is_extend() or (
-            is_dp_attention_enabled()
-            and hidden_states.shape[0] == 0
-            and get_is_extend_in_batch()
-        )
-        if get_moe_a2a_backend().is_ascend_fuseep():
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                fuseep_normal_mode=is_extend_in_batch,
-            )
-        else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output

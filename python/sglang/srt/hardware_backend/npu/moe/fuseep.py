@@ -8,11 +8,11 @@ weight-postprocess helper that NPU quant_methods call from their
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_moe_ep_group
+from sglang.srt.distributed import get_moe_ep_group, get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers.dp_attention import (
@@ -46,14 +46,22 @@ def _get_fuseep_buffer(layer: FusedMoE, normal_mode: bool = False):
     )
 
 
-def _prepare_routing_inputs(
+def _prepare_normal_inputs(
     layer: FusedMoE,
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
-    is_idle_dp_rank: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    #Select routing inputs, substituting a zero-weighted dummy route when idle.
-    if is_idle_dp_rank:
+    use_dp_attention: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    # Prepare normal-mode (DispatchFFNCombine) inputs and output bounds.
+    num_output_tokens = hidden_states.shape[0]
+    global_num_tokens = get_dp_global_num_tokens() if use_dp_attention else None
+    num_input_tokens = max(
+        num_output_tokens,
+        sum(global_num_tokens) if global_num_tokens is not None else 0,
+    )
+    # A zero weighted dummy route keeps every EP rank in the collective; discard
+    # its zero output before returning to the idle scheduler.
+    if num_output_tokens == 0:
         hidden_states = hidden_states.new_zeros((1, layer.hidden_size))
         topk_ids = torch.zeros(
             (1, topk_output.topk_ids.shape[1]),
@@ -69,22 +77,6 @@ def _prepare_routing_inputs(
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)
-    return hidden_states, topk_ids, topk_weights
-
-
-def _prepare_normal_inputs(
-    layer: FusedMoE,
-    hidden_states: torch.Tensor,
-    topk_output: TopKOutput,
-    use_dp_attention: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    #Prepare normal-mode (DispatchFFNCombine) inputs and output bounds.
-    num_output_tokens = hidden_states.shape[0]
-    global_num_tokens = get_dp_global_num_tokens() if use_dp_attention else None
-    num_input_tokens = max(num_output_tokens, sum(global_num_tokens) if global_num_tokens is not None else 0)
-    hidden_states, topk_ids, topk_weights = _prepare_routing_inputs(
-        layer, hidden_states, topk_output, num_output_tokens == 0
-    )
     if use_dp_attention:
         hidden_states = hidden_states.clone()
         topk_ids = topk_ids.contiguous()
@@ -99,7 +91,6 @@ def forward_fuseep(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
     fuseep_activation,
-    fuseep_normal_mode: Optional[bool] = None,
 ) -> torch.Tensor:
     (
         activation_type,
@@ -109,11 +100,8 @@ def forward_fuseep(
         up_clamp_max,
         up_add,
     ) = fuseep_activation.kernel_args()
-    # if fuseep_normal_mode set, prefill->DISPATCH_FFN_COMBINE, decode->FUSED_DEEP_MOE; else use global config
-    if fuseep_normal_mode is None:
-        fuseep_normal_mode = get_exec().moe.fuseep_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value
-
-    if fuseep_normal_mode:
+    fuse_mode = get_exec().moe.fuseep_mode
+    if fuse_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value:
         buf = _get_fuseep_buffer(layer, normal_mode=True)
         hidden_states, topk_ids, topk_weights, num_output_tokens, max_output_size = (
             _prepare_normal_inputs(
@@ -130,7 +118,7 @@ def forward_fuseep(
             gmm2_weight_scale=layer.w2_weight_scale,
             num_max_dispatch_tokens_per_rank=max_output_size,
             num_experts=layer.num_experts,
-            fuse_mode=FusedMoEMode.DISPATCH_FFN_COMBINE.value,
+            fuse_mode=fuse_mode,
             activation_type=activation_type,
             activation_alpha=activation_alpha,
             gate_clamp_max=gate_clamp_max,
@@ -140,15 +128,11 @@ def forward_fuseep(
         )
         return hidden_states[:num_output_tokens]
 
-    is_idle_dp_rank = is_dp_attention_enabled() and hidden_states.shape[0] == 0
-    hidden_states, topk_ids, topk_weights = _prepare_routing_inputs(
-        layer, hidden_states, topk_output, is_idle_dp_rank
-    )
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
-        topk_idx=topk_ids,
-        topk_weights=topk_weights,
+        topk_idx=topk_output.topk_ids,
+        topk_weights=topk_output.topk_weights,
         gmm1_permuted_weight=layer.w13_weight,
         gmm1_permuted_weight_scale=layer.w13_weight_scale,
         gmm2_weight=layer.w2_weight,
@@ -157,7 +141,7 @@ def forward_fuseep(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
-        fuse_mode=FusedMoEMode.FUSED_DEEP_MOE.value,
+        fuse_mode=fuse_mode,
         activation_type=activation_type,
         activation_alpha=activation_alpha,
         gate_clamp_max=gate_clamp_max,
@@ -165,7 +149,7 @@ def forward_fuseep(
         up_clamp_max=up_clamp_max,
         up_add=up_add,
     )
-    return hidden_states[:0] if is_idle_dp_rank else hidden_states
+    return hidden_states
 
 
 def _permute_w13_weight_scale(w: torch.Tensor, tile_n: int) -> torch.Tensor:
@@ -219,11 +203,15 @@ def _release_weight_cache(weight: torch.Tensor) -> torch.Tensor:
 def _scale_from_float_to_int64(scale: torch.Tensor) -> torch.nn.Parameter:
     import numpy as np
 
-    converted = torch.from_numpy(
-        np.frombuffer(
-            scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
-        ).astype(np.int64)
-    ).reshape(scale.shape).to(scale.device)
+    converted = (
+        torch.from_numpy(
+            np.frombuffer(
+                scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
+            ).astype(np.int64)
+        )
+        .reshape(scale.shape)
+        .to(scale.device)
+    )
     return torch.nn.Parameter(converted, requires_grad=False)
 
 
