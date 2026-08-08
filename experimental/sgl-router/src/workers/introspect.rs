@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tracing::warn;
 use url::Url;
 
-use crate::policies::kv_events::EventConfig;
+use crate::policies::kv_events::{EventConfig, ReplayConfig};
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
@@ -276,25 +276,21 @@ pub(crate) fn resolve_event_config(
     worker_url: &str,
     is_bigram: bool,
 ) -> EventConfig {
-    let host = if matches!(
-        block.endpoint_host.as_str(),
-        "*" | "0.0.0.0" | "::" | "[::]"
+    let worker_host = Url::parse(worker_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_owned()));
+    let host = resolve_published_host(block.endpoint_host, worker_url, worker_host.as_deref());
+    let replay = match (
+        block.replay_endpoint_host,
+        block.replay_endpoint_port_base,
+        block.replay_buffer_steps,
     ) {
-        match Url::parse(worker_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|s| s.to_owned()))
-        {
-            Some(h) => h,
-            None => {
-                warn!(
-                    worker_url = %worker_url,
-                    "introspect: cannot parse worker_url for wildcard substitution; keeping advertised host"
-                );
-                block.endpoint_host
-            }
-        }
-    } else {
-        block.endpoint_host
+        (Some(replay_host), Some(replay_port), Some(buffer_steps)) => Some(ReplayConfig {
+            host: resolve_published_host(replay_host, worker_url, worker_host.as_deref()),
+            port_base: replay_port,
+            buffer_steps,
+        }),
+        _ => None,
     };
     EventConfig {
         host,
@@ -302,7 +298,29 @@ pub(crate) fn resolve_event_config(
         topic: block.topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
+        replay,
         is_bigram,
+    }
+}
+
+fn resolve_published_host(
+    advertised_host: String,
+    worker_url: &str,
+    worker_host: Option<&str>,
+) -> String {
+    if matches!(advertised_host.as_str(), "*" | "0.0.0.0" | "::" | "[::]") {
+        match worker_host {
+            Some(h) => h.to_owned(),
+            None => {
+                warn!(
+                    worker_url = %worker_url,
+                    "introspect: cannot parse worker_url for wildcard substitution; keeping advertised host"
+                );
+                advertised_host
+            }
+        }
+    } else {
+        advertised_host
     }
 }
 
@@ -348,6 +366,12 @@ pub(crate) struct KvEventsBlock {
     pub topic: String,
     pub block_size: u32,
     pub dp_size: u32,
+    #[serde(default)]
+    pub replay_endpoint_host: Option<String>,
+    #[serde(default)]
+    pub replay_endpoint_port_base: Option<u16>,
+    #[serde(default)]
+    pub replay_buffer_steps: Option<usize>,
 }
 
 #[cfg(test)]
@@ -460,6 +484,7 @@ mod tests {
         assert_eq!(cfg.topic, "kv");
         assert_eq!(cfg.block_size, 64);
         assert_eq!(cfg.dp_size, 2);
+        assert_eq!(cfg.replay, None);
     }
 
     #[tokio::test]
@@ -479,6 +504,55 @@ mod tests {
         let got = fast_introspector().fetch(&url).await;
         let cfg = got.event_config.expect("kv_events present");
         assert_eq!(cfg.host, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn fetch_parses_replay_config_and_substitutes_wildcard_host() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 2,
+                "replay_endpoint_host": "*",
+                "replay_endpoint_port_base": 5657,
+                "replay_buffer_steps": 1234,
+            }
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        let cfg = got.event_config.expect("kv_events present");
+        assert_eq!(
+            cfg.replay,
+            Some(ReplayConfig {
+                host: "127.0.0.1".to_string(),
+                port_base: 5657,
+                buffer_steps: 1234,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_keeps_live_config_when_replay_fields_absent() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        let cfg = got.event_config.expect("kv_events present");
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.replay, None);
     }
 
     #[tokio::test]

@@ -48,6 +48,9 @@ pub struct EventConfig {
     /// many SUB connections (one per rank), skipping any rank whose
     /// `port_base + dp_rank` overflows `u16`.
     pub dp_size: u32,
+    /// Optional replay ROUTER endpoint advertised by the worker. When present,
+    /// per-rank replay endpoint = `tcp://host:<port_base + dp_rank>`.
+    pub replay: Option<ReplayConfig>,
     /// Whether the worker uses EAGLE-family speculative decoding (EAGLE /
     /// EAGLE3 / FROZEN_KV_MTP), reported via `/server_info`'s top-level
     /// `speculative_algorithm`. When true the worker hashes KV blocks over
@@ -56,6 +59,18 @@ pub struct EventConfig {
     /// match the worker's stored hashes — otherwise cache-aware routing
     /// silently never matches and degrades to min-load.
     pub is_bigram: bool,
+}
+
+/// Replay ROUTER endpoint configuration resolved from `/server_info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayConfig {
+    /// Host the gateway should connect to, with wildcard bind hosts replaced
+    /// by the worker URL's host.
+    pub host: String,
+    /// Base port for rank 0. Per-rank port = `port_base + dp_rank`.
+    pub port_base: u16,
+    /// Worker replay buffer capacity in event-batch steps.
+    pub buffer_steps: usize,
 }
 
 /// Default timeout for the `/server_info` introspection request. The
@@ -114,13 +129,18 @@ pub async fn fetch_event_config(
     // Wildcard bind hosts mean "any interface" on the worker side — the
     // gateway has to connect to a routable address, which it learns from
     // the worker URL.
-    let host = if matches!(
-        block.endpoint_host.as_str(),
-        "*" | "0.0.0.0" | "::" | "[::]"
+    let host = resolve_published_host(block.endpoint_host, &worker_host);
+    let replay = match (
+        block.replay_endpoint_host,
+        block.replay_endpoint_port_base,
+        block.replay_buffer_steps,
     ) {
-        worker_host
-    } else {
-        block.endpoint_host
+        (Some(replay_host), Some(replay_port), Some(buffer_steps)) => Some(ReplayConfig {
+            host: resolve_published_host(replay_host, &worker_host),
+            port_base: replay_port,
+            buffer_steps,
+        }),
+        _ => None,
     };
 
     Ok(Some(EventConfig {
@@ -129,8 +149,17 @@ pub async fn fetch_event_config(
         topic: block.topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
+        replay,
         is_bigram,
     }))
+}
+
+fn resolve_published_host(advertised_host: String, worker_host: &str) -> String {
+    if matches!(advertised_host.as_str(), "*" | "0.0.0.0" | "::" | "[::]") {
+        worker_host.to_owned()
+    } else {
+        advertised_host
+    }
 }
 
 /// Issue the `/server_info` request with bounded retry on transient errors
@@ -254,6 +283,12 @@ struct KvEventsBlock {
     topic: String,
     block_size: u32,
     dp_size: u32,
+    #[serde(default)]
+    replay_endpoint_host: Option<String>,
+    #[serde(default)]
+    replay_endpoint_port_base: Option<u16>,
+    #[serde(default)]
+    replay_buffer_steps: Option<usize>,
 }
 
 #[cfg(test)]
@@ -320,9 +355,58 @@ mod tests {
                 topic: "kv".to_string(),
                 block_size: 64,
                 dp_size: 2,
+                replay: None,
                 is_bigram: false,
             })
         );
+    }
+
+    /// Replay endpoint fields are optional but, when present, are resolved with
+    /// the same wildcard-host substitution as the live PUB endpoint.
+    #[tokio::test]
+    async fn fetch_parses_replay_config_and_substitutes_wildcard_host() {
+        let body = Arc::new(json!({
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "kv",
+                "block_size": 64,
+                "dp_size": 2,
+                "replay_endpoint_host": "*",
+                "replay_endpoint_port_base": 5657,
+                "replay_buffer_steps": 1234,
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(
+            got.replay,
+            Some(ReplayConfig {
+                host: "127.0.0.1".to_string(),
+                port_base: 5657,
+                buffer_steps: 1234,
+            })
+        );
+    }
+
+    /// Older workers and workers without replay configured still expose usable
+    /// live PUB metadata; the replay config should simply be absent.
+    #[tokio::test]
+    async fn fetch_omits_replay_when_fields_missing() {
+        let body = Arc::new(json!({
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }));
+        let (url, _shutdown) = spawn_fake_worker(body).await;
+        let got = fetch_event_config(&url, &client()).await.unwrap().unwrap();
+        assert_eq!(got.replay, None);
     }
 
     /// EAGLE-family `speculative_algorithm` (and only those) must set

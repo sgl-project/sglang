@@ -18,13 +18,14 @@ pub mod block_size_oracle;
 pub mod discovery;
 pub mod hash;
 pub mod index;
+pub(crate) mod replay;
 pub mod subscriber;
 pub mod tree;
 pub mod wire;
 
 pub use block_size_oracle::BlockSizeOracle;
 pub(crate) use discovery::classify_bigram;
-pub use discovery::{fetch_event_config, EventConfig};
+pub use discovery::{fetch_event_config, EventConfig, ReplayConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, WorkerEvent};

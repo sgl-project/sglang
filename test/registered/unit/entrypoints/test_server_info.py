@@ -126,6 +126,69 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertEqual(info["kv_events"]["block_size"], 128)
         self.assertEqual(info["kv_events"]["dp_size"], 1)
 
+    def test_kv_events_descriptor_exposes_valid_replay_endpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"replay_endpoint": "tcp://*:5657", "buffer_steps": 1234, '
+                '"topic": "kv"}'
+            ),
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertEqual(info["kv_events"]["replay_endpoint_host"], "*")
+        self.assertEqual(info["kv_events"]["replay_endpoint_port_base"], 5657)
+        self.assertEqual(info["kv_events"]["replay_buffer_steps"], 1234)
+
+    def test_kv_events_descriptor_omits_replay_when_unconfigured(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", "topic": "kv"}'
+            ),
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertNotIn("replay_endpoint_host", info["kv_events"])
+        self.assertNotIn("replay_endpoint_port_base", info["kv_events"])
+        self.assertNotIn("replay_buffer_steps", info["kv_events"])
+
+    def test_kv_events_descriptor_omits_invalid_replay_without_hiding_live(self):
+        for replay_endpoint in (
+            "inproc://cache",
+            "tcp://0.0.0.0",
+            "tcp://0.0.0.0:abc",
+            "tcp://0.0.0.0:0",
+            "tcp://0.0.0.0:65536",
+        ):
+            with self.subTest(replay_endpoint=replay_endpoint):
+                args = ServerArgs(
+                    model_path="dummy",
+                    kv_events_config=(
+                        '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                        f'"replay_endpoint": "{replay_endpoint}", "topic": "kv"}}'
+                    ),
+                    page_size=64,
+                    dp_size=2,
+                )
+
+                info = _call_server_info_with(args)
+
+                self.assertIsNotNone(info["kv_events"])
+                self.assertEqual(info["kv_events"]["endpoint_port_base"], 5557)
+                self.assertNotIn("replay_endpoint_host", info["kv_events"])
+                self.assertNotIn("replay_endpoint_port_base", info["kv_events"])
+                self.assertNotIn("replay_buffer_steps", info["kv_events"])
+
     # ----- disabled / unconfigured -------------------------------------
 
     def test_kv_events_is_null_when_no_publisher_configured(self):

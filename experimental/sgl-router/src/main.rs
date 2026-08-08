@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
             active_load,
         ),
     );
+    kv_index.attach_metrics(Arc::clone(&ctx.metrics));
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
