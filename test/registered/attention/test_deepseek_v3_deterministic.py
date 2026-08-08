@@ -12,7 +12,7 @@ from sglang.test.test_deterministic_utils import (
     TestDeterministicBase,
 )
 
-register_cuda_ci(est_time=240, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=240, suite="nightly-1-gpu", nightly=True)
 
 DEEPSEEK_MODEL = "lmsys/sglang-ci-dsv3-test"
 
