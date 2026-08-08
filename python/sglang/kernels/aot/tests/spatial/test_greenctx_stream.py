@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from sgl_kernel import create_greenctx_stream_by_value, get_sm_available
 
+from sglang.srt.platforms import current_platform
+
 
 def test_green_ctx():
     A = torch.randn(5120, 5120).cuda()
@@ -18,7 +20,7 @@ def test_green_ctx():
     with torch.cuda.stream(stream_group[1]):
         for _ in range(100):
             result_1 = torch.matmul(A, B)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert torch.allclose(result_0, C)
     assert torch.allclose(result_1, C)
 

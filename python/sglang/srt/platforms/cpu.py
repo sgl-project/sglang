@@ -107,10 +107,10 @@ class CpuDeviceMixin(DeviceMixin):
         #   change.
         gc.collect()
 
-    def synchronize(self) -> None:
+    def synchronize(self, device: "torch.device | int | None" = None) -> None:
         # Documented no-op on CPU (no async streams to drain). Called for
         # symmetry with CudaDeviceMixin's torch.cuda.synchronize().
-        torch.cpu.synchronize()
+        torch.cpu.synchronize(device)
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         vm = psutil.virtual_memory()

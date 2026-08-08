@@ -49,6 +49,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
@@ -2842,7 +2843,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     gc.collect()
     if not _is_cpu:
         if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             if hasattr(torch._C, "_host_emptyCache"):
                 torch._C._host_emptyCache()
             else:

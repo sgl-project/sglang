@@ -35,6 +35,7 @@ from sglang.srt.layers.moe.dwdp.vmm import (
     tensor_from_ptr,
     unmap_va,
 )
+from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def _copy_local_weights_to_handles(
             cuda.cuMemcpyDtoD(temp_va + data_offset, param.data_ptr(), nbytes),
             "cuMemcpyDtoD",
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         unmap_va(temp_va, phys_size)
         free_va(temp_va, phys_size)
@@ -95,7 +96,7 @@ def _copy_local_weights_to_handles(
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
 
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
     return handles, sizes
 

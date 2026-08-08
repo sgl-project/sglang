@@ -80,6 +80,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -2211,12 +2212,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             shuffle_weight(layer.w13_weight.data, (16, 16)),
             requires_grad=False,
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         layer.w2_weight = torch.nn.Parameter(
             shuffle_weight(layer.w2_weight.data, (16, 16)),
             requires_grad=False,
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         # INT4-FP8 : offset INT4 w13_weight_scale1 to single w13_weight_scale
         # Fp8 moe kernel needs single fp8 w13_weight_scale for w13 per expert.
@@ -2253,12 +2254,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
             )
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             layer.w2_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w2_weight.data, (16, 16)),
                 requires_grad=False,
             )
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
@@ -2269,12 +2270,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
                 requires_grad=False,
             )
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             layer.w2_weight = torch.nn.Parameter(
                 F.pad(layer.w2_weight.data, (0, padding_size), "constant", 0),
                 requires_grad=False,
             )
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

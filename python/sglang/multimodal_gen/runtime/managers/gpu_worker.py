@@ -171,7 +171,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         released = self._realtime_sessions.release(session_id)
         if released:
             if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+                current_platform.empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
@@ -546,7 +546,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.get_device_module().empty_cache()
+                current_platform.empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -583,7 +583,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
             if not current_platform.is_cpu():
-                torch.get_device_module().empty_cache()
+                current_platform.empty_cache()
         return output_batch
 
     def _materialize_output_transport(
@@ -645,7 +645,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
             and torch.cuda.is_initialized()
         ):
-            torch.cuda.synchronize()
+            current_platform.synchronize()
         start_time = time.perf_counter()
         output_batch.output = [
             self._materialize_frame_output(output, output_batch, req)
@@ -656,7 +656,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
                 and torch.cuda.is_initialized()
             ):
-                torch.cuda.synchronize()
+                current_platform.synchronize()
             output_batch.metrics.record_stage(
                 "GPUWorker.frame_materialize_for_return",
                 time.perf_counter() - start_time,
@@ -1171,7 +1171,7 @@ def run_scheduler_process(
             del scheduler
         gc.collect()
         if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")

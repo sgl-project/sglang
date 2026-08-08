@@ -8,6 +8,7 @@ import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
@@ -119,7 +120,7 @@ class WeightChecker:
         )
 
     def _compute_checksum(self) -> Dict:
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         start = time.perf_counter()
 
         quantized_set = _build_quantized_set(self._get_model())
@@ -144,7 +145,7 @@ class WeightChecker:
             h.update(checksums[name].encode())
         overall = h.hexdigest()
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         elapsed = time.perf_counter() - start
         logger.info(
             f"[WeightChecker] checksum computed for {len(checksums)} tensors in {elapsed:.3f}s"

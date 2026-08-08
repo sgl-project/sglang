@@ -35,6 +35,7 @@ from PIL import Image
 from sglang.benchmark.serving import run_benchmark
 from sglang.global_config import global_config
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -804,7 +805,7 @@ def _subprocess_popen_with_outputs(
     # Release allocator-cached GPU memory to the driver before spawning a
     # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
     if torch.cuda.is_initialized():
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
@@ -2661,7 +2662,7 @@ def empty_gpu_cache():
 
     # CUDA
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         return
 
     # XPU (Intel)

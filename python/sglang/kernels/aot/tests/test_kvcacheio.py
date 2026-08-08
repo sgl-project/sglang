@@ -13,6 +13,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_mla,
 )
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_cuda_version, is_hip
 
 # Skip entire module on CUDA 13.x — segfaults in transfer_kv kernel.
@@ -138,7 +139,7 @@ def test_transfer_kv(
         dst_k_pool_direct = torch.zeros_like(dst_k_pool_ref)
         dst_v_pool_direct = torch.zeros_like(dst_v_pool_ref)
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # We will test the per-layer function on the first layer (index 0) of the pool.
     layer_idx_to_test = 0
@@ -201,7 +202,7 @@ def test_transfer_kv(
                 dst_indices_device,
                 page_size=page_size,
             )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
         torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
     else:
@@ -297,7 +298,7 @@ def test_transfer_kv(
                 dst_indices_device,
                 page_size=page_size,
             )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
         torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
@@ -364,7 +365,7 @@ def test_transfer_kv_pf_direct(
                 total_pages_in_pool, num_layers, page_size, item_size
             ).pin_memory()
             dst_pool_direct = torch.zeros_like(dst_pool_ref)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             with torch.cuda.stream(test_stream):
                 transfer_kv_all_layer_direct_lf_pf(
@@ -386,7 +387,7 @@ def test_transfer_kv_pf_direct(
                     i,
                     lf_to_pf=True,
                 )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
 
         else:
@@ -404,7 +405,7 @@ def test_transfer_kv_pf_direct(
             dst_v_pool_ref = torch.zeros_like(dst_k_pool_ref)
             dst_k_pool_direct = torch.zeros_like(dst_k_pool_ref)
             dst_v_pool_direct = torch.zeros_like(dst_v_pool_ref)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             with torch.cuda.stream(test_stream):
                 transfer_kv_all_layer_direct_lf_pf(
@@ -435,7 +436,7 @@ def test_transfer_kv_pf_direct(
                     i,
                     lf_to_pf=True,
                 )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
             torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
     else:
@@ -449,7 +450,7 @@ def test_transfer_kv_pf_direct(
             )
             dst_pool_direct = torch.zeros_like(dst_pool_ref)
             dst_pool_direct_ptrs = [dst_pool_direct[i] for i in range(num_layers)]
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             with torch.cuda.stream(test_stream):
                 transfer_kv_per_layer_direct_pf_lf(
@@ -471,7 +472,7 @@ def test_transfer_kv_pf_direct(
                 layer_idx_to_test,
                 lf_to_pf=False,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
         else:
             src_k_pool = torch.randn(
@@ -490,7 +491,7 @@ def test_transfer_kv_pf_direct(
             dst_v_pool_ref = torch.zeros_like(dst_k_pool_ref)
             dst_v_pool_direct = torch.zeros_like(dst_v_pool_ref)
             dst_v_pool_direct_ptrs = [dst_v_pool_direct[i] for i in range(num_layers)]
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             with torch.cuda.stream(test_stream):
                 transfer_kv_per_layer_direct_pf_lf(
@@ -525,7 +526,7 @@ def test_transfer_kv_pf_direct(
                 lf_to_pf=False,
             )
 
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
             torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
@@ -610,7 +611,7 @@ def test_transfer_kv_page_head(
 
         dst_k_pool_kernel = torch.zeros_like(dst_k_pool_ref).pin_memory()
         dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref).pin_memory()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         transfer_kv_all_layer_lf_ph(
             src_k_pool_ptrs,
@@ -625,7 +626,7 @@ def test_transfer_kv_page_head(
             page_size,
             head_num,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         for i in range(num_layers):
             ref_copy_with_indices_page_head(
@@ -648,7 +649,7 @@ def test_transfer_kv_page_head(
                 head_num,
                 lf_to_ph=True,
             )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     else:
@@ -669,7 +670,7 @@ def test_transfer_kv_page_head(
         dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref)
         dst_k_pool_kernel_ptrs = [dst_k_pool_kernel[i] for i in range(num_layers)]
         dst_v_pool_kernel_ptrs = [dst_v_pool_kernel[i] for i in range(num_layers)]
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         transfer_kv_per_layer_ph_lf(
             src_k_pool,
@@ -705,7 +706,7 @@ def test_transfer_kv_page_head(
             head_num,
             lf_to_ph=False,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)

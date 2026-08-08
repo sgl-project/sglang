@@ -24,6 +24,7 @@ import torch
 from transformers import AutoConfig
 
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.platforms import current_platform
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -125,14 +126,14 @@ def benchmark_mrope(
             key.clone(),
         )
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # Time reference implementation
     torch_times = []
     for _ in range(benchmark_iter):
         query_clone = query.clone()
         key_clone = key.clone()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         start_time = time.time()
 
         mrope_helper_class.forward_native(
@@ -141,7 +142,7 @@ def benchmark_mrope(
             key_clone,
         )
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch_times.append(time.time() - start_time)
 
     # Time triton kernel implementation
@@ -149,14 +150,14 @@ def benchmark_mrope(
     for _ in range(benchmark_iter):
         query_clone = query.clone()
         key_clone = key.clone()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         start_time = time.time()
         mrope_helper_class.forward(
             positions,
             query_clone,
             key_clone,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         triton_times.append(time.time() - start_time)
 
     # Calculate statistics

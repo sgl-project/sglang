@@ -27,6 +27,10 @@ class CpuPlatform(Platform):
     device_type = "cpu"
     dispatch_key = "CPU"
 
+    def empty_cache(self) -> None:
+        # torch.cpu exposes no allocator cache to release.
+        pass
+
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device("cpu")

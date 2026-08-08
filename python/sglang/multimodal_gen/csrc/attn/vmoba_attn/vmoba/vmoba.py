@@ -30,6 +30,8 @@ from functools import lru_cache
 
 from einops import rearrange
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 @lru_cache(maxsize=16)
 def calc_chunks(cu_seqlen, moba_chunk_size):
@@ -1014,7 +1016,7 @@ def test_attn_varlen_moba_speed(
         )
         torch.autograd.backward(o, vo_grad)
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     start_flash = time.perf_counter()
     for _ in range(perf_test_iters):
         o = flash_attn_varlen_func(
@@ -1022,7 +1024,7 @@ def test_attn_varlen_moba_speed(
         )
         torch.autograd.backward(o, vo_grad)
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     time_flash = (time.perf_counter() - start_flash) / perf_test_iters * 1000
 
     # Warmup
@@ -1041,7 +1043,7 @@ def test_attn_varlen_moba_speed(
         )
         torch.autograd.backward(om, vo_grad)
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     start_moba = time.perf_counter()
     for _ in range(perf_test_iters):
         om = moba_attn_varlen(
@@ -1058,7 +1060,7 @@ def test_attn_varlen_moba_speed(
         )
         torch.autograd.backward(om, vo_grad)
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     time_moba = (time.perf_counter() - start_moba) / perf_test_iters * 1000
 
     print(f"Flash: {time_flash:.2f}ms, MoBA: {time_moba:.2f}ms")

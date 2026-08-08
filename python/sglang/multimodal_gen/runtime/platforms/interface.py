@@ -286,6 +286,32 @@ class Platform:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
 
+    def empty_cache(self) -> None:
+        """Release cached device memory.
+
+        Defaults to ``torch.<device_type>.empty_cache()`` via
+        ``torch.get_device_module``, so a new backend works without an
+        override. Platforms whose device module has no allocator cache
+        (e.g. ``torch.cpu``) override this with a no-op.
+        """
+        torch.get_device_module(self.device_type).empty_cache()
+
+    def synchronize(self, device: torch.device | int | None = None) -> None:
+        """Wait for all pending work on a device to complete.
+
+        ``device`` selects which device to wait on; ``None`` means the current
+        one. Defaults to ``torch.<device_type>.synchronize()`` via
+        ``torch.get_device_module``.
+
+        ``device`` is only forwarded when set: some device modules (e.g.
+        ``torch.mps``) take no positional argument at all.
+        """
+        device_module = torch.get_device_module(self.device_type)
+        if device is None:
+            device_module.synchronize()
+        else:
+            device_module.synchronize(device)
+
     @lru_cache(maxsize=1)
     def get_device(self, local_rank: int) -> torch.device:
         if self.is_cuda() or self.is_rocm():

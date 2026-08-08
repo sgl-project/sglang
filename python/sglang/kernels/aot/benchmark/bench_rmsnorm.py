@@ -13,6 +13,7 @@ import triton
 import triton.testing
 from sgl_kernel.utils import is_arch_support_pdl
 
+from sglang.srt.platforms import current_platform
 from sglang.utils import is_in_ci
 
 # Optional imports
@@ -291,7 +292,7 @@ def benchmark(batch_size, seq_len, hidden_size, provider, use_residual):
     def timed(fn):
         for _ in range(5):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         ms, qmin, qmax = triton.testing.do_bench_cudagraph(
             fn, quantiles=[0.5, 0.2, 0.8]
         )
