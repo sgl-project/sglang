@@ -9,9 +9,13 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DENSE_ATOL,
+    DENSE_RTOL,
     DenseAttentionCase,
+    build_dense_attention_fixture,
     make_dense_cases,
     run_dense_attention_case,
 )
@@ -427,6 +431,125 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    RETURN_LSE_CASES = (
+        DenseAttentionCase(
+            name="return_lse_mha_extend",
+            backend="fa4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=1,
+            prefix_lens=(2, 4),
+            extend_lens=(3, 1),
+        ),
+        DenseAttentionCase(
+            name="return_lse_gqa_decode",
+            backend="fa4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=8,
+            num_kv_heads=2,
+            page_size=1,
+            prefix_lens=(5, 9),
+        ),
+    )
+
+    def _reference_out_and_lse(self, fixture):
+        """Causal fp32 reference: output and per-query LSE."""
+        case, module = fixture.case, fixture.reference_module
+        dim = module.head_dim
+        rep = case.num_heads // case.num_kv_heads
+        q, k, v = module.project_qkv(fixture.input_hidden)
+        q = q.view(-1, case.num_heads, dim).float()
+        k = k.view(-1, case.num_kv_heads, dim).float()
+        v = v.view(-1, case.num_kv_heads, dim).float()
+
+        outs, lses, seen = [], [], 0
+        for req, prefix in enumerate(fixture.prefix_hidden):
+            _, prefix_k, prefix_v = module.project_qkv(prefix)
+            n = case.input_lens[req]
+            keys = torch.cat(
+                [prefix_k.view(-1, case.num_kv_heads, dim).float(), k[seen : seen + n]]
+            ).repeat_interleave(rep, dim=1)
+            values = torch.cat(
+                [prefix_v.view(-1, case.num_kv_heads, dim).float(), v[seen : seen + n]]
+            ).repeat_interleave(rep, dim=1)
+            for offset in range(n):
+                end = case.prefix_lens[req] + offset + 1
+                scores = (
+                    torch.einsum("hd,khd->hk", q[seen + offset], keys[:end])
+                    * module.scaling
+                )
+                probs = torch.softmax(scores, dim=-1)
+                outs.append(torch.einsum("hk,khd->hd", probs, values[:end]).reshape(-1))
+                lses.append(torch.logsumexp(scores, dim=-1))
+            seen += n
+        return torch.stack(outs), torch.stack(lses)
+
+    def test_return_lse(self):
+        """Calls the backend directly: return_lse is a backend-level contract,
+        and the RadixAttention dispatcher's custom-op schema cannot carry it.
+        """
+        for case in self.RETURN_LSE_CASES:
+            with self.subTest(case=case.name):
+                fixture = build_dense_attention_fixture(
+                    self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
+                )
+                module = fixture.actual_module
+                forward = (
+                    fixture.backend.forward_decode
+                    if case.forward_mode.is_decode()
+                    else fixture.backend.forward_extend
+                )
+                with torch.no_grad(), forward_context(
+                    ForwardContext(attn_backend=fixture.backend)
+                ):
+                    fixture.backend.init_forward_metadata(fixture.forward_batch)
+                    q, k, v = module.project_qkv(fixture.input_hidden)
+                    result = forward(
+                        q, k, v, module.attn, fixture.forward_batch, return_lse=True
+                    )
+
+                self.assertIsInstance(result, tuple)
+                out, lse = result
+                self.assertEqual(
+                    tuple(lse.shape), (case.num_input_tokens, case.num_heads)
+                )
+
+                expected_out, expected_lse = self._reference_out_and_lse(fixture)
+                torch.testing.assert_close(
+                    lse.float(), expected_lse, atol=DENSE_ATOL, rtol=DENSE_RTOL
+                )
+                torch.testing.assert_close(
+                    out.float().reshape(expected_out.shape),
+                    expected_out,
+                    atol=DENSE_ATOL,
+                    rtol=DENSE_RTOL,
+                )
+
+    def test_return_lse_rejects_unsupported_paths(self):
+        """The paged non-MLA path is the only one that can serve an LSE."""
+        case = self.RETURN_LSE_CASES[0]
+        fixture = build_dense_attention_fixture(
+            self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
+        )
+        backend, layer = fixture.backend, fixture.actual_module.attn
+
+        layer.is_cross_attention = True
+        try:
+            with self.assertRaises(RuntimeError):
+                backend._check_return_lse(True, layer)
+        finally:
+            layer.is_cross_attention = False
+
+        backend.fa_impl_ver = 3
+        try:
+            with self.assertRaises(RuntimeError):
+                backend._check_return_lse(True, layer)
+        finally:
+            backend.fa_impl_ver = 4
+
+        backend._check_return_lse(False, layer)  # no-op when not requested
 
 
 if __name__ == "__main__":
