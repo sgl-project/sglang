@@ -826,10 +826,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights.squeeze(2)
 
         if self.paged_mqa_logits_backend.is_aiter():
+            # Under attn-tp / DP-attention (or MAX_LEN padding) q_fp8 and weights
+            # carry padding rows up to the largest per-rank token count, while
+            # seqlens is sized to the real count q_offset. The other backends
+            # below take q_offset= and slice internally; the aiter kernel does
+            # not, and sizes its logits output from q_fp8.shape[0]. Without the
+            # same slice the top-k below sees score.shape[0] != lengths.shape[0]
+            # and asserts (lengths.size(0) == B). Slice to the real length to
+            # match the other backends' contract; the padding is restored after
+            # topk_transform below.
             logits = aiter_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:q_offset],
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset],
                 seqlens_32,
                 block_tables,
                 max_seq_len,
@@ -885,8 +894,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
-        # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
+        # Restore the padding trimmed before the kernel. Every backend above now
+        # returns a result sized to the real q length (q_offset) -- the CUDA
+        # backends via their q_offset= argument, aiter via the slice above -- so
+        # the restore applies uniformly and no longer needs a platform guard.
+        if q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
