@@ -202,6 +202,20 @@ class TestMlxReferenceCorrectness(CustomTestCase):
         self.runner.remove_request(rid)
         return out
 
+    def _upto_eos(self, seq):
+        """Prefix of ``seq`` up to and including the first EOS (all of it if none).
+
+        Past EOS the model is off-distribution: it emits control-token filler
+        whose logits are frequently near-tied, so greedy ``argmax`` there is not
+        stable under the tiny (~1e-3 relative) numerical differences that any
+        change of batch shape produces.  Comparisons that must hold token-for-token
+        are therefore bounded at EOS -- see ``test_batched_decode_matches_solo``.
+        """
+        for i, tok in enumerate(seq):
+            if tok in self.eos_ids:
+                return seq[: i + 1]
+        return seq
+
     def _diff_msg(self, prompt, ref, sgl):
         horizon = min(len(ref), len(sgl))
         first = next((j for j in range(horizon) if ref[j] != sgl[j]), horizon)
@@ -225,6 +239,16 @@ class TestMlxReferenceCorrectness(CustomTestCase):
 
         Pins slot/cache isolation: ``decode_batch`` over several concurrent
         requests must not let one request's state bleed into another's.
+
+        The comparison is bounded at the first EOS.  Batching changes GEMM shapes
+        and therefore floating-point reduction order, which perturbs the logits by
+        ~1e-3 relative -- unavoidable, and *not* caused by padding: an equal-length
+        batch (no padding, no mask) shows the identical perturbation, and adding
+        ragged padding + the attention mask changes it by exactly zero.  Before EOS
+        the argmax margin dwarfs that perturbation, so tokens agree exactly and real
+        cross-request bleed still fails the assert.  After EOS the model emits
+        control-token filler with near-tied logits (observed top-2 margin 0.016),
+        where the same perturbation flips argmax for reasons unrelated to isolation.
         """
         ids_list = [prompt_ids for (_, prompt_ids, _) in self.cases]
 
@@ -237,6 +261,11 @@ class TestMlxReferenceCorrectness(CustomTestCase):
             self.runner.remove_request(f"solo-{i}")
             solo.append(seq)
 
+        self.assertTrue(
+            any(self.eos_ids.isdisjoint(seq) for seq in solo),
+            "at least one case must exercise the full batch horizon without EOS",
+        )
+
         # Batched: prefill all, then advance them together in one decode_batch.
         rids = [f"batch-{i}" for i in range(len(ids_list))]
         batched = [[self._prefill(rid, ids)] for rid, ids in zip(rids, ids_list)]
@@ -247,9 +276,9 @@ class TestMlxReferenceCorrectness(CustomTestCase):
             self.runner.remove_request(rid)
 
         for i, (prompt, _, _) in enumerate(self.cases):
-            self.assertEqual(
-                batched[i], solo[i], self._diff_msg(prompt, solo[i], batched[i])
-            )
+            ref = self._upto_eos(solo[i])
+            got = batched[i][: len(ref)]
+            self.assertEqual(got, ref, self._diff_msg(prompt, ref, got))
 
 
 if __name__ == "__main__":
