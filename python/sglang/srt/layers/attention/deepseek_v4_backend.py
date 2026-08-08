@@ -943,13 +943,7 @@ class DeepseekV4AttnBackend(
         extend_seq_lens = self.extend_seq_lens_buffer[:bs]
         extend_seq_lens.fill_(extend_len)
         extend_start_loc = self.extend_start_loc_buffer[:bs]
-        torch.arange(
-            0,
-            bs * extend_len,
-            extend_len,
-            out=extend_start_loc,
-            **self.cuda_int32_kwargs,
-        )
+        torch.arange(0, bs * extend_len, extend_len, out=extend_start_loc)
         lengths = VerifyExtendLengths(
             seq_lens_extended=seq_lens + extend_len,
             seq_lens_cpu_extended=[x + extend_len for x in seq_lens_cpu],
