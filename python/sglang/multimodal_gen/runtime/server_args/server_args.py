@@ -281,6 +281,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
+    minimax_h3_adaln_cache_path: str | None = None
     # Per-component transformer weight overrides (key = model_index.json component name).
     # Pipelines use this when a checkpoint ships separate quantized weights for
     # secondary DiT components; the generic loader consumes it without model-specific
@@ -1372,6 +1374,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Semantic checkpoint variant to serve. Models with partitioned "
                 "checkpoints use this value to select the compatible weights "
                 "without exposing repository subfolder layout."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-cache-path",
+            type=str,
+            default=ServerArgs.minimax_h3_adaln_cache_path,
+            help=(
+                "Path to a precomputed MiniMax H3 AdaLN cache. This only "
+                "supports the matching unquantized H3 checkpoint and rejects "
+                "requests whose timestep embeddings are not present in the cache."
             ),
         )
         parser.add_argument(
