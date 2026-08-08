@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     sock_recv,
 )
+from sglang.srt.managers.mm_transport import broadcast_mm_cpu_tensors
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
@@ -159,7 +160,7 @@ class SchedulerRequestReceiver:
                 control_reqs = None
 
             if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
+                work_reqs = self._broadcast_work_reqs(
                     work_reqs,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
@@ -167,7 +168,7 @@ class SchedulerRequestReceiver:
                 )
 
             if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
+                work_reqs = self._broadcast_work_reqs(
                     work_reqs,
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
@@ -207,13 +208,27 @@ class SchedulerRequestReceiver:
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
+            recv_reqs = self._broadcast_work_reqs(
                 recv_reqs,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def _broadcast_work_reqs(self, recv_reqs, rank, dist_group, src):
+        # This optimization is for the explicit/auto-resolved CPU feature
+        # transport path.  CUDA IPC/VMM proxies must stay on the existing
+        # object-broadcast path; in particular, K3 on MNNVL may use a GPU
+        # transport and must not pay an additional CPU-transport dispatch.
+        if (
+            self.model_config.is_multimodal
+            and self.server_args.nnodes > 1
+            and self.server_args.dist_init_addr
+            and self.server_args.mm_feature_transport == "cpu"
+        ):
+            return broadcast_mm_cpu_tensors(recv_reqs, rank, dist_group, src=src)
+        return broadcast_pyobj(recv_reqs, rank, dist_group, src=src)
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
         if not recv_reqs:
