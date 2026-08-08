@@ -71,7 +71,7 @@ class TestQwen35(unittest.TestCase):
                 num_examples=200,
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_qwen35",
+                result_dir="performance_results_qwen35",
             ),
         )
 

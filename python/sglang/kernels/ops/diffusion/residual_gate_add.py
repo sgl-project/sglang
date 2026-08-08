@@ -24,7 +24,7 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "residual_gate_add",
-                "sglang_residual_gate_add::" f"ResidualGateAddKernel<{args}>::run",
+                "residual_gate_add::" f"ResidualGateAddKernel<{args}>::run",
             ),
         ],
     )
