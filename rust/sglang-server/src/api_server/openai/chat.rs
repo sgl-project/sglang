@@ -23,6 +23,7 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -46,14 +47,30 @@ pub(super) fn routes() -> Router<AppState> {
 
 async fn chat_completions(
     State(state): State<AppState>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let request = match body {
-        Ok(Json(request)) => request,
+    let mut value = match body {
+        Ok(Json(value)) => value,
         Err(rejection) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 error_payload(StatusCode::BAD_REQUEST, rejection.body_text()),
+                false,
+            );
+        }
+    };
+    // PD routing. The Dynamo request type drops unknown keys, so bootstrap
+    // params — injected by the embedded front door or supplied by an external
+    // router — are read from (and, when this server routes, written into) the
+    // raw JSON, then attached per choice below.
+    let (bootstrap, pd_forward) =
+        super::super::pd_lb::resolve_openai_bootstrap(&state.prefill_worker_pool, &mut value);
+    let request = match CreateChatCompletionRequest::deserialize(&value) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                error_payload(StatusCode::BAD_REQUEST, error.to_string()),
                 false,
             );
         }
@@ -219,6 +236,10 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
+        // Scalar bootstrap params expand per choice as `room + index` — the
+        // same rule a rust prefill peer applies to the forwarded scalar, so
+        // both sides derive identical per-choice rooms.
+        let choice_bootstrap = bootstrap.for_choice(index);
         let native = GenerateRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
@@ -231,6 +252,10 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
+            bootstrap_host: choice_bootstrap.bootstrap_host,
+            bootstrap_port: choice_bootstrap.bootstrap_port,
+            bootstrap_room: choice_bootstrap.bootstrap_room,
+            bootstrap_pair_key: choice_bootstrap.bootstrap_pair_key,
             ..Default::default()
         };
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
@@ -238,6 +263,20 @@ async fn chat_completions(
             Err(response) => return response,
         };
         submitted.push((index, rid, rx));
+    }
+
+    // Every local choice is armed — fire the prefill copy (the client's JSON
+    // with the injected scalars). On forward failure each rid is Fail-aborted.
+    if let Some((pool, endpoint)) = pd_forward {
+        let rids = submitted.iter().map(|(_, rid, _)| rid.clone()).collect();
+        super::super::pd_lb::spawn_forward(
+            pool,
+            endpoint,
+            "/v1/chat/completions",
+            &value,
+            rids,
+            state.senders.clone(),
+        );
     }
 
     if stream {
