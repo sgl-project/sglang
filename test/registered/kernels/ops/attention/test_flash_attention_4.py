@@ -1516,6 +1516,7 @@ def _generate_block_kvcache(
     reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
 )
 @pytest.mark.parametrize("mha_type", ["mqa", "gqa"])
+@pytest.mark.parametrize("num_splits", [0, 1])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1525,12 +1526,13 @@ def _generate_block_kvcache(
         (16, 20000),  # long context
     ],
 )
-def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
+def test_flash_attn_varlen_qv_deepseek_absorbed(
+    seqlen_q, seqlen_k, num_splits, mha_type
+):
     """DeepSeek absorbed-MLA FA4 shape: rope q/k head_dim 64, latent v/qv
-    head_dim 512, varlen q over a paged KV cache, num_splits=1. Mirrors the
-    production calls in flashattention_backend.py, where extend
-    (flash_attn_varlen_func) and decode (flash_attn_with_kvcache) share this
-    qv-threaded path.
+    head_dim 512, and varlen q over a paged KV cache. Mirrors the production
+    calls in flashattention_backend.py, where num_splits=0 selects splits
+    heuristically and extend/decode share this qv-threaded path.
     """
     device = "cuda"
     dtype = torch.bfloat16
@@ -1566,7 +1568,7 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
         seqused_k=cache_seqlens,
         page_table=page_table,
         causal=True,
-        num_splits=1,
+        num_splits=num_splits,
         ver=4,
     )
     out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
@@ -1583,7 +1585,7 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=seqlen_q,
         causal=True,
-        num_splits=1,
+        num_splits=num_splits,
         ver=4,
     )
     assert torch.equal(out_kvcache, out_unpad)
