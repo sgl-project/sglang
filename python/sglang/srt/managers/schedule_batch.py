@@ -79,10 +79,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -845,6 +842,11 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # How many entries of output_ids have already been fed to the sampling
+        # penalizers. A decode step commits more than one token under
+        # speculative decoding, so the penalty state cannot assume 1:1 with
+        # steps and has to track its own cursor.
+        self.penalty_fed_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1686,6 +1688,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.penalty_fed_len = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2964,22 +2967,68 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def cumulate_penalty_output_tokens(self):
         # Under overlap batch.input_ids is just a placeholder here -- the
         # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
+        # entry. So take the output tokens from Req directly
         # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
+        #
+        # Feed every token appended since the previous call, not just the last
+        # one: a speculative decode step commits `accept_len` tokens at once,
+        # and penalty state is per-token. Recording only the tail would leave
+        # the other accepted tokens permanently invisible to the penalizers,
+        # weakening them by a factor of the acceptance length.
+        pending = []
+        for req in self.reqs:
+            if req.penalty_fed_len > len(req.output_ids):
+                # output_ids was reset (retracted request); start over.
+                req.penalty_fed_len = 0
+            new_tokens = req.output_ids[req.penalty_fed_len :]
+            if not new_tokens and req.penalty_fed_len == 0:
+                # First decode, before any output token exists.
+                new_tokens = req.origin_input_ids[-1:]
+            else:
+                req.penalty_fed_len = len(req.output_ids)
+            pending.append(new_tokens)
+
+        max_new = max((len(tokens) for tokens in pending), default=0)
+        if max_new == 0:
+            return
+
         # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
         # pin_memory (matching the prefill-path tensors) keeps the copy async;
         # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
+        pin_memory = is_pin_memory_available(self.device)
+        orchestrator = self.sampling_info.penalizer_orchestrator
+
+        if all(len(tokens) == 1 for tokens in pending):
+            # Non-speculative steps commit exactly one token per request; keep
+            # the original unmasked 1-D call so that path is unchanged. Rows can
+            # be empty when a request produced nothing this step, and those need
+            # the masked path below rather than an out-of-range index.
+            latest_output_ids = torch.tensor(
+                [tokens[0] for tokens in pending],
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(self.device, non_blocking=True)
+            orchestrator.cumulate_output_tokens(latest_output_ids)
+            return
+
+        # Ragged rows: pad to max_new and mark the real entries. Padding ids are
+        # never read because the mask zeroes their contribution.
+        padded_ids = torch.tensor(
+            [list(tokens) + [0] * (max_new - len(tokens)) for tokens in pending],
             dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
+            pin_memory=pin_memory,
+        )
+        mask = torch.tensor(
+            [
+                [True] * len(tokens) + [False] * (max_new - len(tokens))
+                for tokens in pending
+            ],
+            dtype=torch.bool,
+            pin_memory=pin_memory,
+        )
+        orchestrator.cumulate_output_tokens(
+            padded_ids.to(self.device, non_blocking=True),
+            mask.to(self.device, non_blocking=True),
         )
 
     def prepare_for_decode(self):

@@ -42,15 +42,34 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
-            output_ids (torch.Tensor): The output tokens.
+            output_ids (torch.Tensor): `[batch_size]` when a step commits one
+                token per request, or `[batch_size, max_new]` when it commits
+                several (speculative decoding).
+            mask (Optional[torch.Tensor]): bool tensor shaped like `output_ids`
+                marking the real entries. Required whenever the rows are ragged,
+                since padded slots must not reach the penalty state.
         """
-        for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+        if output_ids.dim() == 1:
+            for penalizer in self.penalizers.values():
+                penalizer.cumulate_output_tokens(output_ids=output_ids, mask=mask)
+            return
+
+        # Walk the accepted tokens in order. Each column is a plain 1-D update,
+        # so the penalizers only ever deal with `[batch_size]` indices and
+        # cannot hit the intra-row duplicate-index hazard of a 2-D scatter_.
+        for step in range(output_ids.shape[1]):
+            step_mask = None if mask is None else mask[:, step]
+            for penalizer in self.penalizers.values():
+                penalizer.cumulate_output_tokens(
+                    output_ids=output_ids[:, step], mask=step_mask
+                )
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -209,11 +228,13 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        self._cumulate_output_tokens(output_ids=output_ids, mask=mask)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,10 +272,16 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+
+        `output_ids` is `[batch_size]`. `mask`, when given, is a `[batch_size]`
+        bool tensor; rows where it is False carry no token this step and must be
+        left untouched.
         """
         pass
 

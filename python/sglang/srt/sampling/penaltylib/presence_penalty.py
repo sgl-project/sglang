@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
@@ -32,11 +34,23 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             )
         ).unsqueeze_(1)
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
+        index = output_ids.unsqueeze(1)
+        src = self.presence_penalties
+        if mask is not None:
+            # scatter_ overwrites, so padded rows have to write back whatever is
+            # already stored at that index rather than the penalty value.
+            src = torch.where(
+                mask.unsqueeze(1),
+                src,
+                self.cumulated_presence_penalties.gather(1, index),
+            )
         self.cumulated_presence_penalties.scatter_(
             dim=1,
-            index=output_ids.unsqueeze(1),
-            src=self.presence_penalties,
+            index=index,
+            src=src,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
