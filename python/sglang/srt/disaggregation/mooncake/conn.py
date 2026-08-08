@@ -146,6 +146,7 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
+    dst_num_target_kv_layers: int = -1
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -185,6 +186,9 @@ class KVArgsRegisterInfo:
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            dst_num_target_kv_layers=(
+                int(msg[18].decode("ascii")) if len(msg) > 18 and msg[18] != b"" else -1
+            ),
         )
 
 
@@ -629,6 +633,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
+        num_dst_target_kv_layers: Optional[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
@@ -658,10 +663,19 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+        uses_flat_layout = (
+            self.is_mla_backend or self.is_hybrid_mla_backend or force_flat
+        )
+        has_any_layer_ids = bool(src_layer_ids or dst_layer_ids)
+        use_layer_ids = (
+            has_any_layer_ids
+            if uses_flat_layout
+            else bool(src_layer_ids and dst_layer_ids)
+        )
+        if uses_flat_layout or use_layer_ids:
             # Layer IDs map PP-local buffers to global decode entries.
             # Registrations without them retain the existing PP mapping.
-            if src_layer_ids or dst_layer_ids:
+            if use_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids,
@@ -688,7 +702,11 @@ class MooncakeKVManager(CommonKVManager):
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    num_dst_target_kv_layers=num_dst_target_kv_layers,
+                )
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
@@ -780,6 +798,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        num_dst_target_kv_layers: Optional[int] = None,
     ):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
@@ -804,6 +823,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            num_dst_target_kv_layers=num_dst_target_kv_layers,
         )
 
     def send_kvcache_dcp(
@@ -821,6 +841,7 @@ class MooncakeKVManager(CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
+        num_dst_target_kv_layers: Optional[int] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -839,7 +860,14 @@ class MooncakeKVManager(CommonKVManager):
             return 0
 
         src_layer_ids = self.kv_args.kv_layer_ids
-        if src_layer_ids or dst_layer_ids:
+        uses_flat_layout = self.is_mla_backend or self.is_hybrid_mla_backend
+        has_any_layer_ids = bool(src_layer_ids or dst_layer_ids)
+        use_layer_ids = (
+            has_any_layer_ids
+            if uses_flat_layout
+            else bool(src_layer_ids and dst_layer_ids)
+        )
+        if use_layer_ids:
             dst_indices = resolve_dcp_dst_entry_indices(
                 src_layer_ids,
                 dst_layer_ids,
@@ -849,10 +877,21 @@ class MooncakeKVManager(CommonKVManager):
             src_kv_ptrs = self.kv_args.kv_data_ptrs
             dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
         else:
-            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs,
-                dst_kv_ptrs,
-            )
+            if uses_flat_layout:
+                src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_data_ptrs,
+                    dst_kv_ptrs,
+                )
+            else:
+                src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, _ = (
+                    self.get_mha_kv_ptrs_with_pp(
+                        self.kv_args.kv_data_ptrs,
+                        dst_kv_ptrs,
+                        num_dst_target_kv_layers=num_dst_target_kv_layers,
+                    )
+                )
+                src_kv_ptrs = src_k_ptrs + src_v_ptrs
+                dst_kv_ptrs = dst_k_ptrs + dst_v_ptrs
         layers_current_pp_stage = len(src_kv_ptrs)
         src_groups, dst_groups = group_concurrent_contiguous(
             plan.src_token_indices,
@@ -916,6 +955,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        num_dst_target_kv_layers: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -969,7 +1009,11 @@ class MooncakeKVManager(CommonKVManager):
             dst_head_start_offset = 0
 
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(
+                self.kv_args.kv_data_ptrs,
+                dst_kv_ptrs,
+                num_dst_target_kv_layers=num_dst_target_kv_layers,
+            )
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -1605,6 +1649,9 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        num_dst_target_kv_layers = (
+                            target_rank_registration_info.dst_num_target_kv_layers
+                        )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -1674,6 +1721,7 @@ class MooncakeKVManager(CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
+                                num_dst_target_kv_layers=num_dst_target_kv_layers,
                             )
                         elif (
                             self.is_mla_backend
@@ -1687,8 +1735,11 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
-                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+                                dst_layer_ids=(
+                                    target_rank_registration_info.dst_kv_layer_ids
+                                ),
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                num_dst_target_kv_layers=num_dst_target_kv_layers,
                             )
                         elif (
                             self.enable_staging
@@ -1719,6 +1770,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                num_dst_target_kv_layers=num_dst_target_kv_layers,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -2300,6 +2352,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
             dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
+            dst_num_target_kv_layers = str(
+                getattr(self.kv_mgr.kv_args, "num_target_kv_layers", -1)
+            ).encode("ascii")
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -2334,6 +2389,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            dst_num_target_kv_layers,
                         ]
                     )
             except zmq.ZMQError:
