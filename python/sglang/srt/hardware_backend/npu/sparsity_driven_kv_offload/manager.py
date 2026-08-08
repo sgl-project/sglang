@@ -65,6 +65,25 @@ def _wait_stream_event(stream, event) -> None:
         event.wait(stream)
 
 
+def normalize_batch_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Normalize DSA top-k indices to [batch, topk] for compact KV copies."""
+    if topk_indices.dim() == 2:
+        return topk_indices
+    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
+        return topk_indices[:, 0, :]
+    if (
+        topk_indices.dim() == 4
+        and topk_indices.shape[1] == 1
+        and topk_indices.shape[2] == 1
+    ):
+        return topk_indices[:, 0, 0, :]
+    raise RuntimeError(
+        "Sparsity-driven KV offload expects DSA top-k indices with shape "
+        f"[batch, topk], [batch, 1, topk], or [batch, 1, 1, topk], got "
+        f"{tuple(topk_indices.shape)}."
+    )
+
+
 class SparseKVCacheManager:
     copy_stream = None
     miss_shm_cpu_tensor: list = []
@@ -76,6 +95,7 @@ class SparseKVCacheManager:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        sparse_context_len: int,
         # tp_group: torch.distributed.ProcessGroup,
         # server_args: ServerArgs,
     ) -> None:
@@ -88,7 +108,12 @@ class SparseKVCacheManager:
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
         self.max_context_len = req_to_token_pool.max_context_len
-        self.sparse_context_len = 2048
+        self.sparse_context_len = int(sparse_context_len)
+        if self.sparse_context_len <= 0:
+            raise ValueError(
+                "SparseKVCacheManager requires a positive sparse_context_len, "
+                f"got {self.sparse_context_len}."
+            )
         self.device = req_to_token_pool.device
         paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(paged_kv_cache, MLATokenToKVPool):
@@ -731,8 +756,13 @@ class SparseKVCacheManager:
             )
 
             # Normalize top-k indices and mask invalid requests and token IDs.
-            topk_indices = topk_indices.squeeze(1)
+            topk_indices = normalize_batch_topk_indices(topk_indices)
             batch_size, topk_len = topk_indices.shape
+            if topk_len > self.sparse_context_len:
+                raise RuntimeError(
+                    "DSA top-k length exceeds sparse KV device cache capacity: "
+                    f"topk_len={topk_len}, sparse_context_len={self.sparse_context_len}."
+                )
             valid_topk_mask = (
                 (topk_indices >= 0)
                 & (topk_indices < self.max_context_len)
