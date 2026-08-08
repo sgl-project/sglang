@@ -95,7 +95,7 @@ class EncoderMetaRegistry:
 
     Mooncake decoder ranks consume it early to allocate landing buffers. ZMQ
     publishes the same state for a uniform pipeline but does not consume it
-    before encode/send completes. ``claim`` remains a Mooncake ingress concern.
+    before encode/send completes.
     """
 
     def __init__(self, *, wait_timeout: float, sweep_timeout: float):
@@ -103,8 +103,7 @@ class EncoderMetaRegistry:
         self.wait_timeout = wait_timeout
         # Backstop for state whose /send calls never all land.
         self.sweep_timeout = sweep_timeout
-        # None value = claimed but not yet published, so waiters keep waiting.
-        self._rid_to_meta: Dict[str, Optional[dict]] = {}
+        self._rid_to_meta: Dict[str, dict] = {}
         self._rid_to_send_done: Dict[str, int] = {}
         self._pending_at: Dict[str, float] = {}
         self._sweeper_task: Optional[asyncio.Task] = None
@@ -137,20 +136,6 @@ class EncoderMetaRegistry:
             ]
             for rid in stale:
                 await self._release(rid)
-
-    async def claim(self, req_id: str) -> bool:
-        """True if this caller owns the encode, False if someone already does."""
-        async with rid_lock:
-            if req_id in self._rid_to_meta:
-                existing = self._rid_to_meta[req_id]
-                if not (
-                    isinstance(existing, dict) and existing.get("error") is not None
-                ):
-                    return False
-                self._rid_to_send_done.pop(req_id, None)
-            self._rid_to_meta[req_id] = None
-            self._touch(req_id)
-            return True
 
     async def publish(
         self,

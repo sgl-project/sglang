@@ -383,7 +383,8 @@ class DPDispatcher:
         self.dispatch_sockets = dispatch_sockets
         self.result_socket = result_socket
         self.worker_processes = worker_processes
-        # Key = req_id for encode/broadcast, _send_req_key for mooncake /send.
+        # Key = req_id for encode/broadcast, or a per-control-request key for
+        # Mooncake metadata waits, sends, and destination registrations.
         self.pending_futures: List[Dict[str, asyncio.Future]] = [
             {} for _ in range(dp_size)
         ]
@@ -391,6 +392,7 @@ class DPDispatcher:
         self._mapping_condition = asyncio.Condition()
         self._rr_counter = 0
         self._broadcast_counter = 0
+        self._metadata_counter = 0
         self._dead_ranks: Set[int] = set()
         # req_id -> monotonic ts a mooncake mapping has waited for its /send.
         self._pending_send_at: Dict[str, float] = {}
@@ -458,17 +460,35 @@ class DPDispatcher:
     def _register_req_key(req_id: str, request: dict) -> str:
         return f"{req_id}_register_{request['receive_url']}"
 
+    def _metadata_req_key(self, req_id: str) -> str:
+        key = f"{req_id}_metadata_{self._metadata_counter}"
+        self._metadata_counter += 1
+        return key
+
+    @staticmethod
+    def _pending_req_info(key: str) -> Tuple[str, str]:
+        marker_index, dp_type = max(
+            (
+                (key.rfind("_send_"), "send"),
+                (key.rfind("_metadata_"), "wait_metadata"),
+                (key.rfind("_register_"), "register_destinations"),
+            ),
+            key=lambda item: item[0],
+        )
+        if marker_index >= 0:
+            return key[:marker_index], dp_type
+        return key, "encode"
+
     def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
         # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
         pending = self.pending_futures[rank]
         for key, future in list(pending.items()):
             if not future.done():
-                # /send keys are _send_req_key's shape; the rest are req_id.
-                marker = key.rfind("_send_")
+                req_id, dp_type = self._pending_req_info(key)
                 future.set_result(
                     {
-                        "req_id": key[:marker] if marker >= 0 else key,
-                        "_dp_type": "send" if marker >= 0 else "encode",
+                        "req_id": req_id,
+                        "_dp_type": dp_type,
                         "content": None,
                         "_error": reason,
                         "_error_type": error_type,
@@ -519,10 +539,10 @@ class DPDispatcher:
         )
 
         try:
-            # Do not let a concurrent /scheduler_receive_url route to this
-            # worker until the corresponding encode message is enqueued first.
-            # Both messages share the same PUSH socket, so releasing the
-            # condition after send preserves their required order.
+            # Do not let concurrent metadata/destination control requests route
+            # to this worker until the corresponding encode is enqueued first.
+            # They share one PUSH socket, so releasing the condition after send
+            # preserves the required order.
             async with self._mapping_condition:
                 self.req_id_to_rank[req_id] = rank
                 try:
@@ -605,6 +625,73 @@ class DPDispatcher:
                 req_id,
                 "register_destinations",
                 f"Encoder DP rank={rank} URL registration timed out after "
+                f"{encode_server_module.ENCODER_REQ_TIMEOUT}s",
+            )
+        except BaseException:
+            self.pending_futures[rank].pop(key, None)
+            self._update_pending_gauge()
+            raise
+
+    async def dispatch_wait_metadata(self, request: dict) -> dict:
+        """Wait for metadata in the DP worker that owns ``req_id``.
+
+        The worker-local registry publishes preprocessing metadata before the
+        encoder forward. Keeping the wait in that process preserves Mooncake's
+        early landing-buffer allocation in DP mode.
+        """
+        req_id = request["req_id"]
+        deadline = time.monotonic() + min(5.0, encode_server_module.ENCODER_REQ_TIMEOUT)
+        async with self._mapping_condition:
+            while req_id not in self.req_id_to_rank:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "req_id": req_id,
+                        "_error": f"Unknown req_id: {req_id}",
+                        "_error_code": int(HTTPStatus.NOT_FOUND),
+                    }
+                try:
+                    await asyncio.wait_for(
+                        self._mapping_condition.wait(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    return {
+                        "req_id": req_id,
+                        "_error": f"Unknown req_id: {req_id}",
+                        "_error_code": int(HTTPStatus.NOT_FOUND),
+                    }
+            rank = self.req_id_to_rank[req_id]
+
+        if rank in self._dead_ranks:
+            return {
+                "req_id": req_id,
+                "_error": f"DP worker rank={rank} died before metadata became ready",
+                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+            }
+
+        key = self._metadata_req_key(req_id)
+        future = asyncio.get_running_loop().create_future()
+        self.pending_futures[rank][key] = future
+        self._update_pending_gauge()
+        worker_request = {
+            **request,
+            "_dp_type": "wait_metadata",
+            "_dp_metadata_key": key,
+        }
+        try:
+            await async_sock_send(
+                self.dispatch_sockets[rank], wrap_as_pickle(worker_request)
+            )
+            return await asyncio.wait_for(
+                future, timeout=encode_server_module.ENCODER_REQ_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            self.pending_futures[rank].pop(key, None)
+            self._update_pending_gauge()
+            return self._timeout_envelope(
+                req_id,
+                "wait_metadata",
+                f"Encoder DP rank={rank} metadata wait timed out after "
                 f"{encode_server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
@@ -818,6 +905,14 @@ class DPDispatcher:
                         f"_dp_register_key for req_id={req_id}, dropping"
                     )
                     continue
+            elif dp_type == "wait_metadata":
+                key = msg.get("_dp_metadata_key")
+                if key is None:
+                    logger.warning(
+                        f"_result_listener: metadata envelope without "
+                        f"_dp_metadata_key for req_id={req_id}, dropping"
+                    )
+                    continue
             else:
                 key = req_id
             rank = self.req_id_to_rank.get(req_id)
@@ -837,10 +932,16 @@ class DPDispatcher:
                 pending_key.startswith(register_prefix)
                 for pending_key in self.pending_futures[rank]
             )
+            metadata_prefix = f"{req_id}_metadata_"
+            has_pending_metadata = any(
+                pending_key.startswith(metadata_prefix)
+                for pending_key in self.pending_futures[rank]
+            )
             keep_mapping = (
-                dp_type in ("send", "register_destinations")
+                dp_type in ("send", "register_destinations", "wait_metadata")
                 or (dp_type == "encode" and msg.get("content") is not None)
                 or has_pending_registration
+                or has_pending_metadata
             )
             if dp_type == "send" or (
                 dp_type == "encode" and msg.get("content") is not None
@@ -864,6 +965,18 @@ class DPDispatcher:
                     for pending_key in self.pending_futures[rank]
                 )
                 if not encode_still_pending and not other_registration_pending:
+                    self.req_id_to_rank.pop(req_id, None)
+            elif dp_type == "wait_metadata":
+                encode_still_pending = req_id in self.pending_futures[rank]
+                other_metadata_pending = any(
+                    pending_key.startswith(metadata_prefix)
+                    for pending_key in self.pending_futures[rank]
+                )
+                if (
+                    not encode_still_pending
+                    and not other_metadata_pending
+                    and req_id not in self._pending_send_at
+                ):
                     self.req_id_to_rank.pop(req_id, None)
 
     async def _cleanup_stale_mappings(self) -> None:
@@ -1160,6 +1273,15 @@ async def _dp_worker_handle_request(
                 [request["receive_url"]],
             )
             content = None
+        elif dp_type == "wait_metadata":
+            try:
+                content = await encode_server_module.meta_registry.wait(
+                    request["req_id"]
+                )
+            except asyncio.TimeoutError as e:
+                raise MMError(
+                    "encode metadata not ready", code=HTTPStatus.GATEWAY_TIMEOUT
+                ) from e
         elif dp_type == "send":
             req_id = request["req_id"]
             sent = await enc.send(
@@ -1207,6 +1329,8 @@ async def _dp_worker_handle_request(
             and request.get("_dp_register_key") is not None
         ):
             envelope["_dp_register_key"] = request["_dp_register_key"]
+        if dp_type == "wait_metadata" and request.get("_dp_metadata_key") is not None:
+            envelope["_dp_metadata_key"] = request["_dp_metadata_key"]
     except Exception as e:
         logger.error(
             f"DP worker {dp_rank} error on {dp_type} "
@@ -1229,6 +1353,8 @@ async def _dp_worker_handle_request(
             and request.get("_dp_register_key") is not None
         ):
             envelope["_dp_register_key"] = request["_dp_register_key"]
+        if dp_type == "wait_metadata" and request.get("_dp_metadata_key") is not None:
+            envelope["_dp_metadata_key"] = request["_dp_metadata_key"]
 
     # pyzmq async send isn't safe for concurrent senders.
     try:
