@@ -4358,6 +4358,12 @@ class ServerArgs:
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+            # Keep trtllm_mla on the preferred breakable path. Its current
+            # breakable compatibility rule disables the graph, avoiding the
+            # tc_piecewise FlashInfer paged-MLA fallback; once breakable gains
+            # native support, that rule can be relaxed without re-enabling the
+            # deprecated tc_piecewise path.
+            and self._resolved_attention_backends()[0] != "trtllm_mla"
         ):
             logger.info(
                 "Using tc_piecewise CUDA graph for validated multimodal "
