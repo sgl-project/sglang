@@ -646,6 +646,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         }
     )
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if hf_config.encoder_only:
+            return None
+        return DeepseekV3ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config.text_config, quant_config
+        )
+
     def __init__(
         self,
         config: KimiK25Config,
