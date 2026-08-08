@@ -1,7 +1,6 @@
 # Adapted from the DFlash reference implementation (HF) but implemented with
-# SGLang primitives (RadixAttention + SGLang KV cache). This model intentionally
-# does not include token embeddings or an LM head; DFlash uses the target model's
-# embedding/lm_head.
+# SGLang primitives (RadixAttention + SGLang KV cache). DFlash checkpoints may
+# provide their own token embeddings; the LM head remains owned by the target.
 
 from __future__ import annotations
 
@@ -19,11 +18,13 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -75,7 +76,9 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
@@ -118,14 +121,14 @@ class DFlashAttention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix="qkv_proj",
+            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix="o_proj",
+            prefix=f"{prefix}.o_proj" if prefix else "o_proj",
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -283,17 +286,26 @@ class DFlashMLP(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        attention_prefix = f"{prefix}.self_attn" if prefix else "self_attn"
         self.self_attn = self.attention_cls(
-            config=config, layer_id=layer_id, quant_config=quant_config
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=attention_prefix,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+        mlp_prefix = f"{prefix}.mlp" if prefix else "mlp"
+        self.mlp = DFlashMLP(
+            config=config, quant_config=quant_config, prefix=mlp_prefix
+        )
 
     def forward(
         self,
@@ -326,7 +338,7 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
-    """SGLang DFlash draft model (no embedding / lm_head weights).
+    """SGLang DFlash draft model with optional embedding weights and no LM head.
 
     The checkpoint provides:
       - transformer weights for `layers.*`
@@ -344,11 +356,23 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.has_embed_tokens = bool(getattr(config, "has_embed_tokens", False))
+        if self.has_embed_tokens:
+            embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                hidden_size,
+                quant_config=quant_config,
+                prefix=embed_prefix,
+            )
 
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
                 )
                 for i in range(num_layers)
             ]
@@ -359,23 +383,37 @@ class DFlashDraftModel(nn.Module):
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
-        target_num_layers = (
-            int(draft_config.num_target_layers)
-            if draft_config.num_target_layers is not None
-            else num_layers
-        )
-        target_layer_ids = draft_config.resolve_target_layer_ids(
-            target_num_layers=target_num_layers, draft_num_layers=num_layers
-        )
+        if draft_config.target_layer_ids is not None:
+            # Only the number of target features matters while constructing the
+            # draft. The target worker validates these IDs against the actual
+            # target model depth.
+            target_layer_ids = list(draft_config.target_layer_ids)
+        else:
+            target_num_layers = (
+                int(draft_config.num_target_layers)
+                if draft_config.num_target_layers is not None
+                else num_layers
+            )
+            target_layer_ids = draft_config.resolve_target_layer_ids(
+                target_num_layers=target_num_layers, draft_num_layers=num_layers
+            )
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
+        fc_prefix = f"{prefix}.fc" if prefix else "fc"
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=fc_prefix,
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+
+    def get_input_embeddings(self) -> Optional[VocabParallelEmbedding]:
+        return getattr(self, "embed_tokens", None)
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -387,7 +425,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -397,7 +435,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        projected, _ = self.fc(target_hidden)
+        return self.hidden_norm(projected)
 
     @torch.no_grad()
     def forward(
@@ -479,9 +518,11 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
+                if (
+                    resolved_name.endswith("fc.weight")
+                    and not hasattr(param, "pack_factor")
+                    and tuple(loaded_weight.shape) != tuple(param.shape)
+                ):
                     raise ValueError(
                         "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
                         "number of context features (K) does not match this config. "
@@ -564,7 +605,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
