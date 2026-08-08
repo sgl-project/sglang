@@ -328,6 +328,9 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    def __post_init__(self):
+        self._request_lifecycles: Optional[Dict[str, object]] = None
+
     def regenerate_rid(self, prefix: Optional[str] = None):
         """Generate a new request ID and return it."""
 
