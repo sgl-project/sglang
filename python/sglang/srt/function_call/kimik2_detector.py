@@ -316,7 +316,13 @@ class KimiK2Detector(BaseFormatDetector):
                 if end_idx != -1:
                     args_full = buffer[args_start:end_idx]
                 else:
-                    args_full = buffer[args_start:]
+                    # The <|tool_call_end|> marker is not guaranteed to arrive in
+                    # a single increment (special tokens can straddle chunk
+                    # boundaries -- the same reason `_split_pending_start` exists
+                    # for the begin marker). Hold back any trailing fragment that
+                    # could be the start of the end marker so it does not leak
+                    # into the streamed arguments as garbled JSON.
+                    args_full = self._hold_pending_end(buffer[args_start:])
                 argument_diff = args_full[len(self._last_arguments) :]
                 if argument_diff or name_just_resolved:
                     calls.append(
@@ -396,6 +402,19 @@ class KimiK2Detector(BaseFormatDetector):
             if any(t.startswith(tail) for t in candidates):
                 return text[:-n], tail
         return text, ""
+
+    def _hold_pending_end(self, text: str) -> str:
+        """Drop a trailing fragment that could be the start of
+        <|tool_call_end|>. Mirrors `_split_pending_start` for the end marker so a
+        marker split across streaming increments does not leak into the emitted
+        arguments. A held-back fragment is re-examined once more text arrives:
+        it either completes the marker (call finalizes) or diverges (flushed).
+        """
+        marker = self.tool_call_end_token
+        for n in range(min(len(text), len(marker) - 1), 0, -1):
+            if marker.startswith(text[-n:]):
+                return text[:-n]
+        return text
 
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
