@@ -168,19 +168,10 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_scaled_mm
+    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
 
     from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
-    from sglang.srt.utils.patch_torch import register_fake_if_exists
-
-    @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
-    def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
-
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    from sglang.kernels.ops.gemm.fp8_per_tensor_gemm import fp8_per_tensor_scaled_mm
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
@@ -1805,7 +1796,7 @@ def apply_fp8_linear(
                 qinput, weight, x_scale, weight_scale, input.dtype, bias
             )
         else:
-            output = fp8_scaled_mm(
+            output = fp8_per_tensor_scaled_mm(
                 qinput,
                 weight,
                 x_scale,

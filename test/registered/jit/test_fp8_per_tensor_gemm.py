@@ -2,7 +2,12 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel import fp8_scaled_mm
+
+from sglang.kernels.ops.gemm.fp8_per_tensor_gemm import fp8_per_tensor_scaled_mm
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _cuda_version_at_least(major, minor):
@@ -23,7 +28,6 @@ def _native_scalar_a_supported():
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
     o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
-    o = o.to(torch.float32)
     temp1 = o * scale_a.view(-1, 1)
     temp2 = temp1 * scale_b.view(1, -1)
     final = temp2.to(out_dtype)
@@ -41,17 +45,11 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
     scale_a = torch.randn((M,), device=device, dtype=torch.float32) * 0.001
     scale_b = torch.randn((N,), device=device, dtype=torch.float32) * 0.001
-    if with_bias:
-        bias = torch.randn((N,), device=device, dtype=out_dtype)
-    else:
-        bias = None
+    bias = torch.randn((N,), device=device, dtype=out_dtype) if with_bias else None
     b_fp8 = b_fp8.t()
     o = torch_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    o1 = fp8_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    rtol = 0.02
-    atol = 1
-    torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
-    print(f"M={M}, N={N}, K={K}, with_bias={with_bias}, out_dtype={out_dtype}: OK")
+    o1 = fp8_per_tensor_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
+    torch.testing.assert_close(o, o1, rtol=0.02, atol=1)
 
 
 def _test_scalar_a_accuracy_once(M, N, K, with_bias, out_dtype, device):
@@ -81,8 +79,10 @@ def _test_scalar_a_accuracy_once(M, N, K, with_bias, out_dtype, device):
 
     bias = torch.randn(N, device=device, dtype=out_dtype) if with_bias else None
     expected = torch_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    actual = fp8_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    repeated = fp8_scaled_mm(a_fp8, b_fp8, scale_a_repeated, scale_b, out_dtype, bias)
+    actual = fp8_per_tensor_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
+    repeated = fp8_per_tensor_scaled_mm(
+        a_fp8, b_fp8, scale_a_repeated, scale_b, out_dtype, bias
+    )
 
     torch.testing.assert_close(expected, actual, rtol=0.02, atol=1)
     torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
@@ -97,8 +97,6 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
-# (M, N) shapes that exercise each dispatch bucket / boundary. K is varied
-# separately below so every (M, N) is tested across multiple K values.
 SM90_SWAP_AB_MN_SHAPES = [
     (1, 128),
     (1, 4096),
@@ -115,10 +113,6 @@ SM90_SWAP_AB_MN_SHAPES = [
     (65, 4096),
     (96, 4096),
     (128, 4096),
-    # Cluster-misaligned M_orig in the M64_smallN bucket (TileN=16, cluster_N=4).
-    # For M_orig in {17, 20, 33, 48}, grid_N = ceil(M_orig/16) in {2, 2, 3, 3},
-    # not a multiple of cluster_N=4. Explicit coverage so any can_implement
-    # failure or silent miscompute surfaces here.
     (20, 128),
     (20, 1024),
     (20, 1280),
@@ -142,6 +136,18 @@ def test_accuracy_sm90_swap_ab(shape_mn, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
+SM120_M_BUCKET_EDGES = [1, 2, 15, 16, 17, 31, 32, 33, 63, 255, 256, 257, 512]
+
+
+@pytest.mark.parametrize("M", SM120_M_BUCKET_EDGES)
+@pytest.mark.parametrize("N", [256, 4608])
+@pytest.mark.parametrize("K", [4096, 6656])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_accuracy_sm120_m_buckets(M, N, K, with_bias, out_dtype):
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+
+
 @pytest.mark.skipif(
     not _native_scalar_a_supported(),
     reason="native scalar A scales require a compatible SM90, SM100, or SM120 build",
@@ -161,7 +167,7 @@ def test_rejects_invalid_a_scale_count():
     scale_b = torch.ones(N, device="cuda", dtype=torch.float32)
 
     with pytest.raises(RuntimeError, match="scales_a must contain either"):
-        fp8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
+        fp8_per_tensor_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
 
 
 @pytest.mark.skipif(
@@ -176,7 +182,7 @@ def test_rejects_scalar_a_with_multiple_rows_on_sm89():
     scale_b = torch.ones(N, device="cuda", dtype=torch.float32)
 
     with pytest.raises(RuntimeError, match="scalar scales_a with M > 1 is unsupported"):
-        fp8_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
+        fp8_per_tensor_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16, None)
 
 
 PRODUCTION_LIKE_FP8_GEMM_CASES = [
