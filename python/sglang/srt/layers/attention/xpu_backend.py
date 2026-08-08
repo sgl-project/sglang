@@ -427,6 +427,50 @@ class XPUAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _appendkv_applicable(self, layer, forward_batch, q, k, v, save_kv_cache):
+        """Whether the extend/prefill attention should use the sgl-kernel-xpu
+        AppendKV path (PR #307): the kernel appends the new K/V into the paged
+        cache in-place and attends in one launch, replacing the separate
+        set_kv_buffer pre-write + read-back. Applies only to the non-MLA CALL A
+        prefill path with a paged bf16 cache; every other path keeps the
+        set_kv_buffer behavior.
+        """
+        if not save_kv_cache or k is None or v is None:
+            return False
+        if self.use_mla or layer.is_cross_attention:
+            return False
+        if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            return False
+        metadata = self.forward_metadata
+        if metadata.page_table is None:
+            return False
+        # cascade (target-verify topk>1) and local/irope attention use different
+        # tables / two-pass merges; keep the pre-write path for them.
+        is_hybrid_swa = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+        use_cascade_attn = (
+            forward_batch.forward_mode.is_target_verify()
+            and self.topk > 1
+            and not is_hybrid_swa
+        )
+        use_local_attn = (
+            self.attention_chunk_size is not None
+            and metadata.local_attn_metadata is not None
+            and (hasattr(layer, "use_irope") and layer.use_irope)
+        )
+        if use_cascade_attn or use_local_attn:
+            return False
+        # Paged prefill kernel is bf16-query-only; k_new dtype must equal cache
+        # dtype; supported head dims are the compiled paged set.
+        if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
+            return False
+        if self.kv_cache_dtype != torch.bfloat16:
+            return False
+        if layer.head_dim not in (64, 96, 128, 192, 256, 512):
+            return False
+        return True
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -440,6 +484,14 @@ class XPUAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        # AppendKV (sgl-kernel-xpu PR #307): when applicable, the FMHA prefill
+        # kernel appends new K/V in-place and attends in one launch, so we skip
+        # the separate set_kv_buffer pre-write below and pass k/v/cu_seqlens_k_new
+        # into CALL A instead.
+        use_appendkv = self._appendkv_applicable(
+            layer, forward_batch, q, k, v, save_kv_cache
+        )
+
         if k is None and v is None:
             # Cross-layer KV sharing (Gemma 4): the layer reuses another
             # layer's KV cache. The paged kernel reads K/V directly via
@@ -458,17 +510,20 @@ class XPUAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(
-                            cache_loc,
-                            self.forward_metadata.swa_out_cache_loc,
-                        ),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
+                    # AppendKV path writes the new K/V in-kernel at CALL A, so
+                    # skip the separate pre-write to avoid a double write.
+                    if not use_appendkv:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            KVWriteLoc(
+                                cache_loc,
+                                self.forward_metadata.swa_out_cache_loc,
+                            ),
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
                 else:
                     self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -569,14 +624,44 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            # AppendKV (PR #307): pass the new K/V so the kernel appends them
+            # in-place at the prefix offset and attends in one launch. The
+            # append offset is the PREFIX length (full cache len minus this
+            # step's extend len); cu_seqlens_k_new == cu_seqlens_q since the
+            # appended length equals the query length per request in prefill.
+            # Uses the same page_table the read path selected above (swa_page_table
+            # for hybrid-SWA layers), so write and read never diverge.
+            if use_appendkv:
+                cache_seqlens_prefix = (
+                    metadata.cache_seqlens_int32
+                    - forward_batch.extend_seq_lens.to(torch.int32)
+                )
+                appendkv_kwargs = dict(
+                    # flash_attn_with_kvcache applies maybe_contiguous() to
+                    # k_new/v_new, copying only when the last dim isn't unit-stride
+                    # (the kernel's actual contract). A .contiguous() here would
+                    # force full C-contiguity and add a redundant copy on the hot
+                    # prefill path, so pass k/v through unchanged.
+                    k=k,
+                    v=v,
+                    cache_seqlens=cache_seqlens_prefix,
+                    cu_seqlens_k_new=cu_seqlens_q,
+                    max_seqlen_k=metadata.max_seq_len_q,
+                )
+            else:
+                appendkv_kwargs = dict(
+                    k=None,
+                    v=None,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_k_new=None,
+                )
+
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
-                cache_seqlens=cache_seqlens,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
@@ -598,6 +683,7 @@ class XPUAttentionBackend(AttentionBackend):
                     and getattr(forward_batch, "_attn_output", None) is not None
                     else None
                 ),
+                **appendkv_kwargs,
                 **kwargs,
             )
 
