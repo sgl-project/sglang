@@ -133,6 +133,10 @@ Quant-VideoGen KV-cache quantization targets long-running autoregressive video
 sessions, where the causal self-attention cache can become comparable to the
 model weights. It does not change or quantize the checkpoint weights.
 
+See [Realtime and Causal Video Models](./realtime_models) for the session
+lifecycle, supported pipelines, and the distinction between realtime and
+request-based causal generation.
+
 Install the optional dependency and enable int4 compression when serving a
 supported LingBot World realtime pipeline:
 
@@ -235,7 +239,7 @@ sglang generate \
 
 MiniMax-H3 supports this path while preserving its required FP32 patch,
 timestep, and output projections. See the
-[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#6-runtime-feature-recipes)
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
 for its distributed serving recipe.
 
 ### MXFP4 Online Quantization
