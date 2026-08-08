@@ -173,12 +173,62 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_v4_prefill(layer)
+    elif forward_mode == ForwardMode.DECODE:
+        return _compute_moe_deepseek_v4_decode(layer)
     else:
-        # Decode TBO for DSV4 is not implemented yet (ATOM data: decode TBO
-        # regresses; needs cuda-graph capture work). Prefill-only for now.
         raise NotImplementedError(
-            f"DeepseekV4 TBO only supports prefill (EXTEND), got {forward_mode=}"
+            f"DeepseekV4 TBO only supports EXTEND/DECODE, got {forward_mode=}"
         )
+
+
+def _compute_moe_deepseek_v4_decode(layer):
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep():
+        raise NotImplementedError("DeepseekV4 decode TBO requires DeepEP")
+
+    # Keep the six-stage delta-2 pipeline used by DeepSeek decode, but choose the
+    # attention cut per layer. C4 prepare contains the expensive indexer and
+    # HiSparse swap-in, while C128 moves its attention core into stage 0 because
+    # it has no indexer. Both variants keep identical yield boundaries.
+    attn_stage_0 = [
+        layer.op_mhc_prepare_attn,
+        layer.self_attn.op_attn_prepare,
+    ]
+    attn_stage_1 = [
+        layer.self_attn.op_attn_output,
+        layer.op_mhc_post_attn_pre_mlp,
+        layer.mlp.op_gate,
+        layer.mlp.op_select_experts,
+    ]
+    if layer.self_attn.compress_ratio == 4:
+        attn_stage_1.insert(0, layer.self_attn.op_attn_core)
+    else:
+        # C128 (and uncompressed layers) have no C4 indexer/swap-in. Put the
+        # attention kernel before the first yield and leave WO in stage 1.
+        attn_stage_0.append(layer.self_attn.op_attn_core)
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=2,
+        operations=[
+            *attn_stage_0,
+            operations.YieldOperation(),
+            *attn_stage_1,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_b,
+            operations.YieldOperation(),
+            layer.mlp.op_output,
+            layer.op_mhc_postprocess,
+        ],
+    )
 
 
 def _compute_moe_deepseek_v4_prefill(layer):
