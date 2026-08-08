@@ -101,6 +101,8 @@ def _run_kernel(
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
     output_fill_value: int = -1,
+    miss_top_k_indices: torch.Tensor | None = None,
+    miss_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -130,6 +132,8 @@ def _run_kernel(
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
+        miss_top_k_indices=miss_top_k_indices,
+        miss_counts=miss_counts,
     )
     torch.cuda.synchronize()
     return out
@@ -401,6 +405,178 @@ def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
     assert torch.equal(
         state["lru_slots"].cpu(), torch.tensor([[0, 1, 2, 3]], dtype=torch.int16)
     )
+    for token, loc in zip([4, 5, 6, 7], [9, 7, 3, 5]):
+        assert torch.equal(
+            state["device_buffer"][loc].cpu(), state["host_cache"][token]
+        )
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA uses the split resolve/copy miss path.")
+def test_load_cache_to_device_buffer_parallel_copy_records_all_misses() -> None:
+    """The caller-owned scratch contains every miss before the copy kernel runs.
+
+    This has more misses than the old single-CTA path has warps (8 at block=256),
+    so it guards the multi-CTA copy schedule used by small decode batches.
+    """
+    top_k = 128
+    hot_buffer_size = 128
+    seq_len = 257
+    num_misses = 96
+    kv_dim = 8
+    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
+
+    top_k_tokens = torch.arange(top_k, dtype=torch.int32, device=DEVICE).view(1, -1)
+    device_buffer_tokens = torch.full(
+        (1, hot_buffer_size + 1), -1, dtype=torch.int32, device=DEVICE
+    )
+    device_buffer_tokens[0, : top_k - num_misses] = torch.arange(
+        top_k - num_misses, dtype=torch.int32, device=DEVICE
+    )
+    device_buffer_locs = torch.arange(
+        hot_buffer_size + 1, dtype=torch.int32, device=DEVICE
+    ).view(1, -1)
+    host_cache_locs = torch.arange(seq_len, dtype=torch.int64, device=DEVICE).view(
+        1, -1
+    )
+    host_cache = (
+        torch.arange(seq_len * kv_dim, dtype=DTYPE, device="cpu")
+        .view(seq_len, 1, kv_dim)
+        .pin_memory()
+    )
+    device_buffer = torch.full(
+        (hot_buffer_size + 1, 1, kv_dim), -1, dtype=DTYPE, device=DEVICE
+    )
+    device_buffer[: top_k - num_misses].copy_(
+        host_cache[: top_k - num_misses].to(DEVICE, non_blocking=True)
+    )
+    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE).view(
+        1, -1
+    )
+    out = torch.full_like(top_k_tokens, -1)
+    miss_top_k_indices = torch.full_like(top_k_tokens, -1)
+    miss_counts = torch.full((1,), -1, dtype=torch.int32, device=DEVICE)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        num_top_k=top_k,
+        hot_buffer_size=hot_buffer_size,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+        miss_top_k_indices=miss_top_k_indices,
+        miss_counts=miss_counts,
+    )
+    torch.cuda.synchronize()
+
+    assert miss_counts.item() == num_misses
+    assert torch.equal(
+        miss_top_k_indices[0, :num_misses].cpu(),
+        torch.arange(top_k - num_misses, top_k, dtype=torch.int32),
+    )
+    assert torch.equal(out.cpu(), torch.arange(top_k, dtype=torch.int32).view(1, -1))
+    for token in range(top_k - num_misses, top_k):
+        assert torch.equal(device_buffer[token].cpu(), host_cache[token])
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA uses the split resolve/copy miss path.")
+def test_load_cache_to_device_buffer_parallel_copy_uses_scratch_stride() -> None:
+    """Strided top-k input must not be used to index contiguous miss scratch."""
+    state = _make_state(
+        [[9, 7, 3, 5, 11], [12, 10, 8, 6, 14]],
+        [[0, 1, 2, 3, -1], [0, 1, 2, 3, -1]],
+        [8, 8],
+    )
+    top_k_storage = torch.full((2, 6), -1, dtype=torch.int32, device=DEVICE)
+    top_k_storage[:, :4] = torch.tensor(
+        [[4, 5, 6, 7], [4, 5, 6, 7]], dtype=torch.int32, device=DEVICE
+    )
+    top_k_tokens = top_k_storage[:, :4]
+    miss_top_k_indices = torch.full((2, 4), -1, dtype=torch.int32, device=DEVICE)
+    miss_counts = torch.full((2,), -1, dtype=torch.int32, device=DEVICE)
+
+    assert top_k_tokens.stride(0) == 6
+    assert miss_top_k_indices.stride(0) == 4
+    out = _run_kernel(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=state["device_buffer_tokens"],
+        host_cache_locs=state["host_cache_locs"],
+        device_buffer_locs=state["device_buffer_locs"],
+        host_cache=state["host_cache"],
+        device_buffer=state["device_buffer"],
+        lru_slots=state["lru_slots"],
+        seq_len=9,
+        miss_top_k_indices=miss_top_k_indices,
+        miss_counts=miss_counts,
+    )
+
+    assert torch.equal(miss_counts.cpu(), torch.tensor([4, 4], dtype=torch.int32))
+    assert torch.equal(
+        miss_top_k_indices.cpu(),
+        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        out.cpu(),
+        torch.tensor([[9, 7, 3, 5], [12, 10, 8, 6]], dtype=torch.int32),
+    )
+
+
+@pytest.mark.skipif(is_hip(), reason="CUDA uses the split resolve/copy miss path.")
+def test_load_cache_to_device_buffer_parallel_copy_cuda_graph_replay() -> None:
+    """The coordinator-provided miss scratch is safe to reuse in a CUDA graph."""
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    top_k_tokens = torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device=DEVICE)
+    out = torch.full_like(top_k_tokens, -1)
+    miss_top_k_indices = torch.full_like(top_k_tokens, -1)
+    miss_counts = torch.empty(1, dtype=torch.int32, device=DEVICE)
+    req_pool_indices = torch.tensor([0], dtype=torch.int64, device=DEVICE)
+    seq_lens = torch.tensor([9], dtype=torch.int32, device=DEVICE)
+    num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+
+    def run_once() -> None:
+        load_cache_to_device_buffer_mla(
+            top_k_tokens=top_k_tokens,
+            device_buffer_tokens=state["device_buffer_tokens"],
+            host_cache_locs=state["host_cache_locs"],
+            device_buffer_locs=state["device_buffer_locs"],
+            host_cache=state["host_cache"],
+            device_buffer=state["device_buffer"],
+            top_k_device_locs=out,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            lru_slots=state["lru_slots"],
+            item_size_bytes=ITEM_SIZE_BYTES,
+            num_top_k=top_k_tokens.shape[1],
+            hot_buffer_size=HOT_BUFFER_SIZE,
+            page_size=1,
+            block_size=256,
+            num_real_reqs=num_real_reqs,
+            miss_top_k_indices=miss_top_k_indices,
+            miss_counts=miss_counts,
+        )
+
+    # Compile and warm the JIT path before capture.
+    run_once()
+    torch.cuda.synchronize()
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
+    out.fill_(-1)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_once()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(out.cpu(), torch.tensor([[9, 7, 3, 5]], dtype=torch.int32))
     for token, loc in zip([4, 5, 6, 7], [9, 7, 3, 5]):
         assert torch.equal(
             state["device_buffer"][loc].cpu(), state["host_cache"][token]

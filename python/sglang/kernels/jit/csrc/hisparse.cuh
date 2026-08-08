@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
+#include <type_traits>
 
 namespace sglang {
 
@@ -187,6 +188,7 @@ template <
     int HOT_BUFFER_SIZE,
     bool IsMLA,
     bool IsDsv4Layout,
+    bool UseParallelMissCopy,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -203,10 +205,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
+    int32_t* __restrict__ miss_top_k_indices,
+    int32_t* __restrict__ miss_counts,
     int64_t buffer_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
     int64_t top_k_tokens_stride,
+    int64_t miss_top_k_indices_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
     int64_t item_size_bytes) {
@@ -247,6 +252,11 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
+    if constexpr (UseParallelMissCopy) {
+      if (tid == 0) {
+        miss_counts[bid] = 0;
+      }
+    }
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
       int32_t device_loc = -1;
@@ -467,11 +477,19 @@ __global__ void load_cache_to_device_buffer_kernel(
       s_top_k_tokens[miss_offset] = my_token;
       req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
       req_device_buffer_tokens[evict_slot] = my_token;
+      if constexpr (UseParallelMissCopy) {
+        miss_top_k_indices[bid * miss_top_k_indices_stride + miss_offset] = my_token_idx;
+      }
     }
   }
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if constexpr (UseParallelMissCopy) {
+    if (tid == 0) {
+      miss_counts[bid] = total_misses;
+    }
+  }
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -508,48 +526,108 @@ __global__ void load_cache_to_device_buffer_kernel(
 #endif
   }
 
-  // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
-  for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
-    const int32_t miss_token = s_top_k_tokens[miss_idx];
-    const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+  if constexpr (!UseParallelMissCopy) {
+    // Fallback for ROCm and DSv4 paged layout. CUDA generic MLA uses the
+    // separate copy kernel below so a small decode batch can issue more CTAs.
+    for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
+      const int32_t miss_token = s_top_k_tokens[miss_idx];
+      const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
-    const int64_t src_loc = req_host_cache_locs[miss_token];
-    const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+      const int64_t src_loc = req_host_cache_locs[miss_token];
+      const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
-    if constexpr (IsDsv4Layout) {
+      if constexpr (IsDsv4Layout) {
 #ifdef USE_ROCM
-      // ROCm path: host cache and device buffer both use the page-padded C4
-      // layout (same as the write path and the CUDA branch). We can't reuse
-      // device::hisparse::transfer_item here because its warp logic is hardcoded
-      // to a 32-lane warp; on wavefront64 we use the warp-width-agnostic
-      // transfer_item_warp with paged source and destination addressing.
-      using namespace device::hisparse;
-      const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
-      const auto [src_value_ptr, src_scale_ptr] =
-          get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
-      transfer_item_warp(lane_id, src_value_ptr, dst_value_ptr, kValueBytes);
-      transfer_item_warp(lane_id, src_scale_ptr, dst_scale_ptr, kScaleBytes);
+        // ROCm path: host cache and device buffer both use the page-padded C4
+        // layout (same as the write path and the CUDA branch). We can't reuse
+        // device::hisparse::transfer_item here because its warp logic is hardcoded
+        // to a 32-lane warp; on wavefront64 we use the warp-width-agnostic
+        // transfer_item_warp with paged source and destination addressing.
+        using namespace device::hisparse;
+        const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
+        const auto [src_value_ptr, src_scale_ptr] =
+            get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
+        transfer_item_warp(lane_id, src_value_ptr, dst_value_ptr, kValueBytes);
+        transfer_item_warp(lane_id, src_scale_ptr, dst_scale_ptr, kScaleBytes);
 #else
-      // CUDA path: page-padded device layout + page-padded host layout, K-only.
-      // The host cache is pinned DRAM but uses the same row layout as the GPU C4
-      // cache, so use the page-padded address calculation for both ends.
-      device::hisparse::transfer_item(
-          /*dst_cache=*/device_buffer_k,
-          /*src_cache=*/const_cast<void*>(host_cache_k),
-          /*dst_index=*/static_cast<int32_t>(dst_loc),
-          /*src_index=*/static_cast<int32_t>(src_loc));
+        // CUDA path: page-padded device layout + page-padded host layout, K-only.
+        // The host cache is pinned DRAM but uses the same row layout as the GPU C4
+        // cache, so use the page-padded address calculation for both ends.
+        device::hisparse::transfer_item(
+            /*dst_cache=*/device_buffer_k,
+            /*src_cache=*/const_cast<void*>(host_cache_k),
+            /*dst_index=*/static_cast<int32_t>(dst_loc),
+            /*src_index=*/static_cast<int32_t>(src_loc));
 #endif
-    } else {
-      // Generic path: device + host both linear, stride = item_size_bytes.
-      const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
-      auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
-      transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+      } else {
+        // Generic path: device + host both linear, stride = item_size_bytes.
+        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+        auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
+        transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
 
-      if constexpr (!IsMLA) {
-        const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
-        auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
-        transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+        if constexpr (!IsMLA) {
+          const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+          auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+          transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+        }
       }
+    }
+  }
+}
+
+// CUDA generic MLA only: resolve_cache_to_device_buffer_kernel records every
+// miss, then this kernel lets several CTAs copy pinned host KV for small batches.
+template <int BLOCK_SIZE, int NUM_TOP_K, bool IsMLA, typename SeqLensT, typename ReqPoolIndicesT>
+__global__ void copy_cache_misses_to_device_buffer_kernel(
+    const int32_t* __restrict__ top_k_tokens,
+    const int64_t* __restrict__ host_cache_locs,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    const int32_t* __restrict__ top_k_device_locs,
+    const ReqPoolIndicesT* __restrict__ req_pool_indices,
+    const SeqLensT* __restrict__ seq_lens,
+    const int32_t* __restrict__ num_real_reqs,
+    const int32_t* __restrict__ miss_top_k_indices,
+    const int32_t* __restrict__ miss_counts,
+    int64_t host_stride,
+    int64_t top_k_tokens_stride,
+    int64_t miss_top_k_indices_stride,
+    int64_t top_k_device_locs_stride,
+    int64_t copy_blocks_per_request,
+    int64_t item_size_bytes) {
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  const int bid = blockIdx.x / copy_blocks_per_request;
+  if (bid >= num_real_reqs[0]) {
+    return;
+  }
+
+  const int copy_block = blockIdx.x % copy_blocks_per_request;
+  const int warp_id = threadIdx.x / WARP_SIZE;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int64_t rid = req_pool_indices[bid];
+  const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
+  const int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
+  const int32_t* req_miss_top_k_indices = miss_top_k_indices + bid * miss_top_k_indices_stride;
+  const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+  const int miss_count = miss_counts[bid];
+
+  for (int miss_idx = copy_block * NUM_WARPS + warp_id; miss_idx < miss_count;
+       miss_idx += copy_blocks_per_request * NUM_WARPS) {
+    const int top_k_idx = req_miss_top_k_indices[miss_idx];
+    const int32_t miss_token = req_top_k_tokens[top_k_idx];
+    const int64_t src_loc = req_host_cache_locs[miss_token];
+    const int64_t dst_loc = req_top_k_device_locs[top_k_idx];
+
+    const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+    auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
+    transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+
+    if constexpr (!IsMLA) {
+      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+      auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+      transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
     }
   }
 }
@@ -569,6 +647,8 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
     tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView miss_top_k_indices,
+    tvm::ffi::TensorView miss_counts,
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
@@ -578,6 +658,7 @@ void load_cache_to_device_buffer(
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
+  const int64_t miss_top_k_indices_stride = miss_top_k_indices.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
@@ -605,12 +686,39 @@ void load_cache_to_device_buffer(
         seq_lens_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        static_cast<int32_t*>(miss_top_k_indices.data_ptr()),
+        static_cast<int32_t*>(miss_counts.data_ptr()),
         buffer_stride_0,
         host_stride,
         lru_slot_stride_0,
         top_k_tokens_stride,
+        miss_top_k_indices_stride,
         top_k_device_locs_stride,
         page_size,
+        item_size_bytes);
+  };
+
+  auto launch_copy = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
+    const int64_t copy_blocks_per_request = bs <= 2 ? 4 : 1;
+    LaunchKernel(bs * copy_blocks_per_request, BLOCK_SIZE, device)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        static_cast<const int32_t*>(top_k_device_locs.data_ptr()),
+        req_pool_indices_ptr,
+        seq_lens_ptr,
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        static_cast<const int32_t*>(miss_top_k_indices.data_ptr()),
+        static_cast<const int32_t*>(miss_counts.data_ptr()),
+        host_stride,
+        top_k_tokens_stride,
+        miss_top_k_indices_stride,
+        top_k_device_locs_stride,
+        copy_blocks_per_request,
         item_size_bytes);
   };
 
@@ -619,55 +727,91 @@ void load_cache_to_device_buffer(
   const bool seq_is_i64 = (seq_dtype.code == kDLInt && seq_dtype.bits == 64);
   const bool rpi_is_i64 = (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64);
 
-  if (seq_is_i64 && rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            int64_t,
-            int64_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
-  } else if (seq_is_i64 && !rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            int64_t,
-            int32_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
-  } else if (!seq_is_i64 && rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            int32_t,
-            int64_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
-  } else {
-    launch(
-        load_cache_to_device_buffer_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            IsMLA,
-            IsDsv4Layout,
-            int32_t,
-            int32_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  auto launch_by_dtype = [&](auto use_parallel_copy) {
+    constexpr bool UseParallelMissCopy = decltype(use_parallel_copy)::value;
+    if (seq_is_i64 && rpi_is_i64) {
+      launch(
+          load_cache_to_device_buffer_kernel<
+              BLOCK_SIZE,
+              NUM_TOP_K,
+              HOT_BUFFER_SIZE,
+              IsMLA,
+              IsDsv4Layout,
+              UseParallelMissCopy,
+              int64_t,
+              int64_t>,
+          static_cast<const int64_t*>(seq_lens.data_ptr()),
+          static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+    } else if (seq_is_i64 && !rpi_is_i64) {
+      launch(
+          load_cache_to_device_buffer_kernel<
+              BLOCK_SIZE,
+              NUM_TOP_K,
+              HOT_BUFFER_SIZE,
+              IsMLA,
+              IsDsv4Layout,
+              UseParallelMissCopy,
+              int64_t,
+              int32_t>,
+          static_cast<const int64_t*>(seq_lens.data_ptr()),
+          static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+    } else if (!seq_is_i64 && rpi_is_i64) {
+      launch(
+          load_cache_to_device_buffer_kernel<
+              BLOCK_SIZE,
+              NUM_TOP_K,
+              HOT_BUFFER_SIZE,
+              IsMLA,
+              IsDsv4Layout,
+              UseParallelMissCopy,
+              int32_t,
+              int64_t>,
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+    } else {
+      launch(
+          load_cache_to_device_buffer_kernel<
+              BLOCK_SIZE,
+              NUM_TOP_K,
+              HOT_BUFFER_SIZE,
+              IsMLA,
+              IsDsv4Layout,
+              UseParallelMissCopy,
+              int32_t,
+              int32_t>,
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+    }
+  };
+
+#ifndef USE_ROCM
+  if constexpr (IsMLA && !IsDsv4Layout) {
+    launch_by_dtype(std::true_type{});
+    if (seq_is_i64 && rpi_is_i64) {
+      launch_copy(
+          copy_cache_misses_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, IsMLA, int64_t, int64_t>,
+          static_cast<const int64_t*>(seq_lens.data_ptr()),
+          static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+    } else if (seq_is_i64 && !rpi_is_i64) {
+      launch_copy(
+          copy_cache_misses_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, IsMLA, int64_t, int32_t>,
+          static_cast<const int64_t*>(seq_lens.data_ptr()),
+          static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+    } else if (!seq_is_i64 && rpi_is_i64) {
+      launch_copy(
+          copy_cache_misses_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, IsMLA, int32_t, int64_t>,
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+    } else {
+      launch_copy(
+          copy_cache_misses_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, IsMLA, int32_t, int32_t>,
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+    }
+    return;
   }
+#endif
+  launch_by_dtype(std::false_type{});
 }
 
 }  // namespace sglang
