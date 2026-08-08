@@ -447,9 +447,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 return SharedReadBoundary.UNKNOWN
         elif not forward_mode.is_decode():
             return SharedReadBoundary.UNKNOWN
+        boundary = attn_backend.shared_read_boundary(forward_mode)
+        if boundary is SharedReadBoundary.UNKNOWN:
+            # The capture mode implies the boundary: breakable graphs
+            # interleave eager segments that may reread shared state; full
+            # graphs keep all shared reads inside metadata init.
+            if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph or (
+                isinstance(self.backend, BreakableCudaGraphBackend)
+            ):
+                boundary = SharedReadBoundary.POST_REPLAY
+            else:
+                boundary = SharedReadBoundary.IN_REPLAY
         return resolve_war_read_done_record(
-            attn_backend.shared_read_boundary(forward_mode),
-            node_planted=self._war_read_done_node_planted,
+            boundary, node_planted=self._war_read_done_node_planted
         )
 
     def _publish_war_read_done(self, in_graph: bool):

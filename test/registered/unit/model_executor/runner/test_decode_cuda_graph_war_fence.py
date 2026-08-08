@@ -24,14 +24,10 @@ class _SpecAlgorithm:
 
 
 def _attn_backend(*, breakable_metadata=False):
-    def shared_read_boundary(forward_mode):
-        if breakable_metadata and forward_mode.is_target_verify():
-            return SharedReadBoundary.POST_REPLAY
-        if forward_mode.is_decode() or forward_mode.is_target_verify():
-            return SharedReadBoundary.IN_REPLAY
-        return SharedReadBoundary.UNKNOWN
-
-    return SimpleNamespace(shared_read_boundary=shared_read_boundary)
+    return SimpleNamespace(
+        use_captured_forward_metadata_for_breakable_cuda_graph=breakable_metadata,
+        shared_read_boundary=lambda forward_mode: SharedReadBoundary.UNKNOWN,
+    )
 
 
 def _runner(*, target_verify_war: bool = False, planted: bool = False):
@@ -44,6 +40,7 @@ def _runner(*, target_verify_war: bool = False, planted: bool = False):
         war_fastpath_read_done_event=None,
     )
     runner._war_read_done_node_planted = planted
+    runner.backend = None
     return runner
 
 
@@ -74,6 +71,13 @@ def test_war_read_done_record():
     assert (
         _runner(target_verify_war=True, planted=True)._war_read_done_record(
             _attn_backend(breakable_metadata=True), ForwardMode.TARGET_VERIFY
+        )
+        is SharedReadBoundary.POST_REPLAY
+    )
+    # Captured-metadata decode gets the same treatment as verify.
+    assert (
+        _runner(planted=True)._war_read_done_record(
+            _attn_backend(breakable_metadata=True), ForwardMode.DECODE
         )
         is SharedReadBoundary.POST_REPLAY
     )
