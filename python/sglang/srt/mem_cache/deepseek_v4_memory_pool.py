@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -25,6 +25,9 @@ from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.hisparse_c4_sizing import HiSparseC4Layout
 
 _is_hip = is_hip()
 
@@ -79,7 +82,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
+        self._init_layout_metadata()
         self._create_buffers()
+
+    def _init_layout_metadata(self) -> None:
+        bytes_per_token = self.get_bytes_per_token()
+        self.kv_cache_total_dim = bytes_per_token
+        bytes_per_page_non_padded = self.page_size * bytes_per_token
+        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+
+        assert bytes_per_token == 448 + 64 * 2 + 8, (
+            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+        )
+        assert self.store_dtype == torch.uint8
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -105,17 +121,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
-        bytes_per_token = self.get_bytes_per_token()
-        self.kv_cache_total_dim = bytes_per_token
-        bytes_per_page_non_padded = self.page_size * bytes_per_token
-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
-
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
-        )
-        assert self.store_dtype == torch.uint8
-
         return torch.zeros(
             num_pages,
             self.bytes_per_page_padded,
@@ -181,6 +186,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
+        self.hisparse_c4_layout: Optional[HiSparseC4Layout] = None
         super().__init__(
             size,
             page_size,
@@ -480,6 +486,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        hisparse_c4_layout: Optional[HiSparseC4Layout] = None,
     ):
         super().__init__(
             swa_size,
@@ -564,6 +571,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c128_layer_num = sum(1 for r in stage_ratios if r == 128)
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
+        self.hisparse_c4_layout = hisparse_c4_layout
+        if hisparse_c4_layout is not None:
+            assert self.num_req_slots == hisparse_c4_layout.req_slot_count, (
+                "DSV4 HiSparse req-slot mismatch: "
+                f"pool={self.num_req_slots}, layout={hisparse_c4_layout.req_slot_count}"
+            )
+            assert c4_size == hisparse_c4_layout.c4_device_slot_capacity, (
+                "DSV4 HiSparse C4 capacity mismatch: "
+                f"pool={c4_size}, layout={hisparse_c4_layout.c4_device_slot_capacity}"
+            )
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -621,6 +638,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 global_page_size=page_size,
                 cls=c4_kv_pool_type,
             )
+            if hisparse_c4_layout is not None:
+                self.c4_kv_pool.hisparse_c4_layout = hisparse_c4_layout
 
             self.c128_kv_pool = self._make_kv_pool(
                 size=c128_size,

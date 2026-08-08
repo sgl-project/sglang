@@ -288,6 +288,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
         self._size_full = logical_attn_allocator.size_full
         self._size_hisparse = self.hisparse_kvcache.size
+        self.hisparse_c4_layout = self.hisparse_kvcache.hisparse_c4_layout
 
         self.dtype = self.hisparse_kvcache.dtype
         self.device = self.hisparse_kvcache.device

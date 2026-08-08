@@ -124,6 +124,7 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.mem_cache.hisparse_c4_sizing import HiSparseC4Layout
     from sglang.srt.mem_cache.unified_memory_pool import (
         UnifiedKVPool,
         UnifiedPoolBundle,
@@ -134,9 +135,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
     )
-    from sglang.srt.model_executor.pool_configurator import (
-        MemoryPoolConfig,
-    )
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -169,6 +168,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    hisparse_c4_layout: Optional[HiSparseC4Layout]
 
 
 @dataclass(slots=True, kw_only=True)
@@ -334,6 +334,9 @@ class KVCacheConfigurator:
             c128_state_pool_size=c128_state_pool_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
+            hisparse_c4_layout=(
+                None if self.is_draft_worker else config.hisparse_c4_layout
+            ),
         )
 
     def _init_pools(
@@ -863,6 +866,7 @@ class KVCacheConfigurator:
                 c128_state_pool_size=sizes.c128_state_pool_size,
                 c4_state_dtype=sizes.c4_state_dtype,
                 c128_state_dtype=sizes.c128_state_dtype,
+                hisparse_c4_layout=sizes.hisparse_c4_layout,
                 req_to_token_pool=req_to_token_pool,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
@@ -954,6 +958,7 @@ class KVCacheConfigurator:
         c128_state_pool_size: int,
         c4_state_dtype: Optional[torch.dtype],
         c128_state_dtype: Optional[torch.dtype],
+        hisparse_c4_layout: Optional[HiSparseC4Layout],
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
         swa_page_size = get_schedule().page_size
@@ -1032,6 +1037,7 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
+            hisparse_c4_layout=hisparse_c4_layout,
         )
         return token_to_kv_pool
 
