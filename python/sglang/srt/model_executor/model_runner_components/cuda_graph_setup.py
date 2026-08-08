@@ -41,8 +41,14 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.utils import (
+    ceil_align,
+    get_available_gpu_memory,
+    log_info_on_rank0,
+    require_attn_tp_gather,
+    require_mlp_tp_gather,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -396,6 +402,7 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+
     if should_skip_auto_prefill_cuda_graph_for_memory(
         before_mem,
         getattr(model_runner.server_args, "_cuda_graph_config_locked", set()),
@@ -412,6 +419,16 @@ def capture_prefill_graph(
 
     role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
+    capture_num_tokens = prefill_config.bs
+    if require_mlp_tp_gather(model_runner.server_args) or require_attn_tp_gather(
+        model_runner.server_args
+    ):
+        capture_num_tokens = {
+            ceil_align(int(num_tokens), get_parallel().attn_tp_size)
+            for num_tokens in capture_num_tokens
+        }
+    capture_num_tokens = sorted(capture_num_tokens)
+    prefill_config.bs = capture_num_tokens
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "
         f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
