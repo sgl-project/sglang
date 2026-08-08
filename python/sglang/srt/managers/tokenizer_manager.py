@@ -2177,11 +2177,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
-            if obj.is_single:
-                self.abort_request(obj.rid)
-            else:
-                for rid in obj.rid:
-                    self.abort_request(rid)
+            if obj._request_lifecycles is not None:
+                self._discard_pending_req_states(obj, obj._request_lifecycles)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -3520,6 +3517,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+        if isinstance(obj, GenerateReqInput):
+            obj._request_lifecycles = lifecycle_ids
         return lifecycle_ids
 
     def _discard_pending_req_states(
