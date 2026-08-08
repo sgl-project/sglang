@@ -4232,6 +4232,9 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        # Requested via env var but silently downgraded when FDFO is off, so
+        # report what the scheduler actually resolved rather than what was asked.
+        ret["dllm_mixed_batch_enabled"] = self.dllm_mixed_batch_enabled
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

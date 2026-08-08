@@ -453,6 +453,13 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
+    # dLLM: schedule prefill-phase rows (block-size prompt chunks) and
+    # decode-phase rows (denoise blocks) into one mixed round instead of
+    # prefill-first either/or rounds. Every row is still exactly one block-size
+    # chunk, so the denoise step's uniform-block reshape holds; a prompt-only
+    # row self-finishes on its first denoise step. Requires --dllm-fdfo, where
+    # a round is a single denoise step; ignored otherwise.
+    SGLANG_ENABLE_DLLM_MIXED_BATCH = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
