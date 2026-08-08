@@ -1007,6 +1007,19 @@ EXCLUDE_ARG=()
 # original PW+DW (1P1D -> 2 nodes); wide EP16 1P1D gives 2+2 = 4 nodes.
 TOTAL_NODES=$(( PW * PN_PER + DW * DN_PER ))
 
+# generate_matrix.py reads the same recipe fields to size each leg, and the
+# nightly stages on that number -- legs that fit beside another run in parallel,
+# whole-cluster legs run alone. If the two ever disagreed the workflow would
+# co-schedule legs that do not fit and they would sit in salloc until the step
+# timeout, so fail here instead where the reason is obvious.
+if [[ -n "${EXPECTED_NODES:-}" && "$EXPECTED_NODES" != "$TOTAL_NODES" ]]; then
+    echo "ERROR: node count disagrees with the scheduler: workflow staged this leg" \
+         "for $EXPECTED_NODES node(s), recipe needs $TOTAL_NODES (PW=$PW PN_PER=$PN_PER" \
+         "DW=$DW DN_PER=$DN_PER). Keep generate_matrix.py's recipe_nodes() in" \
+         "sync with this formula." >&2
+    exit 1
+fi
+
 # Keep g20 out of a wide engine's root position, where its slower MORI
 # bootstrap can miss the worker-connect timeout.
 if [[ "$MATRIX_CONFIG_NAME" == *-2p1d-ep16* ]]; then
