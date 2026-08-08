@@ -95,7 +95,6 @@ def test_tree_speculative_sampling_target_only(
 
     expanded_temperature = temperatures.unsqueeze(1).unsqueeze(1)
     target_probs = F.softmax(target_logits / expanded_temperature, dim=-1)
-    draft_probs = torch.full_like(target_probs, 0, dtype=torch.float32, device=device)
     coins = torch.rand(bs, num_draft_tokens, device=device, dtype=torch.float32)
     coins_for_final_sampling = torch.rand(bs, device=device).to(torch.float32)
 
@@ -110,7 +109,6 @@ def test_tree_speculative_sampling_target_only(
         uniform_samples=coins,
         uniform_samples_for_final_sampling=coins_for_final_sampling,
         target_probs=target_probs,
-        draft_probs=draft_probs,
         threshold_single=threshold_single,
         threshold_acc=threshold_acc,
         deterministic=True,

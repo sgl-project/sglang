@@ -729,8 +729,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         uniform_top_k_value=uniform_top_k_value,
         use_sparse_topk=use_sparse_topk,
     )
-    draft_probs = torch.zeros_like(target_probs)
-
     (
         retrieve_index,
         retrieve_next_token,
@@ -757,7 +755,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         uniform_samples=uniform_samples,
         uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
         target_probs=target_probs,
-        draft_probs=draft_probs,
         threshold_single=threshold_single,
         threshold_acc=threshold_acc,
         deterministic=True,

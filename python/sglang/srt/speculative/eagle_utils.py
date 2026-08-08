@@ -773,11 +773,7 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
+        draft_probs = verify_input.draft_probs if use_rejection_sampling else None
         # Defense-in-depth behind the spec_hook startup allowlist: validate the
         # actual kernel inputs (catches draft_probs plumbing regressions or a
         # startup guard bypassed by a worker subclass) before the Triton kernel.
@@ -815,7 +811,7 @@ def eagle_sample(
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
+            **({"draft_probs": draft_probs} if use_rejection_sampling else {}),
             threshold_single=get_spec().speculative_accept_threshold_single,
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
