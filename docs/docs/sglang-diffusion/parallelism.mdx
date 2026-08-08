@@ -79,15 +79,22 @@ mis-mapped layout stays numerically correct and silently loses the performance
 - Ring adds no head constraint (it splits rows), but the sequence — including
   any model-specific packing alignment — must divide by `ulysses × ring`, since
   ring adds an outer row split on top of Ulysses's inner one.
-- Ring requires the `fa` or `sage_attn` attention backend; the launcher
-  auto-selects `fa` when unset.
-- Code paths still on the legacy stacked-QKV `UlyssesAttention` layer (for
-  example some models' secondary attentions) raise `NotImplementedError` under
-  ring: their all-to-all spans the combined SP group and is not ring-aware.
-  The error means that path has not been migrated, not that the configuration
-  is invalid.
-- The replicated-prefix/suffix text paths of `USPAttention` do not support
-  ring yet.
+- Ring requires an attention backend that declares
+  `supports_ring_rotation()` — the per-hop merge needs the kernel's softmax
+  LSE. `fa` and `sage_attn` declare it; the launcher auto-selects `fa` when
+  unset.
+- `USPAttention`'s masked/tail-padded text path and its replicated-prefix,
+  -suffix, and -kv-prefix paths all support ring: the sharded K/V rotates
+  through the ring while the tail-pad or replicated portion is attended
+  locally once and combined into the ring result with the same online-softmax
+  merge. This covers the joint text+image attention most models use (flux,
+  flux_2, qwen_image, zimage, glm_image, ernie_image, and others).
+- What still raises `NotImplementedError` under ring: `USPAttention`'s generic
+  varlen path (multiple packed segments per row, as used by HunyuanVideo —
+  no ring-aware rotation for it yet), and the legacy stacked-QKV
+  `UlyssesAttention` layer, now down to one user (Wan's VSA sparse-attention
+  variant) that has no softmax LSE to merge and can't gain ring support
+  without a different kernel.
 - The launcher validates `num_gpus` against the product of the degrees and
   fails fast on any mismatch.
 
@@ -106,9 +113,12 @@ identical to the NCCL path.
 | `SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS` | `10000` | deadlock backstop for the peer wait; on expiry the transport retires on every rank and the request fails rather than returning incomplete data |
 | `SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS` | `16` | staging pairs kept alive; raise for many-resolution serving |
 
-Independently of the transport, the three Q/K/V input exchanges can be packed
-into one collective; models opt in per attention layer
-(`enable_packed_qkv_input_a2a`).
+Independently of the transport, the default path already packs the three
+Q/K/V input exchanges into one destination-major collective. A handful of
+models (e.g. LTX-2) instead opt into `enable_packed_qkv_input_a2a`, which
+pipelines three separate exchanges over a dedicated stream rather than
+merging them into one payload — a different trade-off, not a strict
+upgrade over the default.
 
 ## Which axes tolerate crossing nodes
 
@@ -122,14 +132,18 @@ to least cross-node friendly:
 | Data parallel | none between replicas | zero on the request path | **Best.** Replicas only share startup init and control-op fan-out; no fast interconnect needed at all. |
 | CFG parallel | one branch-combine | one latent-sized exchange, once | **Good candidate.** Once per step, small payload, naturally deadline-tolerant. Unmeasured across nodes so far. |
 | K/V-gather CP | one K/V all-gather per attention | (R−1)/R of K/V, one unoverlapped burst | **Between Ulysses and ring:** only K/V moves (queries never do), but the burst cannot hide behind compute — prefer ring across nodes, gather at small degrees within one. |
-| Ring SP | neighbor-only K/V rotation | K/V ÷ ring_degree, (R−1) hops, overlapped with attention tiles | **Designed for it.** Validated cross-node for MiniMax H3 (Ulysses intra-node × ring across, net positive and growing with sequence length). |
+| Ring SP | neighbor-only K/V rotation | K/V ÷ ring_degree, (R−1) hops, overlapped with attention tiles | **Designed for it.** The mechanism now covers most models' joint attention (see Constraints). Actually crossing nodes end-to-end is validated for MiniMax H3 (Ulysses intra-node × ring across, net positive and growing with sequence length); other models' ring support is same-node-validated so far. |
 | Ulysses SP | all-to-all | full q/k/v activations, twice per attention, every layer | **Keep intra-node.** All-to-all needs full-bisection bandwidth; across nodes it becomes R² flows with receiver incast. |
 | Tensor parallel | all-reduce | hidden-sized reduction per transformer block (×60 blocks for qwen-class DiTs) | **Worst.** Highest frequency, no overlap, already ~70% of sharded kernel time on NVLink. |
 
-Two caveats keep this a map rather than a promise. Cross-node launch itself
-(`--nnodes`) is not merged yet, and per-model ring support is still partial (see
-the constraints above), so today the validated cross-node configuration is the
-H3 recipe. And the data-parallel row describes the design: the current
+Two caveats keep this a map rather than a promise. Cross-node launch
+(`--nnodes`/`--node-rank`/`--dist-init-addr`) is merged, and per-model ring
+support is broad now (see the constraints above) — but those two facts
+together still don't add up to "any model, any node count." The only
+configuration actually run end-to-end across nodes is the H3 recipe; other
+models' ring support is same-node-validated so far, which means crossing
+nodes with them is untested, not disallowed. And the data-parallel row
+describes the design: the current
 implementation binds each replica's ingress on the local host, so replicas
 spanning hosts additionally need per-replica host addressing before `--dp-size`
 can place one replica per node.
