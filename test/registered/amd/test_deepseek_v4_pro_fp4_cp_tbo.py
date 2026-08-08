@@ -24,7 +24,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, set_ulimit
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -70,6 +70,10 @@ class TestDeepseekV4ProFp4CPInterleaveTbo(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_V4_PRO_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        # GSM8K below drives 1319 concurrent requests, and the launched server
+        # inherits the fd limit of this process, so raise it before popen.
+        set_ulimit(65536)
 
         env = os.environ.copy()
         env.update(COMMON_ENV_VARS)
@@ -131,7 +135,7 @@ class TestDeepseekV4ProFp4CPInterleaveTbo(CustomTestCase):
             api="completion",
             max_tokens=512,
             num_examples=1319,
-            num_threads=32,
+            num_threads=1319,
             num_shots=5,
         )
         metrics = run_eval(args)
