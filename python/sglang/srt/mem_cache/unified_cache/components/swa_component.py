@@ -379,6 +379,11 @@ def _fused_state_h2d(
     ``.to(device=)`` round-trips disappear. Ordering against capture is unchanged:
     the caller waits on each pool's capture-done event before any restore is
     enqueued, and stream order does the rest.
+
+    ``state_locs`` must be non-negative: they are allocated ring slots, and the
+    kernels turn them into raw byte offsets, so a sentinel that the per-layer
+    ``dev[state_locs] = ...`` would quietly fold into a tail row would address out
+    of bounds here instead.
     """
     ring = hp.slot_page_size
     gpu = hp.gpu_device
@@ -1068,13 +1073,15 @@ class SWAComponent(TreeComponent):
             split_len = len(new_parent.key)
             full_span = split_len + len(child.key)
             host_lru = self.tree_core.host_lru_lists[self.component_type]
-            hp = self._swa_kv_pool_host
-            ring = hp.slot_page_size if hp is not None else None
-            if (
-                self._strict_bit_exact
-                and ring is not None
-                and len(child_swa_host_value) == ring
-            ):
+            # Only the strict ring-paged pool carries a slot geometry; the
+            # best-effort SWA host pool has no slot_page_size, so gate on the flag
+            # before reaching for it and still read it defensively.
+            ring = (
+                getattr(self._swa_kv_pool_host, "slot_page_size", None)
+                if self._strict_bit_exact
+                else None
+            )
+            if ring is not None and len(child_swa_host_value) == ring:
                 # Strict host_value is always exactly one ring page (the window at
                 # the child's end), so it belongs whole to the child even when the
                 # node happens to span exactly `ring` tokens -- splitting it by key
