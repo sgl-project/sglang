@@ -10,7 +10,6 @@ from typing import Any, Callable, Collection, Optional, Protocol, runtime_checka
 logger = logging.getLogger(__name__)
 
 
-
 @runtime_checkable
 class LoadSnapshotSource(Protocol):
     """Protocol for a load-snapshot data source."""
@@ -80,7 +79,6 @@ class RouterLoadSnapshotSource:
             return False
         self._expected = updated
         return True
-
 
 
 class LoadSampler:

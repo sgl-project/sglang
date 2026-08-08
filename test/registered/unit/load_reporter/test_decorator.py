@@ -17,7 +17,11 @@ from typing import Any, Optional
 
 import pytest
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
 pytest_plugins = ("pytest_asyncio",)
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +43,7 @@ class FakeOwner:
         self.server_args = FakeServerArgs(port=port)
 
     @staticmethod
-    def make_sync(port: Optional[int] = 30100) -> "FakeOwner":
+    def make_sync(port: Optional[int] = 30100) -> FakeOwner:
         return FakeOwner(port=port)
 
 

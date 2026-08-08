@@ -44,7 +44,7 @@ class _RouterSession:
         store: LatestSnapshotStore,
         builder: ReportBuilder,
         identity: WorkerMetadata,
-        on_close: Callable[[str, "_RouterSession"], None],
+        on_close: Callable[[str, _RouterSession], None],
         on_schedule_changed: Callable[[], None],
         sample_baseline: int,
         sample_generation: Callable[[], int],
@@ -300,7 +300,7 @@ class LoadReporterRuntime:
         router_id: str,
         report_interval_ms: int,
         lease_ttl_ms: int,
-    ) -> Tuple[pb.RegisterResponse, "_RouterSession"]:
+    ) -> Tuple[pb.RegisterResponse, _RouterSession]:
         """Register or replace a Router session and return its acknowledgement."""
         if self._closing:
             raise RuntimeError("load reporter is shutting down")
@@ -339,7 +339,7 @@ class LoadReporterRuntime:
         )
         return ack, session
 
-    def _on_session_closed(self, router_id: str, session: "_RouterSession") -> None:
+    def _on_session_closed(self, router_id: str, session: _RouterSession) -> None:
         """Remove a session only when it still owns its Router ID."""
         if self._sessions.get(router_id) is session:
             del self._sessions[router_id]

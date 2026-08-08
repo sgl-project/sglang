@@ -143,7 +143,7 @@ class TestAwaitReporterStartup(unittest.TestCase):
 
         # A RUNNING future: result(timeout) times out and cancel() returns False,
         # exactly the branch where a late handle would leak.
-        future: "concurrent.futures.Future" = concurrent.futures.Future()
+        future: concurrent.futures.Future = concurrent.futures.Future()
         future.set_running_or_notify_cancel()
 
         with self.assertRaises(TimeoutError):

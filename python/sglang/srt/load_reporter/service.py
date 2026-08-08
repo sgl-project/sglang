@@ -129,9 +129,7 @@ class LoadMonitorService(pb_grpc.LoadMonitorServiceServicer):
                         pass
 
     @staticmethod
-    async def _read_frame(
-        request_iterator: Any, context: Any
-    ) -> "pb.RouterFrame | None":
+    async def _read_frame(request_iterator: Any, context: Any) -> pb.RouterFrame | None:
         """Read one RouterFrame; return None on EOF or context cancel."""
         try:
             return await request_iterator.__anext__()

@@ -39,8 +39,6 @@ def enable_load_monitor(kind: str) -> Callable[..., Any]:
     )
 
 
-
-
 def _get_notify(self: Any) -> Optional[_NotifyFn]:
     """Return the bound callback for *self*, or None if absent or disabled."""
     if getattr(getattr(self, "server_args", None), "load_reporter_port", None) is None:

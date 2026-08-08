@@ -84,7 +84,7 @@ logger = logging.getLogger(__name__)
 
 
 def _await_reporter_startup(
-    future: "concurrent.futures.Future",
+    future: concurrent.futures.Future,
     loop: asyncio.AbstractEventLoop,
     timeout: float,
 ) -> Optional[Any]:
@@ -102,7 +102,7 @@ def _await_reporter_startup(
     except concurrent.futures.TimeoutError:
         future.cancel()
 
-        def _close_if_produced(fut: "concurrent.futures.Future") -> None:
+        def _close_if_produced(fut: concurrent.futures.Future) -> None:
             # Fires when the future settles.  A won cancel leaves it cancelled
             # (the coroutine's own teardown releases the partial handle); a lost
             # cancel leaves a real handle here that must not leak.
@@ -518,6 +518,7 @@ class MultiTokenizerRouter:
         self.socket_mapping = SocketMapping()
 
         self._load_reporter_handle: Optional[Any] = self._start_load_reporter_owner()
+
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
 

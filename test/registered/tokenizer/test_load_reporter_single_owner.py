@@ -41,7 +41,8 @@ class FakeRouterClient:
     """Real grpc.aio client that dials INTO the Worker reporter port.
 
     Runs its own event loop on a background thread. Sends a register frame
-    first, then periodic keep-alives, and records every WorkerFrame it reads.
+    first, then periodic keep-alive frames, and records every WorkerFrame it
+    reads.
     """
 
     def __init__(

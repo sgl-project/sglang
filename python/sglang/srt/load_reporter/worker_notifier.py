@@ -22,7 +22,6 @@ _REASON_PRIORITY: Final[Dict[LoadReporterRefreshReason, int]] = {
 }
 
 
-
 class LoadReporterRefreshNotifier:
     """Single-task coalescer for refresh events."""
 
