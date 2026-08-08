@@ -1939,6 +1939,9 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
+                    # Re-materialized on device via recomputation: emit
+                    # store(GPU) so downstream indexers see it device-local again.
+                    self._record_store_event(node, medium=StorageMedium.GPU)
                 else:
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
@@ -1954,6 +1957,9 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
+                    # Re-materialized on device via recomputation: emit
+                    # store(GPU) so downstream indexers see it device-local again.
+                    self._record_store_event(new_node, medium=StorageMedium.GPU)
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
