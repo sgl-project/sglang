@@ -796,6 +796,25 @@ class ModelRunner:
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        value = getattr(self.loader, "preloaded_weights_bytes", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                "ModelLoader.preloaded_weights_bytes must be a non-negative int, "
+                f"got {value!r}"
+            )
+        return value
+
+    def account_preloaded_weights(self, preloaded_weights_bytes: int) -> None:
+        # Rank-local correction must happen before the distributed MIN. Skip
+        # the extra reduction when no loader reported resident weight memory.
+        if preloaded_weights_bytes == 0:
+            return
+        self.pre_model_load_memory = bootstrap.reduce_min_gpu_memory(
+            self.local_pre_model_load_memory + preloaded_weights_bytes / (1 << 30)
+        )
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -1040,6 +1059,7 @@ class ModelRunner:
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
+        self.local_pre_model_load_memory = result.local_pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(

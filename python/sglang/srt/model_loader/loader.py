@@ -357,6 +357,10 @@ def _post_load_weights(model: nn.Module) -> None:
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
+    # Rank-local weight memory already resident when ModelRunner sampled its
+    # pre-load baseline. Shared allocations must be reported by only one loader.
+    preloaded_weights_bytes: int = 0
+
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
