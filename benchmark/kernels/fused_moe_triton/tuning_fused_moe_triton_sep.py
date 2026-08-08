@@ -22,8 +22,13 @@ from common_utils import (
     get_model_config,
     sort_config,
 )
-from ray.experimental.tqdm_ray import tqdm
 
+try:
+    from ray.experimental.tqdm_ray import tqdm
+except Exception:  # ray's tqdm needs a ray context; fall back to plain tqdm.
+    from tqdm import tqdm
+
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import clear_b_tma_desc_cache
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     get_config_dtype_str,
@@ -38,9 +43,101 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device_count, is_hip
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
+
+# Layout of the saved topk_ids dataset, resolved per-model in BenchmarkWorker so it
+# is correct in both the serial (XPU) path and each ray worker process (CUDA).
+# Defaults preserve the original DeepSeek-V3 behavior (61 layers, 3 dense).
+_NUM_LAYERS = 61
+_DENSE_LAYERS = 3
+# Snapshots saved per MoE layer (the capture snippet stores idx 0 and 1).
+_NUM_SNAPSHOTS = 2
+
+
+def _resolve_layer_layout(model_path: str) -> None:
+    """Set the global topk_ids layer layout from the model's HF config."""
+    global _NUM_LAYERS, _DENSE_LAYERS
+    cfg = get_config(model_path, trust_remote_code=True)
+    if hasattr(cfg, "text_config"):
+        cfg = cfg.get_text_config()
+    _NUM_LAYERS = getattr(cfg, "num_hidden_layers", _NUM_LAYERS)
+    # DeepSeek-family models expose the count of leading dense layers; other MoE
+    # models (e.g. Mixtral) have none.
+    _DENSE_LAYERS = getattr(cfg, "first_k_dense_replace", 0)
+
+
+def _get_accel_device() -> str:
+    """Pick the active accelerator: cuda, else xpu, else raise."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    raise RuntimeError("No CUDA or XPU accelerator available for tuning.")
+
+
+_ACCEL = _get_accel_device()
+# torch.cuda / torch.xpu expose the same synchronize / Event / manual_seed_all API.
+_accel_mod = torch.cuda if _ACCEL == "cuda" else torch.xpu
+# Graph capture is available on CUDA (CUDAGraph) and on XPU builds that expose
+# torch.xpu.XPUGraph / torch.xpu.graph; fall back to eager otherwise.
+_supports_graph = _ACCEL == "cuda" or (
+    _ACCEL == "xpu" and hasattr(torch.xpu, "XPUGraph")
+)
+# CPUs to request per tuning worker. Tuning is GPU-bound, but ray derives a
+# worker's OMP_NUM_THREADS from its CPU share, so asking for 1 would pin host-side
+# work (kernel compile, tensor setup) to a single thread.
+_CPUS_PER_WORKER = 8
+
+
+def _accel_synchronize() -> None:
+    _accel_mod.synchronize()
+
+
+def _accel_event():
+    return _accel_mod.Event(enable_timing=True)
+
+
+def _accel_manual_seed_all(seed: int) -> None:
+    _accel_mod.manual_seed_all(seed)
+
+
+def _accel_new_graph():
+    """Return a new capture graph object for the active accelerator."""
+    return torch.cuda.CUDAGraph() if _ACCEL == "cuda" else torch.xpu.XPUGraph()
+
+
+def _accel_graph_ctx(graph):
+    """Return the graph-capture context manager for the active accelerator."""
+    return torch.cuda.graph(graph) if _ACCEL == "cuda" else torch.xpu.graph(graph)
+
+
+class _TemplateTopKOutput:
+    """Minimal stand-in for the object returned by select_experts."""
+
+    def __init__(self, topk_weights, topk_ids):
+        self.topk_weights = topk_weights
+        self.topk_ids = topk_ids
+        self.router_logits = None
+
+
+def _build_template_topk(hidden_states, input_gating, topk_config):
+    """Build the throwaway topk template used only to size buffers / supply weights.
+
+    The real routing comes from the saved dataset via prepare(); this template's
+    topk_ids are overwritten. Fall back to a native softmax-topk when the fused
+    kernel has no implementation for the given dtype/device (e.g. float32 on XPU).
+    """
+    try:
+        return select_experts(hidden_states, input_gating, topk_config)
+    except NotImplementedError:
+        probs = torch.softmax(input_gating.float(), dim=-1)
+        weights, ids = torch.topk(probs, topk_config.top_k, dim=-1)
+        if getattr(topk_config, "renormalize", False):
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        return _TemplateTopKOutput(weights.to(torch.float32), ids.to(torch.int32))
 
 
 @dataclasses.dataclass
@@ -54,11 +151,13 @@ class MoeInputs:
 class KernelWrapper:
     def __init__(self, moe_inputs, use_cuda_graph=True, inner_iter=10, **kwargs):
         self.func = invoke_fused_moe_kernel
-        self.use_cuda_graph = use_cuda_graph
+        # Graph capture is used on CUDA and on XPU builds that support it;
+        # disabled otherwise (falls back to an eager replay loop).
+        self.use_cuda_graph = use_cuda_graph and _supports_graph
         self.moe_inputs = moe_inputs
         self.inner_iter = inner_iter
         self.kwargs = kwargs
-        if use_cuda_graph:
+        if self.use_cuda_graph:
             self.graph = self.cuda_graph_wrapper()
         else:
             self.graph = None
@@ -72,11 +171,11 @@ class KernelWrapper:
             expert_ids=moe_input.expert_ids,
             num_tokens_post_padded=moe_input.num_tokens_post_padded,
         )
-        torch.cuda.synchronize()
+        _accel_synchronize()
 
-        # Capture 10 invocations with CUDA graph
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # Capture inner_iter invocations into a single replayable graph.
+        graph = _accel_new_graph()
+        with _accel_graph_ctx(graph):
             for k in range(self.inner_iter):
                 moe_input = self.moe_inputs[k]
                 self.func(
@@ -86,19 +185,19 @@ class KernelWrapper:
                     expert_ids=moe_input.expert_ids,
                     num_tokens_post_padded=moe_input.num_tokens_post_padded,
                 )
-        torch.cuda.synchronize()
+        _accel_synchronize()
 
         # Warmup
         for _ in range(5):
             graph.replay()
-        torch.cuda.synchronize()
+        _accel_synchronize()
         return graph
 
     def forward_cost(self, try_cnt=2):
         time_cost = float("inf")
         for _ in range(try_cnt):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            start_event = _accel_event()
+            end_event = _accel_event()
             start_event.record()
             if self.use_cuda_graph:
                 self.graph.replay()
@@ -113,18 +212,20 @@ class KernelWrapper:
                         num_tokens_post_padded=moe_input.num_tokens_post_padded,
                     )
             end_event.record()
-            torch.cuda.synchronize()
+            _accel_synchronize()
             time_cost = min(time_cost, start_event.elapsed_time(end_event))
         return time_cost
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
-    moe_layers = num_layers - dense_layers
-    return torch.load(
-        f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
-    )
+    moe_layers = _NUM_LAYERS - _DENSE_LAYERS
+    # Cycle over the available (layer, snapshot) files so any requested sample
+    # index maps onto a captured file, regardless of model depth.
+    num_samples = moe_layers * _NUM_SNAPSHOTS
+    j = i % num_samples
+    layer = j % moe_layers + _DENSE_LAYERS
+    idx = j // moe_layers
+    return torch.load(f"{topk_ids_dir}/topk_ids_layer{layer}_idx{idx}.pt")
 
 
 def benchmark_config(
@@ -147,6 +248,14 @@ def benchmark_config(
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
+    # The weights allocated below are private to this call, so nothing cached from
+    # a previous config can ever be reused; release it before we add to the
+    # allocator's footprint. Each stale entry pins a dead w1/w2 (~420 MiB per
+    # config for DeepSeek-OCR, >13 GiB once the 64-entry LRU fills), which on a
+    # 24 GiB card starves graph capture as UR_RESULT_ERROR_OUT_OF_RESOURCES a few
+    # hundred configs in. Clearing is ~4.5us to rebuild vs ~3.4us to look up,
+    # against milliseconds of measured kernel time.
+    clear_b_tma_desc_cache()
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
@@ -254,7 +363,7 @@ def benchmark_config(
         top_k=topk,
         renormalize=True,
     )
-    topk_output_ = select_experts(hidden_states, input_gating, topk_config)
+    topk_output_ = _build_template_topk(hidden_states, input_gating, topk_config)
     sorted_token_ids_, expert_ids_, num_tokens_post_padded_ = moe_align_block_size(
         topk_output_.topk_ids, config["BLOCK_SIZE_M"], num_experts
     )
@@ -375,7 +484,6 @@ def benchmark_config(
         return kernel0, kernel1
 
     use_cuda_graph = True if not ncu_enable else False
-
     kernel0, kernel1 = get_kernel_wrapper(False, inner_iter, use_cuda_graph)
     kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, inner_iter, use_cuda_graph)
 
@@ -397,8 +505,7 @@ def benchmark_config(
         ts1.append(kernel1.forward_cost())
         ts_tma0.append(kernel_tma0.forward_cost())
         ts_tma1.append(kernel_tma1.forward_cost())
-    torch.cuda.synchronize()
-
+    _accel_synchronize()
     avg = sum(ts0) / (num_iters) * 1000  # us
     avg1 = sum(ts1) / (num_iters) * 1000  # us
     avg_tma = sum(ts_tma0) / (num_iters) * 1000  # us
@@ -447,13 +554,28 @@ class BestConfigTrace:
 class BenchmarkWorker:
 
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
-        torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
+        # The device index to allocate this worker's tensors and kernels on, as
+        # torch numbers them -- which is not what ray.get_gpu_ids() returns.
+        #
+        # Ray assigns each worker one accelerator. On CUDA it also sets
+        # CUDA_VISIBLE_DEVICES, so the assigned device is the only one torch can
+        # see and its local index is always 0 (get_gpu_ids() reports the global
+        # id, which torch would reject). XPU gets no such masking: ray exports
+        # ONEAPI_DEVICE_SELECTOR only after the worker has initialized the
+        # level-zero stack, so both it and ZE_AFFINITY_MASK are ignored and every
+        # worker enumerates all devices -- the global id *is* the local index, and
+        # without an explicit set_device every worker would pile onto device 0 and
+        # serialize. Empty in the driver process (serial path) -> device 0.
+        assigned = ray.get_gpu_ids() if _ACCEL == "xpu" and ray.is_initialized() else []
+        self.device_id = int(assigned[0]) if assigned else 0
+        _accel_mod.set_device(self.device_id)
+        torch.set_default_device(f"{_ACCEL}:{self.device_id}")
+        _accel_manual_seed_all(0)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU.
-        self.device_id = 0  # int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
+        # Resolve the saved-dataset layer layout for this model. Done here so it is
+        # also set inside each ray worker process (CUDA), not just the serial path.
+        _resolve_layer_layout(server_args.model_path)
 
     def benchmark(
         self,
@@ -472,7 +594,7 @@ class BenchmarkWorker:
         topk_ids_dir: str,
         ep_size: int = 1,
     ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
+        _accel_manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             kernel_time = benchmark_config(
@@ -588,7 +710,7 @@ class BenchmarkWorker:
             print(f"config {i}: {file}")
 
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
-        torch.cuda.manual_seed_all(0)
+        _accel_manual_seed_all(0)
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for bs in num_tokens:
                 kernel_times = []
@@ -763,23 +885,63 @@ def main(args: argparse.Namespace):
 
     assert args.tune
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [
-        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
-        for _ in range(num_gpus)
-    ]
+    if _ACCEL == "cuda":
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        use_ray = True
+    else:
+        # XPU: Ray's IntelGPUAcceleratorManager (requires dpctl) advertises XPUs as
+        # the "GPU" resource. Unlike CUDA it does NOT effectively isolate them --- it
+        # exports ONEAPI_DEVICE_SELECTOR only after the worker has initialized the
+        # level-zero stack, so each worker still enumerates every device and
+        # BenchmarkWorker must pick its own (see its __init__).
+        #
+        # num_cpus must be bounded. Ray sizes its prestarted worker pool from the
+        # core count, and on a many-core host (512 here) it spawns hundreds of
+        # workers that each pay the oneAPI + sglang import cost; ray.init() then
+        # never returns (measured: no completion after 600s, raylet reporting 473
+        # workers "hanging during start"). Tuning only ever needs one worker per
+        # device, so cap the pool at that -- with enough CPU per worker that ray
+        # does not pin it to a single OMP thread.
+        # When ray cannot see multiple devices, fall back to one in-process worker.
+        num_devices = get_device_count()
+        # Workers import this module by path, so they need its directory on
+        # PYTHONPATH to resolve the sibling `common_utils`. Ray overwrites the keys
+        # named in env_vars and inherits the rest, so ${PYTHONPATH} (which ray
+        # expands in the worker) must be kept -- dropping it would strip whatever
+        # the caller put there.
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        ray.init(
+            num_gpus=num_devices,
+            num_cpus=num_devices * _CPUS_PER_WORKER,
+            runtime_env={"env_vars": {"PYTHONPATH": this_dir + ":${PYTHONPATH}"}},
+        )
+        num_gpus = int(ray.available_resources().get("GPU", 0))
+        use_ray = num_gpus > 1
 
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+    if use_ray:
+        # num_cpus must match what ray.init() reserved per device above, or ray
+        # admits more workers than there are devices (its default is 1 CPU each).
+        worker_cls = ray.remote(num_gpus=1, num_cpus=_CPUS_PER_WORKER)(BenchmarkWorker)
+        workers = [worker_cls.remote(args.seed, server_args) for _ in range(num_gpus)]
+
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+            outputs = []
+            worker_idx = 0
+            for input_args in inputs:
+                worker = workers[worker_idx]
+                worker_method = getattr(worker, method)
+                output = worker_method.remote(*input_args)
+                outputs.append(output)
+                worker_idx = (worker_idx + 1) % num_gpus
+            return ray.get(outputs)
+
+    else:
+        serial_worker = BenchmarkWorker(args.seed, server_args)
+
+        def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+            worker_method = getattr(serial_worker, method)
+            return [worker_method(*input_args) for input_args in inputs]
 
     search_space = get_configs_compute_bound()
     if block_shape is not None:
