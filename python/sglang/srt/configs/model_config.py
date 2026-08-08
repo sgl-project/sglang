@@ -103,6 +103,22 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def get_deepseek_v4_compress_ratios(config) -> list[int]:
+    """Per-layer DeepSeek V4 compression ratios, normalized across transformers
+    versions. Legacy configs expose ``compress_ratios``; transformers >= 4.57
+    replaces it with ``compress_rates`` (a ``{layer_type: ratio}`` map) keyed by
+    ``layer_types``. Returns ``[]`` when neither representation is present.
+    """
+    ratios = _hf_attr(config, "compress_ratios")
+    if ratios is not None:
+        return list(ratios)
+    layer_types = _hf_attr(config, "layer_types")
+    compress_rates = _hf_attr(config, "compress_rates")
+    if layer_types is not None and compress_rates is not None:
+        return [compress_rates.get(layer_type, 0) for layer_type in layer_types]
+    return []
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -239,8 +255,8 @@ def get_num_indexer_layers(config) -> int:
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
     if is_deepseek_v4(config):
-        compress_ratios = getattr(config, "compress_ratios", None) or []
-        return sum(1 for r in compress_ratios if r == 4)
+        compress_ratios = get_deepseek_v4_compress_ratios(config)
+        return sum(1 for ratio in compress_ratios if ratio == 4)
     return getattr(config, "num_indexer_layers", 0)
 
 
@@ -381,6 +397,12 @@ class ModelConfig:
                     )
             if envs.SGLANG_DSV4_FP4_DEQUANT.get():
                 envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
+            # Normalize compress_ratios onto hf_config so downstream readers
+            # (models/deepseek_v4.py, NPU backend) work on transformers >= 4.57
+            # configs that only expose compress_rates + layer_types.
+            self.hf_config.compress_ratios = get_deepseek_v4_compress_ratios(
+                self.hf_config
+            )
 
             # HF config.json inherits topk_group=4 from the V3 template, but
             # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
@@ -888,9 +910,12 @@ class ModelConfig:
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
-            self.compress_ratios = self.hf_config.compress_ratios
+            self.compress_ratios = get_deepseek_v4_compress_ratios(self.hf_config)
             self.attention_arch = AttentionArch.MHA
-            self._init_mla_scaling(self.hf_config.rope_scaling)
+            self._init_mla_scaling(
+                _hf_attr(self.hf_config, "rope_parameters")
+                or _hf_attr(self.hf_config, "rope_scaling")
+            )
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
             if self.head_dim is None:
                 self.head_dim = (
