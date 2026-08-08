@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -280,6 +281,9 @@ class DeepEPBuffer:
         is_cu12 = get_cuda_version()[0] == 12
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
+
+        if "explicitly_destroy" in inspect.signature(Buffer.__init__).parameters:
+            buffer_kwargs["explicitly_destroy"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
