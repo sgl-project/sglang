@@ -109,6 +109,40 @@ class TestHermesDetector(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, text)
 
+    # ==================== truncated tool call Tests ====================
+    # A tool call cut off by max_tokens must not leak raw <tool_call>
+    # markup into content: the streaming path drops the markup, and
+    # finish_reason ("length") already tells the client the call is
+    # incomplete, so non-streaming must drop it too.
+
+    def test_truncated_tool_call_dropped_from_content(self):
+        text = (
+            "I will check.\n<tool_call>\n"
+            '{"name": "get_weather", "arguments": {"city": "San Fr'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "I will check.")
+        self.assertEqual(len(result.calls), 0)
+
+    def test_valid_call_preserved_when_followed_by_truncated_call(self):
+        text = (
+            '<tool_call>{"name": "get_weather", "arguments": {"city": "SF"}}'
+            "</tool_call>\n"
+            '<tool_call>{"name": "search", "arguments": {"query": "wea'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_unterminated_block_with_complete_json_still_parsed(self):
+        text = 'ok.<tool_call>{"name": "get_weather", "arguments": {"city": "SF"}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "ok.")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
     # ==================== structure_info Tests ====================
 
     def test_structure_info(self):
