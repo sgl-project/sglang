@@ -165,6 +165,11 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
+    parser.add_argument(
+        "--cache-report",
+        action="store_true",
+        help="Collect and display cache hit breakdown details.",
+    )
     return parser.parse_args()
 
 
@@ -178,6 +183,88 @@ def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
             )  # Write as a single line in JSONL format
     except IOError as e:
         print(f"Error writing to JSONL file: {e}")
+
+
+def build_cache_report(prompt_lens, cached_tokens, cached_tokens_details):
+    total_prompt_tokens = sum(prompt_lens)
+    total_cached_tokens = sum(cached_tokens)
+    total_device = 0
+    total_host = 0
+    total_storage = 0
+    storage_backend_name = None
+    has_details = False
+    has_storage_details = False
+
+    for details in cached_tokens_details:
+        if not details:
+            continue
+        has_details = True
+        total_device += details.get("device") or 0
+        total_host += details.get("host") or 0
+        if "storage" in details:
+            has_storage_details = True
+        total_storage += details.get("storage") or 0
+        if storage_backend_name is None and details.get("storage_backend"):
+            storage_backend_name = details.get("storage_backend")
+
+    cache_hit_rate_pct = (
+        total_cached_tokens / total_prompt_tokens * 100
+        if total_prompt_tokens > 0
+        else 0.0
+    )
+
+    return {
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_cached_tokens": total_cached_tokens,
+        "cache_hit_rate_pct": round(cache_hit_rate_pct, 2),
+        "device_cached_tokens": total_device if has_details else None,
+        "host_cached_tokens": total_host if has_details else None,
+        "storage_cached_tokens": total_storage if has_storage_details else None,
+        "storage_backend": storage_backend_name,
+    }
+
+
+def print_cache_report(cache_report, title="Cache Hit Details"):
+    total_prompt_tokens = cache_report["total_prompt_tokens"]
+    total_cached_tokens = cache_report["total_cached_tokens"]
+    device_cached_tokens = cache_report["device_cached_tokens"]
+    host_cached_tokens = cache_report["host_cached_tokens"]
+    storage_cached_tokens = cache_report["storage_cached_tokens"]
+    storage_backend = cache_report["storage_backend"]
+    cache_hit_rate_pct = cache_report["cache_hit_rate_pct"]
+
+    print("{s:{c}^{n}}".format(s=title, n=50, c="-"))
+    print("{:<40} {:<10}".format("Total prompt tokens:", total_prompt_tokens))
+    print("{:<40} {:<10}".format("Total cached tokens:", total_cached_tokens))
+    if device_cached_tokens is not None and total_cached_tokens > 0:
+        print("{:<40} {:<10}".format("  Device:", device_cached_tokens))
+        print("{:<40} {:<10}".format("  Host:", host_cached_tokens))
+        if storage_cached_tokens is not None:
+            storage_label = (
+                f"  Storage ({storage_backend}):" if storage_backend else "  Storage:"
+            )
+            print("{:<40} {:<10}".format(storage_label, storage_cached_tokens))
+    print("{:<40} {:.1f}%".format("Cache hit rate:", cache_hit_rate_pct))
+    if device_cached_tokens is not None and total_cached_tokens > 0:
+        print(
+            "{:<40} {:.1f}%".format(
+                "  Device:", device_cached_tokens / total_cached_tokens * 100
+            )
+        )
+        print(
+            "{:<40} {:.1f}%".format(
+                "  Host:", host_cached_tokens / total_cached_tokens * 100
+            )
+        )
+        if storage_cached_tokens is not None:
+            storage_label = (
+                f"  Storage ({storage_backend}):" if storage_backend else "  Storage:"
+            )
+            print(
+                "{:<40} {:.1f}%".format(
+                    storage_label, storage_cached_tokens / total_cached_tokens * 100
+                )
+            )
 
 
 class ReadyQueue:
@@ -210,6 +297,7 @@ class ReadyQueue:
 
 class WorkloadGenerator:
     def __init__(self, args):
+        self.args = args
         self.api_format = args.api_format
         self.model_path = args.model_path
 
@@ -320,6 +408,7 @@ class WorkloadGenerator:
                         initial_messages[i],
                         first_round_output_lens[i],
                         self.model_path,
+                        args.cache_report,
                     ),
                 )
                 for i in range(args.num_clients)
@@ -366,6 +455,7 @@ class WorkloadGenerator:
             "latency": [],
             "prompt_len": [],
             "cached_tokens": [],
+            "cached_tokens_details": [],
             "generated_len": [],
         }
         self.enable_round_barrier = args.enable_round_barrier
@@ -377,6 +467,7 @@ class WorkloadGenerator:
                     "latency": [],
                     "prompt_len": [],
                     "cached_tokens": [],
+                    "cached_tokens_details": [],
                     "generated_len": [],
                 }
         self.num_clients = args.num_clients
@@ -462,6 +553,9 @@ class WorkloadGenerator:
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
                 self.performance_metrics["cached_tokens"].append(response.cached_tokens)
+                self.performance_metrics["cached_tokens_details"].append(
+                    getattr(response, "cached_tokens_details", None)
+                )
                 self.performance_metrics["generated_len"].append(response.generated_len)
                 if self.enable_round_barrier:
                     self.performance_metrics[f"round_{current_round}"]["ttft"].append(
@@ -476,6 +570,9 @@ class WorkloadGenerator:
                     self.performance_metrics[f"round_{current_round}"][
                         "cached_tokens"
                     ].append(response.cached_tokens)
+                    self.performance_metrics[f"round_{current_round}"][
+                        "cached_tokens_details"
+                    ].append(getattr(response, "cached_tokens_details", None))
                     self.performance_metrics[f"round_{current_round}"][
                         "generated_len"
                     ].append(response.generated_len)
@@ -496,6 +593,7 @@ class WorkloadGenerator:
                                 self.client_records[client_id]["history"],
                                 sub_q.output_len,
                                 self.model_path,
+                                self.args.cache_report,
                             ),
                         )
                     else:
@@ -639,12 +737,18 @@ class WorkloadGenerator:
                 ),
             },
         }
+        if self.args.cache_report:
+            performance_data["cache_report"] = build_cache_report(
+                self.performance_metrics["prompt_len"],
+                self.performance_metrics["cached_tokens"],
+                self.performance_metrics["cached_tokens_details"],
+            )
         if self.enable_round_barrier:
             performance_data["round"] = {}
             for round_num in range(self.num_rounds):
                 round_key = f"round_{round_num}"
                 round_metrics = self.performance_metrics[round_key]
-                performance_data["round"][round_key] = {
+                round_data = {
                     "average_ttft": (
                         sum(round_metrics["ttft"]) / len(round_metrics["ttft"])
                         if round_metrics["ttft"]
@@ -658,6 +762,13 @@ class WorkloadGenerator:
                     ),
                     "request_count": len(round_metrics["ttft"]),
                 }
+                if self.args.cache_report:
+                    round_data["cache_report"] = build_cache_report(
+                        round_metrics["prompt_len"],
+                        round_metrics["cached_tokens"],
+                        round_metrics["cached_tokens_details"],
+                    )
+                performance_data["round"][round_key] = round_data
         print("All requests completed")
         print("Performance metrics summary:")
         print(
@@ -708,6 +819,8 @@ class WorkloadGenerator:
             f"  Request Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
         )
         print(f"  Cache Hit Rate: {performance_data['summary']['cache_hit_rate']:.6f}")
+        if self.args.cache_report:
+            print_cache_report(performance_data["cache_report"])
 
         if self.enable_round_barrier:
             # Print round-basedsummary
@@ -727,6 +840,11 @@ class WorkloadGenerator:
                             f"({request_count} requests, "
                             f"{clients_in_round} clients)"
                         )
+                        if self.args.cache_report:
+                            print_cache_report(
+                                round_data["cache_report"],
+                                title=f"Round {round_num} Cache Hit Details",
+                            )
                     else:
                         print(f"  Round {round_num}: No requests completed")
 
