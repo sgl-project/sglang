@@ -53,7 +53,7 @@ def test_war_read_done_record():
         _runner(planted=True)._war_read_done_record(_attn_backend(), ForwardMode.DECODE)
         is SharedReadBoundary.IN_REPLAY
     )
-    # No node, snapshot backend: all shared reads finish before launch.
+    # No planted node: fall back to a pre-replay record.
     assert (
         _runner()._war_read_done_record(_attn_backend(), ForwardMode.DECODE)
         is SharedReadBoundary.PRE_REPLAY
@@ -63,7 +63,7 @@ def test_war_read_done_record():
         _runner(planted=True)._war_read_done_record(_attn_backend(), ForwardMode.EXTEND)
         is SharedReadBoundary.UNKNOWN
     )
-    # Backend placement cannot opt an unsupported algorithm into publication.
+    # The algorithm gate precedes the backend declaration.
     assert (
         _runner(planted=True)._war_read_done_record(
             _attn_backend(breakable_metadata=True), ForwardMode.TARGET_VERIFY

@@ -123,10 +123,9 @@ class AttentionBackend(ABC):
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         """Declare where this backend's scheduler-shared reads end per mode.
 
-        Decode/verify default to IN_REPLAY as a consequence of the
-        out-graph/in-graph init contract above: it is a safe upper bound for
-        any backend honoring the contract (a no-op in-graph hook puts the
-        record at the graph head). Override for audited deviations.
+        Decode/verify default to IN_REPLAY: the out-graph/in-graph init
+        contract above makes it a safe upper bound for any backend honoring
+        the contract. Override for audited deviations.
         """
         if forward_mode.is_decode() or forward_mode.is_target_verify():
             return SharedReadBoundary.IN_REPLAY
