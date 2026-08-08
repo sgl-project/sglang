@@ -100,7 +100,7 @@ class Dot3NoteModelNextN(nn.Module):
             buffer_size=2, dtype=torch.float32, device=device
         )
         hidden_states = (
-            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            self._embed_input_ids(input_ids) if input_embeds is None else input_embeds
         )
         head = self.heads[0]
         if hidden_states.shape[0] > 0:
@@ -126,6 +126,14 @@ class Dot3NoteModelNextN(nn.Module):
             else:
                 hidden_states, _ = head.shared_head.norm(hidden_states, residual)
         return hidden_states
+
+    def _embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # VLM prefill input_ids contain hashed multimodal pad sentinels outside
+        # the vocabulary. The target hidden states carry the multimodal semantics
+        # into MTP, so the token embedding at a sentinel position is unused. Use a
+        # valid placeholder index here to avoid an OOB embedding lookup while
+        # retaining the checkpoint's separately trained MTP embedding elsewhere.
+        return self.embed_tokens(input_ids.clamp(min=0, max=self.vocab_size - 1))
 
 
 class Dots3NoteOmniForCausalLMNextN(Dots3LanguageModelForCausalLM):

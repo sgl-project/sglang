@@ -9,9 +9,11 @@ if [[ -d "${PYENV_ROOT}/bin" ]]; then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-MODEL_PATH="${MODEL_PATH:-/cpfs/user/qianwu/models/note_omni_publish}"
+MODEL_PATH="${MODEL_PATH:-/cpfs/user/qianwu/models/note_omni_publish_9800}"
 SGL_PORT="${SGL_PORT:-8192}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
+CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
@@ -36,10 +38,10 @@ if [[ "${LANGUAGE_ONLY:-0}" == "1" ]]; then
   EXTRA_SERVER_ARGS+=(--language-only)
 fi
 
-CUDA_GRAPH_ARGS=()
-if [[ "${ENABLE_CUDA_GRAPH:-0}" != "1" ]]; then
-  CUDA_GRAPH_ARGS+=(--disable-cuda-graph)
-fi
+# Target verification and draft decoding keep separate graph pools.  With MTP,
+# the default graph range leaves too little headroom for sparse-prefill
+# workspaces on an 80 GB GPU when mem-fraction-static is 0.85.
+CUDA_GRAPH_ARGS=(--cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}")
 
 SPECULATIVE_ARGS=()
 if [[ "${DISABLE_SPECULATIVE:-0}" != "1" ]]; then
@@ -66,8 +68,8 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --tp-size 8 \
   --ep-size 8 \
   --port "${SGL_PORT}" \
-  --mem-fraction-static "${MEM_FRACTION_STATIC:-0.85}" \
-  --max-running-requests 256 \
+  --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
+  --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --chunked-prefill-size 16384 \
   --trust-remote-code \
   --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO:-0.2}" \
