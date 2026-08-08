@@ -330,11 +330,10 @@ class SpecInput(ABC):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # DSA MTP IndexShare seed relay. Class-level defaults (not __init__
-    # assignments: dataclass subclasses run __post_init__ -> super().__init__
-    # *after* field assignment, so an init-time default would clobber a
-    # passed value) so scheduler/relay/attention code reads them uniformly
-    # on any SpecInput; only the EAGLE-family inputs override them.
+    # DSA MTP IndexShare seed relay: readable on any SpecInput; only the
+    # EAGLE-family inputs override them. Must stay class-level defaults, not
+    # __init__ assignments -- dataclass subclasses run __post_init__ ->
+    # super().__init__ after field assignment, which would clobber a passed value.
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
