@@ -48,3 +48,9 @@ def test_fused_ln_modulate_guards_and_mount_protocol():
     unmount_fused_ln_modulate(root)
     assert not fused_ln_modulate_active(root.child)
     assert not mount_fused_ln_modulate(nn.Module())  # no marked sites
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

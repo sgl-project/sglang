@@ -48,3 +48,9 @@ def test_modulate_scale_shift_guards_reject_fp32():
     x = torch.randn((1, 64, 64), device="cuda", dtype=torch.float32)
     row = torch.randn((1, 64), device="cuda", dtype=torch.float32)
     assert not can_use_modulate_scale_shift_cuda(x, row, row)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
