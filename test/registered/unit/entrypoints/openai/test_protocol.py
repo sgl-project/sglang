@@ -483,6 +483,32 @@ class TestModelSerialization(unittest.TestCase):
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
 
+    def test_assistant_content_blocks_are_optional_and_ordered(self):
+        plain = ChatMessage(role="assistant", content="answer")
+        self.assertNotIn("content_blocks", plain.model_dump())
+
+        structured = ChatMessage(
+            role="assistant",
+            content="answer-1answer-2",
+            reasoning_content="think-1think-2",
+            content_blocks=[
+                {"type": "thinking", "text": "think-1"},
+                {"type": "text", "text": "answer-1"},
+                {"type": "thinking", "text": "think-2"},
+                {"type": "text", "text": "answer-2"},
+            ],
+        )
+
+        self.assertEqual(
+            structured.model_dump()["content_blocks"],
+            [
+                {"type": "thinking", "thinking": None, "text": "think-1"},
+                {"type": "text", "text": "answer-1"},
+                {"type": "thinking", "thinking": None, "text": "think-2"},
+                {"type": "text", "text": "answer-2"},
+            ],
+        )
+
     def test_prompt_token_ids_and_meta_info_serialization(self):
         """Test that prompt_token_ids and meta_info serialize only when set."""
         default_choice = ChatCompletionResponseChoice(

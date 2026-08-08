@@ -1042,6 +1042,18 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    # Backward-compatible structured side channel for model families whose
+    # ordered reasoning/text blocks cannot round-trip through the two flattened
+    # OpenAI fields above. Existing clients continue to consume ``content`` and
+    # ``reasoning_content``; session-aware clients may retain these blocks.
+    content_blocks: Optional[List[ChatCompletionMessageContentPart]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.content_blocks is None:
+            data.pop("content_blocks", None)
+        return data
 
 
 class ChatCompletionResponseChoice(BaseModel):
