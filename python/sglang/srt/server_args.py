@@ -769,6 +769,11 @@ class ServerArgs:
     max_running_requests: A[
         Optional[int], "The maximum number of running requests.", NS("schedule")
     ] = None
+    max_consecutive_prefill_batches: A[
+        int,
+        "Run at most N consecutive prefill batches before scheduling one runnable decode batch. Set to 0 to preserve prefill-first scheduling.",
+        NS("schedule"),
+    ] = 0
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -8785,6 +8790,10 @@ class ServerArgs:
             assert (
                 self.tp_size * self.pp_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        assert (
+            self.max_consecutive_prefill_batches >= 0
+        ), "--max-consecutive-prefill-batches must be non-negative"
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1

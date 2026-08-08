@@ -104,6 +104,9 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.consecutive_prefill_limiter import (
+    ConsecutivePrefillLimiter,
+)
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -1025,6 +1028,9 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
+        self.consecutive_prefill_limiter = ConsecutivePrefillLimiter(
+            get_schedule().max_consecutive_prefill_batches
+        )
         if not get_parallel().pp_max_micro_batch_size:
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
@@ -3049,10 +3055,17 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif self.consecutive_prefill_limiter.should_force_decode(
+            has_runnable_decode=(
+                not running_batch.is_empty() and not running_batch.is_prefill_only
+            )
+        ):
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+        selected_prefill = new_batch is not None
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3069,12 +3082,16 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
+            if self.dllm_config is None and selected_prefill:
+                self.consecutive_prefill_limiter.on_prefill()
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
+                if ret is not None:
+                    self.consecutive_prefill_limiter.on_decode()
             else:
                 ret = None
 
