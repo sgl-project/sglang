@@ -1090,15 +1090,43 @@ class Gemma3RMSNorm(BaseFusedOp):
         return self.forward_native(x)
 
     def forward_cuda(self, x, residual: Optional[torch.Tensor] = None):
+        # The fused kernels read the weight in the activation dtype and do not
+        # validate it. `self.weight` is `nn.Parameter(torch.zeros(dim))`, so its
+        # dtype follows whatever default was in effect at construction; under
+        # the loader's `set_default_torch_dtype` that matches the activations,
+        # but a module built outside that context keeps an fp32 weight and the
+        # kernel then returns NaNs instead of raising. Fall back to the eager
+        # path in that case rather than silently producing garbage.
+        if (
+            x.dtype not in (torch.float16, torch.bfloat16)
+            or self.weight.dtype != x.dtype
+            or self.weight.device != x.device
+        ):
+            return self.forward_native(x, residual)
+
         if residual is not None:
             # The decoder residual is token-major and contiguous. The fused
             # kernel updates both tensors in place: x becomes the normalized
             # output and residual becomes x + residual for the next layer.
             gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
             return x, residual
+
+        if x.shape[-1] != self.weight.numel():
+            return self.forward_native(x)
+
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
-        return self.forward_native(x)
+
+        # q_norm / k_norm are called with [tokens, heads, head_dim]. RMSNorm
+        # reduces over the last dimension only, so flattening the leading
+        # dimensions and restoring the shape afterwards is exact.
+        # `reshape` returns a view when the strides allow it, and that view is
+        # not always contiguous -- e.g. a slice along the last dimension keeps a
+        # row stride wider than the row. The kernel happens to honour a row
+        # stride today; `contiguous()` is a no-op for the shapes the model
+        # actually produces and removes the dependency on that detail.
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
+        return gemma_rmsnorm(flat, self.weight.data, self.eps).view_as(x)
 
     def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
