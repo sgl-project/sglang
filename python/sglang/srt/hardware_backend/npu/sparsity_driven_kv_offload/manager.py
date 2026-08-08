@@ -878,7 +878,7 @@ class SparseKVCacheManager:
                 1,
                 block_dim=48,
             )
-            _record_stream_event(self._materialize_slot_map_stream, self.slot_map_done)
+            _record_stream_event(self._prefetch_slot_map_stream, self.slot_map_done)
         _profile_pop(profile_range)
         _profile_pop(prefetch_profile_range)
 
