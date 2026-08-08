@@ -285,6 +285,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import draft_dcp_context
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -919,7 +920,8 @@ class Scheduler(
         )
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        with draft_dcp_context():
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -948,24 +950,27 @@ class Scheduler(
         self.init_target_memory_pool()
         if self.draft_worker is not None:
             pool, allocator = self.tp_worker.get_memory_pool()
-            self.draft_worker.alloc_memory_pool(
-                memory_pool_config=self.tp_worker.model_runner.memory_pool_config,
-                req_to_token_pool=pool,
-                token_to_kv_pool_allocator=allocator,
-            )
-            self.draft_worker.init_hicache_draft_plan()
+            with draft_dcp_context():
+                self.draft_worker.alloc_memory_pool(
+                    memory_pool_config=self.tp_worker.model_runner.memory_pool_config,
+                    req_to_token_pool=pool,
+                    token_to_kv_pool_allocator=allocator,
+                )
+                self.draft_worker.init_hicache_draft_plan()
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
         if self.draft_worker is not None:
-            self.draft_worker.init_attention_backends()
+            with draft_dcp_context():
+                self.draft_worker.init_attention_backends()
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
-            self.draft_worker.init_cuda_graphs()
+            with draft_dcp_context():
+                self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
         # Load model weights.

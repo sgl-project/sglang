@@ -2673,6 +2673,27 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         _TP = old_tp_group
 
 
+@contextmanager
+def patch_decode_context_parallel_group(dcp_group: Optional[GroupCoordinator]):
+    """Patch the dcp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, which are TP-sharded
+    and never split the token dimension: they run with ``None``, the same state a
+    process without decode context parallelism is in. Unlike the tp patch this
+    nests, so an inner scope does not have to know whether an outer one is active.
+
+    Args:
+        dcp_group (Optional[GroupCoordinator]): the dcp group coordinator, or None
+    """
+    global _DCP
+    old_dcp_group = _DCP
+    _DCP = dcp_group
+    try:
+        yield
+    finally:
+        _DCP = old_dcp_group
+
+
 def get_world_size():
     """Return world size for the world group."""
     return get_world_group().world_size

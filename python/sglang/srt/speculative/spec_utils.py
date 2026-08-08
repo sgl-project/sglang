@@ -35,6 +35,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    patch_decode_context_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -674,6 +675,12 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
+        yield
+
+
+@contextmanager
+def draft_dcp_context():
+    with patch_decode_context_parallel_group(None):
         yield
 
 
