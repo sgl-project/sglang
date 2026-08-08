@@ -1726,6 +1726,16 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    if view.dllm_algorithm == "Gemma4Renoise":
+        backend = (
+            "torch_native"
+            if view.device == "cpu"
+            else ("ascend" if get_platform().is_npu else "triton")
+        )
+        if view.attention_backend != backend:
+            logger.warning("DiffusionGemma requires the %s attention backend", backend)
+            return {"attention_backend": backend}
+        return {}
     if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(

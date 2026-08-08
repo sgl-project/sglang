@@ -2868,6 +2868,12 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if error_msg := self.validate_dllm_request(req):
+            req.set_finish_with_abort(error_msg, status_code=HTTPStatus.BAD_REQUEST)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
@@ -3512,13 +3518,20 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                if self.dllm_config.first_done_first_out_mode:
-                    if not req.dllm_incomplete_ids:
+                if (
+                    self.dllm_config.first_done_first_out_mode
+                    and req.dllm_incomplete_ids
+                ):
+                    continue
+                if self.dllm_config.is_uniform:
+                    if req.is_dllm_prefill():
                         self.stash_chunked_request(req)
-                        self.req_to_token_pool.free(req)
-                    # Otherwise, keep req slot/KV for reuse.
+                    else:
+                        self._stash_completed_uniform_canvas(req)
                 else:
                     self.stash_chunked_request(req)
+                    if self.dllm_config.first_done_first_out_mode:
+                        self.req_to_token_pool.free(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -4769,7 +4782,7 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
-            and not self.dllm_manager.any_staging_reqs()
+            and self.dllm_manager.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
