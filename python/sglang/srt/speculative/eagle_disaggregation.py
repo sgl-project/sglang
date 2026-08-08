@@ -97,6 +97,10 @@ def build_eagle_disagg_draft_input(
     if batch.enable_overlap:
         spec_info.future_dsa_topk_indices_available = dsa_topk_indices is not None
         spec_info.future_indices = batch.req_pool_indices
+        # Staging fence: all H2D payload materialization is above, so only the
+        # enqueue-only publish/stash relay writes sit behind the fence (see
+        # FutureMap.run_staging_fence).
+        future_map.run_staging_fence()
         # Seed the relay buf with the known seq_lens; publish's chained record
         # keeps the in-flight forward's fence intact (see FutureMap.publish).
         future_map.publish(spec_info.future_indices, batch.seq_lens)
