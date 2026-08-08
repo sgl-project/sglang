@@ -43,7 +43,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -74,7 +73,19 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """Vectorized implementation compatible with CUDA graph capture."""
+    """Vectorized implementation compatible with CUDA graph capture.
+
+    Reference implementation only. It requires a 1-D ``seq_lens`` while the
+    paged call site passes a trailing dim of 1, so it is not reachable from
+    the serving path; ``fp8_paged_mqa_logits_torch_sm120`` is what the
+    dispatch hands out.
+
+    Positions at or beyond ``seq_lens[i]`` are filled with ``-inf``, same as
+    ``fp8_paged_mqa_logits_torch_sm120``. That is not a contract consumers may
+    rely on: the other producers of these logits allocate the output with
+    ``torch.empty`` and leave the tail beyond ``seq_lens`` undefined. Every
+    consumer has to bound itself by ``seq_lens``.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -120,10 +131,10 @@ def fp8_paged_mqa_logits_torch(
         cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
     positions = cache[arange_key].unsqueeze(0)
     valid_mask = positions < seq_lens.unsqueeze(1)
-    scores = scores.masked_fill(~valid_mask, 0.0)
+    scores = scores.masked_fill(~valid_mask, float("-inf"))
 
     if padded_seq_len < max_seq_len:
-        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
+        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=float("-inf"))
     else:
         scores = scores[:, :max_seq_len]
 
@@ -180,7 +191,21 @@ def fp8_paged_mqa_logits_torch_sm120(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
+    """CUDA-graph-compatible FP8 paged MQA logits (vectorized, no ``.item()``).
+
+    Nothing in the body is SM120-specific -- it dequantizes with ``Tensor.to``
+    and accumulates with ``bmm`` -- and it is the variant the torch backend
+    dispatches to on every architecture. Two things distinguish it from
+    ``fp8_paged_mqa_logits_torch``, and both are about the call site rather
+    than the hardware: it squeezes the trailing dim off ``seq_lens``, which
+    arrives 2-D from the paged indexer, and it walks
+    ``ceil(max_seq_len / block_size)`` pages instead of the full capture-time
+    page-table width.
+
+    Positions at or beyond ``seq_lens[i]`` are filled with ``-inf``. That is
+    not a contract consumers may rely on; see the note in
+    ``fp8_paged_mqa_logits_torch``.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -710,10 +735,11 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
-                fn = fp8_paged_mqa_logits_torch_sm120
-            else:
-                fn = fp8_paged_mqa_logits_torch
+            # Not an architecture choice: `fp8_paged_mqa_logits_torch` asserts
+            # on a 1-D `seq_lens`, and `_c4sl` below carries a trailing dim of
+            # 1 on this path. `fp8_paged_mqa_logits_torch_sm120` handles both
+            # and contains nothing SM120-specific.
+            fn = fp8_paged_mqa_logits_torch_sm120
         elif is_xpu():
             from sgl_kernel import fp8_paged_mqa_logits_triton
 
