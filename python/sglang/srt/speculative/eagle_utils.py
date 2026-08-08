@@ -335,6 +335,42 @@ def sgl_build_tree_kernel_triton(
     )
 
 
+def _top_k_normalize_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+):
+    """Rank-based top-k renormalization with native torch ops.
+
+    Mirrors the top-k cutoff in `top_k_top_p_min_p_sampling_from_probs_torch` so
+    the speculative verify path matches the non-speculative sampler.
+    """
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sort[
+        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+
+def _get_spec_renorm_fns():
+    """Return (top_k_renorm, top_p_renorm) for the current platform.
+
+    flashinfer's `renorm.cu` is not part of the ROCm sgl-kernel build (see
+    `sgl-kernel/setup_rocm.py`), so `top_k/top_p_renorm_prob` have no registered
+    torch op there. Fall back to the torch implementations that the
+    non-speculative sampler already uses on ROCm.
+    """
+    if _is_hip:
+        from sglang.srt.layers.sampler import top_p_normalize_probs_torch
+
+        return _top_k_normalize_probs_torch, top_p_normalize_probs_torch
+
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+    return top_k_renorm_prob, top_p_renorm_prob
+
+
 def verify_tree_greedy_triton(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -720,7 +756,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -735,17 +771,27 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+
+        # `speculative_sampling.cu` (tree_speculative_sampling_target_only) is not
+        # part of the ROCm sgl-kernel build, so the only distribution-preserving
+        # verifier available there is the Triton chain kernel. Fail loudly instead
+        # of silently degrading non-greedy requests to greedy verification, which
+        # breaks the losslessness guarantee of speculative decoding.
+        if _is_hip and not use_rejection_sampling:
+            raise NotImplementedError(
+                "Speculative decoding with non-greedy sampling (temperature/top_p/"
+                "top_k) requires --speculative-use-rejection-sampling on ROCm: the "
+                "tree_speculative_sampling_target_only kernel is CUDA-only. Without "
+                "it, verification would fall back to greedy and change the output "
+                "distribution."
+            )
+
+        top_k_renorm_prob, top_p_renorm_prob = _get_spec_renorm_fns()
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -798,11 +844,13 @@ def eagle_sample(
             device=device,
         )
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+        if use_rejection_sampling:
+            sampling_fn = chain_speculative_sampling_triton
+        else:
+            # Imported lazily: this op is absent from the ROCm sgl-kernel build.
+            from sgl_kernel import tree_speculative_sampling_target_only
+
+            sampling_fn = tree_speculative_sampling_target_only
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
