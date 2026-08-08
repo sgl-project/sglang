@@ -36,7 +36,13 @@ def _fake_group() -> SimpleNamespace:
     return SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
 
 
-def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
+def _make_receiver(
+    ps: ParallelState,
+    *,
+    is_multimodal: bool = False,
+    dist_init_addr: str | None = None,
+    mm_feature_transport: str = "cpu",
+) -> SchedulerRequestReceiver:
     group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
@@ -55,10 +61,10 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(
             enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
-            dist_init_addr=None,
-            mm_feature_transport="cpu",
+            dist_init_addr=dist_init_addr,
+            mm_feature_transport=mm_feature_transport,
         ),
-        model_config=SimpleNamespace(is_multimodal=False),
+        model_config=SimpleNamespace(is_multimodal=is_multimodal),
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
@@ -67,9 +73,9 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_mm_cpu_broadcast_is_limited_to_cpu_feature_transport(self):
-        receiver = _make_receiver(_make_ps(pp_size=1, tp_size=2))
-        receiver.model_config = SimpleNamespace(is_multimodal=True)
-        receiver.server_args = SimpleNamespace(
+        receiver = _make_receiver(
+            _make_ps(pp_size=1, tp_size=2),
+            is_multimodal=True,
             dist_init_addr="10.0.0.1:12345",
             mm_feature_transport="cuda_vmm",
         )
@@ -94,9 +100,9 @@ class TestPPCPRankOffsets(unittest.TestCase):
         pyobj_broadcast.assert_called_once()
 
     def test_mm_cpu_broadcast_is_used_for_multinode_cpu_transport(self):
-        receiver = _make_receiver(_make_ps(pp_size=1, tp_size=2))
-        receiver.model_config = SimpleNamespace(is_multimodal=True)
-        receiver.server_args = SimpleNamespace(
+        receiver = _make_receiver(
+            _make_ps(pp_size=1, tp_size=2),
+            is_multimodal=True,
             dist_init_addr="10.0.0.1:12345",
             mm_feature_transport="cpu",
         )

@@ -108,7 +108,7 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
         torch.testing.assert_close(received, expected)
 
     def test_precomputed_embeddings_are_broadcast_directly(self):
-        embeddings = torch.arange(300_000, dtype=torch.float16)
+        embeddings = torch.arange(600_000, dtype=torch.float16)
         req = _make_req(torch.empty(1))
         req.mm_inputs.mm_items[0].feature = None
         req.mm_inputs.mm_items[0].precomputed_embeddings = embeddings
