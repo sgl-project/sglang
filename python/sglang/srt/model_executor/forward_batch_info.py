@@ -1160,57 +1160,121 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
-        # batch_size * [3 * seq_len]
-        batch_size = self.seq_lens_cpu.shape[0]
-        mrope_positions_list = [[]] * batch_size
+        # mrope_positions shape: [3, total_seq_len]
+        # The first dimension corresponds to temporal, height and width positions.
+        seq_lens_cpu = self.seq_lens_cpu
+        batch_size = seq_lens_cpu.shape[0]
+        forward_mode = self.forward_mode
+        mm_inputs = batch.multimodal_inputs
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+
+        if forward_mode.is_decode():
+            seq_lens = self.seq_lens
+            seq_lens_int64 = seq_lens.to(torch.int64)
+
+            # Some multimodal models (e.g. image generation models) provide
+            # precomputed MRoPE positions. In this case, positions cannot be
+            # reconstructed only from mrope_position_delta and need the original
+            # per-request computation path.
+            has_precomputed_mrope = any(
+                mm is not None
+                and mm.mrope_positions is not None
+                and mm.mrope_positions.shape[1] >= seq_lens_cpu[i]
+                for i, mm in enumerate(mm_inputs)
+            )
+            use_vectorized_mrope = not has_precomputed_mrope
+            has_multimodal_input = any(mm is not None for mm in mm_inputs)
+
+            if rl_on_policy_target is not None or not has_multimodal_input:
+                # Text-only decode:
+                # The next token position is simply seq_len - 1.
+                positions_1d = seq_lens_int64 - 1
+                self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
+            else:
+                if use_vectorized_mrope:
+                    # Normal multimodal decode:
+                    # mrope position can be reconstructed by:
+                    # position = mrope_position_delta - 1 + seq_len
+                    # Compute all requests together to avoid per-request Python loops.
+                    deltas_list = [0] * batch_size
+                    for i, mm in enumerate(mm_inputs):
+                        deltas_list[i] = (
+                            mm.mrope_position_delta.item() if mm is not None else 0
+                        )
+                    deltas = torch.tensor(
+                        deltas_list, dtype=torch.int64, device=model_runner.device
+                    )
+                    positions_1d = (deltas - 1) + seq_lens_int64
+
+                    self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
+                else:
+                    # Fallback path for models with precomputed spatial MRoPE positions.
+                    # These positions cannot be derived from mrope_position_delta.
+                    mrope_positions_list = [None] * batch_size
+                    for batch_idx in range(batch_size):
+                        mm_input = mm_inputs[batch_idx]
+                        if mm_input is None:
+                            # text only
+                            mrope_positions = torch.full(
+                                (3, 1),
+                                seq_lens_cpu[batch_idx] - 1,
+                                dtype=torch.int64,
+                            )
+                        else:
+                            mrope_positions = self._expand_mrope_from_input(
+                                mm_input, seq_lens_cpu[batch_idx]
+                            )
+                        mrope_positions_list[batch_idx] = mrope_positions
+
+                    self.mrope_positions = torch.cat(
+                        mrope_positions_list,
+                        dim=1,
+                    ).to(
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                        non_blocking=True,
+                    )
+            return
+
+        if not forward_mode.is_extend(include_draft_extend_v2=True):
+            # Should not reach here: spec/draft_extend_v2 modes go through
+            # compute_spec_mrope_positions in init_new.
+            raise RuntimeError(
+                f"_compute_mrope_positions called with unsupported forward_mode: {forward_mode}"
+            )
+
+        # Optimize text-only branch with torch.arange
+        mrope_positions_list = [None] * batch_size
+        extend_lens = batch.extend_lens
+        prefix_lens = batch.prefix_lens
         for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
-                # 3 * N
-                if mm_input is None or rl_on_policy_target is not None:
-                    mrope_positions_list[batch_idx] = torch.full(
-                        (3, 1),
-                        self.seq_lens_cpu[batch_idx] - 1,
+            mm_input = mm_inputs[batch_idx]
+            extend_seq_len = extend_lens[batch_idx]
+            extend_prefix_len = prefix_lens[batch_idx]
+            if mm_input is None or rl_on_policy_target is not None:
+                # text only
+                mrope_positions = (
+                    torch.arange(
+                        extend_prefix_len,
+                        extend_prefix_len + extend_seq_len,
                         dtype=torch.int64,
                     )
-                else:
-                    mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens_cpu[batch_idx]
-                    )
-                    mrope_positions_list[batch_idx] = mrope_positions
-            elif self.forward_mode.is_extend(include_draft_extend_v2=True):
-                extend_seq_len, extend_prefix_len = (
-                    batch.extend_lens[batch_idx],
-                    batch.prefix_lens[batch_idx],
+                    .unsqueeze(0)
+                    .repeat(3, 1)
                 )
-                if mm_input is None or rl_on_policy_target is not None:
-                    # text only
-                    mrope_positions = torch.tensor(
-                        [
-                            [
-                                pos
-                                for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
-                            ]
-                        ]
-                        * 3
+            else:
+                mrope_positions = mm_input.mrope_positions[
+                    :,
+                    extend_prefix_len : extend_prefix_len + extend_seq_len,
+                ]
+                if mrope_positions.numel() == 0:
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, seq_lens_cpu[batch_idx]
                     )
-                else:
-                    mrope_positions = mm_input.mrope_positions[
-                        :,
-                        extend_prefix_len : extend_prefix_len + extend_seq_len,
-                    ]
-                    if mrope_positions.numel() == 0:
-                        mrope_positions = self._expand_mrope_from_input(
-                            mm_input, self.seq_lens_cpu[batch_idx]
-                        )
-                mrope_positions_list[batch_idx] = mrope_positions
+            mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
-            [pos for pos in mrope_positions_list],
+            mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
