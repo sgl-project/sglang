@@ -61,7 +61,7 @@ DATASET_FLUCTUATION = {
     "aime25": 2,
     "aime26": 2,
     "gpqa_diamond": 5,
-    "gsm8k": 2,
+    "gsm8k": 3,
 }
 
 MAX_RETRY_COUNT = 3
