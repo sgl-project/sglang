@@ -678,6 +678,16 @@ class TreeComponent(ABC):
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass
 
+    def reclaim_coexisting_host_values(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Reclaim host values whose device values remain resident."""
+        return
+
     def drive_host_eviction(
         self,
         num_tokens: int,

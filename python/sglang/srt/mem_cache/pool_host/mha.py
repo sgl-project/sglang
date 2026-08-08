@@ -71,6 +71,20 @@ class MHATokenToKVPoolHost(HostKVCache):
     device_pool: MHATokenToKVPool | None = None
     mtp_draft_device_pools: tuple[MHATokenToKVPool, ...] = ()
 
+    @classmethod
+    def get_size_per_token_for_device_pool(
+        cls,
+        device_pool: MHATokenToKVPool,
+        mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
+    ) -> int:
+        layer_num = device_pool.layer_num + len(mtp_draft_device_pools)
+        return (
+            (device_pool.head_dim + device_pool.v_head_dim)
+            * device_pool.head_num
+            * layer_num
+            * device_pool.store_dtype.itemsize
+        )
+
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
@@ -151,7 +165,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
-        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+        return self.get_size_per_token_for_device_pool(
+            self.device_pool, self.mtp_draft_device_pools
+        )
 
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2
@@ -1063,11 +1079,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         self.head_dim = self.device_pool.head_dim
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
         self.v_head_dim = self.device_pool.v_head_dim
-        return (
-            (self.head_dim + self.v_head_dim)
-            * self.head_num
-            * self.layer_num
-            * self.dtype.itemsize
+        return self.get_size_per_token_for_device_pool(
+            self.device_pool, self.mtp_draft_device_pools
         )
 
     def get_ksize_per_token(self):

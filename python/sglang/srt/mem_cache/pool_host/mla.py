@@ -52,6 +52,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
     mtp_draft_device_pools: tuple[MLATokenToKVPool, ...] = ()
 
+    @classmethod
+    def get_size_per_token_for_device_pool(
+        cls,
+        device_pool: MLATokenToKVPool,
+        override_kv_cache_dim: Optional[int] = None,
+        mtp_draft_device_pools: Sequence[MLATokenToKVPool] = (),
+    ) -> int:
+        layer_num = device_pool.layer_num
+        if device_pool.layer_shard_enabled:
+            shard_size = device_pool.layer_shard_size
+            layer_num = (layer_num + shard_size - 1) // shard_size
+        layer_num += len(mtp_draft_device_pools)
+        kv_cache_dim = override_kv_cache_dim or (
+            device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
+        )
+        return kv_cache_dim * device_pool.store_dtype.itemsize * layer_num
+
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
@@ -130,7 +147,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.kv_cache_dim = self.override_kv_cache_dim or (
             self.kv_lora_rank + self.qk_rope_head_dim
         )
-        return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+        return self.get_size_per_token_for_device_pool(
+            self.device_pool,
+            self.override_kv_cache_dim,
+            self.mtp_draft_device_pools,
+        )
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
