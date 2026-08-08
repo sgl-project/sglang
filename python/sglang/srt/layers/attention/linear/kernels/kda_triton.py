@@ -24,6 +24,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -63,7 +64,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            replayssm_d is not None
+            lower_bound is None
+            and replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
@@ -226,7 +228,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return chunk_kda(
             q=q,
             k=k,

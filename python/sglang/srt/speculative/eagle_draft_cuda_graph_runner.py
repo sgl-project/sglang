@@ -275,6 +275,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+        # Metadata glue graph is intentionally not used for the EAGLE draft
+        # runner.  FlashInferMLAMultiStepDraftBackend.init_forward_metadata_out_graph
+        # re-plans the per-step CUDA-graph wrappers that were already captured
+        # (decode_cuda_graph_metadata dict entries).  Capturing that re-plan
+        # into a secondary glue graph would corrupt the wrapper's internal GPU
+        # state on replay.  The main decode runner (DecodeCudaGraphRunner) is
+        # where the glue graph saves latency; draft metadata is cheaper and
+        # already amortised over speculative_num_steps.
+        self._metadata_glue = None
+
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
 
@@ -646,7 +656,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        # forward_batch.batch_size was overwritten to bs above when padding.
+        # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
+        # each speculative step).  The glue-graph optimisation is not applied
+        # here — see __init__ comment for why.
         self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs

@@ -247,6 +247,14 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1s
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
+  // PDL: this rank's all-reduce output (`result`) is fully written here; the
+  // trailing barrier only guards peer input-buffer reuse and never touches
+  // `result`. Signal now so a PDL-dependent consumer (e.g. the following
+  // fused_add_rmsnorm) can overlap its prologue with the barrier drain. No-op
+  // unless a dependent kernel is waiting; scheduling only, bitwise-identical.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
 

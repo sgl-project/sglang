@@ -27,6 +27,7 @@ from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
+from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -2919,6 +2920,86 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         self.assertEqual(result.normal_text, "")
 
+    def test_streaming_tool_call(self):
+        """Test streaming incremental parsing of a tool call."""
+        chunks = [
+            "<tool_call>get_weather\n",
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_tool_call_without_arguments(self):
+        """Test streaming incremental parsing of a tool call with no arguments."""
+        chunks = [
+            "<tool_call>get_weather\n",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
+    def test_streaming_tool_call_without_arguments_single_chunk(self):
+        """Test no-argument tool call when name and end token arrive together."""
+        chunks = ["<tool_call>get_weather\n</tool_call>"]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
         chunks = [
@@ -3575,6 +3656,133 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+
+class TestLing3Detector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "date": {"type": "string"},
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get current date",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+        self.detector = Ling3Detector()
+
+    def _collect_streaming_tool_calls(self, chunks):
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                while len(tool_calls) <= tool_call_chunk.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                tc = tool_calls[tool_call_chunk.tool_index]
+                if tool_call_chunk.name:
+                    tc["name"] = tool_call_chunk.name
+                if tool_call_chunk.parameters:
+                    tc["parameters"] += tool_call_chunk.parameters
+        return tool_calls
+
+    def test_detect_and_parse_newline_tool_call(self):
+        text = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_detect_and_parse_compact_tool_call(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+
+    def test_detect_and_parse_empty_args(self):
+        result = self.detector.detect_and_parse(
+            "<tool_call>get_date</tool_call>", self.tools
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_date")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+    def test_streaming_empty_args_emits_single_empty_object(self):
+        tool_calls = self._collect_streaming_tool_calls(
+            ["<tool_call>get_date", "</tool_call>"]
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_date")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
+    def test_streaming_empty_args_single_chunk(self):
+        tool_calls = self._collect_streaming_tool_calls(
+            ["<tool_call>get_date</tool_call>"]
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_date")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
+    def test_streaming_compact_tool_call(self):
+        tool_calls = self._collect_streaming_tool_calls(
+            [
+                "<tool_call>get_weather",
+                "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+                "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+                "</tool_call>",
+            ]
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
+        )
+
+    def test_streaming_newline_tool_call(self):
+        tool_calls = self._collect_streaming_tool_calls(
+            [
+                "<tool_call>get_weather\n",
+                "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+                "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+                "</tool_call>",
+            ]
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
 
 
 class TestJsonArrayParser(unittest.TestCase):

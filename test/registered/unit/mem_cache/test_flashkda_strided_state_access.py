@@ -178,11 +178,12 @@ class TestFlashKDAStridedStateAccess(unittest.TestCase):
         conv_before = [cv.clone() for cv in conv_views]
 
         cache_indices = torch.tensor([5, 2], dtype=torch.int32)
-        out = self._run_extend(ssm_states, cache_indices)
+        out, intermediate_states = self._run_extend(ssm_states, cache_indices)
 
         # Routing: the fused path ran exactly once (a silent re-route to the
         # triton fallback would make every assertion below vacuous).
         self.assertEqual(self.fake.calls, 1)
+        self.assertIsNone(intermediate_states)
         self.assertEqual(tuple(out.shape), (1, 2 * _SEQ_LEN, _H, _V))
 
         # Gather: the external kernel must receive a CONTIGUOUS copy whose rows

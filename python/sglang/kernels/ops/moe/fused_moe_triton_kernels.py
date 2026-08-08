@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -383,6 +384,9 @@ def fused_moe_kernel(
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    FUSE_SWIGLU: tl.constexpr = False,
+    USE_GDC: tl.constexpr = False,
+    GDC_EARLY: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -411,6 +415,21 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    # PDL: overlap this kernel's launch/prologue with the tail of the
+    # producer kernel; all dependent loads (num_tokens_post_padded,
+    # sorted_token_ids, expert_ids, A/C) happen after the wait.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        # Early trigger (decode-sized grids only): griddepcontrol.wait always
+        # fences on FULL upstream completion, so triggering here is safe for
+        # every consumer and lets PDL-launched dependents (activation /
+        # down-GEMM / combine) run their prologue + independent loads under
+        # this kernel's whole body instead of only its tail. Gated off for
+        # prefill-sized grids, where an early-launched dependent would steal
+        # SMs from a machine-filling producer.
+        if GDC_EARLY:
+            tl.extra.cuda.gdc_launch_dependents()
+
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -442,6 +461,12 @@ def fused_moe_kernel(
     off_experts = off_experts_i32.to(tl.int64)
 
     if filter_expert and off_experts == -1:
+        if FUSE_SWIGLU:
+            # C is the half-width post-activation buffer here. Rows owned by
+            # filtered experts are never read (the down-GEMM CTA for this
+            # block early-exits before loading A), and an N-wide zero store
+            # would run past the row into a neighboring token's data.
+            return
         if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
             # Write zeros only when this kernel owns the full output; the experimental LoRA
             # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
@@ -608,7 +633,65 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    if FUSE_ADD_TO_OUTPUT:
+    if FUSE_SWIGLU:
+        # W13 rows were interleaved at load time, so gate/up of the same
+        # intermediate channel sit in adjacent (even, odd) columns of this
+        # tile; silu(gate) * up is applied in-register and only the
+        # half-width activation is stored, eliminating intermediate_cache1
+        # and the standalone activation kernel.
+        #
+        # Bit-parity with that kernel (sgl_kernel silu_and_mul, built with
+        # -use_fast_math): `accumulator` is already compute_type, matching
+        # the reference's bf16 store to cache1 + reload; the inline asm
+        # replicates __expf (mul + ex2.approx.ftz), the fast-math division
+        # (div.approx.ftz), and the product (mul.ftz.f32) instruction for
+        # instruction. flashinfer's act_and_mul_kernel instantiates the
+        # activation at float, so silu stays f32 and the multiply runs in
+        # f32 with a single final rounding to bf16 -- rounding silu to bf16
+        # before the multiply diverges on ~25% of inputs (double rounding).
+        acc_pairs = tl.reshape(accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
+        gate_b, up_b = tl.split(acc_pairs)
+        gate_f = gate_b.to(tl.float32)
+        # __expf(-x): x * (-log2(e)), then ex2.approx (0fBFB8AA3B = -log2(e);
+        # folding the negation into the constant flips the sign exactly).
+        exp_neg = tl.inline_asm_elementwise(
+            "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
+            "=f,f",
+            [gate_f],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        silu_f = tl.inline_asm_elementwise(
+            "div.approx.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            [gate_f, 1.0 + exp_neg],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        out_act = tl.inline_asm_elementwise(
+            "mul.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            [silu_f, up_b.to(tl.float32)],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        ).to(compute_type)
+        offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
+        if c_sorted:
+            c_ptrs = (
+                c_ptr
+                + stride_cm * offs_token_id[:, None]
+                + stride_cn * offs_half[None, :]
+            )
+        else:
+            c_ptrs = (
+                c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_half[None, :]
+            )
+        c_mask = token_mask[:, None] & (offs_half[None, :] < N // 2)
+        tl.store(c_ptrs, out_act, mask=c_mask)
+    elif FUSE_ADD_TO_OUTPUT:
         # Accumulate into existing output with per-token mask.
         offs_token_out = offs_token // ROUTER_TOPK
         add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
@@ -648,6 +731,12 @@ def fused_moe_kernel(
             )
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
+
+    # PDL: this block's output is fully written; allow dependent kernels
+    # (activation / down-GEMM / sum) to start their prologue. Early-return
+    # blocks above trigger implicitly on exit.
+    if USE_GDC and not GDC_EARLY:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # -----------------------------------------------------------------------------
@@ -745,9 +834,19 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    fuse_swiglu: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    if fuse_swiglu:
+        # The epilogue assumes an interleaved-gate/up bf16 up-GEMM with a
+        # plain half-width store; every other output flavor is out of scope.
+        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        assert bias is None
+        assert not mul_routed_weight
+        assert not (fuse_add_to_output or mask_output or fuse_sum_all_reduce)
+        assert compute_type == tl.bfloat16
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -910,6 +1009,15 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
+        pdl_kwargs = (
+            # GDC_EARLY: decode-sized grids trigger dependents right after
+            # their own wait (full-body overlap for PDL consumers); prefill
+            # keeps the end trigger so early-launched dependents don't steal
+            # SMs from a machine-filling GEMM.
+            {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
+            if is_arch_support_pdl()
+            else {}
+        )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -960,6 +1068,8 @@ def invoke_fused_moe_kernel(
             LORA_PRESERVE_BASE=lora_preserve_base,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            FUSE_SWIGLU=fuse_swiglu,
+            **pdl_kwargs,
             **config,
         )
 
@@ -1106,6 +1216,7 @@ def _moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -1123,6 +1234,15 @@ def _moe_sum_reduce_kernel(
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+
+    if USE_GDC:
+        # PDL: everything read here is the producer's (down-GEMM) output,
+        # which already triggers dependents right after its store. Trigger our
+        # own dependents immediately: gdc_wait fences on full completion, so
+        # this only lets the next PDL kernel (the fused AR+norm) overlap its
+        # prologue with this kernel's body.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
@@ -1161,6 +1281,7 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
@@ -1174,6 +1295,7 @@ def moe_sum_reduce_triton(
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return
 

@@ -173,6 +173,10 @@ class DeepseekMLARocmForwardMixin:
         k_input,
         forward_batch,
         zero_allocator,
+        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
+        # gate to inner_state, so every *_core dispatched from forward_core
+        # takes it as a trailing arg. None everywhere else.
+        gate=None,
     ):
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -224,6 +228,8 @@ class DeepseekMLARocmForwardMixin:
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
 
         return output

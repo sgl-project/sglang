@@ -1532,6 +1532,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 disable_overlap_schedule=False,
                 page_size=None,
                 linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -1552,6 +1553,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # auto + overlap wanted + extra-buffer support -> extra_buffer
         self.assertEqual(
             _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("BailingMoeV3ForCausalLM")),
             {
                 "uses_mamba_radix_cache": True,
                 "mamba_radix_cache_strategy": "extra_buffer",
@@ -1617,6 +1625,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertFalse(
             supports_mamba_cache_extra_buffer(
                 SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+            )
+        )
+        self.assertFalse(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(
+                    linear_attn_backend="triton",
+                    linear_attn_prefill_backend="flashkda",
+                ),
+                "BailingMoeV3ForCausalLM",
             )
         )
 

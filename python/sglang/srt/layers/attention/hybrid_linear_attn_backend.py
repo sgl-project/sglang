@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
@@ -316,7 +317,12 @@ class MambaAttnBackendBase(AttentionBackend):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        server_args = get_server_args()
+        state_chunk_size = getattr(
+            server_args.get_model_config().hf_config,
+            "mamba_chunk_size",
+            FLA_CHUNK_SIZE,
+        )
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -326,9 +332,9 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
+            num_h_states = extend_seq_lens // state_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // state_chunk_size + 1
 
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
@@ -338,17 +344,16 @@ class MambaAttnBackendBase(AttentionBackend):
         offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
-        is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
+        is_aligned = (lens_masked % state_chunk_size) == 0
 
         # Aligned: last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Unaligned: intermediate state from h.
-        # TODO: handle mamba_cache_chunk_size % page size != 0
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
+            lens_masked[not_aligned] // state_chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
@@ -979,6 +984,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.full_attn_backend.supports_ragged_verify_graph
             and self.linear_attn_backend.supports_ragged_verify_graph
         )
+
+    @property
+    def kv_cache_dtype(self):
+        # trtllm_mla / dsa fuse-rope checks read this off the top-level backend
+        # via get_attn_backend().kv_cache_dtype. Delegate to the full-attn
+        # sub-backend so hybrid models report the right dtype; it defaults to
+        # None on AttentionBackend, so when the sub-backend doesn't set it the
+        # fuse-rope check just evaluates False, matching the non-hybrid
+        # non-fp8 path.
+        return self.full_attn_backend.kv_cache_dtype
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None

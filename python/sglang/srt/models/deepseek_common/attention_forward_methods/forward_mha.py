@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -366,9 +366,15 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
+        # gate to inner_state, so every *_core dispatched from forward_core
+        # takes it as a trailing arg. None everywhere else.
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -396,6 +402,10 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
+        # gate to inner_state, so every *_core dispatched from forward_core
+        # takes it as a trailing arg. None everywhere else.
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
@@ -423,6 +433,8 @@ class DeepseekMHAForwardMixin:
             )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -444,6 +456,10 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
+        # gate to inner_state, so every *_core dispatched from forward_core
+        # takes it as a trailing arg. None everywhere else.
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
@@ -454,7 +470,7 @@ class DeepseekMHAForwardMixin:
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        return self.forward_normal_core(q, k, v, forward_batch)
+        return self.forward_normal_core(q, k, v, forward_batch, gate)
 
     def _chunked_prefix_attn_mha(
         self: DeepseekV2AttentionMLA,

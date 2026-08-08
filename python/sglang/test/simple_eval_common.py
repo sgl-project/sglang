@@ -113,6 +113,9 @@ class ChatCompletionSampler(SamplerBase):
         self.stop = stop
         self.image_format = "url"
         self._completion_tokens: list[int] = []
+        # finish_reason per completed request ("stop" | "length" | ...);
+        # run_eval derives metrics["stop_rate"] from this.
+        self._finish_reasons: list[str] = []
         self.record_meta_info = record_meta_info
         self._meta_infos: List[Dict[str, Any]] = []
         print(
@@ -167,6 +170,8 @@ class ChatCompletionSampler(SamplerBase):
                         self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
+                if response.choices[0].finish_reason is not None:
+                    self._finish_reasons.append(response.choices[0].finish_reason)
                 return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
@@ -211,6 +216,9 @@ class CompletionSampler(SamplerBase):
         self.max_tokens = max_tokens
         self.stop = stop
         self._completion_tokens: list[int] = []
+        # finish_reason per completed request ("stop" | "length" | ...);
+        # run_eval derives metrics["stop_rate"] from this.
+        self._finish_reasons: list[str] = []
         print(
             f"CompletionSampler initialized with {self.model=} {self.temperature=} {self.max_tokens=} {self.stop=}"
         )
@@ -238,6 +246,8 @@ class CompletionSampler(SamplerBase):
                 )
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
+                if response.choices[0].finish_reason is not None:
+                    self._finish_reasons.append(response.choices[0].finish_reason)
                 return response.choices[0].text or ""
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)

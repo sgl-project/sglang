@@ -348,6 +348,7 @@ class Envs:
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
@@ -938,6 +939,10 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
+    # into a small CUDA graph, collapsing its host dispatch cost to one launch.
+    # Experimental; auto-falls back to eager if the backend's prep is not capturable.
+    SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
 
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
@@ -1104,6 +1109,12 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+
+    # ====================================================================
+    # Linear attention (KDA)
+    # Fuse KDA conv1d + gating-delta-rule into one kernel on the MTP
+    # target-verify chain path (speculative_eagle_topk == 1). Experimental.
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
 
     # ====================================================================
     # DeepSeek V4
