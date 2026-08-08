@@ -476,8 +476,9 @@ class GlmImageAR(PipelineStage):
         height: int,
         width: int,
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
-        device = get_local_torch_device()
+        device = device or get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         input_ids = []
