@@ -93,10 +93,7 @@ def validate_alphamoe_runner_contract(
         raise ValueError(
             f"flashinfer_alphamoe top_k={top_k} exceeds experts={num_experts}"
         )
-    if (
-        top_k != ALPHAMOE_VALIDATED_TOP_K
-        or num_experts != ALPHAMOE_VALIDATED_EXPERTS
-    ):
+    if top_k != ALPHAMOE_VALIDATED_TOP_K or num_experts != ALPHAMOE_VALIDATED_EXPERTS:
         raise ValueError(
             "flashinfer_alphamoe is currently admitted only for the validated "
             "Qwen3-Next TP4 routing geometry: "
