@@ -175,6 +175,9 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
+        # Debug tooling UTs (dump comparator, source patcher). Not worth a
+        # per-commit slot: breakage there is fine to notice once a week.
+        "weekly-test-cpu",
     ],
     HWBackend.CUDA: [
         "stress",
