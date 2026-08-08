@@ -30,7 +30,7 @@ SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software s
 
 ### Apple MPS Support
 
-SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, all Triton kernels are replaced with PyTorch-native fallbacks on MPS. Norm operations can be optionally accelerated with MLX fused Metal kernels (`SGLANG_USE_MLX=1`). See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, Triton kernels are replaced with PyTorch-native fallbacks on MPS. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ## Getting Started
 

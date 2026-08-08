@@ -8,6 +8,7 @@ implementations replace the Triton kernels
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -69,20 +70,16 @@ def norm_infer_native(
     out: Optional[Tensor] = None,
 ) -> Tensor:
     """Native fallback for norm_infer (layer norm / rms norm inference)."""
-    orig_dtype = x.dtype
-    x = x.contiguous().float()
+    normalized_shape = (x.shape[-1],)
     if is_rms_norm:
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x_hat = x * torch.rsqrt(variance + eps)
+        result = F.rms_norm(x, normalized_shape, weight, eps)
+        if bias is not None:
+            result = result + bias
     else:
-        mean = x.mean(dim=-1, keepdim=True)
-        variance = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-        x_hat = (x - mean) * torch.rsqrt(variance + eps)
-    if weight is not None:
-        x_hat = x_hat * weight.float()
-    if bias is not None:
-        x_hat = x_hat + bias.float()
-    result = x_hat.to(orig_dtype)
+        result = F.layer_norm(x, normalized_shape, weight, bias, eps)
+    # Match the original fallback and Triton kernel contract even when a
+    # higher-precision weight or bias promotes PyTorch's intermediate result.
+    result = result.to(x.dtype)
     if out is not None:
         out.copy_(result)
         return out
@@ -93,12 +90,7 @@ def triton_one_pass_rms_norm_native(
     x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
     """Native fallback for triton_one_pass_rms_norm."""
-    shape = x.shape
-    orig_dtype = x.dtype
-    x = x.contiguous().float()
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    x_hat = x * torch.rsqrt(variance + eps)
-    return (x_hat * w.float()).to(orig_dtype).view(shape)
+    return F.rms_norm(x, (x.shape[-1],), w, eps)
 
 
 def rms_norm_fn_native(
@@ -130,13 +122,13 @@ def rms_norm_fn_native(
         residual_out_val = x.to(torch.float32 if residual_in_fp32 else orig_dtype)
     else:
         residual_out_val = None
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    x_hat = x * torch.rsqrt(variance + eps)
     if weight is not None:
         w = weight.float()
         if zero_centered_weight:
             w = w + 1.0
-        x_hat = x_hat * w
+    else:
+        w = None
+    x_hat = F.rms_norm(x, (x.shape[-1],), w, eps)
     if bias is not None:
         x_hat = x_hat + bias.float()
     final_dtype = out_dtype if out_dtype is not None else orig_dtype

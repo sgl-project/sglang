@@ -49,6 +49,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -95,7 +96,6 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -3472,6 +3472,11 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+
+        # Reject an explicitly enabled but incompatible hardware runtime before
+        # model path resolution, downloads, or the dummy-model short circuit.
+        self._handle_hardware_runtime_validation()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -4174,6 +4179,13 @@ class ServerArgs:
                     "torch_native" if is_host_cpu_arm64() else "intel_amx"
                 )
             self.sampling_backend = "pytorch"
+
+    def _handle_hardware_runtime_validation(self):
+        # This is intentionally independent of self.device: setting
+        # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
+        # the environment cannot honor that request. With the flag unset,
+        # use_mlx() remains lazy and does not import MLX.
+        use_mlx()
 
     def _handle_npu_backends(self):
         if self.device == "npu":
