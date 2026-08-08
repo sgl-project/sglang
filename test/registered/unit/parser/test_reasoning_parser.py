@@ -265,6 +265,31 @@ class TestInklingDetector(CustomTestCase):
             content += detector.parse_streaming_increment(char).normal_text
         self.assertEqual(content, source)
 
+    def test_tool_header_without_opener_is_not_leaked_as_content(self):
+        """Bug regression: when a turn's first block is a tool call and the
+        <|message_model|> opener came from the prompt rather than the model, the
+        header ran with no open block and was routed to visible content, so the
+        caller got a stray assistant message holding just the tool name
+        alongside the parsed call."""
+        source = (
+            "weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        framed = f"<|message_model|>{source}"
+
+        detector = InklingDetector()
+        self.assertEqual(detector.detect_and_parse(source).normal_text, framed)
+
+        for chunk_size in (1, 7):
+            detector = InklingDetector()
+            content = ""
+            for start in range(0, len(source), chunk_size):
+                content += detector.parse_streaming_increment(
+                    source[start : start + chunk_size]
+                ).normal_text
+            content += detector.finish().normal_text
+            self.assertEqual(content, framed, msg=f"chunk_size={chunk_size}")
+
     def test_raw_text_tool_framing_is_preserved_for_the_tool_parser(self):
         """The headerless <|content_invoke_tool_text|> block must survive into
         content so the tool-call detector can surface it, rather than being
