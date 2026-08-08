@@ -168,6 +168,63 @@ class TestQwen3Detector(CustomTestCase):
 
 
 class TestInklingDetector(CustomTestCase):
+    def test_non_stream_preserves_repeated_and_interleaved_block_boundaries(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_thinking|>think-1<|end_message|>"
+            "<|message_model|><|content_text|>text-1<|end_message|>"
+            "<|message_model|><|content_thinking|>think-2<|end_message|>"
+            "<|message_model|><|content_text|>text-2<|end_message|>"
+            "<|content_model_end_sampling|>"
+        )
+
+        self.assertEqual(
+            detector.detect_and_parse_block_sequence(source),
+            [
+                ("reasoning", "think-1"),
+                ("text", "text-1"),
+                ("reasoning", "think-2"),
+                ("text", "text-2"),
+            ],
+        )
+        flattened = detector.detect_and_parse(source)
+        self.assertEqual(flattened.reasoning_text, "think-1think-2")
+        self.assertEqual(flattened.normal_text, "text-1text-2")
+
+    def test_non_stream_preserves_adjacent_and_empty_text_blocks(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_text|>first<|end_message|>"
+            "<|message_model|><|content_text|><|end_message|>"
+            "<|message_model|><|content_text|>third<|end_message|>"
+            "<|content_model_end_sampling|>"
+        )
+
+        self.assertEqual(
+            detector.detect_and_parse_block_sequence(source),
+            [("text", "first"), ("text", ""), ("text", "third")],
+        )
+
+    def test_non_stream_marks_tool_and_unframed_regions_not_lossless(self):
+        detector = InklingDetector()
+        source = (
+            "unframed"
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{}}<|end_message|>'
+        )
+
+        self.assertEqual(
+            detector.detect_and_parse_block_sequence(source),
+            [
+                ("raw", "unframed"),
+                (
+                    "tool",
+                    "<|message_model|>weather<|content_invoke_tool_json|>"
+                    '{"name":"weather","args":{}}<|end_message|>',
+                ),
+            ],
+        )
+
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
         detector = InklingDetector()
         source = (

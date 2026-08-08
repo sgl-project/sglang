@@ -2221,6 +2221,52 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(msg.content, "")
         self.assertEqual(msg.reasoning_content, "42")
 
+    def test_build_chat_response_inkling_preserves_ordered_blocks(self):
+        self.tm.server_args.reasoning_parser = "inkling"
+        self.chat.reasoning_parser = "inkling"
+
+        req = ChatCompletionRequest(
+            model="thinkingmachines/Inkling-Small-NVFP4",
+            messages=[{"role": "user", "content": "Hi?"}],
+            separate_reasoning=True,
+            return_meta_info=True,
+        )
+        ret_item = {
+            "text": (
+                "<|message_model|><|content_thinking|>think-1<|end_message|>"
+                "<|message_model|><|content_text|>answer-1<|end_message|>"
+                "<|message_model|><|content_thinking|>think-2<|end_message|>"
+                "<|message_model|><|content_text|>answer-2<|end_message|>"
+                "<|content_model_end_sampling|>"
+            ),
+            "meta_info": {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "weight_version": "default",
+                "finish_reason": {"type": "stop", "matched": None},
+            },
+            "index": 0,
+        }
+
+        response = self.chat._build_chat_response(req, [ret_item], created=0)
+        msg = response.choices[0].message
+        self.assertEqual(msg.reasoning_content, "think-1think-2")
+        self.assertEqual(msg.content, "answer-1answer-2")
+        self.assertEqual(
+            [part.model_dump() for part in msg.content_blocks],
+            [
+                {"type": "thinking", "thinking": None, "text": "think-1"},
+                {"type": "text", "text": "answer-1"},
+                {"type": "thinking", "thinking": None, "text": "think-2"},
+                {"type": "text", "text": "answer-2"},
+            ],
+        )
+
+        req.return_meta_info = False
+        compatible = self.chat._build_chat_response(req, [ret_item], created=0)
+        self.assertIsNone(compatible.choices[0].message.content_blocks)
+
     # --- poolside_v1 (Laguna-XS.2) regression tests ---
 
     def test_poolside_v1_enable_thinking_dispatch(self):

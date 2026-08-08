@@ -773,6 +773,98 @@ class InklingDetector(BaseReasoningFormatDetector):
         self._pending_reasoning = ""
         return ret
 
+    def detect_and_parse_block_sequence(self, text: str) -> list[tuple[str, str]]:
+        """Return Inkling's ordered model-block sequence without flattening.
+
+        ``reasoning_content`` and ``content`` cannot distinguish one text block
+        from several adjacent text blocks, nor can they preserve interleaving
+        such as thinking -> text -> thinking.  This lossless side channel keeps
+        canonical thinking/text boundaries while leaving the existing flattened
+        parser result unchanged for OpenAI-compatible clients.
+
+        ``tool`` and ``raw`` entries make incomplete coverage explicit.  The
+        serving layer must not advertise ``content_blocks`` when either appears:
+        native tool calls need their own ordered representation, and unframed
+        text cannot be re-rendered with the original Inkling boundaries.
+        """
+        blocks: list[tuple[str, str]] = []
+        kind: str | None = None
+        parts: list[str] = []
+        pending_header = ""
+        pos = 0
+
+        def finish_block() -> None:
+            nonlocal kind, parts
+            if kind in ("reasoning", "text", "tool"):
+                blocks.append((kind, "".join(parts)))
+            kind = None
+            parts = []
+
+        def append_raw(value: str) -> None:
+            if not value:
+                return
+            if blocks and blocks[-1][0] == "raw":
+                blocks[-1] = ("raw", blocks[-1][1] + value)
+            else:
+                blocks.append(("raw", value))
+
+        for match in _INKLING_CONTROL_RE.finditer(text):
+            fragment = text[pos : match.start()]
+            token = match.group(0)
+            pos = match.end()
+
+            if kind in ("reasoning", "text", "tool"):
+                parts.append(fragment)
+            elif kind == "header":
+                pending_header += fragment
+            else:
+                append_raw(fragment)
+
+            if token == MESSAGE_MODEL:
+                if kind in (None, "header"):
+                    kind = "header"
+                    parts = []
+                    pending_header = ""
+                else:
+                    # A role token inside an open block is literal payload.
+                    parts.append(token)
+            elif token in (CONTENT_INVOKE_TOOL_JSON, CONTENT_INVOKE_TOOL_TEXT):
+                if kind == "header":
+                    parts = [MESSAGE_MODEL, pending_header, token]
+                else:
+                    finish_block()
+                    parts = [token]
+                kind = "tool"
+                pending_header = ""
+            elif kind == "tool":
+                parts.append(token)
+                if token in _INKLING_END_TOKENS:
+                    finish_block()
+            elif token in _INKLING_CONTENT_KINDS:
+                finish_block()
+                kind = "reasoning" if token == CONTENT_THINKING else "text"
+                parts = []
+                pending_header = ""
+            elif token in _INKLING_END_TOKENS:
+                finish_block()
+                pending_header = ""
+            elif kind in ("reasoning", "text"):
+                parts.append(token)
+            else:
+                # Unknown control syntax is intentionally not declared lossless.
+                append_raw(token)
+
+        tail = text[pos:]
+        if kind in ("reasoning", "text", "tool"):
+            parts.append(tail)
+            finish_block()
+        elif kind == "header":
+            append_raw(MESSAGE_MODEL + pending_header + tail)
+        else:
+            append_raw(tail)
+
+        return blocks
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         text = self._buffer + new_text
         partial_len = self._partial_control_length(text)

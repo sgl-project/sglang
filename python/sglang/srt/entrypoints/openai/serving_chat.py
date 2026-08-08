@@ -1498,6 +1498,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
+            content_blocks = None
             if self.reasoning_parser and request.separate_reasoning:
                 force_reasoning = (
                     self.template_manager.force_reasoning
@@ -1511,6 +1512,23 @@ class OpenAIServingChat(OpenAIServingBase):
                         request=request,
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
+                    if self.reasoning_parser == "inkling" and request.return_meta_info:
+                        parsed_blocks = parser.parse_non_stream_blocks(text)
+                        if all(
+                            block["type"] in ("reasoning", "text")
+                            for block in parsed_blocks
+                        ):
+                            content_blocks = [
+                                {
+                                    "type": (
+                                        "thinking"
+                                        if block["type"] == "reasoning"
+                                        else "text"
+                                    ),
+                                    "text": block["text"],
+                                }
+                                for block in parsed_blocks
+                            ]
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
@@ -1527,6 +1545,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tools
                 and self.tool_call_parser
             ):
+                # The ordered side channel currently covers reasoning/text
+                # blocks only. Do not claim losslessness when native tool-call
+                # parsing may remove or reorder invocation blocks.
+                content_blocks = None
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
@@ -1558,6 +1580,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     content=text if text else "",
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
+                    content_blocks=content_blocks,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
