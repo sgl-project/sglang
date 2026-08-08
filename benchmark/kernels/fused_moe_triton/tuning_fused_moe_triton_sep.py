@@ -312,79 +312,130 @@ def benchmark_config(
             moe_inputs[k].expert_ids.copy_(expert_ids_)
             moe_inputs[k].num_tokens_post_padded.copy_(num_tokens_post_padded_)
 
-    def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-        )
-        moe_runner_config = MoeRunnerConfig(
-            inplace=True,
-        )
-        apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
-        kernel0 = KernelWrapper(
-            A=hidden_states,
-            B=w1,
-            bias=None,
-            C=intermediate_cache1,
-            A_scale=a1_scale,
-            B_scale=w1_scale,
-            B_zp=None,
-            topk_weights=topk_output_.topk_weights,
-            moe_inputs=moe_inputs,
-            mul_routed_weight=apply_router_weight_on_input,
-            top_k=topk,
-            config=config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=False,
-            block_shape=block_shape,
-            b_use_tma=moe_use_tma,
-            c_sorted=moe_use_tma,
-            filter_expert=False,
-            use_cuda_graph=use_cuda_graph,
-            inner_iter=inner_iter,
-        )
-        kernel1 = KernelWrapper(
-            A=intermediate_cache2,
-            B=w2,
-            bias=None,
-            C=intermediate_cache3,
-            A_scale=a2_scale,
-            B_scale=w2_scale,
-            B_zp=None,
-            topk_weights=topk_output_.topk_weights,
-            moe_inputs=moe_inputs,
-            mul_routed_weight=not apply_router_weight_on_input,
-            top_k=1,
-            config=config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=False,
-            block_shape=block_shape,
-            a_use_tma=moe_use_tma,
-            b_use_tma=moe_use_tma,
-            filter_expert=False,
-            use_cuda_graph=use_cuda_graph,
-            inner_iter=inner_iter,
-        )
-        return kernel0, kernel1
+    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    moe_runner_config = MoeRunnerConfig(
+        inplace=True,
+    )
+    apply_router_weight_on_input = moe_runner_config.apply_router_weight_on_input
 
     use_cuda_graph = True if not ncu_enable else False
 
-    kernel0, kernel1 = get_kernel_wrapper(False, inner_iter, use_cuda_graph)
-    kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, inner_iter, use_cuda_graph)
+    # We only need to time 4 kernels per config:
+    #   kernel0 (up):    no-TMA  vs  TMA
+    #   kernel1 (down):  no-TMA  vs  TMA
+    # c_sorted for kernel0 follows down_use_tma so the output layout matches
+    # what down_moe_use_tma expects at runtime.
+    kernel0 = KernelWrapper(
+        A=hidden_states,
+        B=w1,
+        bias=None,
+        C=intermediate_cache1,
+        A_scale=a1_scale,
+        B_scale=w1_scale,
+        B_zp=None,
+        topk_weights=topk_output_.topk_weights,
+        moe_inputs=moe_inputs,
+        mul_routed_weight=apply_router_weight_on_input,
+        top_k=topk,
+        config=config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=False,
+        block_shape=block_shape,
+        b_use_tma=False,
+        c_sorted=False,
+        filter_expert=False,
+        use_cuda_graph=use_cuda_graph,
+        inner_iter=inner_iter,
+    )
+    kernel0_tma = KernelWrapper(
+        A=hidden_states,
+        B=w1,
+        bias=None,
+        C=intermediate_cache1,
+        A_scale=a1_scale,
+        B_scale=w1_scale,
+        B_zp=None,
+        topk_weights=topk_output_.topk_weights,
+        moe_inputs=moe_inputs,
+        mul_routed_weight=apply_router_weight_on_input,
+        top_k=topk,
+        config=config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=False,
+        block_shape=block_shape,
+        b_use_tma=True,
+        c_sorted=False,
+        filter_expert=False,
+        use_cuda_graph=use_cuda_graph,
+        inner_iter=inner_iter,
+    )
+    kernel1 = KernelWrapper(
+        A=intermediate_cache2,
+        B=w2,
+        bias=None,
+        C=intermediate_cache3,
+        A_scale=a2_scale,
+        B_scale=w2_scale,
+        B_zp=None,
+        topk_weights=topk_output_.topk_weights,
+        moe_inputs=moe_inputs,
+        mul_routed_weight=not apply_router_weight_on_input,
+        top_k=1,
+        config=config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=False,
+        block_shape=block_shape,
+        a_use_tma=False,
+        b_use_tma=False,
+        filter_expert=False,
+        use_cuda_graph=use_cuda_graph,
+        inner_iter=inner_iter,
+    )
+    kernel1_tma = KernelWrapper(
+        A=intermediate_cache2,
+        B=w2,
+        bias=None,
+        C=intermediate_cache3,
+        A_scale=a2_scale,
+        B_scale=w2_scale,
+        B_zp=None,
+        topk_weights=topk_output_.topk_weights,
+        moe_inputs=moe_inputs,
+        mul_routed_weight=not apply_router_weight_on_input,
+        top_k=1,
+        config=config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=False,
+        block_shape=block_shape,
+        a_use_tma=True,
+        b_use_tma=True,
+        filter_expert=False,
+        use_cuda_graph=use_cuda_graph,
+        inner_iter=inner_iter,
+    )
 
     # JIT compilation & warmup
     if not ncu_enable:
         kernel0.forward_cost()
         kernel1.forward_cost()
-        kernel_tma0.forward_cost()
-        kernel_tma1.forward_cost()
+        kernel0_tma.forward_cost()
+        kernel1_tma.forward_cost()
 
     ts0 = []
     ts1 = []
@@ -393,10 +444,10 @@ def benchmark_config(
 
     for i in range(num_iters // inner_iter):
         prepare(i, inner_iter)
-        ts0.append(kernel0.forward_cost())
-        ts1.append(kernel1.forward_cost())
-        ts_tma0.append(kernel_tma0.forward_cost())
-        ts_tma1.append(kernel_tma1.forward_cost())
+        ts0.append(kernel0.forward_cost())  # up no-tma
+        ts1.append(kernel1.forward_cost())  # down no-tma
+        ts_tma0.append(kernel0_tma.forward_cost())  # up tma
+        ts_tma1.append(kernel1_tma.forward_cost())  # down tma
     torch.cuda.synchronize()
 
     avg = sum(ts0) / (num_iters) * 1000  # us
@@ -416,8 +467,11 @@ class BestConfigTrace:
     def update(self, config, time_cost_all):
         block_m = config["BLOCK_SIZE_M"]
         if not self.down_moe:
-            time_cost = time_cost_all[0]
+            # time_cost_all = (kt0_no_tma, kt0_tma, kt1_no_tma, kt1_tma)
+            # For up_proj, pick the faster of TMA vs no-TMA.
+            time_cost = min(time_cost_all[0], time_cost_all[1])
         else:
+            # For down_proj, pick the faster of TMA vs no-TMA.
             time_cost = min(time_cost_all[2], time_cost_all[3])
         if (
             block_m not in self.best_costs_m
@@ -436,7 +490,11 @@ class BestConfigTrace:
             return {}
         config, _, time_cost_all = self.best_costs_m[block_m]
         if not self.down_moe:
-            return config
+            # up_proj: use TMA when the TMA variant is faster.
+            return {
+                **config,
+                "USE_TMA": time_cost_all[0] > time_cost_all[1],
+            }
         else:
             return {
                 **config,
