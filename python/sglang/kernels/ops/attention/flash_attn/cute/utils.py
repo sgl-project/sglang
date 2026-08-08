@@ -19,6 +19,18 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 _MIXER_ATTRS = ("__vec_size__",)
 
 
+def _nvvm_fmax_requires_explicit_result_type(op=nvvm.fmax) -> bool:
+    """Detect the generated NVVM binding ABI instead of inferring it from CUDA."""
+    try:
+        first_parameter = next(iter(inspect.signature(op).parameters), None)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Unable to inspect the NVVM fmax binding ABI") from exc
+    return first_parameter in {"res", "result"}
+
+
+_NVVM_FMAX_REQUIRES_EXPLICIT_RESULT_TYPE = _nvvm_fmax_requires_explicit_result_type()
+
+
 class AuxData(NamedTuple):
     tensors: tuple | list | None = None
     scalars: tuple | None = None
@@ -371,10 +383,7 @@ def fmax(
     loc=None,
     ip=None,
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+    if _NVVM_FMAX_REQUIRES_EXPLICIT_RESULT_TYPE:
         # Old API: requires explicit result type as first positional argument
         return Float32(
             nvvm.fmax(
