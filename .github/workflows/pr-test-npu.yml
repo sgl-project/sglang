@@ -111,6 +111,7 @@ jobs:
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
+      timeout_per_file: '3600'
     secrets: inherit
 
   base-b-test-2-npu-a3:
@@ -122,6 +123,7 @@ jobs:
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
+      timeout_per_file: '3600'
     secrets: inherit
 
   base-b-test-4-npu-a3:
@@ -132,7 +134,7 @@ jobs:
       self_name: base-b-test-4-npu-a3
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
-      run_timeout_minutes: '60'
+      run_timeout_minutes: '120'
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0, 1]}'
     secrets: inherit
@@ -146,6 +148,7 @@ jobs:
       runner_config: linux-aarch64-a3-8-
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
+      timeout_per_file: '3600'
     secrets: inherit
 
   base-b-test-16-npu-a3:
