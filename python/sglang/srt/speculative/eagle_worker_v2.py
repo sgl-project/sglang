@@ -77,7 +77,6 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -177,6 +176,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _sample_rejection_proposal(
+        self,
+        logits,
+        sampling_info,
+        positions,
+        *,
+        position_offset=0,
+    ):
+        return sample_draft_proposal(logits, sampling_info.temperatures)
 
     def alloc_memory_pool(
         self,
@@ -671,9 +680,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
             if self.server_args.speculative_use_rejection_sampling:
-                probs, topk_p, topk_index = sample_draft_proposal(
+                probs, topk_p, topk_index = self._sample_rejection_proposal(
                     logits_output.next_token_logits,
-                    forward_batch.sampling_info.temperatures,
+                    forward_batch.sampling_info,
+                    forward_batch.positions,
+                    position_offset=1,
                 )
                 draft_probs_list.append(probs)
                 forward_batch.positions.add_(1)
@@ -837,14 +848,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = self.server_args.speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            probs, topk_p, topk_index = self._sample_rejection_proposal(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                batch.seq_lens,
+            )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                False,
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -983,9 +998,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
         if self.server_args.speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+            (
+                ret_draft_probs,
+                ret_topk_p,
+                ret_topk_index,
+            ) = self._sample_rejection_proposal(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
+                batch.sampling_info,
+                batch_result.new_seq_lens,
             )
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts

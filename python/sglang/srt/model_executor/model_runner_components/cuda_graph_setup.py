@@ -169,7 +169,10 @@ def capture_prefill_graph(
     # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
     # (restored from #25795), so it does NOT need this skip.
     if (
-        model_runner.spec_algorithm.is_eagle()
+        (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_dvr_eagle()
+        )
         and not model_runner.is_draft_worker
         and not model_runner.server_args.enable_return_hidden_states
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
@@ -330,7 +333,18 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner)
+        if (
+            model_runner.spec_algorithm.is_dvr()
+            and not model_runner.is_draft_worker
+            and model_runner.device == "cuda"
+        ):
+            from sglang.srt.speculative.dvr.cuda_graph_runner import (
+                DVRTargetVerifyCudaGraphRunner,
+            )
+
+            runner = DVRTargetVerifyCudaGraphRunner(model_runner)
+        else:
+            runner = graph_runners[model_runner.device](model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     graph_mem_usage = before_mem - after_mem

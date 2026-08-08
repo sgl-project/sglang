@@ -111,10 +111,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in (
+            "EAGLE3",
+            "DFLASH",
+            "DECODE_VERIFY_ROLLBACK_DFLASH",
+        ):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3 and "
+                "DFlash-family workers only).",
                 server_args.speculative_algorithm,
             )
 
