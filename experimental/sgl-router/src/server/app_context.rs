@@ -19,8 +19,10 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
-    /// Per-worker active-load bookkeeping shared by the proxy, policies,
-    /// timeout janitor, and metrics.
+    /// Per-worker active-load bookkeeping. Shared between the proxy
+    /// (which mints guards on the request hot path), the cache-aware
+    /// policy (which reads per-worker load when scoring candidates), and
+    /// the stale-request janitor (which sweeps expired entries).
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
@@ -32,10 +34,6 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Constructs an application context with default lifecycle bookkeeping.
-    ///
-    /// The supplied configuration and shared service registries are retained;
-    /// the returned context starts with HTTP readiness unset.
     pub fn new(
         config: Config,
         tokenizers: Arc<TokenizerRegistry>,
@@ -88,20 +86,17 @@ impl AppContext {
         }
     }
 
-    /// Marks the HTTP application ready after every required listener binds.
     pub fn mark_ready(&self) {
         // Relaxed: this flag does not synchronize other state; readers only
         // care about eventual visibility, not happens-before with surrounding ops.
         self.ready.store(true, Ordering::Relaxed);
     }
 
-    /// Returns whether startup has completed the Router readiness boundary.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
-    /// Constructs a dependency-light context for HTTP unit tests.
     pub fn stub() -> Self {
         Self {
             config: Config {

@@ -73,12 +73,6 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 }
 
 #[tokio::main]
-/// Starts the Router control plane, data plane, and graceful shutdown sequence.
-///
-/// # Errors
-///
-/// Returns startup, listener, configuration, or server failures to the process
-/// entry point so the binary exits non-zero.
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Bootstrap subscriber so a config-resolution error has structured
@@ -133,10 +127,12 @@ async fn main() -> Result<()> {
         .context("build policy registry")?,
     );
 
-    // Shared ActiveLoadRegistry + janitor task. The janitor reaps request
-    // entries whose lifetime exceeded `stale_request_timeout`, so a leaked
-    // guard does not inflate a worker's load forever. The registry is built
-    // before the manager so removed workers can be pruned promptly.
+    // Shared ActiveLoadRegistry + janitor task. The janitor reaps
+    // request entries whose lifetime exceeded `stale_request_timeout`,
+    // so a leaked guard (proxy task panic, etc.) does not inflate a
+    // worker's load forever. The registry is built BEFORE the manager
+    // is spawned so the manager can call `forget_worker` on
+    // `DiscoveryEvent::Removed`.
     let stale_timeout = std::time::Duration::from_secs(cfg.active_load.stale_request_timeout_secs);
     let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::new(
         Arc::new(sgl_router::policies::active_load::SystemTimeClock),
@@ -184,6 +180,7 @@ async fn main() -> Result<()> {
             active_load,
         ),
     );
+    ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
 
@@ -191,18 +188,17 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    let actual_http_addr = listener
-        .local_addr()
-        .context("read HTTP listener address")?;
+    tracing::info!("listening on {bind}");
+
     let (sigterm, sigint) = install_signal_handlers()?;
-    ctx.mark_ready();
-    tracing::info!(address = %actual_http_addr, "HTTP listener ready");
 
     let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
     let server_result = serve.await.context("axum serve");
 
-    // Cancel discovery and manager work, close reporter sessions once, then
-    // join the active-load janitor before the process exits.
+    // Best-effort: cancel discovery + manager + janitor on shutdown.
+    // The janitor handle's drop signals cancellation; we additionally
+    // await `shutdown` so the task joins cleanly before the process
+    // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
     load_monitor.shutdown().await;
@@ -210,7 +206,6 @@ async fn main() -> Result<()> {
     server_result
 }
 
-/// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),

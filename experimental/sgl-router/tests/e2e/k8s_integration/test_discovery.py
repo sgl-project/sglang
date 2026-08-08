@@ -8,11 +8,11 @@ routes chat-completion requests to them.
 from __future__ import annotations
 
 import httpx
-from conftest import NAMESPACE, _kubectl, _poll_until
+import pytest
+from conftest import NAMESPACE, _kubectl, _poll_until, logger
 
 
 def _scale_fake_worker(replicas: int) -> None:
-    """Scale the fake-worker deployment to the requested replica count."""
     _kubectl(
         "scale",
         "deployment/fake-worker",
@@ -52,7 +52,7 @@ def test_router_discovers_multiple_workers(router_url):
     """Scale down from 3 to 1 and back to 3 replicas; router must continue
     routing successfully after each transition (EndpointSlice watch reflects
     the change)."""
-    # First confirm baseline routing.
+    # First confirm baseline routing
     r = httpx.post(
         f"{router_url}/v1/chat/completions",
         json={
@@ -63,7 +63,7 @@ def test_router_discovers_multiple_workers(router_url):
     )
     assert r.status_code == 200
 
-    # Scale down to 1; routing should recover after discovery reconverges.
+    # Scale down to 1 — router should still route after reconverging
     _scale_fake_worker(1)
     _poll_until(
         lambda: httpx.post(
@@ -80,5 +80,5 @@ def test_router_discovers_multiple_workers(router_url):
         interval=3,
     )
 
-    # Restore the shared cluster state for later tests.
+    # Restore to 3
     _scale_fake_worker(3)
