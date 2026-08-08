@@ -6,11 +6,7 @@ import unittest
 import aiohttp
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -20,9 +16,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="weekly", runner_config="1-gpu-large")
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
-register_cpu_ci(est_time=184, suite="base-c-test-cpu")
 
 
 class TestRoutingKeyScheduling(CustomTestCase):
