@@ -9002,15 +9002,10 @@ class ServerArgs:
                     "check_lora_server_args", enable_lora_overlap_loading=False
                 )
 
-            if self.enable_lora_overlap_loading:
-                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = self.max_loras_per_batch * 2
-                assert (
-                    self.max_loaded_loras is not None
-                    and self.max_loaded_loras <= max_loaded_loras_limit
-                ), (
-                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
-                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
+            if self.enable_lora_overlap_loading and self.max_loaded_loras is None:
+                self.override(
+                    "check_lora_server_args",
+                    max_loaded_loras=self.max_loras_per_batch,
                 )
 
             # Validate compatibility with speculative decoding
@@ -9104,10 +9099,13 @@ class ServerArgs:
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
                     f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
                 )
-                assert len(self.lora_paths) <= self.max_loaded_loras, (
-                    "The number of LoRA paths should not exceed max_loaded_loras. "
-                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
-                )
+                # With overlap loading, adapters stream in on demand, so the
+                # number of registered paths may exceed the pool capacity.
+                if not self.enable_lora_overlap_loading:
+                    assert len(self.lora_paths) <= self.max_loaded_loras, (
+                        "The number of LoRA paths should not exceed max_loaded_loras. "
+                        f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
+                    )
 
             if self.max_lora_chunk_size is not None:
                 assert (
