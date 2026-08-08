@@ -582,10 +582,6 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
 
-    def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
-        return pin_tensor.to(self.device, non_blocking=True)
-
     def _resolve_verify_layout(
         self,
         forward_batch: ForwardBatch,
