@@ -499,12 +499,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Optional B200/SM100 registration for tests that cover Blackwell-specific code paths
 # register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-# Optional second registration: same file also runs nightly, on the same shape
-# as the per-commit form -- stage is just "nightly" there
-# register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large", nightly=True)
+# Optional second registration: same file also runs nightly, same form,
+# stage is just "nightly" there (and no `nightly=True`)
+# register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
 ```
 
-CI generates the suite name as `{stage}-test-{runner_config}`, so `stage="base-b-kernel-unit", runner_config="1-gpu-large"` becomes the `base-b-kernel-unit-test-1-gpu-large` suite you pass to `run_suite.py` below — don't put the `-test-` infix in `register_cuda_ci`. Nightly uses the same shape with `stage="nightly"`; the single-string `suite=` form is left only for stress/weekly and non-CUDA pools.
+CI generates the suite name as `{stage}-test-{runner_config}`, so `stage="base-b-kernel-unit", runner_config="1-gpu-large"` becomes the `base-b-kernel-unit-test-1-gpu-large` suite you pass to `run_suite.py` below — don't put the `-test-` infix in `register_cuda_ci`. Nightly uses the same shape with `stage="nightly"`; the single-string `suite=` form is left only for `stress` and non-CUDA pools.
 
 Keep `est_time`, `stage`, `runner_config`, and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
 
@@ -661,7 +661,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 
 ## Troubleshooting
 
-- **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time`, `stage`, and `runner_config` (and optional `nightly=True`); starred args and non-literal values break AST collection
+- **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time`, `stage`, and `runner_config`; starred args and non-literal values break AST collection
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/kernels/jit/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. `graph_clone_args` defaults to `"all"`; if you narrow it, it must still cover every *read* tensor — reusing a single buffer keeps it L2-hot and skews results. Keep *write* tensors in it too: they are what sets the rotation count, and a shared output buffer stays L2-hot the same way.

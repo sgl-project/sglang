@@ -1,24 +1,19 @@
-# Reusable workflow for one scheduled CUDA (stage, runner_config) pair. The
-# caller -- nightly-test-nvidia.yml or weekly-test-nvidia.yml -- supplies the
-# stage and runner_config plus a partition layout; everything about the machine
-# (runs-on label, install script, install timeout, rdma devices,
-# Grace-Blackwell flag) is resolved from scripts/ci/runner_configs.yml, and the
-# test list comes from the `{stage}-test-{runner_config}` suite in the registry.
-#
-# Consequence: adding or moving a scheduled test is a registry edit only. A
-# test reaches a machine by declaring `runner_config=`, never by a workflow
-# change.
+# Reusable workflow for one scheduled CUDA (stage, runner_config) pair, called
+# by nightly-test-nvidia.yml and weekly-test-nvidia.yml. Machine details come
+# from scripts/ci/runner_configs.yml and the test list from the
+# `{stage}-test-{runner_config}` suite, so adding or moving a scheduled test is
+# a registry edit only.
 name: Scheduled Test Stage (Nvidia)
 
 on:
   workflow_call:
     inputs:
       stage:
-        description: 'Suite stage, e.g. nightly or weekly. Combined with runner_config into the suite name {stage}-test-{runner_config}.'
+        description: 'nightly or weekly. Joined with runner_config into the suite name {stage}-test-{runner_config}.'
         required: true
         type: string
       runner_config:
-        description: 'Key in scripts/ci/runner_configs.yml. Resolves the runs-on label, install script, install timeout and rdma devices.'
+        description: 'Key in scripts/ci/runner_configs.yml.'
         required: true
         type: string
       runs_on:
@@ -62,11 +57,8 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
-  # Scheduled runs use the full jit_kernel parameter grids. This used to be set
-  # per job on the kernel-only nightly jobs; it is a property of running on a
-  # schedule rather than per-commit, not of a particular machine, so it lives at
-  # the workflow level. Only sglang.kernels.jit reads it (see
-  # should_run_full_tests), so callers with no kernel tests are unaffected.
+  # Full jit_kernel parameter grids -- a property of running on a schedule, not
+  # of a machine. Only sglang.kernels.jit reads it (see should_run_full_tests).
   SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
@@ -109,9 +101,8 @@ jobs:
         env:
           RUNNER_LABELS: ${{ inputs.runs_on }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          # Consumed only by test_nightly_precision_regression.py. Harmless for
-          # every other test on the same machine, so it is set unconditionally
-          # rather than carving the precision test back out into its own job.
+          # Read only by test_nightly_precision_regression.py; set for the whole
+          # machine rather than carving that test back out into its own job.
           SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
           SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
           SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}

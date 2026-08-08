@@ -137,10 +137,8 @@ def _repo_relative_path(p: str) -> str:
     return p[idx + len(marker) :] if idx >= 0 else p
 
 
-# Floor and multiplier for the per-file timeout derived from est_time. The
-# floor matches the historical fixed default, so a short test keeps the same
-# budget it had; the multiplier gives a long test headroom proportional to how
-# long it is expected to run.
+# The floor matches the historical fixed default, so a short test keeps the
+# budget it already had.
 DERIVED_TIMEOUT_FLOOR = 1200.0
 DERIVED_TIMEOUT_FACTOR = 1.5
 
@@ -163,10 +161,8 @@ def run_unittest_files(
 
     Args:
         files: List of TestFile objects to run
-        timeout_per_file: Fixed timeout in seconds for every test file. When
-                          None, each file gets derive_timeout_per_file(est_time)
-                          instead, so one slow test no longer forces the whole
-                          suite onto its budget.
+        timeout_per_file: Fixed timeout in seconds for every test file, or None
+                          to derive each file's budget from its own est_time.
         continue_on_error: If True, continue running remaining tests even if one fails.
                           If False, stop at first failure (default behavior for PR tests).
         enable_retry: If True, retry failed tests that appear to be accuracy/performance

@@ -121,23 +121,15 @@ PER_COMMIT_SUITES = {
 # Nightly test suites (run nightly, organized by GPU configuration)
 NIGHTLY_SUITES = {
     HWBackend.CUDA: [
-        # `stage="nightly"` paired with a runner_config, same shape as the
-        # per-commit `{stage}-test-{runner_config}` suites. The runner_config
-        # is the only axis: everything scheduled onto one machine type shares
-        # a suite and is split by auto_partition, so adding a test never needs
-        # a workflow edit. Machine details (runs-on label, install script, rdma
-        # devices) come from scripts/ci/runner_configs.yml.
-        #
-        # These carry no `nightly=True`: the stage says it, and how often a
-        # suite runs is a property of the workflow that selects it, exactly as
-        # `base-a` being blocking and `extra-a` being label-gated are. The flag
-        # survives only for the legacy single-string suites below, where the
-        # name alone does not identify the cadence.
+        # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
+        # shape as the per-commit suites. No `nightly=True` on these: the stage
+        # name carries the cadence, and only the legacy single-string suites
+        # below still need the flag.
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
         "nightly-test-4-gpu-b200",
-        "nightly-test-4-gpu-gb300",
+        "nightly-test-4-gpu-gb300-nightly",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
     ],
@@ -185,10 +177,8 @@ OTHER_SUITES = {
     ],
     HWBackend.CUDA: [
         "stress",
-        # Same `{stage}-test-{runner_config}` shape as the per-commit and
-        # nightly suites; weekly is just another stage. Listed here rather than
-        # in NIGHTLY_SUITES because it is neither per-commit nor nightly -- the
-        # three dicts only differ in which names this backend may declare.
+        # `stage="weekly"` -- same shape again. The three dicts only group
+        # names for readability; validation reads their union.
         "weekly-test-8-gpu-h200",
     ],
 }
@@ -239,9 +229,8 @@ def filter_tests(
         if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
-    # Checked against every declared suite for this backend, not just the
-    # per-commit or nightly half: CUDA nightly suites are selected by name
-    # alone (stage="nightly") and are run without --nightly.
+    # Union of all three dicts, not just the per-commit or nightly half:
+    # CUDA nightly suites are selected by name alone, without --nightly.
     if suite not in _valid_suites_by_backend().get(hw, set()):
         print(f"Warning: Unknown suite {suite} for backend {hw.name}")
 
@@ -406,9 +395,7 @@ def main():
         action="store_true",
         help=(
             "Derive each file's time limit from its own est_time instead of "
-            "applying one flat --timeout-per-file to the whole suite. Needed "
-            "when a suite mixes fast and slow tests, where a single cap is "
-            "either too tight for the slow ones or useless for the fast ones."
+            "the flat --timeout-per-file, for suites mixing fast and slow tests."
         ),
     )
     parser.add_argument(

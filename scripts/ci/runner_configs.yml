@@ -24,6 +24,9 @@ runner_configs:
   2-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 2-gpu-h100 }
   4-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: $b200_runner }
   4-gpu-gb300:       { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 4-gpu-gb300 }
+  # Same hardware as 4-gpu-gb300, separate pool. A distinct key (not a
+  # stage-conditional label) keeps runs_on resolvable from this file alone.
+  4-gpu-gb300-nightly: { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 4-gpu-gb300-nightly }
   4-gpu-h100:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 4-gpu-h100 }
   8-gpu-h200:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h200 }
   8-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b200 }

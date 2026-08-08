@@ -1,12 +1,6 @@
-# Nightly CUDA tests. One job per runner_config; the test list for each comes
-# from the `nightly-test-{runner_config}` suite in the registry, so a test
-# reaches a machine by declaring `runner_config=` on register_cuda_ci and never
-# by editing this file. Machine details live in scripts/ci/runner_configs.yml.
-#
-# Everything scheduled onto one machine type shares a job and is split by
-# auto_partition; per-file time budgets come from each test's own est_time
-# (--timeout-from-est-time), so a slow test no longer sets the cap for the
-# fast ones sharing its job.
+# Nightly CUDA tests. One job per runner_config, running that machine's
+# `nightly-test-{runner_config}` suite -- so a test reaches a machine by
+# declaring `runner_config=` on register_cuda_ci, never by editing this file.
 name: Nightly Test (Nvidia)
 
 on:
@@ -25,7 +19,7 @@ on:
           - '2-gpu-large'
           - '4-gpu-h100'
           - '4-gpu-b200'
-          - '4-gpu-gb300'
+          - '4-gpu-gb300-nightly'
           - '8-gpu-h200'
           - '8-gpu-b200'
           - 'diffusion'
@@ -52,9 +46,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
-  # Partition counts target roughly 2.5-3h per partition, from the summed
-  # est_time of each suite. max_parallel reflects how many machines of that
-  # type the pool can give us at once.
+  # Partition counts target ~2.5-3h per partition from the suite's summed
+  # est_time; max_parallel is how many machines the pool grants at once.
   nightly-1-gpu-large:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
     uses: ./.github/workflows/_scheduled-test-stage.yml
@@ -62,10 +55,7 @@ jobs:
       stage: nightly
       runner_config: 1-gpu-large
       runs_on: 1-gpu-h100
-      partition_ids: '[0, 1]'
-      partition_count: 2
-      max_parallel: 2
-      run_timeout_minutes: 180
+      run_timeout_minutes: 120
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -76,8 +66,7 @@ jobs:
       stage: nightly
       runner_config: 2-gpu-large
       runs_on: 2-gpu-h100
-      # Two 2h tests (VLM eval + VLM perf) dominate; 3 partitions splits them
-      # apart, 2 would leave one partition carrying both.
+      # 3, not 2: two 2h VLM tests dominate and must land in different shards.
       partition_ids: '[0, 1, 2]'
       partition_count: 3
       max_parallel: 2
@@ -102,19 +91,20 @@ jobs:
     with:
       stage: nightly
       runner_config: 4-gpu-b200
+      # runner_configs.yml carries the $b200_runner sentinel here, resolved by
+      # check-changes to the kernel pool only when sgl_kernel is rebuilt.
+      # Scheduled runs never rebuild it, so pin the non-kernel pool.
       runs_on: 4-gpu-b200
-      run_timeout_minutes: 300
+      run_timeout_minutes: 150
       ref: ${{ inputs.ref }}
     secrets: inherit
 
-  nightly-4-gpu-gb300:
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
+  nightly-4-gpu-gb300-nightly:
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300-nightly')
     uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
       stage: nightly
-      runner_config: 4-gpu-gb300
-      # Nightly keeps its own GB300 pool, separate from the per-commit
-      # `4-gpu-gb300` label used by base-c.
+      runner_config: 4-gpu-gb300-nightly
       runs_on: 4-gpu-gb300-nightly
       partition_ids: '[0, 1, 2, 3]'
       partition_count: 4
@@ -152,9 +142,8 @@ jobs:
       ref: ${{ inputs.ref }}
     secrets: inherit
 
-  # SGLang-Diffusion nightly benchmark. Not a registry suite: it drives
-  # run_comparison.py and publishes a dashboard rather than running test files,
-  # so it stays a hand-written job.
+  # Hand-written because it is not a registry suite: it drives run_comparison.py
+  # and publishes a dashboard rather than running test files.
   nightly-test-diffusion:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == 'diffusion')
     runs-on: 4-gpu-h100
@@ -274,7 +263,7 @@ jobs:
       - nightly-2-gpu-large
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
-      - nightly-4-gpu-gb300
+      - nightly-4-gpu-gb300-nightly
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
       - nightly-test-diffusion
