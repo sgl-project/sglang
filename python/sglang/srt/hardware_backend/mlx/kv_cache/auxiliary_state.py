@@ -72,9 +72,6 @@ def _snapshot_cache(cache: Any) -> _CacheSnapshot:
         for name in _CACHE_ATTRS
         if hasattr(cache, name)
     }
-    arrays = _arrays_in_tree((state, meta_state, attrs))
-    if arrays:
-        mx.eval(*arrays)
     return _CacheSnapshot(state=state, meta_state=meta_state, attrs=attrs)
 
 
@@ -165,9 +162,28 @@ class MlxAuxiliaryStatePool:
         cache: list[Any],
         layer_indices: Iterable[int],
     ) -> None:
-        self._snapshots[self._index(index)] = {
+        self.store_snapshot(index, self.capture_cache(cache, layer_indices))
+
+    def capture_cache(
+        self,
+        cache: list[Any],
+        layer_indices: Iterable[int],
+    ) -> dict[int, _CacheSnapshot]:
+        """Clone a cache boundary without synchronizing its lazy MLX graph."""
+        return {
             layer_idx: _snapshot_cache(cache[layer_idx]) for layer_idx in layer_indices
         }
+
+    def store_snapshot(
+        self,
+        index: Any,
+        snapshot: dict[int, _CacheSnapshot],
+    ) -> None:
+        """Materialize and publish a previously captured cache boundary."""
+        arrays = _arrays_in_tree(snapshot)
+        if arrays:
+            mx.eval(*arrays)
+        self._snapshots[self._index(index)] = snapshot
 
     def restore_cache(
         self,
