@@ -1,9 +1,9 @@
 import unittest
 
 import torch
+from transformers import AutoProcessor
 
 from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -13,12 +13,21 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     SimpleNamespace,
+    build_vlm_image_prompt,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
 # CI Registration
 register_cuda_ci(est_time=180, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
+
+
+# The 192GB mi300x runners have less headroom than the 256GB mi325x ones they
+# replaced: the auto-derived fraction left too little room for the ViT
+# activations plus the piecewise graph private pools, and the server died under
+# the 1024-thread gsm8k load.
+AMD_MEM_FRACTION_STATIC = 0.6
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
@@ -28,14 +37,17 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--cuda-graph-backend-prefill=tc_piecewise",
+            "--disable-radix-cache",
+        ]
+        if is_in_amd_ci():
+            other_args += ["--mem-fraction-static", str(AMD_MEM_FRACTION_STATIC)]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--cuda-graph-backend-prefill=tc_piecewise",
-                "--disable-radix-cache",
-            ],
+            other_args=other_args,
         )
 
     @classmethod
@@ -62,14 +74,19 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
 
     def test_embedding(self):
         model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
-        chat_template = get_chat_template_by_model_path(model_path)
-        text = f"{chat_template.image_token}What is in this picture? Answer: "
+        text = build_vlm_image_prompt(
+            AutoProcessor.from_pretrained(model_path), "What is in this picture?"
+        )
+        extra_args = (
+            {"mem_fraction_static": AMD_MEM_FRACTION_STATIC} if is_in_amd_ci() else {}
+        )
 
         engine = Engine(
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
             cuda_graph_backend_prefill="tc_piecewise",
+            **extra_args,
         )
         out = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0]["embedding"]
         engine.shutdown()
@@ -80,6 +97,7 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             enable_multimodal=True,
             is_embedding=True,
             cuda_graph_backend_prefill="disabled",
+            **extra_args,
         )
         out_without_pcg = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0][
             "embedding"

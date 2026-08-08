@@ -10,11 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
+from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
 )
-from sglang.jit_kernel.diffusion.residual_gate_add import (
+from sglang.kernels.ops.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
 )
@@ -182,7 +182,7 @@ def _ltx2_try_fused_ada_values9(
         return None
 
     try:
-        from sglang.jit_kernel.diffusion.triton.ltx2_ada_values import (
+        from sglang.kernels.ops.diffusion.triton.ltx2_ada_values import (
             ltx2_ada_values9,
         )
 
@@ -264,7 +264,7 @@ def apply_split_rotary_emb(
         and cos.is_cuda
         and sin.is_cuda
     ):
-        from sglang.jit_kernel.diffusion.triton.ltx2_rotary import (
+        from sglang.kernels.ops.diffusion.triton.ltx2_rotary import (
             apply_ltx2_split_rotary_emb,
         )
 
@@ -847,8 +847,17 @@ class LTX2Attention(nn.Module):
             else:
                 if self.qk_norm:
                     assert self.q_norm is not None and self.k_norm is not None
-                    q = self.q_norm(q)
-                    k = self.k_norm(k)
+                    # Torch 2.12+ places rms_norm on the autocast fp32 list. A
+                    # cast after the norm preserves the attention contract but
+                    # still runs the much slower fp32 kernel. Torch 2.11 ran
+                    # this operation in the input dtype, so disable autocast
+                    # around Q/K norm to preserve both its precision path and
+                    # performance.
+                    q_dtype = q.dtype
+                    k_dtype = k.dtype
+                    with torch.autocast(device_type=q.device.type, enabled=False):
+                        q = self.q_norm(q).to(dtype=q_dtype)
+                        k = self.k_norm(k).to(dtype=k_dtype)
 
                 if pe is not None and cos.dim() == 3:
                     q = apply_interleaved_rotary_emb(q, (cos, sin))

@@ -36,7 +36,7 @@ The scale axis (reduces over d_v) matches the per-k-channel decay diag(alpha), s
 the large state entries keep ~bf16 precision and the error concentrates on small
 entries that barely affect the readout. Storing cached states int8 gives ~2x the
 cached-prefix capacity at fixed memory, and composes with host-offload
-(HiMambaRadixCache) which it also halves.
+(--enable-hierarchical-cache) which it also halves.
 
 This is strategy-agnostic: whether the active slot to be cached was produced by
 the ``no_buffer`` donate (copy_from) or the ``extra_buffer`` ping-pong track
@@ -313,21 +313,21 @@ def maybe_init_int8_mamba_checkpoint_pool(
     allocating, so an oversized ``--int8-mamba-ckpt-size`` fails with an actionable
     message instead of a cryptic mid-allocation CUDA OOM.
     """
-    from sglang.srt.runtime_context import get_server_args
+    from sglang.srt.runtime_context import get_exec
 
     try:
-        _sa = get_server_args()
+        mamba = get_exec().mamba
     except ValueError:
         # Some unit-test / mock runners construct HybridReqToTokenPool directly
         # without a global server-args context. The int8 checkpoint pool is opt-in
         # via a CLI flag, so an unset context unambiguously means it is off.
-        _sa = None
-    if not getattr(_sa, "enable_int8_mamba_checkpoint", False):
+        mamba = None
+    if mamba is None or not mamba.enable_int8_mamba_checkpoint:
         return None
 
     GB = 1 << 30
     H, d_v, d_k = cache_params.shape.temporal
-    ckpt_size = _sa.int8_mamba_ckpt_size or (2 * mamba_size)
+    ckpt_size = mamba.int8_mamba_ckpt_size or (2 * mamba_size)
     kwargs = dict(
         num_layers=len(mamba_layer_ids),
         num_slots=ckpt_size,
