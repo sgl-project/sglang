@@ -184,6 +184,7 @@ OTHER_SUITES = {
         # three dicts only differ in which names this backend may declare.
         "weekly-test-1-gpu-large",
         "weekly-test-4-gpu-h100",
+        "weekly-test-8-gpu-b200",
         "weekly-test-8-gpu-h200",
     ],
 }
