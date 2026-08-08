@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+try:
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla, transfer_kv_direct
+except ImportError:  # non-CUDA/ROCm builds; state rides fall back to per-layer
+    transfer_kv_all_layer_mla = None
+    transfer_kv_direct = None
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -277,7 +283,165 @@ def _free_state_bindings(component, node) -> None:
             setattr(node, host_value_attr + "_crc", None)
 
 
-def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
+def _state_host_slot_views(hp):
+    """``hp``'s host tiles reinterpreted as slot rows (one row == one state slot,
+    same dtype/width as the device state buffers), which is the shape the direct
+    transfer backend needs. Cached on the pool: these are pure views over the
+    pinned tiles, which never move.
+
+    Contiguity is a correctness requirement, not just a ``view()`` precondition:
+    a non-contiguous tile would silently reshape into a *copy*, and the transfer
+    would then read that copy instead of the pinned buffer. The probe rejects
+    such pools, so reaching here guarantees ``view()`` succeeds.
+    """
+    views = getattr(hp, "_state_slot_views", None)
+    if views is None:
+        ref = hp.device_buffers[0]
+        views = [
+            b.view(-1).view(ref.dtype).reshape(-1, ref.shape[-1]) for b in hp.data_refs
+        ]
+        hp._state_slot_views = views
+    return views
+
+
+def _probe_state_ride_fusable(hp, pools, layers) -> bool:
+    """The ride must cover every layer of ``hp``, in ``hp``'s own buffer order,
+    with one window width and one ring geometry -- exactly the invariant the pool
+    assembler builds. Anything else (fake/CPU pools in unit tests, partial layer
+    maps, mixed ratio) keeps the per-layer path."""
+    if transfer_kv_direct is None or transfer_kv_all_layer_mla is None:
+        return False
+    if getattr(hp, "layout", None) != "layer_first":
+        return False
+    gpu = getattr(hp, "gpu_device", None)
+    if gpu is None or str(gpu) == "cpu":
+        return False
+    if getattr(hp, "data_ptrs", None) is None:
+        return False
+    if getattr(hp, "device_ptrs", None) is None:
+        return False
+    bufs = getattr(hp, "device_buffers", None)
+    layer_num = getattr(hp, "layer_num", -1)
+    if bufs is None or len(bufs) != layer_num or len(layers) != layer_num:
+        return False
+    refs = getattr(hp, "data_refs", None)
+    if refs is None or len(refs) != layer_num:
+        return False
+    # See _state_host_slot_views: a non-contiguous tile reshapes into a copy,
+    # which the transfer would read instead of the pinned buffer.
+    if any(not getattr(b, "is_contiguous", lambda: False)() for b in refs):
+        return False
+    ref = pools[layers[0][0]]
+    geom = (ref.ratio, ref.ring_size, ref.swa_page_size)
+    seen = set()
+    for layer_id, li in layers:
+        if not isinstance(li, int) or not (0 <= li < layer_num) or li in seen:
+            return False
+        seen.add(li)
+        sp = pools[layer_id]
+        # state_locs are computed once from the reference pool, so every layer
+        # must agree on the window width AND the swa_loc -> state_loc mapping.
+        if (sp.ratio, sp.ring_size, sp.swa_page_size) != geom:
+            return False
+        # The fused call reaches layers through hp's pointer tables, so those must
+        # be the very buffers the per-layer path would have written.
+        if sp.kv_score_buffer.kv_score.data_ptr() != bufs[li].data_ptr():
+            return False
+    return True
+
+
+def _state_ride_fusable(hp, pools, layers) -> bool:
+    """Whether this ride can be restored in one fused transfer. Probed once per
+    pool (the layout is fixed at assembly) and cached."""
+    cached = getattr(hp, "_state_fused_h2d_ok", None)
+    if cached is not None:
+        return cached
+    ok = _probe_state_ride_fusable(hp, pools, layers)
+    hp._state_fused_h2d_ok = ok
+    logger.info(
+        "[SWA-HiCache] c4 state ride restore on pool '%s': %s",
+        getattr(hp, "pool_name", "?"),
+        "fused all-layer H2D" if ok else "per-layer fallback",
+    )
+    return ok
+
+
+def _fused_state_h2d(
+    hp, ratio, page_row, slot_bytes, state_locs, io_backend, off0
+) -> None:
+    """Restore one ride's whole ``[B-ratio, B)`` window for ALL layers in a single
+    transfer enqueued on the current stream.
+
+    Byte-identical to the per-layer loop -- the same host tile bytes land on the
+    same device state rows through the same primitive family the SWA carrier
+    restore uses -- but it costs one launch instead of ``layer_num``. Being a
+    stream op it is also asynchronous, so the per-layer path's blocking
+    ``.to(device=)`` round-trips disappear. Ordering against capture is unchanged:
+    the caller waits on each pool's capture-done event before any restore is
+    enqueued, and stream order does the rest.
+    """
+    ring = hp.slot_page_size
+    gpu = hp.gpu_device
+    # Same source rows the per-layer path slices out of the tile: the tile starts
+    # at ``page_row * ring`` and the window is packed at ``off0`` within it.
+    lo = page_row * ring + off0
+    src_rows = torch.arange(lo, lo + ratio, dtype=torch.int64, device=gpu)
+    dst_rows = state_locs.to(device=gpu, dtype=torch.int64)
+    if io_backend == "direct":
+        transfer_kv_direct(
+            src_layers=_state_host_slot_views(hp),
+            dst_layers=hp.device_buffers,
+            src_indices=src_rows,
+            dst_indices=dst_rows,
+            page_size=1,
+        )
+    else:
+        transfer_kv_all_layer_mla(
+            src_layers=hp.data_ptrs,
+            dst_layers=hp.device_ptrs,
+            src_indices=src_rows,
+            dst_indices=dst_rows,
+            item_size=slot_bytes,
+            num_layers=hp.layer_num,
+        )
+
+
+def _restore_state_ride_per_layer(
+    node,
+    hp,
+    pools,
+    layers,
+    host_value_attr,
+    swa_chunk,
+    swa_ring,
+    B,
+    page_row,
+    slot_bytes,
+    off0,
+) -> None:
+    """One blocking H2D per layer, each layer with its own window width. Fallback
+    for rides that cannot be addressed through the pool's pointer tables."""
+    for layer_id, li in layers:
+        sp = pools[layer_id]
+        ratio = sp.ratio
+        if B < ratio:
+            continue
+        pos = torch.arange(B - ratio, B, dtype=torch.int64, device=swa_chunk.device)
+        state_locs = sp.translate_from_swa_loc_to_state_loc(swa_chunk[pos % swa_ring])
+        dev = sp.kv_score_buffer.kv_score
+        host_tile = hp.data_refs[li][page_row]
+        flat = host_tile[off0 * slot_bytes : (off0 + ratio) * slot_bytes]
+        window = flat.view(dev.dtype).reshape(ratio, -1).to(device=dev.device)
+        dev[state_locs] = window
+        if _SWA_DBG_CHECKSUM:
+            _dbg_verify_state_restore(
+                node, host_value_attr, hp, li, page_row, off0, flat, dev, state_locs
+            )
+
+
+def _restore_state_windows(
+    component, node, swa_chunk: torch.Tensor, io_backend: str = "kernel"
+) -> None:
     """Restore the c4 / c4-indexer overlap state for the reused window onto the
     device state ring, so the reusing request's boundary read is bit-exact.
 
@@ -290,6 +454,10 @@ def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
     the ring no longer divides the page). Each slot's device state row is
     translate_from_swa_loc_to_state_loc(slot), so the captured window lands on the
     exact rows the compressor will read regardless of the reusing request's base.
+
+    That addressing is layer-invariant (one ring size and one window per ride), so
+    it is computed once per ride and the ride's layers move in a single fused
+    transfer instead of ``layer_num`` blocking per-layer copies.
     """
     rides = _state_rides(component)
     if not rides:
@@ -314,23 +482,38 @@ def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
         ring = hp.slot_page_size
         slot_bytes = hp.item_bytes // ring
         page_row = int(host_value[0].item()) // ring
-        for layer_id, li in li_map.items():
-            sp = pools[layer_id] if layer_id < len(pools) else None
-            if sp is None:
-                continue
-            ratio = sp.ratio
-            if B < ratio:
-                continue
-            pos = torch.arange(B - ratio, B, dtype=torch.int64, device=swa_chunk.device)
-            win = swa_chunk[pos % swa_ring]
-            state_locs = sp.translate_from_swa_loc_to_state_loc(win)
-            off0 = 0  # pack at tile start; must match capture off0=0
-            dev = sp.kv_score_buffer.kv_score
-            host_tile = hp.data_refs[li][page_row]
-            flat = host_tile[off0 * slot_bytes : (off0 + ratio) * slot_bytes]
-            window = flat.view(dev.dtype).reshape(ratio, -1).to(device=dev.device)
-            dev[state_locs] = window
-            if _SWA_DBG_CHECKSUM:
+        off0 = 0  # pack at tile start; must match capture off0=0
+        layers = [
+            (layer_id, li)
+            for layer_id, li in li_map.items()
+            if layer_id < len(pools) and pools[layer_id] is not None
+        ]
+        if not layers:
+            continue
+        if not _state_ride_fusable(hp, pools, layers):
+            _restore_state_ride_per_layer(
+                node,
+                hp,
+                pools,
+                layers,
+                host_value_attr,
+                swa_chunk,
+                swa_ring,
+                B,
+                page_row,
+                slot_bytes,
+                off0,
+            )
+            continue
+        ref = pools[layers[0][0]]
+        ratio = ref.ratio
+        if B < ratio:
+            continue
+        pos = torch.arange(B - ratio, B, dtype=torch.int64, device=swa_chunk.device)
+        state_locs = ref.translate_from_swa_loc_to_state_loc(swa_chunk[pos % swa_ring])
+        _fused_state_h2d(hp, ratio, page_row, slot_bytes, state_locs, io_backend, off0)
+        if _SWA_DBG_CHECKSUM:
+            for layer_id, li in layers:
                 _dbg_verify_state_restore(
                     node,
                     host_value_attr,
@@ -338,8 +521,10 @@ def _restore_state_windows(component, node, swa_chunk: torch.Tensor) -> None:
                     li,
                     page_row,
                     off0,
-                    flat,
-                    dev,
+                    hp.data_refs[li][page_row][
+                        off0 * slot_bytes : (off0 + ratio) * slot_bytes
+                    ],
+                    pools[layer_id].kv_score_buffer.kv_score,
                     state_locs,
                 )
 
@@ -1970,15 +2155,15 @@ class SWAComponent(TreeComponent):
             for li in range(hp.layer_num):
                 hp.load_to_device_per_layer(None, host_idx, device_idx, li, io_backend)
         # Ride the c4/c4-indexer overlap state back onto the device state ring for
-        # this reused window; device_idx is the restored ring block and its trailing
-        # `ratio` slots are the boundary group. Wait on each state pool's own
+        # this reused window; device_idx is the restored ring block, indexed by
+        # position to find the boundary group. Wait on each state pool's own
         # capture-done event first, mirroring the SWA wait above. No-op when state
         # offload is unwired or the node carries no state host value.
         for _shp, _spools, _shv, _spend, _sli in _state_rides(self):
             if hasattr(_shp, "wait_capture_done"):
                 _shp.wait_capture_done()
         for _wnode, _ in windows:
-            _restore_state_windows(self, _wnode, device_idx)
+            _restore_state_windows(self, _wnode, device_idx, io_backend)
         if _SWA_DBG_CHECKSUM:
             if hasattr(self, "_dbg_verify_restore"):
                 for node, _ in windows:

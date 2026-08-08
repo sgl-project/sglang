@@ -1562,7 +1562,11 @@ class DeepseekV4HipRadixBackend(
         # same ring rows. The per-row item_bytes check inside the copy guards size.
         staging = host_pool._capture_staging
         seqs_l = seqs.tolist()
-        req_l = forward_batch.req_pool_indices.tolist()
+        # req_pool_indices lives on device, so .tolist() is a blocking D2H sync.
+        # It is only read for rows that land on a stride-aligned page boundary --
+        # at most one step in `page` -- so fetch it lazily instead of stalling
+        # every decode step.
+        req_l = None
         layer_num = host_pool.layer_num
         # Only real requests: cuda-graph decode pads seq_lens/req_pool_indices to
         # a static batch size; padded rows carry stale values that could stage a
@@ -1587,6 +1591,8 @@ class DeepseekV4HipRadixBackend(
             B = total
             if (B // page) % stride != 0:
                 continue  # stride gate: skip non-stride-aligned boundaries
+            if req_l is None:
+                req_l = forward_batch.req_pool_indices.tolist()
             rid = int(req_l[i])
             key = (rid, B)
             if key in staging:
@@ -1689,7 +1695,9 @@ class DeepseekV4HipRadixBackend(
         ring = pool.unified_swa_ring_size
         stride = max(1, int(getattr(pool, "_swa_offload_page_stride", 1)))
         seqs_l = seqs.tolist()
-        req_l = forward_batch.req_pool_indices.tolist()
+        # Lazy for the same reason as the SWA decode capture: this is a device
+        # tensor and .tolist() blocks on a D2H copy, but only boundary rows need it.
+        req_l = None
         bs = getattr(forward_batch, "batch_size", None)
         n = len(seqs_l) if bs is None else min(int(bs), len(seqs_l))
         captured = {id(hp): False for hp, _ in specs}
@@ -1701,6 +1709,8 @@ class DeepseekV4HipRadixBackend(
             B = total
             if (B // page) % stride != 0:
                 continue  # stride gate (mirrors prefill / SWA decode)
+            if req_l is None:
+                req_l = forward_batch.req_pool_indices.tolist()
             r = int(req_l[i])
             key = (r, int(B))
             for hp, state_pools in specs:

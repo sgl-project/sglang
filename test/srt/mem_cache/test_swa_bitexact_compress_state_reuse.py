@@ -313,6 +313,53 @@ class TestCaptureRestoreRoundTrip(unittest.TestCase):
         self.assertEqual(SC._state_rides(restorer), [])
 
 
+class TestFusedStateRideProbe(unittest.TestCase):
+    """The fused all-layer H2D computes state_locs once from the ride's first
+    layer, so the probe must reject any ride whose layers disagree on the window
+    width or the swa_loc -> state_loc geometry."""
+
+    def _ride(self, geoms):
+        layer_num = len(geoms)
+        bufs = [torch.zeros((8, 4), dtype=torch.bfloat16) for _ in range(layer_num)]
+        pools = [
+            types.SimpleNamespace(
+                ratio=g[0],
+                ring_size=g[1],
+                swa_page_size=g[2],
+                kv_score_buffer=types.SimpleNamespace(kv_score=bufs[i]),
+            )
+            for i, g in enumerate(geoms)
+        ]
+        hp = types.SimpleNamespace(
+            layout="layer_first",
+            gpu_device="cuda:0",
+            data_ptrs=object(),
+            device_ptrs=object(),
+            device_buffers=bufs,
+            layer_num=layer_num,
+            data_refs=[torch.zeros(64, dtype=torch.uint8) for _ in range(layer_num)],
+        )
+        layers = [(i, i) for i in range(layer_num)]
+        return hp, pools, layers
+
+    def test_uniform_geometry_is_fusable(self):
+        hp, pools, layers = self._ride([(4, 16, 131), (4, 16, 131)])
+        self.assertTrue(SC._probe_state_ride_fusable(hp, pools, layers))
+
+    def test_mixed_ring_size_falls_back(self):
+        hp, pools, layers = self._ride([(4, 16, 131), (4, 8, 131)])
+        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
+
+    def test_mixed_ratio_falls_back(self):
+        hp, pools, layers = self._ride([(4, 16, 131), (2, 16, 131)])
+        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
+
+    def test_cpu_pool_falls_back(self):
+        hp, pools, layers = self._ride([(4, 16, 131)])
+        hp.gpu_device = "cpu"
+        self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
+
+
 class TestDirtyReadWithoutRestore(unittest.TestCase):
     """Reproduce the strict-mode dirty read.
 

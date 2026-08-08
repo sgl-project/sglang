@@ -43,6 +43,23 @@ from sglang.kernels.ops.attention.dsv4.rms_normalize_hip import rms_normalize_tr
 logger = logging.getLogger(__name__)
 
 
+def _c4_state_overlap_prefix(
+    state_pool, token_to_kv_pool, req_to_token, rid, cs, ratio, device
+):
+    """The overlap prefix rows ``[cs - (cs % ratio + ratio), cs)`` of the request's
+    state ring -- the head of the per-request buffer compress reads. Positions
+    before 0 clamp to the pool's cleared sentinel row, matching that buffer."""
+    positions = torch.arange(cs - (cs % ratio + ratio), cs, device=device).clamp(min=-1)
+    raw_loc = torch.where(
+        positions < 0,
+        torch.full_like(positions, -1),
+        req_to_token[rid, positions],
+    )
+    swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
+    state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
+    return state_pool.get_state_by_state_loc(state_loc).kv_score
+
+
 def capture_c4_state_windows_unified(
     *,
     backend,
@@ -91,6 +108,19 @@ def capture_c4_state_windows_unified(
     req_pool_indices = forward_batch.req_pool_indices
     req_to_token = backend.req_to_token_pool.req_to_token
     device = kv_score_input.device
+    # The capture runs once per c4 layer but these two are identical across
+    # layers, and both come off device tensors, so reading them per layer costs a
+    # D2H sync each -- 60 per forward, on the critical path. ForwardBatch is
+    # rebuilt per forward, so caching on it makes it one sync for the whole step.
+    meta = getattr(forward_batch, "_c4_state_capture_meta", None)
+    if meta is None:
+        _orig = getattr(forward_batch, "orig_seq_lens", None)
+        meta = (
+            [int(x) for x in req_pool_indices.tolist()],
+            _orig.tolist() if _orig is not None else None,
+        )
+        forward_batch._c4_state_capture_meta = meta
+    rids, orig_l = meta
 
     page = backend.page_size
     slot_page = hp.slot_page_size  # == ring_size
@@ -112,8 +142,6 @@ def capture_c4_state_windows_unified(
     # ``cleanup_after_caching_req`` and blow the staging capacity under peak
     # concurrency, excluding real boundaries from reuse (#cached-token=0).
     stride = max(1, int(getattr(token_to_kv_pool, "_swa_offload_page_stride", 1)))
-    _orig = getattr(forward_batch, "orig_seq_lens", None)
-    orig_l = _orig.tolist() if _orig is not None else None
 
     pt = 0
     for i in range(forward_batch.batch_size):
@@ -133,23 +161,15 @@ def capture_c4_state_windows_unified(
             continue  # no page boundary crossed in this chunk -> nothing to stage
 
         # Per-request buffer == [pre_kv_state overlap prefix | new tokens], the
-        # same object compress reads; pre_kv_state comes from the state ring.
-        pre_state_indices = torch.arange(
-            cs - (cs % ratio + ratio), cs, device=device
-        ).clamp(min=-1)
-        raw_loc = torch.where(
-            pre_state_indices < 0,
-            torch.full_like(pre_state_indices, -1),
-            req_to_token[req_pool_indices[i], pre_state_indices],
-        )
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
-        state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
-        pre_kv_state = state_pool.get_state_by_state_loc(state_loc).kv_score
-        state_buf = torch.cat([pre_kv_state, new_tok], dim=0)
-        valid_kv_len = state_buf.size(0)
-        pre_len = valid_kv_len - ext
+        # same object compress reads; pre_kv_state comes from the state ring. A
+        # capture only ever needs `win` rows of it, so materialising the
+        # concatenation would cost O(extend_len) per layer to slice 4 rows; the
+        # window is sliced out of whichever part it falls in, and the prefix is
+        # fetched only for the rare boundary that reaches back into it.
+        pre_len = cs % ratio + ratio
+        pre_kv_state = None
 
-        rid = int(req_pool_indices[i])
+        rid = rids[i]
         while B <= boundary:
             # stride gate: keep every ``stride``-th page boundary plus the true
             # sequence tail page (identical to capture_swa_windows), so exactly
@@ -192,7 +212,26 @@ def capture_c4_state_windows_unified(
                 staging[key] = hidx
             buf_lo = pre_len + (B - win - cs)
             buf_hi = pre_len + (B - cs)
-            win_slice = state_buf[buf_lo:buf_hi]
+            if buf_lo >= pre_len:
+                win_slice = new_tok[buf_lo - pre_len : buf_hi - pre_len]
+            else:
+                if pre_kv_state is None:
+                    pre_kv_state = _c4_state_overlap_prefix(
+                        state_pool,
+                        token_to_kv_pool,
+                        req_to_token,
+                        rid,
+                        cs,
+                        ratio,
+                        device,
+                    )
+                if buf_hi <= pre_len:
+                    win_slice = pre_kv_state[buf_lo:buf_hi]
+                else:
+                    win_slice = torch.cat(
+                        [pre_kv_state[buf_lo:pre_len], new_tok[: buf_hi - pre_len]],
+                        dim=0,
+                    )
             flat = win_slice.contiguous().view(torch.uint8).reshape(-1)
             if flat.numel() != win * slot_bytes:
                 raise AssertionError(
