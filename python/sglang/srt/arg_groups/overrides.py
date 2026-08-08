@@ -444,9 +444,20 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "triton":
+            logger.warning(
+                "Kimi-K3 DCP uses experimental Triton prefill/decode backends "
+                "for functionality bring-up."
+            )
+            overrides.update(
+                prefill_attention_backend="triton",
+                decode_attention_backend="triton",
+            )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                "Decode attention backend for Kimi-K3 DCP must be "
+                "'cutedsl_mla', 'tokenspeed_mla', or 'triton', "
+                f"got {decode_backend!r}."
             )
 
         if server_args.dcp_replicate_q_proj is None:

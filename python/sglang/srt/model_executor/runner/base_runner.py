@@ -238,6 +238,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_a2a_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -291,6 +292,44 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_a2a_workspace(self):
+        """Allocate graph-stable NCCL/RCCL A2A buffers before capture."""
+        mr = self.model_runner
+        parallel = get_parallel()
+        if mr.server_args.dcp_size <= 1 or parallel.dcp_comm_backend != "a2a":
+            return
+
+        from sglang.srt.layers.dcp import init_a2a_workspace
+
+        head_dim = getattr(mr.model_config, "kv_lora_rank", None)
+        if head_dim is None:
+            raise RuntimeError(
+                "a2a MLA workspace requires model_config.kv_lora_rank"
+            )
+
+        # The Triton DCP backend keeps rank-local partial attention output in
+        # fp32 until the cross-rank LSE merge. Other MLA backends use model dtype.
+        workspace_dtype = (
+            torch.float32
+            if getattr(mr, "decode_attention_backend_str", None) == "triton"
+            else mr.dtype
+        )
+        max_num_tokens = max(
+            self._eager_max_bs * self._eager_num_tokens_per_req,
+            mr.max_decode_logits_rows(),
+            mr.max_running_requests or 0,
+        )
+        init_a2a_workspace(
+            parallel.dcp_group,
+            device=torch.device(f"cuda:{mr.gpu_id}"),
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=mr.model_config.get_num_attention_heads(
+                parallel.attn_tp_size
+            ),
+            head_dim=head_dim,
+            dtype=workspace_dtype,
+        )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.

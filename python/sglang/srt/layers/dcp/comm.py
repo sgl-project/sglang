@@ -35,7 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_buffer, get_context, get_parallel
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -382,6 +382,125 @@ def all_gather_kv_cache_for_dcp(
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
 
+_A2A_WORKSPACE_KEY = "dcp_a2a_workspace"
+
+
+class A2AWorkspace:
+    """Static buffers used by the NCCL/RCCL DCP all-to-all path.
+
+    Collective tensor addresses are captured by CUDA/HIP graphs. Allocating the
+    fused output/LSE send and receive tensors on every call can therefore leave
+    a replay using stale addresses after allocator reuse. Keep these buffers
+    alive for the lifetime of the runtime context instead.
+    """
+
+    def __init__(
+        self,
+        *,
+        cp_group: "GroupCoordinator",
+        device: torch.device,
+        max_num_tokens: int,
+        heads_per_rank: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        world_size: int,
+        num_ubatches: int = 1,
+    ):
+        self.cp_group = cp_group
+        self.device = torch.device(device)
+        self.world_size = world_size
+        self.max_num_tokens = max_num_tokens
+        self.heads_per_rank = heads_per_rank
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.num_ubatches = num_ubatches
+        self.lpd = _lse_pack_dim(dtype)
+
+        self.send_combined = torch.empty(
+            num_ubatches,
+            world_size,
+            max_num_tokens,
+            heads_per_rank,
+            head_dim + self.lpd,
+            dtype=dtype,
+            device=self.device,
+        )
+        self.recv_combined = torch.empty_like(self.send_combined)
+        self.send_lse_stg = torch.empty(
+            num_ubatches,
+            world_size,
+            max_num_tokens,
+            heads_per_rank,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.recv_lse_stg = torch.empty_like(self.send_lse_stg)
+
+    @property
+    def geometry(self):
+        return (
+            self.cp_group.device_group.group_name,
+            self.cp_group.cpu_group.group_name,
+            self.world_size,
+            self.cp_group.rank_in_group,
+            self.device,
+            self.max_num_tokens,
+            self.heads_per_rank,
+            self.head_dim,
+            self.dtype,
+            self.num_ubatches,
+        )
+
+
+def init_a2a_workspace(
+    cp_group: "GroupCoordinator",
+    device: torch.device,
+    max_num_tokens: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    num_ubatches: int = 1,
+) -> Optional[A2AWorkspace]:
+    """Allocate graph-stable A2A buffers before CUDA/HIP graph capture."""
+    if cp_group.world_size == 1:
+        return None
+
+    requested_geometry = (
+        cp_group.device_group.group_name,
+        cp_group.cpu_group.group_name,
+        cp_group.world_size,
+        cp_group.rank_in_group,
+        torch.device(device),
+        max_num_tokens,
+        heads_per_rank,
+        head_dim,
+        dtype,
+        num_ubatches,
+    )
+    current = get_context().resources.buffers.get(_A2A_WORKSPACE_KEY)
+    if current is not None and current.geometry != requested_geometry:
+        raise RuntimeError(
+            "a2a workspace geometry conflicts with the existing workspace: "
+            f"existing={current.geometry}, requested={requested_geometry}"
+        )
+
+    workspace = get_buffer(
+        _A2A_WORKSPACE_KEY,
+        lambda: A2AWorkspace(
+            cp_group=cp_group,
+            device=device,
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=dtype,
+            world_size=cp_group.world_size,
+            num_ubatches=num_ubatches,
+        ),
+    )
+    if workspace.geometry != requested_geometry:
+        raise RuntimeError("a2a workspace geometry changed during initialization")
+    return workspace
+
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
@@ -455,6 +574,7 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
+    ubatch_id: int = 0,
 ) -> torch.Tensor:
     """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
     combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
@@ -503,41 +623,83 @@ def dcp_a2a_lse_reduce(
         )
         recv_lse = recv_lse_stg[:, :B, :]
     else:
-        send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
-        send_combined = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            D + lpd,
-            dtype=out_dtype,
-            device=cp_attn_out.device,
-        )
-        recv_combined = torch.empty_like(send_combined)
+        workspace = get_context().resources.buffers.get(_A2A_WORKSPACE_KEY)
+        if workspace is not None and B <= workspace.max_num_tokens:
+            if not 0 <= ubatch_id < workspace.num_ubatches:
+                raise ValueError(
+                    f"ubatch_id {ubatch_id} is outside the A2A workspace range "
+                    f"[0, {workspace.num_ubatches})"
+                )
+            expected = (N, H_per_rank, D, out_dtype, cp_attn_out.device)
+            actual = (
+                workspace.world_size,
+                workspace.heads_per_rank,
+                workspace.head_dim,
+                workspace.dtype,
+                workspace.device,
+            )
+            if actual != expected:
+                raise RuntimeError(
+                    "a2a workspace does not match attention geometry: "
+                    f"workspace={actual}, attention={expected}"
+                )
 
-        send_combined[:, :, :, :D].copy_(reshaped_out)
-        send_combined[:, :, :, D:].copy_(
-            send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
-        )
+            send_combined = workspace.send_combined[ubatch_id]
+            recv_combined = workspace.recv_combined[ubatch_id]
+            send_lse_stg = workspace.send_lse_stg[ubatch_id]
+            recv_lse_stg = workspace.recv_lse_stg[ubatch_id]
 
-        # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
-        # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
-        cp_group.all_to_all_single(
-            recv_combined.reshape(-1).view(torch.uint8),
-            send_combined.reshape(-1).view(torch.uint8),
-        )
+            send_combined[:, :B, :, :D].copy_(reshaped_out)
+            send_lse_stg[:, :B, :].copy_(reshaped_lse)
+            send_combined[:, :, :, D:].copy_(
+                send_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd)
+            )
 
-        recv_output = recv_combined[:, :, :, :D]
-        recv_lse_stg = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            dtype=torch.float32,
-            device=cp_attn_out.device,
-        )
-        recv_lse_stg.view(out_dtype).view(N, B, H_per_rank, lpd).copy_(
-            recv_combined[:, :, :, D:]
-        )
-        recv_lse = recv_lse_stg
+            cp_group.all_to_all_single(
+                recv_combined.reshape(-1).view(torch.uint8),
+                send_combined.reshape(-1).view(torch.uint8),
+            )
+            recv_output = recv_combined[:, :B, :, :D]
+            recv_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd).copy_(
+                recv_combined[:, :, :, D:]
+            )
+            recv_lse = recv_lse_stg[:, :B, :]
+        else:
+            send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
+            send_combined = torch.empty(
+                N,
+                B,
+                H_per_rank,
+                D + lpd,
+                dtype=out_dtype,
+                device=cp_attn_out.device,
+            )
+            recv_combined = torch.empty_like(send_combined)
+
+            send_combined[:, :, :, :D].copy_(reshaped_out)
+            send_combined[:, :, :, D:].copy_(
+                send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
+            )
+
+            # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
+            # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
+            cp_group.all_to_all_single(
+                recv_combined.reshape(-1).view(torch.uint8),
+                send_combined.reshape(-1).view(torch.uint8),
+            )
+
+            recv_output = recv_combined[:, :, :, :D]
+            recv_lse_stg = torch.empty(
+                N,
+                B,
+                H_per_rank,
+                dtype=torch.float32,
+                device=cp_attn_out.device,
+            )
+            recv_lse_stg.view(out_dtype).view(N, B, H_per_rank, lpd).copy_(
+                recv_combined[:, :, :, D:]
+            )
+            recv_lse = recv_lse_stg
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
