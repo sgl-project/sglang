@@ -5,7 +5,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
@@ -66,8 +69,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
-        # Load draft model weights only.
-        with empty_context():
+        # Load draft model weights only. The standalone draft is a real model
+        # whose MoE gates run during construction; the scope routes their
+        # fusion decision to the speculative leaf (it does not swap
+        # runner_backend — the draft's forwards run outside that context).
+        with empty_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,

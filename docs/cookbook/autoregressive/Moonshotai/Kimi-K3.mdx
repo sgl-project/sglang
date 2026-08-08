@@ -309,7 +309,13 @@ sglang serve \
   --port 30000
 ```
 
-- `--mm-feature-transport cuda_ipc` — single-node only: skips the CPU round trip, bounded pool (per-tensor CPU fallback when full), reserves up to `SGLANG_MM_FEATURE_CACHE_MB` on the base GPU. Multi-node recipes use CPU transport.
+- `--mm-feature-transport cuda_ipc` — single-node only: skips the CPU round
+  trip and uses a bounded GPU pool.
+- On multi-node GB200/GB300, SGLang automatically uses CUDA VMM with CUDA
+  FABRIC handles when an IMEX channel is available; otherwise it uses CPU.
+  Pass `--mm-feature-transport cpu` to opt out.
+- CUDA IPC and CUDA VMM share the `SGLANG_MM_FEATURE_CACHE_MB` HBM budget
+  (1 GiB by default) and fall back to CPU per tensor when the pool is full.
 - 2 processor / 16 I/O workers are the measured defaults; more adds contention.
 - Leave `--mm-attention-backend` unset — auto-selected, with a correctness fallback.
 - Don't add `--mm-enable-dp-encoder`; K3 already shards images across TP ranks.
@@ -321,7 +327,7 @@ sglang serve \
 | PD | Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in [PD disaggregation](#pd-disaggregation). |
 | EPD | Supported on the public `kimi-k3` branch. Use an `--encoder-only` vision role and a `--language-only` prefill role; add the normal decode role for full EPD. See the [EPD guide](../../../docs/advanced_features/epd_disaggregation). |
 | MM encoder DP | Built in. K3 shards complete images across TP ranks, so leave `--mm-enable-dp-encoder` unset in unified, PD-prefill, and encoder-only roles. |
-| CUDA IPC | Compatible with the local processor-to-scheduler path on a single-node unified or PD-prefill role. It does not replace `--encoder-transfer-backend` for EPD or the PD KV/KDA transfer, and its bounded pool consumes HBM. |
+| MM feature transport | CUDA IPC is used on a single node. CUDA VMM with FABRIC handles is auto-selected for multi-node GB200/GB300 when IMEX is available. Both use a bounded HBM pool and are separate from EPD's `--encoder-transfer-backend` and the PD KV/KDA transfer. |
 | ViT BCG | Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below. |
 
 #### Should ViT BCG be enabled?
