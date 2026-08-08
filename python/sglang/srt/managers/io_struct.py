@@ -2014,6 +2014,8 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
     profile_stages: Optional[List[str]] = None
+    # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
+    roofline_annotations: bool = False
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
