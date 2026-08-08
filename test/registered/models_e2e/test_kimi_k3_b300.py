@@ -40,8 +40,8 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
-    accept_length_thres = 0
-    bs_1_speed_thres = 0
+    accept_length_thres = 6.6
+    bs_1_speed_thres = 440
 
     @classmethod
     def setUpClass(cls):
@@ -79,7 +79,6 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
         _stop_server(getattr(cls, "process", None))
 
 
-@unittest.skip("Temporarily disabled while testing Low Latency performance")
 class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
     """TP8/DCP8 Balanced recipe with hierarchical cache."""
 
