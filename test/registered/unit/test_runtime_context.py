@@ -19,7 +19,6 @@ from sglang.srt.runtime_context import (
     get_context,
     get_flags,
     get_parallel,
-    get_schedule,
     get_server_args,
     reset_context,
 )
@@ -403,6 +402,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             tbo_token_distribution_threshold=0.48,
             disable_flashinfer_cutlass_moe_fp4_allgather=False,
             quantization=None,
+            disable_shared_experts_fusion=False,
         )
         defaults.update(kw)
         initialize_moe_config(SimpleNamespace(**defaults))
@@ -963,35 +963,6 @@ class TestPublishLifecycle(_IsolatedServerArgs):
     def test_capture_tier_defaults_for_sentinel_publish(self):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
-
-    def test_declare_load_time_override_writes_the_bag(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        args = self._publish(page_size=1)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        # The declaration lands on the config bag; the pristine startup record
-        # (server_args) is untouched.
-        self.assertEqual(get_schedule().page_size, 64)
-        self.assertEqual(args.page_size, 1)
-
-    def test_declare_load_time_override_validates_whitelist(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        args = self._publish(page_size=1)
-        with self.assertRaises(ValueError):
-            declare_load_time_override("bad", {"nope": 1})
-        self.assertEqual(args.page_size, 1)
-
-    def test_declare_load_time_override_records_provenance(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        self._publish(page_size=1)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(get_schedule().page_size, 64)
-        self.assertIn(
-            ("model.load_time", {"page_size": 64}),
-            get_context().overrides_log(),
-        )
 
 
 if __name__ == "__main__":
