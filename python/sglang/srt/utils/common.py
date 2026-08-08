@@ -309,6 +309,15 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+# Ada Lovelace (RTX 4090 / L4 / L40S / L20). Not expressible via
+# _check_cuda_device_version, which only matches on the major (8 would also
+# wrongly include Ampere SM80). Marlin W4A16 MoE only guards on
+# __CUDA_ARCH__ >= 800, so SM89 is eligible for the MXFP4 Marlin path.
+@lru_cache(maxsize=1)
+def is_sm89_supported() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (8, 9)
+
+
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
 # _check_cuda_device_version, which only matches on the major.
 @lru_cache(maxsize=1)

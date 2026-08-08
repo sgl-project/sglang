@@ -86,6 +86,7 @@ from sglang.srt.utils.common import (
     is_sm100_or_sm110_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_sm89_supported,
     is_xpu,
     json_list_type,
     nullable_str,
@@ -5338,6 +5339,16 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+            elif is_sm89_supported():
+                # SM89 (Ada / RTX 4090 / L4 / L40S / L20): same Hopper-only
+                # features unavailable as SM120. TileLang indexer is SM120-only,
+                # so leave it off; the Torch SM120 fallback handles multi-dim
+                # seq_lens via fp8_paged_mqa_logits_torch_sm120.
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
