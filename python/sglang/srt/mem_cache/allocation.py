@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -13,6 +14,7 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -403,6 +405,48 @@ def alloc_for_extend(
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
+# Break-even row count for the batched gather on Ascend, where it was measured
+# (~6 rows; 8 leaves margin). Other backends stay on the per-row path unless
+# SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS is set, since their break-even is unmeasured.
+_NPU_MIN_ROWS_FOR_BATCHED_GATHER = 8
+
+
+@lru_cache(maxsize=1)
+def _auto_min_rows_for_batched_gather() -> Optional[int]:
+    """Row count above which to batch the retained-block gather, or None to never
+    batch it. Cached so the decision -- and its log line -- happen once."""
+    if not _is_npu:
+        return None
+    logger.info(
+        "dLLM retained-block gather: batching enabled above %d reuse rows "
+        "(Ascend default). Override with SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.",
+        _NPU_MIN_ROWS_FOR_BATCHED_GATHER,
+    )
+    return _NPU_MIN_ROWS_FOR_BATCHED_GATHER
+
+
+def _gather_reused_block_locs(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: list[int],
+    prefix_lens: list[int],
+    block_len: int,
+    device: torch.device,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Re-read the retained KV block of every reuse row from ``req_to_token``
+    in one flat index op (rows share ``block_len``), instead of one slice +
+    cast kernel per row.
+    """
+    width = req_to_token.shape[1]
+    flat_cpu = torch.tensor(
+        [row * width + start for row, start in zip(req_pool_indices, prefix_lens)],
+        dtype=torch.int64,
+    ).unsqueeze(1) + torch.arange(block_len, dtype=torch.int64)
+    flat = flat_cpu.reshape(-1).to(device, non_blocking=True)
+    return req_to_token.reshape(-1)[flat].to(out_dtype).reshape(-1, block_len)
+
+
 def _alloc_extend_loc_with_kv_reuse(
     batch: ScheduleBatch,
     reuse_kv: list[bool],
@@ -415,11 +459,14 @@ def _alloc_extend_loc_with_kv_reuse(
     device = batch.device
     req_to_token = batch.req_to_token_pool.req_to_token
 
+    prefix_lens_list = prefix_lens_cpu.tolist()
+    extend_lens_list = extend_lens_cpu.tolist()
+
     for i, req in enumerate(batch.reqs):
         if not reuse_kv[i]:
             continue
-        prefix_len = int(prefix_lens_cpu[i])
-        extend_len = int(extend_lens_cpu[i])
+        prefix_len = prefix_lens_list[i]
+        extend_len = extend_lens_list[i]
         retained_len = len(req.dllm_incomplete_ids)
         if extend_len != retained_len:
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
@@ -427,7 +474,7 @@ def _alloc_extend_loc_with_kv_reuse(
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
     alloc_extend_lens = [
-        0 if reuse_kv[i] else int(extend_lens_cpu[i]) for i in range(len(reuse_kv))
+        0 if reuse_kv[i] else extend_lens_list[i] for i in range(len(reuse_kv))
     ]
     alloc_extend_num_tokens = sum(alloc_extend_lens)
 
@@ -436,19 +483,17 @@ def _alloc_extend_loc_with_kv_reuse(
         if alloc_page_size == 1:
             fresh_slots = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
         else:
+            seq_lens_list = batch.seq_lens_cpu.tolist()
             alloc_seq_lens_cpu = torch.tensor(
                 [
-                    (
-                        int(prefix_lens_cpu[i])
-                        if reuse_kv[i]
-                        else int(batch.seq_lens_cpu[i])
-                    )
+                    prefix_lens_list[i] if reuse_kv[i] else seq_lens_list[i]
                     for i in range(len(reuse_kv))
                 ],
                 dtype=torch.int64,
             )
+            neg_one = torch.tensor([-1], device=device)
             last_loc = [
-                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
+                (t[-1:] if len(t) > 0 else neg_one)
                 for t in (r.prefix_indices for r in batch.reqs)
             ]
             fresh_slots = alloc_paged_token_slots_extend(
@@ -465,18 +510,52 @@ def _alloc_extend_loc_with_kv_reuse(
             )
 
     reuse_dtype = fresh_slots.dtype if fresh_slots is not None else torch.int64
+
+    reuse_rows = [i for i in range(len(reuse_kv)) if reuse_kv[i]]
+    req_pool_indices_list = req_pool_indices_cpu.tolist()
+    reuse_gathered = None
+    # The batched gather replaces one kernel launch per reuse row with a fixed
+    # index build + H2D, so it pays off on wide batches and loses on narrow ones.
+    # The row count is the gate: it is re-evaluated every round, so a batch that
+    # shrinks falls back on its own. The default comes from the backend; the env
+    # var overrides it (see SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS).
+    min_rows_for_batched_gather = envs.SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.get()
+    if min_rows_for_batched_gather is None:
+        min_rows_for_batched_gather = _auto_min_rows_for_batched_gather()
+    if (
+        min_rows_for_batched_gather is not None
+        and min_rows_for_batched_gather >= 0  # negative disables outright
+        and len(reuse_rows) >= min_rows_for_batched_gather
+    ):
+        block_len = extend_lens_list[reuse_rows[0]]
+        # Rows of unequal length cannot share one flat index; fall back per row.
+        if all(extend_lens_list[i] == block_len for i in reuse_rows):
+            reuse_gathered = _gather_reused_block_locs(
+                req_to_token=req_to_token,
+                req_pool_indices=[req_pool_indices_list[i] for i in reuse_rows],
+                prefix_lens=[prefix_lens_list[i] for i in reuse_rows],
+                block_len=block_len,
+                device=device,
+                out_dtype=reuse_dtype,
+            )
+
     parts: list[torch.Tensor] = []
     fresh_ptr = 0
+    reuse_ptr = 0
     for i in range(len(reuse_kv)):
-        prefix_len = int(prefix_lens_cpu[i])
-        extend_len = int(extend_lens_cpu[i])
+        extend_len = extend_lens_list[i]
         if reuse_kv[i]:
-            req_idx = int(req_pool_indices_cpu[i])
-            parts.append(
-                req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
-                    reuse_dtype
+            if reuse_gathered is not None:
+                parts.append(reuse_gathered[reuse_ptr])
+                reuse_ptr += 1
+            else:
+                prefix_len = prefix_lens_list[i]
+                req_idx = req_pool_indices_list[i]
+                parts.append(
+                    req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
+                        reuse_dtype
+                    )
                 )
-            )
         else:
             parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
             fresh_ptr += extend_len
