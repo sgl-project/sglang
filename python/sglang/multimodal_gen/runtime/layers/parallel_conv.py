@@ -12,51 +12,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import CausalConv3d
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-if current_platform.is_cuda():
-    from sglang.kernels.ops.diffusion.causal_conv3d_cat_pad import (
-        can_use_fused_causal_conv3d_cat_pad_cuda,
-        fused_causal_conv3d_cat_pad_cuda,
-    )
-    from sglang.kernels.ops.diffusion.triton.causal_conv3d_pad import (
-        fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
-    )
-else:
-    can_use_fused_causal_conv3d_cat_pad_cuda = None
-    fused_causal_conv3d_cat_pad_cuda = None
-    fused_causal_conv3d_cat_pad_triton = None
-
-
-_causal_conv3d_cat_pad_cuda_failed = False
-
-
-def fused_causal_conv3d_cat_pad(
-    x: torch.Tensor,
-    cache_x: torch.Tensor,
-    padding: list[int],
-) -> torch.Tensor:
-    global _causal_conv3d_cat_pad_cuda_failed
-    if (
-        fused_causal_conv3d_cat_pad_cuda is not None
-        and can_use_fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
-        and not _causal_conv3d_cat_pad_cuda_failed
-    ):
-        try:
-            return fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
-        except Exception:
-            logger.warning(
-                "fused_causal_conv3d_cat_pad_cuda failed, falling back to Triton",
-                exc_info=True,
-            )
-            _causal_conv3d_cat_pad_cuda_failed = True
-    if fused_causal_conv3d_cat_pad_triton is None:
-        raise RuntimeError("causal Conv3D cat/pad fusion is only available on CUDA")
-    return fused_causal_conv3d_cat_pad_triton(x, cache_x, padding)
-
 
 _SPATIAL_PARALLEL_DECODE_DISABLED = contextvars.ContextVar(
     "spatial_parallel_decode_disabled", default=False
@@ -100,51 +60,6 @@ def _tensor_chunk(x: torch.Tensor, dim: int = -2, world_size: int = 1, rank: int
     return torch.tensor_split(x, world_size, dim=dim)[rank].contiguous(
         memory_format=_halo_memory_format(x)
     )
-
-
-def _can_fuse_causal_conv3d_cat_pad(
-    x: torch.Tensor,
-    cache_x: torch.Tensor | None,
-    padding: list[int],
-) -> bool:
-    if cache_x is None or fused_causal_conv3d_cat_pad is None:
-        return False
-    if not current_platform.is_cuda():
-        return False
-    if not x.is_cuda or not x.is_contiguous() or not cache_x.is_contiguous():
-        return False
-    if x.dim() != 5 or cache_x.dim() != 5 or x.dtype != cache_x.dtype:
-        return False
-    if x.shape[0] != cache_x.shape[0] or x.shape[1] != cache_x.shape[1]:
-        return False
-    if x.shape[3:] != cache_x.shape[3:]:
-        return False
-
-    width_left, width_right, height_top, height_bottom, depth_left, depth_right = (
-        padding
-    )
-    if width_left != width_right or height_top != height_bottom or depth_right != 0:
-        return False
-    if depth_left < cache_x.shape[2]:
-        return False
-    return bool(width_left or height_top)
-
-
-def causal_conv3d_cat_pad(
-    x: torch.Tensor,
-    cache_x: torch.Tensor | None,
-    padding: list[int],
-) -> torch.Tensor:
-    if cache_x is not None and padding[4] > 0:
-        if cache_x.device != x.device:
-            cache_x = cache_x.to(x.device)
-        if _can_fuse_causal_conv3d_cat_pad(x, cache_x, padding):
-            return fused_causal_conv3d_cat_pad(x, cache_x, padding)
-        x = torch.cat([cache_x, x], dim=2)
-        padding[4] -= cache_x.shape[2]
-    if any(padding):
-        x = F.pad(x, padding)
-    return x
 
 
 def split_for_parallel_decode(
@@ -589,7 +504,15 @@ class SpatialParallelConv2d(nn.Conv2d):
         )
 
 
-class SpatialParallelCausalConv3d(nn.Conv3d):
+class SpatialParallelCausalConv3d(CausalConv3d):
+    """Causal Conv3d whose height dimension is sharded across the decode group.
+
+    The temporal cache stays rank-local: the height split happens before any
+    convolution runs, so each rank only ever caches its own slice. Height
+    padding comes from the halo exchange while the shard is active, and from
+    plain padding once :func:`disable_spatial_parallel_decode` turns it off.
+    """
+
     def __init__(
         self,
         in_channels: int,
@@ -605,62 +528,37 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
             stride=stride,
             padding=padding,
         )
-
-        self.height_pad_top = self.padding[1]
-        self.height_pad_bottom = self.padding[1]
+        self.height_pad_top = self.height_padding
+        self.height_pad_bottom = self.height_padding
         self.height_halo_size = (self.kernel_size[-2] - 1) // 2
-
-        self.padding: tuple[int, int, int]
-        if self.height_halo_size > 0:
-            self._padding = (
-                self.padding[2],
-                self.padding[2],
-                0,
-                0,
-                2 * self.padding[0],
-                0,
-            )
-        else:
-            self._padding = (
-                self.padding[2],
-                self.padding[2],
-                self.padding[1],
-                self.padding[1],
-                2 * self.padding[0],
-                0,
-            )
-        self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
-    def forward(self, x, cache_x=None):
-        padding = list(self._padding)
+    def spatial_padding(self) -> tuple[int, int, int]:
         if spatial_parallel_decode_disabled():
-            padding[2] = self.height_pad_top
-            padding[3] = self.height_pad_bottom
-        x = causal_conv3d_cat_pad(x, cache_x, padding)
-        x = x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
+            return (0, self.height_pad_top, self.width_padding)
+        # Height padding is supplied by the halo exchange, so the convolution
+        # must not add any of its own.
+        return (0, 0, self.width_padding)
 
+    def _conv(self, x: torch.Tensor, *, time_pad: int) -> torch.Tensor:
         if spatial_parallel_decode_disabled():
-            x = _match_conv3d_input_format(x, self.weight)
-            return F.conv3d(
-                x,
-                self.weight,
-                self.bias,
-                self.stride,
-                (0, 0, 0),
-                self.dilation,
-                self.groups,
-            )
+            return super()._conv(x, time_pad=time_pad)
 
+        if time_pad:
+            x = F.pad(x, (0, 0, 0, 0, time_pad, 0))
+        if not current_platform.is_amp_supported():
+            x = x.to(self.weight.dtype)
         return _spatial_parallel_conv_forward(
             self,
             x,
-            super().forward,
+            self._conv_impl,
             height_pad_mode="zeros",
-            match_conv3d_format=True,
+            # `_conv_impl` matches the layout itself, so a backend that replaces
+            # it can opt out of the conversion entirely.
+            match_conv3d_format=False,
         )
 
 

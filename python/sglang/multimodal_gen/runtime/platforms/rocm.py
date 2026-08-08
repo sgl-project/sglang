@@ -12,7 +12,6 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.multimodal_gen.envs as envs
@@ -275,14 +274,16 @@ class RocmPlatform(Platform):
         stride: tuple[int, ...],
         kt: int,
         compute_bf16: bool = False,
+        spatial_padding: tuple[int, int] = (0, 0),
     ) -> torch.Tensor:
         """Replace F.conv3d with temporal-unfolded batched Conv2D.
 
-        ``x_padded`` must already be spatially/temporally padded so that
-        ``F.conv3d(x_padded, weight, bias, stride, padding=0)`` would produce
-        the correct output.  This routine unfolds along the temporal axis,
-        reshapes into a batch of 2-D frames, runs ``F.conv2d``, and folds the
-        result back.
+        ``x_padded`` must already be padded in time, and ``spatial_padding``
+        must be whatever height/width padding the original conv would have
+        applied, so that the result matches ``F.conv3d(x_padded, weight, bias,
+        stride, padding=(0, *spatial_padding))``. This routine unfolds along the
+        temporal axis, reshapes into a batch of 2-D frames, runs ``F.conv2d``,
+        and folds the result back.
 
         *weight_2d* is the pre-transformed 2-D kernel
         ``[C_out, Kt*C_in, Kh, Kw]``, cached at patch time to avoid
@@ -312,7 +313,9 @@ class RocmPlatform(Platform):
         else:
             b = bias
 
-        out = F.conv2d(unfolded, w, b, stride=(stride_h, stride_w))
+        out = F.conv2d(
+            unfolded, w, b, stride=(stride_h, stride_w), padding=spatial_padding
+        )
 
         if compute_bf16 and orig_dtype != torch.bfloat16:
             out = out.to(orig_dtype)
@@ -326,19 +329,24 @@ class RocmPlatform(Platform):
     ) -> int:
         """Walk *module* and patch every CausalConv3d that has a 3-D kernel.
 
-        A ``CausalConv3d`` is identified as any ``nn.Conv3d`` subclass that
-        carries a ``_padding`` attribute (set by the Wan / diffusers causal
-        conv wrapper).  Only modules whose kernel is truly 3-D (Kt>1, Kh>1,
-        Kw>1) are replaced; pointwise or 1-D-temporal convolutions are left
-        untouched.  Modules with non-default ``groups`` or ``dilation`` are
-        skipped as the 2-D decomposition assumes groups=1 and dilation=1.
+        Only modules whose kernel is truly 3-D (Kt>1, Kh>1, Kw>1) are replaced;
+        pointwise or 1-D-temporal convolutions are left untouched.  Modules with
+        non-default ``groups`` or ``dilation`` are skipped as the 2-D
+        decomposition assumes groups=1 and dilation=1.
+
+        The hook is ``_conv_impl`` rather than ``forward``: by that point the
+        temporal cache has already been consumed and concatenated, so patching
+        here cannot bypass it.
         """
+        # Imported lazily: the causal conv layer imports current_platform.
+        from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
+            CausalConv3d,
+        )
+
         patched = 0
         skipped = 0
         for _name, child in module.named_modules():
-            if not isinstance(child, nn.Conv3d):
-                continue
-            if not hasattr(child, "_padding"):
+            if not isinstance(child, CausalConv3d):
                 continue
             kt, kh, kw = child.kernel_size
             if kt <= 1 or kh <= 1 or kw <= 1:
@@ -348,7 +356,6 @@ class RocmPlatform(Platform):
                 skipped += 1
                 continue
 
-            padding = child._padding
             stride = child.stride
 
             # Pre-compute the 2-D weight: [C_out, C_in, Kt, Kh, Kw]
@@ -360,33 +367,18 @@ class RocmPlatform(Platform):
             )
             child.register_buffer("_weight_2d", weight_2d)
 
-            def _patched_forward(
-                self,
-                x,
-                cache_x=None,
-                *,
-                _padding=padding,
-                _stride=stride,
-                _kt=kt,
-                _bf16=use_bf16,
-            ):
-                pad = list(_padding)
-                if cache_x is not None and _padding[4] > 0:
-                    cache_x = cache_x.to(x.device)
-                    x = torch.cat([cache_x, x], dim=2)
-                    pad[4] -= cache_x.shape[2]
-                x = F.pad(x, pad)
-                x = x.to(self.weight.dtype)
+            def _patched_conv_impl(self, x, *, _stride=stride, _kt=kt, _bf16=use_bf16):
                 return RocmPlatform._conv3d_as_batched_conv2d(
-                    x,
+                    x.to(self.weight.dtype),
                     self._weight_2d,
                     self.bias,
                     _stride,
                     _kt,
                     compute_bf16=_bf16,
+                    spatial_padding=self.spatial_padding()[1:],
                 )
 
-            child.forward = types.MethodType(_patched_forward, child)
+            child._conv_impl = types.MethodType(_patched_conv_impl, child)
             patched += 1
 
         logger.info(

@@ -16,8 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextvars
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -36,11 +35,23 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
+from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
+    CausalCacheMode,
+    CausalConv3d,
+    CausalConvCache,
+    TimeDownsampleCausalConv3d,
+    TimeUpsampleCausalConv3d,
+    assign_causal_cache_keys,
+    causal_cache_scope,
+    flatten_time_into_batch,
+    is_channels_last_3d,
+    should_trim_first_chunk,
+    unflatten_batch_into_time,
+)
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
-    causal_conv3d_cat_pad,
     chunk_height_for_parallel_decode,
     disable_spatial_parallel_decode,
     gather_and_trim_height,
@@ -53,33 +64,6 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     should_run_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-
-CACHE_T = 2
-
-is_first_frame = contextvars.ContextVar("is_first_frame", default=False)
-feat_cache = contextvars.ContextVar("feat_cache", default=None)
-feat_idx = contextvars.ContextVar("feat_idx", default=0)
-first_chunk = contextvars.ContextVar("first_chunk", default=None)
-
-
-def _channels_last_3d_supported_by_platform() -> bool:
-    return hasattr(torch, "channels_last_3d") and (
-        current_platform.is_cuda() or current_platform.is_rocm()
-    )
-
-
-def _conv3d_weight_is_channels_last_3d(weight: torch.Tensor) -> bool:
-    return (
-        weight.dim() == 5
-        and _channels_last_3d_supported_by_platform()
-        and weight.is_contiguous(memory_format=torch.channels_last_3d)
-    )
-
-
-def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    if x.dim() == 5 and _conv3d_weight_is_channels_last_3d(weight):
-        return x.contiguous(memory_format=torch.channels_last_3d)
-    return x
 
 
 class AvgDown3D(nn.Module):
@@ -175,55 +159,11 @@ class DupUp3D(nn.Module):
             x.size(6) * self.factor_s,
         )
 
-        _first_chunk = first_chunk.get() if first_chunk is not None else None
-        if _first_chunk:
+        # The first streaming chunk carries a single latent frame, so the frames
+        # this duplication adds in front of it are not real output frames.
+        if should_trim_first_chunk():
             x = x[:, :, self.factor_t - 1 :, :, :]
         return x
-
-
-class WanCausalConv3d(nn.Conv3d):
-    r"""
-    A custom 3D causal convolution layer with feature caching support.
-
-    This layer extends the standard Conv3D layer by ensuring causality in the time dimension and handling feature
-    caching for efficient inference.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int | tuple[int, int, int],
-        stride: int | tuple[int, int, int] = 1,
-        padding: int | tuple[int, int, int] = 0,
-    ) -> None:
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-        )
-        self.padding: tuple[int, int, int]
-        # Set up causal padding
-        self._padding: tuple[int, ...] = (
-            self.padding[2],
-            self.padding[2],
-            self.padding[1],
-            self.padding[1],
-            2 * self.padding[0],
-            0,
-        )
-        self.padding = (0, 0, 0)
-
-    def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        x = causal_conv3d_cat_pad(x, cache_x, padding)
-        x = (
-            x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
-        )  # casting needed if amp isn't supported
-        x = match_conv3d_input_format(x, self.weight)
-        return super().forward(x)
 
 
 class WanRMS_norm(nn.Module):
@@ -261,162 +201,26 @@ class WanUpsample(nn.Upsample):
     Perform upsampling while ensuring the output tensor has the same data type as the input.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Fixed for the process. Asked per call it would break the compiled
+        # graph at every upsample, which is most of the decoder's breaks.
+        self.needs_float_upcast = not current_platform.is_amp_supported()
+
     def forward(self, x):
-        if current_platform.is_amp_supported():
-            return super().forward(x)
-        return super().forward(x.float()).type_as(x)
-
-
-def resample_forward(self, x):
-    b, c, t, h, w = x.size()
-    first_frame = is_first_frame.get()
-    if first_frame:
-        assert t == 1
-    _feat_cache = feat_cache.get()
-    _feat_idx = feat_idx.get()
-    if self.mode == "upsample3d":
-        if _feat_cache is not None:
-            idx = _feat_idx
-            if _feat_cache[idx] is None:
-                _feat_cache[idx] = "Rep"
-                _feat_idx += 1
-            else:
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if (
-                    cache_x.shape[2] < 2
-                    and _feat_cache[idx] is not None
-                    and _feat_cache[idx] != "Rep"
-                ):
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat(
-                        [
-                            _feat_cache[idx][:, :, -1, :, :]
-                            .unsqueeze(2)
-                            .to(cache_x.device),
-                            cache_x,
-                        ],
-                        dim=2,
-                    )
-                if (
-                    cache_x.shape[2] < 2
-                    and _feat_cache[idx] is not None
-                    and _feat_cache[idx] == "Rep"
-                ):
-                    cache_x = torch.cat(
-                        [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
-                        dim=2,
-                    )
-                if _feat_cache[idx] == "Rep":
-                    x = self.time_conv(x)
-                else:
-                    x = self.time_conv(x, _feat_cache[idx])
-                _feat_cache[idx] = cache_x
-                _feat_idx += 1
-
-                x = x.reshape(b, 2, c, t, h, w)
-                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                x = x.reshape(b, c, t * 2, h, w)
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        elif not first_frame and hasattr(self, "time_conv"):
-            x = self.time_conv(x)
-            x = x.reshape(b, 2, c, t, h, w)
-            x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-            x = x.reshape(b, c, t * 2, h, w)
-    t = x.shape[2]
-    x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-    x = self.resample(x)
-    x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
-
-    _feat_cache = feat_cache.get()
-    _feat_idx = feat_idx.get()
-    if self.mode == "downsample3d":
-        if _feat_cache is not None:
-            idx = _feat_idx
-            if _feat_cache[idx] is None:
-                _feat_cache[idx] = x.clone()
-                _feat_idx += 1
-            else:
-                cache_x = x[:, :, -1:, :, :].clone()
-                x = self.time_conv(torch.cat([_feat_cache[idx][:, :, -1:, :, :], x], 2))
-                _feat_cache[idx] = cache_x
-                _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        elif not first_frame and hasattr(self, "time_conv"):
-            x = self.time_conv(x)
-    return x
-
-
-def residual_block_forward(self, x):
-    # Apply shortcut connection
-    h = self.conv_shortcut(x)
-
-    # First normalization and activation
-    x = self.norm1(x)
-    x = self.nonlinearity(x)
-
-    _feat_cache = feat_cache.get()
-    _feat_idx = feat_idx.get()
-    if _feat_cache is not None:
-        idx = _feat_idx
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-            cache_x = torch.cat(
-                [
-                    _feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ],
-                dim=2,
-            )
-
-        x = self.conv1(x, _feat_cache[idx])
-        _feat_cache[idx] = cache_x
-        _feat_idx += 1
-        feat_cache.set(_feat_cache)
-        feat_idx.set(_feat_idx)
-    else:
-        x = self.conv1(x)
-
-    # Second normalization and activation
-    x = self.norm2(x)
-    x = self.nonlinearity(x)
-
-    # Dropout
-    x = self.dropout(x)
-
-    _feat_cache = feat_cache.get()
-    _feat_idx = feat_idx.get()
-    if _feat_cache is not None:
-        idx = _feat_idx
-        cache_x = x[:, :, -CACHE_T:, :, :].clone()
-        if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-            cache_x = torch.cat(
-                [
-                    _feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device),
-                    cache_x,
-                ],
-                dim=2,
-            )
-
-        x = self.conv2(x, _feat_cache[idx])
-        _feat_cache[idx] = cache_x
-        _feat_idx += 1
-        feat_cache.set(_feat_cache)
-        feat_idx.set(_feat_idx)
-    else:
-        x = self.conv2(x)
-
-    # Add residual connection
-    return x + h
+        if self.needs_float_upcast:
+            return super().forward(x.float()).type_as(x)
+        return super().forward(x)
 
 
 def attention_block_forward(self, x):
     identity = x
+    # The 5D -> 4D -> 5D round trip below drops channels_last_3d, and every
+    # downstream conv would then convert the whole activation back. Restore it
+    # once here instead.
+    restore_channels_last = is_channels_last_3d(x)
     batch_size, channels, num_frames, height, width = x.size()
-    x = x.permute(0, 2, 1, 3, 4).reshape(
-        batch_size * num_frames, channels, height, width
-    )
+    x = flatten_time_into_batch(x)
     x = self.norm(x)
 
     # compute query, key, value
@@ -429,67 +233,20 @@ def attention_block_forward(self, x):
 
     x = (
         x.squeeze(1)
-        .permute(0, 2, 1)
-        .reshape(batch_size * num_frames, channels, height, width)
+        .reshape(batch_size * num_frames, height, width, channels)
+        .permute(0, 3, 1, 2)
     )
 
     # output projection
     x = self.proj(x)
 
     # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
-    x = x.view(batch_size, num_frames, channels, height, width)
-    x = x.permute(0, 2, 1, 3, 4)
+    x = unflatten_batch_into_time(x, batch_size)
 
-    return x + identity
-
-
-def mid_block_forward(self, x):
-    # First residual block
-    x = self.resnets[0](x)
-
-    # Process through attention and residual blocks
-    for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-        if attn is not None:
-            x = attn(x)
-
-        x = resnet(x)
-
-    return x
-
-
-def residual_down_block_forward(self, x):
-    x_copy = x
-    for resnet in self.resnets:
-        x = resnet(x)
-    if self.downsampler is not None:
-        x = self.downsampler(x)
-
-    return x + self.avg_shortcut(x_copy)
-
-
-def residual_up_block_forward(self, x):
-    if self.avg_shortcut is not None:
-        x_copy = x
-
-    for resnet in self.resnets:
-        x = resnet(x)
-
-    if self.upsampler is not None:
-        x = self.upsampler(x)
-
-    if self.avg_shortcut is not None:
-        x = x + self.avg_shortcut(x_copy)
-
-    return x
-
-
-def up_block_forward(self, x):
-    for resnet in self.resnets:
-        x = resnet(x)
-
-    if self.upsamplers is not None:
-        x = self.upsamplers[0](x)
-    return x
+    out = x + identity
+    if restore_channels_last:
+        out = out.contiguous(memory_format=torch.channels_last_3d)
+    return out
 
 
 def split_for_parallel_encode(
@@ -515,23 +272,6 @@ def ensure_local_height(x: torch.Tensor, expected_local_height: int | None):
     if x.shape[-2] > expected_local_height:
         return x[..., :expected_local_height, :].contiguous()
     return x
-
-
-@contextmanager
-def forward_context(
-    first_frame_arg=False, feat_cache_arg=None, feat_idx_arg=None, first_chunk_arg=None
-):
-    is_first_frame_token = is_first_frame.set(first_frame_arg)
-    feat_cache_token = feat_cache.set(feat_cache_arg)
-    feat_idx_token = feat_idx.set(feat_idx_arg)
-    first_chunk_token = first_chunk.set(first_chunk_arg)
-    try:
-        yield
-    finally:
-        is_first_frame.reset(is_first_frame_token)
-        feat_cache.reset(feat_cache_token)
-        feat_idx.reset(feat_idx_token)
-        first_chunk.reset(first_chunk_token)
 
 
 class WanResample(nn.Module):
@@ -577,7 +317,9 @@ class WanResample(nn.Module):
                 WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
                 conv2d_cls(dim, upsample_out_dim, 3, padding=1),
             )
-            self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+            self.time_conv = TimeUpsampleCausalConv3d(
+                dim, dim * 2, (3, 1, 1), padding=(1, 0, 0)
+            )
 
         elif mode == "downsample2d":
             if spatial_parallel:
@@ -601,15 +343,31 @@ class WanResample(nn.Module):
                     zero_pad2d_cls((0, 1, 0, 1)),
                     conv2d_cls(dim, dim, 3, stride=(2, 2)),
                 )
-            self.time_conv = WanCausalConv3d(
+            self.time_conv = TimeDownsampleCausalConv3d(
                 dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
             )
 
         else:
             self.resample = nn.Identity()
 
-    def forward(self, x):
-        return resample_forward(self, x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b = x.size(0)
+        # See attention_block_forward: the round trip through 4D loses the
+        # layout, so restore it once rather than in each consumer.
+        restore_channels_last = is_channels_last_3d(x)
+
+        if self.mode == "upsample3d":
+            x = self.time_conv(x)
+
+        x = flatten_time_into_batch(x)
+        x = self.resample(x)
+        x = unflatten_batch_into_time(x, b)
+
+        if self.mode == "downsample3d":
+            x = self.time_conv(x)
+        if restore_channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+        return x
 
 
 class WanResidualBlock(nn.Module):
@@ -630,8 +388,8 @@ class WanResidualBlock(nn.Module):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         *,
-        causal_conv3d_cls=WanCausalConv3d,
-        shortcut_conv3d_cls=WanCausalConv3d,
+        causal_conv3d_cls=CausalConv3d,
+        shortcut_conv3d_cls=CausalConv3d,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
@@ -650,8 +408,19 @@ class WanResidualBlock(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x):
-        return residual_block_forward(self, x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv_shortcut(x)
+
+        x = self.norm1(x)
+        x = self.nonlinearity(x)
+        x = self.conv1(x)
+
+        x = self.norm2(x)
+        x = self.nonlinearity(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+
+        return x + h
 
 
 class WanAttentionBlock(nn.Module):
@@ -715,8 +484,15 @@ class WanMidBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x):
-        return mid_block_forward(self, x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.resnets[0](x)
+
+        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
+            if attn is not None:
+                x = attn(x)
+            x = resnet(x)
+
+        return x
 
 
 class WanResidualDownBlock(nn.Module):
@@ -757,8 +533,14 @@ class WanResidualDownBlock(nn.Module):
         else:
             self.downsampler = None
 
-    def forward(self, x):
-        return residual_down_block_forward(self, x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_copy = x
+        for resnet in self.resnets:
+            x = resnet(x)
+        if self.downsampler is not None:
+            x = self.downsampler(x)
+
+        return x + self.avg_shortcut(x_copy)
 
 
 class WanDistResample(WanResample):
@@ -885,14 +667,14 @@ class WanEncoder3d(nn.Module):
             world_size = get_sp_world_size()
 
         if use_parallel_encode and world_size > 1:
-            CausalConv3d = SpatialParallelCausalConv3d
+            causal_conv3d_cls = SpatialParallelCausalConv3d
             ResidualDownBlock = WanDistResidualDownBlock
             ResidualBlock = WanDistResidualBlock
             AttentionBlock = WanDistAttentionBlock
             Resample = WanDistResample
             MidBlock = WanDistMidBlock
         else:
-            CausalConv3d = WanCausalConv3d
+            causal_conv3d_cls = CausalConv3d
             ResidualDownBlock = WanResidualDownBlock
             ResidualBlock = WanResidualBlock
             AttentionBlock = WanAttentionBlock
@@ -900,7 +682,7 @@ class WanEncoder3d(nn.Module):
             MidBlock = WanMidBlock
 
         # init block
-        self.conv_in = CausalConv3d(in_channels, dims[0], 3, padding=1)
+        self.conv_in = causal_conv3d_cls(in_channels, dims[0], 3, padding=1)
 
         # downsample blocks
         self.down_blocks = nn.ModuleList([])
@@ -937,7 +719,7 @@ class WanEncoder3d(nn.Module):
 
         # output blocks
         self.norm_out = WanRMS_norm(out_dim, images=False)
-        self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
+        self.conv_out = causal_conv3d_cls(out_dim, z_dim, 3, padding=1)
 
         self.gradient_checkpointing = False
         self.world_size = 1
@@ -946,7 +728,7 @@ class WanEncoder3d(nn.Module):
             self.world_size = get_sp_world_size()
             self.rank = get_sp_parallel_rank()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         expected_local_height = None
         expected_height = None
         if self.use_parallel_encode and self.world_size > 1:
@@ -954,29 +736,7 @@ class WanEncoder3d(nn.Module):
                 x, self.downsample_count, self.world_size, self.rank
             )
 
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv_in(x)
+        x = self.conv_in(x)
 
         ## downsamples
         for layer in self.down_blocks:
@@ -990,30 +750,7 @@ class WanEncoder3d(nn.Module):
         ## head
         x = self.norm_out(x)
         x = self.nonlinearity(x)
-
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv_out(x)
+        x = self.conv_out(x)
 
         if self.use_parallel_encode and self.world_size > 1:
             x = gather_and_trim_height(x, expected_height)
@@ -1083,8 +820,20 @@ class WanResidualUpBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x):
-        return residual_up_block_forward(self, x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.avg_shortcut is not None:
+            x_copy = x
+
+        for resnet in self.resnets:
+            x = resnet(x)
+
+        if self.upsampler is not None:
+            x = self.upsampler(x)
+
+        if self.avg_shortcut is not None:
+            x = x + self.avg_shortcut(x_copy)
+
+        return x
 
 
 class WanUpBlock(nn.Module):
@@ -1135,8 +884,13 @@ class WanUpBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x):
-        return up_block_forward(self, x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for resnet in self.resnets:
+            x = resnet(x)
+
+        if self.upsamplers is not None:
+            x = self.upsamplers[0](x)
+        return x
 
 
 class WanDistResidualUpBlock(WanResidualUpBlock):
@@ -1235,18 +989,18 @@ class WanDecoder3d(nn.Module):
             world_size = get_decode_parallel_world_size()
 
         if use_parallel_decode and world_size > 1:
-            CausalConv3d = SpatialParallelCausalConv3d
+            causal_conv3d_cls = SpatialParallelCausalConv3d
             MidBlock = WanDistMidBlock
             ResidualUpBlock = WanDistResidualUpBlock
             UpBlock = WanDistUpBlock
         else:
-            CausalConv3d = WanCausalConv3d
+            causal_conv3d_cls = CausalConv3d
             MidBlock = WanMidBlock
             ResidualUpBlock = WanResidualUpBlock
             UpBlock = WanUpBlock
 
         # init block
-        self.conv_in = CausalConv3d(z_dim, dims[0], 3, padding=1)
+        self.conv_in = causal_conv3d_cls(z_dim, dims[0], 3, padding=1)
 
         # middle blocks
         self.mid_block = MidBlock(dims[0], dropout, non_linearity, num_layers=1)
@@ -1295,7 +1049,7 @@ class WanDecoder3d(nn.Module):
 
         # output blocks
         self.norm_out = WanRMS_norm(out_dim, images=False)
-        self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
+        self.conv_out = causal_conv3d_cls(out_dim, out_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
         self.world_size = 1
@@ -1304,37 +1058,16 @@ class WanDecoder3d(nn.Module):
             self.world_size = get_decode_parallel_world_size()
             self.rank = get_decode_parallel_rank()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         expected_height = None
         if self.use_parallel_decode and self.world_size > 1:
+            # The height split happens before any conv runs, so the temporal
+            # cache each rank builds up is over its own slice only.
             x, expected_height = split_for_parallel_decode(
                 x, self.upsample_count, self.world_size, self.rank
             )
 
-        ## conv1
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_in(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv_in(x)
+        x = self.conv_in(x)
 
         ## middle
         x = self.mid_block(x)
@@ -1346,29 +1079,7 @@ class WanDecoder3d(nn.Module):
         ## head
         x = self.norm_out(x)
         x = self.nonlinearity(x)
-        _feat_cache = feat_cache.get()
-        _feat_idx = feat_idx.get()
-        if _feat_cache is not None:
-            idx = _feat_idx
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
-            if cache_x.shape[2] < 2 and _feat_cache[idx] is not None:
-                # cache last frame of last two chunk
-                cache_x = torch.cat(
-                    [
-                        _feat_cache[idx][:, :, -1, :, :]
-                        .unsqueeze(2)
-                        .to(cache_x.device),
-                        cache_x,
-                    ],
-                    dim=2,
-                )
-            x = self.conv_out(x, _feat_cache[idx])
-            _feat_cache[idx] = cache_x
-            _feat_idx += 1
-            feat_cache.set(_feat_cache)
-            feat_idx.set(_feat_idx)
-        else:
-            x = self.conv_out(x)
+        x = self.conv_out(x)
 
         if self.use_parallel_decode and self.world_size > 1:
             x = gather_and_trim_height(x, expected_height)
@@ -1454,8 +1165,8 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 is_residual=config.is_residual,
                 use_parallel_encode=self.use_parallel_encode,
             )
-        self.quant_conv = WanCausalConv3d(self.z_dim * 2, self.z_dim * 2, 1)
-        self.post_quant_conv = WanCausalConv3d(self.z_dim, self.z_dim, 1)
+        self.quant_conv = CausalConv3d(self.z_dim * 2, self.z_dim * 2, 1)
+        self.post_quant_conv = CausalConv3d(self.z_dim, self.z_dim, 1)
 
         if config.load_decoder:
             self.decoder = WanDecoder3d(
@@ -1472,44 +1183,33 @@ class AutoencoderKLWan(ParallelTiledVAE):
             )
 
         self.use_feature_cache = config.use_feature_cache
-        self._causal_decode_initialized = False
+        self._causal_session_cache: CausalConvCache | None = None
+        assign_causal_cache_keys(self)
+        # Handed to causal_cache_scope so the convs read a plain attribute
+        # instead of the contextvar, which torch.compile cannot trace.
+        self._cache_consumers = [
+            m for m in self.modules() if isinstance(m, CausalConv3d)
+        ]
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
 
     def clear_cache(self) -> None:
-
-        def _count_conv3d(model) -> int:
-            count = 0
-            for m in model.modules():
-                if isinstance(m, (WanCausalConv3d, SpatialParallelCausalConv3d)):
-                    count += 1
-            return count
-
-        if self.config.load_decoder:
-            self._conv_num = _count_conv3d(self.decoder)
-            self._conv_idx = 0
-            self._feat_map = [None] * self._conv_num
-        # cache encode
-        if self.config.load_encoder:
-            self._enc_conv_num = _count_conv3d(self.encoder)
-            self._enc_conv_idx = 0
-            self._enc_feat_map = [None] * self._enc_conv_num
+        """Drop any cache kept across calls (only the realtime session has one)."""
+        self._causal_session_cache = None
 
     def reset_causal_decode_state(self) -> None:
         """Reset decoder feature cache before a new causal video session."""
-        self._causal_decode_initialized = False
-        if self.use_feature_cache:
-            self.clear_cache()
+        self.clear_cache()
 
     def causal_decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latents while preserving decoder feature cache across chunks."""
         if not self.use_feature_cache:
             return self.decode(z)
 
-        is_first_chunk = not self._causal_decode_initialized
-        if is_first_chunk:
-            self.clear_cache()
+        if self._causal_session_cache is None:
+            self._causal_session_cache = CausalConvCache(CausalCacheMode.STREAMING)
+        cache = self._causal_session_cache
 
         iter_ = z.shape[2]
         x = self.post_quant_conv(z)
@@ -1519,14 +1219,10 @@ class AutoencoderKLWan(ParallelTiledVAE):
             if self._should_use_spatial_parallel_decode(z)
             else disable_spatial_parallel_decode()
         )
-        with spatial_context:
-            with forward_context(
-                feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
-            ):
-                for i in range(iter_):
-                    feat_idx.set(0)
-                    first_chunk.set(is_first_chunk and i == 0)
-                    outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
+        with spatial_context, causal_cache_scope(cache, self._cache_consumers):
+            for i in range(iter_):
+                outs.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                cache.advance_chunk()
         out = torch.cat(outs, 2)
 
         if self.config.patch_size is not None:
@@ -1534,43 +1230,35 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         out = out.float()
         out = torch.clamp(out, min=-1.0, max=1.0)
-        self._causal_decode_initialized = True
         return out
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
-            self.clear_cache()
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
-            with forward_context(
-                feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
-            ):
-                t = x.shape[2]
-                iter_ = 1 + (t - 1) // 4
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
+            with causal_cache_scope(cache, self._cache_consumers):
                 for i in range(iter_):
-                    feat_idx.set(0)
                     if i == 0:
                         out = self.encoder(x[:, :, :1, :, :])
                     else:
                         out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
                         out = torch.cat([out, out_], 2)
+                    cache.advance_chunk()
             enc = self.quant_conv(out)
             mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
             enc = torch.cat([mu, logvar], dim=1)
             enc = DiagonalGaussianDistribution(enc)
-            self.clear_cache()
         else:
-            for block in self.encoder.down_blocks:
-                if isinstance(block, WanResample) and block.mode == "downsample3d":
-                    _padding = list(block.time_conv._padding)
-                    _padding[4] = 2
-                    block.time_conv._padding = tuple(_padding)
             enc = ParallelTiledVAE.encode(self, x)
 
         return enc
 
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
-        with forward_context(first_frame_arg=first_frame):
+        mode = CausalCacheMode.FIRST_FRAME if first_frame else CausalCacheMode.STATELESS
+        with causal_cache_scope(CausalConvCache(mode), self._cache_consumers):
             out = self.encoder(x)
         enc = self.quant_conv(out)
         mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
@@ -1597,7 +1285,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
-            self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
             spatial_context = (
@@ -1605,27 +1292,19 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 if self._should_use_spatial_parallel_decode(z)
                 else disable_spatial_parallel_decode()
             )
-            with spatial_context:
-                with forward_context(
-                    feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
-                ):
-                    out_chunks = []
-                    for i in range(iter_):
-                        feat_idx.set(0)
-                        first_chunk.set(i == 0)
-                        out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
-                    out = (
-                        torch.cat(out_chunks, 2)
-                        if len(out_chunks) > 1
-                        else out_chunks[0]
-                    )
+            cache = CausalConvCache(CausalCacheMode.STREAMING, retain=iter_ > 1)
+            with spatial_context, causal_cache_scope(cache, self._cache_consumers):
+                out_chunks = []
+                for i in range(iter_):
+                    out_chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+                    cache.advance_chunk()
+                out = torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
 
             out = out.float()
             out.clamp_(min=-1.0, max=1.0)
-            self.clear_cache()
         else:
             out = ParallelTiledVAE.decode(self, z)
 
@@ -1638,9 +1317,13 @@ class AutoencoderKLWan(ParallelTiledVAE):
             if self._should_use_spatial_parallel_decode(z)
             else disable_spatial_parallel_decode()
         )
-        with spatial_context:
-            with forward_context(first_frame_arg=first_frame):
-                out = self.decoder(x)
+        mode = CausalCacheMode.FIRST_FRAME if first_frame else CausalCacheMode.STATELESS
+        # The cache scope lives inside the spatial context: switching the shard
+        # on or off changes the height a cached tail would have.
+        with spatial_context, causal_cache_scope(
+            CausalConvCache(mode), self._cache_consumers
+        ):
+            out = self.decoder(x)
 
         out = torch.clamp(out, min=-1.0, max=1.0)
 

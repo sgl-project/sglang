@@ -1117,12 +1117,14 @@ FILE_SUITES = {
     "component-accuracy": [
         "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
         "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
+        "../single_test_file/component_accuracy/test_vae_causal_cache_2_gpu.py",
     ],
     "component-accuracy-1-gpu": [
         "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
     ],
     "component-accuracy-2-gpu": [
         "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
+        "../single_test_file/component_accuracy/test_vae_causal_cache_2_gpu.py",
     ],
     "1-gpu-b200": [
         "test_server_b200.py",
@@ -1226,6 +1228,7 @@ COMPONENT_ACCURACY_SUITES = {
 COMPONENT_ACCURACY_FILE_NUM_GPUS = {
     "test_component_accuracy_1_gpu.py": 1,
     "test_component_accuracy_2_gpu.py": 2,
+    "test_vae_causal_cache_2_gpu.py": 2,
 }
 
 DEFAULT_EST_TIME_SECONDS = 300.0
