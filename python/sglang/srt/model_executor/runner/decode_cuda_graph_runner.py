@@ -444,14 +444,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_mode.is_target_verify():
             if not self.model_runner.spec_algorithm.is_war_publish_phase(forward_mode):
                 return SharedReadBoundary.UNKNOWN
-            if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph:
-                # Breakable-graph verify rereads shared state across segments.
-                return SharedReadBoundary.POST_REPLAY
         elif not forward_mode.is_decode():
             return SharedReadBoundary.UNKNOWN
-        if self._war_read_done_node_planted:
-            return SharedReadBoundary.IN_REPLAY
-        return SharedReadBoundary.PRE_REPLAY
+        boundary = attn_backend.shared_read_boundary(forward_mode)
+        if (
+            boundary is SharedReadBoundary.IN_REPLAY
+            and not self._war_read_done_node_planted
+        ):
+            # Non-capturing runs / no external-event support.
+            return SharedReadBoundary.PRE_REPLAY
+        return boundary
 
     def _publish_war_read_done(self, in_graph: bool):
         """Publish the read-done event the scheduler's WAR barrier waits on."""

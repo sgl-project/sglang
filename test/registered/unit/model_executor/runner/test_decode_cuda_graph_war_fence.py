@@ -24,9 +24,14 @@ class _SpecAlgorithm:
 
 
 def _attn_backend(*, breakable_metadata=False):
-    return SimpleNamespace(
-        use_captured_forward_metadata_for_breakable_cuda_graph=breakable_metadata,
-    )
+    def shared_read_boundary(forward_mode):
+        if breakable_metadata and forward_mode.is_target_verify():
+            return SharedReadBoundary.POST_REPLAY
+        if forward_mode.is_decode() or forward_mode.is_target_verify():
+            return SharedReadBoundary.IN_REPLAY
+        return SharedReadBoundary.UNKNOWN
+
+    return SimpleNamespace(shared_read_boundary=shared_read_boundary)
 
 
 def _runner(*, target_verify_war: bool = False, planted: bool = False):

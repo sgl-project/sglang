@@ -121,8 +121,15 @@ class AttentionBackend(ABC):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
-        """Declare where this backend's scheduler-shared reads end per mode;
-        override only for audited deviations."""
+        """Declare where this backend's scheduler-shared reads end per mode.
+
+        Decode/verify default to IN_REPLAY as a consequence of the
+        out-graph/in-graph init contract above: it is a safe upper bound for
+        any backend honoring the contract (a no-op in-graph hook puts the
+        record at the graph head). Override for audited deviations.
+        """
+        if forward_mode.is_decode() or forward_mode.is_target_verify():
+            return SharedReadBoundary.IN_REPLAY
         return SharedReadBoundary.UNKNOWN
 
     # Chunked-prefix FullCG capture has a second model topology and stable
