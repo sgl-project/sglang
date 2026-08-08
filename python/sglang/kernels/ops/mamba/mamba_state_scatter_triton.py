@@ -10,6 +10,209 @@ import torch
 import triton
 import triton.language as tl
 
+_is_hip = torch.version.hip is not None
+_SUPPORTED_STATE_COPY_DTYPES = (torch.bfloat16, torch.float32)
+
+
+def derive_track_ssm_copy_flags(
+    track_ssm_h_src: torch.Tensor,
+    track_ssm_h_dst: torch.Tensor,
+    track_ssm_final_src: torch.Tensor,
+    track_ssm_final_dst: torch.Tensor,
+    *,
+    h_state_rows: int,
+    pool_rows: int | None,
+) -> tuple[bool, bool, bool]:
+    """Derive trusted-index and non-overlap flags for extend tracking metadata."""
+
+    def _all_in_range(indices: torch.Tensor, lower: int, upper: int) -> bool:
+        if indices.numel() == 0:
+            return True
+        if upper <= lower:
+            return False
+        vals = indices.to(device="cpu", dtype=torch.int64).tolist()
+        return all(lower <= int(v) < upper for v in vals)
+
+    h_trusted = _all_in_range(track_ssm_h_src, 0, h_state_rows) and (
+        pool_rows is not None and _all_in_range(track_ssm_h_dst, 0, pool_rows)
+    )
+    final_trusted = (
+        pool_rows is not None
+        and _all_in_range(track_ssm_final_src, 0, pool_rows)
+        and _all_in_range(track_ssm_final_dst, 0, pool_rows)
+    )
+
+    final_disjoint = True
+    if track_ssm_final_src.numel() > 0 and track_ssm_final_dst.numel() > 0:
+        src_set = set(track_ssm_final_src.to(device="cpu", dtype=torch.int64).tolist())
+        dst_set = set(track_ssm_final_dst.to(device="cpu", dtype=torch.int64).tolist())
+        final_disjoint = src_set.isdisjoint(dst_set)
+    return h_trusted, final_trusted, final_disjoint
+
+
+@triton.jit
+def _copy_mamba_state_rows_kernel(
+    src_ptr,
+    dst_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    src_row_stride,
+    dst_row_stride,
+    row_numel: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pair_idx = tl.program_id(0).to(tl.int64)
+    tile_idx = tl.program_id(1).to(tl.int64)
+    offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < row_numel
+
+    src_idx = tl.load(src_indices_ptr + pair_idx).to(tl.int64)
+    dst_idx = tl.load(dst_indices_ptr + pair_idx).to(tl.int64)
+
+    src_row_stride = src_row_stride.to(tl.int64)
+    dst_row_stride = dst_row_stride.to(tl.int64)
+    src_off = src_idx * src_row_stride + offsets
+    dst_off = dst_idx * dst_row_stride + offsets
+
+    data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+    tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+def _row_interior_is_contiguous(t: torch.Tensor) -> bool:
+    if t.ndim < 2:
+        return False
+    expected_stride = 1
+    for dim in range(t.ndim - 1, 0, -1):
+        if t.stride(dim) != expected_stride:
+            return False
+        expected_stride *= t.shape[dim]
+    return True
+
+
+def _copy_rows_advanced_index(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+) -> None:
+    dst[dst_indices] = src[src_indices].to(dst.dtype, copy=False)
+
+
+def copy_mamba_state_rows(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+) -> None:
+    """Fast-path row copy for extend tracking.
+
+    Contract:
+    - ``src`` and ``dst`` are CUDA tensors on the same device.
+    - ``src_indices`` / ``dst_indices`` are contiguous int32/int64 tensors on-device.
+    - All indices are valid (no ``-1`` and no out-of-range values).
+    - Caller establishes gather-before-scatter safety for shared-storage copies.
+    """
+    if src_indices.ndim != 1 or dst_indices.ndim != 1:
+        raise ValueError("src_indices and dst_indices must be 1D tensors.")
+    if src_indices.numel() != dst_indices.numel():
+        raise ValueError("src_indices and dst_indices must have the same length.")
+    if src.shape[1:] != dst.shape[1:]:
+        raise ValueError(f"Row shape mismatch: {src.shape[1:]=} vs {dst.shape[1:]=}.")
+    if src.device != dst.device:
+        raise ValueError(
+            f"src and dst must be on the same device: {src.device=} {dst.device=}"
+        )
+    if src_indices.numel() == 0:
+        return
+    if not src.is_cuda or not dst.is_cuda:
+        raise ValueError("copy_mamba_state_rows only supports CUDA tensors.")
+    if src_indices.device != src.device or dst_indices.device != dst.device:
+        raise ValueError("indices must be on the same device as src/dst.")
+    if src_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"src_indices must be int32/int64, got {src_indices.dtype}.")
+    if dst_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"dst_indices must be int32/int64, got {dst_indices.dtype}.")
+    if not src_indices.is_contiguous() or not dst_indices.is_contiguous():
+        raise ValueError("src_indices and dst_indices must be contiguous.")
+    if not (_row_interior_is_contiguous(src) and _row_interior_is_contiguous(dst)):
+        raise ValueError(
+            "src/dst row interiors must be contiguous for copy_mamba_state_rows."
+        )
+
+    row_numel = dst[0].numel()
+    block_size = 1024
+    grid = (src_indices.numel(), triton.cdiv(row_numel, block_size))
+    _copy_mamba_state_rows_kernel[grid](
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        src.stride(0),
+        dst.stride(0),
+        row_numel=row_numel,
+        BLOCK_SIZE=block_size,
+    )
+
+
+def copy_mamba_state_extend_rows(
+    h: torch.Tensor | None,
+    ssm_states: torch.Tensor,
+    track_ssm_h_src: torch.Tensor,
+    track_ssm_h_dst: torch.Tensor,
+    track_ssm_final_src: torch.Tensor,
+    track_ssm_final_dst: torch.Tensor,
+    *,
+    h_indices_trusted: bool,
+    final_indices_trusted: bool,
+    final_state_disjoint: bool,
+) -> None:
+    """Apply extend-time SSM tracking copies with metadata-driven overlap policy.
+
+    For h->state, src/dst are distinct tensors so direct Triton copy is used when
+    contract preconditions are met and CPU metadata marks indices as trusted. For
+    state->state, direct copy is used only if CPU metadata marks indices as trusted
+    and proves src/dst non-overlap; otherwise fallback uses exact PyTorch advanced
+    indexing gather-before-scatter semantics.
+    """
+    if track_ssm_h_src.numel() > 0:
+        assert h is not None
+        if (
+            h_indices_trusted
+            and _is_hip
+            and h.is_cuda
+            and ssm_states.is_cuda
+            and h.dtype in _SUPPORTED_STATE_COPY_DTYPES
+            and ssm_states.dtype in _SUPPORTED_STATE_COPY_DTYPES
+            and _row_interior_is_contiguous(h)
+            and _row_interior_is_contiguous(ssm_states)
+        ):
+            copy_mamba_state_rows(h, ssm_states, track_ssm_h_src, track_ssm_h_dst)
+        else:
+            _copy_rows_advanced_index(h, ssm_states, track_ssm_h_src, track_ssm_h_dst)
+
+    if track_ssm_final_src.numel() > 0:
+        if (
+            _is_hip
+            and ssm_states.is_cuda
+            and ssm_states.dtype in _SUPPORTED_STATE_COPY_DTYPES
+            and final_indices_trusted
+            and final_state_disjoint
+            and _row_interior_is_contiguous(ssm_states)
+        ):
+            copy_mamba_state_rows(
+                ssm_states,
+                ssm_states,
+                track_ssm_final_src,
+                track_ssm_final_dst,
+            )
+        else:
+            _copy_rows_advanced_index(
+                ssm_states,
+                ssm_states,
+                track_ssm_final_src,
+                track_ssm_final_dst,
+            )
+
 
 @triton.jit
 def track_mamba_state_if_needed_kernel(
