@@ -865,13 +865,7 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(
-                req,
-                batch,
-                result,
-                i,
-                logits_output,
-            )
+            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
