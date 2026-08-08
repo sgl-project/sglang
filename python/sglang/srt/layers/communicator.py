@@ -24,7 +24,6 @@ from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -611,7 +610,7 @@ class LayerCommunicator:
                             )
                         )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )

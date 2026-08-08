@@ -8,8 +8,6 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import (
     get_attn_tp_group,
-    get_moe_ep_group,
-    get_moe_tp_group,
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
@@ -663,6 +661,13 @@ def _sync_allreduce_unavailable_across_tp():
         logger.debug(f"Failed to sync flashinfer unavailable flag: {e}")
 
 
+def _get_allreduce_group_info(use_attn_tp_group: bool):
+    parallel = get_parallel()
+    if use_attn_tp_group:
+        return parallel.attn_tp_size, parallel.attn_tp_rank, get_attn_tp_group()
+    return parallel.tp_size, parallel.tp_rank, get_tp_group()
+
+
 def ensure_workspace_initialized(
     max_token_num: int = 2048,
     hidden_dim: int = 4096,
@@ -679,19 +684,7 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-        rank = get_parallel().attn_tp_rank
-        coordinator = get_attn_tp_group()
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-            rank = get_parallel().moe_ep_rank
-            coordinator = get_moe_ep_group()
-        else:
-            world_size = get_parallel().moe_tp_size
-            rank = get_parallel().moe_tp_rank
-            coordinator = get_moe_tp_group()
+    world_size, rank, coordinator = _get_allreduce_group_info(use_attn_tp_group)
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
     # rendezvous group from `group=...` (falling back to WORLD when None),
@@ -788,7 +781,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
         fp32_acc: Whether to use fp32 precision
-        use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
+        use_attn_tp_group: If True, use the attention TP group; otherwise use
+            the full TP group matching the unfused post-MoE all-reduce.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
@@ -799,13 +793,11 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    if use_attn_tp_group:
-        world_size = get_parallel().attn_tp_size
-    else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-        else:
-            world_size = get_parallel().moe_tp_size
+    world_size = (
+        get_parallel().attn_tp_size
+        if use_attn_tp_group
+        else get_parallel().tp_size
+    )
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
