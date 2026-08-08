@@ -33,9 +33,18 @@ def to_openai_style_logprobs(
     def append_top_logprobs(top_logprobs):
         for tokens in top_logprobs:
             if tokens is not None:
-                ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
-                )
+                # `tokens` is ranked best-logprob-first (torch.topk default).
+                # Byte-fallback tokenizers can give two distinct token ids the
+                # same decoded text (e.g. multiple replacement-character
+                # fragments of one multi-byte sequence); a plain dict
+                # comprehension keeps whichever entry comes LAST, silently
+                # replacing the top candidate's logprob with a lower-ranked
+                # one. setdefault keeps the first (highest-ranked) entry for
+                # each decoded string instead.
+                entry: Dict[str, float] = {}
+                for logprob, _, token_text in tokens:
+                    entry.setdefault(token_text, logprob)
+                ret_logprobs.top_logprobs.append(entry)
             else:
                 ret_logprobs.top_logprobs.append(None)
 
