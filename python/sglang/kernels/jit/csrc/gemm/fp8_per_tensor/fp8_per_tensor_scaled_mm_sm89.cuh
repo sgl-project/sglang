@@ -31,6 +31,8 @@ limitations under the License.
 #include "cutlass/numeric_types.h"
 // clang-format on
 
+namespace sglang {
+
 using namespace cute;
 
 template <
@@ -297,3 +299,5 @@ void sm89_fp8_pertensor_dispatch_shape(
 
 #undef SGL_SM89_DISPATCH
 }
+
+}  // namespace sglang

@@ -21,6 +21,8 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 
+namespace sglang {
+
 #define CUTLASS_CHECK(status)                                                              \
   {                                                                                        \
     cutlass::Status error = status;                                                        \
@@ -33,3 +35,5 @@ inline uint32_t next_pow_2(uint32_t n) {
   }
   return 1u << (32 - __builtin_clz(n - 1));
 }
+
+}  // namespace sglang

@@ -17,7 +17,9 @@ limitations under the License.
 
 #include "fp8_per_tensor_rowwise_c3x.cuh"
 
-template <typename OutType, bool WithBias>
+namespace sglang {
+
+template <typename OutType, bool WithBias, bool ScalarA>
 void sm120_fp8_pertensor_dispatch_shape(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView a,
@@ -42,7 +44,8 @@ void sm120_fp8_pertensor_dispatch_shape(
         PingpongSchedule,
         EpilogueScheduleAuto,
         Shape<_16, _32>,
-        WithBias>;
+        WithBias,
+        ScalarA>;
     return launch_c3x_fp8_rowwise_scaled_mm<GemmM16>(out, a, b, scales_a, scales_b, bias, stream);
   }
   if (m <= 32) {
@@ -54,7 +57,8 @@ void sm120_fp8_pertensor_dispatch_shape(
         PingpongSchedule,
         EpilogueScheduleAuto,
         Shape<_32, _32>,
-        WithBias>;
+        WithBias,
+        ScalarA>;
     return launch_c3x_fp8_rowwise_scaled_mm<GemmM32>(out, a, b, scales_a, scales_b, bias, stream);
   }
   if (m <= 256) {
@@ -66,7 +70,8 @@ void sm120_fp8_pertensor_dispatch_shape(
         PingpongSchedule,
         EpilogueScheduleAuto,
         EpilogueTileAuto,
-        WithBias>;
+        WithBias,
+        ScalarA>;
     return launch_c3x_fp8_rowwise_scaled_mm<GemmM64>(out, a, b, scales_a, scales_b, bias, stream);
   }
 
@@ -78,7 +83,8 @@ void sm120_fp8_pertensor_dispatch_shape(
       cutlass::gemm::collective::KernelScheduleAuto,
       EpilogueScheduleAuto,
       EpilogueTileAuto,
-      WithBias>;
+      WithBias,
+      ScalarA>;
   return launch_c3x_fp8_rowwise_scaled_mm<GemmDefault>(out, a, b, scales_a, scales_b, bias, stream);
 }
 
@@ -91,8 +97,17 @@ void sm120_fp8_pertensor_dispatch_bias(
     tvm::ffi::TensorView scales_b,
     tvm::ffi::Optional<tvm::ffi::TensorView> bias,
     cudaStream_t stream) {
+  const bool scalar_a = scales_a.numel() == 1;
   if (bias.has_value()) {
-    return sm120_fp8_pertensor_dispatch_shape<OutType, true>(out, a, b, scales_a, scales_b, bias, stream);
+    if (scalar_a) {
+      return sm120_fp8_pertensor_dispatch_shape<OutType, true, true>(out, a, b, scales_a, scales_b, bias, stream);
+    }
+    return sm120_fp8_pertensor_dispatch_shape<OutType, true, false>(out, a, b, scales_a, scales_b, bias, stream);
   }
-  return sm120_fp8_pertensor_dispatch_shape<OutType, false>(out, a, b, scales_a, scales_b, bias, stream);
+  if (scalar_a) {
+    return sm120_fp8_pertensor_dispatch_shape<OutType, false, true>(out, a, b, scales_a, scales_b, bias, stream);
+  }
+  return sm120_fp8_pertensor_dispatch_shape<OutType, false, false>(out, a, b, scales_a, scales_b, bias, stream);
 }
+
+}  // namespace sglang

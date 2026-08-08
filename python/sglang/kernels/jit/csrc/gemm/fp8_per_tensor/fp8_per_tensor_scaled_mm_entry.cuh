@@ -32,6 +32,18 @@ limitations under the License.
 #error "fp8_per_tensor_scaled_mm requires SM89 or later"
 #endif
 
+namespace sglang {
+
+// Scalar (per-tensor) A scales rely on a scalar-broadcast epilogue: SM90 selects
+// one at runtime, SM100/SM120 instantiate one. SM89's visitor is per-row only.
+#if SGL_CUDA_ARCH >= 1000 && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+inline constexpr bool kScalarAScaleSupported = true;
+#elif SGL_CUDA_ARCH >= 900 && SGL_CUDA_ARCH < 1000 && defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+inline constexpr bool kScalarAScaleSupported = true;
+#else
+inline constexpr bool kScalarAScaleSupported = false;
+#endif
+
 template <typename OutType>
 void fp8_per_tensor_dispatch_arch(
     tvm::ffi::TensorView out,
@@ -77,7 +89,20 @@ void fp8_per_tensor_scaled_mm(
   RuntimeCheck(is_type<fp8_e4m3_t>(mat_a.dtype()), "mat_a must be Float8_e4m3fn");
   RuntimeCheck(is_type<fp8_e4m3_t>(mat_b.dtype()), "mat_b must be Float8_e4m3fn");
 
-  RuntimeCheck(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
+  RuntimeCheck(
+      scales_a.numel() == 1 || scales_a.numel() == mat_a.size(0),
+      "scales_a must contain either one scalar scale or one scale per row; got ",
+      scales_a.numel(),
+      " elements for M=",
+      mat_a.size(0));
+  // A single A scale broadcast across M rows needs a scalar-broadcast epilogue,
+  // which only the SM90 and SM100+ paths provide. SM89 stays per-row only.
+  RuntimeCheck(
+      scales_a.numel() != 1 || mat_a.size(0) == 1 || kScalarAScaleSupported,
+      "scalar scales_a with M > 1 is unsupported on SM",
+      SGL_CUDA_ARCH / 10,
+      " for this build; got M=",
+      mat_a.size(0));
   RuntimeCheck(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
   RuntimeCheck(scales_a.IsContiguous(), "scales_a must be contiguous");
   RuntimeCheck(scales_b.IsContiguous(), "scales_b must be contiguous");
@@ -105,3 +130,5 @@ void fp8_per_tensor_scaled_mm(
     Panic("out_dtype must be Half or BFloat16");
   }
 }
+
+}  // namespace sglang

@@ -102,8 +102,8 @@ class TestContextOverride(CustomTestCase):
         self.assertEqual(sa.kv_cache_dtype, raw)
 
     def test_bare_server_args_write_raises_after_resolution(self):
-        # server_args is read-only after resolution regardless of the
-        # SGLANG_STRICT_CONFIG_MUTATION env; write via override instead.
+        # server_args is read-only after resolution: resolved config changes go
+        # to the bags, a per-runner config to a derived variant.
         sa = ServerArgs(model_path="dummy")
         object.__setattr__(sa, "_declarations_materialized", True)
         with self.assertRaises(AttributeError):
@@ -118,8 +118,7 @@ class TestContextOverride(CustomTestCase):
         rc.get_context().override(
             "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype="fp8_e4m3"
         )
-        draft = ServerArgs(model_path="dummy")
-        draft.override(source="draft-build", kv_cache_dtype="bf16")
+        draft = ServerArgs(model_path="dummy", kv_cache_dtype="bf16")
         with rc.get_context().preserve_config():
             rc.get_context().set_server_args(draft)
             # Inside the scope the draft's bags are live...

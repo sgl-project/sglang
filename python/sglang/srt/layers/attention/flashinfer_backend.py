@@ -288,6 +288,10 @@ def fast_prefill_plan(
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -319,9 +323,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "flashinfer"
         )
-        prefill_backend, decode_backend = (
-            model_runner.server_args.get_attention_backends()
-        )
+        prefill_backend = model_runner.prefill_attention_backend_str
+        decode_backend = model_runner.decode_attention_backend_str
         if self.__class__ is FlashInferAttnBackend:
             if prefill_backend == "flashinfer":
                 self._check_kv_attention_access("prefill", self.prefill_kv_access)

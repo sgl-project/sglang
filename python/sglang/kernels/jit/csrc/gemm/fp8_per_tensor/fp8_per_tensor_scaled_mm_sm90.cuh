@@ -30,6 +30,8 @@ limitations under the License.
 #include "cutlass/util/packed_stride.hpp"
 // clang-format on
 
+namespace sglang {
+
 using namespace cute;
 
 template <typename Kernel>
@@ -48,6 +50,12 @@ template <typename T, typename TileShape>
 using ColLoad = cutlass::epilogue::fusion::
     Sm90ColBroadcast<0, TileShape, T, T, Stride<Int<1>, Int<0>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
 
+// A scales may be per-row or a single scalar; SM90 picks between them at
+// runtime off the broadcast flag rather than instantiating a second kernel.
+template <typename T, typename TileShape>
+using ColOrScalarLoad =
+    cutlass::epilogue::fusion::Sm90ColOrScalarBroadcast<0, TileShape, T, Stride<Int<1>, Int<0>, Int<0>>>;
+
 template <typename T, typename TileShape>
 using RowLoad = cutlass::epilogue::fusion::
     Sm90RowBroadcast<0, TileShape, T, T, Stride<Int<0>, Int<1>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
@@ -56,7 +64,7 @@ template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogue {
  private:
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-  using ScaleA = ColLoad<float, TileShape>;
+  using ScaleA = ColOrScalarLoad<float, TileShape>;
   using ScaleB = RowLoad<float, TileShape>;
 
   using Compute0 = cutlass::epilogue::fusion::
@@ -71,7 +79,7 @@ struct ScaledEpilogue {
 
   static ArgumentType prepare_args(
       tvm::ffi::TensorView a_scales, tvm::ffi::TensorView b_scales, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
-    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr())};
+    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr()), a_scales.numel() != 1};
     typename ScaleB::Arguments b_args{static_cast<const float*>(b_scales.data_ptr())};
     typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
     return ArgumentType{a_args, evt0_args, {}};
@@ -82,7 +90,7 @@ template <typename ElementAcc, typename ElementD, typename TileShape, template <
 struct ScaledEpilogueWithBias {
  private:
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-  using ScaleA = ColLoad<float, TileShape>;
+  using ScaleA = ColOrScalarLoad<float, TileShape>;
   using ScaleB = RowLoad<float, TileShape>;
   using Bias = BiasLoad<ElementD, TileShape>;
 
@@ -98,7 +106,7 @@ struct ScaledEpilogueWithBias {
 
   static ArgumentType prepare_args(
       tvm::ffi::TensorView a_scales, tvm::ffi::TensorView b_scales, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
-    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr())};
+    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr()), a_scales.numel() != 1};
     typename ScaleB::Arguments b_args{static_cast<const float*>(b_scales.data_ptr())};
     typename Bias::Arguments bias_args{static_cast<const ElementD*>(bias.value().data_ptr())};
     typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
@@ -377,3 +385,5 @@ void sm90_fp8_pertensor_dispatch_shape(
   }
   return sm90_fp8_pertensor_dispatch_shape_impl<OutType, false>(out, a, b, scales_a, scales_b, bias, stream);
 }
+
+}  // namespace sglang

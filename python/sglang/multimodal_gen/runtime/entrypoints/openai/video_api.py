@@ -6,6 +6,8 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Coroutine
+from contextlib import suppress
 from typing import Any, Dict, Optional
 
 from fastapi import (
@@ -61,6 +63,29 @@ _VIDEO_EXTENSIONS = {
     ".mpg",
     ".webm",
 }
+_VIDEO_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
+
+
+def _discard_video_job_task(job_id: str, task: asyncio.Task[None]) -> None:
+    if _VIDEO_JOB_TASKS.get(job_id) is task:
+        del _VIDEO_JOB_TASKS[job_id]
+
+
+def _start_video_job(job_id: str, job: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    task = asyncio.create_task(job, name=f"video-job-{job_id}")
+    _VIDEO_JOB_TASKS[job_id] = task
+    task.add_done_callback(lambda completed: _discard_video_job_task(job_id, completed))
+    return task
+
+
+async def shutdown_video_jobs() -> None:
+    tasks = list(_VIDEO_JOB_TASKS.values())
+    _VIDEO_JOB_TASKS.clear()
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
@@ -104,6 +129,7 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "action_normalization",
     "condition_frame_indexes_vision",
     "condition_video_keep",
+    "quality",
 )
 
 
@@ -371,6 +397,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "upscaling_model_path": request.upscaling_model_path,
         "upscaling_scale": request.upscaling_scale,
         "output_path": request.output_path,
+        "quality": _extra_value(request, "quality"),
         "output_compression": request.output_compression,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
@@ -489,7 +516,7 @@ async def _dispatch_job_async(
         update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Video job %s failed", job_id)
         await VIDEO_STORE.update_fields(
             job_id,
             {
@@ -824,14 +851,15 @@ async def create_video(
 
     assert batch is not None
     # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(
+    _start_video_job(
+        request_id,
         _dispatch_job_async(
             request_id,
             batch,
             scheduler_batches=scheduler_batches,
             temp_dirs=temp_dirs or None,
             output_persistent=output_persistent,
-        )
+        ),
     )
     return VideoResponse(**job)
 
@@ -842,25 +870,8 @@ async def list_videos(
     limit: Optional[int] = Query(None, ge=1, le=100),
     order: Optional[str] = Query("desc"),
 ):
-    # Normalize order
-    order = (order or "desc").lower()
-    if order not in ("asc", "desc"):
-        order = "desc"
-    jobs = await VIDEO_STORE.list_values()
-
-    reverse = order != "asc"
-    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=reverse)
-
-    if after is not None:
-        try:
-            idx = next(i for i, j in enumerate(jobs) if j["id"] == after)
-            jobs = jobs[idx + 1 :]
-        except StopIteration:
-            jobs = []
-
-    if limit is not None:
-        jobs = jobs[:limit]
-    items = [VideoResponse(**j) for j in jobs]
+    jobs = await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
+    items = [VideoResponse(**job) for job in jobs]
     return VideoListResponse(data=items)
 
 

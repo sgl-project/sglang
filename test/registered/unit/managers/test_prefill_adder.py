@@ -2,24 +2,23 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    estimate_prefill_extend_tile_metrics,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _RecordingDelayer:
@@ -64,11 +63,13 @@ class TestPrefillAdder(CustomTestCase):
         full_available_size: int = 0,
         swa_available_size: int = 0,
         available_size: int = 0,
+        size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
+        allocator.size_swa = size_swa
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:
@@ -97,6 +98,8 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.host_hit_length = 0
+        req.storage_hit_length = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -776,6 +779,116 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def _adder_with_extend_lens(self, extend_lens):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.can_run_list = [
+            SimpleNamespace(extend_input_len=length) for length in extend_lens
+        ]
+        # BLOCK_M is auto-detected from the attention backend in production; the
+        # __new__ helper bypasses __init__, so set it explicitly. 64 matches the
+        # block_m the tile-count assertions below are computed against.
+        adder.prefill_tile_block_m = 64
+        return adder
+
+    def test_estimate_prefill_extend_tile_metrics(self):
+        metrics = estimate_prefill_extend_tile_metrics([1, 7, 13, 129], block_m=64)
+
+        self.assertEqual(metrics["q_tiles_per_request"], [1, 1, 1, 3])
+        self.assertEqual(metrics["legacy_q_tiles_per_head"], 12)
+        self.assertEqual(metrics["compact_q_tiles_per_head"], 6)
+        self.assertEqual(metrics["saved_q_tiles_per_head"], 6)
+        self.assertEqual(metrics["saved_q_tile_ratio"], 0.5)
+
+    def test_compact_prefill_tile_budget_admits_more_than_legacy(self):
+        adder = self._adder_with_extend_lens([1, 7, 13])
+
+        # The tile-budget admission is gated on HIP in production; force the gate
+        # on so this vendor-neutral admission-math check runs on any CI runner.
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(129))
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+        ):
+            self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
+
+    def test_prefill_tile_budget_always_allows_first_request(self):
+        adder = self._adder_with_extend_lens([])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 1),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(4096))
+
+    def test_prefill_tile_budget_disabled_on_non_hip(self):
+        # AMD-only: on non-HIP vendors the tile-budget admission must be a no-op
+        # even when the budget env is set, so scheduler behavior is unchanged.
+        adder = self._adder_with_extend_lens([1, 7, 13])
+
+        with (
+            patch.object(schedule_policy, "_IS_HIP", False),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+        ):
+            self.assertIsNone(adder._check_prefill_tile_budget(129))
+
+    # ---- _swa_req_never_fits: the gate on the _swa_chunk_cap escape hatch ----
+    # The hatch shrinks a chunk and admits it instead of waiting; it must fire
+    # ONLY for a request whose SWA budget can never fit the drained pool (true
+    # head-of-line livelock). Admitting transient-pressure requests instead
+    # collapses the SWA evictable cushion and causes a retraction storm.
+
+    def create_swa_adder(
+        self, *, size_swa: int, sliding_window: int, page_size: int = 16
+    ) -> PrefillAdder:
+        self.mock_tree_cache.sliding_window_size = sliding_window
+        self.mock_token_allocator = self.create_token_allocator(size_swa=size_swa)
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=512,
+        )
+
+    def test_swa_never_fits_false_under_transient_pressure(self):
+        # Small request against an ample pool: budget << pool, so it would fit
+        # once running decodes drain -> must wait, not take the hatch.
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        self.assertFalse(
+            adder._swa_req_never_fits(extend_input_len=256, max_new_tokens=64)
+        )
+
+    def test_swa_never_fits_true_when_budget_exceeds_whole_pool(self):
+        # A large host-hit load-back charge pushes the budget past the entire
+        # pool: it can never fit however far the pool drains -> hatch.
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        self.assertTrue(
+            adder._swa_req_never_fits(
+                extend_input_len=256, max_new_tokens=64, swa_host_hit_length=4096
+            )
+        )
+
+    def test_swa_never_fits_is_gated_by_pool_capacity(self):
+        # Same request; only the pool size changes. Proves the check compares
+        # the budget against size_swa (guards against a wrong-accessor bug).
+        req = dict(extend_input_len=256, max_new_tokens=64, swa_host_hit_length=600)
+        self.assertTrue(
+            self.create_swa_adder(size_swa=512, sliding_window=128)._swa_req_never_fits(
+                **req
+            )
+        )
+        self.assertFalse(
+            self.create_swa_adder(
+                size_swa=4096, sliding_window=128
+            )._swa_req_never_fits(**req)
+        )
 
 
 if __name__ == "__main__":

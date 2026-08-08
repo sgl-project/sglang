@@ -30,6 +30,8 @@ limitations under the License.
 #include "cutlass/util/packed_stride.hpp"
 // clang-format on
 
+namespace sglang {
+
 using namespace cute;
 
 template <
@@ -41,6 +43,7 @@ template <
     typename EpilogueScheduleType,
     typename EpilogueTileType,
     bool WithBias,
+    bool ScalarA = false,
     typename TileScheduler = void>
 struct JitGemmFp8RowwiseC3x {
   using ElementType = cutlass::float_e4m3_t;
@@ -48,12 +51,14 @@ struct JitGemmFp8RowwiseC3x {
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+  using VectorScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+  using ScalarScaleA = cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementComputeEpilogue>;
+  using ScaleA = std::conditional_t<ScalarA, ScalarScaleA, VectorScaleA>;
 
   using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
@@ -135,7 +140,15 @@ struct JitGemmFp8RowwiseC3x {
 
   static ArgumentType prepare_args(
       tvm::ffi::TensorView scales_a, tvm::ffi::TensorView scales_b, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
-    typename ScaleA::Arguments a_args{static_cast<const float*>(scales_a.data_ptr())};
+    typename ScaleA::Arguments a_args = [&] {
+      auto* a_ptr = static_cast<const float*>(scales_a.data_ptr());
+      if constexpr (ScalarA) {
+        // Sm90ScalarBroadcast takes the scale by pointer, not by value.
+        return typename ScalarScaleA::Arguments{{}, {a_ptr}, {}};
+      } else {
+        return typename VectorScaleA::Arguments{a_ptr};
+      }
+    }();
     typename ScaleB::Arguments b_args{static_cast<const float*>(scales_b.data_ptr())};
     typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
 
@@ -207,3 +220,5 @@ void launch_c3x_fp8_rowwise_scaled_mm(
 
   CUTLASS_CHECK(gemm_op.run(args, workspace, stream));
 }
+
+}  // namespace sglang
