@@ -13,14 +13,21 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
+)
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import (
     EagleDraftWorker,
     EAGLEWorkerV2,
+    _aiter_draft_topk1,
     _aiter_draft_topk1_postprocess,
+    _prune_draft_extend_logits,
+    _use_aiter_draft_topk1,
     _use_draft_topk1_postprocess,
 )
 from sglang.test.ci.ci_register import (
@@ -201,6 +208,116 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             draft_tokens[:, (0, 1, 3)],
             torch.full((3, 3), -1, dtype=torch.long, device=DEVICE),
         )
+
+    def test_aiter_raw_selector_delegates_tie_and_nonfinite_inputs_unchanged(self):
+        logits = torch.tensor(
+            [
+                [1.0, 5.0, 5.0, 0.0],
+                [float("nan"), 2.0, 1.0, 0.0],
+                [float("-inf"), float("-inf"), float("-inf"), float("-inf")],
+                [0.0, 1.0, float("inf"), 2.0],
+            ],
+            device=DEVICE,
+        )
+        original = logits.clone()
+
+        def fake_greedy_sample(output, raw_logits):
+            torch.testing.assert_close(raw_logits, original, equal_nan=True)
+            # Model the established fallback's softmax + fast_topk(topk=1),
+            # whose index operation is torch.max.
+            reference_index = torch.max(
+                torch.softmax(raw_logits, dim=-1), dim=-1
+            ).indices
+            output.copy_(reference_index.to(torch.int32))
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2._aiter_greedy_sample",
+            side_effect=fake_greedy_sample,
+        ):
+            topk_p, topk_index = _aiter_draft_topk1(logits)
+
+        torch.testing.assert_close(logits, original, equal_nan=True)
+        expected_index = torch.max(
+            torch.softmax(original, dim=-1), dim=-1, keepdim=True
+        ).indices
+        torch.testing.assert_close(topk_index, expected_index)
+        torch.testing.assert_close(topk_p, torch.ones_like(topk_p))
+
+    def test_aiter_route_preserves_all_fallback_gates(self):
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_hip", True), patch(
+            "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
+        ), envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(True):
+            self.assertTrue(_use_aiter_draft_topk1(1, None, False))
+            self.assertFalse(_use_aiter_draft_topk1(2, None, False))
+            self.assertFalse(
+                _use_aiter_draft_topk1(
+                    1, torch.tensor([0], dtype=torch.long, device=DEVICE), False
+                )
+            )
+            self.assertFalse(_use_aiter_draft_topk1(1, None, True))
+
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_hip", True), patch(
+            "sglang.srt.speculative.eagle_worker_v2._use_aiter", True
+        ), envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.override(False):
+            self.assertFalse(_use_aiter_draft_topk1(1, None, False))
+
+    def test_draft_extend_row_pruning_keeps_full_hidden_capture(self):
+        hidden_states = torch.arange(24, device=DEVICE).reshape(6, 4)
+        select_index = torch.tensor([1, 5], dtype=torch.long, device=DEVICE)
+        metadata = LogitsMetadata(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            draft_extend_select_index=select_index,
+        )
+
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = LogitsProcessor._get_pruned_states(
+            None, hidden_states, None, None, metadata
+        )
+        stored_hidden_states = LogitsProcessor._get_hidden_states_to_store(
+            None,
+            hidden_states,
+            None,
+            None,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            metadata,
+        )
+
+        torch.testing.assert_close(pruned_states, hidden_states[select_index])
+        self.assertEqual(pruned_states.shape, (2, 4))
+        self.assertIs(stored_hidden_states, hidden_states)
+        self.assertEqual(stored_hidden_states.shape, (6, 4))
+
+    def test_draft_extend_pruning_and_graph_row_count_gates(self):
+        server_args = object()
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
+            return_value=False,
+        ):
+            self.assertTrue(_prune_draft_extend_logits(server_args))
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
+            return_value=True,
+        ):
+            self.assertFalse(_prune_draft_extend_logits(server_args))
+
+        runner = EAGLEDraftExtendCudaGraphRunner.__new__(
+            EAGLEDraftExtendCudaGraphRunner
+        )
+        runner.prune_draft_extend_logits = True
+        self.assertEqual(runner._num_logit_rows(batch_size=3, num_tokens=12), 3)
+        runner.prune_draft_extend_logits = False
+        self.assertEqual(runner._num_logit_rows(batch_size=3, num_tokens=12), 12)
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):

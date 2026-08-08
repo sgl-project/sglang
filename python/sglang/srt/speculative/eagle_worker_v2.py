@@ -92,6 +92,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -125,20 +126,10 @@ if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 
 
-def _aiter_draft_topk1_postprocess(
-    next_token_logits: torch.Tensor,
-    positions: torch.Tensor,
-    draft_tokens: Optional[torch.Tensor] = None,
-    draft_token_column: int = 0,
-):
-    """Select greedy draft tokens with AITER and update SGLang-owned metadata."""
+def _aiter_draft_topk1(next_token_logits: torch.Tensor):
+    """Select top-k=1 directly from raw logits with AITER."""
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
-    assert positions.ndim == 1
-    assert positions.dtype == torch.long
-    assert positions.is_contiguous()
-    assert positions.shape[0] == next_token_logits.shape[0]
-    assert positions.device == next_token_logits.device
 
     batch_size, vocab_size = next_token_logits.shape
     assert vocab_size > 0
@@ -150,6 +141,24 @@ def _aiter_draft_topk1_postprocess(
     topk_p = torch.ones(
         (batch_size, 1), dtype=torch.float32, device=next_token_logits.device
     )
+    return topk_p, topk_index
+
+
+def _aiter_draft_topk1_postprocess(
+    next_token_logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: Optional[torch.Tensor] = None,
+    draft_token_column: int = 0,
+):
+    """Select greedy draft tokens with AITER and update SGLang-owned metadata."""
+    assert positions.ndim == 1
+    assert positions.dtype == torch.long
+    assert positions.is_contiguous()
+    assert positions.shape[0] == next_token_logits.shape[0]
+    assert positions.device == next_token_logits.device
+
+    batch_size = next_token_logits.shape[0]
+    topk_p, topk_index = _aiter_draft_topk1(next_token_logits)
 
     positions.add_(1)
     if draft_tokens is not None:
@@ -168,6 +177,26 @@ def _use_draft_topk1_postprocess() -> bool:
     return _is_cuda or (
         _use_aiter and envs.SGLANG_OPT_USE_AITER_DRAFT_TOPK1.get()
     )
+
+
+def _use_aiter_draft_topk1(
+    topk: int,
+    hot_token_id: Optional[torch.Tensor],
+    use_rejection_sampling: bool,
+) -> bool:
+    """Whether AITER may replace the established softmax/top-k path."""
+    return (
+        topk == 1
+        and _is_hip
+        and _use_draft_topk1_postprocess()
+        and hot_token_id is None
+        and not use_rejection_sampling
+    )
+
+
+def _prune_draft_extend_logits(server_args: ServerArgs) -> bool:
+    """Whether draft-extend may project only its selected row per request."""
+    return not require_gathered_buffer(server_args)
 
 
 logger = logging.getLogger(__name__)
@@ -708,7 +737,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 draft_probs_list.append(probs)
                 forward_batch.positions.add_(1)
-            elif self.topk == 1 and (not _is_hip or _use_draft_topk1_postprocess()):
+            elif self.topk == 1 and (
+                not _is_hip
+                or _use_aiter_draft_topk1(
+                    self.topk,
+                    self.hot_token_id,
+                    use_rejection_sampling=False,
+                )
+            ):
                 if _use_draft_topk1_postprocess():
                     if _is_cuda:
                         # The positions advance is fused into the Triton kernel.
@@ -950,6 +986,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=False,
             )
 
+        # Prune before lm_head only when no gathered DP buffer requires all
+        # draft-window rows. The same spec_info field feeds eager and graph
+        # forwards; graph replay copies it into its static select-index buffer.
+        prune_draft_extend_logits = _prune_draft_extend_logits(self.server_args)
+        if prune_draft_extend_logits:
+            forward_batch.spec_info.select_index = select_index
+
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
@@ -1012,23 +1055,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        if not prune_draft_extend_logits:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
+        # Selection remains worker-owned for graph and eager outputs; only the
+        # LM-head row pruning itself is captured in the graph.
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
             )
         elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
+            # Keep ROCm on the established softmax + fast_topk path here:
+            # AITER greedy_sample differs for rows containing NaN logits.
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )

@@ -64,6 +64,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
+    select_index: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -102,6 +103,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        # Gathered-buffer modes size the DP logprob buffers for every draft
+        # window row and therefore cannot narrow the lm_head input to one row.
+        self.prune_draft_extend_logits = not self.require_gathered_buffer
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -124,7 +128,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.capture_forward_mode = self.forward_mode
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if self.eagle_worker.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
 
@@ -188,6 +196,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
+            select_index = torch.arange(
+                0,
+                self.max_num_token,
+                self.captured_req_width,
+                dtype=torch.int64,
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -225,7 +239,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             next_token_logits_buffer = (
                 self.model_runner.graph_shared_output.get_logits_buffer(
-                    vocab_size, rows=self.max_bs * self.captured_req_width
+                    vocab_size,
+                    rows=(
+                        self.max_bs
+                        if self.prune_draft_extend_logits
+                        else self.max_bs * self.captured_req_width
+                    ),
                 )
             )
 
@@ -256,6 +275,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens=extend_seq_lens,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            select_index=select_index,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -278,6 +298,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _num_logit_rows(self, batch_size: int, num_tokens: int) -> int:
+        return batch_size if self.prune_draft_extend_logits else num_tokens
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
@@ -339,10 +362,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[
+            : self._num_logit_rows(bs, num_tokens)
+        ]
 
-        # pruned_states = num_tokens (all tokens)
-        num_tokens_for_logprob = num_tokens
+        num_tokens_for_logprob = self._num_logit_rows(bs, num_tokens)
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.attn_dp_size
@@ -377,6 +401,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.captured_req_width,
         )
+        if self.prune_draft_extend_logits:
+            spec_info.select_index = buffers.select_index[:bs]
 
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -399,7 +425,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=self.capture_hidden_mode,
         )
 
         if self.buffers.dsa_seed_topk_capture is not None:
@@ -522,6 +548,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
             copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
+        if self.prune_draft_extend_logits:
+            assert forward_batch.spec_info.select_index is not None
+            copy_dsts.append(buffers.select_index[:raw_bs])
+            copy_srcs.append(forward_batch.spec_info.select_index)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
@@ -602,7 +632,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out = self._replay_graph(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_tokens],
-            hidden_states=out.hidden_states[:num_tokens],
+            next_token_logits=out.next_token_logits[
+                : self._num_logit_rows(raw_bs, num_tokens)
+            ],
+            hidden_states=(
+                out.hidden_states[:num_tokens]
+                if out.hidden_states is not None
+                else None
+            ),
         )
         return out
