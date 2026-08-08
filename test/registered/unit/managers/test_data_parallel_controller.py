@@ -12,10 +12,12 @@ is exercised as the real method, no mock.
 """
 
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
+import requests
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -27,6 +29,7 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -43,23 +46,42 @@ def _load(**overrides) -> LoadSnapshot:
     return msgspec.structs.replace(_BASE_LOAD, **overrides)
 
 
-def _make_controller(dp_size: int) -> DataParallelController:
+def _make_controller(
+    dp_size: int, launch_dp_size: int | None = None
+) -> DataParallelController:
     """Bypass __init__; inject only the attrs dispatch methods read."""
+    launch_dp_size = launch_dp_size or dp_size
     ctl = DataParallelController.__new__(DataParallelController)
     ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(dp_size)]
+    ctl.send_to_tokenizer = MagicMock(name="send_to_tokenizer")
     ctl.status = [True] * dp_size
     ctl._active_workers = list(range(dp_size))
+    ctl.launch_dp_size = launch_dp_size
+    ctl.bootstrap_room_dp_size = launch_dp_size
+    ctl.max_dp_size = dp_size
+    ctl.dp_active = [True] * launch_dp_size + [False] * (dp_size - launch_dp_size)
+    ctl.server_args = SimpleNamespace(disaggregation_mode="null")
+    ctl._pending_elastic_scale_update = None
+    ctl._last_bootstrap_topology_retry = 0.0
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(
+    routed_dp_rank=None,
+    bootstrap_room=None,
+    input_ids=None,
+    rid="test-rid",
+    http_worker_ipc=None,
+):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        rid=rid,
+        http_worker_ipc=http_worker_ipc,
     )
 
 
@@ -233,6 +255,116 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         ctl.follow_bootstrap_room_scheduler(_req(routed_dp_rank=3, bootstrap_room=1))
         ctl.workers[3].send_pyobj.assert_called_once()
         ctl.workers[1].send_pyobj.assert_not_called()
+
+    def test_excludes_reserved_slots_without_remapping_active_ranks(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl.workers[2:] = [None, None]
+        ctl.status[2:] = [False, False]
+        ctl._active_workers = [0, 1]
+
+        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=2))
+
+        ctl.workers[0].send_pyobj.assert_called_once()
+
+    def test_rejects_room_mapped_to_an_inactive_rank(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.status[1] = False
+        ctl._active_workers = [0, 2, 3]
+
+        ctl.follow_bootstrap_room_scheduler(
+            _req(bootstrap_room=1, http_worker_ipc="ipc://tokenizer-worker")
+        )
+
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_not_called()
+        abort = ctl.send_to_tokenizer.send_pyobj.call_args.args[0]
+        self.assertEqual(abort.rid, "test-rid")
+        self.assertEqual(abort.http_worker_ipc, "ipc://tokenizer-worker")
+        self.assertEqual(abort.finished_reason["status_code"], HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertIn("DP rank 1", abort.finished_reason["message"])
+
+    def test_scale_update_expands_bootstrap_room_modulo_domain(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl.status[2:] = [False, False]
+        ctl._active_workers = [0, 1]
+
+        ctl.handle_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=4,
+                slot_offset=2,
+                slot_count=2,
+            )
+        )
+        ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=2))
+
+        self.assertEqual(ctl.bootstrap_room_dp_size, 4)
+        ctl.workers[2].send_pyobj.assert_called_once()
+        for worker in (ctl.workers[0], ctl.workers[1], ctl.workers[3]):
+            worker.send_pyobj.assert_not_called()
+
+    def test_scale_update_advertises_expanded_bootstrap_dp_size(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl.status[2:] = [False, False]
+        ctl._active_workers = [0, 1]
+        ctl.server_args = SimpleNamespace(
+            disaggregation_mode="prefill",
+            dist_init_addr=None,
+            host="0.0.0.0",
+            disaggregation_bootstrap_port=8998,
+        )
+        response = MagicMock()
+
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.requests.post",
+            return_value=response,
+        ) as post:
+            ctl.handle_elastic_scale_update(
+                ElasticScaleUpdateReq(
+                    success=True,
+                    effective_ep_size=4,
+                    slot_offset=2,
+                    slot_count=2,
+                )
+            )
+
+        post.assert_called_once_with(
+            "http://127.0.0.1:8998/update_dp_size",
+            json={"dp_size": 4},
+            timeout=5,
+        )
+        response.raise_for_status.assert_called_once()
+
+    def test_scale_update_withholds_new_ranks_when_bootstrap_update_fails(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl.status[2:] = [False, False]
+        ctl._active_workers = [0, 1]
+        ctl.server_args = SimpleNamespace(
+            disaggregation_mode="prefill",
+            dist_init_addr=None,
+            host="127.0.0.1",
+            disaggregation_bootstrap_port=8998,
+        )
+        update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.requests.post",
+                side_effect=requests.RequestException("bootstrap unavailable"),
+            ) as post,
+            patch("sglang.srt.managers.data_parallel_controller.time.sleep"),
+        ):
+            ctl.handle_elastic_scale_update(update)
+
+        self.assertEqual(post.call_count, 3)
+        self.assertIs(ctl._pending_elastic_scale_update, update)
+        self.assertEqual(ctl.bootstrap_room_dp_size, 2)
+        self.assertEqual(ctl._active_workers, [0, 1])
 
 
 class TestTotalRequestsScheduler(CustomTestCase):

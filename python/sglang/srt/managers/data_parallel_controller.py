@@ -20,15 +20,18 @@ import signal
 import threading
 import time
 from enum import Enum, auto
+from http import HTTPStatus
 from typing import Callable, List, Optional
 
 import psutil
+import requests
 import setproctitle
 import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -152,6 +155,9 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.send_to_tokenizer = get_zmq_socket(
+                self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -168,6 +174,11 @@ class DataParallelController:
         )
 
         self.launch_dp_size: int = server_args.dp_size
+        # Keep this aligned with the scheduler's effective DP size so
+        # follow_bootstrap_room preserves its cross-process rank mapping.
+        self.bootstrap_room_dp_size: int = self.launch_dp_size
+        self._pending_elastic_scale_update: Optional[ElasticScaleUpdateReq] = None
+        self._last_bootstrap_topology_retry = 0.0
         self.max_dp_size: int = server_args.max_ep_size or server_args.dp_size
         assert self.max_dp_size >= self.launch_dp_size, (
             f"--max-ep-size ({self.max_dp_size}) must be >= "
@@ -292,6 +303,85 @@ class DataParallelController:
             self.max_dp_size,
         )
 
+    def handle_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
+        if not msg.success:
+            return
+
+        if msg.effective_ep_size > self.max_dp_size:
+            raise ValueError(
+                f"[Elastic EP] effective_ep_size ({msg.effective_ep_size}) exceeds "
+                f"max_dp_size ({self.max_dp_size})."
+            )
+
+        if not self._update_bootstrap_dp_size(msg.effective_ep_size):
+            # Do not expose a larger routing domain until decode can observe it.
+            self._pending_elastic_scale_update = msg
+            self._last_bootstrap_topology_retry = time.monotonic()
+            return
+
+        self._complete_elastic_scale_update(msg)
+
+    def _complete_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
+        self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+        self.bootstrap_room_dp_size = msg.effective_ep_size
+        self._pending_elastic_scale_update = None
+
+    def _update_bootstrap_dp_size(self, dp_size: int) -> bool:
+        if self.server_args.disaggregation_mode != "prefill":
+            return True
+
+        if self.server_args.dist_init_addr:
+            host = NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+        else:
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(
+                self.server_args.host, self.server_args.host
+            )
+        url = NetworkAddress(
+            host, self.server_args.disaggregation_bootstrap_port
+        ).to_url()
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{url}/update_dp_size", json={"dp_size": dp_size}, timeout=5
+                )
+                response.raise_for_status()
+                return True
+            except requests.RequestException as exc:
+                logger.warning(
+                    "[Elastic EP] Failed to update bootstrap DP size to %d "
+                    "(attempt %d/3): %s",
+                    dp_size,
+                    attempt + 1,
+                    exc,
+                )
+                if attempt < 2:
+                    time.sleep(0.1 * (2**attempt))
+        return False
+
+    def _retry_pending_bootstrap_topology_update(self) -> None:
+        pending = self._pending_elastic_scale_update
+        if pending is None or time.monotonic() - self._last_bootstrap_topology_retry < 1:
+            return
+
+        self._last_bootstrap_topology_retry = time.monotonic()
+        if self._update_bootstrap_dp_size(pending.effective_ep_size):
+            self._complete_elastic_scale_update(pending)
+
+    def _reject_bootstrap_request(self, req: Req, message: str) -> None:
+        logger.warning("Rejecting request %s: %s", req.rid, message)
+        sock_send(
+            self.send_to_tokenizer,
+            AbortReq(
+                rid=req.rid,
+                http_worker_ipc=req.http_worker_ipc,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+            ),
+        )
+
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
             i for i, active in enumerate(self.dp_active) if active and self.status[i]
@@ -351,12 +441,7 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
-                (
-                    ElasticScaleUpdateReq,
-                    lambda msg: self.add_elastic_workers(
-                        msg.slot_offset, msg.slot_count
-                    ),
-                ),
+                (ElasticScaleUpdateReq, self.handle_elastic_scale_update),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -776,11 +861,28 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
+        self._retry_pending_bootstrap_topology_update()
+        if self._pending_elastic_scale_update is not None:
+            self._reject_bootstrap_request(
+                req, "Elastic prefill topology update is still in progress."
+            )
+            return
+
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
-        target_rank = req.bootstrap_room % len(self.workers)
+        # The bootstrap server and decode side both derive this rank from the
+        # effective DP size. Do not compact active ranks here: doing so would
+        # remap a room after an elastic-EP fault and make its KV transfer fail.
+        target_rank = req.bootstrap_room % self.bootstrap_room_dp_size
+        if target_rank not in self._active_workers:
+            message = (
+                f"DP rank {target_rank} for bootstrap room {req.bootstrap_room} "
+                "is not active."
+            )
+            self._reject_bootstrap_request(req, message)
+            return
         sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
