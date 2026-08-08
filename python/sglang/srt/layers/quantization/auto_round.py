@@ -14,13 +14,35 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 ScalarType, scalar_types = get_scalar_types()
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+
+_CPU_AMX_REQUIRED_MSG = (
+    "SGLang's AutoRound CPU inference path currently requires the Intel AMX "
+    "CPU backend. Generic x86, AMD CPU, and other non-AMX CPU backends are "
+    "not supported by this SGLang backend."
+)
+
+_GPTQ_DEFAULTS = {
+    "lm_head_quantized": False,
+    "desc_act": False,
+    "dynamic": {},
+    "checkpoint_format": "",
+    "true_sequential": False,
+    "static_groups": False,
+}
 
 
 class AutoRoundConfig(QuantizationConfig):
     """Config class for AutoRound.
+
+    CPU support is limited to 4-bit AWQ/GPTQ checkpoints on the
+    Intel AMX backend. This is a limitation of SGLang's current CPU backend,
+    not a general AutoRound limitation.
+
     Reference: https://arxiv.org/pdf/2309.05516
     """
 
@@ -39,6 +61,13 @@ class AutoRoundConfig(QuantizationConfig):
         extra_config: Optional[dict[str, Any]] = None,
         data_type: str = "int",
         backend: str = "auto",
+        lm_head_quantized: bool = False,
+        desc_act: bool = False,
+        dynamic: Optional[dict[str, dict[str, Union[int, bool]]]] = None,
+        checkpoint_format: str = "",
+        true_sequential: bool = False,
+        static_groups: bool = False,
+        gptq_defaulted_config_keys: Optional[tuple[str, ...]] = None,
     ) -> None:
         super().__init__()
         if weight_bits not in self.SUPPORTED_BITS:
@@ -75,6 +104,14 @@ class AutoRoundConfig(QuantizationConfig):
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
+        self.lm_head_quantized = lm_head_quantized
+        self.desc_act = desc_act
+        self.dynamic = dynamic or {}
+        self.checkpoint_format = checkpoint_format
+        self.true_sequential = true_sequential
+        self.static_groups = static_groups
+        self.gptq_defaulted_config_keys = gptq_defaulted_config_keys or ()
+        self._logged_gptq_default_assumptions = False
 
     def __repr__(self) -> str:
         return (
@@ -100,6 +137,21 @@ class AutoRoundConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AutoRoundConfig":
+        def has_any_key(keys: list[str]) -> bool:
+            return any(key in config for key in keys)
+
+        gptq_config_keys = {
+            "lm_head_quantized": ["lm_head", "lm_head_quantized"],
+            "desc_act": ["desc_act"],
+            "dynamic": ["dynamic"],
+            "checkpoint_format": ["checkpoint_format"],
+            "true_sequential": ["true_sequential"],
+            "static_groups": ["static_groups"],
+        }
+        gptq_defaulted_config_keys = tuple(
+            name for name, keys in gptq_config_keys.items() if not has_any_key(keys)
+        )
+
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
@@ -117,6 +169,15 @@ class AutoRoundConfig(QuantizationConfig):
             backend=cls.get_from_keys_or(
                 config, ["backend", "vllm_backend", "sglang_backend"], "auto"
             ),
+            lm_head_quantized=cls.get_from_keys_or(
+                config, ["lm_head", "lm_head_quantized"], False
+            ),
+            desc_act=cls.get_from_keys_or(config, ["desc_act"], False),
+            dynamic=cls.get_from_keys_or(config, ["dynamic"], {}) or {},
+            checkpoint_format=cls.get_from_keys_or(config, ["checkpoint_format"], ""),
+            true_sequential=cls.get_from_keys_or(config, ["true_sequential"], False),
+            static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
+            gptq_defaulted_config_keys=gptq_defaulted_config_keys,
         )
 
     def get_scaled_act_names(self) -> list[str]:
@@ -217,6 +278,55 @@ class AutoRoundConfig(QuantizationConfig):
     def check_quantized(self, weight_bits: int) -> bool:
         return weight_bits < 16
 
+    def check_cpu_support(self, weight_bits: int) -> None:
+        if weight_bits != 4:
+            raise ValueError(
+                "SGLang's AutoRound CPU inference path currently supports "
+                "only 4-bit AWQ/GPTQ checkpoints because it uses the Intel "
+                f"AMX INT4 backend, but got {weight_bits}-bit."
+            )
+        if not _is_cpu_amx_available:
+            raise ValueError(_CPU_AMX_REQUIRED_MSG)
+
+    def log_gptq_default_assumptions_once(self) -> None:
+        if (
+            self._logged_gptq_default_assumptions
+            or not self.gptq_defaulted_config_keys
+        ):
+            return
+        self._logged_gptq_default_assumptions = True
+        default_summary = {
+            key: _GPTQ_DEFAULTS[key] for key in self.gptq_defaulted_config_keys
+        }
+        logger.info(
+            "AutoRound GPTQ config does not specify %s; using SGLang defaults %s.",
+            ", ".join(self.gptq_defaulted_config_keys),
+            default_summary,
+        )
+
+    def check_gptq_support(self) -> None:
+        if self.desc_act:
+            raise ValueError(
+                "SGLang's AutoRound GPTQ loader supports desc_act=False only. "
+                "AutoRound auto_gptq export does not use act-order/desc_act=True; "
+                "if this checkpoint is a GPTQModel act-order checkpoint, use "
+                "`--quantization gptq` or `--quantization gptq_marlin` instead."
+            )
+
+    def get_gptq_config_kwargs(self, weight_bits: int, group_size: int) -> dict[str, Any]:
+        self.log_gptq_default_assumptions_once()
+        self.check_gptq_support()
+        return {
+            "weight_bits": weight_bits,
+            "group_size": group_size,
+            "lm_head_quantized": self.lm_head_quantized,
+            "desc_act": self.desc_act,
+            "dynamic": self.dynamic,
+            "checkpoint_format": self.checkpoint_format,
+            "true_sequential": self.true_sequential,
+            "static_groups": self.static_groups,
+        }
+
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -241,6 +351,27 @@ class AutoRoundConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        if _is_cpu:
+            self.check_cpu_support(weight_bits)
+            from sglang.srt.layers.quantization.awq import (
+                AWQCPUConfig,
+                AWQLinearMethod,
+                AWQMoEMethod,
+            )
+
+            quant_args = AWQCPUConfig(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                zero_point=not sym,
+            )
+            if isinstance(layer, FusedMoE):
+                layer.scheme = quant_args.get_moe_scheme(layer)
+                return AWQMoEMethod(quant_args)
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                layer.scheme = quant_args.get_linear_scheme(layer)
+                return AWQLinearMethod(quant_args)
+            return None
+
         if backend == "auto" or "marlin" in backend:
             AWQ_TYPE_MAP = {
                 4: scalar_types.uint4,
@@ -249,11 +380,11 @@ class AutoRoundConfig(QuantizationConfig):
             use_marlin = (weight_bits in AWQ_TYPE_MAP) and check_marlin_supported(
                 AWQ_TYPE_MAP[weight_bits], group_size, not sym
             )
+
             if isinstance(layer, FusedMoE):
                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
                     layer, group_size
                 )
-
         else:
             use_marlin = False
         if use_marlin:
@@ -334,13 +465,29 @@ class AutoRoundConfig(QuantizationConfig):
             group_size,
             sym,
         )
+        self.log_gptq_default_assumptions_once()
         if _is_npu:
             quant_args = GPTQAscendConfig(
-                weight_bits=weight_bits,
-                group_size=group_size,
-                lm_head_quantized=False,
-                desc_act=False,
-                dynamic={},
+                **self.get_gptq_config_kwargs(weight_bits, group_size),
+            )
+            quant_args.sym = sym
+
+            if isinstance(layer, FusedMoE):
+                layer.scheme = quant_args.get_moe_scheme(layer)
+                return GPTQMoEMethod(quant_args)
+
+            if isinstance(layer, (LinearBase, ParallelLMHead)):
+                layer.scheme = quant_args.get_linear_scheme(layer)
+                return GPTQLinearMethod(quant_args)
+
+            return None
+
+        if _is_cpu:
+            self.check_cpu_support(weight_bits)
+            from sglang.srt.layers.quantization.gptq import CPUGPTQConfig
+
+            quant_args = CPUGPTQConfig(
+                **self.get_gptq_config_kwargs(weight_bits, group_size),
             )
             quant_args.sym = sym
 
@@ -379,37 +526,31 @@ class AutoRoundConfig(QuantizationConfig):
                 weight_bits=weight_bits,
                 group_size=group_size,
                 is_sym=sym,
-                lm_head_quantized=False,
-                desc_act=False,
-                dynamic={},
+                lm_head_quantized=self.lm_head_quantized,
+                desc_act=self.desc_act,
+                dynamic=self.dynamic,
                 full_config={},
             )
         else:
             from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQLinearMethod
 
             quant_args = GPTQConfig(
-                weight_bits=weight_bits,
-                group_size=group_size,
-                lm_head_quantized=False,
-                desc_act=False,
-                dynamic={},
+                **self.get_gptq_config_kwargs(weight_bits, group_size),
             )
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
-                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+                return GPTQMarlinMoEMethod(quant_args_marlin)
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
-                config = {
-                    "quant_method": "gptq",
-                    "bits": weight_bits,
-                    "group_size": group_size,
-                    "sym": sym,
-                    "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
-            return GPTQMarlinMoEMethod(quant_args_marlin)
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
@@ -420,8 +561,7 @@ class AutoRoundConfig(QuantizationConfig):
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        # TODO enable CPU quant method later
         if "gptq" in self.packing_format or "gptq" in self.backend:
-            return self.apply_gptq_quant_layer(layer, prefix)
+            return self.apply_gptq_quant_layer(layer, prefix, self.backend)
         if "awq" in self.packing_format or "awq" in self.backend:
-            return self.apply_awq_quant_layer(layer, prefix)
+            return self.apply_awq_quant_layer(layer, prefix, self.backend)
