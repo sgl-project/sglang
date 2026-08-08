@@ -8803,8 +8803,15 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            pp_dspark_prefill = (
+                self.speculative_algorithm or ""
+            ).upper() == "DSPARK" and self.disaggregation_mode == "prefill"
+            assert self.speculative_algorithm is None or pp_dspark_prefill, (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for DSPARK on a PD prefill server"
+            )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "

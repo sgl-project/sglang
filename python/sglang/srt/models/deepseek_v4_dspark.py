@@ -18,6 +18,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    inverse_transform_scale_ue8m0,
+    transform_scale_ue8m0,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -40,9 +45,10 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
+    use_lifecycle_only_draft_model,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -59,6 +65,83 @@ _PAD_NUM_HEADS = 64
 _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
 )
+
+
+class _BlockFp8LinearSlice(nn.Module):
+    """Persistent K-block slice of a loaded block-FP8 ReplicatedLinear."""
+
+    def __init__(
+        self,
+        *,
+        source: ReplicatedLinear,
+        feature_indices: List[int],
+        feature_width: int,
+    ) -> None:
+        super().__init__()
+        quant_method = source.quant_method
+        if not (
+            isinstance(quant_method, Fp8LinearMethod)
+            and quant_method.block_quant
+            and not quant_method.use_mxfp8
+            and not quant_method.use_marlin
+        ):
+            raise ValueError(
+                "DSpark block-FP8 projection slice requires a non-MXFP8 "
+                "block-quantized Fp8LinearMethod."
+            )
+
+        block_k = int(quant_method.weight_block_size[1])
+        if feature_width % block_k != 0:
+            raise ValueError(
+                f"DSpark feature width {feature_width} must align to FP8 "
+                f"block_k={block_k}."
+            )
+        blocks_per_feature = feature_width // block_k
+        device = source.weight.device
+        weight_columns = torch.cat(
+            [
+                torch.arange(
+                    feature_index * feature_width,
+                    (feature_index + 1) * feature_width,
+                    device=device,
+                )
+                for feature_index in feature_indices
+            ]
+        )
+        scale_columns = torch.cat(
+            [
+                torch.arange(
+                    feature_index * blocks_per_feature,
+                    (feature_index + 1) * blocks_per_feature,
+                    device=device,
+                )
+                for feature_index in feature_indices
+            ]
+        )
+
+        self.quant_method = quant_method
+        self.weight = nn.Parameter(
+            source.weight.detach().index_select(1, weight_columns).contiguous(),
+            requires_grad=False,
+        )
+        source_scale = source.weight_scale_inv.detach()
+        scale_is_ue8m0 = source.weight_scale_inv.format_ue8m0
+        if scale_is_ue8m0:
+            source_scale = inverse_transform_scale_ue8m0(
+                source_scale, mn=source.weight.shape[0]
+            )
+        local_scale = source_scale.index_select(1, scale_columns).contiguous()
+        if scale_is_ue8m0:
+            local_scale = transform_scale_ue8m0(local_scale, mn=source.weight.shape[0])
+        self.weight_scale_inv = nn.Parameter(
+            local_scale,
+            requires_grad=False,
+        )
+        self.weight_scale_inv.format_ue8m0 = scale_is_ue8m0
+        self.register_parameter("bias", None)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply(self, hidden_states, bias=None)
 
 
 def apply_rotary_emb(
@@ -591,6 +674,39 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self.start_layer = 0
         self.end_layer = self.num_stages
+        parallel = get_parallel()
+        self.is_lifecycle_only = use_lifecycle_only_draft_model(
+            disaggregation_mode=get_disagg().disaggregation_mode,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
+            target_layer_ids=[
+                int(layer_id) for layer_id in (dspark_config.target_layer_ids or [])
+            ],
+            num_hidden_layers=target_num_layers,
+        )
+        self.hc_mult = int(config.hc_mult)
+        self.norm_eps = float(config.rms_norm_eps)
+        self.hc_eps = float(config.hc_eps)
+        self.embed_tokens: Optional[nn.Module] = None
+        self.lm_head: Optional[nn.Module] = None
+        self._partial_feature_indices: tuple[int, ...] = ()
+        self._partial_main_proj: Optional[_BlockFp8LinearSlice] = None
+        self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
+        self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        if self.is_lifecycle_only:
+            # Keep ModelRunner's distributed lifecycle aligned without building
+            # draft compute modules on PP ranks that cannot contribute context.
+            self.stages = nn.ModuleList()
+            self.markov_head = None
+            self.confidence_head = None
+            logger.info(
+                "DSpark PP rank %s uses a lifecycle-only draft model; all target "
+                "features are owned by final PP rank %s.",
+                parallel.pp_rank,
+                parallel.pp_size - 1,
+            )
+            return
+
         use_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and envs.SGLANG_DSPARK_ENABLE_MULTI_STREAM.get()
@@ -621,14 +737,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
         )
-        self.hc_mult = int(config.hc_mult)
-        self.norm_eps = float(config.rms_norm_eps)
-        self.hc_eps = float(config.hc_eps)
-
-        self.embed_tokens: Optional[nn.Module] = None
-        self.lm_head: Optional[nn.Module] = None
-        self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
-        self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -641,10 +749,101 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=lm_head)
 
-    def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
+    def prune_to_ctx_projection(self) -> None:
+        if self.is_lifecycle_only:
+            return
         stage0 = self.stages[0]
-        projected, _ = stage0.main_proj(main_hidden)
-        return stage0.main_norm(projected)
+        projection_stage = nn.Module()
+        projection_stage.main_proj = stage0.main_proj
+        projection_stage.main_norm = stage0.main_norm
+        # Preserve stages.0.main_proj parameter names for online weight updates.
+        self.stages = nn.ModuleList([projection_stage])
+        self.markov_head = None
+        self.confidence_head = None
+        self.embed_tokens = None
+        self.lm_head = None
+        del stage0
+        torch.cuda.empty_cache()
+
+    def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        projected, _ = self.stages[0].main_proj(main_hidden)
+        return self.stages[0].main_norm(projected)
+
+    def prepare_target_hidden_partial(self, feature_indices: List[int]) -> None:
+        feature_indices = [int(index) for index in feature_indices]
+        main_proj = self.stages[0].main_proj
+        quant_method = main_proj.quant_method
+        self._partial_feature_indices = tuple(feature_indices)
+        if not (
+            isinstance(quant_method, Fp8LinearMethod)
+            and quant_method.block_quant
+            and not quant_method.use_mxfp8
+            and not quant_method.use_marlin
+        ):
+            self._partial_main_proj = None
+            logger.warning(
+                "DSpark partial projection cannot slice quant method %s; "
+                "falling back to the full-K projection.",
+                type(quant_method).__name__,
+            )
+            return
+        self._partial_main_proj = _BlockFp8LinearSlice(
+            source=main_proj,
+            feature_indices=feature_indices,
+            feature_width=int(self.config.hidden_size),
+        )
+        logger.info(
+            "DSpark block-FP8 partial projection uses feature columns %s "
+            "(local K=%s, full K=%s).",
+            feature_indices,
+            len(feature_indices) * int(self.config.hidden_size),
+            int(main_proj.weight.shape[1]),
+        )
+
+    def project_target_hidden_partial(
+        self, main_hidden: torch.Tensor, feature_indices: list[int]
+    ) -> torch.Tensor:
+        """Project PP-local target features into an additive pre-norm context."""
+        if not feature_indices:
+            raise ValueError("feature_indices must be non-empty.")
+        feature_indices = [int(index) for index in feature_indices]
+        if min(feature_indices) < 0 or max(feature_indices) >= self.num_target_features:
+            raise ValueError(
+                "DeepSeek-V4 DSpark feature_indices out of range: "
+                f"{feature_indices=} {self.num_target_features=}."
+            )
+
+        hidden_size = int(self.config.hidden_size)
+        expected = len(feature_indices) * hidden_size
+        if main_hidden.ndim != 2 or int(main_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "DeepSeek-V4 DSpark partial main_hidden feature dim mismatch. "
+                f"Expected shape [N, {expected}] for {feature_indices=}, "
+                f"but got shape={tuple(main_hidden.shape)}."
+            )
+
+        if (
+            self._partial_main_proj is not None
+            and tuple(feature_indices) == self._partial_feature_indices
+        ):
+            return self._partial_main_proj(main_hidden)
+
+        local_features = main_hidden.view(
+            main_hidden.shape[0], len(feature_indices), hidden_size
+        )
+        full_features = main_hidden.new_zeros(
+            main_hidden.shape[0], self.num_target_features, hidden_size
+        )
+        # Reuse ReplicatedLinear.forward so FP8 weights and scales follow the
+        # same quantization path as the full, non-PP projection.
+        feature_index = torch.tensor(
+            feature_indices, dtype=torch.long, device=main_hidden.device
+        )
+        full_features.index_copy_(1, feature_index, local_features)
+        projected, _ = self.stages[0].main_proj(
+            full_features.view(main_hidden.shape[0], -1)
+        )
+        return projected
 
     def write_target_hidden_kv(
         self,
@@ -655,6 +854,37 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
         main_x = self.project_target_hidden(main_hidden)
+        self._write_context_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def write_projected_context_kv(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        main_x = self.stages[0].main_norm(projected_context)
+        self._write_context_hidden_kv(
+            main_x=main_x,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+        )
+
+    def _write_context_hidden_kv(
+        self,
+        *,
+        main_x: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
         swa_loc = swa_loc.to(torch.int32)
         kvs = CommitKvProj.execute(
             main_x=main_x,
@@ -758,6 +988,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        if self.is_lifecycle_only:
+            return
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 

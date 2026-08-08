@@ -513,6 +513,44 @@ class DSparkDraftMixin:
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = self.project_target_hidden(target_hidden)
+        self.write_context_hidden_kv(
+            ctx_hidden=ctx_hidden,
+            pool=pool,
+            positions=positions,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
+    def write_projected_context_kv(
+        self,
+        *,
+        projected_context: torch.Tensor,
+        pool,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.write_context_hidden_kv(
+            ctx_hidden=self.hidden_norm(projected_context),
+            pool=pool,
+            positions=positions,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
+    def write_context_hidden_kv(
+        self,
+        *,
+        ctx_hidden: torch.Tensor,
+        pool,
+        positions: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
         stacked = self._stacked_ctx_kv_params()
         if stacked is not None:
             k_all, v_all = self._project_ctx_kv_stacked(

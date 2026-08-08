@@ -2500,16 +2500,29 @@ class KimiK3LinearModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if self.dspark_layers_to_capture is not None:
+                if aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
             assert not sp_sharded
             if attn_res is not None:
                 if residual is not None:
                     # Materialize the delayed MLP add: the wire carries the
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
+                    proxy_tensors["hidden_states"] = hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                proxy_tensors["residual"] = residual
+            return PPProxyTensors(proxy_tensors)
 
         if hidden_states.shape[0] != 0:
             if attn_res is not None:
@@ -2618,18 +2631,17 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     @torch.no_grad()
     def forward(
@@ -2740,6 +2752,35 @@ class KimiK3LinearForCausalLM(nn.Module):
         loaded_params: set[str] = set()
 
         num_hidden_layers = self.config.num_hidden_layers
+
+        def maybe_load_truncated_moe_gate(
+            param_name: str, param: torch.Tensor, loaded_weight: torch.Tensor
+        ) -> bool:
+            if self.config.num_experts is None:
+                return False
+            if not (
+                param_name.endswith(".mlp.gate.weight")
+                or param_name.endswith(".mlp.gate.e_score_correction_bias")
+            ):
+                return False
+            if loaded_weight.shape == param.data.shape:
+                return False
+            keep_num_experts = int(self.config.num_experts)
+            if loaded_weight.shape[0] < keep_num_experts:
+                raise ValueError(
+                    f"Cannot truncate Kimi-K3 MoE gate weight {param_name}: "
+                    f"checkpoint has {loaded_weight.shape[0]} experts, "
+                    f"requested {keep_num_experts}."
+                )
+            truncated_weight = loaded_weight.narrow(0, 0, keep_num_experts)
+            if truncated_weight.shape != param.data.shape:
+                raise ValueError(
+                    f"Unexpected truncated Kimi-K3 MoE gate shape for {param_name}: "
+                    f"{truncated_weight.shape=} {param.data.shape=}."
+                )
+            param.data.copy_(truncated_weight)
+            return True
+
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
@@ -2846,6 +2887,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
+                    if maybe_load_truncated_moe_gate(name, param, loaded_weight):
+                        loaded_params.add(name)
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
