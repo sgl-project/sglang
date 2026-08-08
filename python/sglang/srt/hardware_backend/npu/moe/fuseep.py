@@ -8,13 +8,17 @@ weight-postprocess helper that NPU quant_methods call from their
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_moe_ep_group
+from sglang.srt.distributed import get_moe_ep_group, get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import get_exec
@@ -27,23 +31,103 @@ if TYPE_CHECKING:
 _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
 
-def _get_fuseep_buffer(layer: FusedMoE):
-    DeepEPBuffer.set_dispatch_mode_as_low_latency()
+def _get_fuseep_buffer(layer: FusedMoE, normal_mode: bool = False):
+    if normal_mode:
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+    else:
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
     return DeepEPBuffer.get_deepep_buffer(
         get_moe_ep_group().device_group,
         layer.hidden_size,
         _PARAMS_BYTES,
-        DeepEPMode.LOW_LATENCY,
+        DeepEPMode.AUTO,
         envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(),
         layer.num_experts,
     )
+
+
+def _prepare_normal_inputs(
+    layer: FusedMoE,
+    hidden_states: torch.Tensor,
+    topk_output: TopKOutput,
+    use_dp_attention: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    # Prepare normal-mode (DispatchFFNCombine) inputs and output bounds.
+    num_output_tokens = hidden_states.shape[0]
+    global_num_tokens = get_dp_global_num_tokens() if use_dp_attention else None
+    num_input_tokens = max(
+        num_output_tokens,
+        sum(global_num_tokens) if global_num_tokens is not None else 0,
+    )
+    # A zero weighted dummy route keeps every EP rank in the collective; discard
+    # its zero output before returning to the idle scheduler.
+    if num_output_tokens == 0:
+        hidden_states = hidden_states.new_zeros((1, layer.hidden_size))
+        topk_ids = torch.zeros(
+            (1, topk_output.topk_ids.shape[1]),
+            dtype=topk_output.topk_ids.dtype,
+            device=hidden_states.device,
+        )
+        topk_weights = torch.ones(
+            (1, topk_output.topk_weights.shape[1]),
+            dtype=topk_output.topk_weights.dtype,
+            device=hidden_states.device,
+        )
+    else:
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+    topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)
+    if use_dp_attention:
+        hidden_states = hidden_states.clone()
+        topk_ids = topk_ids.contiguous()
+        topk_weights = topk_weights.contiguous()
+    tp_size = 1 if use_dp_attention else get_tp_group().device_group.size()
+    max_output_size = max(num_input_tokens, 1) * topk_ids.shape[1] * tp_size
+    return hidden_states, topk_ids, topk_weights, num_output_tokens, max_output_size
 
 
 def forward_fuseep(
     layer: FusedMoE,
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
+    fuseep_activation,
 ) -> torch.Tensor:
+    (
+        activation_type,
+        activation_alpha,
+        gate_clamp_max,
+        up_clamp_min,
+        up_clamp_max,
+        up_add,
+    ) = fuseep_activation.kernel_args()
+    fuse_mode = get_exec().moe.fuseep_mode
+    if fuse_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value:
+        buf = _get_fuseep_buffer(layer, normal_mode=True)
+        hidden_states, topk_ids, topk_weights, num_output_tokens, max_output_size = (
+            _prepare_normal_inputs(
+                layer, hidden_states, topk_output, is_dp_attention_enabled()
+            )
+        )
+        hidden_states, _ = buf.fused_deep_moe(
+            hidden_states,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            gmm1_permuted_weight=layer.w13_weight,
+            gmm1_permuted_weight_scale=layer.w13_weight_scale,
+            gmm2_weight=layer.w2_weight,
+            gmm2_weight_scale=layer.w2_weight_scale,
+            num_max_dispatch_tokens_per_rank=max_output_size,
+            num_experts=layer.num_experts,
+            fuse_mode=fuse_mode,
+            activation_type=activation_type,
+            activation_alpha=activation_alpha,
+            gate_clamp_max=gate_clamp_max,
+            up_clamp_min=up_clamp_min,
+            up_clamp_max=up_clamp_max,
+            up_add=up_add,
+        )
+        return hidden_states[:num_output_tokens]
+
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
@@ -57,7 +141,13 @@ def forward_fuseep(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
-        fuse_mode=get_exec().moe.fuseep_mode,
+        fuse_mode=fuse_mode,
+        activation_type=activation_type,
+        activation_alpha=activation_alpha,
+        gate_clamp_max=gate_clamp_max,
+        up_clamp_min=up_clamp_min,
+        up_clamp_max=up_clamp_max,
+        up_add=up_add,
     )
     return hidden_states
 
@@ -113,11 +203,15 @@ def _release_weight_cache(weight: torch.Tensor) -> torch.Tensor:
 def _scale_from_float_to_int64(scale: torch.Tensor) -> torch.nn.Parameter:
     import numpy as np
 
-    converted = torch.from_numpy(
-        np.frombuffer(
-            scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
-        ).astype(np.int64)
-    ).to(scale.device)
+    converted = (
+        torch.from_numpy(
+            np.frombuffer(
+                scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
+            ).astype(np.int64)
+        )
+        .reshape(scale.shape)
+        .to(scale.device)
+    )
     return torch.nn.Parameter(converted, requires_grad=False)
 
 

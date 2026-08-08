@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -52,7 +53,11 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    FuseEPActivationConfig,
+    FuseEPActivationType,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -326,6 +331,14 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
+            fuseep_activation=FuseEPActivationConfig(
+                activation_type=FuseEPActivationType.SWIGLU_OAI,
+                alpha=config.swiglu_alpha,
+                gate_clamp_max=config.swiglu_limit,
+                up_clamp_min=-config.swiglu_limit,
+                up_clamp_max=config.swiglu_limit,
+                up_add=1.0,
+            ),
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -340,9 +353,13 @@ class MiniMaxM3MoE(nn.Module):
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts
-            # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
-            # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
-            shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            # Under DeepEP/FuseEP the layer output is all-gathered, not all-reduced, so a
+            # TP-sharded shared MLP (reduce_results=False) would leave an unreduced
+            # partial. Replicate it (tp_size=1) for a complete output, like GLM4 / DSV2.
+            shared_experts_tp1 = (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+            )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
@@ -366,8 +383,11 @@ class MiniMaxM3MoE(nn.Module):
 
         self.layer_id = layer_id
 
-        if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_parallel().moe_ep_size
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
+            self.ep_size = get_moe_expert_parallel_world_size()
             self.top_k = config.num_experts_per_tok
 
     @staticmethod
@@ -382,12 +402,14 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             return self.forward_deepep(hidden_states, forward_batch)
-        else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+        return self.forward_normal(
+            hidden_states, should_allreduce_fusion, use_reduce_scatter
+        )
 
     def forward_normal(
         self,
@@ -430,8 +452,9 @@ class MiniMaxM3MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        # DeepEP returns the complete per-token routed result (no TP all-reduce here);
-        # shared experts are replicated (tp_size=1), so both add directly.
+        # DeepEPMoE returns the complete per-token routed result (no TP all-reduce
+        # here, unlike forward_normal), and the shared experts are replicated
+        # (tp_size=1, see __init__), so both are complete per token and add directly.
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
