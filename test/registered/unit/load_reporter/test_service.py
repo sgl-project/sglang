@@ -9,6 +9,7 @@ stream replacement, and the fixed-port-occupied failure path.
 from __future__ import annotations
 
 import asyncio
+import sys
 import types
 from typing import AsyncIterator
 
@@ -428,3 +429,7 @@ class TestFixedPortOccupied:
             await rt.close()
         finally:
             sock.close()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

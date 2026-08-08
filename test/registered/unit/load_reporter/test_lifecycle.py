@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 import types
 from typing import Any, AsyncIterator, List, Optional
 
@@ -71,7 +72,7 @@ class FakeOwner:
         self.server_args = make_server_args(port=port)
 
     def make_generate(self):
-        from sglang.srt.load_reporter.decorator import enable_load_monitor
+        from sglang.srt.load_reporter.event_hooks import enable_load_monitor
 
         @enable_load_monitor("request_lifecycle")
         async def generate_request(self, n: int = 3):
@@ -93,7 +94,7 @@ class FakeWorkerOwner:
         self.sent.append(obj)
 
     def make_generate(self):
-        from sglang.srt.load_reporter.decorator import enable_load_monitor
+        from sglang.srt.load_reporter.event_hooks import enable_load_monitor
 
         @enable_load_monitor("request_lifecycle")
         async def generate_request(self, n: int = 2):
@@ -148,6 +149,7 @@ class TestDisabled:
         Runs in a clean subprocess so already-imported grpc in this session
         does not mask a regression.
         """
+        import os
         import subprocess
         import sys
         import textwrap
@@ -173,7 +175,14 @@ class TestDisabled:
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
-            cwd="python",
+            cwd=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                os.pardir,
+                os.pardir,
+                os.pardir,
+                os.pardir,
+                "python",
+            ),
         )
         assert "OK" in result.stdout, result.stderr
 
@@ -615,3 +624,7 @@ class TestLifecycleShadowRestoration:
         handle._restore()
 
         assert owner.__dict__["generate_request"] is original
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

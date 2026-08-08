@@ -10,7 +10,10 @@ Asserts wire-contract invariants WITHOUT starting a server:
 
 import ast
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 from sglang.srt.load_reporter.proto import load_monitor_pb2
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -174,3 +177,7 @@ class TestLoadReportFieldNumbers:
 
     def test_ranks_is_7(self):
         assert _fields_by_number("LoadReport")[7] == "ranks"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

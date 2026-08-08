@@ -8,6 +8,7 @@ No grpc.aio server is needed; sessions are driven directly.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import types
 
@@ -803,3 +804,7 @@ class TestDecoratorEvents:
         finally:
             session.stop()
             await rt.close()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
