@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ConfigureLoggingReq,
     ContinueGenerationReqInput,
     FreezeGCReq,
     PauseContinueBroadcastReq,
@@ -555,9 +556,14 @@ class MultiTokenizerRouter:
 class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
-    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
+    Each request is pinned to a worker by hashing its ``rid`` with
     ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
     always land on the same detokenizer and ``decode_status`` stays consistent.
+
+    The key is the ``rid`` rather than the ``http_worker_ipc`` because the
+    latter is only stamped when ``--tokenizer-worker-num > 1``, and even then it
+    identifies an HTTP worker instead of a request, so it can never spread load
+    over more detokenizers than there are tokenizer workers.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -579,18 +585,18 @@ class MultiDetokenizerRouter:
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
 
-            # FreezeGCReq must freeze every detokenizer process.
-            if isinstance(recv_obj, FreezeGCReq):
+            # Control messages carry no rid and must reach every detokenizer.
+            if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Single request: route by its own rid.
             if isinstance(recv_obj, BaseReq):
                 assert (
-                    recv_obj.http_worker_ipc is not None
-                ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                    recv_obj.rid is not None
+                ), f"Single req {type(recv_obj).__name__} missing rid"
+                self._send(self._pick(recv_obj.rid), recv_obj)
                 continue
 
             # Batch request.
@@ -601,20 +607,22 @@ class MultiDetokenizerRouter:
                         self._send(ipc, recv_obj)
                     continue
 
+                # http_worker_ipcs is only populated when there are multiple
+                # tokenizer workers. It is forwarded so the detokenizer can
+                # answer the right HTTP worker, it is not a routing key.
                 ipcs = recv_obj.http_worker_ipcs
-                assert (
-                    ipcs is not None
-                    and len(ipcs) == len(recv_obj.rids)
-                    and all(x is not None for x in ipcs)
+                assert ipcs is None or len(ipcs) == len(
+                    recv_obj.rids
                 ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
 
-                # Split per-item and route each by its own ipc.
-                for i, ipc_key in enumerate(ipcs):
+                # Split per-item and route each by its own rid.
+                for i, rid in enumerate(recv_obj.rids):
                     one = _handle_output_by_index(recv_obj, i)
                     if one is recv_obj:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
-                    one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(ipc_key), one)
+                    if ipcs is not None:
+                        one.http_worker_ipcs = [ipcs[i]]
+                    self._send(self._pick(rid), one)
                 continue
 
             raise ValueError(
