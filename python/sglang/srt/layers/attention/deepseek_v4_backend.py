@@ -935,13 +935,21 @@ class DeepseekV4AttnBackend(
         self, *, seq_lens: torch.Tensor, seq_lens_cpu: List[int], extend_len: int
     ) -> Tuple[VerifyExtendLengths, torch.Tensor]:
         # Uniform verify / draft-block geometry off the preallocated graph
-        # buffers. The returned slices are shared per backend instance;
+        # buffers (allocated only under spec decoding; both callers are
+        # spec-only). The returned slices are shared per backend instance;
         # callers must not mutate them.
+        assert self.speculative_num_draft_tokens is not None
         bs = int(seq_lens.shape[0])
         extend_seq_lens = self.extend_seq_lens_buffer[:bs]
         extend_seq_lens.fill_(extend_len)
         extend_start_loc = self.extend_start_loc_buffer[:bs]
-        torch.arange(0, bs * extend_len, extend_len, out=extend_start_loc)
+        torch.arange(
+            0,
+            bs * extend_len,
+            extend_len,
+            out=extend_start_loc,
+            **self.cuda_int32_kwargs,
+        )
         lengths = VerifyExtendLengths(
             seq_lens_extended=seq_lens + extend_len,
             seq_lens_cpu_extended=[x + extend_len for x in seq_lens_cpu],
