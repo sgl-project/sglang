@@ -65,12 +65,21 @@ on:
 
       scheduled:
         description: >
-          This is a nightly/weekly run, not a per-commit one. Turns on the four
+          This is a nightly/weekly run, not a per-commit one. Turns on the three
           things that differ, none of which any per-commit stage wants: per-file
           budgets derived from est_time (a scheduled suite mixes 30s and 2h
-          tests), the full jit_kernel grids, metrics upload, and the precision
-          rolling baseline. Shards also run one at a time unless the caller was
-          dispatched with full_parallel, leaving the pool to per-commit CI.
+          tests), the full jit_kernel grids, and metrics upload. Shards also run
+          one at a time unless the caller was dispatched with full_parallel,
+          leaving the pool to per-commit CI.
+        type: boolean
+        default: false
+      precision_baseline:
+        description: >
+          Export the rolling-baseline env that test_nightly_precision_regression.py
+          reads. Kept separate from `scheduled` because HF_TOKEN is part of that
+          set: the baseline-store token is scoped to that one repo, so exporting
+          it on a stage that does not need it shadows the runner's own token and
+          turns every gated model into a 404.
         type: boolean
         default: false
       job_timeout_minutes:
@@ -185,15 +194,16 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
-          # Read only by test_nightly_precision_regression.py, which is nightly-
-          # only; harmless for everything else sharing the machine, so it is set
-          # for the whole stage rather than carving that test into its own job.
-          SGLANG_PRECISION_BASELINE_DIR: ${{ inputs.scheduled && '/tmp/sglang_precision_baselines' || '' }}
-          SGLANG_PRECISION_HF_REPO: ${{ inputs.scheduled && vars.SGLANG_PRECISION_HF_REPO || '' }}
-          SGLANG_PRECISION_HF_REVISION: ${{ inputs.scheduled && (vars.SGLANG_PRECISION_HF_REVISION || 'main') || '' }}
-          HF_TOKEN: ${{ inputs.scheduled && secrets.HF_TOKEN_PRECISION_STORE || '' }}
-          SGLANG_PRECISION_COMMIT: ${{ inputs.scheduled && github.sha || '' }}
-          SGLANG_PRECISION_FORCE_UPDATE: ${{ fromJson(inputs.caller_inputs).force_baseline_update && '1' || '0' }}
+          # Only for the stage that runs test_nightly_precision_regression.py.
+          # HF_TOKEN especially: the baseline-store token is scoped to that repo
+          # alone, so exporting it anywhere else shadows the runner's own token
+          # and every gated model 404s.
+          SGLANG_PRECISION_BASELINE_DIR: ${{ inputs.precision_baseline && '/tmp/sglang_precision_baselines' || '' }}
+          SGLANG_PRECISION_HF_REPO: ${{ inputs.precision_baseline && vars.SGLANG_PRECISION_HF_REPO || '' }}
+          SGLANG_PRECISION_HF_REVISION: ${{ inputs.precision_baseline && (vars.SGLANG_PRECISION_HF_REVISION || 'main') || '' }}
+          HF_TOKEN: ${{ inputs.precision_baseline && secrets.HF_TOKEN_PRECISION_STORE || '' }}
+          SGLANG_PRECISION_COMMIT: ${{ inputs.precision_baseline && github.sha || '' }}
+          SGLANG_PRECISION_FORCE_UPDATE: ${{ (inputs.precision_baseline && fromJson(inputs.caller_inputs).force_baseline_update) && '1' || '0' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
