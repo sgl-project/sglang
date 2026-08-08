@@ -37,6 +37,8 @@ pub const STALE_AFTER: Duration = Duration::from_secs(3);
 pub const LEASE_TTL: Duration = Duration::from_secs(15);
 /// Timeout applied while connecting to one Worker reporter.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Timeout for the Worker's registration ack after the stream is established.
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Initial gRPC reconnection delay.
 pub const RECONNECT_INITIAL: Duration = Duration::from_millis(200);
 /// Maximum exponential gRPC reconnection delay before jitter.
@@ -63,7 +65,7 @@ pub enum Freshness {
     Missing,
     /// The report is explicit stale, locally invalid for scheduling, or too old.
     Stale,
-    /// The engine explicitly reported that it cannot obtain load.
+    /// Engine cannot obtain load; ages to [`Freshness::Stale`] after [`STALE_AFTER`].
     Unreachable,
     /// The report is healthy and younger than [`STALE_AFTER`].
     Fresh,
@@ -505,6 +507,11 @@ impl LoadMonitor {
         let mut stream = response.into_inner();
         let first = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(ACK_TIMEOUT) => {
+                return Err(anyhow!(
+                    "Worker did not send registration ack within {ACK_TIMEOUT:?}"
+                ));
+            }
             result = stream.message() => result?,
         }
         .ok_or_else(|| anyhow!("Worker closed reporter stream before registration ack"))?;
@@ -914,6 +921,7 @@ fn worker_snapshot(state: &WorkerState, captured: SystemTime) -> WorkerSnapshot 
         .duration_since(report.received_at)
         .unwrap_or(Duration::ZERO);
     let freshness = match report.status {
+        ReportStatus::Unreachable if age >= STALE_AFTER => Freshness::Stale,
         ReportStatus::Unreachable => Freshness::Unreachable,
         ReportStatus::Stale | ReportStatus::Unspecified => Freshness::Stale,
         ReportStatus::Healthy if report.locally_stale || age >= STALE_AFTER => Freshness::Stale,

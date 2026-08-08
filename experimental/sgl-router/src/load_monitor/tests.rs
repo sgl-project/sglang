@@ -388,3 +388,102 @@ async fn router_dials_worker_and_drives_bidi_monitor_session() {
     server_cancel.cancel();
     server.await.unwrap();
 }
+
+/// A reporter that accepts the gRPC stream but never sends the registration ack.
+#[derive(Clone)]
+struct SilentReporter;
+
+#[tonic::async_trait]
+impl LoadMonitorService for SilentReporter {
+    type MonitorStream = ReceiverStream<std::result::Result<WorkerFrame, Status>>;
+
+    /// Accepts the stream and returns an open response stream with no frames.
+    async fn monitor(
+        &self,
+        _request: Request<tonic::Streaming<RouterFrame>>,
+    ) -> std::result::Result<Response<Self::MonitorStream>, Status> {
+        let (tx, rx) = mpsc::channel(1);
+        // Keep the sender alive without producing any frame so the client's
+        // first-message wait neither resolves nor sees EOF.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(tx);
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// A silent Worker must fail registration by ack timeout.
+#[tokio::test]
+async fn registration_ack_timeout_fails_session() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reporter_addr = listener.local_addr().unwrap();
+    let server_cancel = CancellationToken::new();
+    let server_cancel_task = server_cancel.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(LoadMonitorServiceServer::new(SilentReporter))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                server_cancel_task.cancelled().await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let monitor = test_monitor(reporter_addr.port());
+    let worker = Arc::new(Worker::new(WorkerSpec {
+        id: WorkerId("worker".to_string()),
+        url: "http://127.0.0.1:30000".to_string(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("model".to_string())],
+        bootstrap_port: None,
+    }));
+    let target =
+        WorkerTarget::from_worker(&worker, NonZeroU16::new(reporter_addr.port()).unwrap()).unwrap();
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        monitor.monitor_once(&target, &cancel),
+    )
+    .await
+    .expect("registration ack timeout must complete the session attempt");
+    assert!(
+        result.is_err(),
+        "a silent Worker must fail registration by ack timeout"
+    );
+    assert!(result.unwrap_err().to_string().contains("ack"));
+
+    monitor.shutdown().await;
+    server_cancel.cancel();
+    server.await.unwrap();
+}
+
+/// Unreachable reports age to Stale after the freshness window.
+#[test]
+fn unreachable_report_ages_to_stale() {
+    let monitor = test_monitor(31000);
+    let id = install_worker(&monitor, test_worker("worker", WorkerMode::Plain));
+    let session = begin_test_session(&monitor, &id);
+    let mut report = test_report("ignored", "source", 1, WorkerMode::Plain);
+    report.status = ReportStatus::Unreachable as i32;
+    report.last_error = Some("scheduler unavailable".to_string());
+    report.ranks.clear();
+    monitor.apply_report(&id, session, report).unwrap();
+    assert_eq!(
+        monitor.snapshot().workers[0].freshness,
+        Freshness::Unreachable
+    );
+
+    {
+        let mut store = monitor.inner.store.write();
+        store
+            .workers
+            .get_mut(&id)
+            .unwrap()
+            .report
+            .as_mut()
+            .unwrap()
+            .received_at = SystemTime::now() - STALE_AFTER - Duration::from_millis(1);
+    }
+    assert_eq!(monitor.snapshot().workers[0].freshness, Freshness::Stale);
+}
