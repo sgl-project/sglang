@@ -184,9 +184,7 @@ def check_case(name, seq_lens, world_size, zero_seed):
     for n in seq_lens:
         cu_vals.append(cu_vals[-1] + n)
     cu = torch.tensor(cu_vals, dtype=torch.int32, device=DEVICE)
-    layouts = [
-        build_cp_shard_layout(cu_vals, world_size, r) for r in range(world_size)
-    ]
+    layouts = [build_cp_shard_layout(cu_vals, world_size, r) for r in range(world_size)]
 
     mono_pool = seed_pool.clone()
     o_mono = run_chunk_kda(inputs, cu, mono_pool, slot_indices)

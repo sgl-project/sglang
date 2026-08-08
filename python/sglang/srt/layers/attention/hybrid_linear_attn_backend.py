@@ -271,10 +271,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
         strategy = get_cp_strategy()
-        if (
-            strategy is None
-            or strategy.kind != ContextParallelStrategyKind.CONTIGUOUS
-        ):
+        if strategy is None or strategy.kind != ContextParallelStrategyKind.CONTIGUOUS:
             raise NotImplementedError(
                 "prefill context parallelism for hybrid linear-attention "
                 "models requires --cp-strategy contiguous"

@@ -427,12 +427,7 @@ def cp_merge_fwd_kernel(
     stride_hm = K + V
     for j in range(world_size):
         if j == rank:
-            p_h0 = (
-                h0
-                + (i_n * HV + i_h) * V * K
-                + o_v[:, None] * K
-                + o_k[None, :]
-            )
+            p_h0 = h0 + (i_n * HV + i_h) * V * K + o_v[:, None] * K + o_k[None, :]
             tl.store(
                 p_h0, b_h.to(p_h0.dtype.element_ty), mask=m_v[:, None] & m_k[None, :]
             )
@@ -544,9 +539,7 @@ def cp_merge_states(
         h0=h0,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
-        stride_init_state=(
-            initial_state.stride(0) if initial_state is not None else 0
-        ),
+        stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         world_size=world_size,
         rank=rank,
         HV=HV,
@@ -620,7 +613,5 @@ def chunk_gated_delta_rule_fwd_h_cp_pre_process(
     if cp_context.local_seq_ids is not None:
         scratch_indices = cp_context.local_seq_ids.to(index_dtype)
     else:
-        scratch_indices = torch.arange(
-            h0.shape[0], device=h0.device, dtype=index_dtype
-        )
+        scratch_indices = torch.arange(h0.shape[0], device=h0.device, dtype=index_dtype)
     return h0, scratch_indices

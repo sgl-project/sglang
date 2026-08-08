@@ -102,9 +102,7 @@ def check_ssm_case(name, seq_lens, zero_seed, rank, world_size):
     cu_vals = [0]
     for n in seq_lens:
         cu_vals.append(cu_vals[-1] + n)
-    layouts = [
-        build_cp_shard_layout(cu_vals, world_size, r) for r in range(world_size)
-    ]
+    layouts = [build_cp_shard_layout(cu_vals, world_size, r) for r in range(world_size)]
 
     # Local reference: the sequential shard chain (chunked-prefill semantics).
     ref_pool = seed_pool.clone()
@@ -170,7 +168,8 @@ def check_conv_halo(rank, world_size):
     conv_input = torch.cat(
         [
             tokens[
-                seq_starts[n] + offsets[n] : seq_starts[n]
+                seq_starts[n]
+                + offsets[n] : seq_starts[n]
                 + offsets[n]
                 + meta.shard_lens[rank][n]
             ]
@@ -219,8 +218,10 @@ def main():
     all_ok = torch.tensor([int(all(results))], device=DEVICE)
     dist.all_reduce(all_ok, op=dist.ReduceOp.MIN)
     if rank == 0:
-        print("DIST_ALL_PASS" if int(all_ok.item()) == 1 else "DIST_SOME_FAILED",
-              flush=True)
+        print(
+            "DIST_ALL_PASS" if int(all_ok.item()) == 1 else "DIST_SOME_FAILED",
+            flush=True,
+        )
     dist.destroy_process_group()
     sys.exit(0 if int(all_ok.item()) == 1 else 1)
 

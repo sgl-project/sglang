@@ -144,9 +144,7 @@ class ContiguousCPStrategy(ZigzagCPStrategy):
             prefix_offsets[seq] + sum(per_seq_block_sizes[seq][: cp_rank + 1])
             for seq in range(bs)
         ]
-        actual_seq_q_list = [
-            per_seq_block_sizes[seq][cp_rank] for seq in range(bs)
-        ]
+        actual_seq_q_list = [per_seq_block_sizes[seq][cp_rank] for seq in range(bs)]
 
         try:
             device = torch.device(get_device().device)

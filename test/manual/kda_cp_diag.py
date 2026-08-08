@@ -100,9 +100,7 @@ def main():
 
     # Reference full run
     ref_pool = seed_pool.clone()
-    o_ref = run_chunk_kda(
-        inputs, [(0, total)], cu, ref_pool, slot_indices
-    )
+    o_ref = run_chunk_kda(inputs, [(0, total)], cu, ref_pool, slot_indices)
 
     # True boundary states: run on each global prefix [seq_start, shard_lo)
     layouts = [build_cp_shard_layout(cu_vals, W, r) for r in range(W)]
@@ -146,9 +144,7 @@ def main():
             for r in range(W):
                 gather.current_rank = r
                 ctx = LinearAttnCPContext(world_size=W, rank=r, group=object())
-                local_cu = torch.tensor(
-                    layouts[r][0], dtype=torch.int32, device=DEVICE
-                )
+                local_cu = torch.tensor(layouts[r][0], dtype=torch.int32, device=DEVICE)
                 pool_r = seed_pool.clone()
                 o_r = run_chunk_kda(
                     inputs,
@@ -182,12 +178,13 @@ def main():
     seg_cu = torch.tensor([0, hi - lo], dtype=torch.int32, device=DEVICE)
     p = seed_pool.clone()
     run_chunk_kda(
-        inputs, [(0, lo)], torch.tensor([0, lo], dtype=torch.int32, device=DEVICE),
-        p, slot_indices[0:1],
+        inputs,
+        [(0, lo)],
+        torch.tensor([0, lo], dtype=torch.int32, device=DEVICE),
+        p,
+        slot_indices[0:1],
     )
-    o_cont = run_chunk_kda(
-        inputs, [(lo, hi)], seg_cu, p, slot_indices[0:1]
-    )
+    o_cont = run_chunk_kda(inputs, [(lo, hi)], seg_cu, p, slot_indices[0:1])
     print(
         f"plain continuation [{lo}:{hi}) via pool slot: "
         f"o_ratio={norm_ratio(o_cont, o_ref[:, lo:hi]):.3e}"
@@ -197,12 +194,18 @@ def main():
     # fp32 + arange index) exactly like the CP hook hands the main kernel.
     p2 = seed_pool.clone()
     run_chunk_kda(
-        inputs, [(0, lo)], torch.tensor([0, lo], dtype=torch.int32, device=DEVICE),
-        p2, slot_indices[0:1],
+        inputs,
+        [(0, lo)],
+        torch.tensor([0, lo], dtype=torch.int32, device=DEVICE),
+        p2,
+        slot_indices[0:1],
     )
     scratch = p2[slot_indices[0:1]].clone().contiguous()
     o_scratch = run_chunk_kda(
-        inputs, [(lo, hi)], seg_cu, scratch,
+        inputs,
+        [(lo, hi)],
+        seg_cu,
+        scratch,
         torch.arange(1, dtype=torch.int32, device=DEVICE),
     )
     print(
