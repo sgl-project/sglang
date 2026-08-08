@@ -172,6 +172,47 @@ FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 global_override_indptr_cpu = None
 
 
+def get_model_logits_soft_cap(model_runner: ModelRunner) -> float:
+    """The model's attention logit soft cap, resolved once at backend init.
+
+    FlashInfer specializes its JIT module on ``logits_soft_cap`` when ``plan()``
+    runs: the deprecated ``forward()`` entrypoint still accepts the argument but
+    ignores it. ``call_begin_forward`` has no ``layer`` handle, so the cap has to
+    be read off the model's ``RadixAttention`` layers here and planned with.
+    """
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    model = getattr(model_runner, "model", None)
+    if not isinstance(model, torch.nn.Module):
+        return 0.0
+
+    caps = set()
+    for module in model.modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        cap = float(module.logit_cap or 0.0)
+        if cap > 0.0 and module.logit_capping_method != "tanh":
+            # No CUDA attention backend implements a non-tanh method, so there
+            # is nothing to point the user at -- this used to be ignored.
+            raise ValueError(
+                "The FlashInfer attention backend only implements tanh logit "
+                f"capping, got {module.logit_capping_method!r}."
+            )
+        caps.add(cap)
+
+    if not caps:
+        return 0.0
+    if len(caps) > 1:
+        # One plan covers every layer of a wrapper, so a per-layer cap cannot be
+        # honored here. Fail loudly instead of silently capping the wrong layers.
+        raise ValueError(
+            "The FlashInfer attention backend plans a single logits_soft_cap for "
+            f"the whole model, but its layers disagree: {sorted(caps)}. "
+            "Run with --attention-backend triton."
+        )
+    return caps.pop()
+
+
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -186,6 +227,7 @@ def fast_prefill_plan(
     custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     window_left: int = -1,
+    logits_soft_cap: float = 0.0,
     q_data_type: Union[str, torch.dtype] = "float16",
     kv_data_type: Optional[Union[str, torch.dtype]] = None,
     o_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -222,6 +264,14 @@ def fast_prefill_plan(
     assert (
         getattr(self, "_cached_module", None) is not None
     ), "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    # _cached_module was specialized on the capture-time cap, and this function
+    # reuses it as-is, so a replay may not ask for a different one. run() keeps
+    # reading self._logits_soft_cap, which stays at the capture-time value.
+    assert (getattr(self, "_logits_soft_cap", 0.0) or 0.0) == logits_soft_cap, (
+        "fast_prefill_plan reuses the module compiled by the capture-time plan(); "
+        f"logits_soft_cap changed on replay ({self._logits_soft_cap} -> "
+        f"{logits_soft_cap})"
+    )
 
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -359,6 +409,9 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         # Parse constants
+        # Plan-time constant: FlashInfer bakes the soft cap into the module it
+        # compiles in plan(), so it cannot be supplied per forward call.
+        self.logits_soft_cap = get_model_logits_soft_cap(model_runner)
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=self.flashinfer_kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
@@ -1258,6 +1311,9 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        # Passed twice on purpose: plan() picks the module compiled with (or
+        # without) the tanh cap, and the deprecated forward() below overwrites
+        # the wrapper's runtime cap scalar, which the chosen module then reads.
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
@@ -1485,6 +1541,7 @@ class FlashInferIndicesUpdaterDecode:
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
+        self.logits_soft_cap = attn_backend.logits_soft_cap
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -1716,6 +1773,7 @@ class FlashInferIndicesUpdaterDecode:
                     disable_split_kv if disable_split_kv is not None else False
                 ),
                 global_override_indptr_cpu=global_override_indptr_cpu,
+                logits_soft_cap=self.logits_soft_cap,
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
@@ -1734,6 +1792,7 @@ class FlashInferIndicesUpdaterDecode:
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
+                logits_soft_cap=self.logits_soft_cap,
             )
 
         if locally_override:
@@ -1757,6 +1816,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
+        self.logits_soft_cap = attn_backend.logits_soft_cap
         self.attn_backend = attn_backend
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -2122,6 +2182,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                logits_soft_cap=self.logits_soft_cap,
             )
 
         if use_sliding_window_kv_pool:
@@ -2208,6 +2269,7 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
+            logits_soft_cap=self.logits_soft_cap,
             **paged_plan_kwargs,
         )
 
