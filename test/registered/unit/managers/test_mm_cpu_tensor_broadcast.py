@@ -107,6 +107,34 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
         self.assertIsInstance(received, torch.Tensor)
         torch.testing.assert_close(received, expected)
 
+    def test_precomputed_embeddings_are_broadcast_directly(self):
+        embeddings = torch.arange(300_000, dtype=torch.float16)
+        req = _make_req(torch.empty(1))
+        req.mm_inputs.mm_items[0].feature = None
+        req.mm_inputs.mm_items[0].precomputed_embeddings = embeddings
+        sent = []
+
+        def fake_broadcast(tensor, **kwargs):
+            sent.append(tensor.clone())
+            return SimpleNamespace(wait=lambda: None)
+
+        with (
+            patch(
+                "sglang.srt.managers.mm_transport.broadcast_pyobj",
+                side_effect=lambda data, *args, **kwargs: data,
+            ),
+            patch(
+                "sglang.srt.managers.mm_transport.dist.broadcast",
+                side_effect=fake_broadcast,
+            ),
+        ):
+            result = broadcast_mm_cpu_tensors([req], rank=0, src=0)
+
+        item = result[0].mm_inputs.mm_items[0]
+        self.assertIs(item.precomputed_embeddings, embeddings)
+        self.assertEqual(len(sent), 1)
+        torch.testing.assert_close(sent[0], embeddings)
+
     def test_small_feature_stays_in_metadata_broadcast(self):
         feature = torch.arange(16, dtype=torch.float32)
         req = _make_req(feature)
@@ -120,6 +148,24 @@ class TestMMCpuTensorBroadcast(unittest.TestCase):
             result = broadcast_mm_cpu_tensors([req], rank=0, src=0)
 
         self.assertIs(result[0].mm_inputs.mm_items[0].feature, feature)
+        broadcast.assert_not_called()
+
+    def test_transport_proxy_stays_on_metadata_path(self):
+        # CUDA IPC/VMM proxies are intentionally opaque to this CPU-only
+        # optimization.  A proxy-like object must not trigger a tensor
+        # collective or be replaced by a CPU allocation.
+        proxy = object()
+        req = _make_req(proxy)
+        with (
+            patch(
+                "sglang.srt.managers.mm_transport.broadcast_pyobj",
+                side_effect=lambda data, *args, **kwargs: data,
+            ),
+            patch("sglang.srt.managers.mm_transport.dist.broadcast") as broadcast,
+        ):
+            result = broadcast_mm_cpu_tensors([req], rank=0, src=0)
+
+        self.assertIs(result[0].mm_inputs.mm_items[0].feature, proxy)
         broadcast.assert_not_called()
 
     def test_batch_request_preserves_tensor_list_order(self):

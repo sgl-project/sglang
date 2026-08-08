@@ -55,6 +55,8 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
         server_args=SimpleNamespace(
             enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
+            dist_init_addr=None,
+            mm_feature_transport="cpu",
         ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
@@ -64,6 +66,53 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_mm_cpu_broadcast_is_limited_to_cpu_feature_transport(self):
+        receiver = _make_receiver(_make_ps(pp_size=1, tp_size=2))
+        receiver.model_config = SimpleNamespace(is_multimodal=True)
+        receiver.server_args = SimpleNamespace(
+            dist_init_addr="10.0.0.1:12345",
+            mm_feature_transport="cuda_vmm",
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_mm_cpu_tensors"
+            ) as mm_broadcast,
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_pyobj",
+                side_effect=lambda data, *args, **kwargs: data,
+            ) as pyobj_broadcast,
+        ):
+            result = receiver._broadcast_work_reqs(
+                ["work"], rank=0, dist_group=object(), src=0
+            )
+
+        self.assertEqual(result, ["work"])
+        mm_broadcast.assert_not_called()
+        pyobj_broadcast.assert_called_once()
+
+    def test_mm_cpu_broadcast_is_used_for_multinode_cpu_transport(self):
+        receiver = _make_receiver(_make_ps(pp_size=1, tp_size=2))
+        receiver.model_config = SimpleNamespace(is_multimodal=True)
+        receiver.server_args = SimpleNamespace(
+            dist_init_addr="10.0.0.1:12345",
+            mm_feature_transport="cpu",
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_receiver."
+            "broadcast_mm_cpu_tensors",
+            side_effect=lambda data, *args, **kwargs: data,
+        ) as mm_broadcast:
+            result = receiver._broadcast_work_reqs(
+                ["work"], rank=0, dist_group=object(), src=0
+            )
+
+        self.assertEqual(result, ["work"])
+        mm_broadcast.assert_called_once()
+
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []

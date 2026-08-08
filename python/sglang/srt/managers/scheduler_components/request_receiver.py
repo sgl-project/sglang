@@ -217,7 +217,15 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_work_reqs(self, recv_reqs, rank, dist_group, src):
-        if self.model_config.is_multimodal and self.server_args.dist_init_addr:
+        # This optimization is for the explicit/auto-resolved CPU feature
+        # transport path.  CUDA IPC/VMM proxies must stay on the existing
+        # object-broadcast path; in particular, K3 on MNNVL may use a GPU
+        # transport and must not pay an additional CPU-transport dispatch.
+        if (
+            self.model_config.is_multimodal
+            and self.server_args.dist_init_addr
+            and self.server_args.mm_feature_transport == "cpu"
+        ):
             return broadcast_mm_cpu_tensors(recv_reqs, rank, dist_group, src=src)
         return broadcast_pyobj(recv_reqs, rank, dist_group, src=src)
 
