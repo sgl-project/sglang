@@ -44,13 +44,14 @@ Expect the build to take **30–120 minutes** depending on board speed and netwo
 # On the RISC-V board
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
+```
 
 > If you are using Podman, you can set an alias so all commands below work unchanged:
 > ```bash
 > alias docker=podman
 > ```
 
-
+```bash
 docker build \
     --format docker \
     -t sglang-rvv:latest \
@@ -139,14 +140,15 @@ package after any Python changes.
 
 **Step 5 — Recompile `sgl-kernel` (inside the container)**
 
-Run this whenever you modify C++ kernel code under `sgl-kernel/csrc/`.
+Run this whenever you modify C++ kernel code under
+`python/sglang/kernels/aot/csrc/`.
 It will take about 8 mins on Banana Pi K1.
 VLEN is auto-detected from `/proc/cpuinfo` during the CMake step.
 For RVV kernel builds, use `pyproject_riscv64.toml` (not `pyproject_cpu.toml`).
 
 ```bash
 source /opt/.venv/bin/activate
-cd /workspace/sglang/sgl-kernel
+cd /workspace/sglang/python/sglang/kernels/aot
 
 uv pip uninstall sglang-kernel-riscv64 || true
 uv pip uninstall sglang-kernel-cpu || true
@@ -341,7 +343,7 @@ Run the following directly inside the dev container:
 cd /workspace/sglang
 
 # (Optional) Only needed if you modified Python files in the mounted repo without reinstalling.
-export PYTHONPATH=/workspace/sglang
+export PYTHONPATH=/workspace/sglang/python
 
 /opt/.venv/bin/python -m unittest discover -s test/srt/cpu/rvv -p "test_*.py" -t . -v
 
