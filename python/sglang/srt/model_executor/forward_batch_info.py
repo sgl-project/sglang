@@ -961,13 +961,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if (
-            getattr(model_runner, "dcp_size", 1) > 1
-            and ret.out_cache_loc is not None
-            and is_hip()
-        ):
+        if model_runner.ps.dcp_size > 1 and ret.out_cache_loc is not None and is_hip():
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+                ret.positions % model_runner.ps.dcp_size == model_runner.ps.dcp_rank
             )
 
         return ret

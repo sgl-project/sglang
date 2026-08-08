@@ -23,6 +23,10 @@ class ParallelState:
     dcp_size: int
     gpu_id: int
 
+    @property
+    def dcp_rank(self) -> int:
+        return self.tp_rank % self.dcp_size
+
     @staticmethod
     def trivial(**overrides: Optional[int]) -> "ParallelState":
         kwargs: dict[str, Optional[int]] = dict(
