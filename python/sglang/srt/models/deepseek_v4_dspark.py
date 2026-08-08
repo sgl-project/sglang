@@ -554,6 +554,11 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        del hf_config, quant_config
+        return "DSpark V4 draft weights use separate shared experts."
+
     def __init__(
         self,
         config: DeepSeekV4Config,

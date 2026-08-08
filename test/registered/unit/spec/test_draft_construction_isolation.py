@@ -98,6 +98,18 @@ class TestFusionDecisionFlag(CustomTestCase):
         # The draft's decision stays inspectable on the twin leaf.
         self.assertTrue(get_flags().moe.speculative_disable_shared_experts_fusion)
 
+    def test_dspark_draft_disables_unsupported_shared_expert_fusion(self):
+        from sglang.srt.models.deepseek_v4_dspark import (
+            DeepseekV4ForCausalLMDSpark,
+        )
+
+        self._seed(disable_shared_experts_fusion=False)
+        _install(_NoGate)  # the target's build
+        with draft_model_build_scope():
+            _install(DeepseekV4ForCausalLMDSpark)
+            self.assertTrue(is_shared_experts_fusion_disabled())
+        self.assertTrue(get_flags().moe.speculative_disable_shared_experts_fusion)
+
     def test_a_gateless_draft_inherits_the_active_decision(self):
         self._seed(disable_shared_experts_fusion=False)
         _install(_AlwaysDisables)  # the target's build
