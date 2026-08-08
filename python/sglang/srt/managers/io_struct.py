@@ -1660,6 +1660,27 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     is_pause: bool
 
 
+# ---------------------------------------------------------------------------
+# Load Reporter IPC contracts (worker <-> router refresh channel)
+# ---------------------------------------------------------------------------
+
+
+class LoadReporterRefreshReason(Enum):
+    """Cause of a load-reporter refresh event sent by a worker."""
+
+    DISPATCH = 1
+    COMPLETION = 2
+    ABORT = 3
+
+
+class LoadReporterRefreshIpcReq(BaseReq, kw_only=True):
+    """Worker -> router: incremental load-count refresh event."""
+
+    worker_id: str
+    reason: LoadReporterRefreshReason
+    event_count: int
+
+
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str

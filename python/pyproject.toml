@@ -149,6 +149,11 @@ fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
 
+load-reporter = [
+  "grpcio>=1.78.0",
+  "protobuf>=6.31.1,<7",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -175,8 +180,10 @@ test = [
   "polars",
   "pytest",
   "pytest-cov",
+  "pytest-asyncio",
   "sentence_transformers",
   "sglang[fastokens]",
+  "sglang[load-reporter]",
   "tabulate",
 ]
 

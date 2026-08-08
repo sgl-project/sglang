@@ -50,6 +50,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.load_reporter.event_hooks import enable_load_monitor
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -560,6 +561,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             caller="TokenizerManager",
         )
 
+    @enable_load_monitor("scheduler_message")
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
@@ -762,6 +764,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    @enable_load_monitor("request_lifecycle")
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],

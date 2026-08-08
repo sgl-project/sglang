@@ -79,6 +79,82 @@ def _make_batch_str_output() -> BatchStrOutput:
     )
 
 
+class TestAwaitReporterStartup(unittest.TestCase):
+    """M1: the router reporter startup future must not leak on timeout/failure."""
+
+    def setUp(self):
+        import asyncio
+        import threading
+
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+
+    def tearDown(self):
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
+        self._loop.close()
+
+    def test_timeout_cancels_pending_startup(self):
+        import asyncio
+        import threading
+
+        from sglang.srt.managers.multi_tokenizer_mixin import (
+            _await_reporter_startup,
+        )
+
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        async def slow_start():
+            started.set()
+            try:
+                await asyncio.sleep(30)
+                return object()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        future = asyncio.run_coroutine_threadsafe(slow_start(), self._loop)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        with self.assertRaises(TimeoutError):
+            _await_reporter_startup(future, self._loop, timeout=0.1)
+
+        self.assertTrue(cancelled.wait(timeout=1.0))
+        self.assertTrue(future.cancelled())
+
+    def test_handle_closed_when_produced_after_timeout(self):
+        """Cancel-vs-complete race: when the startup future already produced a
+        handle at timeout (``cancel()`` returns False), that handle must be
+        closed, not leaked."""
+        import concurrent.futures
+        import threading
+
+        from sglang.srt.managers.multi_tokenizer_mixin import (
+            _await_reporter_startup,
+        )
+
+        closed = threading.Event()
+
+        class FakeHandle:
+            async def close(self):
+                closed.set()
+
+        # A RUNNING future: result(timeout) times out and cancel() returns False,
+        # exactly the branch where a late handle would leak.
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        future.set_running_or_notify_cancel()
+
+        with self.assertRaises(TimeoutError):
+            _await_reporter_startup(future, self._loop, timeout=0.05)
+
+        # The startup coroutine settles with a real handle just after timeout.
+        future.set_result(FakeHandle())
+        # The helper's done-callback must close that late handle.
+        self.assertTrue(closed.wait(timeout=2.0))
+
+
 class TestMultiTokenizerMixin(unittest.TestCase):
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()

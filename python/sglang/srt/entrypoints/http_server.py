@@ -390,9 +390,28 @@ async def lifespan(fast_api_app: FastAPI):
     # either still runs the finally cleanup below. Native gRPC is enabled via
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
     # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
+    single_tokenizer = getattr(fast_api_app, "is_single_tokenizer_mode", False)
+    reporter_handle = None
+    if server_args.load_reporter_port is not None:
+        from sglang.srt.load_reporter import start_load_reporter
+        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+
+        # Multi-tokenizer workers forward refresh hints to the router over IPC.
+        snapshot_source = (
+            ManagerLoadSnapshotSource(
+                _global_state.tokenizer_manager, range(server_args.dp_size)
+            )
+            if single_tokenizer
+            else None
+        )
+        reporter_handle = await start_load_reporter(
+            server_args,
+            snapshot_source,
+            event_owner=_global_state.tokenizer_manager,
+        )
     try:
         if (
-            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            single_tokenizer
             and server_args.grpc_port is not None
             and not (server_args.smg_grpc_mode or server_args.grpc_mode)
         ):
@@ -427,6 +446,8 @@ async def lifespan(fast_api_app: FastAPI):
             await tool_server.aclose()
         if warmup_thread is not None:
             warmup_thread.join()
+        if reporter_handle is not None:
+            await reporter_handle.close()
 
 
 # Fast API
@@ -2666,7 +2687,10 @@ def _setup_and_run_http_server(
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()
             if _global_state is not None:
-                _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+                tokenizer_manager = _global_state.tokenizer_manager
+                if isinstance(tokenizer_manager, MultiTokenizerRouter):
+                    tokenizer_manager.close()
+                tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
 def _start_native_grpc_server_for_runtime(

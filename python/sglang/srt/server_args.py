@@ -1512,6 +1512,13 @@ class ServerArgs:
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
         NS("observability"),
     ] = 15
+    load_reporter_port: A[
+        Optional[int],
+        "Port on which this worker listens for load reporter gRPC connections. "
+        "None (default) disables load reporting with zero socket, task, or "
+        "optional-dependency overhead.",
+        NS("observability"),
+    ] = None
     tokenizer_metrics_custom_labels_header: A[
         str,
         "Specify the HTTP header for passing custom labels for tokenizer metrics.",
@@ -3470,6 +3477,8 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+
+        self._handle_load_reporter_config()
 
         self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
@@ -8307,6 +8316,22 @@ class ServerArgs:
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
+
+    def _handle_load_reporter_config(self):
+        """Validate load reporter configuration.
+
+        Only the listener port is user-facing. The snapshot stale threshold and
+        gRPC transport knobs (connect timeout, reconnect backoff, keepalive,
+        message size, shutdown timeout) are reporter-internal constants and are
+        not part of ServerArgs.
+        """
+        if self.load_reporter_port is not None and not (
+            1 <= self.load_reporter_port <= 65535
+        ):
+            raise ValueError(
+                f"--load-reporter-port must be between 1 and 65535 "
+                f"(got {self.load_reporter_port})."
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

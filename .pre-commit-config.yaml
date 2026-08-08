@@ -29,7 +29,7 @@ repos:
     rev: 7.0.0
     hooks:
       - id: isort
-        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
+        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|^python/sglang/srt/load_reporter/proto/.*_pb2(_grpc)?\.py$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1
     hooks:
@@ -47,12 +47,13 @@ repos:
           python/sglang/srt/grpc/.*_pb2_grpc\.py$|
           python/sglang/srt/grpc/.*_pb2\.pyi$|
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
+          python/sglang/srt/load_reporter/proto/.*_pb2(_grpc)?\.py$|
           )$
   - repo: https://github.com/psf/black
     rev: 26.1.0
     hooks:
       - id: black-jupyter
-        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
+        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|^python/sglang/srt/load_reporter/proto/.*_pb2(_grpc)?\.py$'
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:

@@ -98,6 +98,12 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
 ]
+
+load-reporter = [
+  "grpcio>=1.78.0",
+  "protobuf>=6.31.1,<7",
+]
+
 test = [
   "accelerate",
   "bitsandbytes",
@@ -111,6 +117,7 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
+  "sglang[load-reporter]",
   "tabulate",
 ]
 
