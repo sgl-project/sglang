@@ -999,16 +999,20 @@ class MiMoProcessor:
                 if i < len(grid_t_timestamps) - 1
                 else int(video_meta["segment_end_time"] * audio_token_per_second)
             )
-            segment_audio_token_len = (
-                min(audio_end_token_idx, audio_token_len) - audio_start_token_idx
+            # Audio may end before the last video grid (e.g. silent tail).
+            # In that case `min(end, audio_token_len) - start` is <= 0; clamp
+            # to 0 so the grid still emits its video tokens with no audio
+            # placeholders, instead of asserting and dropping the request.
+            segment_audio_token_len = max(
+                0,
+                min(audio_end_token_idx, audio_token_len) - audio_start_token_idx,
             )
-            assert segment_audio_token_len > 0
             segment_audio = (
                 processed_audio[
                     audio_start_token_idx : audio_start_token_idx
                     + segment_audio_token_len
                 ]
-                if is_tokenized
+                if is_tokenized and segment_audio_token_len > 0
                 else None
             )
             units.append(
