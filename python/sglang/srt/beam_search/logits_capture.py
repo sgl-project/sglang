@@ -42,12 +42,10 @@ def capture_pre_sample_logits(
     ):
         return
     if batch.beam_tail is not None:
-        # Split the beam member rows off before sampling so the
-        # sampler and every reqs-aligned consumer downstream see
-        # only the reqs-aligned rows. The tail then sits outside
-        # the sampler's view and keeps its raw logits for the
-        # scheduler-side selection; the leader rows do not, hence
-        # the pre-sample clone.
+        # The sampler and every consumer downstream are reqs-aligned, so the
+        # member tail is split off their view. Outside that view the tail's
+        # raw logits survive the in-place sampling writes as-is; the leader
+        # rows do not, hence the clone.
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
         logits_output.next_token_logits = logits[:n]
@@ -60,9 +58,8 @@ def capture_pre_sample_logits(
             logits_output.hidden_states = logits_output.hidden_states[:n]
         forward_batch.positions = forward_batch.positions[:n]
     elif forward_batch.forward_mode.is_extend():
-        # Same reason, prefill side: the leader's first selection
-        # runs at the relay point, after the sampler's in-place
-        # writes would have clobbered these logits.
+        # The leaders' first selection reads these prefill logits at the
+        # relay point, after sampling -- clone before it clobbers them.
         leader_rows = [i for i, r in enumerate(batch.reqs) if r.beam_group is not None]
         if leader_rows:
             logits_output.beam = BeamLogitsCapture(

@@ -200,9 +200,8 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
-    # Beam search only: raw pre-sample logits preserved for the scheduler-side
-    # joint selection (the sampler rewrites next_token_logits in place); see
-    # beam_search.logits_capture.
+    # Beam search only: raw pre-sample logits for the scheduler-side joint
+    # selection; see beam_search.logits_capture.
     beam: Optional["BeamLogitsCapture"] = None
 
     ## Part 5: Customized Info
