@@ -110,17 +110,20 @@ class AdaptiveController:
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
-        target = self.params.get_steps_for_batch(batch_size)
+    def activate_step_by_batch(self, batch_size: int, ctx_repr: int = 0) -> None:
+        target = self.params.get_steps_for_batch(batch_size, ctx_repr)
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        ctx_repr: int = 0,
     ) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
         new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
+            num_correct_drafts_per_req, batch_size, ctx_repr
         )
         if new_step is not None:
             self._activate(new_step)
