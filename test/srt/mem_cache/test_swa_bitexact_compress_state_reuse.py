@@ -360,6 +360,119 @@ class TestFusedStateRideProbe(unittest.TestCase):
         self.assertFalse(SC._probe_state_ride_fusable(hp, pools, layers))
 
 
+@unittest.skipUnless(
+    torch.cuda.is_available(), "fused state H2D only engages on a real device pool"
+)
+class TestFusedStateRideBytes(unittest.TestCase):
+    """The fused all-layer H2D is the path a real pool takes, and the probe
+    (correctly) rejects the faked pools every other test here uses -- so this is
+    the only place it runs at all. Build the real thing and hold it to the
+    docstring's claim: byte-identical to the per-layer fallback."""
+
+    def _build_ride(self, layer_num=4, ring=16, ratio=4, head_dim=8, page=256):
+        try:
+            pools = [
+                CompressStatePool(
+                    size=1024,
+                    ring_size=ring,
+                    overlap=True,
+                    head_dim=head_dim,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                    enable_memory_saver=False,
+                    ratio=ratio,
+                    swa_page_size=page,
+                )
+                for _ in range(layer_num)
+            ]
+        except torch.OutOfMemoryError as e:  # a busy shared GPU, not a failure here
+            self.skipTest(f"no free device memory for the state pools: {e}")
+        bufs = [p.kv_score_buffer.kv_score for p in pools]
+        item_bytes = ring * bufs[0].shape[-1] * bufs[0].element_size()
+        hp = MPH.DeepSeekV4PagedHostPool(
+            pool_name="test_c4_state",
+            device_buffers=bufs,
+            item_bytes=item_bytes,
+            num_host_pages=8,
+            slot_page_size=ring,
+            layout="layer_first",
+        )
+        hp._capture_staging = {}
+        hp._capture_state_crc = {}
+        # Distinct bytes per layer and per row, so a swapped layer or a misread
+        # tile row cannot pass by accident.
+        for li in range(layer_num):
+            torch.manual_seed(1000 + li)
+            hp.data_refs[li].copy_(
+                torch.randint(0, 256, hp.data_refs[li].shape, dtype=torch.uint8)
+            )
+        return hp, pools, bufs
+
+    def _restore(self, component, node, swa_chunk, hp, bufs, *, fused, io_backend):
+        for b in bufs:
+            b.zero_()
+        hp._state_fused_h2d_ok = fused
+        SC._restore_state_windows(component, node, swa_chunk, io_backend)
+        torch.cuda.synchronize()
+        return [b.clone() for b in bufs]
+
+    def test_fused_lands_same_bytes_as_per_layer(self):
+        layer_num, ring = 4, 16
+        hp, pools, bufs = self._build_ride(layer_num=layer_num, ring=ring)
+        layers = [(i, i) for i in range(layer_num)]
+        # The premise of this whole test: a real pool IS fusable, so production
+        # takes the fused path and the per-layer loop is only a fallback.
+        self.assertTrue(
+            SC._probe_state_ride_fusable(hp, pools, layers),
+            "a real device state pool must be fusable, else the fused path is dead code",
+        )
+
+        page_row, swa_ring, req = 3, 131, 2
+        component = types.SimpleNamespace(
+            _c4_state_layer_index={i: i for i in range(layer_num)},
+            _c4_state_host_pool=hp,
+            _compress_state_pools=pools,
+            _c4_indexer_state_host_pool=None,
+            _indexer_compress_state_pools=None,
+        )
+        node = types.SimpleNamespace(
+            _c4_state_host_value=torch.tensor([page_row * ring], dtype=torch.int64),
+            # 512 % 131 != 0: the boundary group wraps inside the ring block, the
+            # case the positional addressing exists for.
+            _swa_state_B=512,
+        )
+        swa_chunk = (req * swa_ring + torch.arange(swa_ring)).cuda()
+
+        for io_backend in ("kernel", "direct"):
+            with self.subTest(io_backend=io_backend):
+                ref = self._restore(
+                    component, node, swa_chunk, hp, bufs, fused=False, io_backend="x"
+                )
+                got = self._restore(
+                    component,
+                    node,
+                    swa_chunk,
+                    hp,
+                    bufs,
+                    fused=True,
+                    io_backend=io_backend,
+                )
+                # Guard against a vacuous pass: the restore must have written.
+                self.assertTrue(
+                    any(bool(b.any()) for b in ref), "per-layer restore wrote nothing"
+                )
+                for li in range(layer_num):
+                    # Compare bit patterns, not values: the tiles are arbitrary
+                    # bytes, so some rows decode to NaN and float equality would
+                    # report a difference between two identical buffers.
+                    self.assertTrue(
+                        torch.equal(
+                            ref[li].view(torch.uint8), got[li].view(torch.uint8)
+                        ),
+                        f"fused {io_backend} differs from per-layer at layer {li}",
+                    )
+
+
 class TestDirtyReadWithoutRestore(unittest.TestCase):
     """Reproduce the strict-mode dirty read.
 

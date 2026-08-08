@@ -391,16 +391,19 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
         # byte-exact parity between the two paths at the gated boundaries
         self.assertTrue(torch.equal(hp_leg.data_refs[0], hp_uni.data_refs[0]))
 
-    def _stage_both_paths(self, *, extend_len, orig, stride, bigram):
+    def _stage_both_paths(self, *, extend_len, orig, stride, bigram, prefix_len=0):
         """Run the oracle and the unified capture over the same input and return
         their staging key sets. They must always agree; the caller asserts on the
         keys themselves."""
         page, swa_ring, ring_size, ratio = 256, 128, 8, 4
         last_dim, dtype = 16, torch.bfloat16
         slot_bytes = last_dim * torch.tensor([], dtype=dtype).element_size()
-        prefix_len, rid = 0, 7
+        rid = 7
 
-        pre_state = torch.randint(0, 255, (ratio, last_dim), dtype=torch.int32).to(
+        # The overlap prefix compress reads is [cs - (cs%ratio + ratio), cs); the
+        # oracle is handed it already concatenated, unified fetches it lazily.
+        pre_rows = prefix_len % ratio + ratio
+        pre_state = torch.randint(0, 255, (pre_rows, last_dim), dtype=torch.int32).to(
             dtype
         )
         new_tok = torch.randint(0, 255, (extend_len, last_dim), dtype=torch.int32).to(
@@ -434,7 +437,9 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
         be_uni.token_to_kv_pool._swa_capture_bigram_key = bigram
         be_uni.token_to_kv_pool._swa_offload_page_stride = stride
         be_uni.req_to_token_pool = types.SimpleNamespace(
-            req_to_token=torch.zeros((rid + 4, extend_len + page), dtype=torch.int64)
+            req_to_token=torch.zeros(
+                (rid + 4, prefix_len + extend_len + page), dtype=torch.int64
+            )
         )
         be_uni.token_to_kv_pool.translate_loc_from_full_to_swa = lambda x: x
         fb = types.SimpleNamespace(
@@ -492,6 +497,35 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
                     ),
                     {(7, 256), (7, 512)},
                 )
+
+    def test_window_reaching_into_overlap_prefix_is_byte_exact(self):
+        """The window can reach back past the chunk's flat-KV start when a tiny
+        chunk crosses a page boundary, so it must be stitched from the overlap
+        prefix plus the new tokens. cs=254 with a 4-token chunk puts the boundary
+        at 256 and the window [252, 256) two rows behind cs -- the only case where
+        the prefix is read at all, and where an off-by-one in pre_len would stage
+        the wrong bytes. Byte-parity against the oracle is asserted inside."""
+        self.assertEqual(
+            self._stage_both_paths(
+                extend_len=4, orig=258, stride=1, bigram=False, prefix_len=254
+            ),
+            {(7, 256)},
+        )
+
+    def test_bigram_tail_shift_aliases_onto_interior_boundary(self):
+        """At stride=1 the shifted tail lands on a boundary that is already staged
+        (768 -> 512, and 512 was kept as an interior boundary). Both want the same
+        window [508, 512), so the alias is a no-op rather than a boundary whose
+        bytes get overwritten with a different window -- but it does mean 768 is
+        deliberately absent, since under bigram no node ends there."""
+        self.assertEqual(
+            self._stage_both_paths(extend_len=768, orig=768, stride=1, bigram=False),
+            {(7, 256), (7, 512), (7, 768)},
+        )
+        self.assertEqual(
+            self._stage_both_paths(extend_len=768, orig=768, stride=1, bigram=True),
+            {(7, 256), (7, 512)},
+        )
 
     def test_unified_ratio_128_and_no_pool_noop(self):
         hp = _fake_host_pool(ring_size=8, slot_bytes=32, num_pages=4)
