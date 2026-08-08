@@ -195,6 +195,8 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     manager_handle.abort();
     janitor_handle.shutdown().await;
+    // Final whole-file snapshot of session_timestamp.json (no-op when disabled).
+    ctx.session_stats.flush_dump();
     server_result
 }
 
