@@ -91,16 +91,16 @@ RUN python3 -m pip uninstall -y \
       flashinfer-python flashinfer-cubin flashinfer-jit-cache && \
     rm -rf /root/.cache/flashinfer /root/.cache/pip && \
     python3 -m pip install --no-deps \
-      "flashinfer-python==0.6.17rc1" && \
+      "flashinfer-python==0.6.17rc5" && \
     python3 -m pip install --no-deps \
-      "flashinfer-cubin==0.6.17rc1" \
+      "flashinfer-cubin==0.6.17rc5" \
       --index-url https://flashinfer.ai/whl && \
     python3 -m pip install --no-deps \
-      "flashinfer-jit-cache==0.6.17rc1" \
+      "flashinfer-jit-cache==0.6.17rc5" \
       --index-url https://flashinfer.ai/whl/cu129 && \
-    python3 -c 'from importlib.metadata import version; expected = "0.6.17rc1"; assert version("flashinfer-python").split("+", 1)[0] == expected; assert version("flashinfer-cubin").split("+", 1)[0] == expected; assert version("flashinfer-jit-cache").startswith(expected + "+cu129"), version("flashinfer-jit-cache")' && \
+    python3 -c 'from importlib.metadata import version; expected = "0.6.17rc5"; assert version("flashinfer-python").split("+", 1)[0] == expected; assert version("flashinfer-cubin").split("+", 1)[0] == expected; assert version("flashinfer-jit-cache").startswith(expected + "+cu129"), version("flashinfer-jit-cache")' && \
     rm -rf /root/.cache/pip
 
-ENV FLASHINFER_VERSION="0.6.17rc1"
+ENV FLASHINFER_VERSION="0.6.17rc5"
 
 WORKDIR /sgl-workspace/sglang

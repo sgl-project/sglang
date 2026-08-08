@@ -31,7 +31,7 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn-4>=4.0.0b18",
-  "flashinfer_python[cu13]==0.6.17rc1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.6.17rc5", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "helion==1.4",
   "humming-kernels[cu13]==0.1.10",
@@ -67,6 +67,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
+  "sgl-deep-ep==0.1.0",
   "sgl-deep-gemm==0.1.5.post2",
   "sglang-kernel==0.4.6.post1",
   "smg-grpc-servicer>=0.5.0",
