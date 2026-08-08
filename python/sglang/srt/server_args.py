@@ -31,7 +31,6 @@ import uuid
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
@@ -68,7 +67,6 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
-    get_int_env_var,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -1730,7 +1728,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
@@ -2165,6 +2163,12 @@ class ServerArgs:
             choices=QUANTIZATION_CHOICES,
         ),
         NS("spec"),
+    ] = None
+    # Internal provenance used after the public draft quantization inherits the
+    # target value. It is a dataclass field so ServerArgs round-trips preserve
+    # whether the user explicitly set the draft option; it has no CLI surface.
+    _speculative_draft_quantization_explicitly_set: A[
+        Optional[bool], Arg(no_cli=True), NS("spec")
     ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,
@@ -2741,12 +2745,15 @@ class ServerArgs:
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc"]],
-        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
-        "Unset resolves automatically: single-node CUDA deployments (without "
-        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
-        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
-        "back to CPU transport per tensor when the pool is full.",
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
+        "Transport multimodal features through CPU memory, a bounded CUDA IPC "
+        "pool, or a bounded CUDA VMM pool. CUDA VMM must be selected explicitly "
+        "and is available only to models that opt in. "
+        "Unset resolves automatically: multimodal models on single-node CUDA "
+        "deployments (without disaggregation) use cuda_ipc, everything else uses "
+        "cpu. Both CUDA transports reserve SGLANG_MM_FEATURE_CACHE_MB (default "
+        "1024 MiB) on the base GPU across tokenizer workers and fall back to CPU "
+        "transport per tensor when full.",
         NS("mm"),
     ] = None
     keep_mm_feature_on_device: A[
@@ -4073,6 +4080,10 @@ class ServerArgs:
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
+        if self._speculative_draft_quantization_explicitly_set is None:
+            self._speculative_draft_quantization_explicitly_set = (
+                self.speculative_draft_model_quantization is not None
+            )
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
 
@@ -5045,8 +5056,20 @@ class ServerArgs:
             self._resolved_overrides = []
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch == "InternS2MobiusForConditionalGeneration":
+            unsupported = []
+            if self.pp_size != 1:
+                unsupported.append("pipeline parallelism (--pp-size must be 1)")
+            if self.ep_size != 1:
+                unsupported.append("expert parallelism (--ep-size must be 1)")
+            if unsupported:
+                raise ValueError(
+                    "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
+                )
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -5999,7 +6022,7 @@ class ServerArgs:
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
-        # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
+        # MambaRadixCache. The host-offload path (enabled by
         # --enable-hierarchical-cache) and custom radix-cache backends are NOT
         # int8-aware: they would read int8 checkpoint slots as bf16 active slots
         # (wrong pool / out-of-range). Reject the combination up front rather than
@@ -6010,7 +6033,7 @@ class ServerArgs:
             raise ValueError(
                 "--enable-int8-mamba-checkpoint is not supported together with "
                 "--enable-hierarchical-cache: the host-offload path "
-                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+                "is not int8-aware. Disable one of them."
             )
         if self.radix_cache_backend is not None:
             raise ValueError(
@@ -6626,8 +6649,8 @@ class ServerArgs:
         ):
             return
         required_tokens = self.cutedsl_moe_max_num_tokens()
-        max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+        max_dispatch_tokens_per_rank = (
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
         )
         max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
         if max_cutedsl_tokens < required_tokens:
@@ -7330,7 +7353,7 @@ class ServerArgs:
         """True iff the checkpoint requires load_format=mistral.
 
         Looks for consolidated*.safetensors with no competing
-        model-*.safetensors; when both weight formats ship in the
+        model*.safetensors; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
@@ -7363,7 +7386,7 @@ class ServerArgs:
                     )
                 ),
                 has_hf_weights=bool(
-                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                    glob.glob(os.path.join(self.model_path, "model*.safetensors"))
                 ),
             )
 
@@ -7378,7 +7401,10 @@ class ServerArgs:
                     for f in files
                 ),
                 has_hf_weights=any(
-                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                    f.startswith("model")
+                    and f.endswith(".safetensors")
+                    and "/" not in f
+                    for f in files
                 ),
             )
         except Exception:
@@ -7569,10 +7595,10 @@ class ServerArgs:
         legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
         if self.keep_mm_feature_on_device:
-            if requested_transport == "cpu":
+            if requested_transport not in (None, "cuda_ipc"):
                 raise ValueError(
                     "--keep-mm-feature-on-device conflicts with "
-                    "--mm-feature-transport=cpu. Use only "
+                    f"--mm-feature-transport={requested_transport}. Use only "
                     "--mm-feature-transport=cuda_ipc."
                 )
             requested_transport = "cuda_ipc"
@@ -7596,13 +7622,17 @@ class ServerArgs:
                     "encoder-only serving; encoder outputs use "
                     "--encoder-transfer-backend instead."
                 )
-            elif is_cuda() and self.nnodes == 1 and self.disaggregation_mode == "null":
+            elif (
+                self.get_model_config().is_multimodal
+                and is_cuda()
+                and self.nnodes == 1
+                and self.disaggregation_mode == "null"
+            ):
                 # Auto policy: single-node CUDA serving defaults to the bounded
-                # CUDA-IPC pool. The pool is only allocated when a multimodal
-                # processor exists, so text-only deployments are unaffected; a
-                # full pool degrades to CPU transport per tensor. Multi-node
-                # (IPC handles are intra-node) and PD-disaggregated deployments
-                # keep CPU transport.
+                # CUDA-IPC pool for multimodal models. Text-only deployments do
+                # not need feature transport. Multi-node (IPC handles are
+                # intra-node) and PD-disaggregated deployments keep CPU transport.
+                # A full pool degrades to CPU transport per tensor.
                 requested_transport = "cuda_ipc"
                 logger.info(
                     "Multimodal feature transport auto-resolved to cuda_ipc "
@@ -7621,13 +7651,30 @@ class ServerArgs:
                 int(legacy_ipc_enabled),
             )
 
-        if self.encoder_only and requested_transport == "cuda_ipc":
+        if self.encoder_only and requested_transport in ("cuda_ipc", "cuda_vmm"):
             logger.warning(
-                "--mm-feature-transport=cuda_ipc does not control encoder-only "
+                "--mm-feature-transport=%s does not control encoder-only "
                 "output transfer; using cpu for this inactive transport. Select "
-                "--encoder-transfer-backend for encoder outputs."
+                "--encoder-transfer-backend for encoder outputs.",
+                requested_transport,
             )
             requested_transport = "cpu"
+
+        if requested_transport == "cuda_vmm":
+            if not is_cuda():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm requires NVIDIA CUDA."
+                )
+            if self.pp_size != 1:
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm does not support pipeline "
+                    "parallelism."
+                )
+            if envs.SGLANG_RUST_SERVER.get():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_vmm is not supported with "
+                    "SGLANG_RUST_SERVER."
+                )
 
         if requested_transport == "cuda_ipc":
             if not is_cuda():
@@ -7875,8 +7922,12 @@ class ServerArgs:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
                     self.disable_custom_all_reduce = True
+                    # should_torch_symm_mem_allreduce() takes the
+                    # symmetric-memory path only below a byte threshold, so
+                    # which reduce runs would follow the token count.
+                    self.enable_torch_symm_mem = False
                     logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                        "NCCL_ALGO is set to 'allreduce:tree', and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
                     )
 
     def _handle_unified_memory_pool(self):
@@ -8546,56 +8597,33 @@ class ServerArgs:
 
         return resolved_view(self)
 
-    def override(self, source: str, **fields) -> None:
-        """The single post-resolution mutation point.
+    def _late_resolution(self, source: str, **fields) -> None:
+        """Resolve fields at the launcher's validation stage (pre-publish).
 
-        After ``__post_init__`` the configuration is resolved; the audited
-        runtime adjustments (load-resolved values, control-plane
-        reconfiguration, deployment wiring) go through here instead of
-        assigning fields. Whitelisted resolvable fields also join the
-        declaration stash, so a republish resolves the same values;
-        everything is recorded with its ``source`` for provenance.
+        See ``arg_groups.overrides.declare_late_resolution``: in place, because
+        every holder of this instance must see the resolved value, and refused
+        outright once the config is published.
         """
-        from sglang.srt.arg_groups.arg_utils import resolvable_fields
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
 
-        whitelist = resolvable_fields(type(self))
-        declared = {k: v for k, v in fields.items() if k in whitelist}
-        rest = {k: v for k, v in fields.items() if k not in whitelist}
-        if declared:
-            stash = getattr(self, "_resolved_overrides", None)
-            if stash is None:
-                stash = []
-                object.__setattr__(self, "_resolved_overrides", stash)
-            stash.append((source, dict(declared)))
-        if rest:
-            log = getattr(self, "_runtime_mutations", None)
-            if log is None:
-                log = []
-                object.__setattr__(self, "_runtime_mutations", log)
-            log.append((source, dict(rest)))
-        object.__setattr__(self, "_in_override", True)
-        try:
-            for field, value in fields.items():
-                setattr(self, field, value)
-        finally:
-            object.__setattr__(self, "_in_override", False)
+        declare_late_resolution(self, source, **fields)
 
     def __setattr__(self, name, value):
-        # after materialization the fields are the resolved startup
-        # configuration -- the pristine, READ-ONLY record. A bare assignment
-        # outside ServerArgs.override() (and the resolution pipeline, which runs
-        # before materialization) always raises; resolved config is mutated on
-        # the context bags via get_context().override(...), not here. (Formerly
-        # gated on SGLANG_STRICT_CONFIG_MUTATION; now unconditional.)
+        # After materialization the fields are the resolved startup
+        # configuration -- the pristine, READ-ONLY record that the config bags
+        # were projected from. Resolved config changes go to the bags via
+        # get_context().override(source, ...); a value one runner or worker
+        # owns travels as a constructor argument to it.
         if (
             not name.startswith("_")
             and getattr(self, "_declarations_materialized", False)
-            and not getattr(self, "_in_override", False)
+            and not getattr(self, "_internal_write", False)
         ):
             raise AttributeError(
                 f"server_args.{name} assigned after resolution; server_args is "
                 "read-only -- use get_context().override(source, ...) to change "
-                "resolved config."
+                "resolved config; a value one runner owns travels as a "
+                "constructor argument."
             )
         object.__setattr__(self, name, value)
 
@@ -8671,6 +8699,14 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
+
+            try:
+                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+                    CHUNK_SIZE as FLA_CHUNK_SIZE,
+                )
+            except ImportError:
+                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
+                FLA_CHUNK_SIZE = 64
 
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
@@ -8905,7 +8941,7 @@ class ServerArgs:
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
             if self.enable_lora is None:
-                self.override("check_lora_server_args", enable_lora=True)
+                self._late_resolution("check_lora_server_args", enable_lora=True)
                 logger.warning(
                     "--enable-lora is set to True because --lora-paths is provided."
                 )
@@ -8916,7 +8952,7 @@ class ServerArgs:
 
         if self.enable_lora:
             if self.enable_lora_overlap_loading is None:
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args", enable_lora_overlap_loading=False
                 )
 
@@ -8975,9 +9011,11 @@ class ServerArgs:
                             "Expected a string or a dictionary."
                         )
                     parsed_lora_paths.append(lora_ref)
-                self.override("check_lora_server_args", lora_paths=parsed_lora_paths)
+                self._late_resolution(
+                    "check_lora_server_args", lora_paths=parsed_lora_paths
+                )
             elif isinstance(self.lora_paths, dict):
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args",
                     lora_paths=[
                         LoRARef(
@@ -8990,7 +9028,7 @@ class ServerArgs:
                     ],
                 )
             elif self.lora_paths is None:
-                self.override("check_lora_server_args", lora_paths=[])
+                self._late_resolution("check_lora_server_args", lora_paths=[])
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -9000,7 +9038,7 @@ class ServerArgs:
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
-                self.override(
+                self._late_resolution(
                     "check_lora_server_args",
                     lora_target_modules=set(self.lora_target_modules),
                 )
@@ -9165,12 +9203,14 @@ class ServerArgs:
         """Transport backend for modelexpress."""
         return self._parsed_modelexpress_config.get("transport", "nixl")
 
-    def remote_instance_weight_loader_use_transfer_engine(self):
+    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
+        """``load_format`` overrides the seed's: a draft runner loading under
+        ``--speculative-draft-load-format`` needs its own transfer engine."""
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # Use TransferEngine as client backend.
-        if self.load_format == "remote_instance" and (
+        if (load_format or self.load_format) == "remote_instance" and (
             self.remote_instance_weight_loader_backend == "transfer_engine"
             or (
                 self.remote_instance_weight_loader_backend == "modelexpress"
