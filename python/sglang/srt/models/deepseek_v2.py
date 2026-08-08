@@ -954,7 +954,6 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -1055,7 +1054,6 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -2972,7 +2970,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        server_args = get_server_args()
 
         if get_exec().moe.disable_shared_experts_fusion:
             return
