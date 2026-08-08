@@ -100,14 +100,7 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
-                    self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                self._pp_forward_and_process_input_requests(recv_reqs)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -240,10 +233,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                self._pp_forward_and_process_input_requests(recv_reqs)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
@@ -329,9 +319,6 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
@@ -392,10 +379,7 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                self._pp_forward_and_process_input_requests(recv_reqs)
 
                 # reaching consensus through PP ranks
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
@@ -515,9 +499,6 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
@@ -555,6 +536,20 @@ class SchedulerPPMixin:
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
+
+    def _pp_forward_and_process_input_requests(
+        self: Scheduler, recv_reqs: List
+    ) -> None:
+        """Forward PP requests before running handlers that may block on peers."""
+        if not self.pp_group.is_last_rank:
+            self._pp_commit_comm_work(self.send_req_work)
+            with torch.profiler.record_function("send_reqs_to_next_stage"):
+                self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                    recv_reqs,
+                    async_send=True,
+                )
+
+        self.process_input_requests(recv_reqs)
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
