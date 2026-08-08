@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -123,6 +124,15 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_output() -> bool:
+    """Whether the installed aiter.fused_moe takes an `output` kwarg; without
+    it, zero_copy_context's buffer cannot be the destination and we copy."""
+    from aiter.fused_moe import fused_moe
+
+    return "output" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -194,6 +204,25 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        # Let aiter write the top-k sum into the published buffer. It returns
+        # that tensor when it takes it and a fresh one when it declines, so the
+        # publisher still compares before copying. no_combine's output has an
+        # extra top-k dim and cannot stand in for the [M, dim] buffer.
+        if not self.config.no_combine and _aiter_fused_moe_supports_output():
+            zero_copy_out = zero_copy_context.get_moe_output_spec(
+                torch.Size(
+                    (runner_input.hidden_states.shape[0], quant_info.w2_weight.shape[1])
+                ),
+                (
+                    runner_input.output_dtype
+                    if runner_input.output_dtype is not None
+                    else runner_input.hidden_states.dtype
+                ),
+                runner_input.hidden_states.device,
+            )
+            if zero_copy_out is not None:
+                extra["output"] = zero_copy_out
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
