@@ -265,8 +265,9 @@ class NewGELU(BaseFusedOp):
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
-        return self.forward_native(x)
+        from sglang.jit_kernel.new_gelu import new_gelu
+
+        return new_gelu(x)
 
 
 class ReLU2(BaseFusedOp):
