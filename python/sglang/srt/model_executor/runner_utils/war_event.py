@@ -13,17 +13,6 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-def resolve_war_read_done_record(
-    boundary: SharedReadBoundary, *, node_planted: bool
-) -> SharedReadBoundary:
-    """Record placement for a declared boundary; UNKNOWN records nothing.
-    IN_REPLAY without a planted node falls back to a pre-replay record
-    (non-capturing runs / no external-event support; pre-existing behavior)."""
-    if boundary is SharedReadBoundary.IN_REPLAY and not node_planted:
-        return SharedReadBoundary.PRE_REPLAY
-    return boundary
-
-
 def make_war_read_done_event(device_module) -> Optional[torch.cuda.Event]:
     """Create a persistent external event for CUDA graph capture."""
     if not is_cuda():

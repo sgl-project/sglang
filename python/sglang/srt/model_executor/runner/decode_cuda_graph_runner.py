@@ -83,7 +83,6 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.model_executor.runner_utils import resolve_war_read_done_record
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
@@ -445,22 +444,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_mode.is_target_verify():
             if not self.model_runner.spec_algorithm.is_war_publish_phase(forward_mode):
                 return SharedReadBoundary.UNKNOWN
+            if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph:
+                # Breakable-graph verify rereads shared state across segments.
+                return SharedReadBoundary.POST_REPLAY
         elif not forward_mode.is_decode():
             return SharedReadBoundary.UNKNOWN
-        boundary = attn_backend.shared_read_boundary(forward_mode)
-        if boundary is SharedReadBoundary.UNKNOWN:
-            # The capture mode implies the boundary: breakable graphs
-            # interleave eager segments that may reread shared state; full
-            # graphs keep all shared reads inside metadata init.
-            if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph or (
-                isinstance(self.backend, BreakableCudaGraphBackend)
-            ):
-                boundary = SharedReadBoundary.POST_REPLAY
-            else:
-                boundary = SharedReadBoundary.IN_REPLAY
-        return resolve_war_read_done_record(
-            boundary, node_planted=self._war_read_done_node_planted
-        )
+        if self._war_read_done_node_planted:
+            return SharedReadBoundary.IN_REPLAY
+        return SharedReadBoundary.PRE_REPLAY
 
     def _publish_war_read_done(self, in_graph: bool):
         """Publish the read-done event the scheduler's WAR barrier waits on."""
