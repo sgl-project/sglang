@@ -9,6 +9,7 @@ from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -52,6 +53,19 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
+
+
+def _waterfill_trim_local_count(count):
+    """Trim MoRI's local_expert_count to num_local_physical_experts for the EPLB
+    distribution recorder. DeepEP-Waterfill fuses the shared expert as an extra
+    (last) local slot which the recorder does not track; DeepEP feeds a
+    num_local_physical_experts-wide count, so match that here."""
+    meta = get_global_expert_location_metadata()
+    if meta is not None:
+        n = meta.num_local_physical_experts
+        if count.shape[0] != n:
+            return count[:n]
+    return count
 
 
 def _should_record_expert_distribution() -> bool:
@@ -738,7 +752,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         # low_latency hook only when the recorder is actually active.
         if record:
             get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
+                _waterfill_trim_local_count(self.mori_op.local_expert_count)
             )
 
         return (
@@ -927,7 +941,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
 
         if record:
             get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-                self.mori_op.local_expert_count
+                _waterfill_trim_local_count(self.mori_op.local_expert_count)
             )
 
         return MoriEPLLDispatchOutput(

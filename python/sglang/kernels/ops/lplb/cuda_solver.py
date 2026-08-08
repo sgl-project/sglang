@@ -20,6 +20,7 @@ import torch
 from sglang.kernels.jit.utils import (
     cache_once,
     get_jit_cuda_arch,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -59,6 +60,31 @@ def _ipm_module(
     )
 
 
+@cache_once
+def _ipm_module_hip(nc: int, nv: int, block_dim: int, num_iters: int) -> Module:
+    """JIT-compile the HIP/ROCm IPM kernel for one shape.
+
+    ROCm has no cuBLASDx, so this builds ``lplb/ipm_hip.cuh`` (hand-written
+    shared-memory GEMMs + block Cholesky, no mathdx dependency and no SM_VER
+    template). Exports the same ``ipm_solve`` entry name as the CUDA module so
+    callers are backend-agnostic.
+    """
+    args = make_cpp_args(nc, nv, block_dim, num_iters)
+    return load_jit(
+        "lplb_ipm_hip",
+        *args,
+        cuda_files=["lplb/ipm_hip.cuh"],
+        cuda_wrappers=[("ipm_solve", f"ipm_hip_solve<{args}>")],
+    )
+
+
+def _get_ipm_module(nc: int, nv: int, num_iters: int) -> Module:
+    """Return the IPM module for the current backend (HIP or CUDA)."""
+    if is_hip_runtime():
+        return _ipm_module_hip(nc, nv, DEFAULT_BLOCK_DIM, num_iters)
+    return _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
+
+
 def warmup(
     nc: int,
     nv: int,
@@ -68,7 +94,7 @@ def warmup(
     """JIT-compile the kernel for ``(nc, nv)`` so the first real solve isn't
     paying the compile cost. Raises on compile or launch failure.
     """
-    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
+    module = _get_ipm_module(nc, nv, num_iters)
     # Trigger any first-call lazy initialization.
     A = torch.zeros(nc, nv, dtype=torch.float32, device=device)
     b = torch.zeros(nc, dtype=torch.float32, device=device)
@@ -110,7 +136,7 @@ def solve_ipm(
     assert b.shape == (nc,), f"b shape mismatch: {b.shape} vs ({nc},)"
     assert c.shape == (nv,), f"c shape mismatch: {c.shape} vs ({nv},)"
 
-    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
+    module = _get_ipm_module(nc, nv, num_iters)
     if result is None:
         result = torch.empty(nv, dtype=torch.float32, device=A.device)
     module.ipm_solve(A, b, c, result)
