@@ -998,6 +998,10 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # Number of scheduler passes this request has spent in the waiting queue
+        # without being admitted. Used by the lpm aging term to bound
+        # cache-cold request starvation.
+        self.waiting_passes = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -1669,6 +1673,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.waiting_passes = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.skip_lock_node_ids = {}

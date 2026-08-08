@@ -831,6 +831,16 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = "fcfs"
+    lpm_aging_tokens_per_pass: A[
+        int,
+        Arg(
+            help="Aging term added to the lpm (longest-prefix-match) sort key per "
+            "waiting pass, to prevent cache-cold requests from being starved "
+            "by cache-hot arrivals. The lpm sort key becomes "
+            "-(num_matched_prefix_tokens + N * waiting_passes). 0 (default) "
+            "preserves the original lpm behavior exactly.",
+        ),
+    ] = 0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

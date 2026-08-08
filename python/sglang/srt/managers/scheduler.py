@@ -1188,6 +1188,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            lpm_aging_tokens_per_pass=self.server_args.lpm_aging_tokens_per_pass,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: float = 0.0
@@ -3316,6 +3317,11 @@ class Scheduler(
             return None, running_batch
 
         can_run_set = set(can_run_list)
+        # Requests admitted to the running batch leave the waiting queue; reset
+        # their aging counter so a future re-queue (e.g. preemption) starts
+        # fresh rather than inheriting a stale age.
+        for req in can_run_list:
+            req.waiting_passes = 0
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
