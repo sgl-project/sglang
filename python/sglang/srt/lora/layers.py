@@ -944,11 +944,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self,
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
+        lora_execution_engine: str = "legacy",
     ):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
         lora_backend.is_moe_lora = True
+        self.lora_execution_engine = lora_execution_engine
 
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
@@ -973,6 +975,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self._uses_interleaved_gate_up = (
             getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
+
+        if self.lora_execution_engine == "sgl_lora":
+            self._initialize_sgl_lora_execution(base_layer)
+            return
+        if self.lora_execution_engine != "legacy":
+            raise ValueError(
+                "FusedMoEWithLoRA received an unresolved LoRA execution engine: "
+                f"{self.lora_execution_engine!r}"
+            )
 
         # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
@@ -1050,6 +1061,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 f"LoRA MoE not supported for backend {runner_backend}"
             )
 
+    def _initialize_sgl_lora_execution(self, base_layer: FusedMoE) -> None:
+        """Attach the SGL LoRA execution engine to this layer.
+
+        The engine owns admission against the resident provider contract,
+        provider construction, the shared-factor map, and launch configuration;
+        this wrapper keeps no engine internals.
+        """
+        from sglang.srt.lora.sgl_lora.moe_lora_runner import SglMoeLoraRunner
+
+        self.sgl_lora_runner = SglMoeLoraRunner.from_layer(base_layer)
+        self.lora_use_virtual_experts = True
+
     def set_lora_info(
         self,
         gate_up_lora_a_weights: torch.Tensor,
@@ -1058,14 +1081,47 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         down_lora_b_weights: torch.Tensor = None,
     ):
         """Set LoRA weight tensors from memory pool."""
+        if self.lora_execution_engine == "sgl_lora":
+            # Factor dtype and expert domain are immutable once bound, so they
+            # are validated here rather than on every forward.
+            self.sgl_lora_runner.validate_factors(
+                gate_up_lora_a=gate_up_lora_a_weights,
+                gate_up_lora_b=gate_up_lora_b_weights,
+                down_lora_a=down_lora_a_weights,
+                down_lora_b=down_lora_b_weights,
+                shared_outer=self.experts_shared_outer_loras,
+            )
+
         self.set_lora = True
         self.gate_up_lora_a_weights = gate_up_lora_a_weights
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
 
+    def _get_sgl_lora_batch(self):
+        """Build the narrow SGL LoRA batch view straight from batch info.
+
+        Deliberately does not go through the legacy ``LoRAInfo``: this engine
+        consumes eight fields, and building the 18-field legacy structure first
+        would re-couple the new execution boundary to the old one.
+        """
+        from sglang.srt.lora.sgl_lora.moe_lora_runner import SglMoeLoraBatch
+
+        moe_lora_info = self.lora_backend.batch_info.moe_lora_info
+        assert moe_lora_info is not None
+        return SglMoeLoraBatch(
+            gate_up_lora_a=self.gate_up_lora_a_weights,
+            gate_up_lora_b=self.gate_up_lora_b_weights,
+            down_lora_a=self.down_lora_a_weights,
+            down_lora_b=self.down_lora_b_weights,
+            token_slots=moe_lora_info.token_lora_mapping,
+            adapter_enabled=moe_lora_info.adapter_enabled,
+            physical_rank=self.down_lora_a_weights.shape[2],
+            shared_outer=self.experts_shared_outer_loras,
+        )
+
     def _get_lora_info(self):
-        """Build LoRAInfo for the current batch."""
+        """Build LoRAInfo for the current batch (legacy engine)."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
         batch_info = self.lora_backend.batch_info
@@ -1124,11 +1180,33 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if self.lora_backend.batch_info is None:
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
+        if self.lora_execution_engine == "sgl_lora":
+            return self._forward_sgl_lora(hidden_states, topk_output, **kwargs)
+
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()
 
         # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
+
+    def _forward_sgl_lora(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs
+    ):
+        """Run the SGL LoRA engine over the base layer's dispatch boundary."""
+        base_layer = self.base_layer
+        dispatch_output = base_layer.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        combine_input = self.sgl_lora_runner.run(
+            dispatch_output,
+            self._get_sgl_lora_batch(),
+            output_dtype=kwargs.pop("output_dtype", None),
+        )
+        # TODO(followup PR): both engines return here without the shared
+        # FusedMoE epilogue (crop / DWDP / reduce_results all-reduce). That
+        # omission is byte-identical to upstream and affects the legacy path
+        # equally, so it is fixed once for both engines separately.
+        return base_layer.dispatcher.combine(combine_input=combine_input)
 
     def _forward_with_lora(
         self,
@@ -1289,7 +1367,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, lora_backend: BaseLoRABackend
+    layer: nn.Module,
+    lora_backend: BaseLoRABackend,
+    *,
+    lora_execution_engine: str = "legacy",
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -1308,6 +1389,12 @@ def get_lora_layer(
         return InklingQKVRLinearWithLoRA(layer, lora_backend)
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
+            if lora_layer_type is FusedMoEWithLoRA:
+                return lora_layer_type(
+                    layer,
+                    lora_backend,
+                    lora_execution_engine=lora_execution_engine,
+                )
             ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")

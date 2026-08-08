@@ -307,7 +307,7 @@ def _align_block_size_jit(
     block_size: int,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
+    """CUDA JIT align_block_size for num_experts > 1024 (up to 32767).
 
     Uses the v2 kernel from moe_align_kernel.cu which supports large expert
     counts via per-thread multi-expert processing and a two-level warp scan,
@@ -319,8 +319,8 @@ def _align_block_size_jit(
     handles histogram, padded prefix-sum, expert_ids assignment, and token
     scattering in just 2–3 CUDA kernel launches.
     """
-    assert num_experts <= 8191, (
-        f"_align_block_size_jit supports at most 8191 experts "
+    assert num_experts <= 32767, (
+        f"_align_block_size_jit supports at most 32767 experts "
         f"(num_moe_experts * max_loras), got {num_experts}"
     )
 

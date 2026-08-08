@@ -8,7 +8,27 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
+    # Every codegen-affecting parameter must be in the key: on a hit the
+    # wrapper re-launches the CACHED binary, so a constexpr (or launch
+    # meta) missing here is silently frozen at its first-call value — a
+    # process mixing two LoRA max-ranks (two N) reused the narrower
+    # kernel and left the wider call's upper output columns unwritten.
+    lambda _, kwargs: (
+        kwargs["N"],
+        kwargs["K"],
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["BLOCK_N"],
+        kwargs["BLOCK_K"],
+        kwargs.get("num_warps"),
+        kwargs.get("num_stages"),
+        # Pointer dtypes specialize the binary too (x.dtype.element_ty
+        # casts): BF16-then-FP16 at identical dimensions must not reuse
+        # the first compilation (sixth S3 review).
+        kwargs["x"].dtype,
+        kwargs["weights"].dtype,
+        kwargs["output"].dtype,
+    )
 )
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(
@@ -139,6 +159,13 @@ def chunked_sgmv_lora_shrink_forward(
     assert weights.is_contiguous()
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
+    # Metadata dtypes are enforced here instead of entering the compile-
+    # cache key: the kernel loads them via typed pointers, so a drifting
+    # producer must fail loudly rather than replay a mistyped binary.
+    assert batch_info.seg_indptr.dtype == torch.int32
+    assert batch_info.weight_indices.dtype == torch.int32
+    assert batch_info.lora_ranks.dtype == torch.int32
+    assert batch_info.permutation.dtype == torch.int32
 
     # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
