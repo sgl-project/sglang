@@ -48,6 +48,14 @@ class TestConsecutivePrefillLimiter(unittest.TestCase):
 
         self.assertFalse(limiter.should_force_decode(has_runnable_decode=True))
 
+    def test_prefill_count_saturates_at_limit(self):
+        limiter = ConsecutivePrefillLimiter(2)
+
+        for _ in range(4):
+            limiter.on_prefill()
+
+        self.assertEqual(limiter._consecutive_prefill_batches, 2)
+
     def test_rejects_negative_limit(self):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             ConsecutivePrefillLimiter(-1)
@@ -118,6 +126,35 @@ class TestSchedulerConsecutivePrefillLimiter(unittest.TestCase):
         scheduler.get_new_batch_prefill.assert_not_called()
         scheduler.update_running_batch.assert_called_once_with(running_batch)
         self.assertFalse(limiter.should_force_decode(has_runnable_decode=True))
+
+    @patch(
+        "sglang.srt.managers.scheduler.get_spec",
+        return_value=SimpleNamespace(speculative_skip_dp_mlp_sync=False),
+    )
+    @patch("sglang.srt.managers.scheduler.set_schedule_time_batch")
+    def test_dp_sync_idle_batch_does_not_count_as_prefill(
+        self, _set_schedule_time_batch, _get_spec
+    ):
+        running_batch = _Batch()
+        limiter = ConsecutivePrefillLimiter(2)
+        scheduler = _make_scheduler(
+            limiter,
+            SimpleNamespace(batch_to_run=None, running_batch=running_batch),
+        )
+        scheduler.require_mlp_sync = True
+        scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        idle_batch = _Batch(empty=True)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch, need_sync=None: (
+                idle_batch if batch is None else batch
+            )
+        )
+
+        for _ in range(2):
+            Scheduler.get_next_batch_to_run(scheduler, running_batch, None)
+
+        self.assertFalse(limiter.should_force_decode(has_runnable_decode=True))
+        self.assertEqual(limiter._consecutive_prefill_batches, 0)
 
 
 if __name__ == "__main__":

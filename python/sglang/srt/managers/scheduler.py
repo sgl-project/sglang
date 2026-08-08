@@ -3065,6 +3065,7 @@ class Scheduler(
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+        selected_prefill = new_batch is not None
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -3081,7 +3082,7 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
-            if self.dllm_config is None:
+            if self.dllm_config is None and selected_prefill:
                 self.consecutive_prefill_limiter.on_prefill()
             ret = new_batch
         else:
