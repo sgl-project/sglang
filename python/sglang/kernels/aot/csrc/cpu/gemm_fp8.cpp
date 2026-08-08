@@ -23,6 +23,30 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
 }
 
 template <typename scalar_t>
+inline void copy_mul_add_stub(
+    scalar_t* __restrict__ out,
+    const float* __restrict__ input,
+    const float* __restrict__ bias,
+    int size,
+    float scale) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  const fVec vscale = fVec(scale);
+
+  int d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    auto [data0, data1] = load_float_vec2(input + d);
+    auto [bias0, bias1] = load_float_vec2(bias + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * vscale + bias0, data1 * vscale + bias1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d] * scale + bias[d]);
+  }
+}
+template <typename scalar_t>
 inline void copy_add_stub(
     scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -235,12 +259,13 @@ struct tinygemm_kernel_nn {
   }
 };
 
-template <typename scalar_t, int BLOCK_M, int BLOCK_N>
+template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
   static inline void apply(
       const scalar_t* __restrict__ A,
       const at::Float8_e4m3fn* __restrict__ B,
       scalar_t* __restrict__ C,
+      const float* __restrict__ bias,
       float scale,
       int K,
       int lda,
@@ -354,12 +379,13 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
   }
 };
 
-template <int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+template <bool has_bias, int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
   static inline void apply(
       const at::BFloat16* __restrict__ A,
       const at::Float8_e4m3fn* __restrict__ B,
       at::BFloat16* __restrict__ C,
+      const float* __restrict__ bias,
       float scale,
       int K,
       int lda,
@@ -414,8 +440,16 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
       constexpr int col = i % COLS;
       // for COLS = 2, 4 use 512bit store
       if constexpr (col % 2 == 0) {
-        __m512 vc0 = _mm512_mul_ps(vc[row * COLS + col + 0], vscale);
-        __m512 vc1 = _mm512_mul_ps(vc[row * COLS + col + 1], vscale);
+        __m512 vc0, vc1;
+        if constexpr (has_bias) {
+          __m512 vbias0 = _mm512_loadu_ps(bias + col * 16 + 0);
+          __m512 vbias1 = _mm512_loadu_ps(bias + col * 16 + 16);
+          vc0 = _mm512_fmadd_ps(vc[row * COLS + col + 0], vscale, vbias0);
+          vc1 = _mm512_fmadd_ps(vc[row * COLS + col + 1], vscale, vbias1);
+        } else {
+          vc0 = _mm512_mul_ps(vc[row * COLS + col + 0], vscale);
+          vc1 = _mm512_mul_ps(vc[row * COLS + col + 1], vscale);
+        }
         _mm512_storeu_si512(
             reinterpret_cast<__m512i*>((C + row * ldc + col * 16)), (__m512i)(_mm512_cvtne2ps_pbh(vc1, vc0)));
       }
@@ -538,9 +572,17 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLO
       ldc,                                                                            \
       block_size_K);
 
-#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)      \
-  tinygemm_kernel_nn2<scalar_t, MB_SIZE, NB_SIZE>::apply( \
-      A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, scale, K, lda, ldb, ldc);
+#define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)                \
+  tinygemm_kernel_nn2<scalar_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
+      A + mb_start * lda,                                           \
+      B + nb_start * 2,                                             \
+      C + mb_start * ldc + nb_start,                                \
+      has_bias ? bias + nb_start : nullptr,                         \
+      scale,                                                        \
+      K,                                                            \
+      lda,                                                          \
+      ldb,                                                          \
+      ldc);
 
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias>
 struct brgemm {
@@ -562,8 +604,27 @@ struct brgemm {
     TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
   }
 };
-template <typename scalar_t>
-struct brgemm2 {};
+
+template <typename scalar_t, typename packed_t, bool has_bias>
+struct brgemm2 {
+  static inline void apply(
+      const scalar_t* __restrict__ A,
+      const packed_t* __restrict__ B,
+      scalar_t* __restrict__ C,
+      scalar_t* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      const float* __restrict__ bias,
+      float scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    TORCH_CHECK(false, "struct brgemm2: primary template not implemented!");
+  }
+};
 
 template <bool has_bias>
 struct brgemm<at::BFloat16, at::Float8_e4m3fn, float, has_bias> {
@@ -609,14 +670,15 @@ struct brgemm<at::BFloat16, at::Float8_e4m3fn, float, has_bias> {
   }
 };
 
-template <>
-struct brgemm2<at::BFloat16> {
+template <bool has_bias>
+struct brgemm2<at::BFloat16, at::Float8_e4m3fn, has_bias> {
   static inline void apply(
       const at::BFloat16* __restrict__ A,
       const at::Float8_e4m3fn* __restrict__ B,
       at::BFloat16* __restrict__ C,
       at::BFloat16* __restrict__ Btmp,
       float* __restrict__ Ctmp,
+      const float* __restrict__ bias,
       float scale,
       int M,
       int N,
@@ -640,7 +702,11 @@ struct brgemm2<at::BFloat16> {
 
     // copy from Ctmp to C and mul scale
     for (int m = 0; m < M; ++m) {
-      copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, N, scale);
+      if constexpr (has_bias) {
+        copy_mul_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N, scale);
+      } else {
+        copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, N, scale);
+      }
     }
   }
 };
@@ -743,14 +809,15 @@ void tinygemm_kernel(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename packed_t, bool has_bias>
 void tinygemm_kernel2(
     const scalar_t* __restrict__ A,
-    const at::Float8_e4m3fn* __restrict__ B,
+    const packed_t* __restrict__ B,
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
     float scale,
+    const float* __restrict__ bias,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -759,7 +826,7 @@ void tinygemm_kernel2(
     int64_t ldc,
     bool brg) {
   if (brg) {
-    brgemm2<scalar_t>::apply(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc);
+    brgemm2<scalar_t, packed_t, has_bias>::apply(A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc);
     return;
   }
 
@@ -918,6 +985,63 @@ void fp_scaled_mm_kernel_impl(
   });
 }
 
+template <typename scalar_t, typename packed_t>
+void fp_per_tensor_scaled_mm_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const packed_t* __restrict__ mat2,
+    float scale,
+    const float* __restrict__ bias,
+    scalar_t* __restrict__ buffer,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM,
+    int64_t buffer_size_per_thread) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+
+  const bool use_brgemm = can_use_brgemm<packed_t>(M);
+  const int64_t packed_K = get_row_size<packed_t>(K);
+
+  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+      int tid = get_thread_num();
+      scalar_t* __restrict__ Btmp = buffer + tid * buffer_size_per_thread;
+      float* __restrict__ Ctmp = (float*)((void*)(Btmp + MAX_CACHE_BLOCK_SIZE * BLOCK_N * K));
+
+      loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+        int64_t mb_start = mb * BLOCK_M;
+        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+        int64_t nb_start = nb * BLOCK_N;
+        int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+
+        tinygemm_kernel2<scalar_t, packed_t, has_bias>(
+            mat1 + mb_start * mat1_strideM,
+            mat2 + nb_start * packed_K,
+            out + mb_start * out_strideM + nb_start,
+            Btmp + nb_offset * BLOCK_N * K,
+            Ctmp,
+            scale,
+            bias ? bias + nb_start : nullptr,
+            mb_size,
+            nb_size,
+            K,
+            mat1_strideM,
+            nb_size,
+            out_strideM,
+            use_brgemm);
+      });
+      if (use_brgemm) {
+        at::native::cpublas::brgemm_release();
+      }
+    });
+  });
+}
+
 }  // anonymous namespace
 
 // tinygemm interface
@@ -955,6 +1079,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ bias,
     float scale,
     int64_t M,
     int64_t N,
@@ -963,7 +1088,13 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg) {
-  tinygemm_kernel2<scalar_t>(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, brg);
+  if (bias != nullptr) {
+    tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, true>(A, B, C, Btmp, Ctmp, scale, bias, M, N, K, lda, ldb, ldc, brg);
+    return;
+  }
+
+  tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, false>(
+      A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg);
 }
 
 template <typename scalar_t>
@@ -1077,6 +1208,7 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
       TYPE* __restrict__ C,                    \
       TYPE* __restrict__ Btmp,                 \
       float* __restrict__ Ctmp,                \
+      const float* __restrict__ bias,          \
       float scale,                             \
       int64_t M,                               \
       int64_t N,                               \
@@ -1173,6 +1305,58 @@ at::Tensor fp8_scaled_mm_cpu(
         block_size_K,
         buffer.size(-1),
         [&](int64_t nb) { return (nb / blocks_n_per_group) * scale_size_K; });
+  });
+
+  return out;
+}
+
+at::Tensor fp8_per_tensor_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni) {
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
+  CHECK_INPUT(mat2);
+  CHECK_INPUT(scales2);
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_scaled_mm_cpu: expect scales2 to be float32.");
+
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat2.size(1);
+
+  CHECK_EQ(mat1.size(1), K);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+
+  const auto st = mat1.scalar_type();
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "fp8_per_tensor_scaled_mm_cpu: expect A to be bfloat16 or half.");
+  TORCH_CHECK(st == out_dtype, "fp8_per_tensor_scaled_mm_cpu: expect A has same dtype with out_dtype.");
+  TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn, "fp8_per_tensor_scaled_mm_cpu: expect mat2 to be fp8_e4m3.");
+  TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to be float32.");
+  TORCH_CHECK(
+      scales2.numel() == 1, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to have one element for per-tensor scaling.");
+  auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
+  auto buffer = alloc_thread_buffer(mat1.options(), K);
+  float scale_val = scales2.data_ptr<float>()[0];
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "fp8_per_tensor_scaled_mm_kernel_impl", [&] {
+    fp_per_tensor_scaled_mm_kernel_impl<scalar_t, at::Float8_e4m3fn>(
+        out.data_ptr<scalar_t>(),
+        mat1.data_ptr<scalar_t>(),
+        packed_w.data_ptr<at::Float8_e4m3fn>(),
+        scale_val,
+        get_bias_data(bias, N),
+        buffer.data_ptr<scalar_t>(),
+        M,
+        N,
+        K,
+        mat1.stride(0),
+        out.stride(0),
+        buffer.size(-1));
   });
 
   return out;

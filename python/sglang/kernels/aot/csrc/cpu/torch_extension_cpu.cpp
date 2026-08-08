@@ -281,6 +281,14 @@ at::Tensor fp8_scaled_mm_cpu(
     at::ScalarType out_dtype,
     bool is_vnni);
 
+at::Tensor fp8_per_tensor_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
+
 // mxfp4 gemm
 at::Tensor mxfp4_scaled_mm_cpu(
     at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni);
@@ -719,6 +727,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+  m.def(
+      "fp8_per_tensor_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType "
+      "out_dtype, bool is_vnni) -> Tensor");
+  m.impl("fp8_per_tensor_scaled_mm_cpu", torch::kCPU, &fp8_per_tensor_scaled_mm_cpu);
 
   // mxfp4 gemm
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
