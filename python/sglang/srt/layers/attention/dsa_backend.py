@@ -3380,6 +3380,9 @@ class DeepseekSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
 
+    def supports_dsa_indexer_metadata(self) -> bool:
+        return True
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:

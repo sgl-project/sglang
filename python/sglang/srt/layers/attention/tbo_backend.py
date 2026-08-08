@@ -172,6 +172,9 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
+    def supports_dsa_indexer_metadata(self) -> bool:
+        return self.primary.supports_dsa_indexer_metadata()
+
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 

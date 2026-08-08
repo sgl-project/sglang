@@ -247,11 +247,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Populate DSA index-share fields from the draft runner's hf_config.
         # Reused by the attention unit-test harnesses, which skip __init__.
         hf_config = self.draft_runner.model_config.hf_config
+        attn_backend = getattr(self.draft_runner, "attn_backend", None)
+        supports_indexer_metadata = (
+            attn_backend is not None
+            and getattr(
+                attn_backend,
+                "supports_dsa_indexer_metadata",
+                lambda: False,
+            )()
+        )
         # Reuse the first draft step's DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
         self.index_share_for_mtp_iteration = (
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
+            and supports_indexer_metadata
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
@@ -316,6 +326,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
+
+        # The runner's attention backend is initialized after this worker is
+        # constructed. Refresh the capability-gated DSA reuse state before the
+        # backend factory consumes it. White-box tests may supply a partial
+        # runner that deliberately omits model_config.
+        if hasattr(self.draft_runner, "model_config"):
+            self._init_dsa_index_share_state()
 
         self.draft_extend_attn_backend = None
 

@@ -280,6 +280,10 @@ class AttentionBackend(ABC):
         """Check if the current backend supports triton."""
         return True
 
+    def supports_dsa_indexer_metadata(self) -> bool:
+        """Whether this backend can provide DSA indexer metadata for MTP reuse."""
+        return False
+
     def get_indexer_metadata(
         self,
         layer_id: int,
