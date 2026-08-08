@@ -150,7 +150,14 @@ class CommonKVManager(BaseKVManager):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        # Per-component, NOT flattened across components: every state component
+        # ships its own index list, so the bytes it costs are its own per-layer
+        # item lengths times its own index count. Collapsing this to one scalar
+        # would only be usable if every component shipped the same indices, the
+        # way all layers share one page-index list on the KV side.
+        self.state_item_lens_per_component = [
+            sum(component) for component in args.state_item_lens
+        ]
         self.is_mla_backend = is_mla_backend
         # Per-sender fan-out of a KV copy onto N decode destinations
         # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
@@ -1077,7 +1084,10 @@ class CommonKVSender(BaseKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
-        self._transfer_num_state_indices = 0
+        # Accumulated as bytes rather than as an index count: the cost of a state
+        # index depends on which component it belongs to, and that association is
+        # only available where the indices are recorded.
+        self._transfer_state_bytes = 0
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1139,10 +1149,12 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
+        # Every layer ships the SAME page indices, so one KV index costs the sum
+        # over layers -- that scalar product is exact. State components each ship
+        # their own indices, so their bytes are accumulated per component in
+        # `_record_transfer_indices` instead.
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
-        )
+        total_bytes += self._transfer_state_bytes
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
@@ -1154,10 +1166,15 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+        if not state_indices:
+            return
+        item_lens = self.kv_mgr.state_item_lens_per_component
+        for component_id, component_indices in enumerate(state_indices):
+            if component_indices is None:
+                continue
+            self._transfer_state_bytes += (
+                len(component_indices) * item_lens[component_id]
+            )
 
     def _prepare_send_indices(
         self,
