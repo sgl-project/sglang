@@ -450,8 +450,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        # Slice by the kv length, not len(token_ids): a dLLM FDFO request can
+        # hold committed KV beyond origin+output (its unresolved block lives in
+        # dllm_incomplete_ids only), and the tail free below must reclaim it.
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(

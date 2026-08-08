@@ -905,7 +905,13 @@ class PrefillAdder:
             int(self.rem_total_tokens),
         )
         if _rem_tokens <= 0:
-            _rem_tokens = self.rem_dllm_tokens
+            # rem_total_tokens charges max_new_tokens upfront per staging row
+            # every round, so it goes negative long before the KV pool is
+            # actually full; letting staging through anyway avoids stalling
+            # in-flight denoise blocks. It must still be capped at one block:
+            # a larger grant produces a variable-length row, and the denoise
+            # algorithms reshape the batch as uniform block_size rows.
+            _rem_tokens = min(self.rem_dllm_tokens, self.dllm_block_size)
 
         return _rem_tokens
 
