@@ -2379,6 +2379,14 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     disable_shared_experts_fusion writes (post-publish writers exist for that
     field) stay in the handler."""
     moe_runner_backend = view.moe_runner_backend
+    if view.moe_a2a_backend == "flashinfer_megamoe":
+        if moe_runner_backend == "auto":
+            return {"moe_runner_backend": "flashinfer_megamoe"}
+        if moe_runner_backend != "flashinfer_megamoe":
+            raise ValueError(
+                "moe_a2a_backend='flashinfer_megamoe' requires "
+                "moe_runner_backend='flashinfer_megamoe'."
+            )
     if view.quantization == "nvfp4_online":
         if not is_sm100_supported():
             raise ValueError(
@@ -2456,6 +2464,11 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
+    if runner == "flashinfer_megamoe":
+        logger.warning(
+            "FlashInfer MegaMOE is enabled. --disable-shared-experts-fusion is automatically set."
+        )
+        return {"disable_shared_experts_fusion": True}
     return {}
 
 
@@ -2470,7 +2483,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend == "flashinfer":
+    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -2496,6 +2509,7 @@ def _cutlass_moe_env_override(view: Any) -> dict:
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
+        "flashinfer_megamoe",
         "deepep",
         "mooncake",
         "nixl",
@@ -2511,7 +2525,11 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 def _a2a_backend_overrides(view: Any) -> dict:
 
     moe_a2a_backend = view.moe_a2a_backend
-    if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
+    if view.enable_waterfill and moe_a2a_backend not in (
+        "deepep",
+        "megamoe",
+        "flashinfer_megamoe",
+    ):
         logger.warning(
             "moe_a2a_backend is overridden to 'deepep' because Waterfill "
             "requires the DeepEP or MegaMOE backend."

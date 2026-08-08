@@ -255,6 +255,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_megamoe",
     "cutlass",
     "aiter",
     "marlin",
@@ -272,6 +273,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "flashinfer_megamoe",
     "pplx",
     "ascend_tp",
 ]
@@ -279,6 +281,7 @@ MOE_A2A_BACKEND_CHOICES = [
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
+    "flashinfer_megamoe",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
@@ -2289,6 +2292,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "flashinfer_megamoe",
             "pplx",
         ],
         Arg(
@@ -6706,6 +6710,50 @@ class ServerArgs:
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+
+        if a2a_backend == "flashinfer_megamoe":
+            combine_dtype = (
+                envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get()
+                .strip()
+                .lower()
+            )
+            if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
+                raise ValueError(
+                    "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
+                    f"'bf16', 'mxfp8', or 'nvfp4', got {combine_dtype!r}."
+                )
+            if (
+                combine_dtype != "bf16"
+                and envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+            ):
+                raise ValueError(
+                    "Non-bf16 FlashInfer MegaMOE combine dtype is incompatible "
+                    "with in-kernel FC2 reduce."
+                )
+            assert (
+                resolved_view(self).enable_dp_attention
+                and self.dp_size == self.tp_size
+            ), (
+                "FlashInfer MegaMOE requires --enable-dp-attention with "
+                "dp_size == tp_size."
+            )
+            self.ep_size = self.tp_size
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_megamoe"
+            assert (
+                resolved_view(self).moe_runner_backend == "flashinfer_megamoe"
+            ), (
+                "FlashInfer MegaMOE requires "
+                "--moe-runner-backend flashinfer_megamoe."
+            )
+            if resolved_view(self).quantization in ("modelopt_fp4", "mxfp8"):
+                assert is_sm100_supported(), (
+                    "FlashInfer MegaMOE FP4/MXFP8 requires Blackwell (SM100+)."
+                )
+            logger.info(
+                "FlashInfer MegaMOE is enabled; expert parallel size is "
+                f"set to tensor parallel size [{self.tp_size}]."
+            )
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
