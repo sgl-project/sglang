@@ -1939,16 +1939,24 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
+        from sglang.srt.mem_cache.pool_host.coalesce_reload import bulk_reload
+
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
-                transfer_kv_per_layer_mla(
-                    src=self.index_k_with_scale_buffer[host_layer_id],
-                    dst=device_pool.index_k_with_scale_buffer[device_layer_id],
-                    src_indices=host_page_indices,
-                    dst_indices=device_page_indices,
-                    item_size=self.indexer_page_stride_size,
-                )
+                if not bulk_reload(
+                    self.index_k_with_scale_buffer[host_layer_id],
+                    device_pool.index_k_with_scale_buffer[device_layer_id],
+                    host_page_indices,
+                    device_page_indices,
+                ):
+                    transfer_kv_per_layer_mla(
+                        src=self.index_k_with_scale_buffer[host_layer_id],
+                        dst=device_pool.index_k_with_scale_buffer[device_layer_id],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,

@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.coalesce_reload import bulk_reload
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -260,7 +261,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                if self.can_use_jit:
+                if bulk_reload(
+                    self.kv_buffer[host_layer_id],
+                    device_pool.kv_buffer[device_layer_id],
+                    host_indices,
+                    device_indices,
+                ):
+                    pass
+                elif self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         cache_dst=device_pool.kv_buffer[device_layer_id],
                         cache_src=self.kv_buffer[host_layer_id],
