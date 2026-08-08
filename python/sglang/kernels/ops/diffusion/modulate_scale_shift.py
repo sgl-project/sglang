@@ -38,8 +38,7 @@ def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "modulate_scale_shift",
-                "sglang_modulate_scale_shift::"
-                f"ModulateScaleShiftKernel<{args}>::run",
+                f"modulate_scale_shift::ModulateScaleShiftKernel<{args}>::run",
             ),
         ],
     )

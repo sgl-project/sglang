@@ -16,7 +16,9 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace sglang_modulate_scale_shift {
+namespace sglang {
+
+namespace modulate_scale_shift {
 
 namespace {
 
@@ -134,4 +136,6 @@ struct ModulateScaleShiftKernel {
   }
 };
 
-}  // namespace sglang_modulate_scale_shift
+}  // namespace modulate_scale_shift
+
+}  // namespace sglang
