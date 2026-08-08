@@ -206,6 +206,20 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+
+@functools.lru_cache(maxsize=1)
+def _wo_a_ue8m0_sm12x() -> bool:
+    """sm12x needs ue8m0 scales for wo_a; the global flag only covers sm100."""
+    if not _FP8_WO_A_GEMM:
+        return False
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return False
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm120_supported()
+
+
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -591,7 +605,7 @@ class MqaAttentionBase(nn.Module):
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = (
-                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x()
             )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -1395,8 +1409,9 @@ class MQALayer(MqaAttentionBase):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
+                # sm100 (Blackwell) and sm12x: ue8m0 scales via the dedicated
+                # JIT kernel.
                 o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                 recipe = (1, 1, 128)
             else:
@@ -2725,7 +2740,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper
 
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
             from deep_gemm import transform_sf_into_required_layout
 
         if is_nextn:
@@ -2742,7 +2757,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             D = attn.wo_a.weight.shape[1]
 
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or _wo_a_ue8m0_sm12x():
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                     raw_scale,
                     mn=R,

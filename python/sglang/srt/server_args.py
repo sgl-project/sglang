@@ -5331,7 +5331,8 @@ class ServerArgs:
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                    envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
@@ -7838,7 +7839,7 @@ class ServerArgs:
             explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
             supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and is_sm90_supported()
+                and (is_sm90_supported() or is_sm120_supported())
                 and explicit
             )
             if not supported and explicit:
