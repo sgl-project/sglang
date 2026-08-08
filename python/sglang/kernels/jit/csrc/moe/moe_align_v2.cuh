@@ -12,6 +12,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <limits>
 
@@ -157,6 +158,227 @@ ALIGN_KERNEL void moe_align_block_size_kernel(const __grid_constant__ MoEAlignPa
     }
     if (tx == num_buckets - 1) {
       *params.total_tokens_post_pad = static_cast<int32_t>((block_base + num_blocks) * block_size);
+    }
+  }
+}
+
+/**
+ * \brief Tiny-batch variant: one warp per pair, single CTA, no expert axis.
+ *
+ * Capacity is `kWarpThreads` pairs -- warp `w` owns pair `w` and its lanes hold
+ * every pair, so all the bucket bookkeeping is three warp reductions over a
+ * 32x32 relation. Nothing here is sized by the bucket count, which is what the
+ * other paths pay: they zero and scan `kCTASize` shared counters even when a
+ * handful of buckets are non-empty.
+ *
+ * The launcher sizes the block at `numel * kWarpThreads`, so every warp owns a
+ * live pair. The fill does not suffer for it: `buffer_vecs` is proportional to
+ * `numel` too, leaving `div_ceil(block_size, 4 * kWarpThreads)` iterations no
+ * matter how small the batch is.
+ *
+ * The offset trick: `rank` counts pairs in strictly smaller buckets, so it is
+ * the *unpadded* prefix. It is strictly increasing across distinct non-empty
+ * buckets, hence usable as a dense key -- the representative of a bucket adds
+ * its block count into every `s_cumsum[k]` with `k >= rank`. That inclusive
+ * form gives a pair its own bucket's start as `s_cumsum[rank] - num_blocks`,
+ * and leaves the grand total sitting in the last lane.
+ *
+ * Dead lanes (past `numel`, or filtered under kIgnoreInvalid) take the sentinel
+ * bucket INT_MAX: they never compare smaller, so they cannot inflate any live
+ * pair's `rank`, and they are excluded from every store.
+ */
+template <bool kIgnoreInvalid, bool kUsePDL>
+ALIGN_KERNEL void moe_align_small_kernel(const __grid_constant__ MoEAlignParams params) {
+  using namespace device;
+  constexpr int32_t kDead = INT_MAX;
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+
+  // Block counts, prefix-summed and indexed by `rank`. `rank` is bounded by the
+  // pair count, itself capped at one warp, so this is sized in lanes -- not in
+  // warps and not in buckets.
+  __shared__ uint32_t s_cumsum[kWarpThreads];
+
+  if (warp_id == 0) s_cumsum[tx] = 0;
+  __syncthreads();
+
+  // Ahead of the topk_ids loads: this is what makes the producer's writes visible.
+  PDLWaitPrimary<kUsePDL>();
+
+  // NOTE: 1 warp for 1 item
+  const auto load_one = [&](uint32_t i) -> int32_t {
+    if (i >= params.numel) return kDead;
+    const auto v = params.topk_ids[i];
+    if constexpr (kIgnoreInvalid) {
+      return v < 0 ? kDead : v;
+    }
+    return v;
+  };
+  const auto base = load_one(lane_id);
+  const auto self = load_one(warp_id);
+
+  // Placed after those loads on purpose: nothing here consumes them, so the fill
+  // covers their latency.
+  if (params.pad_sorted_token_ids) {
+    AlignedVector<int32_t, 4> fill_vec;
+    fill_vec.fill(static_cast<int32_t>(params.numel));
+    for (auto idx = tx; idx < params.buffer_vecs; idx += blockDim.x) {
+      fill_vec.store(params.sorted_token_ids, idx);
+    }
+  }
+
+  const auto is_live = self != kDead;
+  const auto is_equal = (self == base);
+  const auto is_greater = (self > base);
+  const auto is_greater_in_equal = is_equal && (lane_id < warp_id);
+  // Every lane joins each reduction -- dead lanes contribute 0 rather than exit.
+  const auto rank = warp::reduce_sum(static_cast<uint32_t>(is_greater));
+  const auto rank_in_equal = warp::reduce_sum(static_cast<uint32_t>(is_greater_in_equal));
+  const auto num_equal = warp::reduce_sum(static_cast<uint32_t>(is_equal));
+  const auto num_blocks = div_ceil(num_equal, params.block_size);
+  const auto is_leader = is_live && rank_in_equal == 0;
+
+  // NOTE: inclusive sum here
+  if (is_leader && lane_id >= rank) {
+    atomicAdd(&s_cumsum[lane_id], num_blocks);
+  }
+
+  __syncthreads();
+  PDLTriggerSecondary<kUsePDL>();
+  const auto block_base = s_cumsum[rank] - num_blocks;
+  if (warp_id == params.numel - 1) {
+    *params.total_tokens_post_pad = s_cumsum[warp_id] * params.block_size;
+  }
+  if (!is_live) return;
+  const auto offset = block_base * params.block_size;
+  params.sorted_token_ids[offset + rank_in_equal] = warp_id;
+  // One entry per block this bucket spans, not just the block it starts in.
+  if (is_leader && lane_id < num_blocks) {
+    params.expert_ids[block_base + lane_id] = self;
+  }
+}
+
+/**
+ * \brief The same scheme with two pairs per warp, reaching 2 * kWarpThreads.
+ *
+ * Written out rather than folded into the kernel above as a `kUnroll` template:
+ * one pair per warp is the hot shape and it does not deserve the indexing that
+ * a general form drags in. Three pairs would need a third slot everywhere and
+ * buys nothing, so this stops at two.
+ *
+ * Lane `j` holds the pairs `j` and `j + kWarpThreads`; warp `w` owns the pairs
+ * `w` and `w + num_warps`. The lane mapping has to span the whole capacity,
+ * while the warp mapping is packed so no slot lands past `numel` unless the
+ * count is odd. Each lane folds its two held pairs into one contribution first,
+ * so every quantity is still one warp reduction; `s_cumsum` doubles and each
+ * lane drives two of its entries.
+ */
+template <bool kIgnoreInvalid, bool kUsePDL>
+ALIGN_KERNEL void moe_align_small_x2_kernel(const __grid_constant__ MoEAlignParams params) {
+  using namespace device;
+  constexpr int32_t kDead = INT_MAX;
+  constexpr uint32_t kCapacity = 2 * kWarpThreads;
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+  const auto num_warps = blockDim.x / kWarpThreads;
+
+  __shared__ uint32_t s_cumsum[kCapacity];
+
+  if (warp_id == 0) {
+    s_cumsum[lane_id] = 0;
+    s_cumsum[lane_id + kWarpThreads] = 0;
+  }
+  __syncthreads();
+
+  // Ahead of the topk_ids loads: this is what makes the producer's writes visible.
+  PDLWaitPrimary<kUsePDL>();
+
+  const auto load_one = [&](uint32_t i) -> int32_t {
+    if (i >= params.numel) return kDead;
+    const auto v = params.topk_ids[i];
+    if constexpr (kIgnoreInvalid) {
+      return v < 0 ? kDead : v;
+    }
+    return v;
+  };
+  const auto base_lo = load_one(lane_id);
+  const auto base_hi = load_one(lane_id + kWarpThreads);
+  const auto idx_lo = warp_id;
+  const auto idx_hi = warp_id + num_warps;
+  const auto self_lo = load_one(idx_lo);
+  const auto self_hi = load_one(idx_hi);
+
+  // Placed after those loads on purpose: nothing here consumes them, so the fill
+  // covers their latency.
+  if (params.pad_sorted_token_ids) {
+    AlignedVector<int32_t, 4> fill_vec;
+    fill_vec.fill(static_cast<int32_t>(params.numel));
+    for (auto idx = tx; idx < params.buffer_vecs; idx += blockDim.x) {
+      fill_vec.store(params.sorted_token_ids, idx);
+    }
+  }
+
+  const auto eq_lo_lo = (self_lo == base_lo);
+  const auto eq_lo_hi = (self_lo == base_hi);
+  const auto eq_hi_lo = (self_hi == base_lo);
+  const auto eq_hi_hi = (self_hi == base_hi);
+  // `idx_lo` is a warp id, so it is below kWarpThreads and can never follow a
+  // pair a lane holds in its high slot -- that term is dropped.
+  const auto before_lo = static_cast<uint32_t>(eq_lo_lo && lane_id < idx_lo);
+  const auto before_hi = static_cast<uint32_t>(eq_hi_lo && lane_id < idx_hi) +
+                         static_cast<uint32_t>(eq_hi_hi && lane_id + kWarpThreads < idx_hi);
+
+  // Every lane joins each reduction -- dead lanes contribute 0 rather than exit.
+  const auto rank_lo =
+      warp::reduce_sum(static_cast<uint32_t>(self_lo > base_lo) + static_cast<uint32_t>(self_lo > base_hi));
+  const auto rank_hi =
+      warp::reduce_sum(static_cast<uint32_t>(self_hi > base_lo) + static_cast<uint32_t>(self_hi > base_hi));
+  const auto rank_in_equal_lo = warp::reduce_sum(before_lo);
+  const auto rank_in_equal_hi = warp::reduce_sum(before_hi);
+  const auto num_blocks_lo =
+      div_ceil(warp::reduce_sum(static_cast<uint32_t>(eq_lo_lo) + static_cast<uint32_t>(eq_lo_hi)), params.block_size);
+  const auto num_blocks_hi =
+      div_ceil(warp::reduce_sum(static_cast<uint32_t>(eq_hi_lo) + static_cast<uint32_t>(eq_hi_hi)), params.block_size);
+
+  const auto is_live_lo = self_lo != kDead;
+  const auto is_live_hi = self_hi != kDead;
+  const auto is_leader_lo = is_live_lo && rank_in_equal_lo == 0;
+  const auto is_leader_hi = is_live_hi && rank_in_equal_hi == 0;
+
+  // NOTE: inclusive sum here, over both of this lane's entries.
+  if (is_leader_lo) {
+    if (lane_id >= rank_lo) atomicAdd(&s_cumsum[lane_id], num_blocks_lo);
+    if (lane_id + kWarpThreads >= rank_lo) atomicAdd(&s_cumsum[lane_id + kWarpThreads], num_blocks_lo);
+  }
+  if (is_leader_hi) {
+    if (lane_id >= rank_hi) atomicAdd(&s_cumsum[lane_id], num_blocks_hi);
+    if (lane_id + kWarpThreads >= rank_hi) atomicAdd(&s_cumsum[lane_id + kWarpThreads], num_blocks_hi);
+  }
+
+  __syncthreads();
+  PDLTriggerSecondary<kUsePDL>();
+
+  // No leader ranks above numel - 1, so that entry is the grand total. Warps only
+  // reach num_warps, which is half of it, so a single thread publishes instead.
+  if (tx == 0) {
+    *params.total_tokens_post_pad = s_cumsum[params.numel - 1] * params.block_size;
+  }
+
+  if (is_live_lo) {
+    const auto block_base = s_cumsum[rank_lo] - num_blocks_lo;
+    params.sorted_token_ids[block_base * params.block_size + rank_in_equal_lo] = idx_lo;
+    // One entry per block this bucket spans, not just the block it starts in.
+    if (is_leader_lo && lane_id < num_blocks_lo) {
+      params.expert_ids[block_base + lane_id] = self_lo;
+    }
+  }
+  if (is_live_hi) {
+    const auto block_base = s_cumsum[rank_hi] - num_blocks_hi;
+    params.sorted_token_ids[block_base * params.block_size + rank_in_equal_hi] = idx_hi;
+    if (is_leader_hi && lane_id < num_blocks_hi) {
+      params.expert_ids[block_base + lane_id] = self_hi;
     }
   }
 }
@@ -329,16 +551,22 @@ ALIGN_KERNEL void moe_align_fused_kernel(const __grid_constant__ MoEAlignParams 
  *
  * \param topk_ids            [num_tokens, topk] int32 expert ids; -1 = EP-filtered
  * \param num_experts         BUCKET count E + 1, i.e. what the moe_runner call site
- *                            passes as `num_experts + 1`. Capped at kCTASize.
+ *                            passes as `num_experts + 1`. Capped at kCTASize,
+ *                            except on the tiny-batch path, which is unbounded
+ *                            in buckets because it never scans that axis.
  * \param block_size          GEMM tile height every bucket is padded up to
  * \param sorted_token_ids    [max_num_tokens_padded] out
  * \param expert_ids          [max_num_m_blocks] out
  * \param num_tokens_post_pad [1] out
  * \param cumsum_buffer       [>= num_experts] scratch for the general path
  * \param pad_sorted_token_ids Whether to prefill the pad slots with `numel`
- * \param ignore_invalid_expert Drop -1 pairs instead of bucketing them into 0
+ *
+ * \tparam kIgnoreInvalid Drop -1 pairs instead of bucketing them into 0. A
+ *         template parameter, not an argument: as a runtime bool ptxas keeps the
+ *         test inside the histogram loop instead of unswitching it (~2x on the
+ *         loop body), and only the variant the caller asks for gets compiled.
  */
-template <bool kUsePDL>
+template <bool kIgnoreInvalid, bool kUsePDL>
 void moe_align_v2(
     tvm::ffi::TensorView topk_ids,
     int64_t num_experts,
@@ -347,8 +575,7 @@ void moe_align_v2(
     tvm::ffi::TensorView expert_ids,
     tvm::ffi::TensorView num_tokens_post_pad,
     tvm::ffi::TensorView cumsum_buffer,
-    bool pad_sorted_token_ids,
-    bool ignore_invalid_expert) {
+    bool pad_sorted_token_ids) {
   using namespace host;
 
   auto device_sym = SymbolicDevice{};
@@ -389,13 +616,12 @@ void moe_align_v2(
   CHECK_HOST(block_size > 0) << "block_size must be positive, got " << block_size;
   // Both paths prefill with 4-wide vector stores, and the real total is a multiple of block_size.
   CHECK_HOST(block_size % 4 == 0) << "block_size must be a multiple of 4, got " << block_size;
-  // One thread per bucket in the scan, and s_counts is kCTASize wide.
-  CHECK_HOST(num_buckets <= kCTASize) << "num_experts (bucket count) must be <= " << kCTASize << ", got "
-                                      << num_buckets;
-  CHECK_HOST(C.unwrap() >= num_buckets) << "cumsum_buffer holds " << C.unwrap() << " entries, needs " << num_buckets;
   // Pair indices and the pad sentinel both land in an int32 buffer.
   CHECK_HOST(numel <= std::numeric_limits<int32_t>::max())
       << "topk_ids has " << numel << " elements, which does not fit int32";
+  // The small path launches numel * kWarpThreads threads, and no path writes
+  // total_tokens_post_pad without a live pair to write it.
+  CHECK_HOST(numel > 0) << "topk_ids must not be empty";
   // Worst case: every non-empty bucket pads out to a full extra block. This is
   // exactly the bound the moe_runner call site sizes its buffers to.
   const int64_t worst_total = numel + std::min<int64_t>(numel, num_buckets) * (block_size - 1);
@@ -435,49 +661,49 @@ void moe_align_v2(
       pad_sorted_token_ids,
   };
 
-  static const uint32_t sm_count = runtime::get_sm_count(device.device_id);
-  const uint32_t small_grid = div_ceil(buffer_vecs, kCTASize) + 1;
-  const uint32_t pairs_per_thread = div_ceil(numel, kCTASize);
+  // Tiny batches first: these kernels never touch the bucket axis and load
+  // topk_ids one element at a time, so none of the constraints below apply to
+  // them -- any bucket count, any alignment, no cumsum_buffer. One pair per warp
+  // reaches a warp of pairs, two pairs per warp reach twice that.
+  if (numel <= device::kWarpThreads) {
+    return LaunchKernel(1, numel * device::kWarpThreads, stream)  //
+        .enable_pdl(kUsePDL)(moe_align_small_kernel<kIgnoreInvalid, kUsePDL>, params);
+  }
+  if (numel <= 2 * device::kWarpThreads) {
+    return LaunchKernel(1, div_ceil(numel, 2u) * device::kWarpThreads, stream)  //
+        .enable_pdl(kUsePDL)(moe_align_small_x2_kernel<kIgnoreInvalid, kUsePDL>, params);
+  }
+
+  // Everything past here scans the bucket axis and loads topk_ids as int4.
+  // One thread per bucket in the scan, and s_counts is kCTASize wide.
+  CHECK_HOST(num_buckets <= kCTASize) << "num_experts (bucket count) must be <= " << kCTASize << ", got "
+                                      << num_buckets;
+  CHECK_HOST(C.unwrap() >= num_buckets) << "cumsum_buffer holds " << C.unwrap() << " entries, needs " << num_buckets;
   const bool aligned = reinterpret_cast<uintptr_t>(topk_ids.data_ptr()) % 16 == 0;
   CHECK_HOST(aligned) << "topk_ids must be aligned to 16 bytes for the vectorized load, but got: "
                       << topk_ids.data_ptr();
 
-  // The small path needs three things, and any miss falls back to the general
-  // two-launch path:
-  //  1. `kCTASize * kUnroll` capacity, since it has no loop over the pairs;
-  //  2. its fill blocks resident alongside the compute block, which spins on them.
-  //    `__launch_bounds__(kCTASize, 1)` guarantees one block per SM, so the SM
-  //    count is a safe (conservative) bound;
-  //  3. `topk_ids` aligned for the vectorized load, which a sliced tensor is not.
+  static const uint32_t sm_count = runtime::get_sm_count(device.device_id);
+  const uint32_t small_grid = div_ceil(buffer_vecs, kCTASize) + 1;
+  const uint32_t pairs_per_thread = div_ceil(numel, kCTASize);
+
   constexpr uint32_t kMaxUnroll = 4;
-  // `ignore_invalid_expert` is a compile-time constant in the kernels: as a
-  // runtime bool ptxas keeps the test inside the histogram loop instead of
-  // unswitching it, which measured ~2x on the loop body.
-  const auto launch = [&](auto invalid_tag) {
-    constexpr bool kIgnoreInvalid = decltype(invalid_tag)::value;
-    if (pairs_per_thread <= kMaxUnroll && small_grid <= sm_count) {
-      const auto kernel = (pairs_per_thread <= 1) ? moe_align_fused_kernel<1, kIgnoreInvalid, kUsePDL>
-                          : pairs_per_thread <= 2 ? moe_align_fused_kernel<2, kIgnoreInvalid, kUsePDL>
-                                                  : moe_align_fused_kernel<4, kIgnoreInvalid, kUsePDL>;
-      return LaunchKernel(small_grid, kCTASize, stream)  //
-          .enable_pdl(kUsePDL)(kernel, params);
-    }
-
-    // General path. Block 0 computes, the rest prefill; the fill is a grid-stride
-    // loop so any grid works, capped at what the machine can run at once.
-    const uint32_t fill_blocks = std::clamp<uint32_t>(div_ceil(buffer_vecs, 2 * kCTASize), 1, sm_count - 1);
-    LaunchKernel(1 + fill_blocks, kCTASize, stream)  //
-        .enable_pdl(kUsePDL)(moe_align_block_size_kernel<kIgnoreInvalid, kUsePDL>, params);
-    const uint32_t sort_blocks = div_ceil(numel, kCTASize);
-    LaunchKernel(sort_blocks, kCTASize, stream)  //
-        .enable_pdl(kUsePDL)(count_and_sort_expert_tokens_kernel<kIgnoreInvalid, kUsePDL>, params);
-  };
-
-  if (ignore_invalid_expert) {
-    launch(std::true_type{});
-  } else {
-    launch(std::false_type{});
+  if (pairs_per_thread <= kMaxUnroll && small_grid <= sm_count) {
+    const auto kernel = (pairs_per_thread <= 1) ? moe_align_fused_kernel<1, kIgnoreInvalid, kUsePDL>
+                        : pairs_per_thread <= 2 ? moe_align_fused_kernel<2, kIgnoreInvalid, kUsePDL>
+                                                : moe_align_fused_kernel<4, kIgnoreInvalid, kUsePDL>;
+    return LaunchKernel(small_grid, kCTASize, stream)  //
+        .enable_pdl(kUsePDL)(kernel, params);
   }
+
+  // General path. Block 0 computes, the rest prefill; the fill is a grid-stride
+  // loop so any grid works, capped at what the machine can run at once.
+  const uint32_t fill_blocks = std::clamp<uint32_t>(div_ceil(buffer_vecs, 2 * kCTASize), 1, sm_count - 1);
+  LaunchKernel(1 + fill_blocks, kCTASize, stream)  //
+      .enable_pdl(kUsePDL)(moe_align_block_size_kernel<kIgnoreInvalid, kUsePDL>, params);
+  const uint32_t sort_blocks = div_ceil(numel, kCTASize);
+  LaunchKernel(sort_blocks, kCTASize, stream)  //
+      .enable_pdl(kUsePDL)(count_and_sort_expert_tokens_kernel<kIgnoreInvalid, kUsePDL>, params);
 }
 
 }  // namespace sglang

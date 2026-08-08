@@ -1,9 +1,8 @@
 """Backend dispatch for MoE align-block-size.
 
-Picks between the AOT / JIT ``moe.moe_align_block_size_out`` kernels, the triton
-tiny-batch kernel and the pure-torch fallback, and owns the output buffers they
-write into. The public entry point is
-``sglang.kernels.ops.moe.moe_align_block_size``.
+Picks between the AOT / JIT ``moe.moe_align_block_size_out`` kernels and the
+pure-torch fallback, and owns the output buffers they write into. The public
+entry point is ``sglang.kernels.ops.moe.moe_align_block_size``.
 """
 
 from __future__ import annotations
@@ -20,17 +19,10 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.moe.moe_align_small_numel import (
-        SMALL_NUMEL_LIMIT,
-        moe_align_small_numel,
-    )
+    from sglang.kernels.ops.moe.moe_align import V2_SMALL_NUMEL_LIMIT, v2_supported
 else:
-    SMALL_NUMEL_LIMIT = 0
-    moe_align_small_numel = lambda *_: None
-
-# Where the CUDA kernel's own small-batch single-block path stops: its
-# per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
-_CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+    V2_SMALL_NUMEL_LIMIT = 0
+    v2_supported = lambda *_: False
 
 # How wide each backend's expert scan reaches. The AOT kernel gives one thread
 # per bucket out of a 1024-thread block and checks nothing, so it silently
@@ -181,24 +173,18 @@ def align_block_size(
     device = topk_ids.device
     numel = topk_ids.numel()
 
-    # Tiny-batch fast path (bs=1 decode): one single-CTA triton launch replaces
-    # the generic align + count_and_sort pair, covering the corner the CUDA
-    # small-batch kernel cannot reach. Below that bucket limit the CUDA kernel
-    # is already a single launch and does O(numel) work where this one does
-    # O(numel ** 2) pairwise, so leave that side to it. ignore_invalid_expert is
-    # a different contract from the "+1 offset" convention this kernel implements.
-    # Decided before the bucket-limit check: this kernel works on the pair axis,
-    # so unlike the align kernels it is not bounded by _MAX_BUCKETS.
-    use_small_numel = (
-        _is_cuda
-        and numel <= SMALL_NUMEL_LIMIT
-        and num_buckets > _CUDA_SMALL_BATCH_MAX_BUCKETS
-        and not ignore_invalid_expert
+    # Tiny batches (bs=1 decode) take v2's single-CTA kernels, which work on the
+    # pair axis and never scan the bucket axis -- so alone among the paths here
+    # they are not bounded by _MAX_BUCKETS.
+    jit_tiny_batch = (
+        backend == KernelBackend.JIT
+        and numel <= V2_SMALL_NUMEL_LIMIT
+        and v2_supported(topk_ids, num_buckets, block_size)
     )
 
-    # No kernel on this platform scans that wide; the pure-torch path
-    # allocates its own buffers, so take it before we allocate ours.
-    if not use_small_numel and num_buckets > _MAX_BUCKETS[backend]:
+    # No kernel on this platform scans that wide; the pure-torch path allocates
+    # its own buffers, so take it before we allocate ours.
+    if not jit_tiny_batch and num_buckets > _MAX_BUCKETS[backend]:
         return align_block_size_torch(topk_ids, block_size, num_experts)
 
     if numel == 0:
@@ -238,17 +224,6 @@ def align_block_size(
     num_tokens_post_pad = buf[off : off + 1]
     off += _VEC_SIZE
     cumsum_buffer = buf[off : off + cumsum_len]
-
-    if use_small_numel:
-        moe_align_small_numel(
-            topk_ids,
-            num_buckets,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-        )
-        return sorted_ids, expert_ids, num_tokens_post_pad
 
     # Pass ignore_invalid_expert only when it is actually asked for: wheels built
     # without it bind an 8-arg signature, and a 9th positional argument is a
