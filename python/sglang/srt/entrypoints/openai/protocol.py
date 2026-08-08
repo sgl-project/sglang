@@ -456,11 +456,14 @@ class CompletionResponse(BaseModel):
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    system_fingerprint: Optional[str] = None
     sglext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.system_fingerprint is None:
+            data.pop("system_fingerprint", None)
         if self.sglext is None:
             data.pop("sglext", None)
         return data
@@ -495,11 +498,14 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    system_fingerprint: Optional[str] = None
     sglext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.system_fingerprint is None:
+            data.pop("system_fingerprint", None)
         if self.sglext is None:
             data.pop("sglext", None)
         return data
@@ -1129,11 +1135,14 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    system_fingerprint: Optional[str] = None
     sglext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.system_fingerprint is None:
+            data.pop("system_fingerprint", None)
         if self.sglext is None:
             data.pop("sglext", None)
         return data
@@ -1173,11 +1182,14 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    system_fingerprint: Optional[str] = None
     sglext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.system_fingerprint is None:
+            data.pop("system_fingerprint", None)
         if self.sglext is None:
             data.pop("sglext", None)
         return data
