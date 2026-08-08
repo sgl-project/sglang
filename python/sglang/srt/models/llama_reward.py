@@ -23,6 +23,7 @@ from sglang.srt.layers.pooler import (
     Pooler,
     PoolingType,
     pool_hidden_states,
+    score_and_pool,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -49,6 +50,9 @@ class LlamaForSequenceClassification(nn.Module):
 
         self.eos_token_id = config.eos_token_id
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
+
     @torch.no_grad()
     def forward(
         self,
@@ -63,14 +67,8 @@ class LlamaForSequenceClassification(nn.Module):
         ), "LlamaForSequenceClassification is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
-        scores = self.score(last_token_hidden)
-
-        return EmbeddingPoolerOutput(
-            embeddings=scores,
-            pooled_hidden_states=(
-                last_token_hidden if forward_batch.return_pooled_hidden_states else None
-            ),
+        return score_and_pool(
+            self.score, self.pooler, hidden_states, forward_batch, input_ids
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
