@@ -47,3 +47,9 @@ def test_fused_qk_head_layernorm_is_bit_exact(shape):
     assert torch.equal(k_out, norm_k(k).to(k.dtype))
     assert glm_image._GLM_FUSED_QK_LN_VERIFIED
     assert not glm_image._GLM_FUSED_QK_LN_DISABLED
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
