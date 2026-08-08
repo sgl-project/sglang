@@ -18,6 +18,7 @@
 """Inference-only NemotronH model."""
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -30,6 +31,9 @@ from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -53,6 +57,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
@@ -63,6 +68,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -91,6 +101,7 @@ from sglang.srt.models.nemotron_h_utils import (
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
@@ -170,9 +181,12 @@ class NemotronHMoE(nn.Module):
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_mtp: bool = False,
     ) -> None:
         super().__init__()
 
+        self.layer_idx = layer_idx
+        self.eplb_layer_id = None if is_mtp else layer_idx
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
@@ -215,6 +229,7 @@ class NemotronHMoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_idx,
             use_grouped_topk=True,
             topk_group=config.topk_group,
             num_expert_group=config.n_group,
@@ -263,6 +278,21 @@ class NemotronHMoE(nn.Module):
 
         self._use_min_latency_fc1_gemm: bool | None = None
 
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
+
+    def _expert_location_dispatch_info(self) -> ExpertLocationDispatchInfo | None:
+        if self.eplb_layer_id is None:
+            return None
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.eplb_layer_id)
+
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_fc1_gemm is None:
             self._use_min_latency_fc1_gemm = (
@@ -298,7 +328,11 @@ class NemotronHMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         else:
             shared_output = None
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=self._expert_location_dispatch_info(),
+        )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)
         final_hidden_states = self.experts(hidden_states, topk_output)
@@ -323,7 +357,11 @@ class NemotronHMoE(nn.Module):
             router_logits = torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=self._expert_location_dispatch_info(),
+            )
             if self.use_latent_moe:
                 hidden_states = self._apply_fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
@@ -451,6 +489,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_mtp: bool = False,
     ) -> None:
         super().__init__()
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
@@ -461,6 +500,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
+            is_mtp=is_mtp,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -825,6 +865,11 @@ class NemotronHModel(nn.Module):
         else:
             self.norm_f = PPMissingLayer(return_tuple=True)
 
+        self.record_expert_distribution = (
+            get_server_args().expert_distribution_recorder_mode is not None
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -848,11 +893,17 @@ class NemotronHModel(nn.Module):
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
-            hidden_states, residual = layer.forward(
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
+            ctx = (
+                get_global_expert_distribution_recorder().with_current_layer(i)
+                if self.record_expert_distribution
+                else nullcontext()
             )
+            with ctx:
+                hidden_states, residual = layer.forward(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -953,6 +1004,26 @@ class NemotronHForCausalLM(nn.Module):
                 self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer.layer_idx: layer.mixer.get_moe_weights()
+                for layer in self.model.layers
+                if isinstance(layer, NemotronHMoEDecoderLayer)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=config.n_group,
+        )
 
     def _init_model(
         self,
@@ -1219,7 +1290,20 @@ class NemotronHForCausalLM(nn.Module):
 
 
 class NemotronHPuzzleForCausalLM(NemotronHForCausalLM):
-    pass
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        expert_counts = {
+            block["n_routed_experts"]
+            for block in config.block_configs
+            if block["block_type"] == "moe"
+        }
+        if len(expert_counts) != 1:
+            return None
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=expert_counts.pop(),
+            num_groups=config.n_group,
+        )
 
 
 EntryClass = [NemotronHForCausalLM, NemotronHPuzzleForCausalLM]
