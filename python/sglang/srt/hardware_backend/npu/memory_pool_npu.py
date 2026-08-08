@@ -1,9 +1,6 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.mem_cache.kv_cache_store import (
-    store_kv_cache_prefix_valid_npu_triton,
-)
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -21,6 +18,9 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
+    from sgl_kernel_npu.mem_cache.kv_cache_store import (
+        store_kv_cache_prefix_valid_npu_triton,
+    )
 
 
 def _init_npu_conv_state(
