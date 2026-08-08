@@ -141,10 +141,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1035,6 +1032,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
+            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
+            # orig_dtype (when present) sets the GEMM output dtype.
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                pre_quant_output_dtype=out_dtype,
+            )
+
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -1838,9 +1853,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return qweight.view_as(weight), scale_u8
 
-        from sglang.srt.layers.quantization.mxfp8_block_convert import (
-            _ue8m0_to_fp32,
-        )
+        from sglang.srt.layers.quantization.mxfp8_block_convert import _ue8m0_to_fp32
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
             weight = weight.contiguous()
