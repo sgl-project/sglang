@@ -5,7 +5,7 @@ kernels tree, so it runs on boxes where the full sglang.test / srt import
 chain breaks on unrelated dependencies (xgrammar, etc.). Keep the two in sync
 when the CP op surface changes.
 
-References used (established by test/manual/kda_cp_diag2.py):
+References used (established by test/manual/kda_cp_diag.py --mode numerics):
 * sequential shard chain (run shards one by one through the pool slot —
   exactly chunked-prefill semantics, same per-shard chunk grid as CP): CP must
   reproduce this tightly; only the h0 delivery differs (affine merge chain vs

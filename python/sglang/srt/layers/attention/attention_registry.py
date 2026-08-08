@@ -487,19 +487,30 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             # layers' recurrent state has no position axis to shard — it needs
             # the KDA state hand-off (pre-scan + all-gather + merge, see
             # kernels/ops/attention/fla/chunk_delta_h_cp.py), which is wired
-            # only for the KDA backend under the contiguous shard layout.
+            # only for the text-only KimiLinear model under the contiguous
+            # shard layout.
             # Fail loudly for every other hybrid linear combination.
             kda_cp_ready = (
                 isinstance(linear_attn_backend, KDAAttnBackend)
+                and kimi_linear_config(runner.model_config)
+                is runner.model_config.hf_config
                 and runner.server_args.cp_strategy == "contiguous"
             )
             if not kda_cp_ready:
                 raise NotImplementedError(
                     "Prefill context parallelism for hybrid linear-attention "
-                    "models is only supported for KDA models with "
-                    "--cp-strategy contiguous. Remove --enable-prefill-cp / "
-                    "--attention-context-parallel-size, or switch the "
-                    "strategy."
+                    "models is currently only supported for the text-only "
+                    "KimiLinearForCausalLM model with --cp-strategy contiguous. "
+                    "Kimi-K3 and other KDA-backed wrappers have not yet been "
+                    "ported to the CP-v2 model-boundary and layer-communicator "
+                    "contracts."
+                )
+            if get_parallel().dcp_enabled:
+                raise NotImplementedError(
+                    "KDA prefill context parallelism cannot currently be combined "
+                    "with decode context parallelism (--dcp-size > 1). The MHA "
+                    "one-shot CP path requires a full causal KV window, while DCP "
+                    "stores and fetches only the current rank's KV shard."
                 )
         if runner.is_draft_worker:
             # FIXME: we assume that MTP/NEXTN always use full-attention.

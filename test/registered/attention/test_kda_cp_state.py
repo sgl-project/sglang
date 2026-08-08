@@ -10,7 +10,7 @@ rank gets its own clone of the state pool, matching serving semantics where
 every CP rank holds a pool replica and the merge writes the identical global
 final state into each replica.
 
-References (established empirically, see test/manual/kda_cp_diag2.py):
+References (established empirically, see test/manual/kda_cp_diag.py --mode numerics):
 * sequential shard chain — run the shards one by one through the pool slot,
   i.e. exactly chunked-prefill semantics with the same per-shard chunk grid
   as CP. CP must reproduce this tightly (only the h0 delivery differs:

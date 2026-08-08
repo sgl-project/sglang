@@ -1,15 +1,32 @@
-"""Diagnostic for KDA CP: localize whether h0 handoff or output path is wrong.
+"""Manual diagnostics for KDA CP numerics.
 
-Per rank r: compare (a) the h0 the CP pre-process produced vs the true state
-at the shard boundary (obtained by running chunk_kda on the global prefix),
-and (b) the per-rank output shard error vs the reference output slice.
+Two probes, selected by --mode (default: all):
 
-Usage: PYTHONPATH=<repo>/python python3 test/manual/kda_cp_diag.py
+* ``cp`` — fault localization for the CP state hand-off. Per rank r, compare
+  (a) the h0 the CP pre-process produced vs the true state at the shard
+  boundary (obtained by running chunk_kda on the global prefix), and (b) the
+  per-rank output shard vs the reference output slice. Answers "is the
+  hand-off wrong or the output path?" when the CI test goes red. Uses the
+  well-scaled input distribution so output ratios are meaningful (see below).
+
+* ``numerics`` — the input-conditioning study that established the test
+  methodology (and the CI tolerances CHAIN_TOL/MONO_TOL): a naive per-token
+  fp32 recurrence judges monolithic vs chunked continuation on wild
+  (unscaled randn) and well-scaled inputs. Conclusion: wild inputs make ANY
+  re-chunked run — and the monolithic run itself — deviate from fp32 ground
+  truth at the 1e-1 level, while the scaled distribution keeps everything at
+  the bf16 baseline. Large continuation-vs-monolithic gaps on unscaled
+  random inputs are conditioning, not a CP bug.
+
+Usage:
+    PYTHONPATH=<repo>/python python3 test/manual/kda_cp_diag.py [--mode cp|numerics|all]
 """
 
+import argparse
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 import sglang.kernels.ops.attention.fla.kda as kda_mod
 from sglang.kernels.ops.attention.fla.chunk_delta_h_cp import (
@@ -19,10 +36,8 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h_cp import (
 )
 from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
-H, D, NUM_SLOTS = 4, 128, 8
+H, D = 4, 128
 DEVICE = "cuda"
-SEQ_LENS = [1000, 704]
-W = 4
 
 
 def norm_ratio(actual, ref):
@@ -30,41 +45,42 @@ def norm_ratio(actual, ref):
     return ((actual.float() - ref).norm() / ref.norm().clamp(min=1e-12)).item()
 
 
-class RecordReplayGather:
-    def __init__(self, world_size):
-        self.world_size = world_size
-        self.recorded = {}
-        self.replay = None
-        self.current_rank = None
-
-    def __call__(self, out, inp, group=None):
-        if self.replay is None:
-            self.recorded[self.current_rank] = inp.clone()
-            out.zero_()
-        else:
-            out.copy_(self.replay)
-
-    def build_replay(self):
-        self.replay = torch.stack([self.recorded[r] for r in range(self.world_size)])
-
-
-def make_inputs(total_tokens):
-    mk = lambda *s: torch.randn(*s, dtype=torch.bfloat16, device=DEVICE)
+def make_inputs(total_tokens, wild):
+    if wild:
+        mk = lambda *s: torch.randn(*s, dtype=torch.bfloat16, device=DEVICE)
+        return {
+            "q": mk(1, total_tokens, H, D),
+            "k": mk(1, total_tokens, H, D),
+            "v": mk(1, total_tokens, H, D),
+            "g": mk(1, total_tokens, H, D),
+            "beta": mk(1, total_tokens, H).float().sigmoid(),
+            "A_log": torch.randn(1, 1, H, 1, dtype=torch.float32, device=DEVICE),
+            "dt_bias": torch.randn(H * D, dtype=torch.float32, device=DEVICE),
+        }
+    shape = (1, total_tokens, H, D)
     return {
-        "q": mk(1, total_tokens, H, D),
-        "k": mk(1, total_tokens, H, D),
-        "v": mk(1, total_tokens, H, D),
-        "g": mk(1, total_tokens, H, D),
-        "beta": mk(1, total_tokens, H).float().sigmoid(),
-        "A_log": torch.randn(1, 1, H, 1, dtype=torch.float32, device=DEVICE),
-        "dt_bias": torch.randn(H * D, dtype=torch.float32, device=DEVICE),
+        "q": torch.randn(shape, dtype=torch.bfloat16, device=DEVICE),
+        "k": torch.randn(shape, dtype=torch.bfloat16, device=DEVICE),
+        "v": (torch.randn(shape, dtype=torch.bfloat16, device=DEVICE) * 0.1),
+        "g": (torch.randn(shape, dtype=torch.float32, device=DEVICE) * 0.5 - 2.0).to(
+            torch.bfloat16
+        ),
+        "beta": torch.rand(1, total_tokens, H, dtype=torch.bfloat16, device=DEVICE)
+        .float()
+        .sigmoid(),
+        "A_log": (torch.randn(1, 1, H, 1, dtype=torch.float32, device=DEVICE) * 0.1),
+        "dt_bias": (torch.randn(H * D, dtype=torch.float32, device=DEVICE) * 0.1),
     }
 
 
 def run_chunk_kda(
     inputs, token_ranges, cu_seqlens, pool, slot_indices, cp_context=None
 ):
-    """Run chunk_kda on the concatenation of token_ranges slices."""
+    """Run chunk_kda on the concatenation of token_ranges slices.
+
+    torch.cat builds fresh tensors, so chunk_kda's o=v aliasing cannot
+    clobber the shared ``inputs`` dict across calls.
+    """
     sl = {
         name: torch.cat(
             [inputs[name][:, lo:hi] for lo, hi in token_ranges], dim=1
@@ -87,14 +103,38 @@ def run_chunk_kda(
     )
 
 
-def main():
+class RecordReplayGather:
+    """Single-GPU stand-in for all_gather_into_tensor: record pass, then replay."""
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.recorded = {}
+        self.replay = None
+        self.current_rank = None
+
+    def __call__(self, out, inp, group=None):
+        if self.replay is None:
+            self.recorded[self.current_rank] = inp.clone()
+            out.zero_()
+        else:
+            out.copy_(self.replay)
+
+    def build_replay(self):
+        self.replay = torch.stack([self.recorded[r] for r in range(self.world_size)])
+
+
+def run_cp_localization():
+    """Per-rank h0 / output-shard localization of a CP hand-off fault."""
     torch.manual_seed(42)
-    total = sum(SEQ_LENS)
-    inputs = make_inputs(total)
-    seed_pool = torch.zeros(NUM_SLOTS, H, D, D, dtype=torch.float32, device=DEVICE)
+    seq_lens = [1000, 704]
+    world = 4
+    num_slots = 8
+    total = sum(seq_lens)
+    inputs = make_inputs(total, wild=False)
+    seed_pool = torch.zeros(num_slots, H, D, D, dtype=torch.float32, device=DEVICE)
     slot_indices = torch.tensor([3, 5], dtype=torch.int32, device=DEVICE)
     cu_vals = [0]
-    for n in SEQ_LENS:
+    for n in seq_lens:
         cu_vals.append(cu_vals[-1] + n)
     cu = torch.tensor(cu_vals, dtype=torch.int32, device=DEVICE)
 
@@ -103,9 +143,9 @@ def main():
     o_ref = run_chunk_kda(inputs, [(0, total)], cu, ref_pool, slot_indices)
 
     # True boundary states: run on each global prefix [seq_start, shard_lo)
-    layouts = [build_cp_shard_layout(cu_vals, W, r) for r in range(W)]
+    layouts = [build_cp_shard_layout(cu_vals, world, r) for r in range(world)]
     true_h0 = {}  # (rank, seq) -> [H, D, D]
-    for r in range(W):
+    for r in range(world):
         _, ranges, _ids = layouts[r]
         for n, (lo, hi) in enumerate(ranges):
             seq_start = cu_vals[n]
@@ -134,16 +174,16 @@ def main():
         captured_h0[kw["cp_context"].rank] = h0.clone() if h0 is not None else None
         return h0, idx
 
-    gather = RecordReplayGather(W)
+    gather = RecordReplayGather(world)
     o_shards = None
     with patch("torch.distributed.all_gather_into_tensor", new=gather), patch.object(
         kda_mod, "chunk_gated_delta_rule_fwd_h_cp_pre_process", new=capturing_pre
     ):
         for do_replay in (False, True):
             o_shards = []
-            for r in range(W):
+            for r in range(world):
                 gather.current_rank = r
-                ctx = LinearAttnCPContext(world_size=W, rank=r, group=object())
+                ctx = LinearAttnCPContext(world_size=world, rank=r, group=object())
                 local_cu = torch.tensor(layouts[r][0], dtype=torch.int32, device=DEVICE)
                 pool_r = seed_pool.clone()
                 o_r = run_chunk_kda(
@@ -158,8 +198,7 @@ def main():
             if do_replay is False:
                 gather.build_replay()
 
-    # Report
-    for r in range(W):
+    for r in range(world):
         _, ranges, _ids = layouts[r]
         for n, (lo, hi) in enumerate(ranges):
             h0_ratio = norm_ratio(captured_h0[r][n], true_h0[(r, n)])
@@ -171,47 +210,82 @@ def main():
                 f"o_shard_ratio={o_ratio:.3e}"
             )
 
-    # Bisect: plain (non-CP) chunked continuation of seq0 shard [250, 500)
-    # seeded by the prefix state — does the BASE path already deviate from the
-    # monolithic reference?
-    lo, hi = layouts[1][1][0]
-    seg_cu = torch.tensor([0, hi - lo], dtype=torch.int32, device=DEVICE)
-    p = seed_pool.clone()
-    run_chunk_kda(
-        inputs,
-        [(0, lo)],
-        torch.tensor([0, lo], dtype=torch.int32, device=DEVICE),
-        p,
-        slot_indices[0:1],
-    )
-    o_cont = run_chunk_kda(inputs, [(lo, hi)], seg_cu, p, slot_indices[0:1])
-    print(
-        f"plain continuation [{lo}:{hi}) via pool slot: "
-        f"o_ratio={norm_ratio(o_cont, o_ref[:, lo:hi]):.3e}"
-    )
 
-    # Same continuation but with a scratch-style state tensor ([1, H, V, K]
-    # fp32 + arange index) exactly like the CP hook hands the main kernel.
-    p2 = seed_pool.clone()
-    run_chunk_kda(
-        inputs,
-        [(0, lo)],
-        torch.tensor([0, lo], dtype=torch.int32, device=DEVICE),
-        p2,
-        slot_indices[0:1],
+def _naive_recurrence(inputs, total):
+    """Per-token fp32 recurrence (mirrors TestKDAChunkExponentDomain naive)."""
+    q = F.normalize(inputs["q"].float(), dim=-1)
+    k = F.normalize(inputs["k"].float(), dim=-1)
+    v = inputs["v"].float()
+    beta = inputs["beta"].float()
+    gate = -torch.exp(inputs["A_log"]) * F.softplus(
+        inputs["g"].float() + inputs["dt_bias"].view(1, 1, H, D)
     )
-    scratch = p2[slot_indices[0:1]].clone().contiguous()
-    o_scratch = run_chunk_kda(
-        inputs,
-        [(lo, hi)],
-        seg_cu,
-        scratch,
-        torch.arange(1, dtype=torch.int32, device=DEVICE),
-    )
-    print(
-        f"scratch-style continuation [{lo}:{hi}): "
-        f"o_ratio={norm_ratio(o_scratch, o_ref[:, lo:hi]):.3e}"
-    )
+    scale = D**-0.5
+    out = torch.empty_like(v)
+    state = torch.zeros(H, D, D, dtype=torch.float32, device=DEVICE)  # [H, V, K]
+    for t in range(total):
+        state = state * gate[0, t].exp().unsqueeze(-2)
+        residual = v[0, t] - torch.einsum("hvk,hk->hv", state, k[0, t])
+        state = state + torch.einsum(
+            "hv,hk->hvk", residual * beta[0, t, :, None], k[0, t]
+        )
+        out[0, t] = torch.einsum("hvk,hk->hv", state, q[0, t]) * scale
+    return out, state
+
+
+def run_numerics_study():
+    """Judge monolithic vs continuation against fp32 truth, wild vs scaled."""
+    total, split = 500, 250
+    slot = torch.tensor([0], dtype=torch.int32, device=DEVICE)
+
+    for wild in (True, False):
+        torch.manual_seed(42)
+        inputs = make_inputs(total, wild=wild)
+        cu_full = torch.tensor([0, total], dtype=torch.int32, device=DEVICE)
+        cu_head = torch.tensor([0, split], dtype=torch.int32, device=DEVICE)
+        cu_tail = torch.tensor([0, total - split], dtype=torch.int32, device=DEVICE)
+
+        pool_mono = torch.zeros(1, H, D, D, dtype=torch.float32, device=DEVICE)
+        o_mono = run_chunk_kda(inputs, [(0, total)], cu_full, pool_mono, slot)
+
+        pool_cont = torch.zeros(1, H, D, D, dtype=torch.float32, device=DEVICE)
+        run_chunk_kda(inputs, [(0, split)], cu_head, pool_cont, slot)
+        o_cont = run_chunk_kda(inputs, [(split, total)], cu_tail, pool_cont, slot)
+
+        tag = "wild" if wild else "scaled"
+        print(
+            f"[{tag}] continuation vs monolithic on [{split}:{total}): "
+            f"o_ratio={norm_ratio(o_cont, o_mono[:, split:]):.3e} "
+            f"final_state_ratio={norm_ratio(pool_cont, pool_mono):.3e}"
+        )
+        naive_o, naive_final = _naive_recurrence(inputs, total)
+        print(
+            f"[{tag}]   monolithic vs naive:  head [0:{split})="
+            f"{norm_ratio(o_mono[:, :split], naive_o[:, :split]):.3e}  "
+            f"tail [{split}:{total})="
+            f"{norm_ratio(o_mono[:, split:], naive_o[:, split:]):.3e}"
+        )
+        print(
+            f"[{tag}]   continuation vs naive: tail [{split}:{total})="
+            f"{norm_ratio(o_cont, naive_o[:, split:]):.3e}"
+        )
+        print(
+            f"[{tag}]   final state: mono vs naive="
+            f"{norm_ratio(pool_mono[0], naive_final):.3e}  "
+            f"cont vs naive={norm_ratio(pool_cont[0], naive_final):.3e}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("cp", "numerics", "all"), default="all")
+    args = parser.parse_args()
+    if args.mode in ("cp", "all"):
+        print("=== cp: per-rank h0 / output-shard localization ===")
+        run_cp_localization()
+    if args.mode in ("numerics", "all"):
+        print("=== numerics: input-conditioning study ===")
+        run_numerics_study()
 
 
 if __name__ == "__main__":
