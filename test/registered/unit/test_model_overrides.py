@@ -1702,7 +1702,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+        ):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online")
@@ -1713,11 +1716,36 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online", moe_runner_backend="triton")
                 )
+            # The rule is generic to modelopt_mixed, so existing mixed
+            # checkpoints without MXFP8 layers retain their TRT-LLM MoE default.
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="modelopt_mixed")
+                ),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            for explicit_backend in (
+                "flashinfer_cutlass",
+                "flashinfer_trtllm",
+            ):
+                with self.subTest(explicit_backend=explicit_backend):
+                    self.assertEqual(
+                        _moe_runner_backend_quant_constraints(
+                            _view(
+                                quantization="modelopt_mixed",
+                                moe_runner_backend=explicit_backend,
+                            )
+                        ),
+                        {},
+                    )
         self.assertEqual(
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="modelopt_fp4")
@@ -1725,6 +1753,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"moe_runner_backend": "flashinfer_cutlass"},
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
+
+    def test_modelopt_nvfp4_auto_backend_by_capability(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_backend_quant_constraints,
+        )
+
+        def _resolve(quantization, capability):
+            view = ResolvedView(
+                SimpleNamespace(
+                    quantization=quantization,
+                    moe_runner_backend="auto",
+                )
+            )
+            with patch.object(
+                overrides_module, "is_cuda", return_value=True
+            ), patch.object(
+                overrides_module,
+                "get_device_capability",
+                return_value=capability,
+            ), patch.object(
+                overrides_module,
+                "is_sm100_supported",
+                return_value=capability[0] == 10,
+            ), patch.object(
+                overrides_module,
+                "is_sm120_supported",
+                return_value=capability[0] == 12,
+            ):
+                return _moe_runner_backend_quant_constraints(view)
+
+        cases = (
+            ("modelopt_fp4", (8, 0), "marlin"),
+            ("modelopt_mixed", (8, 0), "marlin"),
+            ("modelopt_fp4", (9, 0), "marlin"),
+            ("modelopt_mixed", (9, 0), "marlin"),
+            ("modelopt_fp4", (10, 0), "flashinfer_trtllm"),
+            ("modelopt_mixed", (12, 0), "flashinfer_cutlass"),
+        )
+        for quantization, capability, expected_backend in cases:
+            with self.subTest(quantization=quantization, capability=capability):
+                self.assertEqual(
+                    _resolve(quantization, capability),
+                    {"moe_runner_backend": expected_backend},
+                )
 
     def test_cutlass_moe_env_override_pass(self):
         from sglang.srt.arg_groups.overrides import (

@@ -2419,16 +2419,26 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
-    if (
-        moe_runner_backend == "auto"
-        and view.quantization == "modelopt_fp4"
-        and is_sm120_supported()
+    if moe_runner_backend == "auto" and view.quantization in (
+        "modelopt_fp4",
+        "modelopt_mixed",
     ):
-        moe_runner_backend = "flashinfer_cutlass"
-        logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM120 for "
-            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-        )
+        # ModelOpt NVFP4 needs a concrete backend before its weight layout is
+        # created. TRT-LLM's NVFP4 MoE kernels are SM100-only; use FlashInfer
+        # CUTLASS on SM120 and the Marlin fallback on pre-Blackwell CUDA GPUs.
+        if is_sm120_supported():
+            moe_runner_backend = "flashinfer_cutlass"
+        elif is_sm100_supported():
+            moe_runner_backend = "flashinfer_trtllm"
+        elif is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+            moe_runner_backend = "marlin"
+
+        if moe_runner_backend != "auto":
+            logger.info(
+                "Use %s as MoE runner backend for %s",
+                moe_runner_backend,
+                view.quantization,
+            )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}

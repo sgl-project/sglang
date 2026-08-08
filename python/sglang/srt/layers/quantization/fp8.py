@@ -98,6 +98,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     mxfp8_block_convert_required,
     print_warning_once,
+    round_up,
     set_weight_attrs,
     use_intel_amx_backend,
     use_intel_xpu_backend,
@@ -129,6 +130,12 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_va
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+# FlashInfer's public API names this SfLayout.layout_128x4, but does not export
+# its dimensions. Keep these in sync with FlashInfer's F8_128x4 scale layout.
+MXFP8_BLOCK_SIZE = 32
+FLASHINFER_MXFP8_SF_TILE_N = 128
+FLASHINFER_MXFP8_SF_TILE_K = 4
 
 
 def _require_fp4_dtype():
@@ -452,6 +459,8 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
+    weight_scale_name = "weight_scale_inv"
+
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
@@ -539,6 +548,7 @@ class Fp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         weight_loader,
         is_checkpoint_fp8_serialized: bool,
+        weight_scale_name: str,
         skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
@@ -601,7 +611,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale.format_ue8m0 = use_mxfp8
                 if scale_dtype != torch.uint8:
                     scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale_inv", scale)
+                layer.register_parameter(weight_scale_name, scale)
             else:
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -652,20 +662,22 @@ class Fp8LinearMethod(LinearMethodBase):
             input_size=input_size,
             output_size=output_size,
             is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
+            weight_scale_name=self.weight_scale_name,
             params_dtype=params_dtype,
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        canonical_weight_scale = getattr(layer, self.weight_scale_name)
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
             )
 
             qweight, scale = convert_mxfp8_weight_to_block_fp8(
-                layer.weight.data, layer.weight_scale_inv.data, block=128
+                layer.weight.data, canonical_weight_scale.data, block=128
             )
             layer.weight = Parameter(qweight, requires_grad=False)
-            layer.weight_scale_inv = Parameter(scale, requires_grad=False)
+            copy_or_rebind_param(layer, self.weight_scale_name, scale)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False
             self.weight_block_size = [128, 128]
@@ -677,16 +689,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 return
             # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
             # Keep parameter object to preserve weight_loader attrs for hot reload.
-            layer.weight_scale_inv.requires_grad_(False)
-            layer.weight_scale_inv.format_ue8m0 = True
+            canonical_weight_scale.requires_grad_(False)
+            canonical_weight_scale.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
-            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+            weight, processed_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                 weight=layer.weight,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=canonical_weight_scale,
                 input_scale=None,
             )
             layer.input_scale = None
@@ -695,9 +707,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
-            layer.weight_scale_inv = torch.nn.Parameter(
-                layer.weight_scale_inv.data, requires_grad=False
-            )
+            canonical_weight_scale.requires_grad_(False)
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
@@ -707,16 +717,17 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
-                layer.weight_scale_inv,
+                canonical_weight_scale,
                 getattr(self.quant_config, "weight_block_size", None),
                 use_deepgemm_runner=use_deepgemm_runner,
                 output_dtype=getattr(layer, "orig_dtype", None),
                 weight_shape=layer.weight.shape,
             )
-            weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+            weight = layer.weight.data
+            processed_weight_scale = canonical_weight_scale.data
 
         layer.weight.data = weight.data
-        layer.weight_scale_inv.data = weight_scale.data
+        canonical_weight_scale.data = processed_weight_scale.data
 
         if (
             _use_aiter_bpreshuffle_gfx95
@@ -735,11 +746,12 @@ class Fp8LinearMethod(LinearMethodBase):
             return
 
         backend = self.mxfp8_dense_backend
+        weight_scale = getattr(layer, self.weight_scale_name)
         if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
-            scale_u8 = layer.weight_scale_inv.data
+            scale_u8 = weight_scale.data
             n, k = weight.shape
             epilogue_tile_m = 128
             sf_cols = k // 32
@@ -777,15 +789,19 @@ class Fp8LinearMethod(LinearMethodBase):
                 .contiguous(),
             )
         elif backend.is_flashinfer_cutlass():
-            from flashinfer import block_scale_interleave
-
-            scale_u8 = layer.weight_scale_inv.data
-            # block_scale_interleave may pad and/or reshape scales,
-            # so store swizzled scales separately to keep weight update working
+            weight = layer.weight.data
+            scale_u8 = weight_scale.data
+            orig_n, k = weight.shape
+            aligned_n = round_up(orig_n, FLASHINFER_MXFP8_SF_TILE_N)
+            layer.mxfp8_orig_n = orig_n
+            if aligned_n != orig_n:
+                weight = F.pad(weight, (0, 0, 0, aligned_n - orig_n))
+                scale_u8 = F.pad(scale_u8, (0, 0, 0, aligned_n - orig_n))
+            copy_or_rebind_param(layer, "weight_mxfp8_cutlass", weight.contiguous())
             copy_or_rebind_param(
                 layer,
                 "weight_scale_inv_swizzled",
-                block_scale_interleave(scale_u8.contiguous()).contiguous(),
+                self._swizzle_mxfp8_cutlass_scale(scale_u8, aligned_n, k),
             )
         elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -793,7 +809,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
             n, k = layer.weight.shape
-            scale_u8 = layer.weight_scale_inv.data
+            scale_u8 = weight_scale.data
             layer.weight_scale_inv_swizzled = None
             if n % 64 != 0 or k % 128 != 0:
                 if not (is_blackwell_supported() and is_flashinfer_available()):
@@ -827,21 +843,53 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
 
+    @staticmethod
+    def _swizzle_mxfp8_cutlass_scale(
+        scale: torch.Tensor, n: int, k: int
+    ) -> torch.Tensor:
+        """Convert canonical [N, K/32] UE8M0 scales to F8_128x4 layout."""
+        n_tiles = round_up(n, FLASHINFER_MXFP8_SF_TILE_N) // FLASHINFER_MXFP8_SF_TILE_N
+        scale_cols = k // MXFP8_BLOCK_SIZE
+        k_tiles = (
+            round_up(scale_cols, FLASHINFER_MXFP8_SF_TILE_K)
+            // FLASHINFER_MXFP8_SF_TILE_K
+        )
+        padded = scale.new_zeros(
+            (
+                n_tiles * FLASHINFER_MXFP8_SF_TILE_N,
+                k_tiles * FLASHINFER_MXFP8_SF_TILE_K,
+            )
+        )
+        padded[:n, :scale_cols] = scale
+        return (
+            padded.view(
+                n_tiles,
+                FLASHINFER_MXFP8_SF_TILE_N // MXFP8_BLOCK_SIZE,
+                MXFP8_BLOCK_SIZE,
+                k_tiles,
+                FLASHINFER_MXFP8_SF_TILE_K,
+            )
+            .transpose(1, 3)
+            .contiguous()
+            .view(-1)
+        )
+
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
         qweight, weight_scale = mxfp8_group_quantize(weight)
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         layer.weight.data = qweight
         layer.weight.requires_grad_(False)
-        if hasattr(layer, "weight_scale_inv") and layer.weight_scale_inv is not None:
-            layer.weight_scale_inv.data = weight_scale
-            layer.weight_scale_inv.requires_grad_(False)
+        scale_param = getattr(layer, self.weight_scale_name, None)
+        if scale_param is not None:
+            scale_param.data = weight_scale
+            scale_param.requires_grad_(False)
         else:
             # First-time online MXFP8 quantization (no serialized scales).
             layer.register_parameter(
-                "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
+                self.weight_scale_name, Parameter(weight_scale, requires_grad=False)
             )
-        layer.weight_scale_inv.format_ue8m0 = True
+        getattr(layer, self.weight_scale_name).format_ue8m0 = True
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
@@ -977,32 +1025,45 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_mxfp8:
             backend = self.mxfp8_dense_backend
             extra_kwargs = {}
+            apply_bias_after_slice = False
             if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
+                weight = layer.weight_mxfp8_cutlass
+                apply_bias_after_slice = weight.shape[0] != layer.mxfp8_orig_n
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
+                weight = layer.weight
             elif backend.is_deep_gemm():
                 weight_scale = layer.weight_scale_inv_deepgemm
                 extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
+                weight = layer.weight
             else:
-                weight_scale = layer.weight_scale_inv
+                weight_scale = getattr(layer, self.weight_scale_name)
+                weight = layer.weight
             if isinstance(x, tuple):
-                return self.w8a8_mxfp8_linear(
+                output = self.w8a8_mxfp8_linear(
                     input=x[0],
-                    weight=layer.weight,
+                    weight=weight,
                     weight_scale=weight_scale,
                     input_scale=x[1],
-                    bias=bias,
+                    bias=None if apply_bias_after_slice else bias,
                     **extra_kwargs,
                 )
-            return self.w8a8_mxfp8_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=weight_scale,
-                input_scale=None,
-                bias=bias,
-                **extra_kwargs,
-            )
+            else:
+                output = self.w8a8_mxfp8_linear(
+                    input=x,
+                    weight=weight,
+                    weight_scale=weight_scale,
+                    input_scale=None,
+                    bias=None if apply_bias_after_slice else bias,
+                    **extra_kwargs,
+                )
+            orig_n = getattr(layer, "mxfp8_orig_n", output.shape[-1])
+            if output.shape[-1] != orig_n:
+                output = output[..., :orig_n].contiguous()
+            if apply_bias_after_slice and bias is not None:
+                output = output + bias
+            return output
 
         if self.block_quant:
             if use_intel_amx_backend(layer):

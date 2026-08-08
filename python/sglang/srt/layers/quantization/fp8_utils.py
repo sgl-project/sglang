@@ -721,19 +721,20 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
-    backend = server_args.fp8_gemm_runner_backend
-    if backend == "auto" and is_sm120_supported():
-        backend = "cutlass"
-
-    backend = Fp8GemmRunnerBackend(backend)
+    backend = Fp8GemmRunnerBackend(server_args.fp8_gemm_runner_backend)
+    sm120_supported = is_sm120_supported()
 
     if (
         backend.is_auto()
-        and server_args.quantization == "mxfp8"
-        and _is_sm100_supported
+        and server_args.quantization in ("mxfp8", "modelopt_mixed")
+        and (_is_sm100_supported or sm120_supported)
         and is_flashinfer_available()
     ):
+        # CUTLASS supports the full MXFP8 linear shape set without TRT-LLM's
+        # K % 256 requirement; narrow output shards are padded by Fp8LinearMethod.
         backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+    elif backend.is_auto() and sm120_supported:
+        backend = Fp8GemmRunnerBackend.CUTLASS
 
     FP8_GEMM_RUNNER_BACKEND = backend
 
