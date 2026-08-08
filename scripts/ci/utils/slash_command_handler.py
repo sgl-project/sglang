@@ -289,14 +289,14 @@ def load_permissions(user_login):
 
 def has_sgl_kernel_changes(pr):
     """
-    Check if the PR has changes to the sgl-kernel directory.
+    Check if the PR has changes to the AOT kernel directory.
     This is used to determine if we need a full workflow rerun
     (to rebuild the kernel) vs just rerunning failed jobs.
     """
     try:
         files = pr.get_files()
         for f in files:
-            if f.filename.startswith("sgl-kernel/"):
+            if f.filename.startswith("python/sglang/kernels/aot/"):
                 return True
         return False
     except Exception as e:
@@ -462,6 +462,7 @@ MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
 MULTIMODAL_PATH_TO_RUNNER = {
     "2_gpu": "2-gpu-h100",
     "2-gpu": "2-gpu-h100",
+    "b200": _B200_DEFAULT_RUNNER,
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
@@ -722,7 +723,7 @@ def _extract_legacy_suites(content):
 # matches the runner the nightly/weekly pipeline actually uses (see
 # .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
 # dispatch a single nightly/weekly test. The runner label, install script,
-# timeout, grace_blackwell, and rdma_devices are then resolved from
+# timeout and rdma_devices are then resolved from
 # runner_configs.yml as usual, keeping that file the single source of truth for
 # runner details.
 #
@@ -755,7 +756,6 @@ def _dispatch_err(suite, msg):
         "runner_label": None,
         "install_script": "",
         "install_timeout": "",
-        "grace_blackwell": "0",
         "rdma_devices": "",
         "is_cpu": False,
         "error": msg,
@@ -796,7 +796,6 @@ def _resolve_runner_config(rc, full_path, suite):
         "runner_label": runs_on,
         "install_script": install_script,
         "install_timeout": str(cfg["install_timeout"]),
-        "grace_blackwell": str(cfg.get("grace_blackwell", "0")),
         "rdma_devices": cfg.get("rdma_devices", ""),
         "is_cpu": False,
         "error": None,
@@ -810,8 +809,8 @@ def detect_suite(file_path_from_test):
 
     A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
     pool it should run on — so this returns a *list* of dispatch dicts, one
-    per registration. Runner label, install script, timeout, grace_blackwell,
-    and rdma_devices are all resolved from scripts/ci/runner_configs.yml — the
+    per registration. Runner label, install script, timeout, and rdma_devices
+    are all resolved from scripts/ci/runner_configs.yml — the
     same single source of truth that drives the main PR test pipeline.
 
     Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
@@ -823,7 +822,7 @@ def detect_suite(file_path_from_test):
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
-    install_timeout, grace_blackwell, rdma_devices, is_cpu, error.
+    install_timeout, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
@@ -859,7 +858,6 @@ def detect_suite(file_path_from_test):
                 "runner_label": "ubuntu-latest",
                 "install_script": "",
                 "install_timeout": "",
-                "grace_blackwell": "0",
                 "rdma_devices": "",
                 "is_cpu": True,
                 "error": None,
@@ -934,7 +932,6 @@ def _resolve_test_spec(test_spec):
                 "runs_on": runner_label,
                 "install_script": "",
                 "install_timeout": "",
-                "grace_blackwell": "0",
                 "rdma_devices": "",
                 "error": None,
             }
@@ -953,7 +950,7 @@ def _resolve_test_spec(test_spec):
         print(
             f"Resolved: file={resolved_path}, selector={test_selector}, "
             f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
-            f"install={info['install_script']}, grace_blackwell={info['grace_blackwell']}, "
+            f"install={info['install_script']}, "
             f"rdma={info['rdma_devices']}, "
             f"command='{test_command}'"
         )
@@ -965,7 +962,6 @@ def _resolve_test_spec(test_spec):
                 "runs_on": info["runner_label"],
                 "install_script": info["install_script"],
                 "install_timeout": info["install_timeout"],
-                "grace_blackwell": info["grace_blackwell"],
                 "rdma_devices": info["rdma_devices"],
                 "error": None,
             }
@@ -977,7 +973,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
-    install_timeout + grace_blackwell + rdma_devices).
+    install_timeout + rdma_devices).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
     """
@@ -986,7 +982,6 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     runs_on = batch[0]["runs_on"]
     install_script = batch[0]["install_script"]
     install_timeout = batch[0]["install_timeout"]
-    grace_blackwell = batch[0]["grace_blackwell"]
     rdma_devices = batch[0]["rdma_devices"]
 
     # Join multiple commands with newlines for the workflow to iterate over
@@ -1019,7 +1014,6 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "runs_on": runs_on or "",
             "install_script": install_script,
             "install_timeout": install_timeout or "20",
-            "grace_blackwell": grace_blackwell or "0",
             "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
@@ -1127,7 +1121,7 @@ def handle_rerun_test(
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
     dispatch shape (mode + runs_on + install_script + install_timeout +
-    grace_blackwell + rdma_devices), and dispatches one workflow per group.
+    rdma_devices), and dispatches one workflow per group.
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
@@ -1222,7 +1216,6 @@ def handle_rerun_test(
             r["runs_on"],
             r["install_script"],
             r["install_timeout"],
-            r["grace_blackwell"],
             r["rdma_devices"],
         )
         groups.setdefault(key, []).append(r)

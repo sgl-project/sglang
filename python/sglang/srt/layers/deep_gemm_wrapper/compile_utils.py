@@ -35,10 +35,9 @@ _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
 
-# Force redirect deep_gemm cache_dir
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm")
-)
+# Force redirect deep_gemm cache_dir. Defaults under SGLANG_CACHE_DIR so it
+# sits with the other compiled-kernel caches; SGLANG_DG_CACHE_DIR still wins.
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 
 # Refer to https://github.com/deepseek-ai/DeepGEMM/commit/d75b218b7b8f4a5dd5406ac87905039ead3ae42f
 # NVRTC may have performance loss with some cases.
@@ -436,7 +435,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
     from sglang.srt.utils.common import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
