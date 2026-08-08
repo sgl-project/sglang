@@ -31,7 +31,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Workload acceptance changes over time**: Use [**Adaptive speculative decoding**](./adaptive_speculative_decoding) on top of **EAGLE** with `--speculative-eagle-topk 1`.
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
-- **Faster deterministic inference, including GDN models**: Use **Decode-Verify-Rollback** with `--speculative-algorithm DECODE_VERIFY_ROLLBACK`.
+- **Faster deterministic target execution, including GDN models**: Use **Decode-Verify-Rollback** with `--speculative-algorithm DECODE_VERIFY_ROLLBACK`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
@@ -93,7 +93,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Target self-draft, EAGLE/MTP, or DFlash</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Optional</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>DECODE_VERIFY_ROLLBACK*</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accelerates deterministic inference; Triton or FA3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accelerates deterministic target execution; Triton or FA3</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DFLASH</td>
@@ -438,14 +438,22 @@ print(response.json())
 
 ## Decode-Verify-Rollback
 
-Decode-Verify-Rollback (DVR) speeds up deterministic inference by asking a fast
-draft path to propose a block of tokens, then verifying the block with the
-deterministic target model. Rejection sampling keeps published tokens
-distributed according to the target model. The draft can come from the target
-model itself, EAGLE/MTP, or DFlash.
+Decode-Verify-Rollback (DVR) speeds up deterministic target execution for RL
+rollouts. A fast provisional path proposes a block of tokens, the deterministic
+target verifies the block with prefill-style execution, and rejection sampling
+keeps published tokens distributed according to the target model. The draft can
+come from the target model itself, EAGLE/MTP, or DFlash.
 
-DVR also tracks recurrent state for GDN targets, whose prefill and decode paths
-use different kernels.
+Only target verification defines committed tokens and scores; provisional draft
+execution may use faster, batch-dependent kernels. For a fixed accepted token
+sequence, DVR target decode and deterministic target prefill produce matching
+target logprobs. End-to-end trainer/generator parity additionally requires a
+training runtime that implements the same numerical contract.
+
+For GDN targets, DVR tracks exact recurrent state at accepted 64-token
+boundaries and replays the accepted suffix during verification. This keeps
+target logprobs aligned with deterministic prefill even though ordinary prefill
+and recurrent decode use different execution paths.
 
 ```bash Command
 python3 -m sglang.launch_server \

@@ -1,11 +1,10 @@
 # Testing Decode-Verify-Rollback
 
-Use the launcher and parity client in this directory to test DVR startup,
-selected-token logprobs, state lifecycle, and decode throughput. Target full
-attention supports Triton and FlashAttention 3. GDN tests use Triton linear
-attention, page size 64, and FP32 recurrent state. Radix may be enabled or
-disabled; GDN recurrent checkpoints are published only at exact chunk
-boundaries.
+Use the launcher and parity client in this directory to test DVR startup, target
+logprob parity, state lifecycle, and decode throughput. Target full attention
+supports Triton and FlashAttention 3. GDN tests use Triton linear attention,
+page size 64, and FP32 recurrent state. Radix may be enabled or disabled; GDN
+recurrent checkpoints are published only at exact chunk boundaries.
 
 ## Launch
 
@@ -45,7 +44,7 @@ matched overlap comparison. Use
 `DISABLE_RADIX_CACHE=1` or `DISABLE_CUSTOM_ALL_REDUCE=1` only for controlled
 comparisons.
 
-## Correctness
+## Target Logprob Parity
 
 Use the same non-greedy sampling configuration for matched standard
 (`SERVER_MODE=normal`), deterministic, and DVR runs. The defaults are
@@ -70,11 +69,15 @@ python3 test/manual/dvr/check_logprob_parity.py det \
   --artifact /results/qwen35_fa3_smoke.json
 ```
 
-The client checks that selected-token original logprobs match in three places:
+The client checks the serving-side numerical contract by comparing
+selected-token original logprobs in three places:
 
 1. repeated deterministic target prefill;
-2. DVR target decode and DVR forced target prefill;
-3. DVR target decode and ordinary deterministic target prefill.
+2. DVR target decode versus DVR forced target prefill;
+3. DVR target decode versus ordinary deterministic target prefill.
+
+End-to-end trainer/generator parity requires a separate training-side check
+against the same forced token sequence and numerical contract.
 
 The smoke profile also runs an independent request without returned logprobs.
 
