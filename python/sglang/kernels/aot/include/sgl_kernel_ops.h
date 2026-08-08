@@ -96,21 +96,6 @@ void register_graph_buffers(
  */
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope,
-    torch::Tensor const& q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
-    double sm_scale,
-    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
-int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len,
-    int64_t num_batches,
-    int64_t sm_count = 0,
-    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 
 /*
  * From csrc/infllm_v2
@@ -220,7 +205,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
 /*
  * From csrc/gemm
  */
-torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -256,17 +240,6 @@ void sgl_per_token_group_quant_8bit_v2(
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-
-torch::Tensor gptq_gemm(
-    torch::Tensor a,
-    torch::Tensor b_q_weight,
-    torch::Tensor b_gptq_qzeros,
-    torch::Tensor b_gptq_scales,
-    torch::Tensor b_g_idx,
-    bool use_shuffle,
-    int64_t bit);
-
-void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
 /*
  * From csrc/moe
@@ -635,82 +608,6 @@ void top_k_renorm_probs(
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
-
-namespace flash {
-/*
- * From fa2 sparse
- */
-std::vector<at::Tensor> mha_fwd_sparse(
-    at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
-    const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size
-    const at::Tensor& v,  // batch_size x seqlen_k x num_heads_k x head_size
-    const at::Tensor& block_count,
-    const at::Tensor& block_offset,
-    const at::Tensor& column_count,
-    const at::Tensor& column_index,
-    const std::optional<at::Tensor>& out_,           // batch_size x seqlen_q x num_heads x head_size
-    const std::optional<at::Tensor>& alibi_slopes_,  // num_heads or batch_size x num_heads
-    const double p_dropout,
-    const double softmax_scale,
-    bool is_causal,
-    const double softcap,
-    const bool return_softmax,
-    std::optional<at::Generator> gen_);
-
-std::vector<at::Tensor> mha_varlen_fwd_sparse(
-    at::Tensor& q,        // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-    const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
-    const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
-    const at::Tensor& block_count,
-    const at::Tensor& block_offset,
-    const at::Tensor& column_count,
-    const at::Tensor& column_index,
-    const c10::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-    const at::Tensor& cu_seqlens_q,         // b+1
-    const at::Tensor& cu_seqlens_k,         // b+1
-    const c10::optional<at::Tensor>&
-        seqused_k,  // b. If given, only this many elements of each batch element's keys are used.
-    const c10::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
-    int64_t max_seqlen_q,
-    const int64_t max_seqlen_k,
-    const double p_dropout,
-    const double softmax_scale,
-    const bool zero_tensors,
-    bool is_causal,
-    const double softcap,
-    const bool return_softmax,
-    c10::optional<at::Generator> gen_);
-}  // namespace flash
-
-void convert_vertical_slash_indexes(
-    torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& block_offset,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
-    torch::Tensor& column_count,     // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& column_index,     // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
-    torch::Tensor q_seqlens,         // [BATCH, ]
-    torch::Tensor kv_seqlens,        // [BATCH, ]
-    torch::Tensor vertical_indexes,  // [BATCH, N_HEADS, NNZ_V]
-    torch::Tensor slash_indexes,     // [BATCH, N_HEADS, NNZ_S]
-    int64_t context_size,
-    int64_t block_size_M,
-    int64_t block_size_N,
-    bool causal);
-
-void convert_vertical_slash_indexes_mergehead(
-    torch::Tensor& block_count,            // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& block_offset,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_S]
-    torch::Tensor& column_count,           // [BATCH, N_HEADS, NUM_ROWS]
-    torch::Tensor& column_index,           // [BATCH, N_HEADS, NUM_ROWS, NNZ_V]
-    torch::Tensor q_seqlens,               // [BATCH, ]
-    torch::Tensor kv_seqlens,              // [BATCH, ]
-    torch::Tensor vertical_indexes,        // [BATCH, N_HEADS, NNZ_V]
-    torch::Tensor slash_indexes,           // [BATCH, N_HEADS, NNZ_S]
-    torch::Tensor vertical_indices_count,  // [N_HEADS, ]
-    torch::Tensor slash_indices_count,
-    int64_t context_size,
-    int64_t block_size_M,
-    int64_t block_size_N,
-    bool causal);
 
 /*
  * From csrc/grammar

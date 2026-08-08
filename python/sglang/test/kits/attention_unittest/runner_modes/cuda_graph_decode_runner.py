@@ -73,20 +73,6 @@ from ..attention_methods.dsv4_attention import (
     run_dsv4_fixture_eager,
     run_dsv4_forward,
 )
-from ..attention_methods.dual_chunk_attention import (
-    DualChunkAttentionCase,
-    _clone_dual_chunk_cache,
-    _restore_dual_chunk_cache,
-    build_dual_chunk_attention_fixture,
-    dual_chunk_fixture_inputs,
-    expected_dual_chunk_output_from_inputs,
-    make_dual_chunk_case_with_prefix_lens,
-    make_dual_chunk_random_inputs,
-    make_dual_chunk_replay_inputs,
-    prepare_dual_chunk_runner_inputs,
-    run_dual_chunk_fixture_eager,
-    run_dual_chunk_forward,
-)
 from ..attention_methods.gdn_attention import DEFAULT_DEVICE as GDN_DEFAULT_DEVICE
 from ..attention_methods.gdn_attention import DEFAULT_DTYPE as GDN_DEFAULT_DTYPE
 from ..attention_methods.gdn_attention import (
@@ -885,61 +871,6 @@ def run_dsa_sparse_cuda_graph_decode_case(
             device=device,
             dsa_decode_backend=dsa_decode_backend,
             fp8_kv_cache=fp8_kv_cache,
-        ),
-        capture_batch_size=capture_batch_size,
-        max_context_len=max_context_len,
-        dtype=dtype,
-        device=device,
-    )
-
-
-def run_dual_chunk_cuda_graph_decode_case(
-    testcase,
-    case: DualChunkAttentionCase,
-    *,
-    head_dim: int = DEFAULT_HEAD_DIM,
-    hidden_size: int = DEFAULT_HIDDEN_SIZE,
-    max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
-    dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
-    device: str = DENSE_DEFAULT_DEVICE,
-    cuda_graph_capture_batch_size: int | None = None,
-):
-    """Dual-chunk CUDA-graph decode replay. Decode reads cached K/V (set
-    by `set_kv_buffer` inside `forward_decode`) so the capture/replay
-    contract is the same shape as dense attention. The
-    `_clone_dual_chunk_cache` / `_restore_dual_chunk_cache` hooks snapshot
-    both K and V buffers so the capture forward's writes don't bleed into
-    replay state."""
-    if not case.forward_mode.is_decode():
-        raise ValueError("run_dual_chunk_cuda_graph_decode_case expects a DECODE case.")
-    capture_batch_size = cuda_graph_capture_batch_size or case.batch_size
-    adapter = CudaGraphDecodeAdapter(
-        build_fixture=build_dual_chunk_attention_fixture,
-        make_case=make_dual_chunk_case_with_prefix_lens,
-        make_forward_batch=_make_dense_forward_batch,
-        fixture_inputs=dual_chunk_fixture_inputs,
-        make_capture_inputs=make_dual_chunk_random_inputs,
-        make_replay_inputs=make_dual_chunk_replay_inputs,
-        prepare_inputs=prepare_dual_chunk_runner_inputs,
-        run_eager=run_dual_chunk_fixture_eager,
-        run_forward=run_dual_chunk_forward,
-        expected_output=expected_dual_chunk_output_from_inputs,
-        clone_state=_clone_dual_chunk_cache,
-        restore_state=_restore_dual_chunk_cache,
-        allow_padding=True,
-        atol=DENSE_ATOL,
-        rtol=DENSE_RTOL,
-    )
-    _run_cuda_graph_decode_case(
-        testcase,
-        case,
-        adapter=adapter,
-        build_kwargs=dict(
-            head_dim=head_dim,
-            hidden_size=hidden_size,
-            max_context_len=max_context_len,
-            dtype=dtype,
-            device=device,
         ),
         capture_batch_size=capture_batch_size,
         max_context_len=max_context_len,
