@@ -2043,9 +2043,12 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
-        get_context().override(
-            "model_runner.update_model_fields",
-            model_path=model_path,
-            load_format=load_format,
-        )
+        # The record says what model this PROCESS serves; a draft's weight
+        # update is not that (its own state is on the runner).
+        if not self.is_draft_worker:
+            get_context().override(
+                "model_runner.update_model_fields",
+                model_path=model_path,
+                load_format=load_format,
+            )
         self.load_config = load_config

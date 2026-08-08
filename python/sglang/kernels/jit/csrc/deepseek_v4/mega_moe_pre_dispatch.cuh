@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
@@ -218,4 +218,4 @@ struct MegaMoEPreDispatchKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
