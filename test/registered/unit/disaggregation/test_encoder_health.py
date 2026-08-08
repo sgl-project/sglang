@@ -3,7 +3,8 @@ import sys
 
 import pytest
 
-from sglang.srt.disaggregation import encode_server
+from sglang.srt.disaggregation import encode_http_server as encode_server
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -17,9 +18,18 @@ class _FakeEncoder:
         self.encode_dispatch_lock = asyncio.Lock()
         self.encode_calls = []
 
+    def has_pending_embeddings(self):
+        return bool(self.embedding_to_send)
+
+    def supports_modality(self, modality):
+        return modality == Modality.IMAGE
+
     async def encode(self, **kwargs):
         self.encode_calls.append(kwargs)
         return 1, 1, 1, None, None
+
+    async def release_request(self, _req_id):
+        return None
 
 
 def _install_tp_encoder(monkeypatch, encoder):

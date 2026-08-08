@@ -1337,8 +1337,9 @@ class Envs:
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
     # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
     SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
-    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
+    # Persistent receiver-side GPU embedding pool size for mooncake/zmq_to_scheduler EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
+    # (mooncake only; zmq_to_scheduler requires the env to be set explicitly).
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 

@@ -709,6 +709,7 @@ def general_mm_embed_routine(
                                 if (
                                     isinstance(precomputed_embeddings, torch.Tensor)
                                     and precomputed_embeddings.is_cuda
+                                    and not mm_item.keep_device_embedding
                                 ):
                                     mm_item.precomputed_embeddings = (
                                         precomputed_embeddings.to(
