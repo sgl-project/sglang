@@ -409,6 +409,13 @@ class DataParallelController:
         if refresh_load_budget and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
 
+        self._retry_pending_bootstrap_topology_update()
+        if self._pending_elastic_scale_update is not None:
+            self._reject_bootstrap_request(
+                req, "Elastic prefill topology update is still in progress."
+            )
+            return
+
         time_stats = DPControllerReqTimeStats.new_from_obj(
             unwrap_from_pickle(req.time_stats)
         )
@@ -861,13 +868,6 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        self._retry_pending_bootstrap_topology_update()
-        if self._pending_elastic_scale_update is not None:
-            self._reject_bootstrap_request(
-                req, "Elastic prefill topology update is still in progress."
-            )
-            return
-
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
@@ -909,6 +909,9 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+            # Elastic EP requires round_robin scheduling, so topology retries
+            # must progress independently of follow_bootstrap_room requests.
+            self._retry_pending_bootstrap_topology_update()
 
 
 def run_data_parallel_controller_process(

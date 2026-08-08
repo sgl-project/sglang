@@ -52,6 +52,7 @@ struct PrefillServerInfo {
     kv_cache_dtype: Option<String>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
+    dynamic_dp_size: bool,
     prefill_http_port: Option<i64>,
 }
 
@@ -69,11 +70,13 @@ struct Registry {
     attn_tp_size: Option<i64>,
     attn_cp_size: Option<i64>,
     dp_size: Option<i64>,
+    max_dp_size: Option<i64>,
     pp_size: Option<i64>,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
+    dynamic_dp_size: bool,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -151,6 +154,10 @@ struct RoutePut {
     load_balance_method: Option<String>,
     #[serde(default)]
     enable_dsa_cache_layer_split: Option<bool>,
+    #[serde(default)]
+    dynamic_dp_size: bool,
+    #[serde(default)]
+    max_dp_size: Option<Int>,
 }
 
 fn not_ready(registered_count: i64) -> Response {
@@ -178,6 +185,9 @@ async fn route_put(State(state): State<Shared>, Json(body): Json<RoutePut>) -> R
     reg.attn_tp_size.get_or_insert(body.attn_tp_size);
     reg.attn_cp_size.get_or_insert(body.attn_cp_size);
     reg.dp_size.get_or_insert(dp_size);
+    if reg.max_dp_size.is_none() {
+        reg.max_dp_size = body.max_dp_size.map(|size| size.0);
+    }
     reg.pp_size.get_or_insert(body.pp_size);
     reg.page_size.get_or_insert(body.page_size.0);
     if reg.kv_cache_dtype.is_none() {
@@ -194,6 +204,7 @@ async fn route_put(State(state): State<Shared>, Json(body): Json<RoutePut>) -> R
     );
     reg.enable_dsa_cache_layer_split
         .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+    reg.dynamic_dp_size |= body.dynamic_dp_size;
 
     reg.prefill_ranks.insert(
         (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
@@ -255,6 +266,7 @@ async fn route_get(
             kv_cache_dtype: reg.kv_cache_dtype.clone(),
             follow_bootstrap_room: reg.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: reg.enable_dsa_cache_layer_split.unwrap_or(false),
+            dynamic_dp_size: reg.dynamic_dp_size,
             prefill_http_port: reg.prefill_http_port,
         })
         .into_response();
@@ -313,6 +325,53 @@ async fn query_dp_ranks(State(state): State<Shared>, Json(body): Json<QueryDpRan
     Json(result).into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct UpdateDpSize {
+    dp_size: Int,
+}
+
+/// Update the active DP topology after elastic EP scale-up. This is the
+/// Python bootstrap server's `/update_dp_size` contract: only growth is
+/// allowed, and a successful update makes the topology dynamic so decode uses
+/// the per-room rank registration handshake.
+async fn update_dp_size(State(state): State<Shared>, Json(body): Json<UpdateDpSize>) -> Response {
+    let dp_size = body.dp_size.0;
+    if dp_size < 1 {
+        return (StatusCode::BAD_REQUEST, "dp_size must be positive").into_response();
+    }
+
+    let mut reg = state.lock().unwrap();
+    let Some(max_dp_size) = reg.max_dp_size else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Bootstrap maximum DP size is not registered",
+        )
+            .into_response();
+    };
+    if dp_size > max_dp_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Cannot grow bootstrap DP size beyond configured maximum {max_dp_size}"),
+        )
+            .into_response();
+    }
+    if reg.dp_size.is_some_and(|current| dp_size < current) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Cannot shrink bootstrap DP size from {} to {dp_size}",
+                reg.dp_size.unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    if dp_size > reg.dp_size.unwrap_or(0) {
+        reg.dp_size = Some(dp_size);
+    }
+    reg.dynamic_dp_size = true;
+    "OK".into_response()
+}
+
 /// No `/health` here: the merged api router already serves it (same 200 "OK"
 /// the standalone Python bootstrap server answered, so probes are unchanged).
 fn router(state: Shared) -> Router {
@@ -322,6 +381,7 @@ fn router(state: Shared) -> Router {
         .route("/route", put(route_put).get(route_get))
         .route("/register_dp_rank", post(register_dp_rank))
         .route("/query_dp_ranks", post(query_dp_ranks))
+        .route("/update_dp_size", post(update_dp_size))
         .with_state(state)
 }
 
@@ -402,6 +462,7 @@ mod tests {
             "page_size": 64, "kv_cache_dtype": "auto",
             "load_balance_method": "follow_bootstrap_room",
             "enable_dsa_cache_layer_split": false,
+            "max_dp_size": 1,
             "prefill_http_port": 30000,
         });
         body.as_object_mut()
@@ -490,6 +551,7 @@ mod tests {
                 "page_size": 64, "kv_cache_dtype": "auto",
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
+                "dynamic_dp_size": false,
                 "prefill_http_port": 30000,
             })
         );
@@ -585,6 +647,64 @@ mod tests {
         assert_eq!(status, 200);
         let result: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(result, serde_json::json!({"42": 3}));
+    }
+
+    /// The Python DPC publishes a successful elastic scale through this
+    /// endpoint before routing into the expanded worker domain. Pin the Rust
+    /// implementation to the same growth-only and aggregate-topology contract.
+    #[test]
+    fn elastic_dp_size_update_matches_python_bootstrap() {
+        let (_rt, addr) = start_on_free_port();
+        let (status, _) = request(
+            addr,
+            "PUT",
+            "/route",
+            Some(&put_route(
+                serde_json::json!({"attn_dp_size": 2, "max_dp_size": 2}),
+            )),
+        );
+        assert_eq!(status, 200);
+
+        let (status, text) = request(
+            addr,
+            "POST",
+            "/update_dp_size",
+            Some(&serde_json::json!({"dp_size": 2})),
+        );
+        assert_eq!((status, text.as_str()), (200, "OK"));
+
+        // A duplicate registration satisfies the same count-based readiness
+        // check as the Python bootstrap registry.
+        let (status, _) = request(
+            addr,
+            "PUT",
+            "/route",
+            Some(&put_route(
+                serde_json::json!({"attn_dp_size": 2, "max_dp_size": 2}),
+            )),
+        );
+        assert_eq!(status, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["dp_size"], 2);
+        assert_eq!(info["dynamic_dp_size"], true);
+
+        let (status, _) = request(
+            addr,
+            "POST",
+            "/update_dp_size",
+            Some(&serde_json::json!({"dp_size": 1})),
+        );
+        assert_eq!(status, 400);
+
+        let (status, _) = request(
+            addr,
+            "POST",
+            "/update_dp_size",
+            Some(&serde_json::json!({"dp_size": 3})),
+        );
+        assert_eq!(status, 400);
     }
 
     /// The registry mounts only on prefill (`enable_pd_bootstrap()`): a

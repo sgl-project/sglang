@@ -11,6 +11,7 @@ if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
 is exercised as the real method, no mock.
 """
 
+import time
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 import requests
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -365,6 +367,46 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         self.assertIs(ctl._pending_elastic_scale_update, update)
         self.assertEqual(ctl.bootstrap_room_dp_size, 2)
         self.assertEqual(ctl._active_workers, [0, 1])
+
+    def test_event_loop_retries_pending_bootstrap_topology_updates(self):
+        ctl = _make_controller(dp_size=2)
+        ctl.soft_watchdog = MagicMock()
+        ctl.recv_from_tokenizer = MagicMock()
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.sock_recv",
+                side_effect=zmq.ZMQError(),
+            ),
+            patch.object(
+                ctl,
+                "_retry_pending_bootstrap_topology_update",
+                side_effect=KeyboardInterrupt,
+            ) as retry,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                ctl.event_loop()
+
+        retry.assert_called_once()
+
+    def test_pending_topology_update_rejects_direct_rank_routing(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl._pending_elastic_scale_update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+        ctl._last_bootstrap_topology_retry = time.monotonic()
+        ctl.refresh_load_budget_on_dispatch = False
+        ctl.dispatching = MagicMock()
+        req = _req(routed_dp_rank=2)
+        req.time_stats = MagicMock()
+
+        ctl.dispatching_with_trace(req)
+
+        ctl.dispatching.assert_not_called()
+        ctl.send_to_tokenizer.send_pyobj.assert_called_once()
 
 
 class TestTotalRequestsScheduler(CustomTestCase):

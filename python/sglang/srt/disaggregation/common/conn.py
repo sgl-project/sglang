@@ -184,9 +184,9 @@ class CommonKVManager(BaseKVManager):
         )
         # Elastic EP needs an exact room-to-rank handshake: cached topology
         # cannot safely span a scale transition.
+        self.bootstrap_max_dp_size = parallel.max_ep_size or parallel.dp_size
         self.dynamic_dp_size = bool(
-            get_parallel().max_ep_size
-            and get_parallel().max_ep_size > get_parallel().dp_size
+            parallel.max_ep_size and parallel.max_ep_size > parallel.dp_size
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
@@ -718,6 +718,7 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "dynamic_dp_size": self.dynamic_dp_size,
+            "max_dp_size": self.bootstrap_max_dp_size,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1099,13 +1100,14 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
-            if (
-                self.kv_mgr.dynamic_dp_size
-                or get_parallel().load_balance_method != "follow_bootstrap_room"
+        if not req_has_disagg_prefill_dp_rank:
+            if self.kv_mgr.dynamic_dp_size:
+                self._register_prefill_dp_rank()
+            elif get_parallel().dp_size > 1 and (
+                get_parallel().load_balance_method != "follow_bootstrap_room"
             ):
                 self._register_prefill_dp_rank()
-            elif (
+            elif get_parallel().dp_size > 1 and (
                 self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
@@ -1552,6 +1554,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.attn_tp_size = None
         self.attn_cp_size = None
         self.dp_size = None
+        self.max_dp_size: Optional[int] = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
@@ -1625,6 +1628,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        max_dp_size = data.get("max_dp_size")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -1635,6 +1639,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.dp_size is None:
             self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
+
+        if self.max_dp_size is None and max_dp_size is not None:
+            self.max_dp_size = int(max_dp_size)
 
         if self.pp_size is None:
             self.pp_size = pp_size
@@ -1761,6 +1768,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             return web.Response(text="dp_size must be positive", status=400)
 
         async with self.lock:
+            if self.max_dp_size is None:
+                return web.Response(
+                    text="Bootstrap maximum DP size is not registered", status=400
+                )
+            if dp_size > self.max_dp_size:
+                return web.Response(
+                    text=(
+                        f"Cannot grow bootstrap DP size beyond configured maximum "
+                        f"{self.max_dp_size}"
+                    ),
+                    status=400,
+                )
             if self.dp_size is not None and dp_size < self.dp_size:
                 return web.Response(
                     text=f"Cannot shrink bootstrap DP size from {self.dp_size} to {dp_size}",
