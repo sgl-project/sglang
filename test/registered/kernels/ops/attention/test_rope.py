@@ -5,7 +5,7 @@ import torch
 import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device, is_hip, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -13,7 +13,11 @@ register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=64, suite="jit-kernel-unit-test-amd")
 
-DEVICE = "cuda"
+try:
+    DEVICE = get_device()
+except RuntimeError:
+    DEVICE = None
+
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 131072  # common seq length
 ROPE_BASE = 10000.0
@@ -130,9 +134,9 @@ def reference_rope(
     is_neox: bool,
 ) -> None:
     # NVIDIA uses flashinfer (the reference); flashinfer is CUDA-only, so on
-    # ROCm fall back to the torch reference (matches flashinfer's cos/sin-cache
+    # ROCm and XPU fall back to the torch reference (matches flashinfer's cos/sin-cache
     # application semantics).
-    if is_hip():
+    if is_hip() or is_xpu():
         torch_impl_rope(q, k, cos_sin_cache, positions, is_neox)
     else:
         flashinfer_rope(q, k, cos_sin_cache, positions, is_neox)
@@ -192,6 +196,9 @@ def test_rope(
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     """Ensure both int32 and int64 position tensors work correctly."""
+    if DEVICE is None:
+        pytest.skip("No CUDA or XPU device available")
+
     batch_size, num_qo_heads, num_kv_heads, rope_dim = 16384, 16, 2, 128
     is_neox = True
 
