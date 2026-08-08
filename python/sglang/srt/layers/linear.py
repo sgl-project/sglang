@@ -1032,6 +1032,29 @@ class QKVParallelLinear(ColumnParallelLinear):
         }
         return shard_size_mapping.get(loaded_shard_id)
 
+    def _is_tp_interleaved_qkv_layout(self) -> bool:
+        # When the model has asymmetric K/V heads (head_size != v_head_size)
+        # AND per-rank merged-QKV output is not divisible by the FP8 block_n,
+        # the checkpoint can't store fp8 scales in the natural flat
+        # [Q | K | V] layout: each rank's K (or V) crosses a block boundary,
+        # so a flat scale tensor would either need to encode mid-block
+        # transitions or be misaligned. Some checkpoints (e.g. MiMo-V2.5-Pro
+        # at TP=8 with head_size=192, v_head_size=128, block_n=128) work
+        # around this by storing both qkv_proj.weight and
+        # qkv_proj.weight_scale_inv in TP-rank-INTERLEAVED layout: each
+        # rank's contiguous Q | K | V slab is laid out back-to-back, and
+        # each rank's scale is padded up to a multiple of block_n.
+        try:
+            block_n = self.quant_method.quant_config.weight_block_size[0]
+        except Exception:
+            return False
+        per_rank_size = (
+            self.total_num_heads * self.head_size
+            + self.total_num_kv_heads * self.head_size
+            + self.total_num_kv_heads * self.v_head_size
+        ) // self.tp_size
+        return per_rank_size % block_n != 0
+
     def _load_fused_module_from_checkpoint(
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
@@ -1044,6 +1067,26 @@ class QKVParallelLinear(ColumnParallelLinear):
         An example of a model with these fused layers:
         https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
         """
+        # If the per-rank output is not block-aligned (asymmetric K/V where
+        # head_size and v_head_size differ enough to break alignment), the
+        # checkpoint stores the qkv_proj weight in TP-rank-INTERLEAVED layout
+        # rather than flat [Q | K | V]. Detect and copy the rank's slab.
+        if self._is_tp_interleaved_qkv_layout():
+            per_rank_size = (
+                self.total_num_heads * self.head_size
+                + self.total_num_kv_heads * self.head_size
+                + self.total_num_kv_heads * self.v_head_size
+            ) // self.tp_size
+            rank_slice = loaded_weight.narrow(
+                param.output_dim, self.tp_rank * per_rank_size, per_rank_size
+            )
+            assert rank_slice.shape == param.data.shape, (
+                f"interleaved qkv weight shape mismatch: "
+                f"{rank_slice.shape} vs {param.data.shape}"
+            )
+            param.data.copy_(rank_slice)
+            return
+
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
             ("q", 0, self.total_num_heads * self.head_size),
@@ -1081,6 +1124,29 @@ class QKVParallelLinear(ColumnParallelLinear):
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
         block_n, _ = self.quant_method.quant_config.weight_block_size
+        # Mirror the weight loader: when the per-rank output is not
+        # block-aligned, the scale is stored in TP-rank-INTERLEAVED layout
+        # with each rank's chunk padded up to a multiple of block_n. The
+        # flat-layout total predicts (Q + K + V) // block_n rows; the
+        # checkpoint actually has tp_size * ceil(per_rank/block_n) rows.
+        # That difference is the smoking gun.
+        flat_total = (
+            self.total_num_heads * self.head_size
+            + self.total_num_kv_heads * self.head_size
+            + self.total_num_kv_heads * self.v_head_size
+        ) // block_n
+        if loaded_weight.shape[param.output_dim] != flat_total:
+            per_rank_blocks = loaded_weight.shape[param.output_dim] // self.tp_size
+            rank_slice = loaded_weight.narrow(
+                param.output_dim, self.tp_rank * per_rank_blocks, per_rank_blocks
+            )
+            assert rank_slice.shape == param.data.shape, (
+                f"interleaved qkv scale shape mismatch: "
+                f"{rank_slice.shape} vs {param.data.shape}"
+            )
+            param.data.copy_(rank_slice)
+            return
+
         q_size = self.total_num_heads * self.head_size // block_n
         k_size = self.total_num_kv_heads * self.head_size // block_n
         v_size = self.total_num_kv_heads * self.v_head_size // block_n
