@@ -868,15 +868,20 @@ def commit_mamba_states_after_verify(
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
+            fused_verify_commit_indices,
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
+        state_batch_indices, last_correct_step_indices, mamba_steps_to_track = (
+            fused_verify_commit_indices(
+                accept_index=accept_index,
+                accept_lens=accept_lens,
+                seq_lens=batch.seq_lens,
+                req_pool_indices=batch.req_pool_indices,
+                mamba_map=req_pool.req_index_to_mamba_index_mapping,
+                draft_token_num=draft_token_num,
+                track_interval=get_exec().mamba.mamba_track_interval,
+            )
         )
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
@@ -884,7 +889,9 @@ def commit_mamba_states_after_verify(
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
+            mamba_steps_to_track=(
+                mamba_steps_to_track if batch.mamba_track_indices is not None else None
+            ),
             null_block_id=-1,
         )
         return
