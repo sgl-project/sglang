@@ -527,8 +527,8 @@ class BeamCoordinator:
 
     def retire_aborted_beam_groups(self, reqs_to_abort: List[Req]) -> None:
         """Leader aborted outside the commit path (retract_decode OOM): the
-        member rows were already freed there while the leader's kv info was
-        alive, so the group only leaves the live set here."""
+        member rows were already freed there, while the leader's kv info still
+        carried the group's lockstep allocated length."""
         for req in reqs_to_abort:
             group = req.beam_group
             if group is None or group.retired:
@@ -548,6 +548,10 @@ class BeamCoordinator:
         gate accurate and drops overshoot selections staged after the
         terminal commit."""
         if not group.retired:
+            # Staged orphans are referenced by no row, so the retract-abort
+            # path's direct fork.free_member_rows cannot see them; drain here
+            # so every exit covers. No-op on the commit paths, already drained.
+            self._reclaim_orphans(group)
             group.retired = True
             group._pending_steps.clear()
             self._num_live_groups -= 1

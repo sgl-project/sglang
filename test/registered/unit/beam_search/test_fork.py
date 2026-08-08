@@ -168,6 +168,83 @@ class TestFreeMemberRows(CustomTestCase):
         self.assertEqual(sorted(pool.freed), [1, 2])
 
 
+class TestRetireReclaimsStagedOrphans(CustomTestCase):
+    """The retract-abort path releases member rows through free_member_rows
+    directly, which only sees slots some row still names. Orphans staged by the
+    launch half are named by none, so _retire_group is their last chance."""
+
+    @staticmethod
+    def _make_coordinator(allocator):
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        return BeamCoordinator(
+            server_args=None,
+            model_config=None,
+            spec_algorithm=None,
+            enable_overlap=True,
+            dllm_enabled=False,
+            max_req_len=0,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=None,
+            future_map=None,
+        )
+
+    def test_retract_abort_does_not_leak_staged_orphans(self):
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+        # Row 1 is nobody's parent, so its window [5, 8) -- slots 17, 18, 19 --
+        # is orphaned by the remap the launch half already applied.
+        old_map, new_map = remap_kv_mapping(
+            req_to_token,
+            rows,
+            torch.tensor([0, 2, 2], dtype=torch.int64),
+            prefix_len=5,
+            seq_len=8,
+        )
+        orphans = sorted(collect_orphan_slots(old_map, new_map).tolist())
+        self.assertEqual(orphans, [17, 18, 19])
+
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = SimpleNamespace(
+            leader=SimpleNamespace(
+                kv=SimpleNamespace(kv_allocated_len=8), kv_committed_len=8
+            ),
+            prompt_len=5,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=rows,
+            pending_orphans=[(7, old_map, new_map)],
+            slots_freed=0,
+            retired=False,
+            _pending_steps=[],
+        )
+
+        # retract_decode's sequence: member rows released without the
+        # coordinator, then the scheduler retires the group.
+        free_member_rows(group, pool, allocator)
+        by_rows = sorted(allocator.freed)
+        self.assertEqual(by_rows, [5, 6, 7, 29, 30, 31])
+        # The orphans are disjoint from what the rows still name, which is
+        # exactly why free_member_rows alone leaks them.
+        self.assertFalse(set(orphans) & set(by_rows))
+
+        coordinator = self._make_coordinator(allocator)
+        coordinator._num_live_groups = 1
+        coordinator._retire_group(group)
+
+        self.assertEqual(sorted(allocator.freed[len(by_rows) :]), orphans)
+        self.assertEqual(group.slots_freed, len(orphans))
+        self.assertEqual(group.pending_orphans, [])
+        self.assertEqual(coordinator._num_live_groups, 0)
+
+        # Retiring twice must not double-free or double-decrement.
+        coordinator._retire_group(group)
+        self.assertEqual(len(allocator.freed), len(by_rows) + len(orphans))
+        self.assertEqual(coordinator._num_live_groups, 0)
+
+
 class TestNeutralParams(CustomTestCase):
     def test_neutral_params(self):
         from sglang.srt.sampling.sampling_params import SamplingParams

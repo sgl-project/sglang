@@ -2794,7 +2794,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # carries the group's lockstep allocated length). The
                 # scheduler retires the group via retire_aborted_beam_groups.
                 req.to_finish = FINISH_ABORT(
-                    "Beam search group aborted: KV cache pool is full.",
+                    "Beam search group aborted: KV cache pool is full. Beam "
+                    "groups cannot be retracted, so they are aborted instead "
+                    "of being requeued.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
                 reqs_to_abort.append(req)
