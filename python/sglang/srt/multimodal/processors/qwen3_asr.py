@@ -75,6 +75,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         audio_data=None,
         input_text=None,
         request_obj=None,
+        audio_encoder_window_config=None,
         **kwargs,
     ):
         if not audio_data:
@@ -93,7 +94,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output,
             self.mm_tokens,
-            audio_encoder_window_config=kwargs.get("audio_encoder_window_config"),
+            audio_encoder_window_config=audio_encoder_window_config,
         )
 
         mrope_positions, mrope_position_delta = self.compute_mrope_positions(

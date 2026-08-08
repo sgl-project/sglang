@@ -1,7 +1,6 @@
 """Text reconciliation for realtime ASR decoder continuation."""
 
 import unicodedata
-from dataclasses import dataclass
 from typing import List, Optional
 
 import msgspec
@@ -13,6 +12,9 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
 )
 
 _MAX_CHARS_PER_TOKEN = 64
+MIN_PREFIX_ECHO_WORDS = 24
+_THAI_CODEPOINT_START = 0x0E00
+_THAI_CODEPOINT_END = 0x0E7F
 
 
 class DecoderSuffixUpdate(msgspec.Struct, frozen=True):
@@ -23,8 +25,7 @@ class DecoderSuffixUpdate(msgspec.Struct, frozen=True):
     pending_suffix: Optional[str]
 
 
-@dataclass
-class DecoderSuffixState:
+class DecoderSuffixState(msgspec.Struct):
     """Reconcile suffix-only decodes after encoder windowing starts."""
 
     emitted_text: str
@@ -32,7 +33,7 @@ class DecoderSuffixState:
 
     @property
     def latest_text(self) -> str:
-        return _join_text(self.emitted_text, self.pending_suffix)
+        return join_text(self.emitted_text, self.pending_suffix)
 
     def get_bounded_prefix(self, tokenizer, max_tokens: int) -> str:
         """Return recent emitted context for the next decoder request."""
@@ -50,11 +51,11 @@ class DecoderSuffixState:
         self, decoded_suffix: str, *, is_last: bool, holdback_words: int
     ) -> DecoderSuffixUpdate:
         """Compute an update without mutating state."""
-        if self.emitted_text and (not self.pending_suffix or is_last):
-            decoded_suffix, _ = _trim_word_overlap(self.emitted_text, decoded_suffix)
         previous_suffix = self.pending_suffix
 
         if is_last:
+            # Without audio alignment, a matching emitted prefix can be a real
+            # repetition. Keep the final decode instead of guessing it is echo.
             return DecoderSuffixUpdate(
                 delta=decoded_suffix or previous_suffix,
                 pending_suffix="",
@@ -88,12 +89,11 @@ class DecoderSuffixState:
             pending_suffix=" ".join(decoded_words[emit_count:]),
         )
 
-    def apply(self, update: DecoderSuffixUpdate, *, is_last: bool) -> str:
+    def apply(self, update: DecoderSuffixUpdate) -> None:
         if update.pending_suffix is None:
-            return ""
-        delta = self._append_emitted_text(update.delta)
-        self.pending_suffix = "" if is_last else update.pending_suffix
-        return delta
+            return
+        self._append_emitted_text(update.delta)
+        self.pending_suffix = update.pending_suffix
 
     def flush(self) -> str:
         delta = self._append_emitted_text(self.pending_suffix)
@@ -106,9 +106,9 @@ class DecoderSuffixState:
         decoder_prefix: str,
         *,
         trim_short_prefix: bool = False,
-        minimum_prefix_words: int = 24,
-    ) -> str:
-        """Remove an exact replay of text supplied as decoder context."""
+        minimum_prefix_words: int = MIN_PREFIX_ECHO_WORDS,
+    ) -> tuple[str, bool]:
+        """Remove an exact replay of supplied context and report a match."""
         decoded_words = decoded_suffix.split()
         prefix_words = decoder_prefix.split()
         if (
@@ -116,16 +116,16 @@ class DecoderSuffixState:
             or (not trim_short_prefix and len(prefix_words) < minimum_prefix_words)
             or len(decoded_words) < len(prefix_words)
         ):
-            return decoded_suffix
+            return decoded_suffix, False
         if _normalized_word_prefix_len(prefix_words, decoded_words) != len(
             prefix_words
         ):
-            return decoded_suffix
-        return " ".join(decoded_words[len(prefix_words) :])
+            return decoded_suffix, False
+        return " ".join(decoded_words[len(prefix_words) :]), True
 
     def _append_emitted_text(self, delta: str) -> str:
         if delta:
-            self.emitted_text = _join_text(self.emitted_text, delta)
+            self.emitted_text = join_text(self.emitted_text, delta)
         return delta
 
 
@@ -156,15 +156,15 @@ def has_no_word_boundaries(text: str) -> bool:
     return (
         bool(text)
         and not any(char.isspace() for char in text)
-        and any(is_cjk_char(char) or 0x0E00 <= ord(char) <= 0x0E7F for char in text)
+        and any(
+            is_cjk_char(char)
+            or _THAI_CODEPOINT_START <= ord(char) <= _THAI_CODEPOINT_END
+            for char in text
+        )
     )
 
 
-def join_handoff_text(pending_text: str, decoded_suffix: str) -> str:
-    return _join_text(pending_text, decoded_suffix)
-
-
-def _join_text(left: str, right: str) -> str:
+def join_text(left: str, right: str) -> str:
     if not left or not right:
         return left or right
     separator = " " if needs_space(left, right) else ""
@@ -197,25 +197,3 @@ def _normalized_word_prefix_len(left_words: List[str], right_words: List[str]) -
             break
         count += 1
     return count
-
-
-def _trim_word_overlap(emitted_text: str, decoded_text: str) -> tuple[str, bool]:
-    """Trim only a normalized decoded prefix matching the emitted tail."""
-    decoded_words = decoded_text.split()
-    if not decoded_words:
-        return decoded_text, False
-    emitted_tail = emitted_text.rsplit(maxsplit=len(decoded_words))[
-        -len(decoded_words) :
-    ]
-    if not emitted_tail:
-        return decoded_text, False
-    emitted_tail_norm = [_normalize_overlap_word(word) for word in emitted_tail]
-    decoded_norm = [_normalize_overlap_word(word) for word in decoded_words]
-    max_overlap = min(len(emitted_tail_norm), len(decoded_norm))
-
-    for overlap in range(max_overlap, 0, -1):
-        if emitted_tail_norm[-overlap:] == decoded_norm[:overlap] and any(
-            emitted_tail_norm[-overlap:]
-        ):
-            return " ".join(decoded_words[overlap:]), True
-    return decoded_text, False

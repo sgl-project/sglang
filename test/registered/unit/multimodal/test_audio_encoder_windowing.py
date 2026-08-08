@@ -216,6 +216,18 @@ class TestAudioEncoderWindowing(CustomTestCase):
             )
             self.assertEqual(exact.hash, with_tail.hash)
 
+    def test_rejects_nondeterministic_feature_extraction(self):
+        feature_extractor = _FeatureExtractor()
+        feature_extractor.dither = 0.1
+
+        with self.assertRaisesRegex(ValueError, "deterministic feature extraction"):
+            resolve_audio_encoder_window_config(
+                AudioEncoderWindowSpec(window_frames=8, alignment_frames=4),
+                feature_extractor=feature_extractor,
+                output_length_fn=lambda lengths: lengths,
+                model_sample_rate=16,
+            )
+
     def test_qwen_capability_uses_base_builder_and_audio_config(self):
         feature_extractor = _FeatureExtractor()
         processor = Qwen3ASRMultimodalProcessor.__new__(Qwen3ASRMultimodalProcessor)
@@ -250,6 +262,21 @@ class TestAudioEncoderWindowing(CustomTestCase):
         self.assertEqual(int((input_ids == 99).sum()), 18)
         self.assertFalse(feature_extractor.last_kwargs["do_normalize"])
         self.assertEqual(feature_extractor.last_kwargs["padding"], "longest")
+
+    def test_window_builder_does_not_hide_internal_errors(self):
+        processor = Qwen3ASRMultimodalProcessor.__new__(Qwen3ASRMultimodalProcessor)
+
+        def fail(*args):
+            raise ValueError("broken window geometry")
+
+        processor.build_audio_encoder_window_items = fail
+
+        with self.assertRaisesRegex(ValueError, "broken window geometry"):
+            processor.process_and_combine_mm_data(
+                BaseMultiModalProcessorOutput(input_text="audio", audios=[np.zeros(4)]),
+                MultimodalSpecialTokens(audio_token_id=99),
+                audio_encoder_window_config=self.config,
+            )
 
 
 if __name__ == "__main__":

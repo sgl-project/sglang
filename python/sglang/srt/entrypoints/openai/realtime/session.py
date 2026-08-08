@@ -136,7 +136,6 @@ class RealtimeConnection:
     ) -> None:
         self.websocket = websocket
         self.adapter = adapter
-        self.server_args = server_args
         self.served_model_name = tokenizer_manager.served_model_name
 
         self.session_id = f"sess_{random_uuid()}"
@@ -251,8 +250,7 @@ class RealtimeConnection:
     async def _on_session_update(self, event: SessionUpdateEvent) -> None:
         cfg = event.session
 
-        # Realtime session updates are patches. Pydantic preserves which nested
-        # fields were sent, so omitted values must not reset earlier settings.
+        # Session updates are patches; omitted nested fields retain their values.
         session_audio = cfg.audio if "audio" in cfg.model_fields_set else None
         audio = (
             session_audio.input
@@ -410,16 +408,20 @@ class RealtimeConnection:
         target_samples = math.ceil(
             src_samples * self.model_sample_rate / self.config.input_sample_rate
         )
+        max_item_bytes = self.asr_processor.max_item_bytes(
+            self.asr_state, self.config.language
+        )
         if (
             self.asr_state.audio.received_bytes
             + target_samples * PCM_SAMPLE_WIDTH_BYTES
-            > self.asr_processor.max_buffer_bytes
+            > max_item_bytes
         ):
             # Close 1009 ("message too big") so clients can distinguish
             # session-resource exhaustion from a normal close.
             await self._send_error_and_close(
                 "buffer_overflow",
-                f"Accumulated audio exceeded {self.asr_processor.max_buffer_seconds}s; "
+                "Accumulated audio exceeded "
+                f"{max_item_bytes / self.asr_processor.pcm_bytes_per_second:g}s; "
                 f"commit or clear before sending more audio",
                 close_code=1009,
             )
@@ -550,6 +552,7 @@ class RealtimeConnection:
             delta = await self.asr_processor.process(
                 self.asr_state,
                 is_last=is_last,
+                language=self.config.language,
                 sampling_params=self.config.sampling_params,
             )
         except Exception:

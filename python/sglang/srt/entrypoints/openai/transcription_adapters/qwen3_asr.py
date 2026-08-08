@@ -6,6 +6,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionVerboseResponse,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
+    RealtimeEncoderWindowPolicy,
     TranscriptionAdapter,
     register_transcription_adapter,
 )
@@ -36,20 +37,24 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
         return DEFAULT_ASR_PROMPT
 
     @property
-    def realtime_encoder_window_config(self) -> dict:
+    def realtime_encoder_window_policy(self) -> RealtimeEncoderWindowPolicy:
         # Window geometry itself comes from the mm processor.
-        return {
+        return RealtimeEncoderWindowPolicy(
             # Activation threshold: equals the default --asr-max-buffer-seconds,
             # so encoder windowing stays dormant until an operator raises the cap.
-            "min_audio_sec": 60.0,
+            min_audio_sec=60.0,
             # Rolling context once active: 8 encoder-native 8s windows (64s of
             # audio) per request; older history is carried by the prefix.
-            "max_audio_context_windows": 8,
+            max_audio_context_windows=8,
             # Recent-text anchor; A/B showed no accuracy cost vs 512.
-            "decoder_prefix_max_tokens": 192,
+            decoder_prefix_max_tokens=192,
             # Hold one agreed word back to avoid premature sentence ends.
-            "decoder_prefix_holdback_words": 1,
-        }
+            decoder_prefix_holdback_words=1,
+            # Rolling suffix reconciliation is currently validated only for
+            # explicitly English sessions. Unknown and auto-detected languages
+            # keep cumulative semantics.
+            supported_languages=("en",),
+        )
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature

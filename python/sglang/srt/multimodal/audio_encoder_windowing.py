@@ -17,6 +17,10 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
+_FEATURE_OUTPUT_KEY = "input_features"
+_ATTENTION_MASK_OUTPUT_KEY = "attention_mask"
+_ITEM_ATTENTION_MASK_KEY = "feature_attention_mask"
+
 
 class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
     """Window geometry in samples and encoder tokens, resolved once from the
@@ -26,9 +30,6 @@ class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
     window_samples: int
     window_frames: int
     window_tokens: int
-    feature_output_key: str = "input_features"
-    attention_mask_output_key: str = "attention_mask"
-    item_attention_mask_key: str = "feature_attention_mask"
 
 
 class AudioEncoderWindowSpec(msgspec.Struct, frozen=True):
@@ -36,9 +37,6 @@ class AudioEncoderWindowSpec(msgspec.Struct, frozen=True):
 
     window_frames: int
     alignment_frames: int
-    feature_output_key: str = "input_features"
-    attention_mask_output_key: str = "attention_mask"
-    item_attention_mask_key: str = "feature_attention_mask"
 
 
 class _AudioWindowFeatures(msgspec.Struct, frozen=True):
@@ -59,8 +57,8 @@ def _extract_feature_batch(
         return []
 
     audio_inputs = extract_features_fn(windows)
-    processed_features = audio_inputs[config.feature_output_key]
-    processed_masks = audio_inputs[config.attention_mask_output_key]
+    processed_features = audio_inputs[_FEATURE_OUTPUT_KEY]
+    processed_masks = audio_inputs[_ATTENTION_MASK_OUTPUT_KEY]
     token_counts = [
         int(count) for count in output_length_fn(processed_masks.sum(dim=-1))
     ]
@@ -93,25 +91,18 @@ def resolve_audio_encoder_window_config(
         raise ValueError("audio window geometry must be positive")
     if spec.window_frames % spec.alignment_frames:
         raise ValueError("audio window is not encoder-block aligned")
-    if not all(
-        (
-            spec.feature_output_key,
-            spec.attention_mask_output_key,
-            spec.item_attention_mask_key,
-        )
-    ):
-        raise ValueError("audio window tensor keys must be non-empty")
     if int(feature_extractor.sampling_rate) != model_sample_rate:
         raise ValueError("audio windowing and realtime model sample rates differ")
+    # Older Transformers releases do not expose dither; their extractor is
+    # deterministic, which is equivalent to the current default of zero.
+    if float(getattr(feature_extractor, "dither", 0.0)) != 0.0:
+        raise ValueError("audio windowing requires deterministic feature extraction")
 
     return AudioEncoderWindowConfig(
         min_input_samples=int(feature_extractor.n_fft),
         window_samples=spec.window_frames * int(feature_extractor.hop_length),
         window_frames=spec.window_frames,
         window_tokens=int(output_length_fn([spec.window_frames])[0]),
-        feature_output_key=spec.feature_output_key,
-        attention_mask_output_key=spec.attention_mask_output_key,
-        item_attention_mask_key=spec.item_attention_mask_key,
     )
 
 
@@ -176,6 +167,7 @@ def _build_audio_window_items(
     complete_window_count: int,
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Expand one audio placeholder and create feature-backed window items."""
+    # Keep hashing local to avoid an import cycle through schedule_batch.
     from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
 
     input_ids = input_ids.flatten()
@@ -208,9 +200,9 @@ def _build_audio_window_items(
         # tails from sharing a Radix/cache identity with a complete window that
         # has identical zero-padded features but a different effective length.
         item_hash = hash_mm_item(
-            hash_feature([window.feature, window.attention_mask]),
-            Modality.AUDIO,
-            [(offset_start, offset_end)],
+            feature_hash=hash_feature([window.feature, window.attention_mask]),
+            modality=Modality.AUDIO,
+            offsets=[(offset_start, offset_end)],
         )
         # The mutable tail changes every request and must not evict reusable
         # complete-window embeddings, even though its Radix identity is valid.
@@ -229,7 +221,7 @@ def _build_audio_window_items(
                     str(window.attention_mask.dtype),
                 ),
                 model_specific_data={
-                    config.item_attention_mask_key: window.attention_mask,
+                    _ITEM_ATTENTION_MASK_KEY: window.attention_mask,
                 },
             )
         )

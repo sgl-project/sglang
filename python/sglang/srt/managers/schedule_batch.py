@@ -375,9 +375,9 @@ class MultimodalDataItem:
         if self.pad_value is not None:
             return
 
-        from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
+        from sglang.srt.managers.mm_utils import hash_feature
 
-        # A preset hash must survive SGLANG_MM_SKIP_COMPUTE_HASH unchanged.
+        # Automatic-hash disabling must not replace a producer-supplied identity.
         if self.hash is None and envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
             import uuid
 
@@ -389,9 +389,7 @@ class MultimodalDataItem:
                 hashed_feature = self.feature
             else:
                 hashed_feature = self.precomputed_embeddings
-            self.hash = hash_mm_item(
-                hash_feature(hashed_feature), self.modality, self.offsets
-            )
+            self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = _compute_pad_value(self.hash)
 

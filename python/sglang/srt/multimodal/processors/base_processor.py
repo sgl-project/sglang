@@ -1552,18 +1552,12 @@ class BaseMultimodalProcessor(ABC):
             Tuple of (list of mm_items, input_ids)
         """
         if audio_encoder_window_config is not None:
-            try:
-                mm_items, input_ids = self.build_audio_encoder_window_items(
-                    base_output,
-                    mm_tokens,
-                    audio_encoder_window_config,
-                )
-                return mm_items, input_ids, {}
-            except (KeyError, TypeError, ValueError):
-                logger.warning(
-                    "Audio encoder windowing failed; using monolithic processing",
-                    exc_info=True,
-                )
+            mm_items, input_ids = self.build_audio_encoder_window_items(
+                base_output,
+                mm_tokens,
+                audio_encoder_window_config,
+            )
+            return mm_items, input_ids, {}
 
         processor_override = processor
         processor, tokenizer = self._resolve_processor(processor)

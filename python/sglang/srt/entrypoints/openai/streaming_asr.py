@@ -5,7 +5,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import msgspec
 import numpy as np
@@ -16,11 +16,18 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.mm_utils import hash_feature
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from sglang.srt.multimodal.audio_encoder_windowing import (
+        AudioEncoderWindowConfig,
+    )
 
+# Cumulative decodes can jitter only in whitespace before punctuation. Remove
+# that formatting noise before comparing successive transcript prefixes.
 _PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 
@@ -29,6 +36,11 @@ class GeneratedTranscript(msgspec.Struct, frozen=True):
 
     text: str
     finish_reason: Optional[str]
+
+
+def hash_audio_content(audio_data: Union[bytes, np.ndarray]) -> str:
+    """Return the per-audio hex identity accepted by GenerateReqInput."""
+    return f"{hash_feature(audio_data):016x}"
 
 
 @dataclass
@@ -141,7 +153,11 @@ _NO_SPACE_AFTER = frozenset("([{（【《「『")
 
 
 def is_cjk_char(char: str) -> bool:
-    """Return whether a character belongs to a no-space CJK range."""
+    """Whether a character belongs to a CJK context that takes no added space.
+
+    This includes CJK punctuation, Japanese kana, ideographs, and fullwidth
+    forms while excluding non-ASCII scripts that remain whitespace-delimited.
+    """
     cp = ord(char)
     return (
         0x3000 <= cp <= 0x303F
@@ -178,7 +194,8 @@ async def generate_asr_transcript(
     prompt: str,
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+    audio_encoder_window_config: Optional["AudioEncoderWindowConfig"] = None,
+    mm_hashes: Optional[List[str]] = None,
 ) -> Optional[GeneratedTranscript]:
     """Run one stateless backend request and return text with its stop reason."""
     chunk_request = GenerateReqInput(
@@ -188,6 +205,7 @@ async def generate_asr_transcript(
         stream=False,
         modalities=["audio"],
         routing_key=routing_key,
+        mm_hashes=mm_hashes,
     )
 
     try:
@@ -195,7 +213,7 @@ async def generate_asr_transcript(
         async for ret in tokenizer_manager.generate_request(
             chunk_request,
             raw_request,
-            internal_mm_processor_kwargs=mm_processor_kwargs,
+            audio_encoder_window_config=audio_encoder_window_config,
         ):
             break
     except asyncio.CancelledError:
@@ -217,29 +235,6 @@ async def generate_asr_transcript(
     )
 
 
-async def generate_asr_text(
-    tokenizer_manager: TokenizerManager,
-    adapter: TranscriptionAdapter,
-    audio_data: Union[bytes, np.ndarray],
-    sampling_params: Dict[str, Any],
-    prompt: str,
-    raw_request: Optional[Request] = None,
-    routing_key: Optional[str] = None,
-    mm_processor_kwargs: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    result = await generate_asr_transcript(
-        tokenizer_manager=tokenizer_manager,
-        adapter=adapter,
-        audio_data=audio_data,
-        sampling_params=sampling_params,
-        prompt=prompt,
-        raw_request=raw_request,
-        routing_key=routing_key,
-        mm_processor_kwargs=mm_processor_kwargs,
-    )
-    return None if result is None else result.text
-
-
 async def process_asr_chunk(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
@@ -251,7 +246,7 @@ async def process_asr_chunk(
     routing_key: Optional[str] = None,
 ) -> str:
     """Run and reconcile one cumulative chunk for HTTP streaming ASR."""
-    text = await generate_asr_text(
+    result = await generate_asr_transcript(
         tokenizer_manager=tokenizer_manager,
         adapter=adapter,
         audio_data=audio_data,
@@ -259,9 +254,11 @@ async def process_asr_chunk(
         prompt=adapter.prompt_template + state.get_prefix_text(),
         raw_request=raw_request,
         routing_key=routing_key,
+        mm_hashes=[hash_audio_content(audio_data)],
     )
-    if text is None:
+    if result is None:
         return ""
+    text = result.text
 
     if is_last:
         state.full_transcript = text

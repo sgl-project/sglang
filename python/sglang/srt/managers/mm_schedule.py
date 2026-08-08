@@ -1,7 +1,7 @@
 """Multimodal embedding scheduling and cache coordination."""
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -280,18 +280,21 @@ class PerImageRequestInfo:
 
 
 def _uses_item_embedding_policy(item: MultimodalDataItem) -> bool:
+    """Whether the producer opted into per-item cache or batching controls."""
     return not item.use_embedding_cache or item.encoder_batch_key is not None
 
 
-def _batch_encode_per_image_misses(
-    data_embedding_func: DataEmbeddingFunc,
-    per_image_requests: List[PerImageRequestInfo],
-    device: torch.device,
-) -> Dict[int, torch.Tensor]:
-    """Resolve per-item embeddings, batching producer-compatible cache misses."""
-    unique_items: Dict[int, Tuple[MultimodalDataItem, int, bool]] = {}
-    hash_to_embedding: Dict[int, torch.Tensor] = {}
+class _EmbeddingItemInfo(NamedTuple):
+    item: MultimodalDataItem
+    token_count: int
+    should_cache: bool
 
+
+def _collect_unique_embedding_items(
+    per_image_requests: List[PerImageRequestInfo],
+) -> Dict[int, _EmbeddingItemInfo]:
+    """Find chunk-overlapping items and merge duplicate content hashes."""
+    unique_items: Dict[int, _EmbeddingItemInfo] = {}
     for req_info in per_image_requests:
         chunk_start = req_info.extend_prefix_len
         chunk_end = chunk_start + req_info.extend_seq_len  # exclusive
@@ -310,10 +313,10 @@ def _batch_encode_per_image_misses(
             if (
                 previous is not None
                 and (
-                    _uses_item_embedding_policy(previous[0])
+                    _uses_item_embedding_policy(previous.item)
                     or _uses_item_embedding_policy(item)
                 )
-                and (previous[0].encoder_batch_key, previous[1])
+                and (previous.item.encoder_batch_key, previous.token_count)
                 != (item.encoder_batch_key, token_count)
             ):
                 raise RuntimeError(
@@ -321,74 +324,74 @@ def _batch_encode_per_image_misses(
                     "encoder_batch_key and token count"
                 )
             if previous is not None:
-                unique_items[item.hash] = (
-                    previous[0],
-                    token_count,
-                    previous[2] or item.use_embedding_cache,
+                unique_items[item.hash] = _EmbeddingItemInfo(
+                    item=previous.item,
+                    token_count=token_count,
+                    should_cache=previous.should_cache or item.use_embedding_cache,
                 )
                 if _uses_item_embedding_policy(item):
                     _acknowledge_deferred_cuda_ipc_cache_hits([item])
                 continue
-            unique_items[item.hash] = (item, token_count, item.use_embedding_cache)
+            unique_items[item.hash] = _EmbeddingItemInfo(
+                item=item,
+                token_count=token_count,
+                should_cache=item.use_embedding_cache,
+            )
+    return unique_items
 
-    unique_misses: Dict[int, Tuple[MultimodalDataItem, int, bool]] = {}
-    for item_hash, (item, token_count, should_cache) in unique_items.items():
-        cached = embedding_cache.get_single(item_hash) if should_cache else None
-        if cached is not None and item.encoder_batch_key is not None:
+
+def _resolve_cached_embeddings(
+    unique_items: Dict[int, _EmbeddingItemInfo],
+) -> tuple[Dict[int, torch.Tensor], Dict[int, _EmbeddingItemInfo]]:
+    """Return valid cache hits and the items that still require encoding."""
+    hash_to_embedding: Dict[int, torch.Tensor] = {}
+    unique_misses: Dict[int, _EmbeddingItemInfo] = {}
+
+    for item_hash, info in unique_items.items():
+        cached = embedding_cache.get_single(item_hash) if info.should_cache else None
+        if cached is not None and info.item.encoder_batch_key is not None:
             cached_embedding = cached.embedding.reshape(-1, cached.embedding.shape[-1])
-            if cached_embedding.shape[0] != token_count:
+            if cached_embedding.shape[0] != info.token_count:
                 embedding_cache.free(item_hash, None)
                 cached = None
             else:
                 cached = EmbeddingResult(embedding=cached_embedding)
         if cached is not None:
             hash_to_embedding[item_hash] = cached.embedding
-            if _uses_item_embedding_policy(item):
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+            if _uses_item_embedding_policy(info.item):
+                _acknowledge_deferred_cuda_ipc_cache_hits([info.item])
         else:
-            unique_misses[item_hash] = (item, token_count, should_cache)
+            unique_misses[item_hash] = info
+    return hash_to_embedding, unique_misses
 
-    miss_groups: Dict[
-        Optional[tuple], Dict[int, Tuple[MultimodalDataItem, int, bool]]
-    ] = {}
-    for item_hash, miss in unique_misses.items():
-        miss_groups.setdefault(miss[0].encoder_batch_key, {})[item_hash] = miss
 
-    # Items without a batch key retain the legacy single encoder call. Opt-in
-    # producers can split incompatible shapes into explicit groups.
-    for batch_key, compatible_misses in miss_groups.items():
-        ordered_hashes = list(compatible_misses)
-        miss_items = [compatible_misses[item_hash][0] for item_hash in ordered_hashes]
-        token_counts = [compatible_misses[item_hash][1] for item_hash in ordered_hashes]
+def _encode_embedding_miss_group(
+    data_embedding_func: DataEmbeddingFunc,
+    compatible_misses: Dict[int, _EmbeddingItemInfo],
+    device: torch.device,
+    *,
+    batch_key: Optional[tuple],
+) -> Dict[int, torch.Tensor]:
+    """Encode one producer-compatible miss group and populate eligible cache entries."""
+    ordered_hashes = list(compatible_misses)
+    miss_items = [compatible_misses[item_hash].item for item_hash in ordered_hashes]
+    token_counts = [
+        compatible_misses[item_hash].token_count for item_hash in ordered_hashes
+    ]
 
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(miss_items, device)
-        all_miss_embedding = data_embedding_func(miss_items)
+    if not _can_skip_pre_embed_feature_move(data_embedding_func):
+        _move_items_to_device(miss_items, device)
+    all_miss_embedding = data_embedding_func(miss_items)
 
-        if isinstance(all_miss_embedding, list):
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                embedding.reshape(-1, embedding.shape[-1])
-                for embedding in all_miss_embedding
-            ]
-            clone_cached_splits = False
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            if batch_key is not None and all_miss_embedding.shape[0] != sum(
-                token_counts
-            ):
-                raise RuntimeError(
-                    f"item embedding batch produced {all_miss_embedding.shape[0]} "
-                    f"tokens, expected {sum(token_counts)}"
-                )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-            clone_cached_splits = batch_key is not None and len(miss_items) > 1
-
+    if isinstance(all_miss_embedding, list):
+        assert len(all_miss_embedding) == len(miss_items), (
+            f"per-item embedding count {len(all_miss_embedding)} != "
+            f"cache-miss item count {len(miss_items)}"
+        )
+        split_embeddings = [
+            embedding.reshape(-1, embedding.shape[-1])
+            for embedding in all_miss_embedding
+        ]
         if batch_key is not None:
             for item_hash, embedding, token_count in zip(
                 ordered_hashes, split_embeddings, token_counts
@@ -398,13 +401,53 @@ def _batch_encode_per_image_misses(
                         f"item {item_hash} produced {embedding.shape[0]} "
                         f"embedding tokens, expected {token_count}"
                     )
+        clone_cached_splits = False
+    else:
+        all_miss_embedding = all_miss_embedding.reshape(
+            -1, all_miss_embedding.shape[-1]
+        )
+        if batch_key is not None and all_miss_embedding.shape[0] != sum(token_counts):
+            raise RuntimeError(
+                f"item embedding batch produced {all_miss_embedding.shape[0]} "
+                f"tokens, expected {sum(token_counts)}"
+            )
+        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        clone_cached_splits = batch_key is not None and len(miss_items) > 1
 
-        for item_hash, embedding in zip(ordered_hashes, split_embeddings):
-            if compatible_misses[item_hash][2]:
-                if clone_cached_splits:
-                    embedding = embedding.clone()
-                embedding_cache.set(item_hash, EmbeddingResult(embedding=embedding))
-            hash_to_embedding[item_hash] = embedding
+    encoded = {}
+    for item_hash, embedding in zip(ordered_hashes, split_embeddings):
+        if compatible_misses[item_hash].should_cache:
+            if clone_cached_splits:
+                embedding = embedding.clone()
+            embedding_cache.set(item_hash, EmbeddingResult(embedding=embedding))
+        encoded[item_hash] = embedding
+    return encoded
+
+
+def _batch_encode_per_image_misses(
+    data_embedding_func: DataEmbeddingFunc,
+    per_image_requests: List[PerImageRequestInfo],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    """Resolve per-item embeddings, batching producer-compatible cache misses."""
+    unique_items = _collect_unique_embedding_items(per_image_requests)
+    hash_to_embedding, unique_misses = _resolve_cached_embeddings(unique_items)
+
+    miss_groups: Dict[Optional[tuple], Dict[int, _EmbeddingItemInfo]] = {}
+    for item_hash, miss in unique_misses.items():
+        miss_groups.setdefault(miss.item.encoder_batch_key, {})[item_hash] = miss
+
+    # Items without a batch key retain the default single encoder call. Opt-in
+    # producers can split incompatible shapes into explicit groups.
+    for batch_key, compatible_misses in miss_groups.items():
+        hash_to_embedding.update(
+            _encode_embedding_miss_group(
+                data_embedding_func,
+                compatible_misses,
+                device,
+                batch_key=batch_key,
+            )
+        )
 
     return hash_to_embedding
 
