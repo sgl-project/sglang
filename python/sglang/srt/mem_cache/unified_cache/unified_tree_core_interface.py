@@ -166,6 +166,16 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash values owned by this node, excluding its ancestors."""
+        ...
+
+    @abstractmethod
+    def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
+        """The NodeId anchoring matches for the namespace."""
+        ...
+
+    @abstractmethod
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
@@ -345,6 +355,17 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...
 
+    @abstractmethod
+    def evict_excess_path_states(
+        self,
+        tail_node_id: NodeId,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Evict shallow Mamba device checkpoints beyond the per-path cap on the
+        tail's root path, collecting freed values into the caller's dicts."""
+        ...
+
     # ==== HiCache ====
 
     @abstractmethod
@@ -438,6 +459,15 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     ) -> list[CacheAction | ComponentAction]:
         """Commit a successful H->D load-back onto the node; returns any cache actions."""
         ...
+
+    @abstractmethod
+    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+        """Clear the in-flight H->D marks on the anchor's root path at ack time."""
+        ...
+
+    # Order-sensitive digest of write_back duplicate-reclaim victim ids,
+    # cross-checked across TP ranks; cores that never reclaim keep 0.
+    write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
     def mark_write_through_pending(self, node_id: NodeId) -> None:

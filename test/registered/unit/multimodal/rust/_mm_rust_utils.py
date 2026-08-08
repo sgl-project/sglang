@@ -88,5 +88,12 @@ def image_bytes(width, height, seed=0):
     return buffer.getvalue()
 
 
-def spec_json(config, image_token_id=IMAGE_TOKEN_ID):
-    return json.dumps({"family": "qwen_vl", "image_token_id": image_token_id, **config})
+def spec_json(config, image_token_id=IMAGE_TOKEN_ID, resample="aten_u8"):
+    return json.dumps(
+        {
+            "family": "qwen_vl",
+            "image_token_id": image_token_id,
+            "resample": resample,
+            **config,
+        }
+    )
