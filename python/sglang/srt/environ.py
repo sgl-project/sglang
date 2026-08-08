@@ -632,6 +632,9 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Quantize the absorbed MLA value projection directly from the AITER
+    # batched-GEMM accumulator, avoiding the intermediate BF16 tensor.
+    SGLANG_ROCM_FUSE_MLA_VALUE_MXFP4_QUANT = EnvBool(True)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
