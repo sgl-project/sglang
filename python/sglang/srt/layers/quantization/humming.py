@@ -194,12 +194,276 @@ def compressed_tensors_get_config(config: dict[str, Any], key: str):
     return target_group_config
 
 
+class _CheckpointWeightSchema:
+    def process_loaded_weight(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        return tensor
+
+    def get_padded_tensors_attrs(
+        self,
+        shape_n: int,
+        shape_k: int,
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        has_bias: bool = False,
+        pad_n_to_multiple: int = 1,
+        pad_k_to_multiple: int = 1,
+        stack_size: int = 1,
+    ) -> dict[str, dict[str, Any]]:
+        _lazy_import_humming()
+        return BaseWeightSchema.get_padded_tensors_attrs(
+            self,
+            shape_n=shape_n,
+            shape_k=shape_k,
+            param_dtype=param_dtype,
+            num_experts=num_experts,
+            has_bias=has_bias,
+            pad_n_to_multiple=pad_n_to_multiple,
+            pad_k_to_multiple=pad_k_to_multiple,
+            stack_size=stack_size,
+        )
+
+
+class _W4AFp8CheckpointWeightSchema(_CheckpointWeightSchema):
+    quant_method = "w4afp8"
+
+    def __init__(self, group_size: int = 128):
+        if (
+            not isinstance(group_size, int)
+            or isinstance(group_size, bool)
+            or group_size <= 0
+        ):
+            raise ValueError(
+                f"W4AFP8 group_size must be a positive integer, got {group_size!r}."
+            )
+        self.group_size = group_size
+
+    def get_tensors_attrs(
+        self,
+        shape_n: int,
+        shape_k: int,
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        has_bias: bool = False,
+        stack_size: int = 1,
+    ) -> dict[str, dict[str, Any]]:
+        if shape_k % self.group_size != 0:
+            raise ValueError(
+                f"W4AFP8 shape_k = {shape_k} must be divisible by group_size = "
+                f"{self.group_size}. Choose a tensor-parallel configuration whose "
+                "local K dimension preserves quantization groups."
+            )
+        if shape_k % 8 != 0:
+            raise ValueError(
+                f"W4AFP8 shape_k = {shape_k} must be divisible by 8 for int32 "
+                "packed-weight storage."
+            )
+
+        tensors_attrs = {
+            "weight": {
+                "shape": (shape_n, shape_k // 2),
+                "dtype": torch.int8,
+                "extra_attrs": {"output_dim": 0, "input_dim": 1},
+            },
+            "weight_scale_inv": {
+                "shape": (shape_n, shape_k // self.group_size),
+                "dtype": param_dtype,
+                "extra_attrs": {
+                    "output_dim": 0,
+                    "input_dim": 1,
+                    "scale_type": "group",
+                },
+            },
+        }
+        if has_bias:
+            tensors_attrs["bias"] = {
+                "shape": (shape_n,),
+                "dtype": param_dtype,
+                "extra_attrs": {"output_dim": 0},
+            }
+        _lazy_import_humming()
+        return BaseWeightSchema.may_add_expert_dim(tensors_attrs, num_experts)
+
+    def convert_humming(
+        self,
+        tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
+        shape_k_stacks: list[int],
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+    ):
+        _lazy_import_humming()
+        schema = HummingWeightSchema(
+            b_dtype=DataType.from_str("uint4"),
+            bs_dtype=DataType.from_torch_dtype(param_dtype),
+            weight_scale_group_size=self.group_size,
+        )
+        weight = tensors["weight"].view(torch.uint8).bitwise_xor(0x88)
+        output_tensors = {
+            "weight": weight.contiguous().view(torch.int32),
+            "weight_scale": tensors["weight_scale_inv"].to(param_dtype),
+        }
+        if "bias" in tensors:
+            output_tensors["bias"] = tensors["bias"]
+        return schema, output_tensors
+
+
+class _StackedBlockFp8CheckpointWeightSchema(_CheckpointWeightSchema):
+    def __init__(self, schema):
+        self.schema = schema
+        self.quant_method = schema.quant_method
+        weight_block_size = tuple(schema.weight_block_size)
+        if len(weight_block_size) != 2 or any(
+            not isinstance(size, int) or isinstance(size, bool) or size <= 0
+            for size in weight_block_size
+        ):
+            raise ValueError(
+                "FP8 weight_block_size must contain two positive integers, "
+                f"got {schema.weight_block_size!r}."
+            )
+        self.weight_block_size = weight_block_size
+        self.weight_scale_key = schema.weight_scale_key
+
+    def get_tensors_attrs(
+        self,
+        shape_n: int,
+        shape_k: int,
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        has_bias: bool = False,
+        stack_size: int = 1,
+    ) -> dict[str, dict[str, Any]]:
+        tensors_attrs = self.schema.get_tensors_attrs(
+            shape_n=shape_n,
+            shape_k=shape_k,
+            param_dtype=param_dtype,
+            num_experts=num_experts,
+            has_bias=has_bias,
+            stack_size=stack_size,
+        )
+        block_n, block_k = self.weight_block_size
+        scale_shape = (math.ceil(shape_n / block_n), math.ceil(shape_k / block_k))
+        if num_experts:
+            scale_shape = (num_experts,) + scale_shape
+        tensors_attrs[self.weight_scale_key]["shape"] = scale_shape
+        return tensors_attrs
+
+    def get_stacked_tensors_attrs(
+        self,
+        shape_n_stacks: list[int],
+        shape_k: int,
+        param_dtype: torch.dtype,
+        has_bias: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        tensors_attrs = self.get_tensors_attrs(
+            shape_n=sum(shape_n_stacks),
+            shape_k=shape_k,
+            param_dtype=param_dtype,
+            has_bias=has_bias,
+            stack_size=len(shape_n_stacks),
+        )
+        block_n, block_k = self.weight_block_size
+        tensors_attrs[self.weight_scale_key]["shape"] = (
+            sum(math.ceil(shape_n / block_n) for shape_n in shape_n_stacks),
+            math.ceil(shape_k / block_k),
+        )
+        return tensors_attrs
+
+    def convert_humming(
+        self,
+        tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
+        shape_k_stacks: list[int],
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+    ):
+        schema, output_tensors = self.schema.convert_humming(
+            tensors=tensors,
+            shape_n_stacks=shape_n_stacks,
+            shape_k_stacks=shape_k_stacks,
+            param_dtype=param_dtype,
+            num_experts=num_experts,
+        )
+        if len(shape_n_stacks) == 1:
+            return schema, output_tensors
+
+        block_n, _ = self.weight_block_size
+        scale_rows = [math.ceil(shape_n / block_n) for shape_n in shape_n_stacks]
+        scale_stacks = tensors[self.weight_scale_key].split(scale_rows, dim=-2)
+        output_tensors["weight_scale"] = (
+            torch.cat(
+                [
+                    scale.repeat_interleave(block_n, -2)[..., :shape_n, :]
+                    for scale, shape_n in zip(scale_stacks, shape_n_stacks, strict=True)
+                ],
+                dim=-2,
+            )
+            .to(param_dtype)
+            .contiguous()
+        )
+        return schema, output_tensors
+
+
+def _validate_block_fp8_partition_shape(
+    layer: torch.nn.Module,
+    weight_schema,
+    input_size: int,
+    output_size: int,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    skip_block_quant_check: bool = False,
+) -> None:
+    if skip_block_quant_check or not isinstance(
+        weight_schema, _StackedBlockFp8CheckpointWeightSchema
+    ):
+        return
+
+    from sglang.srt.layers.quantization.fp8_utils import validate_fp8_block_shape
+
+    validate_fp8_block_shape(
+        layer=layer,
+        input_size=input_size,
+        output_size=output_size,
+        input_size_per_partition=input_size_per_partition,
+        output_partition_sizes=output_partition_sizes,
+        block_size=list(weight_schema.weight_block_size),
+    )
+
+
+def _build_checkpoint_weight_schema(layer_config: dict[str, Any]):
+    quant_method = layer_config.get("quant_method")
+    if quant_method is None:
+        return None
+    if quant_method == "w4afp8":
+        return _W4AFp8CheckpointWeightSchema(
+            group_size=layer_config.get("group_size", 128)
+        )
+
+    schema = BaseWeightSchema.from_config(layer_config)
+    if quant_method == "fp8" and getattr(schema, "weight_block_size", None):
+        return _StackedBlockFp8CheckpointWeightSchema(schema)
+    return schema
+
+
 class HummingConfig(QuantizationConfig):
     packed_modules_mapping = {}
 
     def __init__(self, full_config: dict[str, Any] | None = None):
         _lazy_import_humming()
         self.full_config: dict[str, Any] = full_config or {}
+        self._w4afp8_config = None
+        if self.full_config.get("quant_method") == "w4afp8":
+            from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+
+            self._w4afp8_config = W4AFp8Config.from_config(self.full_config)
+        # DeepSeek's MLA weight post-processing reads the dense FP8 block size
+        # from the model-level quantization config before per-layer Humming
+        # post-processing runs. Keep that checkpoint metadata available here
+        # as well as on HummingLayerQuantizationConfig.
+        self.weight_block_size = (
+            self._w4afp8_config.weight_block_size
+            if self._w4afp8_config is not None
+            else self.full_config.get("weight_block_size")
+        )
         self.is_fp4_experts: bool = False
 
     @classmethod
@@ -282,9 +546,7 @@ class HummingConfig(QuantizationConfig):
                 layer_config.update(override_config)
                 break
 
-        if "quant_method" in layer_config:
-            return BaseWeightSchema.from_config(layer_config)
-        return None
+        return _build_checkpoint_weight_schema(layer_config)
 
     def get_layer_input_schema(self, config: dict[str, Any], prefix: str):
         if self.is_layer_skipped(config, prefix):
@@ -299,14 +561,46 @@ class HummingConfig(QuantizationConfig):
             return BaseInputSchema.from_config(config)
         return None
 
+    def get_checkpoint_configs_for_layer(
+        self, layer_type: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if self._w4afp8_config is None:
+            return self.full_config, self.full_config
+
+        activation_scheme = (
+            self._w4afp8_config.moe_activation_scheme
+            if layer_type == "moe"
+            else self._w4afp8_config.linear_activation_scheme
+        )
+        fp8_config = {
+            "quant_method": "fp8",
+            "activation_scheme": activation_scheme,
+            "weight_block_size": self._w4afp8_config.weight_block_size,
+            "ignored_layers": self._w4afp8_config.ignored_layers,
+        }
+        weight_config = (
+            {
+                "quant_method": "w4afp8",
+                "group_size": self._w4afp8_config.group_size,
+            }
+            if layer_type == "moe"
+            else fp8_config
+        )
+        return weight_config, fp8_config
+
     def get_quant_config_for_layer(
         self, prefix: str, layer_type: str
     ) -> "HummingLayerQuantizationConfig | None":
         weight_schema: BaseWeightSchema | None = None
         force_weight_schema: HummingWeightSchema | None = None
 
-        if self.full_config:
-            weight_schema = self.get_layer_weight_schema(self.full_config, prefix)
+        checkpoint_weight_config, checkpoint_input_config = (
+            self.get_checkpoint_configs_for_layer(layer_type)
+        )
+        if checkpoint_weight_config:
+            weight_schema = self.get_layer_weight_schema(
+                checkpoint_weight_config, prefix
+            )
 
         is_online_quant = False
         online_quant_config = envs.SGLANG_HUMMING_ONLINE_QUANT_CONFIG.get() or {}
@@ -325,8 +619,10 @@ class HummingConfig(QuantizationConfig):
             input_schema = None
             force_input_schema = None
 
-            if self.full_config:
-                input_schema = self.get_layer_input_schema(self.full_config, prefix)
+            if checkpoint_input_config:
+                input_schema = self.get_layer_input_schema(
+                    checkpoint_input_config, prefix
+                )
 
             if envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get():
                 quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get().copy()
@@ -510,6 +806,7 @@ class HummingLinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
+        skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
         from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -523,6 +820,16 @@ class HummingLinearMethod(LinearMethodBase):
         layer.output_partition_sizes = output_partition_sizes
         layer.extra_weight_attrs = extra_weight_attrs.copy()
 
+        _validate_block_fp8_partition_shape(
+            layer=layer,
+            weight_schema=self.weight_schema,
+            input_size=input_size,
+            output_size=output_size,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            skip_block_quant_check=skip_block_quant_check,
+        )
+
         weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
         new_weight_loader = self.prepare_weight_loader(layer, weight_loader)
         extra_weight_attrs["weight_loader"] = new_weight_loader
@@ -532,12 +839,23 @@ class HummingLinearMethod(LinearMethodBase):
             if block_size is not None:
                 layer.weight_block_size = block_size
 
-        weight_tensor_attrs = self.weight_schema.get_tensors_attrs(
-            shape_n=layer.output_partition_sizes_sum,
-            shape_k=layer.input_size_per_partition,
-            param_dtype=params_dtype,
-            stack_size=len(layer.output_partition_sizes),
+        get_stacked_tensors_attrs = getattr(
+            self.weight_schema, "get_stacked_tensors_attrs", None
         )
+        if get_stacked_tensors_attrs is not None:
+            weight_tensor_attrs = get_stacked_tensors_attrs(
+                shape_n_stacks=layer.output_partition_sizes,
+                shape_k=layer.input_size_per_partition,
+                param_dtype=params_dtype,
+                has_bias=False,
+            )
+        else:
+            weight_tensor_attrs = self.weight_schema.get_tensors_attrs(
+                shape_n=layer.output_partition_sizes_sum,
+                shape_k=layer.input_size_per_partition,
+                param_dtype=params_dtype,
+                stack_size=len(layer.output_partition_sizes),
+            )
 
         input_tensor_attrs = self.input_schema.get_tensors_attrs(
             shape_k=layer.input_size_per_partition,
@@ -790,6 +1108,12 @@ class HummingMoEMethod(FusedMoEMethodBase):
         if getattr(self, "processed", False):
             return
         self.processed = True
+        from sglang.srt.layers.quantization.humming_utils import (
+            configure_humming_deepep_dispatch,
+            make_humming_deepep_input_schema,
+        )
+
+        use_deepep_fp8_dispatch = configure_humming_deepep_dispatch(layer)
         self.weight_schemas = {}
         self.input_schemas = {}
         for sublayer_name, configs in layer.sublayer_configs.items():
@@ -869,6 +1193,12 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
                 del tensors
 
+            if use_deepep_fp8_dispatch:
+                input_schema = make_humming_deepep_input_schema(
+                    sublayer_name, configs["shape_k"]
+                )
+            self.input_schemas[sublayer_name] = input_schema
+
             # prepare layer config from humming kernel
             HummingMethod.prepare_layer_meta(
                 layer=layer,
@@ -886,9 +1216,6 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
             # preprocess weight for inference
             HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
-
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
     def create_moe_runner(
         self,
