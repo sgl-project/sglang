@@ -89,6 +89,7 @@ class IpcModelLoader(BaseModelLoader):
         (fallback to disk loading would cause OOM on shared GPUs).
         In client mode, falls back to DefaultModelLoader.
         """
+        self.preexisting_weight_memory_bytes = 0
         tic = time.perf_counter()
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
@@ -118,6 +119,16 @@ class IpcModelLoader(BaseModelLoader):
             return self._fallback_load(model_config, device_config)
 
         entries = cache_data["entries"]
+        resident_bytes = cache_data.get("resident_bytes")
+        if (
+            isinstance(resident_bytes, bool)
+            or not isinstance(resident_bytes, int)
+            or resident_bytes < 0
+        ):
+            raise RuntimeError(
+                "[IpcModelLoader] Daemon returned invalid preexisting memory "
+                f"metadata: {resident_bytes=}"
+            )
         logger.info(
             f"[IpcModelLoader] Fetched {len(entries)} IPC handles from daemon "
             f"in {time.perf_counter() - tic:.2f}s"
@@ -135,6 +146,7 @@ class IpcModelLoader(BaseModelLoader):
             entries,
             quant_config,
         )
+        self.preexisting_weight_memory_bytes = resident_bytes
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting

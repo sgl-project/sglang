@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import unittest
+from unittest.mock import Mock, patch
 
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
@@ -63,6 +64,77 @@ def _make_cache_config(**overrides) -> CacheConfig:
     )
     base.update(overrides)
     return CacheConfig(**base)
+
+
+class TestPreexistingWeightMemory(CustomTestCase):
+    def test_effective_baseline_adds_locally_before_min(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.local_pre_model_load_memory = 80
+        runner.preexisting_weight_memory_bytes_for_kv_sizing = 20 * (1 << 30)
+
+        with patch(
+            "sglang.srt.model_executor.model_runner.bootstrap.reduce_min_gpu_memory",
+            side_effect=lambda local: min(local, 95),
+        ) as reduce_min:
+            self.assertEqual(runner._effective_pre_model_load_memory(), 95)
+        reduce_min.assert_called_once_with(100)
+
+    def test_multi_runner_workers_and_scheduler_sum_target_and_draft(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.tp_worker import BaseTpWorker
+        from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
+        from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+            FrozenKVMTPDraftWorker,
+        )
+
+        def aggregate(*values):
+            worker = SimpleNamespace(
+                model_runner=None,
+                model_runner_list=[
+                    SimpleNamespace(preexisting_weight_memory_bytes=value)
+                    for value in values
+                ],
+            )
+            return BaseTpWorker.preexisting_weight_memory_bytes.fget(worker)
+
+        target_bytes = aggregate(11, 12)
+        draft_bytes = EagleDraftWorkerBase.preexisting_weight_memory_bytes.fget(
+            SimpleNamespace(
+                draft_runners=[
+                    SimpleNamespace(preexisting_weight_memory_bytes=value)
+                    for value in (5, 7)
+                ]
+            )
+        )
+        frozen_kv_draft = FrozenKVMTPDraftWorker.__new__(FrozenKVMTPDraftWorker)
+        frozen_kv_draft._model_runner = SimpleNamespace(
+            preexisting_weight_memory_bytes=13
+        )
+        self.assertEqual(frozen_kv_draft.preexisting_weight_memory_bytes, 13)
+        target_runner = SimpleNamespace(
+            memory_pool_config=None,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            preexisting_weight_memory_bytes_for_kv_sizing=0,
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=target_runner,
+            preexisting_weight_memory_bytes=target_bytes,
+            alloc_memory_pool=Mock(),
+        )
+        scheduler.draft_worker = SimpleNamespace(
+            preexisting_weight_memory_bytes=draft_bytes
+        )
+
+        scheduler.init_target_memory_pool()
+        self.assertEqual(
+            target_runner.preexisting_weight_memory_bytes_for_kv_sizing, 35
+        )
 
 
 class TestProtocolFraming(CustomTestCase):
@@ -360,6 +432,43 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         # The error must be about the missing daemon, proving we did not quietly
         # fall through to a disk load.
         self.assertIn("daemon", str(ctx.exception).lower())
+
+    def test_resident_bytes_propagate_validate_and_reset_on_fallback(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        loader = IpcModelLoader(
+            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+            socket_path="/unused",
+            weight_cache_mode="client",
+        )
+        model = Mock()
+        model.eval.return_value = model
+        with (
+            patch.object(
+                loader,
+                "_fetch_from_cache",
+                return_value={"entries": {}, "resident_bytes": 123, "pid": None},
+            ) as fetch,
+            patch.object(loader, "_fallback_load", return_value=object()),
+            patch.object(loader, "_load_zero_copy_mode", return_value=model),
+            patch.object(loader, "_rebuild_stale_views"),
+            patch.object(loader, "_start_daemon_liveness_watchdog"),
+            patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+        ):
+            loader.load_model(model_config=self._model_config(), device_config=None)
+            self.assertEqual(loader.preexisting_weight_memory_bytes, 123)
+
+            fetch.return_value = None
+            loader.load_model(model_config=self._model_config(), device_config=None)
+            self.assertEqual(loader.preexisting_weight_memory_bytes, 0)
+
+            fetch.return_value = {"entries": {}, "resident_bytes": True}
+            with self.assertRaisesRegex(RuntimeError, "resident_bytes=True"):
+                loader.load_model(model_config=self._model_config(), device_config=None)
 
 
 if __name__ == "__main__":

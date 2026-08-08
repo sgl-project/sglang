@@ -38,6 +38,8 @@ import logging
 import os
 import signal
 import socket
+import subprocess
+import sys
 import time
 from typing import Any, Dict, Optional
 
@@ -71,6 +73,25 @@ logger = logging.getLogger(__name__)
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+
+def _sample_device_free_memory_in_helper(gpu_id: int) -> int:
+    """Sample device-wide free bytes in a short-lived helper process.
+
+    The sample may include temporary CUDA-context overhead from the helper.
+    Taking both the pre-load and post-load samples through this function puts
+    them in the same measurement domain so that overhead approximately cancels.
+    """
+    output = subprocess.check_output(
+        [
+            sys.executable,
+            "-c",
+            ("import sys, torch; print(torch.cuda.mem_get_info(int(sys.argv[1]))[0])"),
+            str(gpu_id),
+        ],
+        text=True,
+    )
+    return int(output.strip())
 
 
 class WeightCacheDaemon:
@@ -123,6 +144,7 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.resident_bytes = 0
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -200,6 +222,7 @@ class WeightCacheDaemon:
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
         # message before touching the device.
         self._assert_ipc_compatible_allocator()
+        free_before_load = _sample_device_free_memory_in_helper(self.gpu_id)
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
         # Reduce thread contention during multi-process loading
@@ -310,6 +333,13 @@ class WeightCacheDaemon:
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
+        current_platform.synchronize()
+        current_platform.empty_cache()
+        free_after_load = _sample_device_free_memory_in_helper(self.gpu_id)
+        # Device-wide occupancy, including this daemon's context and distributed
+        # allocations, with the helper's temporary context overhead approximately
+        # canceled.
+        self.resident_bytes = max(0, free_before_load - free_after_load)
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
@@ -505,6 +535,7 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
+                    "resident_bytes": self.resident_bytes,
                     # PID so the client can watch daemon liveness: if this
                     # process dies while clients hold IPC mappings, their
                     # param.data (and any CUDA-graph-captured addresses) dangle.

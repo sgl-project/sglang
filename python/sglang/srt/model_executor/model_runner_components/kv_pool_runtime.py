@@ -50,7 +50,7 @@ def compute_post_capture_kv_resize(
         distributed=get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
-    headroom_gb = model_runner.pre_model_load_memory * (
+    headroom_gb = model_runner.kv_sizing_pre_model_load_memory * (
         1 - model_runner.mem_fraction_static
     )
     decode_cuda_graph_config = model_runner.server_args.cuda_graph_config.decode
