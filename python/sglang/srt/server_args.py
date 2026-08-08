@@ -5478,16 +5478,11 @@ class ServerArgs:
             # The prefill attention backend default + validation moved to the
             # override registry (arg_groups/overrides.py: _moss_vl_overrides).
             pass
-        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
-            if hf_config.sliding_window_pattern is not None:
-                # disable_hybrid_swa_memory moved to the override registry
-                # (arg_groups/overrides.py: _exaone_overrides).
-                # https://docs.sglang.ai/advanced_features/attention_backend.html
-                accepted_backends = ["fa3", "triton", "trtllm_mha"]
-                attention_backend = resolved_view(self).attention_backend
-                assert (
-                    attention_backend in accepted_backends
-                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoeForCausalLM"]:
+            # Attention backend selection, validation, and hybrid-SWA memory
+            # handling moved to the override registry
+            # (arg_groups/overrides.py: _exaone_overrides).
+            pass
         elif model_arch in ["Olmo2ForCausalLM"]:
             # disable_hybrid_swa_memory + attention backend selection moved to
             # the override registry (arg_groups/overrides.py: _olmo2_overrides).

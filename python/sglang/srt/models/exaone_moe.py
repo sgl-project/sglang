@@ -14,16 +14,22 @@
 # ==============================================================================
 
 # Adapted from the vLLM version of EXAONE-MoE model
-"""Inference-only ExaoneMoE model compatible with HuggingFace weights."""
+"""Inference-only EXAONE MoE model compatible with HuggingFace weights."""
 
 import logging
 from collections.abc import Iterable
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32, silu_and_mul_clamp
+from sglang.kernels.ops.attention.fused_qknorm_rope import (
+    can_use_fused_qk_norm_rope,
+    fused_qk_norm_rope,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -32,6 +38,11 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -62,20 +73,22 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
-class ExaoneMoEMLP(nn.Module):
+class ExaoneMoeMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        swiglu_limit: Optional[float] = None,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
@@ -83,6 +96,7 @@ class ExaoneMoEMLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.tp_size = tp_size
         gateup_quant_config = quant_config
         down_quant_config = quant_config
         if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
@@ -116,23 +130,41 @@ class ExaoneMoEMLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.swiglu_limit = swiglu_limit
 
     def forward(
         self,
         x,
         forward_batch=None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if self.tp_size == 1 and x.shape[0] == 0:
+            return x
+
+        if self.swiglu_limit is None:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(x, forward_batch=forward_batch)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            if _is_npu:
+                gate, up = gate_up.chunk(2, dim=-1)
+                gate = gate.clamp(min=None, max=self.swiglu_limit)
+                up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+                x = F.silu(gate) * up
+            else:
+                num_tokens, hidden_dim = gate_up.shape
+                x = gate_up.new_empty((num_tokens, hidden_dim // 2))
+                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+            x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
 
-class ExaoneMoESparseMoEBlock(nn.Module):
+class ExaoneMoeSparseMoEBlock(nn.Module):
     def __init__(
         self,
         layer_id: int,
         config: PretrainedConfig,
+        swiglu_limit: Optional[float] = None,
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
@@ -173,10 +205,12 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
+            swiglu_limit=swiglu_limit,
         )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -187,12 +221,13 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             scoring_func="sigmoid",
         )
 
-        if config.num_shared_experts is not None:
+        if config.num_shared_experts > 0:
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
-            self.shared_experts = ExaoneMoEMLP(
+            self.shared_experts = ExaoneMoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
+                swiglu_limit=swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
@@ -224,7 +259,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         shared_output = None
         if hidden_states.shape[0] > 0:
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._router_logits(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -247,9 +282,14 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
+
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if _is_cuda:
+            return linear_bf16_fp32(hidden_states, self.gate.weight)
+        return F.linear(hidden_states.float(), self.gate.weight.float())
 
     def forward_normal_dual_stream(
         self,
@@ -300,7 +340,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class ExaoneMoEAttention(nn.Module):
+class ExaoneMoeAttention(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -315,6 +355,7 @@ class ExaoneMoEAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         prefix: str = "",
+        is_mtp: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -342,6 +383,7 @@ class ExaoneMoEAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
 
         qkv_quant_config = quant_config
         o_quant_config = quant_config
@@ -370,6 +412,7 @@ class ExaoneMoEAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            reduce_results=False,
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -378,7 +421,18 @@ class ExaoneMoEAttention(nn.Module):
         if quant_config is not None and quant_config.get_name() == "gguf":
             rope_is_neox_style = False
 
+        self.sliding_window_size = None
+
         self.sliding_window = config.layer_types[layer_id] == "sliding_attention"
+        if config.sliding_windows is not None:
+            self.sliding_window_size = config.sliding_windows[layer_id] - 1
+
+        if is_mtp:
+            self.sliding_window = (
+                config.mtp_layer_types[layer_id] == "sliding_attention"
+            )
+            if config.mtp_sliding_windows is not None:
+                self.sliding_window_size = config.mtp_sliding_windows[layer_id] - 1
 
         # apply rotary embeddings to every layer in full attention models
         self.apply_rope_all_layers = "sliding_attention" not in config.layer_types
@@ -392,16 +446,32 @@ class ExaoneMoEAttention(nn.Module):
             is_neox_style=rope_is_neox_style,
         )
 
+        rope_type = (
+            (rope_scaling or {}).get("rope_type")
+            or (rope_scaling or {}).get("type")
+            or "default"
+        )
+        self.use_fused_qk_norm_rope = (
+            get_exec().kernel.enable_fused_qk_norm_rope
+            and _is_cuda
+            and rope_type == "default"
+            and (self.sliding_window or self.apply_rope_all_layers)
+            and can_use_fused_qk_norm_rope(
+                self.head_dim,
+                self.rotary_emb.is_neox_style,
+                torch.bfloat16,
+            )
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
-            sliding_window_size=(
-                config.sliding_window if self.sliding_window else None
-            ),
+            sliding_window_size=self.sliding_window_size,
         )
         self.layer_id = layer_id
 
@@ -412,18 +482,40 @@ class ExaoneMoEAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rope_theta,
+                self.rotary_emb.is_neox_style,
+                positions.view(-1)
+                .to(dtype=torch.int32, device=qkv.device)
+                .contiguous(),
+                1.0,
+                0,
+                0,
+                1.0,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.reshape(-1, self.head_dim)
-        q = self.q_norm(q)
-        q = q.reshape(-1, self.num_heads * self.head_dim)
+            q = q.reshape(-1, self.head_dim)
+            q = self.q_norm(q)
+            q = q.reshape(-1, self.num_heads * self.head_dim)
 
-        k = k.reshape(-1, self.head_dim)
-        k = self.k_norm(k)
-        k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+            k = k.reshape(-1, self.head_dim)
+            k = self.k_norm(k)
+            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
 
-        if self.sliding_window or self.apply_rope_all_layers:
-            q, k = self.rotary_emb(positions, q, k)
+            if self.sliding_window or self.apply_rope_all_layers:
+                q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -431,20 +523,23 @@ class ExaoneMoEAttention(nn.Module):
         return output
 
 
-class ExaoneMoEDecoderLayer(nn.Module):
+class ExaoneMoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_mtp: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        self.layer_id = layer_id
+        rope_parameters = getattr(config, "rope_parameters", None)
+        rope_theta = rope_parameters.get("rope_theta", 1000000)
+        rope_scaling = getattr(config, "rope_scaling", rope_parameters)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
@@ -460,7 +555,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        self.self_attn = ExaoneMoEAttention(
+        self.self_attn = ExaoneMoeAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -473,27 +568,67 @@ class ExaoneMoEDecoderLayer(nn.Module):
             quant_config=quant_config,
             bias=attention_bias,
             prefix=add_prefix("self_attn", prefix),
+            is_mtp=is_mtp,
         )
 
-        if config.is_moe_layer[layer_id]:
-            self.mlp = ExaoneMoESparseMoEBlock(
+        self.is_layer_sparse = self._is_layer_sparse(layer_id)
+        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1)
+        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1)
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
+        )
+
+        swiglu_limits = getattr(config, "swiglu_limits", None)
+        if swiglu_limits is not None:
+            self.swiglu_limit = swiglu_limits[layer_id]
+            self.swiglu_limit = self.swiglu_limit if self.swiglu_limit > 0 else None
+        else:
+            self.swiglu_limit = None
+
+        if self.is_layer_sparse and not is_mtp:
+            self.mlp = ExaoneMoeSparseMoEBlock(
                 layer_id=layer_id,
                 config=config,
+                swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            self.mlp = ExaoneMoEMLP(
+            if enable_moe_dense_fully_dp():
+                mlp_tp_rank, mlp_tp_size = 0, 1
+            else:
+                mlp_tp_rank, mlp_tp_size = None, None
+            self.mlp = ExaoneMoeMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
+                swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+        )
+
+    def _is_layer_sparse(self, layer_idx: int) -> bool:
+        return (
+            0 <= layer_idx < len(self.config.mlp_layer_types)
+            and "sparse" == self.config.mlp_layer_types[layer_idx]
         )
 
     def forward(
@@ -503,27 +638,47 @@ class ExaoneMoEDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        # Self Attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
         )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        with get_forward().scoped(
+            fuse_mlp_allreduce=should_allreduce_fusion,
+            mlp_reduce_scatter=use_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch)
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
 
-class ExaoneMoEModel(nn.Module):
+class ExaoneMoeModel(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -531,6 +686,7 @@ class ExaoneMoEModel(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_mtp: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -543,18 +699,19 @@ class ExaoneMoEModel(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: ExaoneMoEDecoderLayer(
+            lambda idx, prefix: ExaoneMoeDecoderLayer(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                is_mtp=is_mtp,
                 alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
@@ -617,7 +774,7 @@ class ExaoneMoEModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class ExaoneMoEForCausalLM(nn.Module):
+class ExaoneMoeForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -629,7 +786,7 @@ class ExaoneMoEForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None
-        self.model = ExaoneMoEModel(
+        self.model = ExaoneMoeModel(
             config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -653,13 +810,16 @@ class ExaoneMoEForCausalLM(nn.Module):
             lambda: {
                 layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
                 for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, ExaoneMoESparseMoEBlock)
+                if isinstance(self.model.layers[layer_id].mlp, ExaoneMoeSparseMoEBlock)
             }
         )
 
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -871,5 +1031,19 @@ class ExaoneMoEForCausalLM(nn.Module):
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
 
-EntryClass = ExaoneMoEForCausalLM
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i". To capture the hidden state after target
+        # layer `k` (HF-style), we capture before layer `k + 1`.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+
+EntryClass = ExaoneMoeForCausalLM

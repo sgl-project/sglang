@@ -609,4 +609,17 @@ class Qwen3DSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel, DSparkDraftModel]
+class ExaoneMoeDSparkModel(DSparkDraftModel):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def remap_mtp_weights():
+            for name, loaded_weight in weights:
+                if name.startswith("model."):
+                    continue
+                if name.startswith("mtp."):
+                    name = name[len("mtp.") :]
+                yield name, loaded_weight
+
+        super().load_weights(remap_mtp_weights())
+
+
+EntryClass = [Qwen3DSparkModel, ExaoneMoeDSparkModel, DSparkDraftModel]

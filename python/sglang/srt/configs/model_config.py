@@ -682,9 +682,30 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
-            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
-            self.hf_config.num_nextn_predict_layers = 1
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoeForCausalLM":
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+
+            if self.speculative_algorithm in (
+                None,
+                "DSPARK",
+            ) and checkpoint_bundles_dspark_draft(self.hf_config):
+                cfg = self.hf_config
+                cfg.architectures[0] = "ExaoneMoeDSparkModel"
+                cfg.num_hidden_layers = cfg.dspark_num_hidden_layers
+                cfg.num_target_layers = cfg.dspark_num_target_layers
+                cfg.block_size = cfg.dspark_block_size
+                cfg.target_layer_ids = cfg.dspark_target_layer_ids
+                cfg.markov_rank = cfg.dspark_markov_rank
+                cfg.markov_head_type = cfg.dspark_markov_head_type
+                cfg.mask_token_id = cfg.dspark_noise_token_id
+                cfg.enable_confidence_head = cfg.dspark_enable_confidence_head
+                cfg.confidence_head_with_markov = cfg.dspark_confidence_head_with_markov
+                cfg.layer_types = cfg.mtp_layer_types
+            else:
+                self.hf_config.architectures[0] = "ExaoneMoeForCausalLMMTP"
+                self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "NemotronHForCausalLM",
@@ -2019,6 +2040,8 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "Exaone4ForCausalLM",
+        "ExaoneMoeForCausalLM",
         "MellumForCausalLM",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
@@ -2133,6 +2156,17 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if i not in local_layer_id_set
+        ]
+    elif (
+        "ExaoneMoeForCausalLM" in model_architectures
+        or "Exaone4ForCausalLM" in model_architectures
+    ):
+        layer_types = getattr(hf_text_config, "layer_types", [])
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))

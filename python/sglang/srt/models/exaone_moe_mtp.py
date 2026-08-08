@@ -14,7 +14,7 @@
 # ==============================================================================
 
 # Adapted from the vLLM version of EXAONE-MoE MTP
-"""Inference-only ExaoneMoE MTP Speculative Decoding."""
+"""Inference-only EXAONE MoE MTP Speculative Decoding."""
 
 import logging
 from typing import Iterable, Optional, Tuple
@@ -24,19 +24,20 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.exaone_moe import ExaoneMoEForCausalLM, ExaoneMoEModel
+from sglang.srt.models.exaone_moe import ExaoneMoeForCausalLM, ExaoneMoeModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 
-class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
+class ExaoneMoeForCausalLMMTP(ExaoneMoeForCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -55,8 +56,8 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.model = ExaoneMoEModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+        self.model = ExaoneMoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix), is_mtp=True
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -86,12 +87,13 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            hidden_states,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                hidden_states,
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -103,4 +105,4 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
         super().load_weights(weights, is_mtp=True)
 
 
-EntryClass = ExaoneMoEForCausalLMMTP
+EntryClass = ExaoneMoeForCausalLMMTP

@@ -617,7 +617,6 @@ def _fused_moe_kernel_sequence(
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
             #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
-            assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
             assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
 
