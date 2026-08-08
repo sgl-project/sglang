@@ -17,6 +17,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace {
 
 struct AlignSingleTokenParams {
@@ -105,3 +107,5 @@ struct AlignSingleTokenKernel {
 };
 
 }  // namespace
+
+}  // namespace sglang
