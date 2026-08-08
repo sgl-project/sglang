@@ -4466,22 +4466,10 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import (
-            is_deepseek_dsa,
-            is_deepseek_v4,
-            is_nemotron_h,
-        )
+        from sglang.srt.configs.model_config import is_deepseek_v4, is_nemotron_h
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
-            # MLA prefill under BCG takes forward_mha, which has no eager
-            # breaks. DSA is exempt: BCG forces the sparse path, whose
-            # indexer already splits eagerly.
-            (
-                "MLA attention (non-DSA)",
-                lambda: self.use_mla_backend()
-                and not is_deepseek_dsa(self.get_model_config().hf_config),
-            ),
             # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
             # state-track write is not wired into the captured buffers, so a
             # replay can commit a cache slot it never wrote.

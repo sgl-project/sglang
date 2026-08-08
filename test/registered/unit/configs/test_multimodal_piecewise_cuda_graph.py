@@ -36,7 +36,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
-        runner.mla_pinned_under_bcg = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
@@ -141,12 +140,16 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
 
-    def test_breakable_prefill_rejects_nonzero_prefix(self):
+    def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
         forward_batch = self._make_multimodal_forward_batch()
         forward_batch.extend_prefix_lens_cpu = [1]
 
-        self.assertFalse(runner.can_run_graph(forward_batch))
+        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
+        with patch(target, return_value=True):
+            self.assertTrue(runner.can_run_graph(forward_batch))
+        with patch(target, return_value=False):
+            self.assertFalse(runner.can_run_graph(forward_batch))
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
