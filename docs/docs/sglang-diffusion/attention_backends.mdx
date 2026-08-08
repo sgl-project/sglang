@@ -57,7 +57,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SAGE_ATTN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>sageattention</code>. On Hopper (SM90), PyPI <code>sageattention==2.2.0</code> is unsupported because it lacks the upstream SM90 binding fix. Install <code>pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation</code>. Upstream SageAttention CUDA extensions target SM80/SM86/SM89/SM90/SM120; see upstream <code>setup.py</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>sageattention</code>. On Hopper (SM90), PyPI <code>sageattention==2.2.0</code> is unsupported because it lacks the upstream SM90 binding fix. Install <code>pip install --force-reinstall git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation</code>. Upstream SageAttention CUDA extensions target SM80/SM86/SM89/SM90/SM120; see upstream <code>setup.py</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_attn_3`</td>
