@@ -7,7 +7,6 @@ from typing import Any
 
 import torch  # type: ignore
 
-from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
@@ -157,8 +156,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self.crossattn_cache: list | None = None
         self.causal_kv_cache_neg: list | None = None
         self.crossattn_cache_neg: list | None = None
-        # KV-cache quantization config (resolved per-forward from ServerArgs)
-        self._kv_quant_args = QVGKVQuantArgs()
         # Model-dependent constants (aligned with causal_inference.py assumptions)
         self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
         self.num_frames_per_block = (
@@ -422,12 +419,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 raise ValueError("realtime_causal_kv_cache_num_frames must be positive")
             self.sliding_window_num_frames = int(kv_cache_num_frames)
 
-        # KV-cache quantization config is fixed for the server lifetime
-        self._kv_quant_args = server_args.kv_cache_quant_config
-
-    def _resolve_kv_quant_args(self) -> QVGKVQuantArgs:
-        """KV-quant config from ServerArgs (disabled by default)."""
-        return self._kv_quant_args
+        if (
+            server_args.kv_cache_quant_config.enabled
+            and not self._supports_qvg_kv_cache_quantization()
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not support QVG KV-cache quantization"
+            )
 
     def _supports_qvg_kv_cache_quantization(self) -> bool:
         return False
@@ -1131,35 +1129,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
     ) -> list[CausalKVCache]:
         if attention_window_size is None:
             attention_window_size = kv_cache_size
-        quant_args = self._resolve_kv_quant_args()
-        if quant_args.enabled:
-            if not self._supports_qvg_kv_cache_quantization():
-                raise ValueError(
-                    f"{type(self).__name__} does not support QVG KV-cache quantization"
-                )
-            if global_sink_tokens or allow_growth:
-                raise NotImplementedError(
-                    "QVG packed KV cache supports only the LingBot realtime "
-                    "sliding-window and sink path"
-                )
-            return [
-                QVGPackedCausalKVCache(
-                    batch_size=batch_size,
-                    cache_size=kv_cache_size,
-                    num_heads=num_attention_heads,
-                    head_dim=attention_head_dim,
-                    dtype=dtype,
-                    device=device,
-                    use_int_indices=use_int_indices,
-                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    sink_tokens=sink_tokens,
-                    attention_window_size=attention_window_size,
-                    quant_args=quant_args,
-                )
-                for _ in range(self.num_transformer_blocks)
-            ]
-
         int_index = 0 if use_int_indices else None
         shape = [batch_size, kv_cache_size, num_attention_heads, attention_head_dim]
         return [

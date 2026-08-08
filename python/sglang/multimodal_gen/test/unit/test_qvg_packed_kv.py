@@ -10,6 +10,7 @@
 
 import importlib.util
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -165,17 +166,16 @@ class TestPackedStorageEquivalence(unittest.TestCase):
 
     def test_quantization_is_rejected_by_unsupported_causal_stages(self):
         stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
-        stage._kv_quant_args = QVGKVQuantArgs(bits=4)
-        stage.num_transformer_blocks = 1
+        stage.sink_size = 0
+        stage.sliding_window_num_frames = 1
 
         with self.assertRaisesRegex(ValueError, "does not support QVG"):
-            stage._allocate_causal_kv_cache(
-                batch_size=1,
-                kv_cache_size=8,
-                num_attention_heads=1,
-                attention_head_dim=4,
-                dtype=torch.float32,
-                device=torch.device("cpu"),
+            stage._apply_causal_cache_overrides(
+                SimpleNamespace(),
+                SimpleNamespace(
+                    pipeline_config=SimpleNamespace(),
+                    kv_cache_quant_config=QVGKVQuantArgs(bits=4),
+                ),
             )
 
     def test_quantization_is_available_for_lingbot(self):
