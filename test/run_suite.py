@@ -175,8 +175,9 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
-        # Debug tooling UTs (dump comparator, source patcher). Not worth a
-        # per-commit slot: breakage there is fine to notice once a week.
+        # `stage="weekly"` + `runner_config="cpu"`, same {stage}-test-{runner_config}
+        # rule as the CUDA suites. Debug tooling UTs (dump comparator, source
+        # patcher): breakage there is fine to notice once a week.
         "weekly-test-cpu",
     ],
     HWBackend.CUDA: [

@@ -16,7 +16,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
 from sglang.srt.debug_utils.comparator.threshold_dsl import DiffThresholdRule
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="weekly-test-cpu")
+register_cpu_ci(est_time=20, stage="weekly", runner_config="cpu")
 
 
 class TestComputeTensorInfo:
