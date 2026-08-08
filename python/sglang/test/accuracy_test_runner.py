@@ -203,6 +203,13 @@ def _get_nemo_venv() -> Tuple[str, dict]:
     # Pinned: NeMo-Skills main after PR #1433 pins litellm==1.83.14 (httpx==0.28.1),
     # which is unsatisfiable against nemo-run's transitive leptonai dep.
     nemo_skills_ref = "589294c"
+    # Commit timestamp of that ref. Pinning the ref alone leaves every
+    # transitive dependency floating, and mcp later dropped
+    # `streamablehttp_client`, which nemo_skills.mcp.clients imports at module
+    # scope -- so an unchanged pin started failing to import. Resolving as of
+    # the ref's own commit time gives it the dependency set it was written
+    # against, and keeps future releases from breaking it the same way.
+    nemo_skills_ref_time = "2026-05-04T20:37:29Z"
     print(f"Installing nemo_skills (pinned to {nemo_skills_ref})...")
     pip_result = subprocess.run(
         [
@@ -211,6 +218,8 @@ def _get_nemo_venv() -> Tuple[str, dict]:
             "install",
             "--python",
             f"{_nemo_venv_dir}/venv/bin/python",
+            "--exclude-newer",
+            nemo_skills_ref_time,
             f"git+https://github.com/NVIDIA/NeMo-Skills.git@{nemo_skills_ref}",
         ],
         capture_output=True,
