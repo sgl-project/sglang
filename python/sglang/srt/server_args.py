@@ -774,6 +774,14 @@ class ServerArgs:
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
         NS("schedule"),
     ] = None
+    max_inflight_prefill_tokens: A[
+        Optional[int],
+        "Admission cap on the total prompt tokens of in-flight (not yet finished) requests. "
+        "A new request is rejected up front when it would push the in-flight total over this, "
+        "so a burst of long-context prompts sheds gracefully instead of over-committing prefill "
+        "memory. Unset (default) disables it.",
+        NS("schedule"),
+    ] = None
     max_total_tokens: A[
         Optional[int],
         Arg(
