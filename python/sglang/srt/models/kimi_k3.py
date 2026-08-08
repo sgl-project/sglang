@@ -104,6 +104,12 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+    fill_transparent_bg,
+    normalization_tensors,
+    to_chw_uint8,
+)
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
@@ -3040,40 +3046,59 @@ class KimiK3ForConditionalGeneration(nn.Module):
         grid_thw_list = grid_thws_host.tolist()
 
         def materialize_item_features(image_indices: List[int]) -> torch.Tensor:
-            """Materialize features for the images assigned to this rank.
-
-            K3 vision is image-wise data-parallel, so each image is consumed
-            by exactly one TP rank. Deferred CUDA-IPC proxies are
-            reconstructed here, after the assignment is known, so an image
-            crosses the tokenizer/scheduler boundary once instead of once
-            per rank; CPU-transport features likewise only pay their H2D
-            copy on the owner rank. The consumer count matches
-            MmItemMemoryPool.try_to_recycle(), which waits for the server TP
-            size rather than the attention subgroup size.
-            """
-            parallel = get_parallel()
-            server_args = get_server_args()
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            """Materialize only the images assigned to this vision-DP rank."""
+            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
 
-            features = []
+            selected_items = []
             for image_index in image_indices:
                 item = items[image_index]
                 if device.type == "cuda":
                     item.reconstruct(
                         device_index, ipc_consumer_count=ipc_consumer_count
                     )
-                feature = item.feature
-                if not isinstance(feature, torch.Tensor):
+                selected_items.append(item)
+
+            deferred = [
+                item.model_specific_data.get(DEFERRED_PREPROCESSING_KEY)
+                for item in selected_items
+            ]
+            if any(config is not None for config in deferred):
+                if not all(config is not None for config in deferred):
+                    raise ValueError(
+                        "Kimi-K3 cannot mix deferred and preprocessed image features"
+                    )
+                from sglang.srt.multimodal.processors.kimi_k25 import (
+                    _gpu_preprocess_images,
+                )
+
+                first_config = deferred[0]
+                image_scale, image_bias = normalization_tensors(
+                    first_config["image_mean"], first_config["image_std"], device
+                )
+                pixel_values, _ = _gpu_preprocess_images(
+                    [item.feature for item in selected_items],
+                    [config["resize_config"] for config in deferred],
+                    image_scale,
+                    image_bias,
+                    self.vision_tower.patch_size,
+                    to_chw=lambda image: to_chw_uint8(image, device=device),
+                    post_resize=lambda x: fill_transparent_bg(
+                        x, first_config["transparent_bg_config"]
+                    ),
+                )
+                return pixel_values.to(dtype=target_dtype)
+
+            features = []
+            for item in selected_items:
+                if not isinstance(item.feature, torch.Tensor):
                     raise TypeError(
                         "Kimi-K3 image feature must be a torch.Tensor, "
-                        f"got {type(feature)}"
+                        f"got {type(item.feature)}"
                     )
-                features.append(feature)
+                features.append(item.feature)
             return materialize_multimodal_features(
                 features, device=device, dtype=target_dtype
             )
