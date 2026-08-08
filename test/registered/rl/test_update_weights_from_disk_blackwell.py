@@ -7,6 +7,11 @@ import unittest
 
 import requests
 
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -44,10 +49,17 @@ class UpdateWeightsFromDiskBase:
             )
 
     def _launch_server(self, backend_test_suite):
-        launch_kwargs = {}
-        if self.launch_env is not None:
-            launch_kwargs["env"] = self.launch_env
-        other_args = backend_test_suite.get("other_args")
+        launch_kwargs = {
+            "env": {
+                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
+                **(self.launch_env or {}),
+            }
+        }
+        other_args = (
+            *backend_test_suite.get("other_args", ()),
+            "--enable-memory-saver",
+            "--cuda-graph-backend-prefill=disabled",
+        )
         return popen_launch_server(
             self.model,
             self.base_url,
@@ -140,6 +152,18 @@ class UpdateWeightsFromDiskBase:
             timeout=self.update_timeout,
         )
 
+    def _offload_engine_and_resume_weights(self):
+        self._post_json("/release_memory_occupation", {})
+        self._post_json(
+            "/resume_memory_occupation", {"tags": [GPU_MEMORY_TYPE_WEIGHTS]}
+        )
+
+    def _resume_kv_cache_and_cuda_graph(self):
+        self._post_json(
+            "/resume_memory_occupation",
+            {"tags": [GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]},
+        )
+
     def test_parameterized_update_weights_from_disk(self):
         for backend_test_suite in self.backend_test_suites:
             case_name = backend_test_suite.get("name", "default")
@@ -154,6 +178,7 @@ class UpdateWeightsFromDiskBase:
                     for update_test_suite in self.update_test_suites:
                         with self.subTest(case_name=case_name, **update_test_suite):
                             self._wait_until_idle()
+                            self._offload_engine_and_resume_weights()
                             ret = self._run_update_weights(
                                 self.model,
                                 flush_cache=update_test_suite["flush_cache"],
@@ -161,6 +186,7 @@ class UpdateWeightsFromDiskBase:
                                     "abort_all_requests"
                                 ],
                             )
+                            self._resume_kv_cache_and_cuda_graph()
                             self.assertTrue(ret.get("success"), f"{ret=}")
                             self.assertEqual(self._get_model_info(), self.model)
                             self._assert_non_empty_decode()
@@ -169,7 +195,7 @@ class UpdateWeightsFromDiskBase:
                                 baseline_sig, updated_sig
                             )
                 finally:
-                    kill_process_tree(process.pid)
+                    kill_process_tree(process.pid, wait_timeout=60)
 
 
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
@@ -238,7 +264,6 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
                 "--moe-a2a-backend",
                 "none",
                 "--enable-deterministic-inference",
-                "--cuda-graph-backend-prefill=disabled",
             ),
         },
     )
