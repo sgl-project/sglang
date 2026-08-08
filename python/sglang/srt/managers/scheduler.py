@@ -2274,22 +2274,69 @@ class Scheduler(
             req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
         return True
 
-    def _maybe_compute_mrope_positions(self, req) -> None:
-        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
+    def _maybe_compute_mrope_positions(
+        self, req, *, force_recompute: bool = False
+    ) -> None:
+        """Compute M-RoPE positions when missing or invalidated by an append."""
         if self._mm_processor is None:
             return
         mm = req.multimodal_inputs
-        if mm is None or mm.mrope_positions is not None:
+        if mm is None or (mm.mrope_positions is not None and not force_recompute):
             return
 
+        input_ids = (
+            req.origin_input_ids_unpadded if force_recompute else req.origin_input_ids
+        )
         mrope_positions, mrope_position_delta = (
-            self._mm_processor.compute_mrope_positions(
-                req.origin_input_ids, mm.mm_items
-            )
+            self._mm_processor.compute_mrope_positions(input_ids, mm.mm_items)
         )
         if mrope_positions is not None:
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
+            mm.mrope_position_delta_repeated_cache = None
+
+    def _prepare_multimodal_inputs_for_generate(
+        self, recv_req, req, image_inputs
+    ) -> None:
+        """Pad, merge, and position multimodal inputs for a generate request.
+
+        A streaming session carries the previous turn's already-padded token
+        array. Rebuild it from the cumulative unpadded tokens and multimodal
+        items so newly shifted offsets and all model-specific pad values are
+        canonical. The carried fill IDs and page-local M-RoPE metadata must be
+        rebuilt from the same cumulative view as well.
+        """
+        SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
+
+        is_streaming_session = req.session is not None and req.session.streaming
+        if is_streaming_session:
+            req.extend_image_inputs(image_inputs)
+            if self.pad_input_ids_func is not None:
+                req.origin_input_ids = array(
+                    "q",
+                    self.pad_input_ids_func(
+                        req.origin_input_ids_unpadded,
+                        req.multimodal_inputs,
+                    ),
+                )
+            else:
+                self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+
+            # Padding can rewrite token values without changing the length, so
+            # Req._refresh_fill_ids cannot detect a stale carried array.
+            req.full_untruncated_fill_ids = req.origin_input_ids[:]
+            self._maybe_compute_mrope_positions(req, force_recompute=True)
+            return
+
+        if (
+            not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+            and self.pad_input_ids_func
+        ):
+            req.origin_input_ids = array(
+                "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+            )
+        req.extend_image_inputs(image_inputs)
+        self._maybe_compute_mrope_positions(req)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
         if (
@@ -2534,21 +2581,7 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
-
-            SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
-
-            # The following steps are already fast, execute locally on each rank.
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings.
-            # The pad function is model-specific and can be None for some backends.
-            if (
-                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
-                and self.pad_input_ids_func
-            ):
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
-                )
-            req.extend_image_inputs(image_inputs)
-            self._maybe_compute_mrope_positions(req)
+            self._prepare_multimodal_inputs_for_generate(recv_req, req, image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(

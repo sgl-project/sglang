@@ -473,11 +473,11 @@ class SessionController:
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):
         # For session requests, adjust mm_inputs offsets by the prefix length.
-        # Session.create_req prepends previous context to origin_input_ids,
+        # Session.create_req prepends previous context to origin_input_ids_unpadded,
         # so offsets from the new prompt need to be shifted.
-        if len(recv_req.input_ids) >= len(req.origin_input_ids):
+        if len(recv_req.input_ids) >= len(req.origin_input_ids_unpadded):
             return
-        prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+        prefix_len = len(req.origin_input_ids_unpadded) - len(recv_req.input_ids)
         for mm_item in image_inputs.mm_items:
             if mm_item.offsets:
                 mm_item.offsets = [
