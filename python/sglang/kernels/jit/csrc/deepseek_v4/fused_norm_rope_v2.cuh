@@ -38,6 +38,16 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
 
 constexpr uint32_t kBlockSize = 256;
 constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
+// FlashMLA ILP: a block processes this many tokens back-to-back. Resolving all
+// K plans, then issuing all K input loads before any is consumed, keeps many
+// independent global loads in flight to hide the ~hundreds-of-cycles load
+// latency the 1-token baseline stalls on (long_scoreboard). The per-token
+// reduction tree and store (fp8 quant OR bf16) are unchanged, so output is
+// bit-identical to the 1-token kernel. Small num_tokens is grid-starved at K=4
+// (too few blocks for the SMs), so the launcher drops to K=1 below the cutoff.
+constexpr uint32_t kFlashmlaTokensPerBlock = 4;
+constexpr uint32_t kFlashmlaSmallNTokensPerBlock = 1;
+constexpr uint32_t kFlashmlaSmallNCutoff = 2048;
 
 struct FusedNormRopeStoreParams {
   void* __restrict__ input;
@@ -376,11 +386,24 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 }
 
 // ----------------------------------------------------------------------------
-// FlashMLA variant: kHeadDim = 512, 1 token per *block* (256 threads).
-// Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
+// FlashMLA variant: kHeadDim = 512, kTokensPerBlock tokens per *block* (256
+// threads; each thread owns kVecSize=2 elems -> 256 threads cover one token's
+// 512 dims, and the block loops over its tokens).
 // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
+//
+// ILP: resolve all K plans, then issue all K input loads before consuming any,
+// so the K independent global loads stay in flight together and hide the load
+// latency the 1-token baseline stalls on. The per-token reduction tree and
+// store (fp8 quant OR bf16) are byte-for-byte the 1-token path, so output is
+// bit-identical to the original kernel.
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, bool kBf16Store = false>
+template <
+    typename DType,
+    ForwardMode kMode,
+    int32_t kPageBits,
+    bool kUsePDL,
+    bool kBf16Store = false,
+    uint32_t kTokensPerBlockT = kFlashmlaTokensPerBlock>
 FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -391,6 +414,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // Last warp owns the rope tail. The remaining 7 warps each emit one
   // 64-element fp8 group (own UE8M0 scale).
   constexpr uint32_t kRopeWarp = kNumWarps - 1;
+  constexpr uint32_t kTokensPerBlock = kTokensPerBlockT;
   // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
   // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
   constexpr int64_t kPageBytes =
@@ -400,114 +424,160 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
   using Storage = AlignedVector<DType, kVecSize>;
   using Float2 = AlignedVector<float, kVecSize>;
+  // One 2-bf16 input pack == one 32-bit word; used for the streaming __ldcs load.
+  using LoadWord = typename details::sized_int<Storage>;
 
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
   const auto lane_id = tx % kWarpThreads;
-  const auto work_id = blockIdx.x;
+  const auto work_base = blockIdx.x * kTokensPerBlock;
 
-  if (work_id >= params.num_tokens) return;
+  // Per-token state. valid[t] is block-uniform (depends only on blockIdx.x and
+  // the plan), so branching on it around __syncthreads and the warp-wide fp8
+  // reduce_max never splits a warp.
+  bool valid[kTokensPerBlock];
+  int32_t position_arr[kTokensPerBlock];
+  int64_t out_loc_arr[kTokensPerBlock];
+  Storage input_vec[kTokensPerBlock];
+  Float2 freq[kTokensPerBlock];
+  Storage weight_vec;  // shared by every token -> loaded once
 
-  const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
-  int32_t position;
-  int64_t out_loc;
-  if constexpr (kMode == CompressExtend) {
-    const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
-    if (plan.is_invalid()) return;
-    position = plan.seq_len - params.compress_ratio;
-    out_loc = params.out_loc[plan.ragged_id];
-  } else if constexpr (kMode == CompressDecode) {
-    const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
-    if (plan.seq_len % params.compress_ratio != 0) return;
-    position = plan.seq_len - params.compress_ratio;
-    out_loc = params.out_loc[work_id];
-  } else {
-    static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
-  }
-  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+  __shared__ float partial_sums[kTokensPerBlock][kNumWarps];
 
   PDLWaitPrimary<kUsePDL>();
-  Float2 data, freq;
+  weight_vec.load(params.weight, tx);
 
-  // part 1: norm. Each thread owns one 2-elem pack (`tx`-th pack of input).
-  // Sum of squares is reduced across the whole block via per-warp partials.
-  {
-    __shared__ float partial_sums[kNumWarps];
+  // Stage A: resolve every token's plan first (K independent 16B plan loads in
+  // flight) and stash position / out_loc; do NOT yet touch input / freqs.
+#pragma unroll
+  for (uint32_t t = 0; t < kTokensPerBlock; ++t) {
+    const auto work_id = work_base + t;
+    bool ok = (work_id < params.num_tokens);
+    int32_t position = 0;
+    int64_t out_loc = 0;
+    if (ok) {
+      if constexpr (kMode == CompressExtend) {
+        const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
+        if (plan.is_invalid()) {
+          ok = false;
+        } else {
+          position = plan.seq_len - params.compress_ratio;
+          out_loc = params.out_loc[plan.ragged_id];
+        }
+      } else if constexpr (kMode == CompressDecode) {
+        const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
+        if (plan.seq_len % params.compress_ratio != 0) {
+          ok = false;
+        } else {
+          position = plan.seq_len - params.compress_ratio;
+          out_loc = params.out_loc[work_id];
+        }
+      } else {
+        static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
+      }
+    }
+    valid[t] = ok;
+    position_arr[t] = position;
+    out_loc_arr[t] = out_loc;
+  }
 
-    Storage input_vec, weight_vec;
-    input_vec.load(input, tx);
-    weight_vec.load(params.weight, tx);
-    if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
+  // Stage B: issue all input (+ freqs) loads back-to-back. Addresses are
+  // resolved, so the K loads have no dependency and stay in flight together.
+  // Input is streamed (read once) via __ldcs (evict-first, read-only path) so
+  // it doesn't evict the reused weight/freqs from L1 -- this is the second half
+  // of the speedup (drives long_scoreboard down further than K-ILP alone).
+#pragma unroll
+  for (uint32_t t = 0; t < kTokensPerBlock; ++t) {
+    if (!valid[t]) continue;
+    const auto work_id = work_base + t;
+    const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
+    const auto word = __ldcs(reinterpret_cast<const LoadWord*>(input) + tx);
+    *reinterpret_cast<LoadWord*>(&input_vec[t]) = word;
+    if (warp_id == kRopeWarp) freq[t].load(params.freqs_cis + position_arr[t] * kRopeDim, lane_id);
+  }
 
+  // part 1: norm -- per-token sum of squares, warp reduce, write partial.
+#pragma unroll
+  for (uint32_t t = 0; t < kTokensPerBlock; ++t) {
+    if (!valid[t]) continue;
     float sum_of_squares = 0.0f;
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
+      const auto fp32_input = cast<float>(input_vec[t][i]);
       sum_of_squares += fp32_input * fp32_input;
     }
-
     const auto warp_sum = warp::reduce_sum(sum_of_squares);
-    if (lane_id == 0) partial_sums[warp_id] = warp_sum;
-    __syncthreads();
-    // Replicate the per-warp partial sums to a full warp and reduce. Every
-    // lane-group of `kNumWarps` lanes ends up with the global sum.
-    sum_of_squares = warp::reduce_sum<kNumWarps>(partial_sums[lane_id % kNumWarps]);
-    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
-
-#pragma unroll
-    for (int i = 0; i < kVecSize; ++i) {
-      const auto fp32_input = cast<float>(input_vec[i]);
-      const auto fp32_weight = cast<float>(weight_vec[i]);
-      data[i] = fp32_input * norm_factor * fp32_weight;
-    }
+    if (lane_id == 0) partial_sums[t][warp_id] = warp_sum;
   }
-
-  const int64_t page = out_loc >> kPageBits;
-  const int64_t offset = out_loc & ((1 << kPageBits) - 1);
-  const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
+  __syncthreads();
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on the rope warp (BF16 store), or per-warp FP8 quant + store.
-  if constexpr (kBf16Store) {
-    Float2 d = data;
-    if (warp_id == kRopeWarp) {
+  // part 2: per token -- cross-warp reduce -> normalize -> rope + store.
+#pragma unroll
+  for (uint32_t t = 0; t < kTokensPerBlock; ++t) {
+    if (!valid[t]) continue;
+    // Replicate the per-warp partial sums to a full warp and reduce. Every
+    // lane-group of `kNumWarps` lanes ends up with the global sum.
+    const auto sum_of_squares = warp::reduce_sum<kNumWarps>(partial_sums[t][lane_id % kNumWarps]);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+    Float2 data;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_input = cast<float>(input_vec[t][i]);
+      const auto fp32_weight = cast<float>(weight_vec[i]);
+      data[i] = fp32_input * norm_factor * fp32_weight;
+    }
+
+    const int64_t out_loc = out_loc_arr[t];
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+    const auto page_ptr = params.kvcache + page * kPageBytes;
+    const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
+
+    if constexpr (kBf16Store) {
+      Float2 d = data;
+      if (warp_id == kRopeWarp) {
+        const auto x_real = data[0];
+        const auto x_imag = data[1];
+        const auto freq_real = freq[t][0];
+        const auto freq_imag = freq[t][1];
+        // Explicit fma pins the fp-contraction so the unrolled K-loop compiles
+        // to the same rounding as the 1-token baseline (nvcc fuses a*b-c*d into
+        // fma(a,b,-(c*d)); pin it so unrolling can't pick a different form).
+        d[0] = __fmaf_rn(x_real, freq_real, -(x_imag * freq_imag));
+        d[1] = __fmaf_rn(x_real, freq_imag, x_imag * freq_real);
+      }
+      reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
+    } else if (warp_id == kRopeWarp) {
+      // Each rope-warp lane owns exactly one (real, imag) pair within the rope
+      // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
       const auto x_real = data[0];
       const auto x_imag = data[1];
-      const auto freq_real = freq[0];
-      const auto freq_imag = freq[1];
-      d[0] = x_real * freq_real - x_imag * freq_imag;
-      d[1] = x_real * freq_imag + x_imag * freq_real;
+      const auto freq_real = freq[t][0];
+      const auto freq_imag = freq[t][1];
+      data[0] = __fmaf_rn(x_real, freq_real, -(x_imag * freq_imag));
+      data[1] = __fmaf_rn(x_real, freq_imag, x_imag * freq_real);
+      const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+      const auto rope_ptr = value_ptr + 448;
+      reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+    } else {
+      // Non-rope warp: per-warp UE8M0 group (64 elems -> 64 fp8 + 1 scale byte).
+      // BF16 round-trip to match the precision of the non-fused path
+      // (which goes through quant_to_nope_fp8_rope_bf16_pack_triton with bf16 input).
+      const auto x = cast<float>(cast<bf16_t>(data[0]));
+      const auto y = cast<float>(cast<bf16_t>(data[1]));
+      const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+      const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+      const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+      const auto result = pack_fp8(x * inv_scale, y * inv_scale);
+      const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
+      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
+      // All lanes in this warp produce the same scale byte; let lane 0 publish.
+      if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
     }
-    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
-  } else if (warp_id == kRopeWarp) {
-    // Each rope-warp lane owns exactly one (real, imag) pair within the rope
-    // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
-    const auto x_real = data[0];
-    const auto x_imag = data[1];
-    const auto freq_real = freq[0];
-    const auto freq_imag = freq[1];
-    data[0] = x_real * freq_real - x_imag * freq_imag;
-    data[1] = x_real * freq_imag + x_imag * freq_real;
-    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
-    const auto rope_ptr = value_ptr + 448;
-    reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
-  } else {
-    // Non-rope warp: per-warp UE8M0 group (64 elems -> 64 fp8 + 1 scale byte).
-    // BF16 round-trip to match the precision of the non-fused path
-    // (which goes through quant_to_nope_fp8_rope_bf16_pack_triton with bf16 input).
-    const auto x = cast<float>(cast<bf16_t>(data[0]));
-    const auto y = cast<float>(cast<bf16_t>(data[1]));
-    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
-    const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
-    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
-    const auto result = pack_fp8(x * inv_scale, y * inv_scale);
-    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
-    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
-    // All lanes in this warp produce the same scale byte; let lane 0 publish.
-    if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
   }
 }
 
@@ -532,12 +602,12 @@ struct FusedNormRopeKernel {
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
 
-  template <ForwardMode kMode>
+  template <ForwardMode kMode, uint32_t kTPW = kFlashmlaTokensPerBlock>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
       return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
     } else {
-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
+      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store, kTPW>;
     }
   }
 
@@ -612,12 +682,28 @@ struct FusedNormRopeKernel {
         .compress_ratio = compress_ratio,
         .num_tokens = num_tokens,
     };
-    // Indexer packs `kNumWarps` tokens per block (warp-major); FlashMLA uses
-    // a whole block per token (cta-major sum-reduce over head_dim=512).
-    const uint32_t num_blocks = kIsIndexer ? div_ceil(num_tokens, kNumWarps) : num_tokens;
     const auto device = device_.unwrap();
-    const auto kernel = mode == CompressExtend ? select_kernel<CompressExtend>() : select_kernel<CompressDecode>();
-    LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+    if constexpr (kIsIndexer) {
+      // Indexer packs `kNumWarps` tokens per block (warp-major); unchanged.
+      const uint32_t num_blocks = div_ceil(num_tokens, kNumWarps);
+      const auto kernel = mode == CompressExtend ? select_kernel<CompressExtend>() : select_kernel<CompressDecode>();
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+    } else {
+      // FlashMLA: K tokens/block (ILP hides load latency). Small num_tokens is
+      // grid-starved at the K=4 large-N default (too few blocks for the SMs),
+      // so drop to K=1 there. Per-token math/store are identical across K, so
+      // output is bit-identical either way.
+      const bool small_n = num_tokens < kFlashmlaSmallNCutoff;
+      constexpr uint32_t kBigK = kFlashmlaTokensPerBlock;
+      constexpr uint32_t kSmallK = kFlashmlaSmallNTokensPerBlock;
+      const uint32_t k = small_n ? kSmallK : kBigK;
+      const uint32_t num_blocks = div_ceil(num_tokens, k);
+      const auto kernel =
+          mode == CompressExtend
+              ? (small_n ? select_kernel<CompressExtend, kSmallK>() : select_kernel<CompressExtend, kBigK>())
+              : (small_n ? select_kernel<CompressDecode, kSmallK>() : select_kernel<CompressDecode, kBigK>());
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+    }
   }
 
   static void forward_fp4(
