@@ -25,7 +25,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInput
@@ -42,6 +47,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -676,7 +682,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # mamba slot -1 and are skipped.
                 if ragged_verify_layout.bs != bs or ragged_verify_layout.cap is None:
                     ragged_verify_layout = ragged_verify_layout.padded_to_bucket(
-                        padded_bs=bs, cap=spec_info.draft_token_num
+                        padded_bs=bs, cap=self.num_draft_tokens
                     )
                 self.query_start_loc_list[bs - 1].copy_(
                     ragged_verify_layout.qo_indptr_device
