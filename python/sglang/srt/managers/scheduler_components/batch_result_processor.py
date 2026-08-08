@@ -841,11 +841,14 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
-        mamba_track_mask_cpu = (
-            None if not batch.spec_algorithm.is_none() else batch.mamba_track_mask_cpu
-        )
-        if mamba_track_mask_cpu is not None:
-            assert len(mamba_track_mask_cpu) == len(batch.reqs)
+        if not batch.spec_algorithm.is_none():
+            mamba_track_mask_cpu = None
+            mamba_track_mask_next_cpu = None
+            mamba_decode_batch_idx_cpu = None
+        else:
+            mamba_track_mask_cpu = batch.mamba_track_mask_cpu
+            mamba_track_mask_next_cpu = batch.mamba_track_mask_next_cpu
+            mamba_decode_batch_idx_cpu = batch.mamba_decode_batch_idx_cpu
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -871,17 +874,25 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
+            known_mamba_boundary = None
+            if mamba_track_mask_cpu is not None:
+                lookahead = req.decode_batch_idx - mamba_decode_batch_idx_cpu[i]
+                assert lookahead in (0, 1), (
+                    f"mamba result lookahead={lookahead} for req {req.rid}; "
+                    "overlap advanced more than one decode batch"
+                )
+                if lookahead == 0:
+                    known_mamba_boundary = bool(mamba_track_mask_cpu[i])
+                else:
+                    known_mamba_boundary = bool(mamba_track_mask_next_cpu[i])
+
             self._handle_finish_state_updated_req(
                 req,
                 batch,
                 result,
                 i,
                 logits_output,
-                known_mamba_boundary=(
-                    None
-                    if mamba_track_mask_cpu is None
-                    else bool(mamba_track_mask_cpu[i])
-                ),
+                known_mamba_boundary=known_mamba_boundary,
             )
 
             if req.return_logprob:
@@ -1117,13 +1128,9 @@ class SchedulerBatchResultProcessor:
 
         lazy = get_server_args().enable_mamba_extra_buffer_lazy()
         if known_boundary:
-            track_seqlen = len(req.origin_input_ids) + len(req.output_ids) - 1
+            self._mamba_assert_committed_len_lookahead(req)
+            track_seqlen = req.kv_committed_len
             assert track_seqlen % get_exec().mamba.mamba_track_interval == 0
-            assert (req.kv_committed_len - track_seqlen) in (0, 1), (
-                f"mamba track boundary: kv_committed_len={req.kv_committed_len} "
-                f"leads seq_len={track_seqlen} by more than one (req {req.rid}); "
-                "overlap lookahead wider than assumed"
-            )
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(
@@ -1205,6 +1212,20 @@ class SchedulerBatchResultProcessor:
         # keep holds the track_seqlen state either way.
         req.mamba_last_track_seqlen = track_seqlen
 
+    @staticmethod
+    def _mamba_assert_committed_len_lookahead(req: Req) -> None:
+        """Alarm if overlap advances beyond the scheduler's modeled window."""
+        assert req.output_ids, (
+            "mamba track boundary reached before a decode token was appended "
+            f"(req {req.rid}); output_ids is empty"
+        )
+        token_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        assert (req.kv_committed_len - token_seq_len) in (0, 1), (
+            f"mamba track boundary: kv_committed_len={req.kv_committed_len} "
+            f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "
+            "overlap lookahead wider than assumed"
+        )
+
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
@@ -1222,6 +1243,7 @@ class SchedulerBatchResultProcessor:
         interval = get_exec().mamba.mamba_track_interval
 
         if batch.spec_algorithm.is_none():
+            self._mamba_assert_committed_len_lookahead(req)
             if req.kv_committed_len % interval == 0:
                 return True, req.kv_committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
