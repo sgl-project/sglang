@@ -167,7 +167,7 @@ def test_kimi_k3_vision_tower_reuses_prepared_forward_metadata(monkeypatch):
     )
 
     assert len(actual) == len(reference) == 1
-    assert torch.equal(actual[0], reference[0])
+    torch.testing.assert_close(actual[0], reference[0], rtol=0, atol=0, equal_nan=True)
 
 
 def test_kimi_k3_dp_helper_passes_host_grid_list_to_capable_tower():
