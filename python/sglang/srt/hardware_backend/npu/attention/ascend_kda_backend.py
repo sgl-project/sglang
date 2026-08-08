@@ -11,7 +11,6 @@ from sgl_kernel_npu.fla.kda_prefill import (
     recompute_w_u_fwd_npu,
 )
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -24,6 +23,7 @@ from sgl_kernel_npu.mamba.causal_conv1d_verify import (
 
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,

@@ -18,9 +18,6 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
-    from sgl_kernel_npu.mem_cache.kv_cache_store import (
-        store_kv_cache_prefix_valid_npu_triton,
-    )
 
 
 def _init_npu_conv_state(
@@ -321,6 +318,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 device=k_buffer_layer.device, non_blocking=True
             )
         self._debug_prefix_valid_backend = "npu_triton"
+        from sgl_kernel_npu.mem_cache.kv_cache_store import (
+            store_kv_cache_prefix_valid_npu_triton,
+        )
         store_kv_cache_prefix_valid_npu_triton(
             k_buffer_layer.view(-1, self.head_num, self.head_dim),
             v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
