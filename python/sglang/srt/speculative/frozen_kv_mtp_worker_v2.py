@@ -228,11 +228,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         pass
 
     def _resolve_draft_backend_type(self) -> str:
-        return (
-            self.server_args.speculative_draft_attention_backend
-            or self.server_args.decode_attention_backend
-            or self.server_args.attention_backend
-        )
+        # The draft runner already resolved and stamped its pair when it built
+        # its backends (--speculative-draft-attention-backend wins there, else
+        # the configured decode/base pair), so read the stamp instead of
+        # re-deriving the same chain from the process config.
+        return self.draft_model_runner.decode_attention_backend_str
 
     def _init_draft_attn_backend(self):
         if self.topk == 1:
