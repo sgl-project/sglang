@@ -95,6 +95,12 @@ class EagleDraftWorkerBase(ABC):
     def weight_load_time(self) -> float:
         return sum(runner.weight_load_time for runner in self.draft_runners)
 
+    @property
+    def preexisting_weight_memory_bytes(self) -> int:
+        return sum(
+            runner.preexisting_weight_memory_bytes for runner in self.draft_runners
+        )
+
     def alloc_memory_pool(self, **kwargs):
         pass
 
@@ -210,6 +216,13 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is None:
             return 0.0
         return self.draft_worker.weight_load_time
+
+    @property
+    def preexisting_weight_memory_bytes(self) -> int:
+        draft_worker = self.draft_worker
+        if draft_worker is None:
+            return 0
+        return draft_worker.preexisting_weight_memory_bytes
 
     @property
     def war_fastpath_runner(self):

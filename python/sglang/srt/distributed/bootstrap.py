@@ -46,6 +46,17 @@ class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
     pp_group: object
     attention_tp_group: object
     pre_model_load_memory: float
+    local_pre_model_load_memory: float
+
+
+def reduce_min_gpu_memory(local_memory_gb: float) -> float:
+    """Return the minimum local GPU-memory value across the world group."""
+    world_group = get_world_group()
+    if world_group.world_size == 1:
+        return local_memory_gb
+    tensor = torch.tensor(local_memory_gb, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=world_group.cpu_group)
+    return tensor.item()
 
 
 def init_torch_distributed(
@@ -105,12 +116,8 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
-    pre_model_load_memory = get_available_gpu_memory(
-        device,
-        ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
-        cpu_group=get_world_group().cpu_group,
-    )
+    local_pre_model_load_memory = get_available_gpu_memory(device, ps.gpu_id)
+    pre_model_load_memory = reduce_min_gpu_memory(local_pre_model_load_memory)
     tp_group = get_tp_group()
     pp_group = get_pp_group()
     attention_tp_group = get_parallel().attn_tp_group
@@ -132,6 +139,7 @@ def init_torch_distributed(
         pp_group=pp_group,
         attention_tp_group=attention_tp_group,
         pre_model_load_memory=pre_model_load_memory,
+        local_pre_model_load_memory=local_pre_model_load_memory,
     )
 
 

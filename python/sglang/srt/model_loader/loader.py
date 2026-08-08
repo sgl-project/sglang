@@ -342,6 +342,9 @@ def _post_load_weights(model: nn.Module) -> None:
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
+    # Net local weight occupancy already included in the pre-load memory sample.
+    preexisting_weight_memory_bytes: int = 0
+
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 

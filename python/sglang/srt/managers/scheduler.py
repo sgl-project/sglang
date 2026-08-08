@@ -940,6 +940,14 @@ class Scheduler(
             and self.tp_worker.model_runner.token_to_kv_pool_allocator is not None
         ):
             return
+        preexisting_weight_memory_bytes = self.tp_worker.preexisting_weight_memory_bytes
+        if self.draft_worker is not None:
+            preexisting_weight_memory_bytes += (
+                self.draft_worker.preexisting_weight_memory_bytes
+            )
+        self.tp_worker.model_runner.preexisting_weight_memory_bytes_for_kv_sizing = (
+            preexisting_weight_memory_bytes
+        )
         self.tp_worker.alloc_memory_pool()
 
     def init_memory_pools(self):

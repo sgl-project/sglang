@@ -348,6 +348,8 @@ class ModelRunner:
         self.enable_hisparse = server_args.enable_hisparse
 
         self.init_startup_observability()
+        self.preexisting_weight_memory_bytes = 0
+        self.preexisting_weight_memory_bytes_for_kv_sizing = 0
 
         self.init_remote_instance_weight_transporter()
 
@@ -804,14 +806,26 @@ class ModelRunner:
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 
+    def _effective_pre_model_load_memory(self) -> float:
+        local_memory = (
+            self.local_pre_model_load_memory
+            + self.preexisting_weight_memory_bytes_for_kv_sizing / (1 << 30)
+        )
+        return bootstrap.reduce_min_gpu_memory(local_memory)
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator()
+        self.kv_sizing_pre_model_load_memory = (
+            self.pre_model_load_memory
+            if self.is_draft_worker
+            else self._effective_pre_model_load_memory()
+        )
         result = self.kv_cache_configurator.configure(
-            pre_model_load_memory=self.pre_model_load_memory
+            pre_model_load_memory=self.kv_sizing_pre_model_load_memory
         )
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
@@ -1040,6 +1054,7 @@ class ModelRunner:
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
+        self.local_pre_model_load_memory = result.local_pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(
@@ -1107,6 +1122,9 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        preexisting_bytes = loaded.loader.preexisting_weight_memory_bytes
+        self.preexisting_weight_memory_bytes = preexisting_bytes
+        self.preexisting_weight_memory_bytes_for_kv_sizing = preexisting_bytes
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
                 loaded.remote_instance_weight_info
