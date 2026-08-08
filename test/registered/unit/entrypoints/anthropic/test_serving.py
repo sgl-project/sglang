@@ -410,6 +410,62 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("https://docs.sglang.ai", tool_message["content"])
         self.assertIn("Anthropic API notes", tool_message["content"])
 
+    def _is_error_request(self, role, **block_overrides):
+        block = {
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "boom",
+        }
+        block.update(block_overrides)
+        messages = [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
+        if role == "assistant":
+            messages.append({"role": "assistant", "content": [block]})
+        else:
+            messages.append({"role": "user", "content": [block]})
+        return AnthropicMessagesRequest.model_validate(
+            {"model": "test-model", "max_tokens": 16, "messages": messages}
+        )
+
+    def test_tool_result_is_error_is_propagated(self):
+        """OpenAI has no ``is_error`` field, so dropping it here would make a
+        failed tool call indistinguishable from a successful one."""
+        request = self._is_error_request("user", is_error=True)
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        tool_message = [
+            msg
+            for msg in chat_request.model_dump()["messages"]
+            if msg["role"] == "tool"
+        ][0]
+
+        self.assertTrue(tool_message["is_error"])
+
+    def test_tool_result_without_is_error_is_not_flagged(self):
+        request = self._is_error_request("user")
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        tool_message = [
+            msg
+            for msg in chat_request.model_dump()["messages"]
+            if msg["role"] == "tool"
+        ][0]
+
+        self.assertFalse(tool_message["is_error"])
+
+    def test_tool_result_is_error_in_assistant_turn_is_labelled(self):
+        """An assistant-turn tool_result has no ``role: "tool"`` slot and
+        degrades to text, so the failure must survive in that text."""
+        request = self._is_error_request("assistant", is_error=True)
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        assistant_message = [
+            msg
+            for msg in chat_request.model_dump()["messages"]
+            if msg["role"] == "assistant"
+        ][0]
+
+        self.assertIn("error", assistant_message["content"].lower())
+
     def test_mixed_tool_reference_content_preserves_part_order(self):
         request = self._tool_result_request(
             [

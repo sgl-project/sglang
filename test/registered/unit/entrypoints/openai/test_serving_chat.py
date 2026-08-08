@@ -29,7 +29,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
+    TOOL_ERROR_PREFIX,
     OpenAIServingChat,
+    fold_tool_error_into_content,
     normalize_tool_content,
 )
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
@@ -1155,6 +1157,91 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 self.chat._process_messages(req, is_multimodal=False)
+
+    def test_tool_error_marker_reaches_custom_encoders(self):
+        """These encoders bypass the Jinja branch entirely, so folding
+        ``is_error`` only there rendered a failure as a normal ``<result>``."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32", "kimi_k3"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Beijing"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "boom",
+                            "is_error": True,
+                        },
+                    ],
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
+                encoded = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertIn(TOOL_ERROR_PREFIX.strip(), encoded)
+
+    def test_tool_error_marker_reaches_inkling_renderer(self):
+        """Inkling is the third encoder returning through _encode_messages, and
+        it renders tool turns through its own renderer rather than a template."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat._inkling_default_reasoning_effort = 0.9
+        self.tm.tokenizer.encode.side_effect = lambda text, **kw: list(text.encode())
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "boom",
+                    "is_error": True,
+                },
+            ],
+            reasoning_effort=0.5,
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+
+        rendered = bytes(b for b in result.prompt_ids if b < 256).decode(
+            errors="ignore"
+        )
+        self.assertIn(TOOL_ERROR_PREFIX.strip(), rendered)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -3004,6 +3091,38 @@ class TestNormalizeToolContent(unittest.TestCase):
             "tool", ["plain", {"type": "text", "text": "rich"}]
         )
         self.assertEqual(result, "plain rich")
+
+
+class TestFoldToolErrorIntoContent(unittest.TestCase):
+    def test_marks_list_content_as_extra_part(self):
+        """An image-bearing tool_result stays a list, so marking only the
+        string path would silently drop the failure marker."""
+        parts = [{"type": "image_url", "image_url": {"url": "x"}}]
+        message = {"role": "tool", "content": list(parts), "is_error": True}
+        fold_tool_error_into_content(message)
+        self.assertEqual(message["content"][0]["text"], TOOL_ERROR_PREFIX.strip())
+        self.assertEqual(message["content"][1:], parts)
+
+    def test_is_error_is_always_dropped(self):
+        """It is an SGLang extension; leaking it would reach chat templates."""
+        for is_error in (True, False):
+            with self.subTest(is_error=is_error):
+                message = {"role": "tool", "content": "x", "is_error": is_error}
+                fold_tool_error_into_content(message)
+                self.assertNotIn("is_error", message)
+
+    def test_marker_only_on_failures(self):
+        """A predicate that degraded to always-true would brand every
+        successful tool result, and non-tool roles, as failed."""
+        for message in (
+            {"role": "tool", "content": "fine", "is_error": False},
+            {"role": "tool", "content": "fine"},
+            {"role": "user", "content": "fine", "is_error": True},
+        ):
+            with self.subTest(message=message):
+                fold_tool_error_into_content(dict(message))
+                fold_tool_error_into_content(message)
+                self.assertEqual(message["content"], "fine")
 
 
 class InklingReasoningEffortTest(unittest.TestCase):

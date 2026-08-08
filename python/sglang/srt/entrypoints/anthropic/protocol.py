@@ -49,6 +49,8 @@ class AnthropicUsage(BaseModel):
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
+# ``cache_control`` is deliberately undeclared so Pydantic drops it: it marks
+# Anthropic prompt-cache breakpoints, which SGLang's radix cache doesn't need.
 
 
 class TextBlock(BaseModel):

@@ -619,6 +619,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # Not in the OpenAI spec: carries Anthropic ``tool_result.is_error`` so a
+    # failed tool call stays distinguishable from a successful one in history.
+    is_error: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod

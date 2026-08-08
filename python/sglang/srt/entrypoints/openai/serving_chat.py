@@ -83,6 +83,29 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
 
+TOOL_ERROR_PREFIX = "[Tool execution failed] "
+
+
+def fold_tool_error_into_content(message: Dict[str, Any]) -> None:
+    """``is_error`` is an SGLang extension with no OpenAI equivalent, and every
+    encoder renders tool content verbatim, so the failure has to become part of
+    the content itself or the model reads a failed call as a normal result.
+    """
+    is_error = message.pop("is_error", None)
+    if not is_error or message.get("role") != "tool":
+        return
+
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = TOOL_ERROR_PREFIX + content
+    elif isinstance(content, list):
+        # Kept as a list (some templates iterate it), so the marker rides along
+        # as an extra text part rather than prefixing a string.
+        message["content"] = [
+            {"type": "text", "text": TOOL_ERROR_PREFIX.strip()}
+        ] + content
+
+
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
@@ -1160,6 +1183,9 @@ class OpenAIServingChat(OpenAIServingBase):
             normalize_assistant_tool_call_arguments(
                 message, strict=self.chat_encoding_spec != "kimi_k3"
             )
+            # Must precede encoder dispatch: the custom and dsv4/dsv32/kimi_k3
+            # encoders never reach the Jinja branch below.
+            fold_tool_error_into_content(message)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
