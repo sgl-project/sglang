@@ -80,7 +80,9 @@ def _test_scalar_a_accuracy_once(M, N, K, with_bias, out_dtype, device):
     bias = torch.randn(N, device=device, dtype=out_dtype) if with_bias else None
     expected = torch_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
     actual = fp8_per_tensor_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias)
-    repeated = fp8_per_tensor_scaled_mm(a_fp8, b_fp8, scale_a_repeated, scale_b, out_dtype, bias)
+    repeated = fp8_per_tensor_scaled_mm(
+        a_fp8, b_fp8, scale_a_repeated, scale_b, out_dtype, bias
+    )
 
     torch.testing.assert_close(expected, actual, rtol=0.02, atol=1)
     torch.testing.assert_close(repeated, actual, rtol=0, atol=0)

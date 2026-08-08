@@ -50,22 +50,36 @@ template <typename T, typename TileShape>
 using ColLoad = cutlass::epilogue::fusion::
     Sm90ColBroadcast<0, TileShape, T, T, Stride<Int<1>, Int<0>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
 
-// A scales may be per-row or a single scalar; SM90 picks between them at
-// runtime off the broadcast flag rather than instantiating a second kernel.
-template <typename T, typename TileShape>
-using ColOrScalarLoad =
-    cutlass::epilogue::fusion::Sm90ColOrScalarBroadcast<0, TileShape, T, Stride<Int<1>, Int<0>, Int<0>>>;
-
 template <typename T, typename TileShape>
 using RowLoad = cutlass::epilogue::fusion::
     Sm90RowBroadcast<0, TileShape, T, T, Stride<Int<0>, Int<1>, Int<0>>, 128 / sizeof_bits_v<T>, false>;
 
-template <typename ElementAcc, typename ElementD, typename TileShape>
+// One scale broadcast to every element. The AOT tree reads a per-row or
+// scalar A scale through a vendored Sm90ColOrScalarBroadcast that switches on
+// a runtime flag; upstream CUTLASS has no such visitor, so the JIT build picks
+// the broadcast at compile time instead -- the same way the SM100/SM120 paths
+// specialize on ScalarA.
+template <typename T, typename TileShape>
+using ScalarLoad = cutlass::epilogue::fusion::Sm90ScalarBroadcast<T>;
+
+// Sm90ScalarBroadcast takes its value by pointer, in a different Arguments
+// shape than the row/column broadcasts.
+template <typename Descriptor, bool IsScalar>
+static typename Descriptor::Arguments scale_args(tvm::ffi::TensorView scales) {
+  auto* ptr = static_cast<const float*>(scales.data_ptr());
+  if constexpr (IsScalar) {
+    return typename Descriptor::Arguments{{}, {ptr}, {}};
+  } else {
+    return typename Descriptor::Arguments{ptr};
+  }
+}
+
+template <bool ScalarA, bool ScalarB, typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogue {
  private:
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-  using ScaleA = ColOrScalarLoad<float, TileShape>;
-  using ScaleB = RowLoad<float, TileShape>;
+  using ScaleA = std::conditional_t<ScalarA, ScalarLoad<float, TileShape>, ColLoad<float, TileShape>>;
+  using ScaleB = std::conditional_t<ScalarB, ScalarLoad<float, TileShape>, RowLoad<float, TileShape>>;
 
   using Compute0 = cutlass::epilogue::fusion::
       Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
@@ -79,19 +93,25 @@ struct ScaledEpilogue {
 
   static ArgumentType prepare_args(
       tvm::ffi::TensorView a_scales, tvm::ffi::TensorView b_scales, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
-    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr()), a_scales.numel() != 1};
-    typename ScaleB::Arguments b_args{static_cast<const float*>(b_scales.data_ptr())};
+    auto a_args = scale_args<ScaleA, ScalarA>(a_scales);
+    auto b_args = scale_args<ScaleB, ScalarB>(b_scales);
     typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
     return ArgumentType{a_args, evt0_args, {}};
   }
 };
 
-template <typename ElementAcc, typename ElementD, typename TileShape, template <typename, typename> typename BiasLoad>
+template <
+    bool ScalarA,
+    bool ScalarB,
+    typename ElementAcc,
+    typename ElementD,
+    typename TileShape,
+    template <typename, typename> typename BiasLoad>
 struct ScaledEpilogueWithBias {
  private:
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-  using ScaleA = ColOrScalarLoad<float, TileShape>;
-  using ScaleB = RowLoad<float, TileShape>;
+  using ScaleA = std::conditional_t<ScalarA, ScalarLoad<float, TileShape>, ColLoad<float, TileShape>>;
+  using ScaleB = std::conditional_t<ScalarB, ScalarLoad<float, TileShape>, RowLoad<float, TileShape>>;
   using Bias = BiasLoad<ElementD, TileShape>;
 
   using Compute0 = cutlass::epilogue::fusion::
@@ -106,19 +126,19 @@ struct ScaledEpilogueWithBias {
 
   static ArgumentType prepare_args(
       tvm::ffi::TensorView a_scales, tvm::ffi::TensorView b_scales, tvm::ffi::Optional<tvm::ffi::TensorView> bias) {
-    typename ScaleA::Arguments a_args{static_cast<const float*>(a_scales.data_ptr()), a_scales.numel() != 1};
-    typename ScaleB::Arguments b_args{static_cast<const float*>(b_scales.data_ptr())};
+    auto a_args = scale_args<ScaleA, ScalarA>(a_scales);
+    auto b_args = scale_args<ScaleB, ScalarB>(b_scales);
     typename Bias::Arguments bias_args{static_cast<const ElementD*>(bias.value().data_ptr())};
     typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
     return ArgumentType{a_args, evt0_args, bias_args, {}};
   }
 };
 
-template <typename ElementAcc, typename ElementD, typename TileShape>
-using ScaledEpilogueBias = ScaledEpilogueWithBias<ElementAcc, ElementD, TileShape, RowLoad>;
+template <bool ScalarA, bool ScalarB, typename ElementAcc, typename ElementD, typename TileShape>
+using ScaledEpilogueBias = ScaledEpilogueWithBias<ScalarA, ScalarB, ElementAcc, ElementD, TileShape, RowLoad>;
 
-template <typename ElementAcc, typename ElementD, typename TileShape>
-using ScaledEpilogueColumnBias = ScaledEpilogueWithBias<ElementAcc, ElementD, TileShape, ColLoad>;
+template <bool ScalarA, bool ScalarB, typename ElementAcc, typename ElementD, typename TileShape>
+using ScaledEpilogueColumnBias = ScaledEpilogueWithBias<ScalarA, ScalarB, ElementAcc, ElementD, TileShape, ColLoad>;
 
 template <
     typename ElementAB_,
@@ -286,16 +306,22 @@ template <
     typename TileShape_,
     typename ClusterShape_,
     typename KernelSchedule_,
-    bool SwapAb>
+    bool SwapAb,
+    bool ScalarAScale>
 struct Sm90Fp8Config {
+  // launch() hands the epilogue (b_scales, a_scales) when it swaps A and B, so
+  // a scalar A scale sits in the ScaleB slot there and in ScaleA otherwise.
+  static constexpr bool kScalarInA = ScalarAScale && !SwapAb;
+  static constexpr bool kScalarInB = ScalarAScale && SwapAb;
+
   template <typename Acc, typename D, typename Tile>
   using Epilogue = std::conditional_t<
       !WithBias,
-      sm90_fp8::ScaledEpilogue<Acc, D, Tile>,
+      sm90_fp8::ScaledEpilogue<kScalarInA, kScalarInB, Acc, D, Tile>,
       std::conditional_t<
           SwapAb,
-          sm90_fp8::ScaledEpilogueColumnBias<Acc, D, Tile>,
-          sm90_fp8::ScaledEpilogueBias<Acc, D, Tile>>>;
+          sm90_fp8::ScaledEpilogueColumnBias<kScalarInA, kScalarInB, Acc, D, Tile>,
+          sm90_fp8::ScaledEpilogueBias<kScalarInA, kScalarInB, Acc, D, Tile>>>;
 
   using Gemm = sm90_fp8::Gemm<
       cutlass::float_e4m3_t,
@@ -308,7 +334,7 @@ struct Sm90Fp8Config {
       SwapAb>;
 };
 
-template <typename OutType, bool WithBias>
+template <typename OutType, bool WithBias, bool ScalarA>
 void sm90_fp8_pertensor_dispatch_shape_impl(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView a,
@@ -320,25 +346,45 @@ void sm90_fp8_pertensor_dispatch_shape_impl(
   using PingpongFastAccum = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
   using FastAccum = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
 
-  using GemmDefault =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_128, _128, _128>, Shape<_2, _1, _1>, PingpongFastAccum, false>::
-          Gemm;
-  using GemmM128LargeN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _128, _128>, Shape<_2, _1, _1>, PingpongFastAccum, false>::
-          Gemm;
-  using GemmM128SmallN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _128>, Shape<_1, _1, _1>, PingpongFastAccum, false>::
-          Gemm;
+  using GemmDefault = typename Sm90Fp8Config<
+      OutType,
+      WithBias,
+      Shape<_128, _128, _128>,
+      Shape<_2, _1, _1>,
+      PingpongFastAccum,
+      false,
+      ScalarA>::Gemm;
+  using GemmM128LargeN = typename Sm90Fp8Config<
+      OutType,
+      WithBias,
+      Shape<_64, _128, _128>,
+      Shape<_2, _1, _1>,
+      PingpongFastAccum,
+      false,
+      ScalarA>::Gemm;
+  using GemmM128SmallN = typename Sm90Fp8Config<
+      OutType,
+      WithBias,
+      Shape<_64, _64, _128>,
+      Shape<_1, _1, _1>,
+      PingpongFastAccum,
+      false,
+      ScalarA>::Gemm;
   using GemmM64SmallN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _4, _1>, FastAccum, true>::Gemm;
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _4, _1>, FastAccum, true, ScalarA>::
+          Gemm;
   using GemmM64LargeN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _256>, Shape<_1, _1, _1>, FastAccum, true>::Gemm;
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _64, _256>, Shape<_1, _1, _1>, FastAccum, true, ScalarA>::
+          Gemm;
   using GemmM32LargeN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _32, _256>, Shape<_1, _1, _1>, FastAccum, true>::Gemm;
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _32, _256>, Shape<_1, _1, _1>, FastAccum, true, ScalarA>::
+          Gemm;
   using GemmM16SmallN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _2, _1>, FastAccum, true>::Gemm;
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _2, _1>, FastAccum, true, ScalarA>::
+          Gemm;
   using GemmM16LargeN =
-      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _1, _1>, FastAccum, true>::Gemm;
+      typename Sm90Fp8Config<OutType, WithBias, Shape<_64, _16, _256>, Shape<_1, _1, _1>, FastAccum, true, ScalarA>::
+          Gemm;
 
   const uint32_t m = a.size(0);
   const uint32_t n = b.size(1);
@@ -380,10 +426,17 @@ void sm90_fp8_pertensor_dispatch_shape(
     tvm::ffi::TensorView scales_b,
     tvm::ffi::Optional<tvm::ffi::TensorView> bias,
     cudaStream_t stream) {
+  const bool scalar_a = scales_a.numel() == 1;
   if (bias.has_value()) {
-    return sm90_fp8_pertensor_dispatch_shape_impl<OutType, true>(out, a, b, scales_a, scales_b, bias, stream);
+    if (scalar_a) {
+      return sm90_fp8_pertensor_dispatch_shape_impl<OutType, true, true>(out, a, b, scales_a, scales_b, bias, stream);
+    }
+    return sm90_fp8_pertensor_dispatch_shape_impl<OutType, true, false>(out, a, b, scales_a, scales_b, bias, stream);
   }
-  return sm90_fp8_pertensor_dispatch_shape_impl<OutType, false>(out, a, b, scales_a, scales_b, bias, stream);
+  if (scalar_a) {
+    return sm90_fp8_pertensor_dispatch_shape_impl<OutType, false, true>(out, a, b, scales_a, scales_b, bias, stream);
+  }
+  return sm90_fp8_pertensor_dispatch_shape_impl<OutType, false, false>(out, a, b, scales_a, scales_b, bias, stream);
 }
 
 }  // namespace sglang
