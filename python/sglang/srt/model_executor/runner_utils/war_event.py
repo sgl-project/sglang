@@ -1,7 +1,6 @@
 """WAR read-done event utilities for CUDA graph runners."""
 
 import logging
-from enum import Enum, auto
 from typing import Optional
 
 import torch
@@ -14,29 +13,15 @@ from sglang.srt.utils import is_cuda
 logger = logging.getLogger(__name__)
 
 
-# Where the WAR read-done record lands; derived from a SharedReadBoundary
-# by resolve_war_read_done_policy.
-class WarReadDonePolicy(Enum):
-    NONE = auto()
-    PRE_REPLAY = auto()
-    IN_GRAPH = auto()
-    POST_REPLAY = auto()
-
-
-def resolve_war_read_done_policy(
+def resolve_war_read_done_record(
     boundary: SharedReadBoundary, *, node_planted: bool
-) -> WarReadDonePolicy:
-    """IN_REPLAY without a planted node falls back to a pre-replay record
+) -> SharedReadBoundary:
+    """Record placement for a declared boundary; UNKNOWN records nothing.
+    IN_REPLAY without a planted node falls back to a pre-replay record
     (non-capturing runs / no external-event support; pre-existing behavior)."""
-    if boundary is SharedReadBoundary.PRE_REPLAY:
-        return WarReadDonePolicy.PRE_REPLAY
-    if boundary is SharedReadBoundary.IN_REPLAY:
-        if node_planted:
-            return WarReadDonePolicy.IN_GRAPH
-        return WarReadDonePolicy.PRE_REPLAY
-    if boundary is SharedReadBoundary.POST_REPLAY:
-        return WarReadDonePolicy.POST_REPLAY
-    return WarReadDonePolicy.NONE
+    if boundary is SharedReadBoundary.IN_REPLAY and not node_planted:
+        return SharedReadBoundary.PRE_REPLAY
+    return boundary
 
 
 def make_war_read_done_event(device_module) -> Optional[torch.cuda.Event]:

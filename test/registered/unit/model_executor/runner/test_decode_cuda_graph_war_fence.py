@@ -10,7 +10,6 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_utils import WarReadDonePolicy
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -48,35 +47,35 @@ def _runner(*, target_verify_war: bool = False, planted: bool = False):
     return runner
 
 
-def test_war_read_done_policy():
+def test_war_read_done_record():
     # Planted node: the graph re-arms it every replay.
     assert (
-        _runner(planted=True)._war_read_done_policy(_attn_backend(), ForwardMode.DECODE)
-        is WarReadDonePolicy.IN_GRAPH
+        _runner(planted=True)._war_read_done_record(_attn_backend(), ForwardMode.DECODE)
+        is SharedReadBoundary.IN_REPLAY
     )
     # No node, snapshot backend: all shared reads finish before launch.
     assert (
-        _runner()._war_read_done_policy(_attn_backend(), ForwardMode.DECODE)
-        is WarReadDonePolicy.PRE_REPLAY
+        _runner()._war_read_done_record(_attn_backend(), ForwardMode.DECODE)
+        is SharedReadBoundary.PRE_REPLAY
     )
     # Unrelated modes never publish from the decode graph runner.
     assert (
-        _runner(planted=True)._war_read_done_policy(_attn_backend(), ForwardMode.EXTEND)
-        is WarReadDonePolicy.NONE
+        _runner(planted=True)._war_read_done_record(_attn_backend(), ForwardMode.EXTEND)
+        is SharedReadBoundary.UNKNOWN
     )
     # Backend placement cannot opt an unsupported algorithm into publication.
     assert (
-        _runner(planted=True)._war_read_done_policy(
+        _runner(planted=True)._war_read_done_record(
             _attn_backend(breakable_metadata=True), ForwardMode.TARGET_VERIFY
         )
-        is WarReadDonePolicy.NONE
+        is SharedReadBoundary.UNKNOWN
     )
     # Captured-metadata verify keeps reading throughout the graph, even planted.
     assert (
-        _runner(target_verify_war=True, planted=True)._war_read_done_policy(
+        _runner(target_verify_war=True, planted=True)._war_read_done_record(
             _attn_backend(breakable_metadata=True), ForwardMode.TARGET_VERIFY
         )
-        is WarReadDonePolicy.POST_REPLAY
+        is SharedReadBoundary.POST_REPLAY
     )
 
 
