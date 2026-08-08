@@ -517,13 +517,16 @@ class TpModelWorker(BaseTpWorker):
             * self.model_runner.dcp_size
             - 1,
         )
+        max_req_input_len = max_req_len - 5
+        if self.dllm_algorithm is not None:
+            max_req_input_len -= self.dllm_algorithm.block_size
         return (
             self.model_runner.max_total_num_tokens,
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
             max_req_len,
-            max_req_len - 5,
+            max_req_input_len,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,

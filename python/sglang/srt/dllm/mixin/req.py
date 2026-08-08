@@ -26,7 +26,9 @@ class ReqDllmMixin:
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
-            if len(self.origin_input_ids) < self.dllm_config.block_size:
+            if self.dllm_config.is_uniform:
+                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            elif len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
@@ -46,19 +48,24 @@ class ReqDllmMixin:
             return
 
         prefix_length = len(self.prefix_indices)
-        min_required_length = prefix_length + self.dllm_config.block_size
+        if self.dllm_config.is_uniform:
+            self.dllm_phase = (
+                DllmReqPhase.STAGING_PREFILL
+                if prefix_length < self.dllm_block_offset
+                else DllmReqPhase.STAGING_DECODE
+            )
+            return
 
+        min_required_length = prefix_length + self.dllm_config.block_size
         if len(self.full_untruncated_fill_ids) < min_required_length:
-            # still incoming stage
             return
 
         input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
-        is_prefill_phase = self.dllm_config.mask_id not in input_block
-
-        if is_prefill_phase:
-            self.dllm_phase = DllmReqPhase.STAGING_PREFILL
-        else:
-            self.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.dllm_phase = (
+            DllmReqPhase.STAGING_PREFILL
+            if self.dllm_config.mask_id not in input_block
+            else DllmReqPhase.STAGING_DECODE
+        )
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_incomplete_ids:
@@ -72,22 +79,34 @@ class ReqDllmMixin:
             # non-incomplete path which also defers it to the adder.
             return
 
-        self.dllm_block_offset = (
-            0
-            if not self.dllm_initialized
-            else self.dllm_block_offset + self.dllm_config.block_size
-        )
-        self.full_untruncated_fill_ids = (
-            self.origin_input_ids
-            + self.output_ids
-            + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
-        )
+        if self.dllm_config.is_uniform:
+            self._refresh_fill_ids()
+            self.dllm_block_offset = self.seqlen
+            if self.dllm_initialized:
+                self.full_untruncated_fill_ids.extend([0] * self.dllm_config.block_size)
+        else:
+            self.dllm_block_offset = (
+                0
+                if not self.dllm_initialized
+                else self.dllm_block_offset + self.dllm_config.block_size
+            )
+            self.full_untruncated_fill_ids = (
+                self.origin_input_ids
+                + self.output_ids
+                + array(
+                    "q",
+                    [self.dllm_config.mask_id] * self.dllm_config.block_size,
+                )
+            )
         self.dllm_initialized = True
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
-        assert (
-            prefix_len % self.dllm_config.block_size == 0
-        ), f"Unexpected prefix len: {prefix_len}"
-        if prefix_len > self.dllm_block_offset:
-            self.dllm_block_offset = prefix_len
+        if self.dllm_config.is_uniform:
+            assert prefix_len <= self.dllm_block_offset
+        else:
+            assert (
+                prefix_len % self.dllm_config.block_size == 0
+            ), f"Unexpected prefix len: {prefix_len}"
+            if prefix_len > self.dllm_block_offset:
+                self.dllm_block_offset = prefix_len

@@ -41,6 +41,9 @@ class DllmAlgorithm:
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         return [None] * forward_batch.batch_size
 
+    def prepare_inputs(self, forward_batch: ForwardBatch, states: List[Any]) -> None:
+        pass
+
     def max_steps(self, block_size: int) -> int:
         return block_size + 1
 
@@ -76,6 +79,8 @@ class DllmAlgorithm:
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
         start_list = self._block_start_list(forward_batch)
+        states = self.init_step_state(forward_batch)
+        self.prepare_inputs(forward_batch, states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         # No mask to denoise: return empty so process_batch_result_dllm skips the
@@ -83,7 +88,6 @@ class DllmAlgorithm:
         if all(start == self.block_size for start in start_list):
             return out.logits_output, [], None, None, out.can_run_graph
 
-        states = self.init_step_state(forward_batch)
         # NPU: attention metadata is stable across a block's denoise steps (the
         # first forward above already planned it), so mark it ready once and let
         # every later forward skip re-planning.
@@ -121,6 +125,7 @@ class DllmAlgorithm:
             else:
                 states.append(carried)
 
+        self.prepare_inputs(forward_batch, states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
 

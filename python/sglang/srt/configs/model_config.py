@@ -735,6 +735,7 @@ class ModelConfig:
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
+            "DiffusionGemmaForBlockDiffusion",
         ]
 
     @cached_property
@@ -1774,6 +1775,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
     "Gemma4UnifiedForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -2018,6 +2020,7 @@ def is_hybrid_swa_model(
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
+        "DiffusionGemmaForBlockDiffusion",
         "LagunaForCausalLM",
         "MellumForCausalLM",
         "InklingForConditionalGeneration",
@@ -2093,6 +2096,7 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
+        or "DiffusionGemmaForBlockDiffusion" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
     ):

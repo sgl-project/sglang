@@ -635,7 +635,11 @@ class PrefillAdder:
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
 
-        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        self.rem_dllm_tokens = (
+            self.rem_input_tokens
+            if dllm_config.is_uniform
+            else max_running_reqs * self.dllm_block_size
+        )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -898,26 +902,37 @@ class PrefillAdder:
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
 
-    def _get_dllm_remain_tokens(self) -> int:
-        _rem_tokens = min(
-            self.rem_dllm_tokens,
-            self.dllm_block_size,
-            int(self.rem_total_tokens),
-        )
+    def _get_dllm_remain_tokens(self, req: Optional[Req] = None) -> int:
+        _rem_tokens = min(self.rem_dllm_tokens, int(self.rem_total_tokens))
+        if not (
+            self.dllm_config.is_uniform and req is not None and req.is_dllm_prefill()
+        ):
+            _rem_tokens = min(_rem_tokens, self.dllm_block_size)
         if _rem_tokens <= 0:
             _rem_tokens = self.rem_dllm_tokens
 
+        _rem_tokens = min(_rem_tokens, int(self.cur_rem_tokens) - self.page_size)
+        if self.is_hybrid_swa:
+            _rem_tokens = min(_rem_tokens, int(self.rem_swa_tokens) - self.page_size)
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        if self.dllm_config.is_uniform:
+            remaining = (
+                req.dllm_block_offset - prefix_len
+                if req.is_dllm_prefill()
+                else len(req.full_untruncated_fill_ids) - prefix_len
+            )
+            limit = self.rem_dllm_tokens
+            if not req.is_dllm_prefill():
+                limit = min(limit, self.dllm_block_size)
+            trunc_len = min(limit, remaining)
+        else:
+            trunc_len = (
+                min(self.rem_dllm_tokens, self.dllm_block_size)
+                // self.page_size
+                * self.page_size
+            )
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 
@@ -943,7 +958,7 @@ class PrefillAdder:
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
-        _rem_tokens = self._get_dllm_remain_tokens()
+        _rem_tokens = self._get_dllm_remain_tokens(req)
 
         if _rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -952,7 +967,15 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
+        if self.dllm_config.is_uniform and req.is_dllm_prefill():
+            cand_extend_input_len = min(
+                cand_extend_input_len,
+                req.dllm_block_offset - len(req.prefix_indices),
+            )
+        if (
+            req.dllm_incomplete_ids
+            or (self.dllm_config.is_uniform and not req.is_dllm_prefill())
+        ) and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
@@ -976,13 +999,13 @@ class PrefillAdder:
         # Return based on remaining token availability
         return (
             AddReqResult.NO_TOKEN
-            if self._get_dllm_remain_tokens() <= 0
+            if self._get_dllm_remain_tokens(req) <= 0
             else AddReqResult.CONTINUE
         )
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
-            _rem_tokens = self._get_dllm_remain_tokens()
+            _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
