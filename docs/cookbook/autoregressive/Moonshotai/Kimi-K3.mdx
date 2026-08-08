@@ -19,7 +19,7 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 ```bash Command
 docker pull lmsysorg/sglang:kimi-k3 # CUDA13
 docker pull lmsysorg/sglang:kimi-k3-cu12 # CUDA12
-docker pull lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727 # ROCM
+docker pull lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260805 # ROCM daily image
 ```
 
 These tags publish with the public K3 launch; until then, build from the Dockerfiles linked below.
@@ -154,7 +154,7 @@ Remaining kernel sources JIT once from the public `flashinfer` wheel (a few minu
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
 | H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
-| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention, graph bs up to 256; DSPARK supported |
+| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention, graph bs up to 256, fp8 kvcache; DSPARK supported |
 
 **DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
 
@@ -309,7 +309,13 @@ sglang serve \
   --port 30000
 ```
 
-- `--mm-feature-transport cuda_ipc` — single-node only: skips the CPU round trip, bounded pool (per-tensor CPU fallback when full), reserves up to `SGLANG_MM_FEATURE_CACHE_MB` on the base GPU. Multi-node recipes use CPU transport.
+- `--mm-feature-transport cuda_ipc` — single-node only: skips the CPU round
+  trip and uses a bounded GPU pool.
+- On multi-node GB200/GB300, SGLang automatically uses CUDA VMM with CUDA
+  FABRIC handles when an IMEX channel is available; otherwise it uses CPU.
+  Pass `--mm-feature-transport cpu` to opt out.
+- CUDA IPC and CUDA VMM share the `SGLANG_MM_FEATURE_CACHE_MB` HBM budget
+  (1 GiB by default) and fall back to CPU per tensor when the pool is full.
 - 2 processor / 16 I/O workers are the measured defaults; more adds contention.
 - Leave `--mm-attention-backend` unset — auto-selected, with a correctness fallback.
 - Don't add `--mm-enable-dp-encoder`; K3 already shards images across TP ranks.
@@ -321,7 +327,7 @@ sglang serve \
 | PD | Supported. Image processing and ViT run on prefill; the PD transfer then moves both paged MLA KV and KDA recurrent state as described in [PD disaggregation](#pd-disaggregation). |
 | EPD | Supported on the public `kimi-k3` branch. Use an `--encoder-only` vision role and a `--language-only` prefill role; add the normal decode role for full EPD. See the [EPD guide](../../../docs/advanced_features/epd_disaggregation). |
 | MM encoder DP | Built in. K3 shards complete images across TP ranks, so leave `--mm-enable-dp-encoder` unset in unified, PD-prefill, and encoder-only roles. |
-| CUDA IPC | Compatible with the local processor-to-scheduler path on a single-node unified or PD-prefill role. It does not replace `--encoder-transfer-backend` for EPD or the PD KV/KDA transfer, and its bounded pool consumes HBM. |
+| MM feature transport | CUDA IPC is used on a single node. CUDA VMM with FABRIC handles is auto-selected for multi-node GB200/GB300 when IMEX is available. Both use a bounded HBM pool and are separate from EPD's `--encoder-transfer-backend` and the PD KV/KDA transfer. |
 | ViT BCG | Compatible with unified and encoder-only roles, but recommended only for repeated encoder shapes after measuring the HBM trade-off below. |
 
 #### Should ViT BCG be enabled?
