@@ -11,15 +11,15 @@ if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
 is exercised as the real method, no mock.
 """
 
-import time
+import threading
 import unittest
+from collections import deque
 from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
 import requests
-import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -64,7 +64,10 @@ def _make_controller(
     ctl.dp_active = [True] * launch_dp_size + [False] * (dp_size - launch_dp_size)
     ctl.server_args = SimpleNamespace(disaggregation_mode="null")
     ctl._pending_elastic_scale_update = None
-    ctl._last_bootstrap_topology_retry = 0.0
+    ctl._pending_elastic_scale_updates = deque()
+    ctl._published_elastic_scale_update = None
+    ctl._bootstrap_topology_update_lock = threading.Lock()
+    ctl._bootstrap_topology_update_in_progress = False
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     return ctl
@@ -317,10 +320,19 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         )
         response = MagicMock()
 
-        with patch(
-            "sglang.srt.managers.data_parallel_controller.requests.post",
-            return_value=response,
-        ) as post:
+        def run_now(*, target, daemon):
+            return SimpleNamespace(start=target)
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.requests.post",
+                return_value=response,
+            ) as post,
+            patch(
+                "sglang.srt.managers.data_parallel_controller.threading.Thread",
+                side_effect=run_now,
+            ),
+        ):
             ctl.handle_elastic_scale_update(
                 ElasticScaleUpdateReq(
                     success=True,
@@ -337,7 +349,7 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         )
         response.raise_for_status.assert_called_once()
 
-    def test_scale_update_withholds_new_ranks_when_bootstrap_update_fails(self):
+    def test_scale_update_retries_bootstrap_update_in_background(self):
         ctl = _make_controller(dp_size=4, launch_dp_size=2)
         ctl.status[2:] = [False, False]
         ctl._active_workers = [0, 1]
@@ -354,21 +366,131 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             slot_count=2,
         )
 
-        with (
-            patch(
-                "sglang.srt.managers.data_parallel_controller.requests.post",
-                side_effect=requests.RequestException("bootstrap unavailable"),
-            ) as post,
-            patch("sglang.srt.managers.data_parallel_controller.time.sleep"),
-        ):
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.threading.Thread"
+        ) as thread:
             ctl.handle_elastic_scale_update(update)
 
-        self.assertEqual(post.call_count, 3)
         self.assertIs(ctl._pending_elastic_scale_update, update)
-        self.assertEqual(ctl.bootstrap_room_dp_size, 2)
-        self.assertEqual(ctl._active_workers, [0, 1])
+        self.assertTrue(ctl._bootstrap_topology_update_in_progress)
+        thread.assert_called_once()
 
-    def test_event_loop_retries_pending_bootstrap_topology_updates(self):
+    def test_background_bootstrap_retry_activates_new_ranks(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl.status[2:] = [False, False]
+        ctl._active_workers = [0, 1]
+        update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+        ctl._pending_elastic_scale_updates.append(update)
+        ctl._pending_elastic_scale_update = update
+        ctl._bootstrap_topology_update_in_progress = True
+
+        with (
+            patch.object(ctl, "_update_bootstrap_dp_size", side_effect=[False, True]),
+            patch("sglang.srt.managers.data_parallel_controller.time.sleep"),
+        ):
+            ctl._publish_bootstrap_topology_update()
+
+        self.assertIs(ctl._published_elastic_scale_update, update)
+        self.assertEqual(ctl.bootstrap_room_dp_size, 2)
+        ctl._apply_published_bootstrap_topology_update()
+        self.assertIsNone(ctl._pending_elastic_scale_update)
+        self.assertFalse(ctl._pending_elastic_scale_updates)
+        self.assertEqual(ctl.bootstrap_room_dp_size, 4)
+        self.assertEqual(ctl._active_workers, [0, 1, 2, 3])
+
+    def test_background_bootstrap_publisher_applies_incremental_updates_in_order(self):
+        ctl = _make_controller(dp_size=6, launch_dp_size=2)
+        ctl.status[2:] = [False, False, False, False]
+        ctl._active_workers = [0, 1]
+        first = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+        second = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=6,
+            slot_offset=4,
+            slot_count=2,
+        )
+        ctl._pending_elastic_scale_updates.extend((first, second))
+        ctl._pending_elastic_scale_update = first
+        ctl._bootstrap_topology_update_in_progress = True
+
+        with (
+            patch.object(ctl, "_update_bootstrap_dp_size", return_value=True) as update,
+            patch("sglang.srt.managers.data_parallel_controller.threading.Thread"),
+        ):
+            ctl._publish_bootstrap_topology_update()
+            ctl._apply_published_bootstrap_topology_update()
+            ctl._publish_bootstrap_topology_update()
+            ctl._apply_published_bootstrap_topology_update()
+
+        self.assertEqual(update.call_args_list, [call(4), call(6)])
+        self.assertIsNone(ctl._pending_elastic_scale_update)
+        self.assertEqual(ctl.bootstrap_room_dp_size, 6)
+        self.assertEqual(ctl._active_workers, [0, 1, 2, 3, 4, 5])
+
+    def test_background_publisher_does_not_mutate_active_ranks(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl.status[2:] = [False, False]
+        ctl._active_workers = [0, 1]
+        update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+        ctl._pending_elastic_scale_updates.append(update)
+        ctl._pending_elastic_scale_update = update
+        ctl._bootstrap_topology_update_in_progress = True
+
+        with patch.object(ctl, "_update_bootstrap_dp_size", return_value=True):
+            ctl._publish_bootstrap_topology_update()
+
+        self.assertEqual(ctl._active_workers, [0, 1])
+        self.assertEqual(ctl.bootstrap_room_dp_size, 2)
+        ctl._apply_published_bootstrap_topology_update()
+        self.assertEqual(ctl._active_workers, [0, 1, 2, 3])
+        self.assertEqual(ctl.bootstrap_room_dp_size, 4)
+
+    def test_pending_topology_update_rejects_inactive_direct_rank(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl._active_workers = [0, 1]
+        ctl._pending_elastic_scale_update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+        req = _req(routed_dp_rank=2)
+
+        ctl.round_robin_scheduler(req)
+
+        ctl.send_to_tokenizer.send_pyobj.assert_called_once()
+
+    def test_pending_topology_update_keeps_old_domain_routable(self):
+        ctl = _make_controller(dp_size=4, launch_dp_size=2)
+        ctl._active_workers = [0, 1]
+        ctl._pending_elastic_scale_update = ElasticScaleUpdateReq(
+            success=True,
+            effective_ep_size=4,
+            slot_offset=2,
+            slot_count=2,
+        )
+
+        ctl.round_robin_scheduler(_req())
+
+        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.send_to_tokenizer.send_pyobj.assert_not_called()
+
+    def test_event_loop_does_not_retry_bootstrap_topology_updates(self):
         ctl = _make_controller(dp_size=2)
         ctl.soft_watchdog = MagicMock()
         ctl.recv_from_tokenizer = MagicMock()
@@ -376,37 +498,17 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         with (
             patch(
                 "sglang.srt.managers.data_parallel_controller.sock_recv",
-                side_effect=zmq.ZMQError(),
+                side_effect=KeyboardInterrupt,
             ),
             patch.object(
                 ctl,
-                "_retry_pending_bootstrap_topology_update",
-                side_effect=KeyboardInterrupt,
-            ) as retry,
+                "_publish_bootstrap_topology_update",
+            ) as publish,
         ):
             with self.assertRaises(KeyboardInterrupt):
                 ctl.event_loop()
 
-        retry.assert_called_once()
-
-    def test_pending_topology_update_rejects_direct_rank_routing(self):
-        ctl = _make_controller(dp_size=4, launch_dp_size=2)
-        ctl._pending_elastic_scale_update = ElasticScaleUpdateReq(
-            success=True,
-            effective_ep_size=4,
-            slot_offset=2,
-            slot_count=2,
-        )
-        ctl._last_bootstrap_topology_retry = time.monotonic()
-        ctl.refresh_load_budget_on_dispatch = False
-        ctl.dispatching = MagicMock()
-        req = _req(routed_dp_rank=2)
-        req.time_stats = MagicMock()
-
-        ctl.dispatching_with_trace(req)
-
-        ctl.dispatching.assert_not_called()
-        ctl.send_to_tokenizer.send_pyobj.assert_called_once()
+        publish.assert_not_called()
 
 
 class TestTotalRequestsScheduler(CustomTestCase):
