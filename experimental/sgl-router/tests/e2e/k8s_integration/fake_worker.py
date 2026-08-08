@@ -33,9 +33,7 @@ def _load_generated_proto():
     output = tempfile.mkdtemp(prefix="load-monitor-proto-")
     app_root = Path(__file__).parent
     include = Path(grpc_tools.__file__).parent / "_proto"
-    proto_file = (
-        app_root / "sglang/router/loadmonitor/v1/load_monitor.proto"
-    )
+    proto_file = app_root / "sglang/router/loadmonitor/v1/load_monitor.proto"
     result = protoc.main(
         [
             "grpc_tools.protoc",
