@@ -6,7 +6,15 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=1200, stage="nightly", runner_config="8-gpu-h200")
+# Disabled at the registry as well as via @unittest.skip below, so its est_time
+# stops counting toward shard sizing while the class exits immediately. Drop
+# both once DeepEP raises kNumMaxTopK.
+register_cuda_ci(
+    est_time=1200,
+    stage="nightly",
+    runner_config="8-gpu-h200",
+    disabled="DeepEP low-latency dispatch caps num_topk at kNumMaxTopK=11; LongCat needs 12",
+)
 
 # LongCat-Flash-Lite-FP8 is the smallest member of the LongCat family
 # (~138 GB FP8 weights, hidden=3072, 14 layers, 256 routed + 128 zero
