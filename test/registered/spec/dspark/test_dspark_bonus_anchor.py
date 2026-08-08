@@ -12,6 +12,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     _resolve_corrected_logits_dtype,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _config(**overrides):
