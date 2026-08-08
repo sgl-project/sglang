@@ -606,6 +606,11 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    # Per-process device cache for DFlash target verify. Source identity and
+    # version ensure reassignment or in-place mutation invalidates the cache.
+    mrope_position_delta_gpu_cache: Optional[torch.Tensor] = None
+    mrope_position_delta_gpu_cache_source_id: Optional[int] = None
+    mrope_position_delta_gpu_cache_source_version: Optional[int] = None
 
     # Moss-VL related
     vision_position_ids: Optional[torch.Tensor] = None
@@ -752,6 +757,12 @@ class MultimodalInputs:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+            # The merged CPU source has a new layout/value. Rebuild derived
+            # caches lazily from the new source.
+            self.mrope_position_delta_repeated_cache = None
+            self.mrope_position_delta_gpu_cache = None
+            self.mrope_position_delta_gpu_cache_source_id = None
+            self.mrope_position_delta_gpu_cache_source_version = None
 
         for key, val in other.__dict__.items():
             if "_id" in key:

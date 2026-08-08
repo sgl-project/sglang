@@ -16,7 +16,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import fast_prefill_plan
+from sglang.srt.layers.attention.flashinfer_backend import (
+    WrapperDispatch,
+    _is_supported_dflash_fast_plan_topology,
+    fast_prefill_plan,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +42,28 @@ NUM_QO_HEADS = 8
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 DTYPE = torch.float16
+
+
+class TestDFlashFastPrefillPlanTopology(unittest.TestCase):
+    def test_supported_wrapper_layouts(self):
+        cases = (
+            ("draft", None, True),
+            ("draft", WrapperDispatch.SLIDING_WINDOW, True),
+            ("draft", WrapperDispatch.CROSS_ATTENTION, False),
+            ("target_verify", None, True),
+            ("target_verify", WrapperDispatch.SLIDING_WINDOW, False),
+            ("target_verify", WrapperDispatch.CROSS_ATTENTION, False),
+            ("unknown", None, False),
+        )
+        for plan_kind, dispatch_reason, expected in cases:
+            with self.subTest(
+                plan_kind=plan_kind,
+                dispatch_reason=dispatch_reason,
+            ):
+                self.assertEqual(
+                    _is_supported_dflash_fast_plan_topology(plan_kind, dispatch_reason),
+                    expected,
+                )
 
 
 @unittest.skipUnless(_HAS_FLASHINFER, "requires flashinfer")
@@ -133,12 +159,25 @@ class TestFastPrefillPlan(CustomTestCase):
         self._real_plan(w)
         return self._forward(w)
 
-    def _out_fast(self, *, kv_indices=None):
+    def _out_fast(
+        self,
+        *,
+        kv_indices=None,
+        kv_indptr_host=None,
+        kv_lens_host=None,
+        max_kv_len=None,
+    ):
         """Same attention, planned via the host-known fast path. One real plan()
         first populates `_cached_module` (mirrors capture), then fast_prefill_plan
         re-plans from host metadata."""
         if kv_indices is None:
             kv_indices = self.kv_indices
+        if kv_indptr_host is None:
+            kv_indptr_host = self.kv_indptr_host
+        if kv_lens_host is None:
+            kv_lens_host = self.kv_lens_host
+        if max_kv_len is None:
+            max_kv_len = self.max_kv_len
         w = self._new_wrapper()
         self._real_plan(w)
         fast_prefill_plan(
@@ -155,10 +194,10 @@ class TestFastPrefillPlan(CustomTestCase):
             q_data_type=DTYPE,
             kv_data_type=DTYPE,
             qo_indptr_host=self.qo_indptr_host,
-            kv_indptr_host=self.kv_indptr_host,
-            kv_lens_host=self.kv_lens_host,
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
             max_q_len=self.max_q_len,
-            max_kv_len=self.max_kv_len,
+            max_kv_len=max_kv_len,
         )
         return self._forward(w)
 
@@ -167,6 +206,22 @@ class TestFastPrefillPlan(CustomTestCase):
         # the same attention output.
         out_upstream = self._out_upstream()
         out_fast = self._out_fast()
+        torch.testing.assert_close(out_fast, out_upstream, rtol=0, atol=0)
+
+    def test_dflash_full_attention_conservative_bound_matches_upstream(self):
+        # DFlash overlap may expose a host planning bound that is larger than
+        # the exact device layout. The host values only schedule work; the
+        # device indptr/indices remain authoritative for attention addressing.
+        kv_lens_host = self.kv_lens_host + NUM_TOKENS_PER_REQ
+        kv_indptr_host = torch.zeros(self.bs + 1, dtype=torch.int32, device="cpu")
+        kv_indptr_host[1:] = torch.cumsum(kv_lens_host, dim=0)
+
+        out_upstream = self._out_upstream()
+        out_fast = self._out_fast(
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
+            max_kv_len=int(kv_lens_host.max()),
+        )
         torch.testing.assert_close(out_fast, out_upstream, rtol=0, atol=0)
 
     def test_mutation_changes_output(self):
