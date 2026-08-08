@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAMetadata,
 )
+from sglang.srt.layers.attention.dsv4.indexer import topk_transform_512_flashinfer
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -32,7 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -449,6 +450,148 @@ class TestDSAIndexer(CustomTestCase):
             index=perm,
         )
 
+    def _assert_dsv4_compact_topk_result(
+        self,
+        scores: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        out_page_indices: torch.Tensor,
+        out_raw_indices: Optional[torch.Tensor],
+        page_size: int,
+    ) -> None:
+        topk = out_page_indices.shape[1]
+        for row in range(scores.shape[0]):
+            seq_len = int(seq_lens[row].item())
+            expected_count = min(seq_len, topk)
+            if seq_len <= topk:
+                expected_raw = torch.arange(
+                    seq_len, dtype=torch.int32, device=scores.device
+                )
+            else:
+                expected_raw = torch.topk(
+                    scores[row, :seq_len], topk, sorted=False
+                ).indices.to(torch.int32)
+            expected_page_indices = (
+                page_table[row, expected_raw.long() // page_size] * page_size
+                + expected_raw % page_size
+            )
+
+            actual_page_indices = out_page_indices[row]
+            valid = actual_page_indices >= 0
+            self.assertEqual(int(valid.sum().item()), expected_count)
+            expected_valid = torch.arange(topk, device=scores.device) < expected_count
+            self.assertTrue(torch.equal(valid, expected_valid))
+            self.assertTrue(torch.all(actual_page_indices[~valid] == -1))
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(actual_page_indices[valid]).values,
+                    torch.sort(expected_page_indices).values,
+                )
+            )
+
+            if out_raw_indices is not None:
+                actual_raw = out_raw_indices[row]
+                raw_valid = actual_raw >= 0
+                self.assertTrue(torch.equal(raw_valid, valid))
+                self.assertTrue(
+                    torch.equal(
+                        torch.sort(actual_raw[raw_valid]).values,
+                        torch.sort(expected_raw).values,
+                    )
+                )
+                translated_raw = (
+                    page_table[row, actual_raw[raw_valid].long() // page_size]
+                    * page_size
+                    + actual_raw[raw_valid] % page_size
+                )
+                self.assertTrue(
+                    torch.equal(actual_page_indices[raw_valid], translated_raw)
+                )
+
+    def test_dsv4_flashinfer_compact_topk_cuda_graph(self):
+        num_rows, max_len, page_size = 4, 2048, 64
+        score_storage = torch.empty(
+            (num_rows, max_len + 16), dtype=torch.float32, device=self.device
+        )
+        scores = score_storage[:, 1 : max_len + 1]
+        self.assertFalse(scores.is_contiguous())
+
+        page_table = 17 + torch.arange(
+            num_rows * (max_len // page_size),
+            dtype=torch.int32,
+            device=self.device,
+        ).reshape(num_rows, max_len // page_size)
+
+        for topk in (512, 1024):
+            for with_raw_output in (False, True):
+                with self.subTest(topk=topk, with_raw_output=with_raw_output):
+                    scores.copy_(
+                        torch.arange(max_len, dtype=torch.float32, device=self.device)
+                        .unsqueeze(0)
+                        .expand(num_rows, -1)
+                    )
+                    seq_lens = torch.full(
+                        (num_rows,), max_len, dtype=torch.int32, device=self.device
+                    )
+                    out_page_indices = torch.empty(
+                        (num_rows, topk), dtype=torch.int32, device=self.device
+                    )
+                    out_raw_indices = (
+                        torch.empty_like(out_page_indices) if with_raw_output else None
+                    )
+
+                    with (
+                        envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
+                        envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
+                    ):
+                        topk_transform_512_flashinfer(
+                            scores,
+                            seq_lens,
+                            page_table,
+                            out_page_indices,
+                            page_size,
+                            out_raw_indices,
+                        )
+                        torch.cuda.synchronize()
+
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            topk_transform_512_flashinfer(
+                                scores,
+                                seq_lens,
+                                page_table,
+                                out_page_indices,
+                                page_size,
+                                out_raw_indices,
+                            )
+
+                        scores.copy_(
+                            torch.arange(
+                                max_len, 0, -1, dtype=torch.float32, device=self.device
+                            )
+                            .unsqueeze(0)
+                            .expand(num_rows, -1)
+                        )
+                        page_table.add_(100)
+                        seq_lens.copy_(
+                            torch.tensor(
+                                [0, topk - 1, topk + 73, max_len],
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                        )
+                        graph.replay()
+                        torch.cuda.synchronize()
+
+                    self._assert_dsv4_compact_topk_result(
+                        scores,
+                        seq_lens,
+                        page_table,
+                        out_page_indices,
+                        out_raw_indices,
+                        page_size,
+                    )
+
     def _run_unfused_topk_backend_validity_test(
         self,
         batch_size: int,
@@ -570,25 +713,55 @@ class TestDSAIndexer(CustomTestCase):
         query_lens: Optional[List[int]] = None,
     ):
         num_rows = sum(query_lens) if query_lens is not None else batch_size
+        # Shifted PAGED rows use global score offsets and request-local page tables.
+        # Give each packed row more than topk entries to exercise actual selection.
+        if with_row_starts and topk_transform_method == TopkTransformMethod.PAGED:
+            max_score_len = max(max_score_len, batch_size * (topk + 1))
         logits = self._make_tie_free_logits(num_rows, max_score_len)
 
         if with_row_starts:
-            row_starts = torch.randint(
-                0,
-                max_score_len - 1,
-                (num_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_lengths = max_score_len - row_starts
-            random_lengths = torch.randint(
-                1,
-                max_score_len,
-                (num_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
+            if topk_transform_method == TopkTransformMethod.PAGED:
+                packed_row_size = max_score_len // batch_size
+                self.assertGreaterEqual(packed_row_size, topk)
+                cu_seqlens_k = (
+                    torch.arange(batch_size + 1, dtype=torch.int32, device=self.device)
+                    * packed_row_size
+                )
+                if query_lens is None:
+                    row_to_batch = torch.arange(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    row_to_batch = torch.repeat_interleave(
+                        torch.arange(batch_size, dtype=torch.int32, device=self.device),
+                        torch.tensor(query_lens, dtype=torch.int32, device=self.device),
+                        output_size=num_rows,
+                    )
+                row_starts = cu_seqlens_k[:-1][row_to_batch]
+                seq_lens_expanded = torch.randint(
+                    topk + 1,
+                    packed_row_size + 1,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                row_starts = torch.randint(
+                    0,
+                    max_score_len - 1,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                max_lengths = max_score_len - row_starts
+                random_lengths = torch.randint(
+                    1,
+                    max_score_len,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
         else:
             row_starts = None
             seq_lens_expanded = torch.randint(
@@ -616,9 +789,10 @@ class TestDSAIndexer(CustomTestCase):
             )
             cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
             batch_idx_list = list(range(batch_size))
-        cu_seqlens_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device
-        )
+        if not (with_row_starts and topk_transform_method == TopkTransformMethod.PAGED):
+            cu_seqlens_k = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
         dsa_cu_seqlens_k = torch.zeros(
             num_rows + 1, dtype=torch.int32, device=self.device
         )
@@ -677,13 +851,21 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=DSATopKBackend.FLASHINFER,
         )
 
+        import flashinfer
+
         repeat_interleave = torch.repeat_interleave
+        top_k_page_table_transform = flashinfer.top_k_page_table_transform
         with (
             envs.SGLANG_DSA_FUSE_TOPK.override(True),
             patch(
                 "sglang.srt.layers.attention.dsa_backend.torch.repeat_interleave",
                 wraps=repeat_interleave,
             ) as mock_repeat_interleave,
+            patch.object(
+                flashinfer,
+                "top_k_page_table_transform",
+                wraps=top_k_page_table_transform,
+            ) as mock_top_k_page_table_transform,
         ):
             out_sgl = metadata_sgl.topk_transform(
                 logits,
@@ -699,6 +881,25 @@ class TestDSAIndexer(CustomTestCase):
                 cu_seqlens_q=q_lens,
                 batch_idx_list=batch_idx_list,
             )
+
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            mock_top_k_page_table_transform.assert_called_once()
+            call_kwargs = mock_top_k_page_table_transform.call_args.kwargs
+            if row_starts is None:
+                self.assertIsNone(call_kwargs["row_starts"])
+                self.assertIsNone(call_kwargs["page_table_row_starts"])
+            else:
+                self.assertTrue(torch.equal(call_kwargs["row_starts"], row_starts))
+                self.assertIsNotNone(call_kwargs["row_to_batch"])
+                expected_page_table_row_starts = (
+                    row_starts - cu_seqlens_k[:-1][call_kwargs["row_to_batch"]]
+                )
+                self.assertTrue(
+                    torch.equal(
+                        call_kwargs["page_table_row_starts"],
+                        expected_page_table_row_starts,
+                    )
+                )
 
         if query_lens is not None:
             self.assertTrue(mock_repeat_interleave.call_args_list)

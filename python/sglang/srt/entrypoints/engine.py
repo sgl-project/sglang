@@ -1650,7 +1650,10 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if server_args.attention_backend == "flashinfer":
+        if (
+            server_args.attention_backend == "flashinfer"
+            or server_args.dsa_topk_backend == "flashinfer"
+        ):
             assert_pkg_version(
                 "flashinfer_python",
                 "0.6.15.post1",

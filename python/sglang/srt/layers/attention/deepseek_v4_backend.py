@@ -669,6 +669,7 @@ class DeepseekV4AttnBackend(
                 self.enable_deepseek_v4_fp4_indexer and _is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            enable_topk_v2=self.dsa_topk_backend.is_sgl_kernel(),
         )
 
     def init_forward_metadata_decode(
