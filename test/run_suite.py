@@ -182,6 +182,8 @@ OTHER_SUITES = {
         # nightly suites; weekly is just another stage. Listed here rather than
         # in NIGHTLY_SUITES because it is neither per-commit nor nightly -- the
         # three dicts only differ in which names this backend may declare.
+        "weekly-test-1-gpu-large",
+        "weekly-test-4-gpu-h100",
         "weekly-test-8-gpu-h200",
     ],
 }
