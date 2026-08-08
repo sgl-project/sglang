@@ -26,7 +26,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct KdaPackedDecodeParams {
   const bf16_t* __restrict__ mixed_qkv;  // [B, 2*H*K + HV*V]
@@ -237,4 +237,4 @@ struct KdaPackedDecodeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
