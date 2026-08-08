@@ -1831,10 +1831,12 @@ class FlashAttentionBackend(AttentionBackend):
         fa_k_descale, fa_v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
+        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
+            and self.fa_impl_ver != 4
             and not self.kv_cache_is_mxfp8
         ):
             if layer.k_scale is not None:
