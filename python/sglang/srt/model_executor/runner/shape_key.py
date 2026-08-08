@@ -27,11 +27,14 @@ class ShapeKey:
         - prefill: num_tokens
         - decode:  bs
     stream_idx:   pdmux stream index, or None for single-stream runners.
-    variant_label: optional execution variant (for example, "lora",
-        "nolora", or "chunked_prefix"), or None for runners that don't
-        record per-variant graphs.
+    variant_label: LoRA-variant label ("lora" / "nolora"), or None
+        for runners that don't record per-variant graphs.
+    dsa_variant: DSA decode dual-graph variant ("dense" / "sparse"), or None
+        when DSA dual-graph capture is not enabled. Composes with variant_label
+        so LoRA and DSA variants can be captured independently.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
+    dsa_variant: Optional[str] = None
