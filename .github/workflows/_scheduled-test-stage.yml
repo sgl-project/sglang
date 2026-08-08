@@ -30,11 +30,11 @@ on:
         required: false
         type: number
         default: 1
-      max_parallel:
-        description: 'Concurrent partitions for this runner pool.'
+      full_parallel:
+        description: 'Run every shard at once instead of one at a time. Off by default so a scheduled run leaves capacity for per-commit CI.'
         required: false
-        type: number
-        default: 1
+        type: boolean
+        default: false
       run_timeout_minutes:
         description: 'timeout-minutes for the test step.'
         required: false
@@ -69,7 +69,9 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_parallel }}
+      # 128 is just "no limit" -- GitHub queues shards against whatever the pool
+      # actually has, so this file never has to track runner counts.
+      max-parallel: ${{ inputs.full_parallel && 128 || 1 }}
       matrix:
         partition: ${{ fromJson(inputs.partition_ids) }}
     steps:

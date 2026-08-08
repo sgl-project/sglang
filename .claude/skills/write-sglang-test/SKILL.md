@@ -120,7 +120,7 @@ CUDA nightly suites are named `nightly-test-{runner_config}` — one per machine
 - `nightly-test-1-gpu-large` (CUDA)
 - `nightly-test-2-gpu-large` (CUDA)
 - `nightly-test-8-gpu-h200` (CUDA)
-- `nightly-test-4-gpu-gb300-nightly` (CUDA)
+- `nightly-test-4-gpu-gb300` (CUDA)
 - `nightly-amd` (AMD)
 - `nightly-amd-8-gpu-mi35x` (AMD)
 - `nightly-1-npu-a3` (NPU)

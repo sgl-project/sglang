@@ -15,6 +15,11 @@ on:
         options:
           - 'all'
           - '8-gpu-h200'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: weekly-test-nvidia-${{ github.ref }}
@@ -29,4 +34,5 @@ jobs:
       runner_config: 8-gpu-h200
       runs_on: 8-gpu-h200
       run_timeout_minutes: 240
+      full_parallel: ${{ inputs.full_parallel || false }}
     secrets: inherit

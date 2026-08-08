@@ -19,10 +19,15 @@ on:
           - '2-gpu-large'
           - '4-gpu-h100'
           - '4-gpu-b200'
-          - '4-gpu-gb300-nightly'
+          - '4-gpu-gb300'
           - '8-gpu-h200'
           - '8-gpu-b200'
           - 'diffusion'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
       force_baseline_update:
         description: 'Refresh the precision rolling baseline instead of comparing (sets SGLANG_PRECISION_FORCE_UPDATE=1). Dispatch once after an intentional forward-path dtype/precision change stales the baseline; later scheduled runs compare against it and go green.'
         required: false
@@ -40,14 +45,20 @@ on:
         required: false
         type: string
         default: 'all'
+      full_parallel:
+        description: 'Run all shards of a job at once instead of one at a time.'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
-  # Partition counts target ~2.5-3h per partition from the suite's summed
-  # est_time; max_parallel is how many machines the pool grants at once.
+  # Partition counts target ~2.5-3h per shard from the suite's summed est_time.
+  # Shards run one at a time unless the run is dispatched with full_parallel,
+  # so a scheduled run never drains a pool that per-commit CI shares.
   nightly-1-gpu-large:
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
     uses: ./.github/workflows/_scheduled-test-stage.yml
@@ -56,6 +67,7 @@ jobs:
       runner_config: 1-gpu-large
       runs_on: 1-gpu-h100
       run_timeout_minutes: 120
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -69,8 +81,8 @@ jobs:
       # 3, not 2: two 2h VLM tests dominate and must land in different shards.
       partition_ids: '[0, 1, 2]'
       partition_count: 3
-      max_parallel: 2
       run_timeout_minutes: 240
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -82,6 +94,7 @@ jobs:
       runner_config: 4-gpu-h100
       runs_on: 4-gpu-h100
       run_timeout_minutes: 120
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -96,20 +109,23 @@ jobs:
       # Scheduled runs never rebuild it, so pin the non-kernel pool.
       runs_on: 4-gpu-b200
       run_timeout_minutes: 150
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
     secrets: inherit
 
-  nightly-4-gpu-gb300-nightly:
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300-nightly')
+  nightly-4-gpu-gb300:
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
     uses: ./.github/workflows/_scheduled-test-stage.yml
     with:
       stage: nightly
-      runner_config: 4-gpu-gb300-nightly
-      runs_on: 4-gpu-gb300-nightly
+      runner_config: 4-gpu-gb300
+      runs_on: 4-gpu-gb300
+      # One 2h test per shard: three of the four have est_time 7200, so pairing
+      # any two would let their per-file budgets outrun run_timeout_minutes.
       partition_ids: '[0, 1, 2, 3]'
       partition_count: 4
-      max_parallel: 4
       run_timeout_minutes: 300
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -122,8 +138,8 @@ jobs:
       runs_on: 8-gpu-h200
       partition_ids: '[0, 1, 2, 3]'
       partition_count: 4
-      max_parallel: 2
       run_timeout_minutes: 300
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
       force_baseline_update: ${{ inputs.force_baseline_update || false }}
     secrets: inherit
@@ -137,8 +153,8 @@ jobs:
       runs_on: 8-gpu-b200
       partition_ids: '[0, 1, 2, 3]'
       partition_count: 4
-      max_parallel: 2
       run_timeout_minutes: 300
+      full_parallel: ${{ inputs.full_parallel || false }}
       ref: ${{ inputs.ref }}
     secrets: inherit
 
@@ -263,7 +279,7 @@ jobs:
       - nightly-2-gpu-large
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
-      - nightly-4-gpu-gb300-nightly
+      - nightly-4-gpu-gb300
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
       - nightly-test-diffusion

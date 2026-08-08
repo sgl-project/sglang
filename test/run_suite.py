@@ -129,7 +129,7 @@ NIGHTLY_SUITES = {
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
         "nightly-test-4-gpu-b200",
-        "nightly-test-4-gpu-gb300-nightly",
+        "nightly-test-4-gpu-gb300",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
     ],
