@@ -98,23 +98,11 @@ async fn main() -> Result<()> {
         cfg.server.port
     );
 
-    // The reporting listener binds before discovery starts. Registration can
-    // therefore advertise the real port even when the configured port is 0.
-    let (load_monitor, grpc_handle) = if cfg.load_monitor.enabled {
-        let (monitor, handle) = sgl_router::load_monitor::bind_and_serve(cfg.load_monitor.clone())
-            .await
-            .context("start load-monitor gRPC server")?;
-        tracing::info!(
-            address = %handle.local_addr(),
-            "load-monitor gRPC listener ready",
-        );
-        (Arc::new(monitor), Some(handle))
-    } else {
-        (
-            Arc::new(sgl_router::load_monitor::LoadMonitor::disabled()),
-            None,
-        )
-    };
+    // The Router owns one outbound monitor session per discovered Worker.
+    // No Router-side gRPC listener or HTTP registration callback is needed.
+    let load_monitor = Arc::new(sgl_router::load_monitor::LoadMonitor::new(
+        cfg.load_monitor.clone(),
+    ));
 
     let tokenizers = Arc::new(
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
@@ -213,15 +201,12 @@ async fn main() -> Result<()> {
     let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
     let server_result = serve.await.context("axum serve");
 
-    // Cancel discovery and manager work, stop reporting renewals once, then
-    // join the janitor and gRPC listener before the process exits.
+    // Cancel discovery and manager work, close reporter sessions once, then
+    // join the active-load janitor before the process exits.
     discovery_handle.abort();
     manager_handle.abort();
-    load_monitor.stop_registrations().await;
+    load_monitor.shutdown().await;
     janitor_handle.shutdown().await;
-    if let Some(handle) = grpc_handle {
-        handle.shutdown(&load_monitor).await;
-    }
     server_result
 }
 

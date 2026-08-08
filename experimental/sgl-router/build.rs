@@ -3,7 +3,7 @@
 
 use std::error::Error;
 
-/// Generates Rust gRPC bindings from the Router-local load-monitor protocol.
+/// Generates Rust gRPC bindings from SGLang's canonical load-monitor protocol.
 ///
 /// The build uses a vendored `protoc`, so contributors and CI do not need a
 /// system protobuf compiler. The generated code is written to Cargo's normal
@@ -16,10 +16,12 @@ use std::error::Error;
 fn main() -> Result<(), Box<dyn Error>> {
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     std::env::set_var("PROTOC", protoc);
-    println!("cargo:rerun-if-changed=proto/load_monitor.proto");
+    const PROTO_ROOT: &str = "../../proto";
+    const PROTO_FILE: &str = "../../proto/sglang/router/loadmonitor/v1/load_monitor.proto";
+    println!("cargo:rerun-if-changed={PROTO_FILE}");
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["proto/load_monitor.proto"], &["proto"])?;
+        .compile_protos(&[PROTO_FILE], &[PROTO_ROOT])?;
     Ok(())
 }

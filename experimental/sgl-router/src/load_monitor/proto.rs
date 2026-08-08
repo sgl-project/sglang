@@ -7,4 +7,4 @@
 // scoped to generated bindings so handwritten Router code retains the lint.
 #![allow(unused_qualifications)]
 
-tonic::include_proto!("router.loadmonitor.v1");
+tonic::include_proto!("sglang.router.loadmonitor.v1");

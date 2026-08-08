@@ -51,10 +51,11 @@ with `--prefill-selector` and `--decode-selector`.
 
 ## Engine-reported load monitoring
 
-Load monitoring is disabled by default. When enabled, the Router first binds
-an independent gRPC listener, then asks every discovered worker to start or
-renew reporting through `/v1/start_reporting`. Port `0` is supported and the
-actual bound port is sent to the engine:
+Load monitoring is disabled by default. When enabled, the Router derives each
+Worker host from service discovery and dials the Worker's fixed Load Reporter
+port over h2c. The Router sends the first `RegisterRequest`, maintains the
+lease with `KeepAlive`, and consumes `LoadReport` frames on the same bidi
+stream:
 
 ```bash
 sgl-router \
@@ -64,14 +65,13 @@ sgl-router \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
   --policy round_robin \
   --load-monitor \
-  --load-monitor-bind-host 0.0.0.0 \
-  --load-monitor-bind-port 0 \
-  --load-monitor-report-ip 10.0.0.10
+  --load-reporter-port 31000
 ```
 
-`--load-monitor-report-ip` is required and must be reachable from the engine.
+`--load-reporter-port` is required with `--load-monitor` and must match the
+fixed `--load-reporter-port` configured on every SGLang Worker.
 The first version uses a fixed 1-second report interval, 3-second freshness
-window, 15-second lease, and 2-second registration timeout. This change keeps
+window, 15-second lease, and 2-second connection timeout. This change keeps
 routing policies unchanged; the immutable snapshot is the read-only boundary
 for follow-up scheduling integrations.
 
@@ -80,11 +80,10 @@ freshness, source and sequence metadata, complete DP-rank values, and aggregate
 load. This snapshot is intentionally not exposed as a public HTTP endpoint;
 follow-up scheduling policies consume it inside the Router process.
 
-The Router intentionally sends no `Authorization` header to
-`/v1/start_reporting`. It is therefore compatible with an unauthenticated
-open-source or fake engine. Engine builds that enforce `ADMIN_FORCE` on this
-endpoint currently reject registration with 401/403; authenticated reporting
-is outside this Router-only change.
+The current transport is insecure h2c and does not provide TLS, mTLS, or gRPC
+authentication. The report's `worker_addr` remains compatibility metadata;
+the Router associates every report with the discovery-owned Worker whose
+outbound task owns the stream.
 
 ## License
 

@@ -127,21 +127,12 @@ pub struct Cli {
     pub stale_request_timeout_secs: u64,
 
     // ---- engine-reported load monitor ----
-    /// Enable Router-initiated engine load reporting and snapshot scheduling.
+    /// Enable Router-initiated Worker load reporting and snapshot collection.
     #[arg(long)]
     pub load_monitor: bool,
-    /// Address for the independent load-monitor gRPC listener. Defaults to
-    /// `0.0.0.0` when `--load-monitor` is enabled.
+    /// Fixed gRPC reporter port paired with each discovered Worker host.
     #[arg(long)]
-    pub load_monitor_bind_host: Option<String>,
-    /// Port for the independent load-monitor gRPC listener. Defaults to `0`,
-    /// allowing the operating system to select a free port.
-    #[arg(long)]
-    pub load_monitor_bind_port: Option<u16>,
-    /// Router IP reachable from engines and advertised to
-    /// `/v1/start_reporting`. Required with `--load-monitor`.
-    #[arg(long)]
-    pub load_monitor_report_ip: Option<String>,
+    pub load_reporter_port: Option<std::num::NonZeroU16>,
 
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
@@ -295,11 +286,7 @@ impl Cli {
             },
             load_monitor: LoadMonitorConfig {
                 enabled: self.load_monitor,
-                bind_host: self
-                    .load_monitor_bind_host
-                    .unwrap_or_else(|| "0.0.0.0".to_string()),
-                bind_port: self.load_monitor_bind_port.unwrap_or(0),
-                report_ip: self.load_monitor_report_ip,
+                reporter_port: self.load_reporter_port,
             },
         };
         config.validate()?;
@@ -986,9 +973,9 @@ mod tests {
         );
     }
 
-    /// Enabling monitoring requires an engine-reachable callback IP.
+    /// Enabling monitoring requires the paired Worker reporter port.
     #[test]
-    fn rejects_load_monitor_without_report_ip() {
+    fn rejects_load_monitor_without_reporter_port() {
         let err = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
@@ -997,24 +984,24 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("load_monitor.report_ip must be non-empty"),
+            err.contains("--load-monitor requires --load-reporter-port"),
             "got: {err}"
         );
     }
 
-    /// Monitor address knobs cannot be silently ignored while disabled.
+    /// The reporter port cannot be silently ignored while monitoring is disabled.
     #[test]
     fn rejects_load_monitor_address_knob_while_disabled() {
         let err = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--load-monitor-bind-port",
+            "--load-reporter-port",
             "12345",
         ]))
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("load-monitor address configuration requires load monitoring"),
+            err.contains("--load-reporter-port requires --load-monitor"),
             "got: {err}"
         );
     }

@@ -120,6 +120,9 @@ spec:
                   fieldPath: status.podIP
           ports:
             - containerPort: 30000
+              name: http
+            - containerPort: 31000
+              name: load-reporter
           readinessProbe:
             httpGet:
               path: /health

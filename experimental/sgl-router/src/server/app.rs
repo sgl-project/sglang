@@ -51,9 +51,9 @@ async fn log_413(req: Request, next: Next) -> Response {
 
 /// Builds the HTTP application from one shared Router context.
 ///
-/// The input context supplies configuration, registries, policies, and the
-/// load monitor; the returned Axum router owns a clone of that context and is
-/// ready to be served by an already-bound listener.
+/// The input context supplies configuration, registries, policies, and active
+/// request bookkeeping; the returned Axum router owns a clone of that context
+/// and is ready to be served by an already-bound listener.
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))

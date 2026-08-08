@@ -73,8 +73,8 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
 /// `cfg` is `None` the default CB config is used for every worker
-/// (threshold = 3); when `load_monitor` is `None`, no engine-reporting
-/// registration tasks are created.
+/// (threshold = 3); when `load_monitor` is `None`, no Worker reporter
+/// sessions are created.
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
 /// introspection.  Tests that want a tighter timeout call

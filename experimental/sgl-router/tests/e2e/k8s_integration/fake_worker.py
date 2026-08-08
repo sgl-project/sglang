@@ -1,11 +1,7 @@
-"""Minimal fake SGLang worker for kind E2E integration testing.
+"""Minimal fake SGLang Worker for kind E2E integration testing.
 
-Responds to:
-  GET  /health                   -> {"status": "ok"}
-  GET  /server_info              -> {"served_model_name": MODEL_ID}
-  GET  /v1/models                -> list with a single MODEL_ID model entry
-  POST /v1/chat/completions      -> echoes the last user message back
-  POST /v1/start_reporting       -> renews an unauthenticated gRPC load stream
+The HTTP server exposes inference/discovery fixtures on port 30000. A separate
+h2c gRPC server exposes the canonical Load Reporter service on port 31000.
 """
 
 from __future__ import annotations
@@ -15,6 +11,7 @@ import os
 import sys
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import grpc
@@ -25,45 +22,201 @@ from grpc_tools import protoc
 
 
 def _load_generated_proto():
-    """Generate and import Python bindings for the Router-local test proto.
+    """Generate Python bindings from the repository's canonical reporter proto.
 
     Returns:
-        A tuple containing the protobuf messages module and gRPC stub module.
+        A tuple containing the protobuf messages module and gRPC module.
 
     Raises:
-        RuntimeError: If the vendored grpc-tools compiler rejects the schema.
+        RuntimeError: If grpc-tools cannot compile the canonical schema.
     """
     output = tempfile.mkdtemp(prefix="load-monitor-proto-")
+    app_root = Path(__file__).parent
     include = Path(grpc_tools.__file__).parent / "_proto"
+    proto_file = (
+        app_root / "sglang/router/loadmonitor/v1/load_monitor.proto"
+    )
     result = protoc.main(
         [
             "grpc_tools.protoc",
-            f"-I{Path(__file__).parent}",
+            f"-I{app_root}",
             f"-I{include}",
             f"--python_out={output}",
             f"--grpc_python_out={output}",
-            str(Path(__file__).parent / "load_monitor.proto"),
+            str(proto_file),
         ]
     )
     if result != 0:
         raise RuntimeError(f"grpc_tools.protoc failed with exit code {result}")
     sys.path.insert(0, output)
-    import load_monitor_pb2  # pylint: disable=import-outside-toplevel
-    import load_monitor_pb2_grpc  # pylint: disable=import-outside-toplevel
+    from sglang.router.loadmonitor.v1 import (  # pylint: disable=import-outside-toplevel
+        load_monitor_pb2,
+        load_monitor_pb2_grpc,
+    )
 
     return load_monitor_pb2, load_monitor_pb2_grpc
 
 
 load_monitor_pb2, load_monitor_pb2_grpc = _load_generated_proto()
 
-app = FastAPI()
-
 MODEL_ID = os.environ.get("MODEL_ID", "tiny")
 POD_IP = os.environ.get("POD_IP", "127.0.0.1")
-_reporting_task = None
-_reporting_config = None
-_lease_deadline = 0.0
+REPORTER_PORT = int(os.environ.get("LOAD_REPORTER_PORT", "31000"))
 _sequence_id = 0
+
+
+def _healthy_report():
+    """Build the next healthy single-rank LoadReport.
+
+    Returns:
+        A canonical LoadReport with a strictly increasing sequence number.
+    """
+    global _sequence_id
+    _sequence_id += 1
+    now_ms = int(time.time() * 1000)
+    return load_monitor_pb2.LoadReport(
+        source_instance_id=f"fake-{POD_IP}",
+        sequence_id=_sequence_id,
+        report_time_unix_ms=now_ms,
+        worker=load_monitor_pb2.Worker(
+            worker_addr=f"{POD_IP}:30000",
+            worker_type=load_monitor_pb2.WORKER_TYPE_REGULAR,
+            model=MODEL_ID,
+        ),
+        status=load_monitor_pb2.REPORT_STATUS_HEALTHY,
+        ranks=[
+            load_monitor_pb2.RankLoad(
+                dp_rank=0,
+                snapshot_time_unix_ms=now_ms,
+                num_running_reqs=0,
+                num_waiting_reqs=0,
+                num_waiting_uncached_tokens=0,
+                num_used_tokens=1,
+                num_total_tokens=1,
+                max_total_num_tokens=1024,
+                max_running_requests=32,
+                token_usage=1.0 / 1024.0,
+                gen_throughput=1.0,
+                cache_hit_rate=0.0,
+                utilization=0.0,
+            )
+        ],
+    )
+
+
+class FakeLoadMonitorService(load_monitor_pb2_grpc.LoadMonitorServiceServicer):
+    """Serve the Worker side of the Router-initiated bidi protocol."""
+
+    async def Monitor(self, request_iterator, _context):
+        """Acknowledge registration and stream reports until stop or lease expiry.
+
+        Args:
+            request_iterator: Async RouterFrame stream from one Router session.
+            _context: gRPC request context, unused by the fake implementation.
+
+        Yields:
+            WorkerFrame registration, report, or validation-error messages.
+        """
+        try:
+            first = await request_iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        if first.WhichOneof("payload") != "register":
+            yield load_monitor_pb2.WorkerFrame(
+                error=load_monitor_pb2.StreamError(
+                    code="INVALID_FIRST_FRAME",
+                    message="first frame must register",
+                )
+            )
+            return
+
+        register = first.register
+        if (
+            not register.router_id
+            or register.report_interval_ms <= 0
+            or register.lease_ttl_ms <= 0
+        ):
+            yield load_monitor_pb2.WorkerFrame(
+                error=load_monitor_pb2.StreamError(
+                    code="INVALID_ARGUMENT",
+                    message="invalid registration timing or router_id",
+                )
+            )
+            return
+
+        interval = register.report_interval_ms / 1000.0
+        lease_ttl = register.lease_ttl_ms / 1000.0
+        lease_deadline = time.monotonic() + lease_ttl
+        stopped = asyncio.Event()
+
+        async def consume_controls():
+            """Apply keep-alive, reconfiguration, and stop control frames.
+
+            Returns:
+                None. The coroutine ends at EOF or after a stop frame.
+            """
+            nonlocal interval, lease_ttl, lease_deadline
+            async for frame in request_iterator:
+                payload = frame.WhichOneof("payload")
+                if payload == "keep_alive":
+                    lease_deadline = time.monotonic() + lease_ttl
+                elif payload == "update_config":
+                    update = frame.update_config
+                    if update.HasField("report_interval_ms"):
+                        interval = update.report_interval_ms / 1000.0
+                    if update.HasField("lease_ttl_ms"):
+                        lease_ttl = update.lease_ttl_ms / 1000.0
+                    lease_deadline = time.monotonic() + lease_ttl
+                elif payload == "stop":
+                    stopped.set()
+                    return
+            stopped.set()
+
+        control_task = asyncio.create_task(consume_controls())
+        try:
+            yield load_monitor_pb2.WorkerFrame(
+                registered=load_monitor_pb2.RegisterResponse(
+                    lease_ttl_ms=register.lease_ttl_ms,
+                    renew_after_ms=max(1, register.lease_ttl_ms // 2),
+                )
+            )
+            while not stopped.is_set() and time.monotonic() < lease_deadline:
+                yield load_monitor_pb2.WorkerFrame(report=_healthy_report())
+                timeout = min(interval, max(0.0, lease_deadline - time.monotonic()))
+                try:
+                    await asyncio.wait_for(stopped.wait(), timeout=timeout)
+                except TimeoutError:
+                    pass
+        finally:
+            control_task.cancel()
+            await asyncio.gather(control_task, return_exceptions=True)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    """Own the fake Worker's independent gRPC reporter server.
+
+    Args:
+        _app: FastAPI application instance, unused by this fixture.
+
+    Yields:
+        Control to FastAPI after the reporter port has started listening.
+    """
+    server = grpc.aio.server()
+    load_monitor_pb2_grpc.add_LoadMonitorServiceServicer_to_server(
+        FakeLoadMonitorService(), server
+    )
+    bound_port = server.add_insecure_port(f"[::]:{REPORTER_PORT}")
+    if bound_port == 0:
+        raise RuntimeError(f"failed to bind load reporter port {REPORTER_PORT}")
+    await server.start()
+    try:
+        yield
+    finally:
+        await server.stop(grace=0)
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -75,8 +228,6 @@ async def health():
 @app.get("/server_info")
 async def server_info():
     """Return the model identity consumed by Router introspection."""
-    # The sgl-router worker manager fetches this on every Added event and
-    # uses `served_model_name` to populate the registry's model index.
     return {"served_model_name": MODEL_ID}
 
 
@@ -125,82 +276,6 @@ async def chat_completions(request: Request):
         ],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     }
-
-
-async def _report_stream():
-    """Maintain a reconnecting gRPC report stream until its lease expires.
-
-    Returns:
-        None. The coroutine exits after the last renewed lease deadline.
-    """
-    global _sequence_id
-    backoff = 0.2
-    while time.monotonic() < _lease_deadline:
-        config = dict(_reporting_config)
-        target = f"{config['ip']}:{config['port']}"
-        try:
-            async with grpc.aio.insecure_channel(target) as channel:
-                stub = load_monitor_pb2_grpc.LoadMonitorServiceStub(channel)
-
-                async def reports():
-                    """Yield periodic healthy reports while the lease is live."""
-                    global _sequence_id
-                    while time.monotonic() < _lease_deadline:
-                        _sequence_id += 1
-                        yield load_monitor_pb2.LoadReport(
-                            source_instance_id=f"fake-{POD_IP}",
-                            sequence_id=_sequence_id,
-                            report_time_unix_ms=int(time.time() * 1000),
-                            worker=load_monitor_pb2.Worker(
-                                worker_addr=f"{POD_IP}:30000",
-                                worker_type=load_monitor_pb2.WORKER_TYPE_REGULAR,
-                                model=MODEL_ID,
-                            ),
-                            status=load_monitor_pb2.REPORT_STATUS_HEALTHY,
-                            ranks=[
-                                load_monitor_pb2.RankLoad(
-                                    dp_rank=0,
-                                    snapshot_time_unix_ms=int(time.time() * 1000),
-                                    num_running_reqs=0,
-                                    num_waiting_reqs=0,
-                                    num_waiting_uncached_tokens=0,
-                                    num_used_tokens=1,
-                                    num_total_tokens=1,
-                                    max_total_num_tokens=1024,
-                                    max_running_requests=32,
-                                    token_usage=1.0 / 1024.0,
-                                    gen_throughput=1.0,
-                                    cache_hit_rate=0.0,
-                                    utilization=0.0,
-                                )
-                            ],
-                        )
-                        await asyncio.sleep(config["report_interval_ms"] / 1000.0)
-
-                await stub.Report(reports())
-                backoff = 0.2
-        except (grpc.aio.AioRpcError, OSError):
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 5.0)
-
-
-@app.post("/v1/start_reporting")
-async def start_reporting(request: Request):
-    """Start or renew the fake engine's unauthenticated reporting lease.
-
-    Args:
-        request: JSON request containing callback IP/port, interval, and TTL.
-
-    Returns:
-        A small acknowledgement showing that the lease was renewed.
-    """
-    global _lease_deadline, _reporting_config, _reporting_task
-    config = await request.json()
-    _reporting_config = config
-    _lease_deadline = time.monotonic() + config["lease_ttl_ms"] / 1000.0
-    if _reporting_task is None or _reporting_task.done():
-        _reporting_task = asyncio.create_task(_report_stream())
-    return {"status": "reporting"}
 
 
 if __name__ == "__main__":

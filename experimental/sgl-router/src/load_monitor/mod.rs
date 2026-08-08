@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Router-owned load reporting, ingestion, immutable snapshots, and renewal.
+//! Router-owned Worker reporter sessions and immutable load snapshots.
 
 pub mod proto;
 
@@ -11,48 +11,47 @@ use crate::workers::Worker;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use parking_lot::RwLock;
-use proto::load_monitor_service_server::{LoadMonitorService, LoadMonitorServiceServer};
-use proto::{LoadReport, RankLoad, ReportStatus, WorkerType};
+use proto::load_monitor_service_client::LoadMonitorServiceClient;
+use proto::{
+    router_frame, worker_frame, KeepAlive, LoadReport, RankLoad, RegisterRequest, ReportStatus,
+    RouterFrame, StopRequest,
+};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::num::NonZeroU16;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status};
+use tonic::transport::Endpoint;
+use tonic::Status;
 
-/// Engine endpoint used to start or renew reporting.
-pub const START_REPORTING_PATH: &str = "/v1/start_reporting";
 /// Requested engine report cadence.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Router-receipt age after which a report stops being schedulable.
 pub const STALE_AFTER: Duration = Duration::from_secs(3);
 /// Engine-side reporting lease renewed by the Router.
 pub const LEASE_TTL: Duration = Duration::from_secs(15);
-/// Timeout applied to each registration HTTP request.
-pub const REGISTRATION_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
-/// Initial registration retry delay.
+/// Timeout applied while connecting to one Worker reporter.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Initial gRPC reconnection delay.
 pub const RECONNECT_INITIAL: Duration = Duration::from_millis(200);
-/// Maximum exponential registration retry delay before jitter.
+/// Maximum exponential gRPC reconnection delay before jitter.
 pub const RECONNECT_MAX: Duration = Duration::from_secs(5);
-/// Maximum random delay added to registration retries.
+/// Maximum random delay added to reconnection retries.
 pub const RECONNECT_JITTER_MAX: Duration = Duration::from_millis(500);
 
 /// Lightweight internal result used while validating and binding an ingest
-/// stream.
-///
-/// Boxing keeps the error branch small; the gRPC boundary converts it back to
-/// the protocol-level [`Status`] returned to the engine.
+/// report.
 type IngestResult<T> = std::result::Result<T, Box<Status>>;
 
 /// Boxes a gRPC status for propagation through internal ingest helpers.
 ///
-/// The caller supplies the fully classified status, and the returned boxed
-/// value is unboxed exactly once by the tonic service boundary.
+/// The caller supplies the fully classified status. Boxing keeps validation
+/// error paths small without changing the public snapshot types.
 fn ingest_status(status: Status) -> Box<Status> {
     Box::new(status)
 }
@@ -153,23 +152,23 @@ impl LoadMonitorSnapshot {
 struct WorkerTarget {
     id: WorkerId,
     url: String,
-    origin: String,
+    reporter_endpoint: String,
     mode: WorkerMode,
     model_ids: Vec<String>,
 }
 
 impl WorkerTarget {
-    /// Builds the reporting identity for one registered Router worker.
+    /// Builds the reporting identity and paired reporter endpoint for a Worker.
     ///
     /// # Errors
     ///
-    /// Returns an error when the worker URL cannot be reduced to a unique
-    /// `host:port` origin.
-    fn from_worker(worker: &Arc<Worker>) -> Result<Self> {
+    /// Returns an error when the worker URL has no host or cannot be converted
+    /// to the reporter's h2c endpoint.
+    fn from_worker(worker: &Arc<Worker>, reporter_port: NonZeroU16) -> Result<Self> {
         Ok(Self {
             id: worker.id.clone(),
             url: worker.url.clone(),
-            origin: normalize_origin(&worker.url)?,
+            reporter_endpoint: reporter_endpoint(&worker.url, reporter_port)?,
             mode: worker.mode(),
             model_ids: worker
                 .model_ids
@@ -179,10 +178,11 @@ impl WorkerTarget {
         })
     }
 
-    /// Returns whether a target preserves the engine identity that owns load
-    /// report sequence and source-retirement state.
+    /// Returns whether an existing client task still targets the same Worker.
     fn same_identity(&self, other: &Self) -> bool {
-        self.url == other.url && self.mode == other.mode
+        self.url == other.url
+            && self.reporter_endpoint == other.reporter_endpoint
+            && self.mode == other.mode
     }
 }
 
@@ -205,7 +205,6 @@ struct WorkerState {
     report: Option<AcceptedReport>,
     active_source: Option<String>,
     active_session: Option<u64>,
-    retired_sources: HashSet<String>,
 }
 
 impl WorkerState {
@@ -216,7 +215,6 @@ impl WorkerState {
             report: None,
             active_source: None,
             active_session: None,
-            retired_sources: HashSet::new(),
         }
     }
 }
@@ -225,77 +223,49 @@ impl WorkerState {
 struct StoreState {
     version: u64,
     workers: HashMap<WorkerId, WorkerState>,
-    origin_to_id: HashMap<String, WorkerId>,
-    duplicate_origins: HashSet<String>,
 }
 
 #[derive(Debug)]
-struct RegistrationTask {
+struct ReporterTask {
     identity: WorkerTarget,
     cancel: CancellationToken,
-    waiting_for_topology: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
 
 #[derive(Debug)]
 struct MonitorInner {
     config: LoadMonitorConfig,
-    callback_port: u16,
-    client: reqwest::Client,
+    router_id: String,
     store: RwLock<StoreState>,
-    registrations: Mutex<HashMap<WorkerId, RegistrationTask>>,
+    sessions: Mutex<HashMap<WorkerId, ReporterTask>>,
     next_session: AtomicU64,
-    active_streams: AtomicUsize,
-    stream_change: Notify,
     shutting_down: AtomicBool,
 }
 
-/// Shared load-monitor handle used by discovery, gRPC, HTTP, and scheduling.
+/// Shared load-monitor handle used by discovery and snapshot consumers.
 #[derive(Debug, Clone)]
 pub struct LoadMonitor {
     inner: Arc<MonitorInner>,
 }
 
 impl LoadMonitor {
-    /// Constructs a disabled monitor used when no gRPC listener is running.
+    /// Constructs a disabled monitor with no Worker reporter sessions.
     pub fn disabled() -> Self {
-        Self::new_inner(LoadMonitorConfig::default(), 0)
-            .expect("disabled load-monitor HTTP client must build")
+        Self::new(LoadMonitorConfig::default())
     }
 
-    /// Constructs an enabled monitor after the gRPC listener has selected its
-    /// actual callback port.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the registration HTTP client cannot be built.
-    fn new_enabled(config: LoadMonitorConfig, callback_port: u16) -> Result<Self> {
-        Self::new_inner(config, callback_port)
-    }
-
-    /// Constructs the shared monitor state and bounded registration client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `reqwest` cannot construct a rustls HTTP client.
-    fn new_inner(config: LoadMonitorConfig, callback_port: u16) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(REGISTRATION_HTTP_TIMEOUT)
-            .build()
-            .context("build load-monitor registration client")?;
-        Ok(Self {
+    /// Constructs a monitor from validated Router configuration.
+    pub fn new(config: LoadMonitorConfig) -> Self {
+        Self {
             inner: Arc::new(MonitorInner {
                 config,
-                callback_port,
-                client,
+                router_id: format!("sgl-router-{}", uuid::Uuid::new_v4()),
                 store: RwLock::new(StoreState::default()),
-                registrations: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
                 next_session: AtomicU64::new(1),
-                active_streams: AtomicUsize::new(0),
-                stream_change: Notify::new(),
                 shutting_down: AtomicBool::new(false),
             }),
-        })
+        }
     }
 
     /// Returns whether active load monitoring is enabled.
@@ -333,18 +303,22 @@ impl LoadMonitor {
     }
 
     /// Reconciles the complete Router worker registry into monitor state and
-    /// per-worker registration renewal tasks.
+    /// per-Worker outbound reporter tasks.
     ///
     /// Workers whose URL and role are unchanged preserve accepted reports,
     /// sequence state, and retired sources. Removed or identity-changed workers
-    /// lose that state and have their prior renewal task cancelled.
+    /// lose that state and have their prior reporter task cancelled.
     pub async fn reconcile(&self, workers: Vec<Arc<Worker>>) {
         if !self.enabled() || self.inner.shutting_down.load(Ordering::Acquire) {
             return;
         }
+        let Some(reporter_port) = self.inner.config.reporter_port else {
+            tracing::error!("load monitor: enabled configuration has no reporter port");
+            return;
+        };
         let mut targets = HashMap::new();
         for worker in workers {
-            match WorkerTarget::from_worker(&worker) {
+            match WorkerTarget::from_worker(&worker, reporter_port) {
                 Ok(target) => {
                     targets.insert(target.id.clone(), target);
                 }
@@ -352,80 +326,340 @@ impl LoadMonitor {
                     worker_id = %worker.id,
                     worker_url = %worker.url,
                     error = %error,
-                    "load monitor: worker URL has no reportable origin",
+                    "load monitor: cannot derive Worker reporter endpoint",
                 ),
             }
         }
-
-        {
-            let mut store = self.inner.store.write();
-            let mut changed = false;
-            store.workers.retain(|id, _| {
-                let keep = targets.contains_key(id);
-                changed |= !keep;
-                keep
-            });
-            for (id, target) in &targets {
-                match store.workers.get_mut(id) {
-                    Some(state) if state.target.same_identity(target) => {
-                        changed |= state.target.model_ids != target.model_ids;
-                        state.target.model_ids.clone_from(&target.model_ids);
-                    }
-                    Some(state) => {
-                        *state = WorkerState::new(target.clone());
-                        changed = true;
-                    }
-                    None => {
-                        store
-                            .workers
-                            .insert(id.clone(), WorkerState::new(target.clone()));
-                        changed = true;
-                    }
-                }
-            }
-            let mut origin_members: HashMap<String, Vec<WorkerId>> = HashMap::new();
-            for target in targets.values() {
-                origin_members
-                    .entry(target.origin.clone())
-                    .or_default()
-                    .push(target.id.clone());
-            }
-            let mut next_origins = HashMap::new();
-            let mut duplicate_origins = HashSet::new();
-            for (origin, ids) in origin_members {
-                if ids.len() == 1 {
-                    next_origins.insert(origin, ids[0].clone());
-                } else {
-                    tracing::error!(
-                        %origin,
-                        worker_ids = ?ids,
-                        "load monitor: duplicate normalized worker origin; rejecting report streams",
-                    );
-                    duplicate_origins.insert(origin);
-                }
-            }
-            if store.origin_to_id != next_origins {
-                store.origin_to_id = next_origins;
-                changed = true;
-            }
-            if store.duplicate_origins != duplicate_origins {
-                store.duplicate_origins = duplicate_origins;
-                changed = true;
-            }
-            if changed {
-                store.version = store.version.wrapping_add(1);
-            }
-        }
-
-        self.reconcile_registration_tasks(targets).await;
+        let task_targets = self.update_store(targets);
+        self.reconcile_reporter_tasks(task_targets).await;
     }
 
-    /// Stops every Start Reporting renewal without sending an explicit stop.
+    /// Updates Worker snapshot state and excludes duplicate endpoints from
+    /// client-task creation.
+    fn update_store(
+        &self,
+        mut targets: HashMap<WorkerId, WorkerTarget>,
+    ) -> HashMap<WorkerId, WorkerTarget> {
+        let mut store = self.inner.store.write();
+        let mut changed = false;
+        store.workers.retain(|id, _| {
+            let keep = targets.contains_key(id);
+            changed |= !keep;
+            keep
+        });
+        for (id, target) in &targets {
+            match store.workers.get_mut(id) {
+                Some(state) if state.target.same_identity(target) => {
+                    changed |= state.target.model_ids != target.model_ids;
+                    state.target.model_ids.clone_from(&target.model_ids);
+                }
+                Some(state) => {
+                    *state = WorkerState::new(target.clone());
+                    changed = true;
+                }
+                None => {
+                    store
+                        .workers
+                        .insert(id.clone(), WorkerState::new(target.clone()));
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            store.version = store.version.wrapping_add(1);
+        }
+        drop(store);
+
+        let mut endpoint_members: HashMap<String, Vec<WorkerId>> = HashMap::new();
+        for target in targets.values() {
+            endpoint_members
+                .entry(target.reporter_endpoint.clone())
+                .or_default()
+                .push(target.id.clone());
+        }
+        for (endpoint, ids) in endpoint_members {
+            if ids.len() > 1 {
+                tracing::error!(
+                    %endpoint,
+                    worker_ids = ?ids,
+                    "load monitor: duplicate reporter endpoint; skipping all duplicate sessions",
+                );
+                for id in ids {
+                    targets.remove(&id);
+                }
+            }
+        }
+        targets
+    }
+
+    /// Reconciles one long-lived outbound gRPC task per unique Worker endpoint.
+    async fn reconcile_reporter_tasks(&self, targets: HashMap<WorkerId, WorkerTarget>) {
+        let mut tasks = self.inner.sessions.lock().await;
+        let stale_ids = tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                let keep = targets
+                    .get(id)
+                    .is_some_and(|target| task.identity.same_identity(target))
+                    && !task.handle.is_finished();
+                (!keep).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut stale_handles = Vec::with_capacity(stale_ids.len());
+        for id in stale_ids {
+            if let Some(task) = tasks.remove(&id) {
+                task.cancel.cancel();
+                stale_handles.push(task.handle);
+            }
+        }
+        drop(tasks);
+        for handle in stale_handles {
+            let _ = handle.await;
+        }
+
+        let mut tasks = self.inner.sessions.lock().await;
+        for (id, target) in targets {
+            if tasks.contains_key(&id) {
+                continue;
+            }
+            let cancel = CancellationToken::new();
+            let monitor = self.clone();
+            let target_for_task = target.clone();
+            let cancel_for_task = cancel.clone();
+            let handle = tokio::spawn(async move {
+                monitor
+                    .run_reporter_loop(target_for_task, cancel_for_task)
+                    .await;
+            });
+            tasks.insert(
+                id,
+                ReporterTask {
+                    identity: target,
+                    cancel,
+                    handle,
+                },
+            );
+        }
+    }
+
+    /// Connects and reconnects one Worker's reporter until cancellation.
+    async fn run_reporter_loop(&self, target: WorkerTarget, cancel: CancellationToken) {
+        let mut backoff = RECONNECT_INITIAL;
+        loop {
+            let started = tokio::time::Instant::now();
+            let result = self.monitor_once(&target, &cancel).await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            if let Err(error) = result {
+                tracing::warn!(
+                    worker_id = %target.id,
+                    reporter_endpoint = %target.reporter_endpoint,
+                    error = %error,
+                    "load monitor: Worker reporter session ended; reconnecting",
+                );
+            }
+            if started.elapsed() >= REPORT_INTERVAL {
+                backoff = RECONNECT_INITIAL;
+            }
+            let jitter_ms =
+                rand::thread_rng().gen_range(0..=RECONNECT_JITTER_MAX.as_millis() as u64);
+            let delay = backoff + Duration::from_millis(jitter_ms);
+            backoff = (backoff * 2).min(RECONNECT_MAX);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    /// Runs one Router-initiated bidirectional reporter session.
     ///
-    /// The engine closes its gRPC stream after the existing lease expires.
-    pub async fn stop_registrations(&self) {
+    /// # Errors
+    ///
+    /// Returns connection, handshake, stream, or report-validation failures so
+    /// the caller can reconnect with bounded backoff.
+    async fn monitor_once(&self, target: &WorkerTarget, cancel: &CancellationToken) -> Result<()> {
+        let endpoint = Endpoint::from_shared(target.reporter_endpoint.clone())?
+            .connect_timeout(CONNECT_TIMEOUT);
+        let channel = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            result = endpoint.connect() => result?,
+        };
+        let mut client = LoadMonitorServiceClient::new(channel);
+        let (request_tx, request_rx) = mpsc::channel(8);
+        request_tx
+            .send(RouterFrame {
+                payload: Some(router_frame::Payload::Register(RegisterRequest {
+                    router_id: self.inner.router_id.clone(),
+                    report_interval_ms: REPORT_INTERVAL.as_millis() as i64,
+                    lease_ttl_ms: LEASE_TTL.as_millis() as i64,
+                })),
+            })
+            .await
+            .map_err(|_| anyhow!("reporter request stream closed before registration"))?;
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            result = client.monitor(ReceiverStream::new(request_rx)) => result?,
+        };
+        let mut stream = response.into_inner();
+        let first = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            result = stream.message() => result?,
+        }
+        .ok_or_else(|| anyhow!("Worker closed reporter stream before registration ack"))?;
+        let registered = match first.payload {
+            Some(worker_frame::Payload::Registered(registered)) => registered,
+            Some(worker_frame::Payload::Error(error)) => {
+                return Err(anyhow!(
+                    "Worker rejected registration: {}: {}",
+                    error.code,
+                    error.message
+                ));
+            }
+            _ => return Err(anyhow!("first WorkerFrame must be registered or error")),
+        };
+        if registered.lease_ttl_ms <= 0
+            || registered.renew_after_ms <= 0
+            || registered.renew_after_ms >= registered.lease_ttl_ms
+        {
+            return Err(anyhow!(
+                "Worker returned invalid lease timing: renew_after_ms must be positive and less than lease_ttl_ms"
+            ));
+        }
+        let renew_after = Duration::from_millis(registered.renew_after_ms as u64);
+        let session = self.begin_session(&target.id)?;
+        let result = self
+            .run_registered_session(
+                target,
+                session,
+                request_tx,
+                &mut stream,
+                renew_after,
+                cancel,
+            )
+            .await;
+        self.end_session(&target.id, session);
+        result
+    }
+
+    /// Processes reports and keep-alive deadlines for an acknowledged session.
+    ///
+    /// # Errors
+    ///
+    /// Returns stream, protocol, send, or load-report validation failures.
+    async fn run_registered_session(
+        &self,
+        target: &WorkerTarget,
+        session: u64,
+        request_tx: mpsc::Sender<RouterFrame>,
+        stream: &mut tonic::Streaming<proto::WorkerFrame>,
+        renew_after: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let keep_alive = tokio::time::sleep(renew_after);
+        tokio::pin!(keep_alive);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = request_tx.try_send(RouterFrame {
+                        payload: Some(router_frame::Payload::Stop(StopRequest {})),
+                    });
+                    return Ok(());
+                }
+                _ = &mut keep_alive => {
+                    request_tx.send(RouterFrame {
+                        payload: Some(router_frame::Payload::KeepAlive(KeepAlive {})),
+                    }).await.map_err(|_| anyhow!("Worker closed reporter request stream"))?;
+                    keep_alive.as_mut().reset(tokio::time::Instant::now() + renew_after);
+                }
+                frame = stream.message() => {
+                    let frame = frame?.ok_or_else(|| anyhow!("Worker closed reporter response stream"))?;
+                    match frame.payload {
+                        Some(worker_frame::Payload::Report(report)) => {
+                            self.apply_report(&target.id, session, report)
+                                .map_err(|status| anyhow!("invalid Worker report ({:?}): {}", status.code(), status.message()))?;
+                        }
+                        Some(worker_frame::Payload::Error(error)) => {
+                            return Err(anyhow!("Worker reporter error: {}: {}", error.code, error.message));
+                        }
+                        Some(worker_frame::Payload::Registered(_)) => {
+                            return Err(anyhow!("Worker sent duplicate registration ack"));
+                        }
+                        None => return Err(anyhow!("Worker sent an empty reporter frame")),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks a newly acknowledged outbound stream as the Worker's active session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `not_found` when discovery removed the Worker during handshake.
+    fn begin_session(&self, worker_id: &WorkerId) -> IngestResult<u64> {
+        let session = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
+        let mut store = self.inner.store.write();
+        let state = store.workers.get_mut(worker_id).ok_or_else(|| {
+            ingest_status(Status::not_found("worker was removed during handshake"))
+        })?;
+        state.active_session = Some(session);
+        Ok(session)
+    }
+
+    /// Validates and publishes one report for its discovery-bound Worker.
+    ///
+    /// Report metadata never chooses the Worker identity: `worker_id` comes
+    /// from the outbound task created by discovery. Duplicate or out-of-order
+    /// sequences from the same source are ignored.
+    fn apply_report(
+        &self,
+        worker_id: &WorkerId,
+        session: u64,
+        report: LoadReport,
+    ) -> IngestResult<()> {
+        let accepted = validate_report(&report, SystemTime::now())?;
+        let mut store = self.inner.store.write();
+        let state = store
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| ingest_status(Status::not_found("worker was removed")))?;
+        if state.active_session != Some(session) {
+            return Err(ingest_status(Status::aborted(
+                "reporter session was superseded",
+            )));
+        }
+        let same_source =
+            state.active_source.as_deref() == Some(accepted.source_instance_id.as_str());
+        if same_source
+            && state
+                .report
+                .as_ref()
+                .is_some_and(|current| accepted.sequence_id <= current.sequence_id)
+        {
+            return Ok(());
+        }
+        state.active_source = Some(accepted.source_instance_id.clone());
+        state.report = Some(accepted);
+        store.version = store.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Clears the active marker only when it still belongs to this session.
+    fn end_session(&self, worker_id: &WorkerId, session: u64) {
+        let mut store = self.inner.store.write();
+        if let Some(state) = store.workers.get_mut(worker_id) {
+            if state.active_session == Some(session) {
+                state.active_session = None;
+            }
+        }
+    }
+
+    /// Cancels all Worker sessions, sends best-effort stop frames, and joins tasks.
+    pub async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
-        let mut tasks = self.inner.registrations.lock().await;
+        let mut tasks = self.inner.sessions.lock().await;
         for task in tasks.values() {
             task.cancel.cancel();
         }
@@ -438,522 +672,20 @@ impl LoadMonitor {
             let _ = handle.await;
         }
     }
-
-    /// Waits until all engine report streams have closed, bounded by one lease
-    /// TTL. A timeout is expected for engines that do not honor lease expiry.
-    pub async fn wait_for_streams_or_lease_expiry(&self) {
-        let wait = async {
-            loop {
-                let changed = self.inner.stream_change.notified();
-                if self.inner.active_streams.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                changed.await;
-            }
-        };
-        if tokio::time::timeout(LEASE_TTL, wait).await.is_err() {
-            tracing::warn!(
-                active_streams = self.inner.active_streams.load(Ordering::Acquire),
-                "load monitor: report streams remained open after one lease TTL; forcing shutdown",
-            );
-        }
-    }
-
-    /// Reconciles per-worker HTTP renewal tasks against the current topology.
-    async fn reconcile_registration_tasks(&self, targets: HashMap<WorkerId, WorkerTarget>) {
-        let mut tasks = self.inner.registrations.lock().await;
-        tasks.retain(|id, task| {
-            let keep = targets
-                .get(id)
-                .is_some_and(|target| task.identity.same_identity(target))
-                && !task.waiting_for_topology.load(Ordering::Acquire)
-                && !task.handle.is_finished();
-            if !keep {
-                task.cancel.cancel();
-                task.handle.abort();
-            }
-            keep
-        });
-
-        for (id, target) in targets {
-            if tasks.contains_key(&id) {
-                continue;
-            }
-            let cancel = CancellationToken::new();
-            let monitor = self.clone();
-            let target_for_task = target.clone();
-            let cancel_for_task = cancel.clone();
-            let waiting_for_topology = Arc::new(AtomicBool::new(false));
-            let waiting_for_task = Arc::clone(&waiting_for_topology);
-            let handle = tokio::spawn(async move {
-                monitor
-                    .run_registration_loop(target_for_task, cancel_for_task, waiting_for_task)
-                    .await;
-            });
-            tasks.insert(
-                id,
-                RegistrationTask {
-                    identity: target,
-                    cancel,
-                    waiting_for_topology,
-                    handle,
-                },
-            );
-        }
-    }
-
-    /// Renews one engine's reporting lease until cancellation or a terminal
-    /// client-side HTTP response.
-    ///
-    /// `target` identifies the engine, `cancel` stops the worker task, and
-    /// `waiting_for_topology` publishes terminal-4xx state to a concurrent
-    /// reconcile before this task's join handle necessarily becomes finished.
-    async fn run_registration_loop(
-        &self,
-        target: WorkerTarget,
-        cancel: CancellationToken,
-        waiting_for_topology: Arc<AtomicBool>,
-    ) {
-        let mut backoff = RECONNECT_INITIAL;
-        loop {
-            let result = self.register_once(&target).await;
-            let delay = match result {
-                Ok(RegistrationOutcome::Renewed) => {
-                    backoff = RECONNECT_INITIAL;
-                    REPORT_INTERVAL
-                }
-                Ok(RegistrationOutcome::Retry) => {
-                    let jitter_ms =
-                        rand::thread_rng().gen_range(0..=RECONNECT_JITTER_MAX.as_millis() as u64);
-                    let delay = backoff + Duration::from_millis(jitter_ms);
-                    backoff = (backoff * 2).min(RECONNECT_MAX);
-                    delay
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        worker_id = %target.id,
-                        error = %error,
-                        "load monitor: Start Reporting transport failure",
-                    );
-                    let jitter_ms =
-                        rand::thread_rng().gen_range(0..=RECONNECT_JITTER_MAX.as_millis() as u64);
-                    let delay = backoff + Duration::from_millis(jitter_ms);
-                    backoff = (backoff * 2).min(RECONNECT_MAX);
-                    delay
-                }
-                Ok(RegistrationOutcome::WaitForTopology) => {
-                    // Publish the terminal state before the task completes so
-                    // a concurrent topology generation cannot miss the
-                    // restart window by observing an unfinished JoinHandle.
-                    waiting_for_topology.store(true, Ordering::Release);
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(delay) => {}
-            }
-        }
-    }
-
-    /// Sends one unauthenticated `/v1/start_reporting` lease request.
-    ///
-    /// # Errors
-    ///
-    /// Returns configuration or HTTP transport failures so the caller can
-    /// apply bounded exponential retry.
-    async fn register_once(&self, target: &WorkerTarget) -> Result<RegistrationOutcome> {
-        let report_ip = self
-            .inner
-            .config
-            .report_ip
-            .as_deref()
-            .ok_or_else(|| anyhow!("enabled load monitor has no report IP"))?;
-        let url = format!(
-            "{}{}",
-            target.url.trim_end_matches('/'),
-            START_REPORTING_PATH
-        );
-        let body = StartReportingRequest {
-            ip: report_ip,
-            port: self.inner.callback_port,
-            report_interval_ms: REPORT_INTERVAL.as_millis() as u64,
-            lease_ttl_ms: LEASE_TTL.as_millis() as u64,
-        };
-        let response = self.inner.client.post(&url).json(&body).send().await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(RegistrationOutcome::Renewed);
-        }
-        let response_body = response.text().await.unwrap_or_default();
-        if status.as_u16() == 429 || status.is_server_error() {
-            tracing::warn!(
-                worker_id = %target.id,
-                %status,
-                body = %response_body,
-                "load monitor: Start Reporting retryable response",
-            );
-            return Ok(RegistrationOutcome::Retry);
-        }
-        tracing::error!(
-            worker_id = %target.id,
-            %status,
-            body = %response_body,
-            "load monitor: Start Reporting rejected; waiting for next topology generation",
-        );
-        Ok(RegistrationOutcome::WaitForTopology)
-    }
-
-    /// Binds a stream identity from its first report and atomically accepts the
-    /// report when it is valid.
-    ///
-    /// # Errors
-    ///
-    /// Returns gRPC `invalid_argument` for unknown origins, role mismatches,
-    /// retired sources, duplicate streams, and invalid rank fields.
-    fn begin_stream(&self, report: LoadReport) -> IngestResult<StreamBinding> {
-        if self.inner.shutting_down.load(Ordering::Acquire) {
-            return Err(ingest_status(Status::unavailable(
-                "load monitor is shutting down",
-            )));
-        }
-        let worker = report.worker.as_ref().ok_or_else(|| {
-            ingest_status(Status::invalid_argument(
-                "first report is missing worker identity",
-            ))
-        })?;
-        let origin = normalize_origin(&worker.worker_addr)
-            .map_err(|error| ingest_status(Status::invalid_argument(error.to_string())))?;
-        let source = report.source_instance_id.clone();
-        if source.is_empty() {
-            return Err(ingest_status(Status::invalid_argument(
-                "source_instance_id must be non-empty",
-            )));
-        }
-        let role = WorkerType::try_from(worker.worker_type)
-            .map_err(|_| ingest_status(Status::invalid_argument("unknown worker_type")))?;
-        let session = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
-        let mut store = self.inner.store.write();
-        if store.duplicate_origins.contains(&origin) {
-            return Err(ingest_status(Status::invalid_argument(format!(
-                "duplicate worker origin {origin}"
-            ))));
-        }
-        let id = store.origin_to_id.get(&origin).cloned().ok_or_else(|| {
-            ingest_status(Status::invalid_argument(format!(
-                "unknown worker origin {origin}"
-            )))
-        })?;
-        let state = store.workers.get_mut(&id).ok_or_else(|| {
-            ingest_status(Status::invalid_argument(
-                "worker was removed during stream bind",
-            ))
-        })?;
-        if role != worker_type_for_mode(state.target.mode) {
-            return Err(ingest_status(Status::invalid_argument(
-                "reported worker role does not match discovery",
-            )));
-        }
-        if state.retired_sources.contains(&source) {
-            return Err(ingest_status(Status::failed_precondition(
-                "source_instance_id has been retired",
-            )));
-        }
-        if state.active_source.as_deref() == Some(source.as_str()) && state.active_session.is_some()
-        {
-            return Err(ingest_status(Status::already_exists(
-                "duplicate stream for worker origin",
-            )));
-        }
-        let same_source = state.active_source.as_deref() == Some(source.as_str());
-        let duplicate_sequence = same_source
-            && state
-                .report
-                .as_ref()
-                .is_some_and(|current| report.sequence_id <= current.sequence_id);
-        let accepted = if duplicate_sequence {
-            None
-        } else {
-            Some(validate_report(&report, SystemTime::now())?)
-        };
-        if let Some(previous) = state.active_source.replace(source.clone()) {
-            if previous != source {
-                state.retired_sources.insert(previous);
-            }
-        }
-        state.active_session = Some(session);
-        if let Some(accepted) = accepted {
-            state.report = Some(accepted);
-            store.version = store.version.wrapping_add(1);
-        }
-        Ok(StreamBinding {
-            id,
-            origin,
-            role,
-            source,
-            session,
-        })
-    }
-
-    /// Applies a subsequent report after verifying immutable stream identity.
-    ///
-    /// Duplicate and out-of-order sequence numbers are ignored without closing
-    /// the stream. A superseded stream is closed on its next message.
-    fn apply_stream_report(&self, binding: &StreamBinding, report: LoadReport) -> IngestResult<()> {
-        let worker = report.worker.as_ref().ok_or_else(|| {
-            ingest_status(Status::invalid_argument(
-                "report is missing worker identity",
-            ))
-        })?;
-        let origin = normalize_origin(&worker.worker_addr)
-            .map_err(|error| ingest_status(Status::invalid_argument(error.to_string())))?;
-        let role = WorkerType::try_from(worker.worker_type)
-            .map_err(|_| ingest_status(Status::invalid_argument("unknown worker_type")))?;
-        if origin != binding.origin
-            || role != binding.role
-            || report.source_instance_id != binding.source
-        {
-            return Err(ingest_status(Status::invalid_argument(
-                "worker_addr, worker_type, and source_instance_id must remain stable",
-            )));
-        }
-        {
-            let store = self.inner.store.read();
-            let state = store
-                .workers
-                .get(&binding.id)
-                .ok_or_else(|| ingest_status(Status::not_found("worker was removed")))?;
-            if state.active_session != Some(binding.session) {
-                return Err(ingest_status(Status::aborted(
-                    "stream source was superseded",
-                )));
-            }
-            if state
-                .report
-                .as_ref()
-                .is_some_and(|current| report.sequence_id <= current.sequence_id)
-            {
-                return Ok(());
-            }
-        }
-
-        // Rank validation, sorting, allocation, and aggregation are pure work.
-        // Keep them outside the global store write lock so independent engine
-        // streams do not serialize their millisecond-scale report processing.
-        let accepted = validate_report(&report, SystemTime::now())?;
-
-        let mut store = self.inner.store.write();
-        let state = store
-            .workers
-            .get_mut(&binding.id)
-            .ok_or_else(|| ingest_status(Status::not_found("worker was removed")))?;
-        if state.active_session != Some(binding.session) {
-            return Err(ingest_status(Status::aborted(
-                "stream source was superseded",
-            )));
-        }
-        if state
-            .report
-            .as_ref()
-            .is_some_and(|current| report.sequence_id <= current.sequence_id)
-        {
-            return Ok(());
-        }
-        state.report = Some(accepted);
-        store.version = store.version.wrapping_add(1);
-        Ok(())
-    }
-
-    /// Clears the active stream marker only when it still belongs to the
-    /// ending stream session.
-    fn end_stream(&self, binding: &StreamBinding) {
-        let mut store = self.inner.store.write();
-        if let Some(state) = store.workers.get_mut(&binding.id) {
-            if state.active_session == Some(binding.session) {
-                state.active_session = None;
-            }
-        }
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegistrationOutcome {
-    Renewed,
-    Retry,
-    WaitForTopology,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct StartReportingRequest<'a> {
-    ip: &'a str,
-    port: u16,
-    report_interval_ms: u64,
-    lease_ttl_ms: u64,
-}
-
-#[derive(Debug)]
-struct StreamBinding {
-    id: WorkerId,
-    origin: String,
-    role: WorkerType,
-    source: String,
-    session: u64,
-}
-
-#[derive(Debug)]
-struct StreamCountGuard {
-    inner: Arc<MonitorInner>,
-}
-
-impl StreamCountGuard {
-    /// Increments the live gRPC stream count for graceful shutdown tracking.
-    fn new(inner: Arc<MonitorInner>) -> Self {
-        inner.active_streams.fetch_add(1, Ordering::AcqRel);
-        Self { inner }
-    }
-}
-
-impl Drop for StreamCountGuard {
-    /// Decrements the live stream count and wakes shutdown waiters.
-    fn drop(&mut self) {
-        self.inner.active_streams.fetch_sub(1, Ordering::AcqRel);
-        self.inner.stream_change.notify_waiters();
-    }
-}
-
-#[tonic::async_trait]
-impl LoadMonitorService for LoadMonitor {
-    /// Receives one engine's client-streaming load reports.
-    ///
-    /// The first message binds immutable stream identity; later messages must
-    /// preserve it. Sequence duplicates are ignored, while invalid identity or
-    /// rank data closes the stream with a precise gRPC status.
-    async fn report(
-        &self,
-        request: Request<tonic::Streaming<LoadReport>>,
-    ) -> Result<Response<()>, Status> {
-        let _count = StreamCountGuard::new(Arc::clone(&self.inner));
-        let mut stream = request.into_inner();
-        let first = stream
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("report stream is empty"))?;
-        let binding = self.begin_stream(first).map_err(|status| *status)?;
-        let result = async {
-            while let Some(report) = stream.message().await? {
-                self.apply_stream_report(&binding, report)
-                    .map_err(|status| *status)?;
-            }
-            Ok(Response::new(()))
-        }
-        .await;
-        self.end_stream(&binding);
-        result
-    }
-}
-
-/// Running gRPC server and its cancellation handle.
-#[derive(Debug)]
-pub struct GrpcServerHandle {
-    local_addr: SocketAddr,
-    cancel: CancellationToken,
-    join: JoinHandle<Result<(), tonic::transport::Error>>,
-}
-
-impl GrpcServerHandle {
-    /// Returns the actual bound listener address, including an ephemeral port.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Waits one lease window for streams, then terminates the gRPC server and
-    /// joins its task. The caller must stop registration renewals first.
-    pub async fn shutdown(self, monitor: &LoadMonitor) {
-        monitor.wait_for_streams_or_lease_expiry().await;
-        self.cancel.cancel();
-        match self.join.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(%error, "load monitor gRPC server failed"),
-            Err(error) => tracing::error!(%error, "load monitor gRPC task failed"),
-        }
-    }
-}
-
-/// Binds and starts the independent load-monitor gRPC listener.
-///
-/// Binding completes before the monitor is returned, so registration requests
-/// always advertise the actual listening port.
+/// Converts a discovered inference URL into its paired h2c reporter endpoint.
 ///
 /// # Errors
 ///
-/// Returns an error if the address cannot bind, the local address cannot be
-/// read, or the registration client cannot be constructed.
-pub async fn bind_and_serve(config: LoadMonitorConfig) -> Result<(LoadMonitor, GrpcServerHandle)> {
-    if !config.enabled {
-        return Err(anyhow!("cannot bind a disabled load monitor"));
-    }
-    let bind = format!("{}:{}", config.bind_host, config.bind_port);
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("bind load-monitor gRPC listener {bind}"))?;
-    let local_addr = listener
-        .local_addr()
-        .context("read load-monitor local address")?;
-    let monitor = LoadMonitor::new_enabled(config, local_addr.port())?;
-    let service = LoadMonitorServiceServer::new(monitor.clone());
-    let cancel = CancellationToken::new();
-    let cancel_for_server = cancel.clone();
-    let join = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                cancel_for_server.cancelled().await;
-            })
-            .await
-    });
-    Ok((
-        monitor,
-        GrpcServerHandle {
-            local_addr,
-            cancel,
-            join,
-        },
-    ))
-}
-
-/// Converts a worker URL or reported address into canonical `host:port` form.
-///
-/// # Errors
-///
-/// Returns an error for missing hosts, missing ports, unsupported URL syntax,
-/// or values that cannot be parsed even after adding an `http://` prefix.
-fn normalize_origin(value: &str) -> Result<String> {
-    let normalized = if value.contains("://") {
-        value.to_owned()
-    } else {
-        format!("http://{value}")
-    };
-    let parsed = url::Url::parse(&normalized)
-        .with_context(|| format!("invalid worker address {value:?}"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow!("worker address {value:?} has no host"))?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| anyhow!("worker address {value:?} has no port"))?;
-    if host.contains(':') {
-        Ok(format!("[{host}]:{port}"))
-    } else {
-        Ok(format!("{host}:{port}"))
-    }
-}
-
-/// Maps Router discovery roles to the protobuf worker role contract.
-fn worker_type_for_mode(mode: WorkerMode) -> WorkerType {
-    match mode {
-        WorkerMode::Plain => WorkerType::Regular,
-        WorkerMode::Prefill => WorkerType::Prefill,
-        WorkerMode::Decode => WorkerType::Decode,
+/// Returns an error when the inference URL is invalid or has no host.
+fn reporter_endpoint(worker_url: &str, reporter_port: NonZeroU16) -> Result<String> {
+    let parsed = url::Url::parse(worker_url)
+        .with_context(|| format!("invalid Worker URL {worker_url:?}"))?;
+    match parsed.host() {
+        Some(url::Host::Ipv6(host)) => Ok(format!("http://[{host}]:{reporter_port}")),
+        Some(host) => Ok(format!("http://{host}:{reporter_port}")),
+        None => Err(anyhow!("Worker URL {worker_url:?} has no host")),
     }
 }
 

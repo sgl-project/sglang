@@ -15,30 +15,11 @@ impl Config {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
         }
-        if !self.load_monitor.enabled
-            && (self.load_monitor.bind_host != "0.0.0.0"
-                || self.load_monitor.bind_port != 0
-                || self.load_monitor.report_ip.is_some())
-        {
-            return Err(anyhow!(
-                "load-monitor address configuration requires load monitoring to be enabled"
-            ));
+        if !self.load_monitor.enabled && self.load_monitor.reporter_port.is_some() {
+            return Err(anyhow!("--load-reporter-port requires --load-monitor"));
         }
-        if self.load_monitor.enabled
-            && self
-                .load_monitor
-                .report_ip
-                .as_deref()
-                .is_none_or(str::is_empty)
-        {
-            return Err(anyhow!(
-                "load_monitor.report_ip must be non-empty when load monitor is enabled"
-            ));
-        }
-        if let Some(report_ip) = self.load_monitor.report_ip.as_deref() {
-            report_ip.parse::<std::net::IpAddr>().map_err(|error| {
-                anyhow!("load_monitor.report_ip {report_ip:?} must be an IP address: {error}")
-            })?;
+        if self.load_monitor.enabled && self.load_monitor.reporter_port.is_none() {
+            return Err(anyhow!("--load-monitor requires --load-reporter-port"));
         }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {

@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -20,23 +20,13 @@ pub struct Config {
     pub load_monitor: LoadMonitorConfig,
 }
 
-/// Configuration for the Router-owned load-reporting control plane.
-///
-/// Timing and endpoint constants intentionally are not configurable in the
-/// first version; only listener placement and the engine-reachable callback IP
-/// are exposed.
+/// Configuration for Router-initiated connections to Worker load reporters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadMonitorConfig {
-    /// Enables active registration, gRPC ingestion, snapshot publication, and
-    /// freshness classification for snapshot consumers.
+    /// Enables per-Worker gRPC sessions and immutable load snapshots.
     pub enabled: bool,
-    /// Address used by the independent gRPC listener.
-    pub bind_host: String,
-    /// Requested gRPC listener port. Zero asks the operating system to select
-    /// an available port.
-    pub bind_port: u16,
-    /// Engine-reachable Router IP sent to `/v1/start_reporting`.
-    pub report_ip: Option<String>,
+    /// Fixed reporter port paired with every discovered Worker's host.
+    pub reporter_port: Option<NonZeroU16>,
 }
 
 impl Default for LoadMonitorConfig {
@@ -44,9 +34,7 @@ impl Default for LoadMonitorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind_host: "0.0.0.0".to_string(),
-            bind_port: 0,
-            report_ip: None,
+            reporter_port: None,
         }
     }
 }
