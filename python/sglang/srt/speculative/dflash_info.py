@@ -42,6 +42,8 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_req: int = -1
 
+    # Seed for ForwardBatch.ragged_verify_layout (handed over in
+    # prepare_for_verify); set at construction, never reassigned after.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     def __post_init__(self):

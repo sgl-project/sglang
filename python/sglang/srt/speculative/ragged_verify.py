@@ -217,10 +217,8 @@ def build_capture_verify_lens(
 
 
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
-    """Canonical read of the batch's verify layout (ForwardBatch field).
-    Tolerates the runner's ad-hoc replay batch views, which may not carry
-    the field at all."""
-    return getattr(forward_batch, "ragged_verify_layout", None)
+    """Canonical read of the batch's verify layout (ForwardBatch field)."""
+    return forward_batch.ragged_verify_layout
 
 
 class RaggedTargetVerifyGeometry(msgspec.Struct):
