@@ -2998,6 +2998,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             latest_output_ids
         )
 
+    def sync_min_new_tokens_output_counts(self):
+        # Speculative decoding commits a variable-length accepted run per step,
+        # so the one-token-per-step accounting in
+        # cumulate_penalty_output_tokens does not apply. req.output_ids is the
+        # single place committed output tokens land (extended in
+        # BatchResultProcessor.process_batch_result_decode with the run that
+        # _resolve_spec_v2_tokens settled -- already grammar-truncated, and left
+        # untouched for a retracted or already-finished request), so read the
+        # counts from there instead of re-deriving them.
+        #
+        # Gate on the min_new_tokens penalizer specifically, not on the
+        # orchestrator's is_required: that is true as soon as any penalizer is
+        # required, so a repetition-only or frequency-only request would build
+        # and upload a counts tensor every decode step for a penalizer that was
+        # never prepared. The check has to precede the list comprehension, the
+        # pinned host tensor and the H2D copy.
+        orchestrator = self.sampling_info.penalizer_orchestrator
+        if not orchestrator.is_min_new_tokens_active():
+            return
+        counts = torch.tensor(
+            [len(req.output_ids) for req in self.reqs],
+            dtype=torch.int32,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        orchestrator.set_min_new_tokens_output_counts(counts)
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         server_args = get_server_args()

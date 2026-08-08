@@ -1035,6 +1035,16 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             server_args.max_speculative_num_draft_tokens,
         )
     if batch.spec_algorithm.is_dflash_family():
+        # The dflash family returns here instead of reaching the seen-token
+        # accounting in ScheduleBatch.prepare_for_decode, so
+        # BatchedMinNewTokensPenalizer.len_output_tokens stays 0 and the
+        # min_new_tokens stop-token mask folded into acc_additive_penalties
+        # never lifts. Sync that counter to the tokens each request has actually
+        # committed. The remaining seen-token ledgers (repetition / frequency /
+        # presence) need the accepted token ids and are still tracked by #28180.
+        # The hook self-gates on the min_new_tokens penalizer being prepared, so
+        # requests using only the other penalizers pay nothing here.
+        batch.sync_min_new_tokens_output_counts()
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

@@ -70,6 +70,24 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.len_output_tokens += 1
 
+    def set_output_token_counts(self, counts: torch.Tensor):
+        """Set the seen-token counter to the exact number of output tokens each
+        request has committed so far.
+
+        `_cumulate_output_tokens` advances by one per call, which is right when
+        every step commits exactly one token. Speculative decoding commits a
+        variable-length accepted run per step, so the caller supplies the counts
+        instead. Assignment rather than accumulation keeps this idempotent: a
+        step whose tokens are not committed yet is a no-op, never a double count.
+        """
+        if not self._is_prepared:
+            return
+        self.len_output_tokens = counts.view(-1, 1).to(
+            device=self.len_output_tokens.device,
+            dtype=self.len_output_tokens.dtype,
+            non_blocking=True,
+        )
+
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
         # device-to-host sync every decode step; torch.where is a plain
