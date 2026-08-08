@@ -236,6 +236,67 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertEqual(detector.reasoning_default, "explicit_thinking")
         self.assertTrue(detector.thinks_internally)
 
+    def test_uses_dsv4_dsml_tool_start_tokens(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertEqual(
+            detector.tool_start_tokens,
+            ["<｜DSML｜tool_calls>", "<｜DSML｜invoke name="],
+        )
+
+    def _run_streaming_in_reasoning(self, chunks):
+        detector = DeepSeekV4Detector(stream_reasoning=True)
+        detector._in_reasoning = True
+        detector.stripped_think_start = True
+
+        reasoning = ""
+        normal = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+        return reasoning, normal
+
+    def test_streaming_exits_reasoning_on_split_dsml_tool_start(self):
+        reasoning, normal = self._run_streaming_in_reasoning(
+            ["need a tool", "<", "｜DSML｜tool_calls>\nX"]
+        )
+
+        self.assertEqual(reasoning, "need a tool")
+        self.assertEqual(normal, "<｜DSML｜tool_calls>\nX")
+
+    def test_streaming_exits_reasoning_on_same_delta_dsml_tool_start(self):
+        detector = DeepSeekV4Detector(stream_reasoning=True)
+        result = detector.parse_streaming_increment(
+            "<think>need a tool<｜DSML｜tool_calls>\nX"
+        )
+
+        self.assertEqual(result.reasoning_text, "need a tool")
+        self.assertEqual(result.normal_text, "<｜DSML｜tool_calls>\nX")
+
+    def test_streaming_exits_reasoning_on_split_dsml_invoke(self):
+        reasoning, normal = self._run_streaming_in_reasoning(
+            ["need a tool", "<｜DSML｜inv", 'oke name="bash">\nX']
+        )
+
+        self.assertEqual(reasoning, "need a tool")
+        self.assertEqual(normal, '<｜DSML｜invoke name="bash">\nX')
+
+    def test_streaming_keeps_non_tool_dsml_prefix_in_reasoning(self):
+        reasoning, normal = self._run_streaming_in_reasoning(
+            ["literal", "<｜DSML｜", "not_a_tool"]
+        )
+
+        self.assertEqual(reasoning, "literal<｜DSML｜not_a_tool")
+        self.assertEqual(normal, "")
+
+    def test_streaming_think_end_keeps_existing_priority_over_dsml_tool_start(self):
+        reasoning, normal = self._run_streaming_in_reasoning(
+            ["need <｜DSML｜tool_calls></think>answer"]
+        )
+
+        self.assertEqual(reasoning, "need <｜DSML｜tool_calls>")
+        self.assertEqual(normal, "answer")
+
 
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
@@ -1139,7 +1200,6 @@ class TestReasoningParserAdvanced(CustomTestCase):
         """Test that all DetectorMap alias keys create the correct detector type."""
         # These are aliases that map to existing detector classes
         alias_tests = {
-            "deepseek-v3": Qwen3Detector,
             "step3": DeepSeekR1Detector,
             "step3p5": DeepSeekR1Detector,
             "interns1": Qwen3Detector,
