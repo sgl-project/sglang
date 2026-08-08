@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
 # =============================================================================
 # Fused kernel — reads INTERLEAVED input format
 # Used by Qwen3-Next whose checkpoint stores fused in_proj_qkvz weights
@@ -127,6 +131,8 @@ def fused_qkvzba_split_reshape_cat(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_kernel[grid](
         mixed_qkv,
@@ -292,6 +298,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
@@ -387,6 +395,8 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    if _is_hip and seq_len == 0:
+        return q, k, v
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,
