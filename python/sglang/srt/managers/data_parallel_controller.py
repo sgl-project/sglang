@@ -58,6 +58,8 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     configure_logger,
+    graceful_kill_process_tree,
+    install_graceful_sigterm_handler,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
@@ -819,6 +821,16 @@ def run_data_parallel_controller_process(
     faulthandler.enable()
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
+
+    # SIGTERM → propagate graceful shutdown to scheduler children, which would
+    # otherwise be SIGKILLed via PR_SET_PDEATHSIG before they finish cleanup.
+    install_graceful_sigterm_handler(
+        logger,
+        "data_parallel_controller",
+        on_shutdown=lambda: graceful_kill_process_tree(
+            timeout=envs.SGLANG_CHILD_PROCESS_SHUTDOWN_TIMEOUT.get()
+        ),
+    )
 
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
