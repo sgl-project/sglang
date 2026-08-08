@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
     linear_bf16_fp32,
@@ -22,17 +23,15 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
@@ -344,7 +343,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(MultiPlatformOp):
+class Compressor(BaseFusedOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -426,9 +425,8 @@ class Compressor(MultiPlatformOp):
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
-            kv_score = cp_all_gather_rerange_output(
+            kv_score = cp_materialize_global_token_order(
                 kv_score,
-                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
@@ -473,9 +471,8 @@ class Compressor(MultiPlatformOp):
             return x.new_empty(0, self.head_dim)
 
         if dsa_use_prefill_cp(forward_batch):
-            x = cp_all_gather_rerange_output(
+            x = cp_materialize_global_token_order(
                 x,
-                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
