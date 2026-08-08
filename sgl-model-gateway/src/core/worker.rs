@@ -34,6 +34,7 @@ pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
+        .http1_only()
         .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
         .build()
         .expect("Failed to create worker HTTP client")
