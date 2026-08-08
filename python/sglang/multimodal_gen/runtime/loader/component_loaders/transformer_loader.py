@@ -39,6 +39,17 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
+def _resolve_checkpoint_load_device(
+    runtime_device: torch.device,
+    *,
+    component_cpu_offload: bool,
+    runtime_quant_config: object | None,
+) -> torch.device:
+    if component_cpu_offload and runtime_quant_config is None:
+        return torch.device("cpu")
+    return runtime_device
+
+
 def _default_quantized_attention_backend(
     quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
 ) -> AttentionBackendEnum | None:
@@ -198,8 +209,13 @@ class TransformerLoader(ComponentLoader):
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
+        checkpoint_load_device = _resolve_checkpoint_load_device(
+            local_torch_device,
+            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            runtime_quant_config=quant_spec.runtime_quant_config,
+        )
         weight_load_plan = WeightLoadPlan.for_component(
-            checkpoint_load_device=local_torch_device,
+            checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
             component_cpu_offload=bool(component_server_args.dit_cpu_offload),
         )
