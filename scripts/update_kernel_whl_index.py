@@ -11,10 +11,10 @@ DEFAULT_CUDA_VERSION = "130"
 
 
 def check_wheel_cuda_version(path_name, target_cuda_version):
-    # Skip non-CUDA backend wheels (rocm, musa, ...). Their +<backend><ver>
-    # local-version tags don't match the CUDA wheel regex below, and they are
-    # published by the dedicated release-rocm*/release-musa* jobs.
-    if re.search(r"\+(rocm|musa)", path_name):
+    # Skip non-CUDA backend wheels (rocm, musa, xpu, ...). Their +<backend><ver>
+    # local-version tags or package names don't match the CUDA wheel regex below,
+    # and they are published by the dedicated release-rocm*/release-musa*/release-xpu jobs.
+    if re.search(r"\+(rocm|musa)", path_name) or "xpu" in path_name:
         return False
 
     # For other CUDA versions, the wheel path name will contain the cuda version suffix, e.g. sglang_kernel-0.4.0+cu130-cp310-abi3-manylinux2014_x86_64.whl
@@ -68,6 +68,25 @@ def _update_non_cuda_wheel_index(backend, version):
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
 
+def update_wheel_index_xpu():
+    index_dir = pathlib.Path("sgl-whl/xpu/sglang-kernel-xpu")
+    base_url = "https://github.com/sgl-project/whl/releases/download"
+
+    for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
+        if "xpu" not in path.name:
+            continue
+        index_dir.mkdir(exist_ok=True, parents=True)
+        with open(path, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+        ver = re.findall(
+            r"sglang_kernel_xpu-([0-9.]+(?:\.post[0-9]+)?)-",
+            path.name,
+        )[0]
+        full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+        with (index_dir / "index.html").open("a") as f:
+            f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
+
+
 def update_wheel_index_rocm(rocm_version):
     _update_non_cuda_wheel_index("rocm", rocm_version)
 
@@ -81,8 +100,11 @@ def main():
     parser.add_argument("--cuda", type=str, default=DEFAULT_CUDA_VERSION)
     parser.add_argument("--rocm", type=str, default=None)
     parser.add_argument("--musa", type=str, default=None)
+    parser.add_argument("--xpu", action="store_true")
     args = parser.parse_args()
-    if args.musa is not None:
+    if args.xpu:
+        update_wheel_index_xpu()
+    elif args.musa is not None:
         update_wheel_index_musa(args.musa)
     elif args.rocm is not None:
         update_wheel_index_rocm(args.rocm)
