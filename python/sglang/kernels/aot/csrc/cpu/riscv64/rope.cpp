@@ -249,7 +249,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox) {
-  RECORD_FUNCTION("sgl-kernel::rotary_embedding_cpu", std::vector<c10::IValue>({query, key}));
   CHECK_DIM(1, positions);
   const auto input_dim = query.dim();
   const auto input_dtype = query.scalar_type();
