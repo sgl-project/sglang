@@ -1,6 +1,6 @@
 """
 Publish diffusion CI ground-truth images to sgl-project/ci-data
-via the GitHub API (same pattern as publish_traces.py).
+via the GitHub API.
 """
 
 import argparse
@@ -11,10 +11,10 @@ import sys
 from pathlib import Path
 from urllib.error import HTTPError
 
-# Reuse GitHub API helpers from publish_traces.
+# Reuse GitHub API helpers from github_repo_upload.
 # Support both direct script execution and package-style imports.
 if __package__:
-    from ..publish_traces import (
+    from ..github_repo_upload import (
         create_blobs,
         create_commit,
         create_tree,
@@ -28,7 +28,7 @@ if __package__:
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from publish_traces import (
+    from github_repo_upload import (
         create_blobs,
         create_commit,
         create_tree,

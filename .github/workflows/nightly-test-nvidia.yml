@@ -173,6 +173,9 @@ jobs:
   nightly-test-general-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h200')
     runs-on: 8-gpu-h200
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -196,7 +199,7 @@ jobs:
         if: always()
         timeout-minutes: 300
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://sglang-ci-traces.s3.us-west-1.amazonaws.com/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-h200"
           IS_H200: "1"
@@ -204,14 +207,22 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
-      - name: Publish traces to storage repo
+      - name: Configure AWS credentials
+        if: always()
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::324621154379:role/GitHubActionsSglangCI
+          aws-region: us-west-1
+
+      - name: Publish traces to S3
         if: always()
         continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          SGLANG_CI_TRACES_S3_BUCKET: sglang-ci-traces
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
+          python3 -m pip install -q boto3
           TRACE_ARGS=""
           for dir in test/performance_profiles_*/; do
             [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
@@ -289,6 +300,9 @@ jobs:
   nightly-test-general-8-gpu-b200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-b200')
     runs-on: 8-gpu-b200
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -310,21 +324,29 @@ jobs:
         if: always()
         timeout-minutes: 200
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://sglang-ci-traces.s3.us-west-1.amazonaws.com/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
-      - name: Publish traces to storage repo
+      - name: Configure AWS credentials
+        if: always()
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::324621154379:role/GitHubActionsSglangCI
+          aws-region: us-west-1
+
+      - name: Publish traces to S3
         if: always()
         continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          SGLANG_CI_TRACES_S3_BUCKET: sglang-ci-traces
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
+          python3 -m pip install -q boto3
           TRACE_ARGS=""
           for dir in test/performance_profiles_*/; do
             [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
@@ -390,6 +412,9 @@ jobs:
   nightly-test-text-perf-2-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-h100')
     runs-on: 2-gpu-h100
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -405,7 +430,7 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 30
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://sglang-ci-traces.s3.us-west-1.amazonaws.com/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-h100"
         run: |
@@ -413,12 +438,20 @@ jobs:
           rm -rf performance_profiles_text_models/
           python3 run_suite.py --hw cuda --suite nightly-perf-text-2-gpu --nightly --continue-on-error --timeout-per-file 3600
 
-      - name: Publish traces to storage repo
+      - name: Configure AWS credentials
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::324621154379:role/GitHubActionsSglangCI
+          aws-region: us-west-1
+
+      - name: Publish traces to S3
+        continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          SGLANG_CI_TRACES_S3_BUCKET: sglang-ci-traces
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
+          python3 -m pip install -q boto3
           python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_text_models
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -453,6 +486,9 @@ jobs:
   nightly-test-vlm-perf-2-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-h100')
     runs-on: 2-gpu-h100
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -468,7 +504,7 @@ jobs:
       - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 30
         env:
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          TRACE_BASE_URL: https://sglang-ci-traces.s3.us-west-1.amazonaws.com/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-h100"
         run: |
@@ -476,12 +512,20 @@ jobs:
           rm -rf performance_profiles_vlms/
           python3 run_suite.py --hw cuda --suite nightly-perf-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 3600
 
-      - name: Publish traces to storage repo
+      - name: Configure AWS credentials
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::324621154379:role/GitHubActionsSglangCI
+          aws-region: us-west-1
+
+      - name: Publish traces to S3
+        continue-on-error: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          SGLANG_CI_TRACES_S3_BUCKET: sglang-ci-traces
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
+          python3 -m pip install -q boto3
           python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_vlms
 
       - uses: ./.github/actions/upload-cuda-coredumps
