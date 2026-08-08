@@ -81,10 +81,9 @@ def needs_rewrite(prompt: str) -> bool:
 class LingBotVideoPromptRewriteStage(PipelineStage):
     """Expand a plain prompt into the structured caption the DiT was trained on.
 
-    The rewriter is a separate vision language model, so it is served externally and
-    reached over an OpenAI-compatible endpoint. Requests run in two turns against the
-    same server: the first expands the prompt without the rewriter adapter, the second
-    maps that expansion to JSON with the adapter enabled.
+    The rewriter is a separate vision language model reached over an OpenAI-compatible
+    endpoint, in two turns against the same server: expand without the rewriter adapter,
+    then map that expansion to JSON with the adapter enabled.
     """
 
     def __init__(self, url: str, expand_model: str, map_model: str, timeout: float):
@@ -96,8 +95,7 @@ class LingBotVideoPromptRewriteStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        # Rank 0 talks to the rewriter and broadcasts, so a multi-GPU deployment
-        # issues one set of requests and every rank denoises the same caption.
+        # Rank 0 rewrites and broadcasts, so every rank denoises the same caption.
         return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -113,9 +111,7 @@ class LingBotVideoPromptRewriteStage(PipelineStage):
         batch.prompt = rewritten if batched else rewritten[0]
         return batch
 
-    def _rewrite(
-        self, prompt: str, mode: str, duration: int, image: str | None
-    ) -> str:
+    def _rewrite(self, prompt: str, mode: str, duration: int, image: str | None) -> str:
         if not needs_rewrite(prompt):
             return prompt
         detailed = self._chat(

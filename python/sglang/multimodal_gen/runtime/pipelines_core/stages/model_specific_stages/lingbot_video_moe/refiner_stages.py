@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.denoising import (
@@ -30,8 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context,
     autocast_enabled,
-    resolve_precision,
+    resolve_decode_precision,
     temporary_module_dtype,
 )
 
@@ -45,25 +47,23 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         config = server_args.pipeline_config
         height, width = config.refiner_height, config.refiner_width
-        vae_dtype = resolve_precision(
-            server_args, self.component_name, precision_attr="vae_precision"
-        )
-
-        # One stream feeds both posterior samples and the noise draw, so the pass is
-        # reproducible from the request seed.
+        # The inherited component_uses declares residency at the decode precision.
+        vae_dtype = resolve_decode_precision(server_args, self.component_name)
         generator = _refiner_generator(batch, get_local_torch_device())
 
         with self.use_declared_component(
             component_name=self.component_name, module=self.vae
         ) as vae:
             self.vae = vae
-            # The refiner resolution is far above the base pass, so this round trip
-            # needs tiling whatever the pipeline-wide setting is. The VAE is shared
-            # with the final decode, so put it back afterwards.
+            # The refiner resolution needs tiling whatever the pipeline-wide setting is.
             was_tiling = self.vae.use_tiling
             self.vae.use_tiling = True
             try:
-                pixels = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+                # Only the decode half has a fast path; the re-encode has none.
+                with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
+                    pixels = self.decode(
+                        batch.latents, server_args, vae_dtype=vae_dtype
+                    )
                 upscaled = resize_video_pixels(pixels, height, width)
                 latents = self._encode(
                     upscaled, server_args, vae_dtype=vae_dtype, generator=generator
@@ -96,11 +96,7 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
     ) -> torch.Tensor:
         normalized = (pixels.to(get_local_torch_device()).float() - 0.5) / 0.5
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
-        with torch.autocast(
-            device_type=normalized.device.type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             if not vae_autocast_enabled:
                 normalized = normalized.to(vae_dtype)
             with temporary_module_dtype(
@@ -196,14 +192,7 @@ def _zero_negative_conditioning(batch: Req) -> None:
 
 
 def _refiner_generator(batch: Req, device: torch.device) -> torch.Generator | None:
-    # The reference implementation reseeds for the second pass rather than
-    # continuing the base pass stream.
+    # The reference reseeds for the second pass rather than continuing the base stream.
     if not batch.seeds:
         return None
     return torch.Generator(device=device).manual_seed(int(batch.seeds[0]))
-
-
-def _retrieve_latents(latent_dist, sample_mode: str):
-    if hasattr(latent_dist, "latent_dist"):
-        latent_dist = latent_dist.latent_dist
-    return latent_dist.mode() if sample_mode == "argmax" else latent_dist.sample()

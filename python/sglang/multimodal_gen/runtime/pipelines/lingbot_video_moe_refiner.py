@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
-    """Two-pass LingBot-Video: base denoise, then the refiner weights at a higher resolution.
+    """Base denoise, then the refiner weights at a higher resolution.
 
     Opt in with ``--pipeline-class-name LingBotVideoRefinerPipeline``; the refiner DiT
     doubles the resident weights, so the single-pass pipeline stays the default.
@@ -35,8 +35,7 @@ class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
     _refiner_subfolder = "refiner"
 
     def _load_config(self) -> dict[str, Any]:
-        # The refiner DiT ships as a bare subfolder, absent from model_index.json,
-        # and is the same architecture as the base DiT.
+        # The refiner DiT is absent from model_index.json but shares the base architecture.
         config = super()._load_config()
         config["transformer_2"] = config["transformer"]
         return config
@@ -44,8 +43,7 @@ class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
     def _resolve_component_path(
         self, server_args: ServerArgs, module_name: str, load_module_name: str
     ) -> str:
-        # Keep the transformer_2 name so the loader registry still picks the
-        # transformer loader, and only redirect where the weights come from.
+        # The name drives loader selection, so keep it and redirect only the path.
         if module_name == "transformer_2":
             return os.path.join(self.model_path, self._refiner_subfolder)
         return super()._resolve_component_path(

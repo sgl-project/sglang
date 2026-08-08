@@ -11,7 +11,6 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, List, Union
 
-import msgspec
 import numpy as np
 import torch
 from setproctitle import setproctitle
@@ -85,18 +84,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
-
-
-# Read-only srt get_server_args() surface for the reused fused_experts (LingBot
-# MoE). All False = default fused_experts mode; only the MoE path reads these.
-class SrtMoeBridgeArgs(msgspec.Struct, frozen=True):
-    enable_deterministic_inference: bool = False
-    enable_fused_moe_sum_all_reduce: bool = False
-    enable_symm_mem: bool = False
-
-
-_SRT_MOE_BRIDGE_ARGS = SrtMoeBridgeArgs()
-
 
 logger = init_logger(__name__)
 

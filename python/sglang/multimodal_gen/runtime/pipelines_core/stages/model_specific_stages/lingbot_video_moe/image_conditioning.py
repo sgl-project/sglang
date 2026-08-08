@@ -16,10 +16,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     pixel_to_vlm_image,
     preprocess_condition_image,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context,
     autocast_enabled,
     resolve_precision,
     temporary_module_dtype,
@@ -75,11 +75,7 @@ class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
         ) as vae:
             assert vae is not None
             self.vae = vae
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
-                enabled=vae_autocast_enabled,
-            ):
+            with autocast_context(vae_dtype, server_args.disable_autocast):
                 if not vae_autocast_enabled:
                     normalized = normalized.to(vae_dtype)
                 with temporary_module_dtype(
@@ -89,8 +85,8 @@ class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
                 if isinstance(latent_dist, AutoencoderKLOutput):
                     latent_dist = latent_dist.latent_dist
 
-        # The reference implementation samples the posterior rather than taking its
-        # mode, which also advances the generator before the noise draw.
+        # The reference samples the posterior rather than taking its mode, which also
+        # advances the generator before the noise draw.
         cond_latent = self.retrieve_latents(
             latent_dist, generator, sample_mode="sample"
         ).float()

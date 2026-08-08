@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import PIL.Image
@@ -21,6 +22,10 @@ from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe_refiner import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
     LingBotVideoDenoisingStage,
+    LingBotVideoRefinerUpscaleStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
+    refiner_stages as refiner_stages_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
     COND_LATENT_KEY,
@@ -62,6 +67,13 @@ class _RecordingProcessor:
             "input_ids": torch.zeros(1, self.width, dtype=torch.long),
             "attention_mask": torch.ones(1, self.width, dtype=torch.long),
         }
+
+
+class _StubVae:
+    # The fast-path gate registry is keyed by weak reference, so this cannot be a
+    # SimpleNamespace.
+    def __init__(self):
+        self.use_tiling = False
 
 
 def _text_encoding_stage(processor):
@@ -345,6 +357,52 @@ def test_refiner_weights_resolve_to_the_refiner_subfolder():
     path = pipeline._resolve_component_path(None, "transformer_2", "transformer_2")
 
     assert path == "/models/lingbot/refiner"
+
+
+def test_refiner_round_trip_matches_the_declared_decode_precision(monkeypatch):
+    monkeypatch.setattr(
+        refiner_stages_module, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    vae = _StubVae()
+    stage = object.__new__(LingBotVideoRefinerUpscaleStage)
+    stage.component_name = "vae"
+    stage.vae = vae
+    stage.use_declared_component = lambda **kwargs: nullcontext(vae)
+
+    seen = {}
+
+    def decode(latents, server_args, *, vae_dtype):
+        seen["decode"] = vae_dtype
+        return torch.zeros(1, 3, 1, 4, 4)
+
+    def encode(pixels, server_args, *, vae_dtype, generator):
+        seen["encode"] = vae_dtype
+        return torch.zeros(1, 4, 1, 2, 2)
+
+    stage.decode = decode
+    stage._encode = encode
+
+    config = LingBotVideoMoEPipelineConfig()
+    # The decode-only override must win over vae_precision on both halves.
+    config.vae_decode_precision = "fp32"
+    config.refiner_height, config.refiner_width = 8, 16
+    server_args = SimpleNamespace(pipeline_config=config, disable_autocast=False)
+    batch = SimpleNamespace(
+        latents=torch.zeros(1, 4, 1, 2, 2),
+        extra={},
+        seeds=[],
+        sampling_params=SimpleNamespace(quality="lossless"),
+        height=480,
+        width=832,
+    )
+
+    stage.forward(batch, server_args)
+
+    declared = stage.component_uses(server_args)[0].target_dtype
+    assert declared == torch.float32
+    assert seen["decode"] == declared
+    assert seen["encode"] == declared
+    assert (batch.height, batch.width) == (8, 16)
 
 
 def test_rewrite_mode_follows_the_request_shape():
