@@ -34,6 +34,7 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 
 
 class KDAKernelDispatcher:
@@ -731,7 +732,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = self.verify_intermediate_state_indices
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = resolve_ragged_verify_layout(forward_batch)
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

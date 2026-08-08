@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
-    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -328,23 +327,16 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
-    # Per-request verify lengths for the ragged-verify graphs (see
-    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
-    # supports_ragged_verify() override it per step. Must stay a class-level
-    # default, not an __init__ assignment: dataclass subclasses declare it as
-    # a field and run __post_init__ -> super().__init__ *after* field
-    # assignment, so an init-time default would clobber the passed layout.
-    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
-
     # Uniform per-request token width of this forward (and its logits-row
     # counterpart). Doubles as the DP-attention global_num_tokens multiplier
     # (ragged forwards carry 1 there). -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
-    # ragged_verify_layout) so scheduler/relay/attention code reads them
-    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    # DSA MTP IndexShare seed relay: readable on any SpecInput; only the
+    # EAGLE-family inputs override them. Must stay class-level defaults, not
+    # __init__ assignments -- dataclass subclasses run __post_init__ ->
+    # super().__init__ after field assignment, which would clobber a passed value.
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
