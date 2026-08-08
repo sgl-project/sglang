@@ -59,6 +59,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         batch = SimpleNamespace(
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
+            draft_global_num_tokens=None,
             can_run_dp_cuda_graph=True,
         )
 
@@ -72,6 +73,35 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
         )
         self.assertTrue(fb.can_run_dp_cuda_graph)
+
+    def test_init_mlp_sync_metadata_uses_draft_worker_token_counts(self):
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=torch.arange(2),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+            out_cache_loc=torch.arange(2),
+            seq_lens_sum=11,
+            positions=torch.arange(2),
+        )
+        batch = SimpleNamespace(
+            global_num_tokens=[2, 4],
+            global_num_tokens_for_logprob=[2, 4],
+            draft_global_num_tokens=[2],
+            draft_global_num_tokens_for_logprob=[2],
+            can_run_dp_cuda_graph=True,
+        )
+
+        fb.init_mlp_sync_metadata(batch, torch.device("cpu"), is_draft_worker=True)
+
+        self.assertEqual(fb.original_global_num_tokens_cpu, [2])
+        self.assertEqual(fb.global_num_tokens_cpu, [2])
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
+        torch.testing.assert_close(fb.global_num_tokens_gpu, torch.tensor([2]))
+        torch.testing.assert_close(
+            fb.global_num_tokens_for_logprob_gpu, torch.tensor([2])
+        )
 
     def test_draft_input_without_hidden_states_can_be_padded(self):
         spec_info = SimpleNamespace(

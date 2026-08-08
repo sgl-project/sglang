@@ -703,28 +703,40 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mark_forward_metadata_ready()
 
     def init_mlp_sync_metadata(
-        self, batch: ScheduleBatch, device: Union[str, torch.device]
+        self,
+        batch: ScheduleBatch,
+        device: Union[str, torch.device],
+        *,
+        is_draft_worker: bool = False,
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
-        if batch.global_num_tokens is None:
+        global_num_tokens_source = batch.global_num_tokens
+        global_num_tokens_for_logprob_source = batch.global_num_tokens_for_logprob
+        if is_draft_worker and batch.draft_global_num_tokens is not None:
+            global_num_tokens_source = batch.draft_global_num_tokens
+            global_num_tokens_for_logprob_source = (
+                batch.draft_global_num_tokens_for_logprob
+            )
+
+        if global_num_tokens_source is None:
             return
 
-        assert batch.global_num_tokens_for_logprob is not None
+        assert global_num_tokens_for_logprob_source is not None
         if self.spec_info is not None:
             from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
 
             global_num_tokens, global_num_tokens_for_logprob = (
                 spec_scale_global_num_tokens(
                     self.spec_info,
-                    batch.global_num_tokens,
-                    batch.global_num_tokens_for_logprob,
+                    global_num_tokens_source,
+                    global_num_tokens_for_logprob_source,
                 )
             )
         else:
-            global_num_tokens = batch.global_num_tokens
-            global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+            global_num_tokens = global_num_tokens_source
+            global_num_tokens_for_logprob = global_num_tokens_for_logprob_source
 
-        self.original_global_num_tokens_cpu = batch.global_num_tokens
+        self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64
@@ -874,7 +886,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         ret.num_token_non_padded_cpu = num_tokens
 
-        ret.init_mlp_sync_metadata(batch, device)
+        ret.init_mlp_sync_metadata(
+            batch, device, is_draft_worker=model_runner.is_draft_worker
+        )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1590,6 +1604,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if self.forward_mode.is_idle():
+                    self.positions = self.positions[:bs]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
