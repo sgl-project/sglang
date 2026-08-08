@@ -134,6 +134,15 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
+# moonmath_attention: bf16 LiteAttention kernel for gfx942. Not on PyPI; built
+# from source (needs hipcc). Required by the ROCm diffusion attention backend.
+if [[ "${OPTIONAL_DEPS}" == *"diffusion"* ]]; then
+  git_clone_with_retry https://github.com/moonmath-ai/amd-kernels.git amd-kernels
+  docker cp amd-kernels ci_sglang:/
+  docker exec ci_sglang git config --global --add safe.directory /amd-kernels
+  install_with_retry docker exec -w /amd-kernels ci_sglang pip install --no-build-isolation --no-deps --cache-dir=/sgl-data/pip-cache -e .
+fi
+
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
