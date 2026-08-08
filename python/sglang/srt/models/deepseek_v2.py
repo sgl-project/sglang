@@ -1955,8 +1955,12 @@ class DeepseekV2AttentionMLA(
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
-        self._q_b_proj_verified_shape = self.has_q_b_proj and (
-            tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
+        # Packed quantizations (AWQ, GPTQ) register `qweight` and no `weight`,
+        # and can't use the fused-a GEMM anyway; leave them unverified.
+        self._q_b_proj_verified_shape = (
+            self.has_q_b_proj
+            and hasattr(self.q_b_proj, "weight")
+            and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
         )
         self._use_min_latency_q_b_gemm: bool | None = None
 
