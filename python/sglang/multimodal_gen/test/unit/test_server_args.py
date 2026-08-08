@@ -2185,8 +2185,14 @@ class TestJobControlEnabled(unittest.TestCase):
         enable_cfg_parallel=False,
         tp_size=1,
         dp_size=1,
+        num_gpus=1,
+        batching_max_size=1,
+        backend=None,
+        pipeline_config=None,
+        pipeline_class_name=None,
     ):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+        from sglang.multimodal_gen.runtime.server_args import Backend
 
         sa = ServerArgs.__new__(ServerArgs)
         sa.disable_job_control = disable_job_control
@@ -2195,6 +2201,11 @@ class TestJobControlEnabled(unittest.TestCase):
         sa.enable_cfg_parallel = enable_cfg_parallel
         sa.tp_size = tp_size
         sa.dp_size = dp_size
+        sa.num_gpus = num_gpus
+        sa.batching_max_size = batching_max_size
+        sa.backend = Backend.AUTO if backend is None else backend
+        sa.pipeline_config = pipeline_config or QwenImagePipelineConfig()
+        sa.pipeline_class_name = pipeline_class_name
         return sa
 
     def test_enabled_for_single_rank_monolithic_defaults(self):
@@ -2202,6 +2213,22 @@ class TestJobControlEnabled(unittest.TestCase):
 
     def test_disable_flag_turns_it_off(self):
         self.assertFalse(self._args(disable_job_control=True).job_control_enabled)
+
+    def test_cancel_channel_is_loopback_only(self):
+        args = self._args()
+        args.host = "0.0.0.0"
+        args.scheduler_cancel_port = 5601
+        self.assertEqual(args.scheduler_cancel_endpoint, "tcp://127.0.0.1:5601")
+
+    def test_cancel_port_cannot_overlap_broker(self):
+        args = self._args()
+        args.port = 8000
+        args.scheduler_port = 5600
+        args.scheduler_cancel_port = args.broker_port
+        args.master_port = None
+        args.strict_ports = True
+        with self.assertRaisesRegex(RuntimeError, "duplicates another server port"):
+            args._settle_job_control_port()
 
     def test_dp_size_gt_one_turns_it_off(self):
         self.assertFalse(self._args(dp_size=2).job_control_enabled)
@@ -2219,6 +2246,40 @@ class TestJobControlEnabled(unittest.TestCase):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         self.assertFalse(self._args(disagg_role=RoleType.DENOISER).job_control_enabled)
+
+    def test_disabled_for_more_than_one_gpu(self):
+        self.assertFalse(self._args(num_gpus=2).job_control_enabled)
+
+    def test_disabled_for_dynamic_batching(self):
+        self.assertFalse(self._args(batching_max_size=2).job_control_enabled)
+
+    def test_disabled_for_diffusers_backend(self):
+        from sglang.multimodal_gen.runtime.server_args import Backend
+
+        self.assertFalse(self._args(backend=Backend.DIFFUSERS).job_control_enabled)
+
+    def test_disabled_for_diffusers_pipeline_config(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+            DiffusersGenericPipelineConfig,
+        )
+
+        self.assertFalse(
+            self._args(
+                pipeline_config=DiffusersGenericPipelineConfig()
+            ).job_control_enabled
+        )
+
+    def test_disabled_for_explicit_diffusers_pipeline(self):
+        self.assertFalse(
+            self._args(pipeline_class_name="DiffusersPipeline").job_control_enabled
+        )
+
+    def test_disabled_for_non_visual_task(self):
+        self.assertFalse(
+            self._args(
+                pipeline_config=PipelineConfig(task_type=ModelTaskType.VLA_ACTION)
+            ).job_control_enabled
+        )
 
 
 class TestDisaggTransferBackendArgs(unittest.TestCase):

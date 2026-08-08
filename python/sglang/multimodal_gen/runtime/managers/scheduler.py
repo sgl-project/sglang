@@ -12,6 +12,7 @@ from copy import deepcopy
 from enum import Enum
 from typing import Any, Iterator, List
 
+import msgspec
 import zmq
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -46,12 +47,10 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.job_registry import (
     CANCELLED,
-    CancelReq,
     JobRegistry,
-    JobStatusReq,
-    clear_current_jobs,
+    clear_current_job,
     contains_file_refs,
-    set_current_jobs,
+    set_current_job,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -317,7 +316,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
                         error_msg=output_batch.error,
-                        cancelled=output_batch.cancelled,
                     )
 
                 split_outputs = self._split_batched_output(output_batch, reqs)
@@ -328,7 +326,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
                         error_msg="Dynamic batching failed: could not split merged output.",
-                        cancelled=output_batch.cancelled,
                     )
 
                 logger.info(
@@ -361,7 +358,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
                     error_msg=output_batch.error,
-                    cancelled=output_batch.cancelled,
                 )
 
             split_outputs = self._split_batched_output(output_batch, reqs)
@@ -372,7 +368,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
                     error_msg="Native grouped execution failed: could not split output.",
-                    cancelled=output_batch.cancelled,
                 )
 
             logger.info(
@@ -641,10 +636,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self,
         reqs: list[Req],
         error_msg: str,
-        *,
-        cancelled: bool = False,
     ) -> list[OutputBatch]:
-        return [OutputBatch(error=error_msg, cancelled=cancelled) for _ in reqs]
+        return [OutputBatch(error=error_msg) for _ in reqs]
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
         req = get_first_generation_req(processed_req)
@@ -825,7 +818,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.trajectory_decoded, start, end, total_items
                 ),
                 error=output_batch.error,
-                cancelled=output_batch.cancelled,
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
@@ -993,13 +985,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         try:
             socket.bind(self.server_args.scheduler_cancel_endpoint)
         except zmq.ZMQError as e:
-            logger.error(
-                "job-control channel failed to bind %s; job control disabled: %s",
-                self.server_args.scheduler_cancel_endpoint,
-                e,
-            )
             socket.close(linger=0)
-            return
+            raise RuntimeError(
+                "job-control channel failed to bind "
+                f"{self.server_args.scheduler_cancel_endpoint}"
+            ) from e
         self._job_control_socket = socket
         self.jobs = JobRegistry()
         self._job_control_thread = threading.Thread(
@@ -1020,18 +1010,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 # drain all frames so REP alternation survives multipart input
                 payload = socket.recv_multipart()[-1]
                 try:
-                    request = pickle.loads(payload)
-                    if isinstance(request, CancelReq):
-                        reply = self.jobs.cancel(request.request_id)
-                    elif isinstance(request, JobStatusReq):
-                        reply = self.jobs.status(request.request_id)
+                    request = msgspec.msgpack.decode(payload)
+                    if not isinstance(request, dict):
+                        raise ValueError("malformed job control request")
+                    request_id = request.get("request_id")
+                    if (
+                        not isinstance(request_id, str)
+                        or not 1 <= len(request_id) <= 128
+                    ):
+                        raise ValueError("malformed job control request")
+                    if request.get("operation") == "cancel":
+                        reply = self.jobs.cancel(request_id)
+                    elif request.get("operation") == "status":
+                        reply = self.jobs.status(request_id)
                     else:
                         reply = {
-                            "error": f"unknown job control request: {type(request)}"
+                            "error": f"unknown job control operation: {request.get('operation')!r}"
                         }
                 except Exception as e:  # never kill the channel
                     reply = {"error": str(e)}
-                socket.send(pickle.dumps(reply))
+                socket.send(msgspec.msgpack.encode(reply))
             except zmq.ZMQError:
                 break  # context shut down
         socket.close(linger=0)
@@ -1048,7 +1046,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if not isinstance(req, Req) or is_warmup_req(req) or not req.request_id:
                 admitted.append((identity, req))
                 continue
-            verdict, payload = self.jobs.admit(req.request_id, identity)
+            verdict, payload = self.jobs.admit(
+                req.request_id,
+                identity,
+                (req.extra or {}).get("job_request_fingerprint"),
+            )
             if verdict == "new":
                 admitted.append((identity, req))
             elif verdict == "cancelled":
@@ -1057,6 +1059,22 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 self.jobs.finish(req.request_id, output)
                 self._try_return(output, identity)
+            elif verdict == "conflict":
+                self._try_return(
+                    OutputBatch(
+                        error=f"request_id {req.request_id!r} was reused with different parameters",
+                        idempotency_conflict=True,
+                    ),
+                    identity,
+                )
+            elif verdict == "overloaded":
+                self._try_return(
+                    OutputBatch(
+                        error=f"request_id {req.request_id!r} has too many duplicate waiters",
+                        idempotency_conflict=True,
+                    ),
+                    identity,
+                )
             elif verdict == "replay":
                 if payload is None or contains_file_refs(payload.output):
                     payload = OutputBatch(
@@ -1064,6 +1082,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                             f"request {req.request_id} already finished; "
                             "result not replayable"
                         ),
+                        idempotency_conflict=True,
                         cancelled=(
                             self.jobs.status(req.request_id)["status"] == CANCELLED
                         ),
@@ -1076,7 +1095,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         try:
             self.return_result(output_batch, identity)
         except zmq.ZMQError as e:
-            logger.warning("job-control reply failed: %s", e)
+            logger.warning("scheduler job reply failed: %s", e)
 
     def _drop_cancelled_items(
         self, items: list[tuple[bytes | None, Any]]
@@ -1102,18 +1121,16 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 kept.append((identity, req))
         return kept
 
-    def _set_running_jobs(self, items: list[tuple[bytes | None, Any]]) -> None:
+    def _set_running_job(self, items: list[tuple[bytes | None, Any]]) -> None:
         if self.jobs is None:
             return
-        handles = [
-            handle
-            for _, req in items
-            if isinstance(req, Req)
-            and req.request_id
-            and not is_warmup_req(req)
-            and (handle := self.jobs.mark_running(req.request_id)) is not None
-        ]
-        set_current_jobs(handles)
+        for _, req in items:
+            if isinstance(req, Req) and req.request_id and not is_warmup_req(req):
+                handle = self.jobs.mark_running(req.request_id)
+                if handle is not None:
+                    set_current_job(handle)
+                    return
+        set_current_job(None)
 
     def _job_waiters(
         self, req: Any, output_batch: OutputBatch, is_warmup: bool
@@ -1246,7 +1263,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if not items:
                 continue
 
-            self._set_running_jobs(items)
+            self._set_running_job(items)
             try:
                 handler_result = self._dispatch_items(items)
             except Exception as e:
@@ -1256,7 +1273,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
                 handler_result = OutputBatch(error=str(e))
             finally:
-                clear_current_jobs()
+                clear_current_job()
 
             if isinstance(handler_result, list):
                 output_batches = handler_result

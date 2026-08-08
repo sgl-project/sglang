@@ -20,7 +20,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
@@ -1624,58 +1624,58 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
-            self.progress_bar(
-                total=ctx.num_inference_steps, batch=batch
-            ) as progress_bar,
         ):
-            for step_index, t_host in enumerate(timesteps_cpu):
-                check_current_step(step_index, ctx.num_inference_steps)
-                # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
-                # use non-integer timesteps keep their precision in markers.
-                step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
-                with (
-                    maybe_nvtx_range(step_marker, use_nvtx),
-                    StageProfiler(
-                        f"denoising_step_{step_index}",
-                        logger=logger,
-                        metrics=batch.metrics,
-                        perf_dump_path_provided=batch.perf_dump_path is not None,
-                        record_as_step=True,
-                    ),
-                ):
-                    step = self._prepare_step_state(
-                        ctx,
-                        batch,
-                        server_args,
-                        step_index,
-                        t_host,
-                        timesteps_cpu,
-                    )
-                    # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
-                    # x_{t_i} for rollout trajectory collection. Must run
-                    # BEFORE _run_denoising_step so ctx.latents is still the
-                    # pre-step value. Gated on batch.rollout to keep the
-                    # non-rollout path strictly untouched.
-                    if batch.rollout:
-                        batch._rollout_loop_step_index = step_index
-                        self._maybe_append_dit_trajectory_step(
-                            batch=batch,
-                            latents=ctx.latents,
-                            timestep_value=step.t_host,
-                            step_index=step_index,
-                        )
-                    self._run_denoising_step(ctx, step, batch, server_args)
-                    self._record_trajectory(ctx, step, batch, server_args)
-
-                    if step_index == num_timesteps - 1 or (
-                        (step_index + 1) > ctx.num_warmup_steps
-                        and (step_index + 1) % ctx.scheduler.order == 0
-                        and progress_bar is not None
+            with self.progress_bar(
+                total=ctx.num_inference_steps, batch=batch
+            ) as progress_bar:
+                for step_index, t_host in enumerate(timesteps_cpu):
+                    check_current_step(step_index, ctx.num_inference_steps)
+                    # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
+                    # use non-integer timesteps keep their precision in markers.
+                    step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
+                    with (
+                        maybe_nvtx_range(step_marker, use_nvtx),
+                        StageProfiler(
+                            f"denoising_step_{step_index}",
+                            logger=logger,
+                            metrics=batch.metrics,
+                            perf_dump_path_provided=batch.perf_dump_path is not None,
+                            record_as_step=True,
+                        ),
                     ):
-                        progress_bar.update()
+                        step = self._prepare_step_state(
+                            ctx,
+                            batch,
+                            server_args,
+                            step_index,
+                            t_host,
+                            timesteps_cpu,
+                        )
+                        # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
+                        # x_{t_i} for rollout trajectory collection. Must run
+                        # BEFORE _run_denoising_step so ctx.latents is still the
+                        # pre-step value. Gated on batch.rollout to keep the
+                        # non-rollout path strictly untouched.
+                        if batch.rollout:
+                            batch._rollout_loop_step_index = step_index
+                            self._maybe_append_dit_trajectory_step(
+                                batch=batch,
+                                latents=ctx.latents,
+                                timestep_value=step.t_host,
+                                step_index=step_index,
+                            )
+                        self._run_denoising_step(ctx, step, batch, server_args)
+                        self._record_trajectory(ctx, step, batch, server_args)
 
-                    if not ctx.is_warmup:
-                        self.step_profile()
+                        if step_index == num_timesteps - 1 or (
+                            (step_index + 1) > ctx.num_warmup_steps
+                            and (step_index + 1) % ctx.scheduler.order == 0
+                            and progress_bar is not None
+                        ):
+                            progress_bar.update()
+
+                        if not ctx.is_warmup:
+                            self.step_profile()
 
         denoising_end_time = time.time()
 

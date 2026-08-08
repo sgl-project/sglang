@@ -28,6 +28,16 @@ class AsyncDictStore:
             item.update(updates)
             return item
 
+    async def update_fields_if_status(
+        self, key: str, updates: Dict[str, Any], allowed_statuses: set[str]
+    ) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            item = self._items.get(key)
+            if item is None or item.get("status") not in allowed_statuses:
+                return None
+            item.update(updates)
+            return item
+
     async def get(self, key: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
             return self._items.get(key)

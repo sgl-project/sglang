@@ -2,7 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,6 +21,16 @@ class ImageResponse(BaseModel):
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+
+
+JobRequestId = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
 
 
 class ImageGenerationsRequest(BaseModel):
@@ -57,8 +67,8 @@ class ImageGenerationsRequest(BaseModel):
     upscaling_model_path: Optional[str] = None
     upscaling_scale: Optional[int] = 4
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    request_id: Optional[JobRequestId] = None
     # Performance profiling
-    request_id: Optional[str] = None
     perf_dump_path: Optional[str] = None
     # Progressive resolution generation
     progressive_mode: Optional[str] = None

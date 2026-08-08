@@ -16,6 +16,7 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -461,6 +462,7 @@ def minimax_h3_denoise_loop(
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
     for step in range(num_steps):
+        check_current_step(step, num_steps)
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]

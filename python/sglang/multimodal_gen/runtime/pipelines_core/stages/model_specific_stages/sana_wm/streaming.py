@@ -24,6 +24,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -98,7 +99,8 @@ def self_forcing_denoise_chunk(
     ctx = forward_ctx if forward_ctx is not None else (lambda _ts: nullcontext())
 
     scheduler.set_timesteps(sigmas=sigmas, device=device)
-    for t in scheduler.timesteps:
+    for step_idx, t in enumerate(scheduler.timesteps):
+        check_current_step(step_idx, len(scheduler.timesteps))
         chunk_lat = get_chunk()
         B, C = chunk_lat.shape[0], chunk_lat.shape[1]
         lat_in = torch.cat([chunk_lat, chunk_lat], dim=0) if do_cfg else chunk_lat

@@ -25,8 +25,11 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.job_registry import (
+    RequestCancelledError,
+    RequestConflictError,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.managers.job_registry import RequestCancelledError
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.common import parse_size
@@ -357,6 +360,8 @@ async def process_generation_batch(
             and result.raw_frame_batches is None
         ):
             error_msg = result.error or "Unknown error"
+            if result.idempotency_conflict:
+                raise RequestConflictError(error_msg)
             if result.cancelled:
                 raise RequestCancelledError(error_msg)
             raise RuntimeError(

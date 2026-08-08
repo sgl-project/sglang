@@ -2,10 +2,12 @@ import pickle
 import time
 from typing import Any, Optional, Set
 
+import msgspec
 import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.managers.job_registry import CancelReq, JobStatusReq
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -199,13 +201,31 @@ class AsyncSchedulerClient:
             raise RuntimeError(
                 "AsyncSchedulerClient is not initialized. Call initialize() first."
             )
+        if isinstance(request, CancelReq):
+            operation = "cancel"
+        elif isinstance(request, JobStatusReq):
+            operation = "status"
+        else:
+            raise TypeError(f"unsupported job control request: {type(request)}")
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.RCVTIMEO, 5000)
         socket.connect(self.server_args.scheduler_cancel_endpoint)
         try:
-            await socket.send(pickle.dumps(request))
-            return pickle.loads(await socket.recv())
+            await socket.send(
+                msgspec.msgpack.encode(
+                    {"operation": operation, "request_id": request.request_id}
+                )
+            )
+            try:
+                reply = msgspec.msgpack.decode(await socket.recv())
+            except msgspec.DecodeError as e:
+                raise RuntimeError(
+                    "Scheduler returned an invalid job-control reply."
+                ) from e
+            if not isinstance(reply, dict):
+                raise RuntimeError("Scheduler returned an invalid job-control reply.")
+            return reply
         except zmq.error.Again:
             raise TimeoutError("Scheduler job-control channel did not respond.")
         finally:

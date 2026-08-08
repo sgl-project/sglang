@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import time
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
     ImageResponseData,
+    JobRequestId,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
@@ -43,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.job_registry import (
     CancelReq,
     JobStatusReq,
     RequestCancelledError,
+    RequestConflictError,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -50,6 +53,12 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
+
+
+def _request_fingerprint(request: ImageGenerationsRequest) -> str:
+    payload = request.model_dump(mode="json", exclude={"request_id"})
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _get_extra_field(request, field_name):
@@ -303,6 +312,8 @@ async def generations(
             sampling_params=sampling,
             external_trace_header=trace_headers,
         )
+        if request.request_id is not None:
+            batch.extra["job_request_fingerprint"] = _request_fingerprint(request)
         # Add diffusers_kwargs if provided
         if request.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
@@ -311,6 +322,8 @@ async def generations(
                 async_scheduler_client, batch
             )
         except RequestCancelledError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except RequestConflictError as e:
             raise HTTPException(status_code=409, detail=str(e))
         save_file_path = save_file_path_list[0]
         resp_format = (request.response_format or "b64_json").lower()
@@ -463,12 +476,9 @@ async def edits(
             sampling_params=sampling,
             external_trace_header=trace_headers,
         )
-        try:
-            save_file_path_list, result = await process_generation_batch(
-                async_scheduler_client, batch
-            )
-        except RequestCancelledError as e:
-            raise HTTPException(status_code=409, detail=str(e))
+        save_file_path_list, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
         save_file_path = save_file_path_list[0]
         resp_format = (response_format or "b64_json").lower()
 
@@ -567,19 +577,38 @@ def _require_job_control() -> None:
     if not get_global_server_args().job_control_enabled:
         raise HTTPException(
             status_code=503,
-            detail="job control requires a single-rank scheduler in v1",
+            detail="job control is unavailable for this server configuration",
         )
 
 
+async def _job_control(request):
+    try:
+        reply = await async_scheduler_client.job_control(request)
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=504, detail="scheduler job-control channel timed out"
+        ) from e
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=503, detail="scheduler job-control channel is unavailable"
+        ) from e
+    if reply.get("error"):
+        raise HTTPException(status_code=503, detail=reply["error"])
+    return reply
+
+
 @router.get("/jobs/{request_id}")
-async def job_status(request_id: str):
+async def job_status(request_id: JobRequestId):
     """Observable job status from the scheduler's job-control channel."""
     _require_job_control()
-    return await async_scheduler_client.job_control(JobStatusReq(request_id=request_id))
+    return await _job_control(JobStatusReq(request_id=request_id))
 
 
 @router.delete("/jobs/{request_id}")
-async def cancel_job(request_id: str):
+async def cancel_job(request_id: JobRequestId):
     """Cancel a job by request id."""
     _require_job_control()
-    return await async_scheduler_client.job_control(CancelReq(request_id=request_id))
+    reply = await _job_control(CancelReq(request_id=request_id))
+    if reply.get("overloaded"):
+        raise HTTPException(status_code=429, detail="precancel capacity is exhausted")
+    return reply

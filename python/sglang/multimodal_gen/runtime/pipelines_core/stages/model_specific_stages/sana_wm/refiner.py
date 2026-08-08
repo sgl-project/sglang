@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -662,6 +663,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
         n_context_tokens = sink_tokens.shape[1]
 
         for step_idx in range(len(sigmas) - 1):
+            check_current_step(step_idx, len(sigmas) - 1)
             sigma = sigmas[step_idx]
             denoised = self._predict_current_x0(
                 sink=sink,

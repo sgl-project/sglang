@@ -485,8 +485,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 output_batch = OutputBatch()
             output_batch.error = f"request cancelled: {e}"
             output_batch.cancelled = True
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
         except Exception as e:
             logger.error(
                 f"Error executing {error_context}: {e}",

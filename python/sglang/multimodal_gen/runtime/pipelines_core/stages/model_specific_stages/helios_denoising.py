@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -157,6 +158,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         do_cfg = guidance_scale > 1.0
 
         for i, t in enumerate(timesteps):
+            check_current_step(
+                global_step_offset + i, global_step_offset + len(timesteps)
+            )
             with StageProfiler(
                 f"denoising_step_{global_step_offset + i}",
                 logger=logger,
@@ -355,6 +359,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
 
             # Denoising loop for this pyramid stage
             for idx, t in enumerate(timesteps):
+                check_current_step(step_counter, step_counter + len(timesteps) - idx)
                 with StageProfiler(
                     f"denoising_step_{step_counter}",
                     logger=logger,

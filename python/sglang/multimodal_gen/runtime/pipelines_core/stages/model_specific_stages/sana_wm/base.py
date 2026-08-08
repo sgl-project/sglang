@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -965,6 +966,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             self.transformer = transformer
 
             for step_idx, t in enumerate(self.progress_bar(timesteps, batch=batch)):
+                check_current_step(step_idx, len(timesteps))
                 if cfg_parallel:
                     latent_model_input = latents
                 else:

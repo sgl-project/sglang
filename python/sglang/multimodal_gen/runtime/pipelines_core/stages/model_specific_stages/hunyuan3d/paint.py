@@ -20,7 +20,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -875,7 +874,6 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             extra_step_kwargs["generator"] = generator
 
         for step_idx, t in enumerate(timesteps):
-            check_current_step(step_idx, len(timesteps))
             latents = rearrange(latents, "(b n) c h w -> b n c h w", n=num_in_batch)
             latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
             latent_model_input = rearrange(

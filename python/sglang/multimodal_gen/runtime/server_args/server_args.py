@@ -21,6 +21,9 @@ import yaml
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+    DiffusersGenericPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     is_ltx23_native_variant,
@@ -1006,7 +1009,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _settle_job_control_port(self):
-        """Reserve the cancel port when job control is enabled."""
+        """Select and validate the cancel port when job control is enabled."""
         if not self.job_control_enabled:
             return
         self.scheduler_cancel_port = (
@@ -1014,7 +1017,12 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         taken_ports = {
             port
-            for port in (self.port, self.scheduler_port, self.master_port)
+            for port in (
+                self.port,
+                self.broker_port,
+                self.scheduler_port,
+                self.master_port,
+            )
             if port is not None
         }
         if self.strict_ports:
@@ -2089,21 +2097,25 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @property
     def scheduler_cancel_endpoint(self):
-        scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
-            scheduler_host = "127.0.0.1"
-        return f"tcp://{scheduler_host}:{self.scheduler_cancel_port}"
+        """Local-only endpoint for monolithic v1 job control."""
+        return f"tcp://127.0.0.1:{self.scheduler_cancel_port}"
 
     @property
     def job_control_enabled(self) -> bool:
-        """True when single-rank job cancel/status is enabled."""
+        """True for supported single-request image and video jobs."""
         return (
             not self.disable_job_control
             and self.disagg_role == RoleType.MONOLITHIC
+            and self.num_gpus == 1
             and self.sp_degree == 1
             and not self.enable_cfg_parallel
             and self.tp_size == 1
             and self.dp_size == 1
+            and self.batching_max_size == 1
+            and self.pipeline_config.task_type.is_visual_gen()
+            and not isinstance(self.pipeline_config, DiffusersGenericPipelineConfig)
+            and self.backend != Backend.DIFFUSERS
+            and self.pipeline_class_name != "DiffusersPipeline"
         )
 
     def settle_port(

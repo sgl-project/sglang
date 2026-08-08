@@ -1,10 +1,14 @@
 """Unit tests for runtime/managers/job_registry (job control)."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import numpy as np
 
 from sglang.multimodal_gen.runtime.managers.job_registry import (
     _FINISHED_HARD_CAP,
+    _WAITER_CAP,
     CANCELLED,
     COMPLETED,
     FAILED,
@@ -12,9 +16,10 @@ from sglang.multimodal_gen.runtime.managers.job_registry import (
     RUNNING,
     JobRegistry,
     RequestCancelledError,
+    _value_nbytes,
     check_current_step,
-    clear_current_jobs,
-    set_current_jobs,
+    clear_current_job,
+    set_current_job,
 )
 
 
@@ -27,6 +32,10 @@ class _Output:
         raw_frame_batches=None,
         trajectory_latents=None,
         rollout_trajectory_data=None,
+        output_file_paths=None,
+        audio=None,
+        action_pred=None,
+        noise_pred=None,
     ):
         self.error = error
         self.cancelled = cancelled
@@ -34,16 +43,20 @@ class _Output:
         self.raw_frame_batches = raw_frame_batches
         self.trajectory_latents = trajectory_latents
         self.rollout_trajectory_data = rollout_trajectory_data
+        self.output_file_paths = output_file_paths
+        self.audio = audio
+        self.action_pred = action_pred
+        self.noise_pred = noise_pred
 
 
 class TestJobRegistry(unittest.TestCase):
     def test_admit_dedupes_and_replays(self):
         registry = JobRegistry()
-        verdict, handle = registry.admit("a", b"c1")
+        verdict, handle = registry.admit("a", b"c1", "fingerprint")
         self.assertEqual(verdict, "new")
         self.assertEqual(handle.status, QUEUED)
 
-        verdict, same = registry.admit("a", b"c2")
+        verdict, same = registry.admit("a", b"c2", "fingerprint")
         self.assertEqual(verdict, "wait")
         self.assertEqual(same.waiters, [b"c2"])
 
@@ -52,9 +65,41 @@ class TestJobRegistry(unittest.TestCase):
         self.assertEqual(waiters, [b"c2"])
         self.assertEqual(registry.status("a")["status"], COMPLETED)
 
-        verdict, cached = registry.admit("a", b"c3")
+        verdict, cached = registry.admit("a", b"c3", "fingerprint")
         self.assertEqual(verdict, "replay")
         self.assertIs(cached, output)
+
+    def test_reused_id_with_different_fingerprint_conflicts(self):
+        registry = JobRegistry()
+        verdict, _ = registry.admit("a", b"c1", "fingerprint-a")
+        self.assertEqual(verdict, "new")
+
+        verdict, payload = registry.admit("a", b"c2", "fingerprint-b")
+        self.assertEqual(verdict, "conflict")
+        self.assertIsNone(payload)
+
+    def test_duplicate_waiters_are_bounded(self):
+        registry = JobRegistry()
+        registry.admit("a", b"original")
+        for index in range(_WAITER_CAP):
+            verdict, _ = registry.admit("a", str(index).encode())
+            self.assertEqual(verdict, "wait")
+        verdict, payload = registry.admit("a", b"overflow")
+        self.assertEqual(verdict, "overloaded")
+        self.assertIsNone(payload)
+
+    def test_path_backed_output_keeps_status_but_not_replay_payload(self):
+        registry = JobRegistry()
+        _, handle = registry.admit("path-backed", None, "fingerprint")
+        registry.finish(
+            "path-backed", _Output(output_file_paths=["/temporary/result.png"])
+        )
+        self.assertEqual(registry.status("path-backed")["status"], COMPLETED)
+        self.assertIsNone(handle.output)
+
+        verdict, payload = registry.admit("path-backed", b"duplicate", "fingerprint")
+        self.assertEqual(verdict, "replay")
+        self.assertIsNone(payload)
 
     def test_finish_classifies_from_output(self):
         registry = JobRegistry()
@@ -111,6 +156,80 @@ class TestJobRegistry(unittest.TestCase):
         registry.admit("bulky", b"c2")
         waiters = registry.finish("bulky", _Output(trajectory_latents=object()))
         self.assertEqual(waiters, [b"c2"])
+
+    def test_replay_payloads_are_byte_bounded(self):
+        small = np.zeros(8, dtype=np.uint8)
+        cap = _value_nbytes(_Output(output=small))
+        self.assertIsInstance(cap, int)
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.job_registry._REPLAY_BYTES_CAP",
+            cap,
+        ):
+            registry = JobRegistry()
+            _, first = registry.admit("first", None, "fingerprint")
+            registry.finish("first", _Output(output=small))
+            self.assertIsNotNone(first.output)
+
+            _, second = registry.admit("second", None, "fingerprint")
+            registry.finish("second", _Output(output=np.zeros(1, dtype=np.uint8)))
+            self.assertIsNone(first.output)
+            self.assertIsNotNone(second.output)
+            self.assertLessEqual(registry._replay_bytes, cap)
+
+            _, oversized = registry.admit("oversized", None, "fingerprint")
+            registry.finish(
+                "oversized", _Output(output=np.zeros(cap + 1, dtype=np.uint8))
+            )
+            self.assertIsNone(oversized.output)
+            self.assertIsNotNone(second.output)
+            self.assertLessEqual(registry._replay_bytes, cap)
+
+    def test_replay_cap_counts_error_and_metadata(self):
+        base_size = _value_nbytes(_Output())
+        self.assertIsInstance(base_size, int)
+        payloads = {
+            "error": "x" * 1024,
+            "raw_frame_metadata": {"blob": "x" * 1024},
+            "metrics": SimpleNamespace(blob="x" * 1024),
+            "metrics_list": [SimpleNamespace(blob="x" * 1024)],
+        }
+        for field, payload in payloads.items():
+            with self.subTest(field=field), patch(
+                "sglang.multimodal_gen.runtime.managers.job_registry._REPLAY_BYTES_CAP",
+                base_size + 128,
+            ):
+                output = _Output()
+                setattr(output, field, payload)
+                registry = JobRegistry()
+                _, handle = registry.admit(field, None, "fingerprint")
+                registry.finish(field, output)
+                self.assertIsNone(handle.output)
+                self.assertEqual(registry._replay_bytes, 0)
+
+    def test_replay_does_not_retain_device_tensors(self):
+        payload = SimpleNamespace(device="cuda:0", nbytes=1)
+        registry = JobRegistry()
+        _, handle = registry.admit("device-output", None, "fingerprint")
+        registry.finish("device-output", _Output(output=payload))
+        self.assertIsNone(handle.output)
+
+    def test_replay_rejects_secondary_device_payloads_and_large_containers(self):
+        payload = SimpleNamespace(device="cuda:0", nbytes=1)
+        for field in ("action_pred", "noise_pred"):
+            with self.subTest(field=field):
+                registry = JobRegistry()
+                _, handle = registry.admit(field, None, "fingerprint")
+                registry.finish(field, _Output(**{field: payload}))
+                self.assertIsNone(handle.output)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.job_registry._REPLAY_BYTES_CAP",
+            128,
+        ):
+            registry = JobRegistry()
+            _, handle = registry.admit("large-list", None, "fingerprint")
+            registry.finish("large-list", _Output(output=[0] * 100))
+            self.assertIsNone(handle.output)
 
     def test_hard_cap_bounds_young_finished_jobs(self):
         """The TTL keeps young terminal jobs replayable, but sustained load
@@ -173,36 +292,29 @@ class TestJobRegistry(unittest.TestCase):
         registry.cancel("stale-id")
         future = unittest.mock.MagicMock(return_value=1e12)
         with patch(
-            "sglang.multimodal_gen.runtime.managers.job_registry.time.time", future
+            "sglang.multimodal_gen.runtime.managers.job_registry.time.monotonic", future
         ):
             verdict, _ = registry.admit("stale-id", b"c1")
         self.assertEqual(verdict, "new")
 
     def test_check_current_step_updates_progress_and_aborts(self):
         registry = JobRegistry()
-        _, first = registry.admit("m1", None)
-        _, second = registry.admit("m2", None)
-        set_current_jobs([first, second])
+        _, handle = registry.admit("job", None)
+        set_current_job(handle)
         try:
             check_current_step(3, 10)
-            self.assertEqual(first.step, 3)
-            self.assertEqual(second.total_steps, 10)
+            self.assertEqual(handle.step, 3)
+            self.assertEqual(handle.total_steps, 10)
 
-            # a merged batch aborts only when every member is cancelled
-            first.cancel_event.set()
-            check_current_step(4, 10)
-            second.cancel_event.set()
+            handle.cancel_event.set()
             with self.assertRaises(RequestCancelledError):
-                check_current_step(5, 10)
+                check_current_step(4, 10)
         finally:
-            clear_current_jobs()
+            clear_current_job()
         # no current jobs: the checkpoint is inert
-        check_current_step(6, 10)
+        check_current_step(5, 10)
 
-    def test_precancel_overflow_still_tombstones(self):
-        """DELETE promises the id will not run. With the table full, cancel
-        used to return cancelled=True without storing the tombstone, so the
-        later submit dispatched on GPU anyway."""
+    def test_precancel_overflow_preserves_acknowledged_tombstones(self):
         from sglang.multimodal_gen.runtime.managers.job_registry import (
             _PRECANCEL_CAP,
             JobRegistry,
@@ -214,10 +326,64 @@ class TestJobRegistry(unittest.TestCase):
         self.assertEqual(len(registry._precancelled), _PRECANCEL_CAP)
 
         ack = registry.cancel("overflow")
-        self.assertTrue(ack["cancelled"])
-        status, _ = registry.admit("overflow", None)
+        self.assertFalse(ack["cancelled"])
+        self.assertTrue(ack["overloaded"])
+
+        status, _ = registry.admit("filler-0", None)
         self.assertEqual(status, "cancelled")
+        status, _ = registry.admit("overflow", None)
+        self.assertEqual(status, "new")
         self.assertLessEqual(len(registry._precancelled), _PRECANCEL_CAP)
+
+    def test_job_control_bind_failure_is_fatal(self):
+        from unittest.mock import MagicMock
+
+        import zmq
+
+        from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.context = MagicMock()
+        socket = scheduler.context.socket.return_value
+        socket.bind.side_effect = zmq.ZMQError(zmq.EADDRINUSE)
+        scheduler.server_args = SimpleNamespace(
+            scheduler_cancel_endpoint="tcp://127.0.0.1:5601"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "job-control channel failed to bind"):
+            scheduler._start_job_control()
+        socket.close.assert_called_once_with(linger=0)
+
+    def test_scheduler_returns_typed_admission_conflicts(self):
+        from unittest.mock import MagicMock
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+        from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.jobs = JobRegistry()
+        scheduler._try_return = MagicMock()
+
+        first = Req(sampling_params=SamplingParams(prompt="first", request_id="same"))
+        first.extra["job_request_fingerprint"] = "fingerprint-a"
+        self.assertEqual(
+            scheduler._admit_new_reqs([(b"first", first)]), [(b"first", first)]
+        )
+
+        second = Req(sampling_params=SamplingParams(prompt="second", request_id="same"))
+        second.extra["job_request_fingerprint"] = "fingerprint-b"
+        self.assertEqual(scheduler._admit_new_reqs([(b"second", second)]), [])
+        output, identity = scheduler._try_return.call_args.args
+        self.assertEqual(identity, b"second")
+        self.assertTrue(output.idempotency_conflict)
+
+        scheduler.jobs._jobs["same"].waiters = [b"waiter"] * _WAITER_CAP
+        first.extra["job_request_fingerprint"] = "fingerprint-a"
+        self.assertEqual(scheduler._admit_new_reqs([(b"overflow", first)]), [])
+        output, identity = scheduler._try_return.call_args.args
+        self.assertEqual(identity, b"overflow")
+        self.assertIn("too many duplicate waiters", output.error)
 
 
 if __name__ == "__main__":

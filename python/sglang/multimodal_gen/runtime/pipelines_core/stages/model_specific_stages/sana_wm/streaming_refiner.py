@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
     unpack_latents,
@@ -567,6 +568,7 @@ class RefinerChunkRunner:
         )
         active_positions = list(range(int(block_start), int(block_end)))
         for level in range(int(self.sigmas.numel()) - 1):
+            check_current_step(level, int(self.sigmas.numel()) - 1)
             sigma_cur = float(self.sigmas[level].item())
             sigma_next = float(self.sigmas[level + 1].item())
             pred_x0 = refiner._predict_x0_active_block(

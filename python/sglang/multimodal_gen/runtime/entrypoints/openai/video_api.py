@@ -64,6 +64,23 @@ _VIDEO_EXTENSIONS = {
 }
 
 
+def _require_trackable_video_batch(
+    server_args, scheduler_batches: list[Req] | None
+) -> None:
+    if (
+        server_args.job_control_enabled
+        and scheduler_batches is not None
+        and len(scheduler_batches) != 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "job control does not support grouped multi-output video requests; "
+                "use one output or start the server with --disable-job-control"
+            ),
+        )
+
+
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
     return (request.model_extra or {}).get(name)
 
@@ -492,7 +509,15 @@ async def _dispatch_job_async(
     except RequestCancelledError as e:
         logger.info(f"video {job_id} cancelled: {e}")
         await VIDEO_STORE.update_fields(
-            job_id, {"status": "cancelled", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "cancelled",
+                "error": {"message": str(e)},
+                "url": None,
+                "file_path": None,
+                "file_paths": None,
+                "num_outputs": None,
+            },
         )
     except Exception as e:
         logger.error(f"{e}")
@@ -810,6 +835,7 @@ async def create_video(
         scheduler_batches = sampling_params.expand_video_request_outputs_for_queue(
             batch
         )
+        _require_trackable_video_batch(server_args, scheduler_batches)
         job = _video_job_from_sampling(request_id, req, sampling_params)
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
@@ -883,17 +909,51 @@ async def delete_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+    if job.get("status") in {"completed", "failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail=f"video is already {job['status']}")
     from sglang.multimodal_gen.runtime.managers.job_registry import CancelReq
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
-    if get_global_server_args().job_control_enabled:
-        try:
-            await async_scheduler_client.job_control(CancelReq(request_id=video_id))
-        except (TimeoutError, RuntimeError):
-            pass
-    job = await VIDEO_STORE.pop(video_id) or job
-    job["status"] = "cancelled"
-    return VideoResponse(**job)
+    if not get_global_server_args().job_control_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="video cancellation requires supported single-request job control",
+        )
+    try:
+        reply = await async_scheduler_client.job_control(CancelReq(request_id=video_id))
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=504, detail="scheduler job-control channel timed out"
+        ) from e
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=503, detail="scheduler job-control channel is unavailable"
+        ) from e
+    if not isinstance(reply, dict) or reply.get("error"):
+        detail = reply.get("error") if isinstance(reply, dict) else "invalid reply"
+        raise HTTPException(
+            status_code=503, detail=f"scheduler job-control failure: {detail}"
+        )
+    if reply.get("overloaded"):
+        raise HTTPException(status_code=429, detail="precancel capacity is exhausted")
+    if not reply.get("cancelled"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"video is already {reply.get('status', 'terminal')}",
+        )
+    updated = await VIDEO_STORE.update_fields_if_status(
+        video_id,
+        {"status": "cancelling"},
+        {"queued", "running", "in_progress", "cancelling"},
+    )
+    if updated is not None:
+        return VideoResponse(**updated)
+    latest = await VIDEO_STORE.get(video_id)
+    if latest is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if latest.get("status") == "cancelled":
+        return VideoResponse(**latest)
+    raise HTTPException(status_code=409, detail=f"video is already {latest['status']}")
 
 
 def _select_video_variant_path(job: dict, variant: str | None) -> str | None:

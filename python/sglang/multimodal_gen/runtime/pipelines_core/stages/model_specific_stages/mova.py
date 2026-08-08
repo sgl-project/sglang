@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 
 # Both audio and video DiT use the same sinusoidal_embedding_1d function
 # Import from mova_video_dit where it's defined (mova_audio_dit re-exports it)
@@ -488,6 +489,7 @@ class MOVADenoisingStage(PipelineStage):
 
         with self.progress_bar(total=total_steps, batch=batch) as progress_bar:
             for idx_step in range(total_steps):
+                check_current_step(idx_step, total_steps)
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
                     logger=logger,
