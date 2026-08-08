@@ -112,6 +112,13 @@ class SparseKVCacheManager:
         self._prefetch_d2d_hit_stream = torch.npu.Stream()
         self._prefetch_h2d_miss_stream = torch.npu.Stream()
         self._prefetch_refill_stream = torch.npu.Stream()
+        self._prefetch_slot_map_stream = torch.npu.Stream()
+
+        self.hit_done = torch.npu.Event()
+        self.miss_done = torch.npu.Event()
+        self.refill_done = torch.npu.Event()
+        self.slot_map_done = torch.npu.Event()
+
         # device KV buffer
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -151,6 +158,11 @@ class SparseKVCacheManager:
                     )
                     for _ in range(self.layer_num)
                 ]
+                # Pre-filled all-(-1) template used to reset the slot map with a
+                # fast device-to-device copy instead of an indexed fill.
+                self._device_slot_map_minus_one = torch.full_like(
+                    self.device_slot_map[0], -1
+                )
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
@@ -773,9 +785,6 @@ class SparseKVCacheManager:
             refill_valid_mask = valid_topk_mask.reshape(-1).contiguous()
 
             copy_ready = torch.npu.Event()
-            hit_done = torch.npu.Event()
-            miss_done = torch.npu.Event()
-            refill_done = torch.npu.Event()
             _record_stream_event(stream, copy_ready)
 
         # Copy device-cache hits into the current KV buffer.
@@ -792,7 +801,7 @@ class SparseKVCacheManager:
                 2,  #
                 block_dim=24,
             )
-            _record_stream_event(self._prefetch_d2d_hit_stream, hit_done)
+            _record_stream_event(self._prefetch_d2d_hit_stream, self.hit_done)
         _profile_pop(profile_range)
 
         # Copy host shared-memory misses into the current KV buffer.
@@ -810,15 +819,15 @@ class SparseKVCacheManager:
                 block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
-            _record_stream_event(self._prefetch_h2d_miss_stream, miss_done)
+            _record_stream_event(self._prefetch_h2d_miss_stream, self.miss_done)
         _profile_pop(profile_range)
 
         # Refill the device cache with the current top-k after hit and miss
         # copies complete, so the next step can reuse these entries.
         profile_range = _profile_push("sparse_kv_prefetch.device_refill")
         with torch.npu.stream(self._prefetch_refill_stream):
-            _wait_stream_event(self._prefetch_refill_stream, hit_done)
-            _wait_stream_event(self._prefetch_refill_stream, miss_done)
+            _wait_stream_event(self._prefetch_refill_stream, self.hit_done)
+            _wait_stream_event(self._prefetch_refill_stream, self.miss_done)
             unidex_copy_inplace(
                 current_kv_buffer,
                 self.device_kv_buffer[layer_idx],
@@ -827,18 +836,19 @@ class SparseKVCacheManager:
                 refill_valid_mask,
                 2,
                 2,
-                block_dim=48,
+                block_dim=24,
             )
-            _record_stream_event(self._prefetch_refill_stream, refill_done)
+            _record_stream_event(self._prefetch_refill_stream, self.refill_done)
         _profile_pop(profile_range)
 
-        _wait_stream_event(stream, refill_done)
+
 
         # Replace the slot-map row with the current top-k mapping. Invalid
         # entries use the max_context_len sentinel column to preserve shape.
         profile_range = _profile_push("sparse_kv_prefetch.metadata_update")
-        with torch.npu.stream(stream):
-            self.device_slot_map[layer_idx].index_fill_(0, slot_map_row_indices, -1)
+        with torch.npu.stream(self._prefetch_slot_map_stream):
+            _wait_stream_event(self._prefetch_slot_map_stream, copy_ready)
+            self.device_slot_map[layer_idx].copy_(self._device_slot_map_minus_one)
 
             slot_map_token_indices = torch.where(
                 valid_topk_mask,
@@ -854,9 +864,21 @@ class SparseKVCacheManager:
                 slot_map_row_indices.unsqueeze(1) * self._slot_map_width
                 + slot_map_token_indices
             ).reshape(-1)
-            self.device_slot_map[layer_idx].view(-1).scatter_(
-                0, slot_map_flat_indices, slot_map_slot_values.reshape(-1)
+            unidex_copy_inplace(
+                slot_map_slot_values.reshape(-1, 1).contiguous(),
+                self.device_slot_map[layer_idx].view(-1, 1),
+                torch.arange(
+                    slot_map_slot_values.numel(),
+                    dtype=torch.long,
+                    device=topk_indices.device,
+                ),
+                slot_map_flat_indices,
+                valid_topk_mask.reshape(-1),
+                1,
+                1,
+                block_dim=48,
             )
+            _record_stream_event(self._materialize_slot_map_stream, self.slot_map_done)
         _profile_pop(profile_range)
         _profile_pop(prefetch_profile_range)
 

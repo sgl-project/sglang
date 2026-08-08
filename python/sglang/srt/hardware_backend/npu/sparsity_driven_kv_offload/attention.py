@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import _wait_stream_event
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
 if TYPE_CHECKING:
@@ -144,9 +145,15 @@ def forward_sparsity_driven_kv_offload(
         sparse_kv_manager.prefetch(
             layer, forward_batch, topk_indices, selected_kv, stream
         )
+
+
+        _wait_stream_event(stream, sparse_kv_manager.hit_done)
+        _wait_stream_event(stream, sparse_kv_manager.miss_done)
+
         selected_k_nope, selected_k_rope = selected_kv.split(
             [nope_head_dim, rope_head_dim], dim=-1
         )
+
 
         topk_2d = topk_indices
         if topk_2d.dim() == 3:
@@ -252,6 +259,9 @@ def forward_sparsity_driven_kv_offload(
             attention_mode=2,
             return_softmax_lse=False,
         )
+
+        _wait_stream_event(stream, sparse_kv_manager.refill_done)
+        _wait_stream_event(stream, sparse_kv_manager.slot_map_done)
 
         attn_out = ret[0] if isinstance(ret, tuple) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(
