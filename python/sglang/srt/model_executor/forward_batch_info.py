@@ -482,6 +482,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     original_global_num_tokens_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
+    _target_verify_metadata_backup: Optional[Tuple] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -1157,6 +1158,105 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    def _prepare_ragged_target_verify_mlp_sync(self, num_tokens: int) -> Optional[int]:
+        spec_info = self.spec_info
+        layout = (
+            getattr(spec_info, "ragged_verify_layout", None)
+            if spec_info is not None
+            else None
+        )
+        if layout is None:
+            return None
+
+        bs = int(layout.verify_lens.shape[0])
+        if bs <= 0:
+            raise RuntimeError("Ragged TARGET_VERIFY requires at least one row.")
+        if self.seq_lens.shape[0] != bs:
+            raise RuntimeError(
+                "Ragged TARGET_VERIFY layout/request mismatch before MLP sync: "
+                f"layout.bs={bs}, seq_lens.shape[0]={self.seq_lens.shape[0]}."
+            )
+        if layout.qo_indptr_device.shape[0] != bs + 1:
+            raise RuntimeError(
+                "Ragged TARGET_VERIFY has an invalid qo_indptr shape: "
+                f"expected {bs + 1}, got {layout.qo_indptr_device.shape[0]}."
+            )
+        if int(layout.graph_num_tokens) > num_tokens:
+            raise RuntimeError(
+                "Ragged TARGET_VERIFY graph tokens exceed the MLP-sync token "
+                f"buffer: graph_num_tokens={layout.graph_num_tokens}, "
+                f"num_tokens={num_tokens}."
+            )
+        if self._target_verify_metadata_backup is not None:
+            raise RuntimeError(
+                "Ragged TARGET_VERIFY MLP-sync metadata was prepared twice "
+                "without being restored."
+            )
+
+        self._target_verify_metadata_backup = (
+            self.extend_num_tokens,
+            self.extend_seq_lens,
+            self.extend_prefix_lens,
+            self.extend_start_loc,
+            self.extend_prefix_lens_cpu,
+            self.extend_seq_lens_cpu,
+            self.extend_logprob_start_lens_cpu,
+        )
+
+        # The graph runner refreshes verify_lens and qo_indptr in place before
+        # every replay. Use those tensors directly instead of reconstructing
+        # request geometry from num_tokens_per_req (which is only an accounting
+        # width in compact ragged mode).
+        self.extend_num_tokens = int(layout.graph_num_tokens)
+        self.extend_seq_lens = layout.verify_lens
+        self.extend_prefix_lens = self.seq_lens
+        self.extend_start_loc = layout.qo_indptr_device[:-1]
+
+        verify_lens_cpu = layout.verify_lens_cpu
+        if verify_lens_cpu is not None:
+            if len(verify_lens_cpu) != bs:
+                raise RuntimeError(
+                    "Ragged TARGET_VERIFY CPU/device layout mismatch: "
+                    f"len(verify_lens_cpu)={len(verify_lens_cpu)}, bs={bs}."
+                )
+            self.extend_seq_lens_cpu = [int(x) for x in verify_lens_cpu]
+            if self.seq_lens_cpu is not None and len(self.seq_lens_cpu) == bs:
+                self.extend_prefix_lens_cpu = [
+                    int(total) - int(extend)
+                    for total, extend in zip(
+                        self.seq_lens_cpu, self.extend_seq_lens_cpu
+                    )
+                ]
+                self.extend_logprob_start_lens_cpu = (
+                    self.extend_prefix_lens_cpu
+                )
+            else:
+                self.extend_prefix_lens_cpu = None
+                self.extend_logprob_start_lens_cpu = None
+        else:
+            # CUDA Graph replay intentionally has no fresh host mirror. Do not
+            # introduce a device-to-host synchronization on the decode path.
+            self.extend_prefix_lens_cpu = None
+            self.extend_seq_lens_cpu = None
+            self.extend_logprob_start_lens_cpu = None
+
+        return bs
+
+    def _restore_target_verify_mlp_sync_metadata(self) -> None:
+        backup = self._target_verify_metadata_backup
+        if backup is None:
+            return
+        (
+            self.extend_num_tokens,
+            self.extend_seq_lens,
+            self.extend_prefix_lens,
+            self.extend_start_loc,
+            self.extend_prefix_lens_cpu,
+            self.extend_seq_lens_cpu,
+            self.extend_logprob_start_lens_cpu,
+        ) = backup
+        self._target_verify_metadata_backup = None
+
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
@@ -1272,13 +1372,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
-                tokens_per_req = self.spec_info.num_tokens_per_req
-                bs = self.batch_size = num_tokens // tokens_per_req
+                ragged_bs = (
+                    self._prepare_ragged_target_verify_mlp_sync(num_tokens)
+                    if self.forward_mode.is_target_verify()
+                    else None
+                )
+                if ragged_bs is not None:
+                    bs = self.batch_size = ragged_bs
+                else:
+                    tokens_per_req = self.spec_info.num_tokens_per_req
+                    if tokens_per_req <= 0 or num_tokens % tokens_per_req != 0:
+                        raise RuntimeError(
+                            "Uniform speculative MLP sync requires num_tokens to "
+                            "be divisible by num_tokens_per_req, got "
+                            f"num_tokens={num_tokens}, "
+                            f"num_tokens_per_req={tokens_per_req}."
+                        )
+                    bs = self.batch_size = num_tokens // tokens_per_req
 
-                if (
-                    self.forward_mode.is_target_verify()
-                    and self.extend_seq_lens is None
-                ):
+                if self.forward_mode.is_target_verify() and ragged_bs is None:
                     dev = self.seq_lens.device
                     num_token_non_padded_cpu = (
                         self.num_token_non_padded_cpu
@@ -1538,12 +1650,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                num_tokens = bs * self.spec_info.draft_token_num
+                ragged_layout = getattr(
+                    self.spec_info, "ragged_verify_layout", None
+                )
+                if ragged_layout is not None:
+                    num_tokens = (
+                        int(ragged_layout.total_verify_tokens)
+                        if ragged_layout.total_verify_tokens is not None
+                        else int(ragged_layout.graph_num_tokens)
+                    )
+                else:
+                    num_tokens = bs * self.spec_info.draft_token_num
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
@@ -1574,6 +1699,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        self._restore_target_verify_mlp_sync_metadata()
 
     @property
     def can_run_tbo(self):
