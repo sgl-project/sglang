@@ -162,8 +162,6 @@ class TestGetDcpLens(CustomTestCase):
                 device="cpu",
                 is_draft_worker=False,
             )
-            # The allocator widens from get_parallel(), not from the injected
-            # server_args stand-in -- drive the cause, not the effect.
             with patch(
                 "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
                 return_value=False,
@@ -189,6 +187,39 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.size, 4096)
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
+
+    def test_draft_pool_shape_comes_from_its_allocator_not_from_dcp(self):
+        """The draft's pool shape follows its allocator, not attn_dcp_size."""
+        physical_page_size = 64
+        override = rc.get_context().override_server_args(
+            page_size=physical_page_size,
+            disaggregation_mode="null",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        # pool_page_size composes loc_space_scale, so both must be real properties.
+        class _Configurator:
+            loc_space_scale = KVCacheConfigurator.loc_space_scale
+            pool_page_size = KVCacheConfigurator.pool_page_size
+
+            def __init__(self, *, is_draft_worker, allocator):
+                self.is_draft_worker = is_draft_worker
+                self.token_to_kv_pool_allocator = allocator
+
+        # The widened allocator the target built (dcp_size=4).
+        widened = SimpleNamespace(page_size=physical_page_size * 4, size=4096)
+        draft = _Configurator(is_draft_worker=True, allocator=widened)
+        target = _Configurator(is_draft_worker=False, allocator=widened)
+
+        # attn_dcp_size=1 stands in for a draft-scoped "DCP is off" context.
+        for attn_dcp_size in (4, 1):
+            with rc.get_parallel().override(attn_dcp_size=attn_dcp_size):
+                self.assertEqual(draft.loc_space_scale, 4)
+                self.assertEqual(draft.pool_page_size, widened.page_size)
+                self.assertEqual(target.loc_space_scale, 1)
+                self.assertEqual(target.pool_page_size, physical_page_size)
 
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4
