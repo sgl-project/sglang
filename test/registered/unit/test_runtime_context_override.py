@@ -118,9 +118,7 @@ class TestContextOverride(CustomTestCase):
         rc.get_context().override(
             "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype="fp8_e4m3"
         )
-        draft = ServerArgs(model_path="dummy").derive(
-            "draft-build", kv_cache_dtype="bf16"
-        )
+        draft = ServerArgs(model_path="dummy", kv_cache_dtype="bf16")
         with rc.get_context().preserve_config():
             rc.get_context().set_server_args(draft)
             # Inside the scope the draft's bags are live...

@@ -15,7 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
-    get_server_args,
+    get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -40,15 +40,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
         num_tokens_per_bs: int = 1,
     ) -> Optional["RoutedExpertsCapturer"]:
-        server_args = get_server_args()
         if not get_exec().features.enable_return_routed_experts:
             return None
-        if not get_exec().moe.disable_shared_experts_fusion and hasattr(
-            model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
+        # The model's own attribute is the baked decision (0 when its gate
+        # disabled fusion); the ACTIVE flag can be holding another runner's.
+        num_fused_shared_experts = getattr(model, "num_fused_shared_experts", 0)
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,

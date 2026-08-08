@@ -1569,9 +1569,9 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
-        # Expose pool refs so TboAttnBackend (TBO) can alias them through primary.
-        self.token_to_kv_pool = sparse_backend.token_to_kv_pool
-        self.req_to_token_pool = sparse_backend.req_to_token_pool
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
+        ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.
