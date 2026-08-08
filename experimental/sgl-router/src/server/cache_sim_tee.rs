@@ -16,8 +16,9 @@
 //!
 //! Fire-and-forget by construction: [`CacheSimTee::offer`] enqueues onto a
 //! bounded channel and returns immediately; a full queue is dropped + counted
-//! (never parked), and one background task POSTs serially. The tee is purely
-//! observational, so it must never slow, block, or fail the serving path.
+//! (never parked), and a background sender drains it with a bounded fan-out of
+//! concurrent POSTs (see [`run_sender`]). The tee is purely observational, so it
+//! must never slow, block, or fail the serving path.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,7 +167,15 @@ impl CacheSimTee {
     /// base (e.g. `http://radixark-cache-sim:9095`); `/ingest_ids` is appended.
     /// `max_captures` caps concurrent streaming captures (see `capture_sem`);
     /// `0` is clamped to `1` so the semaphore is always constructible.
-    pub fn spawn(url: String, metrics: Arc<MetricsRegistry>, max_captures: usize) -> Arc<Self> {
+    /// `send_concurrency` is how many teed POSTs the background sender keeps in
+    /// flight at once — see [`run_sender`] for why serial draining was the tee's
+    /// throughput ceiling; `0` is clamped to `1` (serial).
+    pub fn spawn(
+        url: String,
+        metrics: Arc<MetricsRegistry>,
+        max_captures: usize,
+        send_concurrency: usize,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         // .expect, not a fallback: reqwest::Client::new() would panic on the
         // same (near-impossible, TLS-backend-init) failure, and a fallback
@@ -187,6 +196,7 @@ impl CacheSimTee {
             ingest_url,
             extend_url,
             Arc::clone(&metrics),
+            send_concurrency,
         ));
         Arc::new(Self {
             tx,
@@ -310,81 +320,131 @@ impl CacheSimTee {
     }
 }
 
-/// Drain the queue and POST each request's ids to the cache-sim, serially.
-/// Errors are metered and dropped — a down cache-sim must never spam the
-/// router's logs or affect serving. Ends when the channel closes (all senders
-/// dropped, i.e. shutdown).
+/// Drain the queue, POSTing each request's ids to the cache-sim with up to
+/// `concurrency` POSTs in flight at once. Errors are metered and dropped — a
+/// down cache-sim must never spam the router's logs or affect serving. Ends when
+/// the channel closes (all senders dropped, i.e. shutdown).
 ///
-/// INVARIANT: this loop must never be able to panic. It is the sole consumer of
-/// the tee channel; a panic ends the task permanently and silently (teeing just
-/// stops — no counter moves). Every fallible step is matched, not unwrapped.
+/// Why concurrent: the sender used to `.await` each POST serially, so tee
+/// throughput was capped at ~`1 / POST-latency` (≈110 req/s at a ~9 ms
+/// in-cluster POST). Any sustained arrival above that filled the bounded tee
+/// channel and dropped the excess
+/// (`sgl_router_cache_sim_tee_total{result="dropped"}`) — the oracle then
+/// undercounted vs the engine at peak. Fanning out to `concurrency` tasks raises
+/// the ceiling to ~`concurrency / POST-latency`; the per-POST timeout still
+/// bounds a hung cache-sim.
+///
+/// A `concurrency`-permit semaphore backpressures the DRAIN, never the
+/// offer/serving path (that's the non-blocking `try_send` in `offer`): when all
+/// permits are out the recv loop parks until a POST finishes, so we never spawn
+/// unbounded tasks. The queue keeps absorbing offers meanwhile, dropping on
+/// overflow exactly as before.
+///
+/// INVARIANT: the recv loop must never panic — it is the sole consumer of the
+/// tee channel, and a panic ends teeing permanently and silently. Each POST now
+/// runs in its own task, so a (nonexistent — every step is matched) panic there
+/// can't kill the consumer, and its permit is released on unwind.
 async fn run_sender(
     mut rx: mpsc::Receiver<TeeMsg>,
     client: reqwest::Client,
     ingest_url: String,
     extend_url: String,
     metrics: Arc<MetricsRegistry>,
+    concurrency: usize,
 ) {
+    let ingest_url = Arc::new(ingest_url);
+    let extend_url = Arc::new(extend_url);
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     while let Some(msg) = rx.recv().await {
-        let body = IngestIdsBody {
-            model: &msg.model,
-            input_ids: &msg.input_ids,
-            request_id: &msg.request_id,
-            prompt_len: msg.prompt_len,
-            // A single-choice response carries no discriminator: absent means
-            // "not a fan-out", which is the common case and the cheapest wire.
-            choice_index: msg.choice.map(|c| c.index),
-            choice_count: msg.choice.map(|c| c.count),
-            output_tokens: msg.output_tokens,
+        // Acquire BEFORE spawning so at most `concurrency` POSTs are in flight;
+        // this await parks the drain (not serving) when saturated.
+        // `acquire_owned` errors only on a closed semaphore, which we never
+        // close (we hold an Arc) — treat the impossible case as shutdown rather
+        // than unwrap-panicking the sole consumer.
+        let permit = match Arc::clone(&sem).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
         };
-        // Per-kind outcome labels so a version-skewed cache-sim (no
-        // /extend_ids yet → 404) shows up as `extend_http_error` while the
-        // ingest tee stays visibly healthy.
-        let (url, sent, http_error, error) = match msg.kind {
-            TeeKind::Ingest => (&ingest_url, "sent", "http_error", "error"),
-            TeeKind::Extend => (
-                &extend_url,
-                "extend_sent",
-                "extend_http_error",
-                "extend_error",
-            ),
-        };
-        // Serializing {model, input_ids} cannot realistically fail; count it
-        // rather than unwrap-panicking the sole sender task.
-        let bytes = match serde_json::to_vec(&body) {
-            Ok(b) => b,
-            Err(_) => {
-                metrics.record_cache_sim_tee(error);
-                continue;
-            }
-        };
-        // reqwest returns Ok for ANY completed exchange, INCLUDING 4xx/5xx, so
-        // inspect the status: a misconfigured URL (404) or an overloaded/OOM
-        // cache-sim (503) is a broken tee, not a delivery — counting it "sent"
-        // would blind the one health signal this counter exists to be. `error`
-        // stays transport-only (connect refused / DNS / the 2s timeout) so a
-        // dashboard can tell "cache-sim rejecting" from "cache-sim unreachable".
-        // Re-attach the upstream's per-request attribution as x-radixark-* headers
-        // so the cache-sim receiver reads them into each record (it reads headers,
-        // not the JSON body). Non-empty values only — an empty header would look
-        // like a real value and collapse a downstream group-by / join. Pure
-        // pass-through: the router relays what the upstream stamped, minting nothing.
-        let mut rb = client.post(url).header("content-type", "application/json");
-        for (name, value) in [
-            ("x-radixark-correlation-id", &msg.attr.correlation_id),
-            ("x-radixark-endpoint-id", &msg.attr.endpoint_id),
-            ("x-radixark-key-id", &msg.attr.key_id),
-            ("x-radixark-endpoint-slug", &msg.attr.slug),
-        ] {
-            if let Some(v) = value.as_deref().filter(|s| !s.is_empty()) {
-                rb = rb.header(name, v);
-            }
+        // reqwest::Client is Arc-backed — cloning shares the connection pool.
+        let client = client.clone();
+        let ingest_url = Arc::clone(&ingest_url);
+        let extend_url = Arc::clone(&extend_url);
+        let metrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let _permit = permit; // released when the POST finishes (or unwinds)
+            post_one(msg, &client, &ingest_url, &extend_url, &metrics).await;
+        });
+    }
+}
+
+/// POST one teed message to the cache-sim and meter the outcome. Split out of
+/// [`run_sender`] so the concurrent fan-out can spawn it directly. Never panics:
+/// every fallible step is matched, not unwrapped.
+async fn post_one(
+    msg: TeeMsg,
+    client: &reqwest::Client,
+    ingest_url: &str,
+    extend_url: &str,
+    metrics: &MetricsRegistry,
+) {
+    let body = IngestIdsBody {
+        model: &msg.model,
+        input_ids: &msg.input_ids,
+        request_id: &msg.request_id,
+        prompt_len: msg.prompt_len,
+        // A single-choice response carries no discriminator: absent means
+        // "not a fan-out", which is the common case and the cheapest wire.
+        choice_index: msg.choice.map(|c| c.index),
+        choice_count: msg.choice.map(|c| c.count),
+        output_tokens: msg.output_tokens,
+    };
+    // Per-kind outcome labels so a version-skewed cache-sim (no /extend_ids yet
+    // → 404) shows up as `extend_http_error` while the ingest tee stays visibly
+    // healthy.
+    let (url, sent, http_error, error) = match msg.kind {
+        TeeKind::Ingest => (ingest_url, "sent", "http_error", "error"),
+        TeeKind::Extend => (
+            extend_url,
+            "extend_sent",
+            "extend_http_error",
+            "extend_error",
+        ),
+    };
+    // Serializing {model, input_ids} cannot realistically fail; count it rather
+    // than unwrap-panicking the sender task.
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(_) => {
+            metrics.record_cache_sim_tee(error);
+            return;
         }
-        match rb.body(bytes).send().await {
-            Ok(r) if r.status().is_success() => metrics.record_cache_sim_tee(sent),
-            Ok(_) => metrics.record_cache_sim_tee(http_error),
-            Err(_) => metrics.record_cache_sim_tee(error),
+    };
+    // reqwest returns Ok for ANY completed exchange, INCLUDING 4xx/5xx, so
+    // inspect the status: a misconfigured URL (404) or an overloaded/OOM
+    // cache-sim (503) is a broken tee, not a delivery — counting it "sent"
+    // would blind the one health signal this counter exists to be. `error`
+    // stays transport-only (connect refused / DNS / the 2s timeout) so a
+    // dashboard can tell "cache-sim rejecting" from "cache-sim unreachable".
+    // Re-attach the upstream's per-request attribution as x-radixark-* headers
+    // so the cache-sim receiver reads them into each record (it reads headers,
+    // not the JSON body). Non-empty values only — an empty header would look
+    // like a real value and collapse a downstream group-by / join. Pure
+    // pass-through: the router relays what the upstream stamped, minting nothing.
+    let mut rb = client.post(url).header("content-type", "application/json");
+    for (name, value) in [
+        ("x-radixark-correlation-id", &msg.attr.correlation_id),
+        ("x-radixark-endpoint-id", &msg.attr.endpoint_id),
+        ("x-radixark-key-id", &msg.attr.key_id),
+        ("x-radixark-endpoint-slug", &msg.attr.slug),
+    ] {
+        if let Some(v) = value.as_deref().filter(|s| !s.is_empty()) {
+            rb = rb.header(name, v);
         }
+    }
+    match rb.body(bytes).send().await {
+        Ok(r) if r.status().is_success() => metrics.record_cache_sim_tee(sent),
+        Ok(_) => metrics.record_cache_sim_tee(http_error),
+        Err(_) => metrics.record_cache_sim_tee(error),
     }
 }
 
@@ -436,7 +496,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
-        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64, 8);
         // Full attribution — plus an empty key_id, which must be OMITTED
         // (not sent as a blank header).
         tee.offer(
@@ -495,6 +555,64 @@ mod tests {
         assert!(
             rendered.contains(r#"sgl_router_cache_sim_tee_total{result="sent"} 1"#),
             "tee sent counter not rendered:\n{rendered}"
+        );
+    }
+
+    /// The sender POSTs concurrently, not serially. A mock that holds each POST
+    /// briefly while tracking the live in-flight count proves the fan-out: with
+    /// the old serial sender only ONE POST was ever in flight (peak == 1); the
+    /// concurrent sender drives the peak above 1. This is the regression guard
+    /// for the throughput ceiling that made the oracle undercount at peak.
+    #[tokio::test]
+    async fn sender_posts_concurrently_not_serially() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Default)]
+        struct Live {
+            cur: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+        let live = Live::default();
+        let app = Router::new()
+            .route(
+                "/ingest_ids",
+                post(|State(l): State<Live>, _b: axum::body::Bytes| async move {
+                    // Track peak concurrency: bump on entry, hold, drop on exit.
+                    let now = l.cur.fetch_add(1, Ordering::SeqCst) + 1;
+                    l.max.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    l.cur.fetch_sub(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }),
+            )
+            .with_state(live.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let metrics = MetricsRegistry::new();
+        // Concurrency 8, and 8 requests that each hold the mock 100 ms: a serial
+        // sender would take ~800 ms with peak in-flight 1; the concurrent sender
+        // runs them together.
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64, 8);
+        for i in 0..8u32 {
+            tee.offer("m", &[1, 2, 3], &format!("rid-{i}"), Attribution::default());
+        }
+
+        // Wait until all 8 land (or time out), then assert the peak in-flight
+        // exceeded 1 — impossible under a serial sender.
+        for _ in 0..80 {
+            if metrics
+                .render()
+                .contains(r#"sgl_router_cache_sim_tee_total{result="sent"} 8"#)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let peak = live.max.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "sender must POST concurrently; peak in-flight was {peak} (a serial sender pins it at 1)"
         );
     }
 
@@ -585,7 +703,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
-        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64, 8);
         tee.offer_extend(
             "m",
             &[10, 11, 12, 13],
@@ -679,7 +797,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
-        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64, 8);
         tee.offer("m", &[1, 2, 3], "rid-1", Attribution::default());
 
         let mut rendered = String::new();

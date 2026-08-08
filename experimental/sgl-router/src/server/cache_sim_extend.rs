@@ -862,7 +862,7 @@ mod spawn_tests {
         }
         let mut ctx = AppContext::stub();
         ctx.tokenizers = Arc::new(reg);
-        ctx.cache_sim_tee = Some(CacheSimTee::spawn(url, MetricsRegistry::new(), 64));
+        ctx.cache_sim_tee = Some(CacheSimTee::spawn(url, MetricsRegistry::new(), 64, 8));
         (Arc::new(ctx), cap)
     }
 
