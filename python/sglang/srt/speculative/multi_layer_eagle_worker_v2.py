@@ -972,6 +972,41 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
+
+            # dp_attn can stamp the global is_extend_in_batch on a batch with no
+            # local extend, but the scheduler nulled input_ids for the spec
+            # iteration. The only supported case is the staggered-IDLE rank
+            # (empty batch; the fill below no-ops). A NON-empty locally-DECODE
+            # divert requires --speculative-skip-dp-mlp-sync; the multi-layer
+            # draft-extend path has no divert synthesis for it and no such
+            # batch has been observed in practice with the flag enabled --
+            # fail loud here rather than crash later in rotate_input_ids with
+            # a peer rank hung in the dp gather. The tripwire sits ABOVE the
+            # bonus-shape condition so any non-empty divert is caught
+            # regardless of spec_info.
+            if not batch.forward_mode.is_extend():
+                if batch.seq_lens.numel() > 0:
+                    raise RuntimeError(
+                        "multi-layer EAGLE received a diverted locally-DECODE/"
+                        f"globally-EXTEND dp batch (bs={batch.seq_lens.numel()}, "
+                        f"forward_mode={batch.forward_mode}). The multi-layer "
+                        "draft-extend path has no divert synthesis; this batch "
+                        "shape is not produced by the default spec+dp-attention "
+                        "no-mix sync and has not been observed under "
+                        "--speculative-skip-dp-mlp-sync either."
+                    )
+                if (
+                    isinstance(batch.spec_info, EagleDraftInput)
+                    and batch.spec_info.bonus_tokens is not None
+                    and batch.spec_info.bonus_tokens.shape == batch.seq_lens.shape
+                ):
+                    # Staggered-IDLE empty fill: no-ops on the empty tensors.
+                    batch.input_ids = batch.spec_info.bonus_tokens.to(torch.int64)
+                    batch.out_cache_loc = self.req_to_token_pool.req_to_token[
+                        batch.req_pool_indices,
+                        batch.seq_lens - 1,
+                    ].to(torch.int64)
+
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=target_capture_mode
             )
