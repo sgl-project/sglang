@@ -322,6 +322,7 @@ class MlxModelRunner:
                 return
             req.mamba_ping_pong_track_buffer = track_buffer
             req.mamba_next_track_idx = 0
+            req.mamba_last_track_idx = 0
 
         pool.store_cache(
             track_buffer[0],
