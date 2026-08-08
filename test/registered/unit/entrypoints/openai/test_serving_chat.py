@@ -70,6 +70,9 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
+            return_input_ids=False,
+            return_output_ids=False,
+            incremental_streaming_output=False,
         )
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
@@ -2003,6 +2006,82 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_abort_with_ids_enabled(self):
+        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "Partial ",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1, 2, 3],
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0.7,
+            max_tokens=100,
+            stream=True,
+            return_input_ids=True,
+            return_output_ids=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                chunks = []
+                try:
+                    async for chunk in self.chat._generate_chat_stream(
+                        adapted_request, req, self.fastapi_request
+                    ):
+                        chunks.append(chunk)
+                except Exception as e:
+                    print(f"Error during stream iteration: {e}")
+                return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        # Exactly one error chunk followed by [DONE]; no sglext ids leak.
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("error", chunks[0])
+        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        self.assertFalse(
+            any("input_ids" in c or "output_ids" in c for c in chunks),
+            "sglext ids event leaked after abort error",
+        )
+
+        error_chunk_data = json.loads(chunks[0][len("data: ") :])
+        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
+        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
             chunks = []
@@ -2356,6 +2435,262 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def _output_ids_ret(self, *output_ids_by_choice):
+        return [
+            {
+                "text": "Answer",
+                "prompt_token_ids": [1, 2, 3],
+                "output_ids": list(output_ids),
+                "meta_info": {
+                    "id": "chatcmpl-output-ids",
+                    "prompt_tokens": 3,
+                    "completion_tokens": len(output_ids),
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+            for output_ids in output_ids_by_choice
+        ]
+
+    def test_non_streaming_ids_emit_sglext(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            n=2,
+            return_input_ids=True,
+            return_output_ids=True,
+        )
+
+        response = self.chat._build_chat_response(
+            req, self._output_ids_ret([5, 6, 7], [8, 9]), 123
+        )
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.input_ids, [1, 2, 3])
+        self.assertEqual(response.sglext.output_ids, [[5, 6, 7], [8, 9]])
+        dumped = json.loads(response.model_dump_json())
+        self.assertEqual(dumped["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(dumped["sglext"]["output_ids"], [[5, 6, 7], [8, 9]])
+        # None sglext fields stay stripped from the serialized response.
+        self.assertNotIn("routed_experts", dumped["sglext"])
+
+    def test_non_streaming_ids_not_returned_by_default(self):
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+
+        response = self.chat._build_chat_response(
+            req, self._output_ids_ret([5, 6, 7]), 123
+        )
+
+        self.assertIsNone(response.sglext)
+
+    def test_non_streaming_ids_server_default_enables_flag(self):
+        self.tm.server_args.return_input_ids = True
+        self.tm.server_args.return_output_ids = True
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+
+        response = self.chat._build_chat_response(
+            req, self._output_ids_ret([5, 6, 7]), 123
+        )
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.input_ids, [1, 2, 3])
+        self.assertEqual(response.sglext.output_ids, [[5, 6, 7]])
+
+    def test_ids_header_enables_flag(self):
+        self.fastapi_request.headers = {
+            "x-sglext-return-input-ids": "1",
+            "x-sglext-return-output-ids": "1",
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        processed_messages = MessageProcessingResult(
+            "Test prompt",
+            [1, 2, 3],
+            None,
+            None,
+            [],
+            ["</s>"],
+            None,
+        )
+
+        with patch.object(
+            self.chat, "_process_messages", return_value=processed_messages
+        ):
+            _, processed_request = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+        self.assertTrue(processed_request.return_input_ids)
+        self.assertTrue(processed_request.return_output_ids)
+
+    def _run_output_ids_stream(self, chunk_output_ids, incremental):
+        """Stream chunks whose output_ids follow incremental (delta) or
+        non-incremental (full accumulated list) semantics; return the parsed
+        sglext chunks."""
+        self.tm.server_args.incremental_streaming_output = incremental
+
+        async def _mock_generate():
+            for i, ids in enumerate(chunk_output_ids):
+                finished = i == len(chunk_output_ids) - 1
+                yield {
+                    "text": "chunk",
+                    "prompt_token_ids": [1, 2, 3],
+                    "output_ids": list(ids),
+                    "meta_info": {
+                        "id": "chatcmpl-output-ids-stream",
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1 + i,
+                        "cached_tokens": 0,
+                        "finish_reason": (
+                            {"type": "stop", "matched": None} if finished else None
+                        ),
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+            return_input_ids=True,
+            return_output_ids=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        return [c for c in self._parse_chunks(chunks) if "sglext" in c]
+
+    def test_streaming_output_ids_incremental_accumulates_deltas(self):
+        sglext_chunks = self._run_output_ids_stream([[5, 6], [7]], incremental=True)
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["choices"], [])
+        # input_ids is captured once as a flat shared prompt, not accumulated.
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    def test_streaming_output_ids_non_incremental_keeps_latest_full_list(self):
+        sglext_chunks = self._run_output_ids_stream(
+            [[5, 6], [5, 6, 7]], incremental=False
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["input_ids"], [1, 2, 3])
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    def _run_output_ids_stream_with_graceful_abort(
+        self, normal_chunks, abort_output_ids, incremental
+    ):
+        """Stream normal output_ids chunks then a graceful-abort chunk
+        (finish_reason type 'abort', no status_code) whose output_ids is the
+        producer's collapsed [last_token] (tokenizer_manager._handle_abort_req).
+        Returns the parsed sglext chunks."""
+        self.tm.server_args.incremental_streaming_output = incremental
+
+        async def _mock_generate():
+            for ids in normal_chunks:
+                yield {
+                    "text": "chunk",
+                    "output_ids": list(ids),
+                    "meta_info": {
+                        "id": "chatcmpl-abort-ids-stream",
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "finish_reason": None,
+                        "output_token_logprobs": None,
+                        "output_top_logprobs": None,
+                    },
+                    "index": 0,
+                }
+            # Graceful abort terminal chunk (no status_code): falls through to
+            # the normal finalization path, so its output_ids would corrupt the
+            # accumulator if not skipped.
+            yield {
+                "text": "chunk",
+                "output_ids": list(abort_output_ids),
+                "meta_info": {
+                    "id": "chatcmpl-abort-ids-stream",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "abort", "message": "Aborted."},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+            return_output_ids=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        return [c for c in self._parse_chunks(chunks) if "sglext" in c]
+
+    def test_streaming_output_ids_incremental_ignores_abort_chunk(self):
+        # Deltas deliver 5,6,7; the abort chunk re-sends the last token
+        # ([output_ids[-1]]). It must not be appended again (no [[5, 6, 7, 7]]).
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[[5, 6], [7]],
+            abort_output_ids=[7],
+            incremental=True,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
+
+    def test_streaming_output_ids_non_incremental_ignores_abort_chunk(self):
+        # Cumulative chunks carry the full list; the abort chunk collapses to
+        # [last_token] and must not overwrite the accumulated prefix (no [[7]]).
+        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
+            normal_chunks=[[5, 6], [5, 6, 7]],
+            abort_output_ids=[7],
+            incremental=False,
+        )
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
 
     def _collect_continuous_usage(self, cached_tokens):
         content = {
