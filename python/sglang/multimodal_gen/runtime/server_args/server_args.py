@@ -224,6 +224,12 @@ class ServerArgs(DisaggServerArgsMixin):
     performance_mode: str = "auto"
     base_gpu_id: int = 0
     gpu_ids: list[int] | None = None
+    # cross-node: num_gpus is the total world size across all nodes; each
+    # node runs num_gpus // nnodes local GPU workers (mirrors srt's
+    # tp_size_per_node convention)
+    nnodes: int = 1
+    node_rank: int = 0
+    dist_init_addr: str | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -1468,6 +1474,27 @@ class ServerArgs(DisaggServerArgsMixin):
             "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
         )
         parser.add_argument(
+            "--nnodes",
+            type=int,
+            default=ServerArgs.nnodes,
+            help="The number of nodes for cross-node parallelism. --num-gpus is "
+            "the total GPU count across all nodes; each node runs "
+            "num_gpus // nnodes local workers.",
+        )
+        parser.add_argument(
+            "--node-rank",
+            type=int,
+            default=ServerArgs.node_rank,
+            help="The rank of this node among --nnodes nodes, in [0, nnodes).",
+        )
+        parser.add_argument(
+            "--dist-init-addr",
+            type=str,
+            default=ServerArgs.dist_init_addr,
+            help="The host:port distributed rendezvous address, reachable from "
+            "every node. Required when --nnodes > 1.",
+        )
+        parser.add_argument(
             "--gpu-ids",
             nargs="+",
             default=None,
@@ -2494,6 +2521,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"kv_gather_degree ({self.kv_gather_degree}) must equal "
                 f"sp_degree ({self.sp_degree}); check how many GPUs remain for "
                 "sequence parallelism after dp/tp/cfg"
+            )
+
+        if self.nnodes < 1:
+            raise ValueError("--nnodes must be a natural number")
+        if not (0 <= self.node_rank < self.nnodes):
+            raise ValueError(
+                f"--node-rank ({self.node_rank}) must be in [0, nnodes={self.nnodes})"
+            )
+        if self.nnodes > 1 and self.dist_init_addr is None:
+            raise ValueError("--dist-init-addr is required when --nnodes > 1")
+        if self.num_gpus % self.nnodes != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
             )
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
