@@ -106,6 +106,13 @@ class SchedulerStats:
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
 
+    # Radix-native session pressure. These are the device-evictable portions
+    # that eviction may reclaim only by destroying active-session reuse.
+    session_radix_active_sessions: int = 0
+    session_radix_full_referenced_evictable_tokens: int = 0
+    session_radix_swa_referenced_evictable_tokens: int = 0
+    session_radix_mamba_referenced_evictable_slots: int = 0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -385,6 +392,30 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.mamba_evictable_tokens = Gauge(
             name="sglang:mamba_evictable_tokens",
             documentation="Number of evictable (radix-cached) state slots in the mamba SSM pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.session_radix_active_sessions = Gauge(
+            name="sglang:session_radix_active_sessions",
+            documentation="Number of open radix-native sessions not closed yet.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.session_radix_full_referenced_evictable_tokens = Gauge(
+            name="sglang:session_radix_full_referenced_evictable_tokens",
+            documentation="Device-evictable Full KV tokens referenced by active radix-native sessions.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.session_radix_swa_referenced_evictable_tokens = Gauge(
+            name="sglang:session_radix_swa_referenced_evictable_tokens",
+            documentation="Device-evictable SWA KV tokens referenced by active radix-native sessions.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.session_radix_mamba_referenced_evictable_slots = Gauge(
+            name="sglang:session_radix_mamba_referenced_evictable_slots",
+            documentation="Device-evictable Mamba state slots referenced by active radix-native sessions.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1341,6 +1372,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.mamba_available_tokens, stats.mamba_available_tokens)
         self._log_gauge(self.mamba_evictable_tokens, stats.mamba_evictable_tokens)
         self._log_gauge(self.mamba_used_tokens, stats.mamba_used_tokens)
+        self._log_gauge(
+            self.session_radix_active_sessions,
+            stats.session_radix_active_sessions,
+        )
+        self._log_gauge(
+            self.session_radix_full_referenced_evictable_tokens,
+            stats.session_radix_full_referenced_evictable_tokens,
+        )
+        self._log_gauge(
+            self.session_radix_swa_referenced_evictable_tokens,
+            stats.session_radix_swa_referenced_evictable_tokens,
+        )
+        self._log_gauge(
+            self.session_radix_mamba_referenced_evictable_slots,
+            stats.session_radix_mamba_referenced_evictable_slots,
+        )
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

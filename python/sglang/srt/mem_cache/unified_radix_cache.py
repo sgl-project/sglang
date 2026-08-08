@@ -2104,6 +2104,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
 
+    def active_radix_session_count(self) -> int:
+        return self.session_refs.active_radix_session_count()
+
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
     def supports_streaming_session(self) -> bool:
@@ -2136,14 +2139,23 @@ class UnifiedRadixCache(BasePrefixCache):
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
+    def full_session_referenced_evictable_size(self) -> int:
+        return self.tree_core.full_session_referenced_evictable_size()
+
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
 
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
 
+    def swa_session_referenced_evictable_size(self) -> int:
+        return self.tree_core.swa_session_referenced_evictable_size()
+
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
+
+    def mamba_session_referenced_evictable_size(self) -> int:
+        return self.tree_core.mamba_session_referenced_evictable_size()
 
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()

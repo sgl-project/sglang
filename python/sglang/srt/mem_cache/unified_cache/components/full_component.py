@@ -61,7 +61,7 @@ class FullComponent(TreeComponent):
         while node is not None and node is not self.tree_core.root_node:
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
-            cd.session_ref -= 1
+            self.tree_core._adjust_component_session_ref(node, self.component_type, -1)
             node = node.parent
 
     def _advance_session_coverage(
@@ -77,7 +77,7 @@ class FullComponent(TreeComponent):
             and node is not stop
             and node is not self.tree_core.root_node
         ):
-            node.component_data[self.component_type].session_ref += 1
+            self.tree_core._adjust_component_session_ref(node, self.component_type, 1)
             node = node.parent
 
     def _recede_session_coverage(
@@ -95,7 +95,7 @@ class FullComponent(TreeComponent):
         ):
             cd = node.component_data[self.component_type]
             assert cd.session_ref > 0
-            cd.session_ref -= 1
+            self.tree_core._adjust_component_session_ref(node, self.component_type, -1)
             node = node.parent
 
     def create_match_validator(
@@ -145,6 +145,9 @@ class FullComponent(TreeComponent):
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
+            parent_evictable_size = min(split_len, child_cd.device_evictable_size)
+            new_parent.component_data[ct].device_evictable_size = parent_evictable_size
+            child_cd.device_evictable_size -= parent_evictable_size
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
         if child_cd.host_value is not None:
@@ -168,7 +171,9 @@ class FullComponent(TreeComponent):
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
-            self.tree_core.component_evictable_size_[self.component_type] -= freed
+            self.tree_core._adjust_component_evictable_size(
+                node, self.component_type, -freed
+            )
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
             # cd.value = None
@@ -291,7 +296,7 @@ class FullComponent(TreeComponent):
             ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
-                self.tree_core.component_evictable_size_[ct] -= key_len
+                self.tree_core._adjust_component_evictable_size(cur, ct, -key_len)
                 self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
             cd.lock_ref += 1
@@ -331,7 +336,9 @@ class FullComponent(TreeComponent):
 
             if cd.lock_ref == 1:
                 key_len = len(cd.value)
-                self.tree_core.component_evictable_size_[ct] += key_len
+                self.tree_core._adjust_component_evictable_size(
+                    node=cur, component_type=ct, delta=key_len
+                )
                 self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
@@ -419,7 +426,7 @@ class FullComponent(TreeComponent):
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
                 # Full uses leaf sets, not LRU
-                self.tree_core.component_evictable_size_[ct] += n_len
+                self.tree_core._adjust_component_evictable_size(n, ct, n_len)
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)

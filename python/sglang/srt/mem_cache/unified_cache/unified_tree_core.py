@@ -446,6 +446,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self.component_evictable_size_ = {ct: 0 for ct in self.component_types}
         self.component_protected_size_ = {ct: 0 for ct in self.component_types}
+        # Subset of component_evictable_size_ that is still referenced by at
+        # least one active radix-native session. Admission control needs this
+        # split to distinguish cheap reclamation from reclamation that destroys
+        # reusable session state. Keep it incrementally so metric collection is
+        # O(1) instead of walking the whole tree.
+        self.component_session_evictable_size_ = {ct: 0 for ct in self.component_types}
 
         self.lru_lists = {
             ct: UnifiedLRUList(
@@ -1087,7 +1093,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
-        self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+        self._adjust_component_evictable_size(new_node, BASE_COMPONENT_TYPE, len(value))
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1106,7 +1112,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self.component_evictable_size_[ct] += n
+        self._adjust_component_evictable_size(node, ct, n)
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
         self._update_duplicate_tracking(node)
@@ -1992,7 +1998,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
-        self.component_evictable_size_[component_type] += len(value)
+        self._adjust_component_evictable_size(node, component_type, len(value))
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -2204,16 +2210,27 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for ct in self.component_types:
             evictable = 0
             protected = 0
+            session_evictable = 0
             for n in all_nodes:
                 if n is self.root_node:
                     continue
                 cd = n.component_data[ct]
+                expected_node_evictable = 0
                 if cd.value is not None:
                     toks = len(cd.value)
                     if cd.lock_ref > 0:
                         protected += toks
                     else:
+                        expected_node_evictable = toks
                         evictable += toks
+                        if cd.session_ref > 0:
+                            session_evictable += toks
+                if cd.device_evictable_size != expected_node_evictable:
+                    E(
+                        f"[Size] node={n.id} {ct} device_evictable="
+                        f"{cd.device_evictable_size} "
+                        f"!= recomputed={expected_node_evictable}"
+                    )
             if self.component_evictable_size_[ct] != evictable:
                 E(
                     f"[Size] {ct} evictable={self.component_evictable_size_[ct]} "
@@ -2223,6 +2240,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 E(
                     f"[Size] {ct} protected={self.component_protected_size_[ct]} "
                     f"!= recomputed={protected}"
+                )
+            if self.component_session_evictable_size_[ct] != session_evictable:
+                E(
+                    f"[Size] {ct} session_evictable="
+                    f"{self.component_session_evictable_size_[ct]} "
+                    f"!= recomputed={session_evictable}"
                 )
 
         # ── PART 5: Ongoing Operations ──
@@ -2332,6 +2355,48 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evictable_size(self) -> int:
         return self.component_evictable_size_.get(BASE_COMPONENT_TYPE, 0)
 
+    def _adjust_component_evictable_size(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+        delta: int,
+    ) -> None:
+        """Adjust total and session-referenced device-evictable accounting."""
+        cd = node.component_data[component_type]
+        cd.device_evictable_size += delta
+        self.component_evictable_size_[component_type] += delta
+        if cd.session_ref > 0:
+            self.component_session_evictable_size_[component_type] += delta
+
+        assert cd.device_evictable_size >= 0
+        assert self.component_evictable_size_[component_type] >= 0
+        assert self.component_session_evictable_size_[component_type] >= 0
+        assert (
+            self.component_session_evictable_size_[component_type]
+            <= self.component_evictable_size_[component_type]
+        )
+
+    def _adjust_component_session_ref(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+        delta: int,
+    ) -> int:
+        """Adjust a node's session ref and its O(1) evictable subset counter."""
+        cd = node.component_data[component_type]
+        was_referenced = cd.session_ref > 0
+        cd.session_ref += delta
+        assert cd.session_ref >= 0
+        is_referenced = cd.session_ref > 0
+
+        if was_referenced != is_referenced and cd.device_evictable_size > 0:
+            self.component_session_evictable_size_[component_type] += (
+                cd.device_evictable_size if is_referenced else -cd.device_evictable_size
+            )
+            assert self.component_session_evictable_size_[component_type] >= 0
+
+        return cd.session_ref
+
     def protected_size(self) -> int:
         return self.component_protected_size_.get(BASE_COMPONENT_TYPE, 0)
 
@@ -2339,8 +2404,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Evictable token count for one component (0 if the component is absent)."""
         return self.component_evictable_size_.get(component_type, 0)
 
+    def component_session_referenced_evictable_size(
+        self, component_type: ComponentType
+    ) -> int:
+        """Device-evictable units referenced by at least one active session."""
+        return self.component_session_evictable_size_.get(component_type, 0)
+
     def full_evictable_size(self) -> int:
         return self.evictable_size()
+
+    def full_session_referenced_evictable_size(self) -> int:
+        return self.component_session_referenced_evictable_size(BASE_COMPONENT_TYPE)
 
     def full_protected_size(self) -> int:
         return self.protected_size()
@@ -2348,8 +2422,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def swa_evictable_size(self) -> int:
         return self.component_evictable_size_.get(ComponentType.SWA, 0)
 
+    def swa_session_referenced_evictable_size(self) -> int:
+        return self.component_session_referenced_evictable_size(ComponentType.SWA)
+
     def mamba_evictable_size(self) -> int:
         return self.component_evictable_size_.get(ComponentType.MAMBA, 0)
+
+    def mamba_session_referenced_evictable_size(self) -> int:
+        return self.component_session_referenced_evictable_size(ComponentType.MAMBA)
 
     def swa_protected_size(self) -> int:
         return self.component_protected_size_.get(ComponentType.SWA, 0)

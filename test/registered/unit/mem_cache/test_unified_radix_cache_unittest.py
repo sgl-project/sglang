@@ -2099,6 +2099,7 @@ class UnifiedRadixCacheSuite:
         aux_len = len(aux_cd.value)
         cache.tree_core.component_protected_size_[aux] -= aux_len
         cache.tree_core.component_evictable_size_[aux] += aux_len
+        aux_cd.device_evictable_size += aux_len
         aux_cd.lock_ref = 0
         self.assertNotIn(node, cache.tree_core.evictable_device_leaves)
 

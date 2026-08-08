@@ -332,7 +332,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
+    def full_session_referenced_evictable_size(self):
+        return 0
+
     def swa_evictable_size(self):
+        return 0
+
+    def swa_session_referenced_evictable_size(self):
+        return 0
+
+    def mamba_session_referenced_evictable_size(self):
+        return 0
+
+    def active_radix_session_count(self):
         return 0
 
     def protected_size(self):
