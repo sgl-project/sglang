@@ -813,6 +813,7 @@ export const Playground = ({ config }) => {
         const baseSpec = flags.filter((f) => {
           const head = f.split(/[\s=]/)[0];
           return head === "--speculative-algorithm"
+              || head === "--speculative-draft-model-path"
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
@@ -840,7 +841,8 @@ export const Playground = ({ config }) => {
           return { flags, env };
         }
         flags = h.stripFlagsByFirstToken(flags, [
-          "--speculative-algorithm", "--speculative-num-steps",
+          "--speculative-algorithm", "--speculative-draft-model-path",
+          "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
           "--speculative-dspark-block-size",
           "--speculative-ngram-max-bfs-breadth",
