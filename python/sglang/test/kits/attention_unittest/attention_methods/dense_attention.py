@@ -79,6 +79,7 @@ class DenseAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     sliding_window_size: int | None = None
+    logit_cap: float = 0.0
 
     @property
     def batch_size(self) -> int:
@@ -459,6 +460,7 @@ class ProjectedDenseAttention(nn.Module):
         dtype: torch.dtype,
         device: str,
         sliding_window_size: int | None = None,
+        logit_cap: float = 0.0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -499,6 +501,7 @@ class ProjectedDenseAttention(nn.Module):
             scaling=head_dim**-0.5,
             num_kv_heads=num_kv_heads,
             layer_id=0,
+            logit_cap=logit_cap,
             sliding_window_size=(
                 sliding_window_size if sliding_window_size is not None else -1
             ),
@@ -846,6 +849,8 @@ def _dense_attention_reference(
             query = query.float()
             keys = keys.float()
             scores = torch.einsum("hd,hkd->hk", query, keys) * module.scaling
+            if case.logit_cap > 0.0:
+                scores = case.logit_cap * torch.tanh(scores / case.logit_cap)
             probs = torch.softmax(scores, dim=-1)
             out = torch.einsum("hk,hkd->hd", probs, values.float())
             outputs.append(out.reshape(-1))
@@ -1011,6 +1016,7 @@ def build_dense_attention_fixture(
         dtype=dtype,
         device=device,
         sliding_window_size=case.sliding_window_size,
+        logit_cap=case.logit_cap,
     )
     reference_module = ReferenceDenseAttention(
         hidden_size=hidden_size,
@@ -1115,6 +1121,7 @@ def make_dense_case_with_prefix_lens(
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
         sliding_window_size=case.sliding_window_size,
+        logit_cap=case.logit_cap,
     )
 
 
