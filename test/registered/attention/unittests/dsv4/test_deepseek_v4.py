@@ -304,6 +304,253 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
                 )
 
 
+class TestDSV4DraftMetadataPlanning(CustomTestCase):
+    """Lightweight guards for DSV4 draft metadata preparation."""
+
+    class _StepBackendSpy:
+        def __init__(self, step_id):
+            self.speculative_step_id = step_id
+            self.calls = []
+
+        def init_forward_metadata(self, forward_batch):
+            self.calls.append(("eager", forward_batch))
+
+        def init_forward_metadata_in_graph(self, forward_batch):
+            self.calls.append(("in_graph", forward_batch))
+
+        def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+            self.calls.append(("out_graph", forward_batch, in_capture))
+
+    @staticmethod
+    def _make_multi_step_backend(num_steps):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4MultiStepBackend,
+        )
+
+        backend = object.__new__(DeepseekV4MultiStepBackend)
+        backend.speculative_num_steps = num_steps
+        backend.attn_backends = [
+            TestDSV4DraftMetadataPlanning._StepBackendSpy(i) for i in range(num_steps)
+        ]
+        return backend
+
+    @staticmethod
+    def _make_multi_step_forward_batch():
+        return SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=None,
+            positions=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.arange(2, dtype=torch.int32),
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            seq_lens_sum=2,
+            seq_lens_cpu=None,
+            out_cache_loc=torch.arange(6, dtype=torch.int64),
+            spec_info=SimpleNamespace(),
+        )
+
+    def test_multi_step_metadata_only_initializes_executed_steps(self):
+        batch = self._make_multi_step_forward_batch()
+        for num_steps in (1, 3):
+            expected_step_ids = list(range(max(num_steps - 1, 0)))
+            with self.subTest(num_steps=num_steps, phase="eager"):
+                backend = self._make_multi_step_backend(num_steps)
+                backend.init_forward_metadata(batch)
+                self.assertEqual(
+                    [
+                        spy.speculative_step_id
+                        for spy in backend.attn_backends
+                        if spy.calls
+                    ],
+                    expected_step_ids,
+                )
+
+            with self.subTest(num_steps=num_steps, phase="capture_out_graph"):
+                backend = self._make_multi_step_backend(num_steps)
+                backend.init_forward_metadata_out_graph(batch, in_capture=True)
+                self.assertEqual(
+                    [
+                        spy.speculative_step_id
+                        for spy in backend.attn_backends
+                        if spy.calls
+                    ],
+                    expected_step_ids,
+                )
+
+            with self.subTest(num_steps=num_steps, phase="in_graph"):
+                backend = self._make_multi_step_backend(num_steps)
+                backend.init_forward_metadata_in_graph(batch)
+                self.assertEqual(
+                    [
+                        spy.speculative_step_id
+                        for spy in backend.attn_backends
+                        if spy.calls
+                    ],
+                    expected_step_ids,
+                )
+
+    @staticmethod
+    def _make_decode_backend(*, is_draft_runner):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.is_draft_runner = is_draft_runner
+        backend.page_size = DSV4_PAGE_SIZE
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.req_to_token = torch.zeros((2, 4096), dtype=torch.int32)
+        backend.token_to_kv_pool = object()
+        core_metadata = SimpleNamespace(
+            page_table=torch.zeros((2, 1), dtype=torch.int32)
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core_metadata)
+        backend.init_forward_metadata_indexer = mock.Mock(
+            side_effect=AssertionError(
+                "draft decode must not initialize indexer metadata"
+            )
+        )
+        return backend, core_metadata
+
+    def _assert_draft_decode_metadata(self, metadata, core_metadata):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+
+        self.assertIsInstance(metadata, DSV4Metadata)
+        self.assertIs(metadata.core_attn_metadata, core_metadata)
+        self.assertIsNone(metadata.indexer_metadata)
+        self.assertIsNone(metadata.c4_compress_metadata)
+        self.assertIsNone(metadata.c128_compress_metadata)
+
+    def test_draft_decode_skips_compression_direct_and_raw_upgrade(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention import deepseek_v4_backend
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DSV4RawDecodeMetadata,
+        )
+
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
+        seq_lens = torch.tensor([32, 64], dtype=torch.int32)
+        out_cache_loc = torch.tensor([7, 11], dtype=torch.int64)
+
+        backend, core_metadata = self._make_decode_backend(is_draft_runner=True)
+        with (
+            envs.SGLANG_PREP_IN_CUDA_GRAPH.override(False),
+            mock.patch.object(
+                deepseek_v4_backend,
+                "create_paged_compressor_data",
+                side_effect=AssertionError(
+                    "draft decode must not initialize compressor metadata"
+                ),
+            ),
+        ):
+            metadata = backend.init_forward_metadata_decode(
+                max_seq_len=2048,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+            )
+        self._assert_draft_decode_metadata(metadata, core_metadata)
+        self.assertEqual(
+            backend.make_core_attn_metadata.call_args.kwargs["max_seq_len"],
+            DSV4_PAGE_SIZE,
+        )
+        self.assertFalse(
+            backend.make_core_attn_metadata.call_args.kwargs["need_compress"]
+        )
+
+        backend.make_core_attn_metadata.reset_mock()
+        raw_metadata = DSV4RawDecodeMetadata(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+        )
+        with mock.patch.object(
+            deepseek_v4_backend,
+            "create_paged_compressor_data",
+            side_effect=AssertionError(
+                "draft raw decode must not initialize compressor metadata"
+            ),
+        ):
+            metadata = backend.make_forward_metadata_from_raw_decode(raw_metadata)
+        self._assert_draft_decode_metadata(metadata, core_metadata)
+        self.assertEqual(
+            backend.make_core_attn_metadata.call_args.kwargs["max_seq_len"],
+            DSV4_PAGE_SIZE,
+        )
+        self.assertFalse(
+            backend.make_core_attn_metadata.call_args.kwargs["need_compress"]
+        )
+
+    def test_target_decode_keeps_full_compression_metadata(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention import deepseek_v4_backend
+
+        backend, core_metadata = self._make_decode_backend(is_draft_runner=False)
+        indexer_metadata = object()
+        backend.init_forward_metadata_indexer = mock.Mock(return_value=indexer_metadata)
+
+        def _make_compressor_metadata(*, compress_ratio, **_kwargs):
+            return f"c{compress_ratio}"
+
+        with (
+            envs.SGLANG_PREP_IN_CUDA_GRAPH.override(False),
+            mock.patch.object(
+                deepseek_v4_backend,
+                "create_paged_compressor_data",
+                side_effect=_make_compressor_metadata,
+            ) as create_compressor,
+        ):
+            metadata = backend.init_forward_metadata_decode(
+                max_seq_len=2048,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+                seq_lens=torch.tensor([32, 64], dtype=torch.int32),
+                out_cache_loc=torch.tensor([7, 11], dtype=torch.int64),
+            )
+
+        self.assertIs(metadata.core_attn_metadata, core_metadata)
+        self.assertIs(metadata.indexer_metadata, indexer_metadata)
+        self.assertEqual(metadata.c4_compress_metadata, "c4")
+        self.assertEqual(metadata.c128_compress_metadata, "c128")
+        self.assertTrue(
+            backend.make_core_attn_metadata.call_args.kwargs["need_compress"]
+        )
+        self.assertEqual(
+            backend.make_core_attn_metadata.call_args.kwargs["max_seq_len"], 2048
+        )
+        self.assertEqual(create_compressor.call_count, 2)
+
+    def test_graph_warmup_keeps_draft_compression_schedules_absent(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4AttnMetadata,
+            DSV4Metadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        core_metadata = object.__new__(DSV4AttnMetadata)
+        core_metadata.c1_flashmla_metadata = object()
+        core_metadata.c4_flashmla_metadata = None
+        core_metadata.c128_flashmla_metadata = None
+        backend.forward_metadata = DSV4Metadata(
+            core_attn_metadata=core_metadata,
+            indexer_metadata=None,
+        )
+        backend._current_capture_raw = None
+
+        with mock.patch.object(
+            deepseek_v4_backend,
+            "_create_flashmla_metadata",
+            return_value="new-c1",
+        ) as create_flashmla_metadata:
+            backend.on_after_cuda_graph_warmup()
+
+        self.assertEqual(core_metadata.c1_flashmla_metadata, "new-c1")
+        self.assertIsNone(core_metadata.c4_flashmla_metadata)
+        self.assertIsNone(core_metadata.c128_flashmla_metadata)
+        create_flashmla_metadata.assert_called_once_with()
+
+
 class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     """CPU-only checks for the DSV4 BCG metadata replay contract."""
 
