@@ -4633,6 +4633,33 @@ class MHATokenToKOnlyPool(KVCache):
         k_size_bytes = sum(get_tensor_size_bytes(k) for k in self.k_buffer)
         return k_size_bytes, 0
 
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        k_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            k_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu = self.k_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                k_cache_cpu[-1].append(k_cpu)
+        current_platform.synchronize()
+        return k_cache_cpu
+
+    def load_cpu_copy(self, k_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu = k_cache_cpu[layer_id][i // chunk_size]
+                assert k_cpu.shape[0] == len(chunk_indices)
+                k_chunk = k_cpu.to(self.k_buffer[layer_id].device, non_blocking=True)
+                self.k_buffer[layer_id][chunk_indices] = k_chunk
+        current_platform.synchronize()
+
 
 class MiniMaxSparseKVPool(KVCache):
     def __init__(
@@ -4968,6 +4995,29 @@ class MiniMaxSparseKVPool(KVCache):
         sub_pools = [self.main_pool, self.index_kv_pool, self.index_k_pool]
         sizes = [p.get_kv_size_bytes() for p in sub_pools if p is not None]
         return sum(k for k, _ in sizes), sum(v for _, v in sizes)
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return {
+            "main": self.main_pool.get_cpu_copy(indices),
+            "index_kv": (
+                self.index_kv_pool.get_cpu_copy(indices)
+                if self.index_kv_pool is not None
+                else None
+            ),
+            "index_k": (
+                self.index_k_pool.get_cpu_copy(indices)
+                if self.index_k_pool is not None
+                else None
+            ),
+        }
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        """Reload KV previously produced by ``get_cpu_copy`` back onto device."""
+        self.main_pool.load_cpu_copy(kv_cache_cpu["main"], indices)
+        if self.index_kv_pool is not None:
+            self.index_kv_pool.load_cpu_copy(kv_cache_cpu["index_kv"], indices)
+        if self.index_k_pool is not None:
+            self.index_k_pool.load_cpu_copy(kv_cache_cpu["index_k"], indices)
 
     def get_contiguous_buf_infos(self):
         # Main K/V only; index buffers ride the state-buffer channel.
