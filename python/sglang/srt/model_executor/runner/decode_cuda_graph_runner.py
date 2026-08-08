@@ -1209,8 +1209,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         raw_bs = forward_batch.batch_size
 
         if is_ragged:
-            # The layout is the single source of the tier; it is constructed
-            # on this runner's capture grid.
+            # The layout tier is always on this runner's capture grid, so no
+            # re-round or assert here: the planner rounds on
+            # ragged_capture_num_tokens, which returns this runner's
+            # capture_num_tokens (same source), and verify_layout_grid's
+            # [total] escape branches only fire with ragged_verify_mode off,
+            # where this branch is unreachable.
             raw_num_token = graph_size_key = ragged_layout.graph_num_tokens
             bs = self._ragged_capture_slots(graph_size_key)
             assert bs >= raw_bs, (
