@@ -14,7 +14,8 @@
 """Config loading utilities."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
+from collections.abc import Mapping
 
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -214,6 +215,32 @@ class MistralModelConfigParser(ModelConfigParserBase):
         )
 
 
+def deep_update(
+    original: Union[PretrainedConfig, dict], new: dict
+) -> Union[PretrainedConfig, dict]:
+    """
+    Recursively merging of model configs
+    """
+    for key, value in new.items():
+        current = (
+            getattr(original, key, None)
+            if isinstance(original, PretrainedConfig)
+            else original.get(key)
+        )
+        if (
+            current is not None
+            and isinstance(value, Mapping)
+            and isinstance(current, (Mapping, PretrainedConfig))
+        ):
+            deep_update(current, value)
+        else:
+            if isinstance(original, PretrainedConfig):
+                setattr(original, key, value)
+            else:
+                original[key] = value
+    return original
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -258,11 +285,7 @@ def get_config(
         # config, so '{"text_config": {...}}' on a VLM would replace the whole
         # sub-config with a dict and break attribute access downstream.
         for key, value in model_override_args.items():
-            current = getattr(config, key, None)
-            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
-                current.update(value)
-            else:
-                setattr(config, key, value)
+            deep_update(config, model_override_args)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
