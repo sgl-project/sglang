@@ -343,6 +343,15 @@ def flashinfer_per_tensor_fp8_supported() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def _fp8_pertensor_backend():
+    if not is_sm120_supported():
+        return None
+    from sglang.kernels.ops.gemm import fp8_pertensor_gemm as pertensor
+
+    return pertensor if pertensor.is_available() else None
+    
+
 if flashinfer_per_tensor_fp8_supported():
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
 
@@ -361,6 +370,18 @@ if flashinfer_per_tensor_fp8_supported():
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
         m, n = q_input.shape[0], weight.shape[1]
+        k = weight.shape[0]
+        pertensor = _fp8_pertensor_backend()
+        if(
+            pertensor is not None
+            and out_dtype == torch.bfloat16
+            and pertensor.is_profitable(m, n, k)
+        ):
+            w_nk = weight.t()
+            if q_input.is_contiguous() and w_nk.is_contiguous():
+                return pertensor.fp8_pertensor_scaled_mm(
+                    q_input, w_nk, x_scale.reshape(1), weight_scale.reshape(1)
+                )
         return _raw_flashinfer_bmm_fp8(
             q_input.unsqueeze(0),
             weight.unsqueeze(0),
