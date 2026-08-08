@@ -243,6 +243,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
+        scheduler.enable_overlap_mlx = False
         scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
