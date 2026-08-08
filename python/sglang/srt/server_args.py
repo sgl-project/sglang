@@ -6369,6 +6369,8 @@ class ServerArgs:
         strategy_to_legacy_mode = {
             "zigzag": "in-seq-split",
             "interleave": "round-robin-split",
+            # contiguous postdates the legacy mode names; it is its own alias.
+            "contiguous": "contiguous",
         }
 
         if (
