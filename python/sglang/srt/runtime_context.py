@@ -964,12 +964,15 @@ class RuntimeContext:
         dummy-boundary ``ServerArgs`` carrying ``fields`` and returns it;
         ``restore()`` (or exiting) reinstates whatever the slot held before.
 
-        Transitional — to be deprecated: it exists because production code
-        still branches on raw ``server_args`` fields at runtime, so forcing a
-        path needs a full config in the slot. As those readers migrate onto
-        the named runtime tiers (flags / resources / forward), prefer the
-        finer-grained overrides; once they cover the branching surface this
-        override loses its clients and goes away.
+        This is the sanctioned way for a test to get a published context, and
+        it stays. The transitional reason it was introduced for — production
+        code branching on raw ``server_args`` fields at runtime — is gone (the
+        read ratchet pins business reads at zero), but a test that exercises
+        bag readers still needs bags, and the bag tree is projected *from an
+        instance*: something has to publish one. Prefer the finer-grained
+        scoped overrides (``get_exec().override(...)``, the flag groups'
+        ``override``) on top of a published context when a test only needs to
+        force one leaf.
         """
         return _ServerArgsOverride(self, fields)
 
@@ -1189,10 +1192,12 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Audited (record-mode smokes, plain + DP-attention): the DP controller
     # reads only the elastic-EP gate; its module's static read set agrees.
     "dp_controller": frozenset({"exec"}),
-    # Zero bag reads observed (per-instance managers read self.server_args by
-    # design). Keep full: it may need namespaces (e.g. disagg) once tokenizer
-    # paths migrate off self.server_args, and restricting on a zero-read
-    # audit would be guesswork.
+    # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
+    # /v1/models): reads exactly {"serving"} — the per-instance managers read
+    # self.server_args by design. Still declared full, because that run did not
+    # exercise the multimodal processors, LoRA/score endpoints, the disagg
+    # roles, or the gRPC bridge; narrowing needs those shapes audited too, and
+    # a wrong set fails a request rather than a test.
     "tokenizer": None,
     # Deployment shapes not exercised locally; audit before restricting.
     "encoder": None,

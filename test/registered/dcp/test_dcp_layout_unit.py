@@ -137,25 +137,20 @@ class TestGetDcpLens(CustomTestCase):
         )
         allocators = {}
 
-        # The configurator's bag reads (disaggregation_mode / page_size /
-        # enable_hisparse) come from the published context; the per-iteration
-        # dcp_size stays on the injected instance stand-in.
-        self._sa_override = rc.get_context().override_server_args(
-            disaggregation_mode="null",
-            page_size=physical_page_size,
-            enable_hisparse=False,
-        )
-        self._sa_override.install()
-        self.addCleanup(self._sa_override.restore)
-
+        # The configurator's own inputs are published leaves now, so each
+        # iteration publishes them. The DCP *scale* is not one of them: the
+        # allocator widens from the live get_parallel().attn_dcp_size, which the
+        # override below drives.
         for dcp_size in (1, 4):
+            override = rc.get_context().override_server_args(
+                disaggregation_mode="null",
+                page_size=physical_page_size,
+                enable_hisparse=False,
+            )
+            override.install()
+            self.addCleanup(override.restore)
             configurator = SimpleNamespace(
-                server_args=SimpleNamespace(
-                    disaggregation_mode="null",
-                    enable_hisparse=False,
-                    page_size=physical_page_size,
-                    dcp_size=dcp_size,
-                ),
+                server_args=SimpleNamespace(),
                 hybrid_gdn_config=None,
                 is_hybrid_swa=False,
                 kv_cache_dtype=torch.bfloat16,
