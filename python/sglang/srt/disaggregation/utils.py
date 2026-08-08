@@ -1030,6 +1030,29 @@ def setup_state_kv_args(
             comp_item_lens,
         ) in token_to_kv_pool.get_pd_state_components():
             append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
+        # Register the draft model's SWA buffer (DSpark). The draft pool has
+        # its own swa_kv_pool.kv_buffer (data not shared with target), but
+        # shares the allocator / full_to_swa_index_mapping (slots shared).
+        # Use the same DSV4_SWA type: the sender pairs by position, and page
+        # indices are identical (shared mapping).
+        if draft_token_to_kv_pool is not None and isinstance(
+            draft_token_to_kv_pool, DSV4NPUTokenToKVPool
+        ):
+            from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+            for (
+                _st,
+                comp_ptrs,
+                comp_lens,
+                comp_item_lens,
+            ) in draft_token_to_kv_pool.get_pd_state_components():
+                append_state_component(
+                    kv_args,
+                    AscendStateType.DSV4_SWA,
+                    comp_ptrs,
+                    comp_lens,
+                    comp_item_lens,
+                )
     elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(

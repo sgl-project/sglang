@@ -559,6 +559,44 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             cache = cache.unsqueeze(1)
         buf_flat[loc] = cache.to(buf_flat.dtype)
 
+    def set_swa_key_buffer_radix_fused_norm_rope(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        kv_out = torch_npu.npu_rms_norm(kv, kv_weight, eps)[0]
+
+        rope_dim = freqs_cis.shape[-1] * 2
+
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+        cos, sin = Dsv4NpuRoPE.for_freqs(freqs_cis).get_cos_sin(
+            positions,
+            kv_out.dtype,
+            view_4d=True,
+            allow_build=True,
+            cache_dtype=torch.float32,
+        )
+        Dsv4NpuRoPE.apply_rotary_mul_inplace(
+            kv_out.reshape(kv_out.shape[0], -1, kv_out.shape[-1]),
+            None,
+            cos,
+            sin,
+            qk_nope_dim=kv_out.shape[-1] - rope_dim,
+        )
+
+        safe_swa_loc = swa_loc.clamp_min(0).to(torch.int64)
+        self.set_swa_buffer(
+            layer_id,
+            safe_swa_loc,
+            kv_out,
+        )
+
     # ------------------------------------------------------------------
     # NPU port hooks — used by dsv4/{compressor,indexer}.py forward_npu.
     # CompressStatePool stores a fused [kv | score] tensor; split is a last-dim slice.
