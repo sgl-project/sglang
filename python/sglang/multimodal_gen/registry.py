@@ -45,6 +45,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.boogu_image import (
+    BooguImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
 )
@@ -105,6 +108,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.boogu_image import BooguImageSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
@@ -916,6 +920,15 @@ def _register_configs():
             "Tongyi-MAI/Z-Image-Turbo",
         ],
         model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
+    )
+    # Boogu-Image (base T2I only)
+    register_configs(
+        sampling_param_cls=BooguImageSamplingParams,
+        pipeline_config_cls=BooguImagePipelineConfig,
+        hf_model_paths=[
+            "boogu-project/Boogu-Image-0.1-Base",
+        ],
+        model_detectors=[lambda hf_id: "boogu-image" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
