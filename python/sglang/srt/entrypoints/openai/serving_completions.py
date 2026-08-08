@@ -286,9 +286,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    total_output_logprobs = content["meta_info"][
-                        "output_token_logprobs_length"
-                    ]
+                    # An abort/finish chunk may carry no logprob fields (the
+                    # logprob accounting for this rid never started); default to
+                    # n_prev_token so the chunk skips logprob emission and still
+                    # reaches the finish/abort handling below instead of 500ing.
+                    total_output_logprobs = content["meta_info"].get(
+                        "output_token_logprobs_length", n_prev_token
+                    )
                     if (
                         n_prev_token < total_output_logprobs
                         or input_token_logprobs is not None
