@@ -185,6 +185,14 @@ class QuantizationConfig(ABC):
         if hf_quant_config is None:
             return None
 
+        # If the user explicitly requested an online requantization (e.g.
+        # quark_mxfp4 on top of an NVFP4 checkpoint), do not override it back
+        # to the source format.
+        from sglang.srt.configs.model_config import REQUANTIZATION_METHODS
+
+        if user_quant in REQUANTIZATION_METHODS:
+            return None
+
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 
