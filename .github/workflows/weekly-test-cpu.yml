@@ -1,0 +1,53 @@
+# Weekly CPU tests. Holds the CPU-only unit tests that are not worth a
+# per-commit slot -- debug tooling (dump comparator, source patcher) whose
+# breakage is fine to notice once a week.
+#
+# Separate from weekly-test-nvidia.yml because CPU has no runner_config: the
+# shared _scheduled-test-stage.yml resolves machines through
+# scripts/ci/runner_configs.yml, which is CUDA-only.
+name: Weekly Test (CPU)
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Sunday 00:00 UTC, alongside the Nvidia weekly run
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-test-cpu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  weekly-test-cpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install protoc + Rust toolchain
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      # uv pip targets a venv by default; setup-python has no venv -- install
+      # into that interpreter (UV_SYSTEM_PYTHON).
+      - name: Install dependencies
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Run test
+        run: |
+          cd test
+          python3 run_suite.py --hw cpu --suite weekly-test-cpu --continue-on-error

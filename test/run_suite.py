@@ -175,6 +175,10 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
+        # `stage="weekly"` + `runner_config="cpu"`, same {stage}-test-{runner_config}
+        # rule as the CUDA suites. Debug tooling UTs (dump comparator, source
+        # patcher): breakage there is fine to notice once a week.
+        "weekly-test-cpu",
     ],
     HWBackend.CUDA: [
         "stress",
@@ -182,6 +186,11 @@ OTHER_SUITES = {
         # nightly suites; weekly is just another stage. Listed here rather than
         # in NIGHTLY_SUITES because it is neither per-commit nor nightly -- the
         # three dicts only differ in which names this backend may declare.
+        "weekly-test-1-gpu-large",
+        "weekly-test-2-gpu-large",
+        "weekly-test-4-gpu-b200",
+        "weekly-test-4-gpu-h100",
+        "weekly-test-8-gpu-b200",
         "weekly-test-8-gpu-h200",
     ],
 }
