@@ -98,6 +98,9 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    # Elastic prefill topology can grow after registration. Decode resolves
+    # per-room ranks through the bootstrap service instead of a stale modulo.
+    dynamic_dp_size: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -178,6 +181,12 @@ class CommonKVManager(BaseKVManager):
         )
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
+        )
+        # Elastic EP needs an exact room-to-rank handshake: cached topology
+        # cannot safely span a scale transition.
+        self.bootstrap_max_dp_size = parallel.max_ep_size or parallel.dp_size
+        self.dynamic_dp_size = bool(
+            parallel.max_ep_size and parallel.max_ep_size > parallel.dp_size
         )
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
@@ -499,10 +508,12 @@ class CommonKVManager(BaseKVManager):
                 f"PD retract rebootstrap /generate request errored for rid={rid}.",
             )
 
-    def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
+    def try_ensure_parallel_info(
+        self, bootstrap_addr: str, force_refresh: bool = False
+    ) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
-        if bootstrap_addr in self.prefill_info_table:
+        if not force_refresh and bootstrap_addr in self.prefill_info_table:
             return True
 
         info: PrefillServerInfo = None
@@ -706,6 +717,8 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "dynamic_dp_size": self.dynamic_dp_size,
+            "max_dp_size": self.bootstrap_max_dp_size,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1087,10 +1100,14 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
-            if get_parallel().load_balance_method != "follow_bootstrap_room":
+        if not req_has_disagg_prefill_dp_rank:
+            if self.kv_mgr.dynamic_dp_size:
                 self._register_prefill_dp_rank()
-            elif (
+            elif get_parallel().dp_size > 1 and (
+                get_parallel().load_balance_method != "follow_bootstrap_room"
+            ):
+                self._register_prefill_dp_rank()
+            elif get_parallel().dp_size > 1 and (
                 self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
@@ -1537,10 +1554,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.attn_tp_size = None
         self.attn_cp_size = None
         self.dp_size = None
+        self.max_dp_size: Optional[int] = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.dynamic_dp_size = False
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1576,6 +1595,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
+        self.app.router.add_post("/update_dp_size", self._handle_update_dp_size)
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
@@ -1608,6 +1628,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        max_dp_size = data.get("max_dp_size")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -1618,6 +1639,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.dp_size is None:
             self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
+
+        if self.max_dp_size is None and max_dp_size is not None:
+            self.max_dp_size = int(max_dp_size)
 
         if self.pp_size is None:
             self.pp_size = pp_size
@@ -1636,6 +1660,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "load_balance_method", "follow_bootstrap_room"
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+
+        self.dynamic_dp_size = self.dynamic_dp_size or bool(
+            data.get("dynamic_dp_size", False)
+        )
 
         if self.enable_dsa_cache_layer_split is None:
             self.enable_dsa_cache_layer_split = bool(
@@ -1706,6 +1734,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                dynamic_dp_size=self.dynamic_dp_size,
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
@@ -1731,6 +1760,36 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
 
         return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+
+    async def _handle_update_dp_size(self, request: web.Request):
+        data = await request.json()
+        dp_size = int(data["dp_size"])
+        if dp_size < 1:
+            return web.Response(text="dp_size must be positive", status=400)
+
+        async with self.lock:
+            if self.max_dp_size is None:
+                return web.Response(
+                    text="Bootstrap maximum DP size is not registered", status=400
+                )
+            if dp_size > self.max_dp_size:
+                return web.Response(
+                    text=(
+                        f"Cannot grow bootstrap DP size beyond configured maximum "
+                        f"{self.max_dp_size}"
+                    ),
+                    status=400,
+                )
+            if self.dp_size is not None and dp_size < self.dp_size:
+                return web.Response(
+                    text=f"Cannot shrink bootstrap DP size from {self.dp_size} to {dp_size}",
+                    status=400,
+                )
+            if dp_size > (self.dp_size or 0):
+                self.dp_size = dp_size
+            self.dynamic_dp_size = True
+        logger.info("Updated prefill bootstrap DP size to %d", dp_size)
+        return web.Response(text="OK", status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

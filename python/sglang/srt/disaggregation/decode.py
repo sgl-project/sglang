@@ -579,6 +579,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if req.disagg_prefill_dp_rank is not None:
             return req.disagg_prefill_dp_rank
 
+        if prefill_info.dynamic_dp_size:
+            # Elastic EP records the actual prefill rank for this room. Do not
+            # derive it from cached topology across a scale transition.
+            return None
+
         if prefill_info.dp_size == 1:
             return 0
 

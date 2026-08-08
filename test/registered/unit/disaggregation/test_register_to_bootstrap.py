@@ -275,6 +275,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.system_dp_rank = 0
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
+        mgr.dynamic_dp_size = False
+        mgr.bootstrap_max_dp_size = 1
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
