@@ -80,9 +80,7 @@ class _RecordReplayGather:
 
     def build_replay(self):
         assert len(self.recorded) == self.world_size
-        self.replay = torch.stack(
-            [self.recorded[r] for r in range(self.world_size)]
-        )
+        self.replay = torch.stack([self.recorded[r] for r in range(self.world_size)])
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -103,8 +101,7 @@ class TestKDAContextParallelState(CustomTestCase):
             "k": torch.randn(shape, dtype=torch.bfloat16, device=self.device),
             "v": torch.randn(shape, dtype=torch.bfloat16, device=self.device) * 0.1,
             "g": (
-                torch.randn(shape, dtype=torch.float32, device=self.device) * 0.5
-                - 2.0
+                torch.randn(shape, dtype=torch.float32, device=self.device) * 0.5 - 2.0
             ).to(torch.bfloat16),
             "beta": torch.rand(
                 1, total_tokens, h, dtype=torch.bfloat16, device=self.device
@@ -266,17 +263,13 @@ class TestKDAContextParallelState(CustomTestCase):
             f"CP{world_size} output vs monolithic: {mono_ratio:.2e}",
         )
         for r, pool_r in enumerate(cp_pools):
-            state_chain = _norm_ratio(
-                pool_r[slot_indices], chain_pool[slot_indices]
-            )
+            state_chain = _norm_ratio(pool_r[slot_indices], chain_pool[slot_indices])
             self.assertLess(
                 state_chain,
                 CHAIN_TOL,
                 f"rank {r} final state vs chain: {state_chain:.2e}",
             )
-            state_mono = _norm_ratio(
-                pool_r[slot_indices], mono_pool[slot_indices]
-            )
+            state_mono = _norm_ratio(pool_r[slot_indices], mono_pool[slot_indices])
             self.assertLess(
                 state_mono,
                 MONO_TOL,
@@ -291,24 +284,18 @@ class TestKDAContextParallelState(CustomTestCase):
 
     def test_cp4_fresh_prefill(self):
         # 1000 is not 64-aligned, 704 is: covers both shard-boundary layouts.
-        self._check_cp_matches_refs(
-            seq_lens=[1000, 704], world_size=4, zero_seed=True
-        )
+        self._check_cp_matches_refs(seq_lens=[1000, 704], world_size=4, zero_seed=True)
 
     def test_cp4_chunked_prefill_continuation(self):
         # Non-zero pool seed: the merge chain must start from the carried
         # state, and the writeback must land the correct global final state.
-        self._check_cp_matches_refs(
-            seq_lens=[831, 512], world_size=4, zero_seed=False
-        )
+        self._check_cp_matches_refs(seq_lens=[831, 512], world_size=4, zero_seed=False)
 
     def test_cp8_empty_shards(self):
         # A 5-token sequence over CP8 leaves most ranks with an empty shard;
         # the layout must compact it away (base kernels corrupt on empty
         # sequences) while the merge still writes its final state everywhere.
-        self._check_cp_matches_refs(
-            seq_lens=[5, 640], world_size=8, zero_seed=False
-        )
+        self._check_cp_matches_refs(seq_lens=[5, 640], world_size=8, zero_seed=False)
 
     def test_cp1_passthrough(self):
         # world_size == 1 must be a strict no-op passthrough (no scratch, no
@@ -317,18 +304,14 @@ class TestKDAContextParallelState(CustomTestCase):
         inputs = self._make_inputs(total_tokens)
         seed_pool = self._make_seed_pool(zero=False)
         slot_indices = torch.tensor([2], dtype=torch.int32, device=self.device)
-        cu = torch.tensor(
-            [0, total_tokens], dtype=torch.int32, device=self.device
-        )
+        cu = torch.tensor([0, total_tokens], dtype=torch.int32, device=self.device)
 
         ref_pool = seed_pool.clone()
         o_ref = self._run_chunk_kda(inputs, cu, ref_pool, slot_indices)
 
         cp_pool = seed_pool.clone()
         ctx = LinearAttnCPContext(world_size=1, rank=0, group=None)
-        o_cp = self._run_chunk_kda(
-            inputs, cu, cp_pool, slot_indices, cp_context=ctx
-        )
+        o_cp = self._run_chunk_kda(inputs, cu, cp_pool, slot_indices, cp_context=ctx)
 
         torch.testing.assert_close(o_cp, o_ref, rtol=0, atol=0)
         torch.testing.assert_close(cp_pool, ref_pool, rtol=0, atol=0)

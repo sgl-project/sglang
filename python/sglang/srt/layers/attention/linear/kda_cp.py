@@ -39,7 +39,7 @@ so its in-place final-window writeback lands on scratch and the pool is
 updated only with the globally-correct tail.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import msgspec
 import torch

@@ -45,9 +45,11 @@ def _token(seq_idx: int, pos: int) -> torch.Tensor:
 
 def _build_streams(seq_lens):
     return [
-        torch.stack([_token(n, p) for p in range(length)])
-        if length > 0
-        else torch.zeros(0, DIM)
+        (
+            torch.stack([_token(n, p) for p in range(length)])
+            if length > 0
+            else torch.zeros(0, DIM)
+        )
         for n, length in enumerate(seq_lens)
     ]
 
@@ -64,9 +66,11 @@ class TestKDACPConvHalo(CustomTestCase):
         n_global = len(seq_lens)
         prior = torch.stack(
             [
-                torch.stack([_token(n, -(WINDOW - j)) - 50 for j in range(WINDOW)])
-                if has_prior_flags[n]
-                else torch.zeros(WINDOW, DIM)
+                (
+                    torch.stack([_token(n, -(WINDOW - j)) - 50 for j in range(WINDOW)])
+                    if has_prior_flags[n]
+                    else torch.zeros(WINDOW, DIM)
+                )
                 for n in range(n_global)
             ]
         )
@@ -139,9 +143,7 @@ class TestKDACPConvHalo(CustomTestCase):
                     f"rank {r} seq {n} has_initial",
                 )
             for n in range(n_global):
-                expect = _ref_window(
-                    streams[n], prior_or_zero[n], upto=seq_lens[n]
-                )
+                expect = _ref_window(streams[n], prior_or_zero[n], upto=seq_lens[n])
                 torch.testing.assert_close(
                     global_tails[n],
                     expect,
@@ -185,9 +187,7 @@ class TestKDACPPrefillMetadata(CustomTestCase):
         self.assertEqual(meta.query_start_loc.tolist(), [0, 80])
         # Shard length tables cover every rank and sum to the sequence.
         for n, total in enumerate([5, 640]):
-            self.assertEqual(
-                sum(meta.shard_lens[r][n] for r in range(8)), total
-            )
+            self.assertEqual(sum(meta.shard_lens[r][n] for r in range(8)), total)
         self.assertIsInstance(meta, KDACPPrefillMetadata)
 
     def test_cp_context_carries_compaction(self):
@@ -196,9 +196,7 @@ class TestKDACPPrefillMetadata(CustomTestCase):
         )
         ctx = meta.to_cp_context(group=object())
         self.assertEqual(ctx.num_global_seqs, 2)
-        self.assertEqual(
-            ctx.local_seq_ids.tolist(), meta.local_seq_ids_list
-        )
+        self.assertEqual(ctx.local_seq_ids.tolist(), meta.local_seq_ids_list)
 
 
 if __name__ == "__main__":

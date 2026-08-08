@@ -40,18 +40,14 @@ def make_inputs(total_tokens, wild):
         "q": torch.randn(shape, dtype=torch.bfloat16, device=DEVICE),
         "k": torch.randn(shape, dtype=torch.bfloat16, device=DEVICE),
         "v": (torch.randn(shape, dtype=torch.bfloat16, device=DEVICE) * 0.1),
-        "g": (
-            torch.randn(shape, dtype=torch.float32, device=DEVICE) * 0.5 - 2.0
-        ).to(torch.bfloat16),
+        "g": (torch.randn(shape, dtype=torch.float32, device=DEVICE) * 0.5 - 2.0).to(
+            torch.bfloat16
+        ),
         "beta": torch.rand(1, total_tokens, H, dtype=torch.bfloat16, device=DEVICE)
         .float()
         .sigmoid(),
-        "A_log": (
-            torch.randn(1, 1, H, 1, dtype=torch.float32, device=DEVICE) * 0.1
-        ),
-        "dt_bias": (
-            torch.randn(H * D, dtype=torch.float32, device=DEVICE) * 0.1
-        ),
+        "A_log": (torch.randn(1, 1, H, 1, dtype=torch.float32, device=DEVICE) * 0.1),
+        "dt_bias": (torch.randn(H * D, dtype=torch.float32, device=DEVICE) * 0.1),
     }
 
 

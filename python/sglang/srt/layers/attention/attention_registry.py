@@ -329,12 +329,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if cfg := mambaish_config(runner.model_config):
+        from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
         from sglang.srt.layers.utils.cp_utils import (
             is_prefill_context_parallel_enabled,
         )
         from sglang.srt.runtime_context import get_parallel
-
-        from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
 
         if isinstance(
             runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
@@ -483,10 +482,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
         from sglang.srt.runtime_context import get_parallel
 
-        if (
-            is_prefill_context_parallel_enabled()
-            or get_parallel().attn_cp_size > 1
-        ):
+        if is_prefill_context_parallel_enabled() or get_parallel().attn_cp_size > 1:
             # The CP-v2 runner shards prefill tokens across ranks, but linear
             # layers' recurrent state has no position axis to shard — it needs
             # the KDA state hand-off (pre-scan + all-gather + merge, see
