@@ -22,21 +22,23 @@ NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 register_cuda_ci(est_time=7200, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_THRESHOLDS = {
-    # Conservative thresholds on 100 MMMU samples, especially for latency thresholds.
+    # Accuracy floors are conservative, on 100 MMMU samples.
     #
-    # The latency numbers below are calibrated against max_tokens=1024 (#27327
-    # raised it from 30 for CoT prompts). A thinking model now emits a full chain
-    # of thought, so latency measured under the old cap is not comparable -- the
-    # entries updated for it are set at ~1.2x the slowest of five nightly runs.
+    # Every latency ceiling is 1.2x the slowest of five nightly runs, so the
+    # guard means the same thing for each model. They are calibrated against
+    # max_tokens=1024: #27327 raised it from 30 for CoT prompts without touching
+    # these, which left a thinking model measured under the old cap comparing
+    # against a ceiling it could no longer meet. Recalibrate here whenever
+    # max_tokens changes.
     ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(
-        0.320, 56.1
+        0.320, 25.5
     ),
-    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 40.3),
+    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 37.5),
     ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
-        0.270, 56.7
+        0.270, 30.0
     ),
     ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
-        0.270, 23.8
+        0.270, 13.0
     ),
     ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 22.5),
     ModelLaunchSettings(
@@ -49,22 +51,22 @@ MODEL_THRESHOLDS = {
     # sitting at a steady 0.3399 across five runs.
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.330, 28.0),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
-        0.330, 23.5
+        0.330, 21.0
     ),
     # temporarily disabled: NaN in next_token_logits
     # ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
     # ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
-    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 18.0),
-    ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
-    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.330, 31.9),
+    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 15.0),
+    ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 27.0),
+    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.330, 26.0),
     ModelLaunchSettings(
         "Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.29, 37.0),
+    ): ModelEvalMetrics(0.29, 34.5),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.30, 42.5),
-    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 40.0),
-    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
+    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 33.0),
+    ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 35.5),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
     ): ModelEvalMetrics(0.26, 165.0),
