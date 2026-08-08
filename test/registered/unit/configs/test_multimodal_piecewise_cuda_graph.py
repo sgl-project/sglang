@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     is_multimodal_piecewise_cuda_graph_supported,
 )
@@ -30,8 +31,11 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def _make_prefill_runner(self, backend):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner.enable_lora = False
+        runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
+        runner.mla_pinned_under_bcg = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
@@ -99,6 +103,50 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         forward_batch.extend_prefix_lens_cpu = [1]
 
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_embedding_gemma_forces_breakable_prefill(self):
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            is_embedding_gemma=True,
+            is_multimodal=False,
+            context_len=2048,
+            hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
+        )
+        args.disable_radix_cache = False
+        args.chunked_prefill_size = 2048
+
+        with (
+            patch.object(args, "get_model_config", return_value=args.model_config),
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+        ):
+            args._handle_model_capability_adjustments()
+
+        self.assertTrue(args.disable_radix_cache)
+        self.assertEqual(args.chunked_prefill_size, -1)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_encoder_embedding_model_enables_embedding_mode_without_flag(self):
+        args = ServerArgs(model_path="dummy")
+        args.is_embedding = False
+        args.model_config = SimpleNamespace(
+            embedding_model_spec=resolve_embedding_model_spec(
+                ["BertModel"],
+                is_embedding_requested=False,
+                is_embedding_gemma=False,
+            ),
+            is_multimodal=False,
+            hf_config=SimpleNamespace(architectures=["BertModel"]),
+        )
+
+        with patch.object(args, "get_model_config", return_value=args.model_config):
+            args._handle_model_capability_adjustments()
+
+        self.assertTrue(args.is_embedding)
 
 
 if __name__ == "__main__":

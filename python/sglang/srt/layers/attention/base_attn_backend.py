@@ -9,7 +9,10 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+        BaseIndexerMetadata,
+    )
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
@@ -98,12 +101,41 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # True for backends that preallocate per-seq extend metadata at req-pool
+    # size (e.g. triton's kv_indptr): dummy extend batches must then keep
+    # batch_size <= req_to_token_pool.size.
+    extend_dummy_seqs_capped_by_req_pool: bool = False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    # Whether prefill metadata initialization finishes all scheduler-shared reads.
+    prefill_shared_reads_end_at_metadata_init: bool = False
+
+    # Chunked-prefix FullCG capture has a second model topology and stable
+    # prefix buffers. Backends must opt in explicitly so the runner does not
+    # assume that generic ForwardBatch metadata is sufficient for every
+    # attention implementation.
+    supports_full_cuda_graph_chunked_prefix: bool = False
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        """Prepare backend-private metadata for chunked-prefix FullCG.
+
+        Only called for backends that set
+        ``supports_full_cuda_graph_chunked_prefix``; the runner validates the
+        flag up front. The runner owns and refreshes the shared ForwardBatch
+        prefix buffers. Backends that need wrappers or other derived metadata
+        should override this hook for both capture and replay.
+        """
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
@@ -145,13 +177,10 @@ class AttentionBackend(ABC):
         """
         pass
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers of verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [None, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        """The mask the draft stage fills in place, if this backend has one."""
+        return None
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

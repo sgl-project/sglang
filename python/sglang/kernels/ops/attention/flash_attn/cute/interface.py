@@ -14,6 +14,9 @@ from cutlass import Float32, Int32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+    is_batch_invariant,
+)
 from sglang.kernels.ops.attention.flash_attn.cute.cache_utils import get_jit_cache
 from sglang.kernels.ops.attention.flash_attn.cute.testing import is_fake_mode
 
@@ -692,7 +695,12 @@ def _flash_attn_fwd(
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+    if (
+        arch // 10 in [10, 11]
+        and head_dim != head_dim_v
+        and num_splits > 1
+        and not (page_table is not None and q_stage == 1)
+    ):
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -1066,6 +1074,7 @@ def _flash_attn_fwd(
             # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
             return out, lse
 
+    batch_invariant = is_batch_invariant()
     compile_key = (
         dtype,
         head_dim,
@@ -1125,6 +1134,7 @@ def _flash_attn_fwd(
         sfq.ndim if sfq is not None else None,
         sfk.ndim if sfk is not None else None,
         sfv.ndim if sfv is not None else None,
+        batch_invariant,
         fa_logging.get_fa_log_level(),
     )
 
@@ -1348,6 +1358,7 @@ def _flash_attn_fwd(
                             v_dequant=v_blockscaled,
                             q_sf_interleaved=q_sf_interleaved,
                             kv_sf_interleaved=kv_sf_interleaved,
+                            batch_invariant=batch_invariant,
                         )
                     ),
                 )

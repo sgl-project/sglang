@@ -3,6 +3,14 @@
 # Replaces only step 3 of MiniMax sparse prefill/decode. The lightning indexer
 # (steps 1-2) is unchanged and still produces `topk_idx`.
 # NVIDIA Blackwell (SM100/sm_103) only; callers gate on `msa_available()`.
+#
+# Dtypes: bf16 end-to-end, or uniform fp8_e4m3fn Q/K/V under fp8 attn-GEMM mode
+# (output bf16). fmha_sm100 selects its kernel variant from q.dtype alone and
+# casts k/v pointers to the same element type, so mixed bf16-q/fp8-KV is NOT
+# possible on the cutlass path and e5m2 would silently dispatch the e4m3
+# kernel — `_check_msa_dtypes` enforces uniformity here. The fp8 kernel
+# quantizes the unnormalized softmax P to e4m3 before the PV MMA (same
+# contract as the Triton fp8 path).
 
 from __future__ import annotations
 
@@ -11,9 +19,30 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import unit_scale
+
 
 class MSAUnavailableError(RuntimeError):
     """Raised when fmha_sm100 cannot serve the MiniMax MSA path."""
+
+
+def _check_msa_dtypes(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor):
+    # Uniform dtype required in BOTH modes: fmha_sm100 keys its kernel variant
+    # on q.dtype alone and casts the k/v pointers to the same element type, so
+    # a mismatched cache would be silently reinterpreted.
+    if q.dtype == torch.bfloat16:
+        assert (
+            k_cache.dtype == torch.bfloat16
+        ), f"MSA bf16 requires a bf16 K cache, got {k_cache.dtype}"
+    elif q.dtype == torch.float8_e4m3fn:
+        # e5m2 is rejected here too: fmha_sm100's variant lookup falls back to
+        # the e4m3 kernel for unknown dtype codes.
+        assert (
+            k_cache.dtype == torch.float8_e4m3fn
+        ), f"MSA fp8 requires an fp8_e4m3fn K cache, got {k_cache.dtype}"
+    else:
+        raise AssertionError(f"MSA supports bf16 or fp8_e4m3fn Q, got {q.dtype}")
+    assert v_cache.dtype == k_cache.dtype
 
 
 @functools.lru_cache(maxsize=1)
@@ -101,12 +130,23 @@ def msa_sparse_prefill_main(
     prefix_lens: torch.Tensor,  # [batch]
     block_size_k: int,  # == page_size == 128 for M3
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Drop-in for flash_prefill_with_gqa_share_sparse using MSA fmha_sm100.
 
-    Returns o [total_q, num_q_heads, head_dim].
+    Returns o [total_q, num_q_heads, head_dim] (bf16 for fp8 inputs).
+
+    Scale semantics (per-tensor, None = unit): attention runs on Q*q_scale,
+    K*k_scale, V*v_scale. The long-q cute path honors only sm_scale, so
+    q_scale*k_scale is folded into sm_scale (exact for softmax) and v_scale is
+    applied on the output; the short-q cutlass path gets the same folded values.
     """
     fmha_sm100, _ = _load_fmha_sm100()
+    _check_msa_dtypes(q, k_cache, v_cache)
+    is_fp8 = q.dtype == torch.float8_e4m3fn
+    v_scale = unit_scale(v_scale)
 
     max_slots, num_kv_heads, head_dim = k_cache.shape
     num_q_heads = q.shape[1]
@@ -116,6 +156,7 @@ def msa_sparse_prefill_main(
         raise ValueError(f"max_slots={max_slots} not divisible by page_size={P}")
     if sm_scale is None:
         sm_scale = head_dim**-0.5
+    sm_scale = sm_scale * unit_scale(q_scale) * unit_scale(k_scale)
 
     # Whole pool as MSA paged KV: [num_phys_pages, num_kv_heads, P, head_dim].
     n_phys_pages = max_slots // P
@@ -138,6 +179,7 @@ def msa_sparse_prefill_main(
         kv_block_num=topk,
         causal=True,
         qo_offset=prefix_lens.to(torch.int32),
+        use_fp8_kvcache=is_fp8,
     )
     o, _ = fmha_sm100(
         q,
@@ -148,6 +190,10 @@ def msa_sparse_prefill_main(
         kv_indices=kv_indices,
         kv_block_indexes=kv_block_indexes,
     )
+    # The cute (long-q) sparse prefill backend honors sm_scale only; apply the
+    # V dequant scale on the output (exact: softmax normalization excludes V).
+    if v_scale != 1.0:
+        o = o * v_scale
     return o
 
 
@@ -159,6 +205,7 @@ def build_msa_decode_meta(
     num_q_heads: int,
     block_size_k: int,
     topk: int,
+    is_fp8: bool = False,
 ):
     """Per-forward MSA decode metadata (page table + fmha plan), shared across layers.
 
@@ -187,25 +234,28 @@ def build_msa_decode_meta(
         kv_block_num=topk,
         causal=False,
         qo_offset=seq_lens_i32 - 1,  # decode query sits at the last cached position
+        use_fp8_kvcache=is_fp8,
     )
     return kv_indices, plan
 
 
 # ---------------------------------------------------------------------------
-# Eager-only MSA decode plan (NOT used under CUDA graph)
+# MSA decode plan (persistent per batch size; used by eager decode AND under
+# CUDA graph)
 #
-# WARNING: the fmha_sm100 sparse decode kernel is NOT cuda-graph-safe — captured
-# and replayed it returns silently wrong results that compound across replays
-# (~14% GSM8K loss on B200). The backend routes decode to the cuda-graph-safe
-# Triton sparse path whenever decode runs under a CUDA graph (see
-# MiniMaxSparseAttnBackend._use_msa_decode); this plan is reachable ONLY in eager
-# decode (no decode CUDA graph), where there is no capture/replay. Do NOT wire it
-# back into a captured graph — that reintroduces the ~14% regression.
+# History: MSA decode under CUDA graph was disabled after silently wrong
+# results (~14% GSM8K on B200). Root cause (2026-07): the topk producers
+# emitted block ids in score order, violating fmha_sm100's strictly-ascending
+# kv_block_indexes contract — its sorted-order early-exit then mis-masked the
+# partial last block for any row with seq_len > topk*block_size. The producers
+# now sort ascending (minimax_decode_topk.cuh, _topk_index_merge_kernel,
+# prefill _topk_index_kernel), and capture/replay of the full pipeline is
+# bit-exact vs eager (see tests/repro_msa_decode_degenerate.py).
 #
-# The build-once / replay-update structure below (refreshing the four length
-# tensors ``{kv_segment_lens, kv_segment_offsets, kv_page_indptr, qo_offset}`` and
-# the page table in place) is a leftover from the abandoned capture-once attempt;
-# it is kept only because eager decode reuses one per-forward plan across layers.
+# The build-once / update-in-place structure below refreshes the four length
+# tensors ``{kv_segment_lens, kv_segment_offsets, kv_page_indptr, qo_offset}``
+# and the page table each forward; the captured graph reads the same tensor
+# addresses on replay.
 # ---------------------------------------------------------------------------
 
 _MSA_CG_LEN_KEYS = (
@@ -242,6 +292,7 @@ def build_msa_decode_cg_plan(
     topk: int,
     batch_size: int,
     device: Optional[torch.device] = None,
+    is_fp8: bool = False,
 ):
     """Persistent fmha_sm100 decode plan for one batch size (CUDA-graph stable).
 
@@ -264,6 +315,7 @@ def build_msa_decode_cg_plan(
         causal=False,
         qo_offset=kv - 1,
         device=device,
+        use_fp8_kvcache=is_fp8,
     )
     _check_cg_plan_layout(plan)
     return plan
@@ -280,37 +332,53 @@ def update_msa_decode_cg_meta(
     num_q_heads: int,
     num_kv_heads: int,
 ):
-    """Refresh the persistent decode plan's length-dependent tensors + page table IN PLACE.
+    """Refresh the persistent decode plan's length-dependent tensors + page table
+    IN PLACE, entirely with device-side ops (no host<->device sync).
 
-    Host-side (calls fmha_sm100_plan and one ``.item()``); MUST run outside CUDA-graph
-    capture — i.e. only from ``init_forward_metadata_out_graph``. The captured graph then
-    reads the same plan-tensor and ``kv_indices_buf`` addresses on replay.
+    Runs once per decode forward from ``init_forward_metadata_out_graph``; the
+    captured graph then reads the same plan-tensor and ``kv_indices_buf``
+    addresses on replay. A device sync here stalls the overlap scheduler, so the
+    previous implementation — a throwaway ``fmha_sm100_plan`` build per step
+    (``.tolist()``/``.item()`` syncs + a plan-kernel launch) just to copy four
+    length tensors — is replaced by computing their contents directly, matching
+    ``_fmha_sm100_plan``'s sparse-decode (qo_len==1, causal=False) layout:
+
+      kv_segment_lens    = seq_lens
+      kv_segment_offsets = [0, cumsum(seq_lens)]
+      kv_page_indptr     = [0, cumsum(ceil(seq_lens / P))]
+      qo_offset          = broadcast max(seq_lens)   (causal=False planner quirk)
+
+    The worklist tensors stay untouched: the plan schedules from the constant
+    ``topk * P`` per request, never the real lengths (see build_msa_decode_cg_plan).
     """
     P = block_size_k
     B = seq_lens.shape[0]
+    if B == 0:  # idle batch: serving guards this, but keep the helper total
+        return
+    pd = plan[3]
     seq_lens_i32 = seq_lens.to(torch.int32)
-    # Fresh plan for the real lengths; copy only its four length-dependent tensors into the
-    # persistent plan (same shapes — they depend on batch size, not length). The fresh
-    # worklist is identical to the persistent one (topk*P based) and is discarded.
-    # qo_offset is clamped: graph replay pads the batch with seq_len==0 slots
-    # (masked via kv_segment_lens==0, but seq_len-1 would be -1).
-    fresh = _run_fmha_sm100_plan(
-        torch.ones(B, dtype=torch.int32),
-        seq_lens_i32,
-        num_q_heads,
-        num_kv_heads=num_kv_heads,
-        page_size=P,
-        kv_block_num=topk,
-        causal=False,
-        qo_offset=(seq_lens_i32 - 1).clamp_min(0),
-        device=seq_lens.device,
-    )
-    _check_cg_plan_layout(fresh)
-    pd, fd = plan[3], fresh[3]
-    for k in _MSA_CG_LEN_KEYS:
-        pd[k].copy_(fd[k])
-    table = _build_page_table(req_to_token, slot_ids, seq_lens, P)
-    kv_indices_buf[: table.numel()].copy_(table)
+    pd["kv_segment_lens"].copy_(seq_lens_i32)
+    kv_off = pd["kv_segment_offsets"]
+    kv_off[0].zero_()
+    torch.cumsum(seq_lens_i32, 0, out=kv_off[1:])
+    n_pages = torch.div(seq_lens_i32 + (P - 1), P, rounding_mode="floor")
+    indptr = pd["kv_page_indptr"]
+    indptr[0].zero_()
+    torch.cumsum(n_pages, 0, out=indptr[1:])
+    pd["qo_offset"].copy_(seq_lens_i32.max().expand(B))
+
+    # Page table, sync-free: fill the WHOLE persistent buffer (fixed size, no
+    # host-side total-page count). Packed slot -> (request, logical page) via
+    # searchsorted; slots beyond the live page count land on clamped reads and
+    # are never dereferenced (the kernel walks kv_page_indptr ranges only).
+    n = kv_indices_buf.numel()
+    idx = torch.arange(n, device=kv_indices_buf.device)
+    ends = torch.cumsum(n_pages.to(torch.int64), 0)
+    req = torch.searchsorted(ends, idx, right=True).clamp_max_(B - 1)
+    starts = ends - n_pages
+    logical_first = ((idx - starts[req]) * P).clamp_(0, req_to_token.shape[1] - 1)
+    rows = slot_ids[req].to(torch.int64)
+    kv_indices_buf.copy_((req_to_token[rows, logical_first] // P).to(torch.int32))
 
 
 def msa_sparse_decode_main(
@@ -327,18 +395,27 @@ def msa_sparse_decode_main(
         torch.Tensor
     ] = None,  # precomputed page table (per-forward cache)
     plan=None,  # precomputed fmha_sm100 plan (per-forward cache)
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Drop-in for flash_decode_with_gqa_share_sparse using MSA fmha_sm100.
 
     Each request is one decode query at absolute position seq_len-1 attending to its
-    cached KV through the topk selected 128-blocks. Returns o [batch, num_q_heads, head_dim].
+    cached KV through the topk selected 128-blocks. Returns o [batch, num_q_heads,
+    head_dim] (bf16 for fp8 inputs).
 
     ``kv_indices`` / ``plan`` are shared across all sparse layers of a forward; the serving
     backend builds them once via ``build_msa_decode_cg_plan`` + ``update_msa_decode_cg_meta``
     (eager decode only) and passes them in. When omitted (only the standalone parity
     harnesses) they are built here via ``build_msa_decode_meta``.
+
+    Scales (None = unit) are passed natively: the cutlass decode path folds
+    q_scale*k_scale into the softmax scale and applies v_scale on the output
+    in-kernel.
     """
     fmha_sm100, _ = _load_fmha_sm100()
+    _check_msa_dtypes(q, k_cache, v_cache)
 
     max_slots, num_kv_heads, head_dim = k_cache.shape
     H = q.shape[1]
@@ -355,7 +432,14 @@ def msa_sparse_decode_main(
 
     if kv_indices is None or plan is None:
         kv_indices, plan = build_msa_decode_meta(
-            k_cache, req_to_token, slot_ids, seq_lens, H, P, topk
+            k_cache,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            H,
+            P,
+            topk,
+            is_fp8=q.dtype == torch.float8_e4m3fn,
         )
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)
 
@@ -365,6 +449,9 @@ def msa_sparse_decode_main(
         v_paged,
         plan,
         sm_scale=sm_scale,
+        q_scale=unit_scale(q_scale),
+        k_scale=unit_scale(k_scale),
+        v_scale=unit_scale(v_scale),
         kv_indices=kv_indices,
         kv_block_indexes=kv_block_indexes,
     )
