@@ -506,9 +506,7 @@ class SchedulerBatchResultProcessor:
     ) -> int:
         """Rows are laid out per req in batch order, extend_input_len rows each:
         every processed req advances the offset, only returning reqs keep
-        their slice, so batched context forwards stay aligned. Chunked
-        prefill merges into one entry per request (extend_batch_idx > 1), so
-        the streamer's finished_len slice keeps its per-entry semantics."""
+        their slice, so batched context forwards stay aligned."""
         if capture_hidden_mode.is_full():
             start = hidden_state_offset
             hidden_state_offset += extend_input_len
@@ -520,17 +518,8 @@ class SchedulerBatchResultProcessor:
                 req.hidden_states.append(span[-1].tolist())
                 return hidden_state_offset
 
-            continuation = req.extend_batch_idx > 1 and req.hidden_states
-            if req.hidden_states_transport is not None:
-                # shm transport keeps chunks as tensors until stream time.
-                if continuation:
-                    req.hidden_states[-1] = torch.cat(
-                        [req.hidden_states[-1], span.clone()]
-                    )
-                else:
-                    req.hidden_states.append(span.clone())
-            elif continuation:
-                req.hidden_states[-1] = req.hidden_states[-1] + span.tolist()
+            if req.hidden_states_buffer is not None:
+                req.hidden_states.append(span.clone())
             else:
                 req.hidden_states.append(span.tolist())
         elif capture_hidden_mode.is_last():

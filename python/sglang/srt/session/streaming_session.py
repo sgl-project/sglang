@@ -284,9 +284,6 @@ class StreamingSession(BasePrefixCache):
         Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
             return False
-        if req.skip_radix_cache_insert:
-            # Context-forward scratch spans are not session state.
-            return False
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

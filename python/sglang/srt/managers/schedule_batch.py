@@ -791,7 +791,7 @@ class Req(ReqDllmMixin):
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: ReturnHiddenStatesMode = False,
-        hidden_states_transport: Optional[str] = None,
+        hidden_states_buffer: Optional[Dict[str, Any]] = None,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
@@ -885,8 +885,7 @@ class Req(ReqDllmMixin):
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states
         )
-        # None (inline) or "shm" at stream time.
-        self.hidden_states_transport = hidden_states_transport
+        self.hidden_states_buffer = hidden_states_buffer
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -1758,7 +1757,7 @@ class Req(ReqDllmMixin):
         self.return_logprob = False
         self.logprob_start_len = -1
         self.return_hidden_states = False
-        self.hidden_states_transport = None
+        self.hidden_states_buffer = None
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -2395,11 +2394,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         f"{embeds_start} but the cached prefix ends at {pre_len}; "
                         "the session prefix was evicted"
                     )
+                embeds_offset = pre_len - embeds_start
                 input_embeds.extend(
                     req.input_embeds[
-                        pre_len - embeds_start : pre_len
-                        - embeds_start
-                        + req.extend_range.length
+                        embeds_offset : embeds_offset + req.extend_range.length
                     ]
                 )
 

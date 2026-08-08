@@ -215,11 +215,7 @@ class Session:
         last_req = None
         abort = False
         abort_message = ""
-        if req.query_attention is not None or req.input_embeds is not None:
-            # Context forwards are sessionless in v1.
-            abort = True
-            abort_message = "Sessions do not support context forwards."
-        elif self.streaming:
+        if self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
             if self._inflight:
                 abort = True
@@ -307,9 +303,6 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             return_sampling_mask=req.return_sampling_mask,
-            input_embeds=req.input_embeds,
-            query_attention=req.query_attention,
-            token_positions=req.token_positions,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,

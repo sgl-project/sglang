@@ -1,15 +1,9 @@
-"""E2E tests for the session context forward primitive (PR-2).
+"""GPU E2E tests for context forward."""
 
-A context forward is a normal-queue request carrying input_ids (prefix +
-query span, for radix matching) + input_embeds covering the span tail +
-query_attention="bidirectional" + explicit token_positions +
-max_new_tokens=0, returning the span's hidden states. With a single query
-token, bidirectional attention equals causal attention, so the hidden state
-must be bit-equal to a plain extend of the token the embeds encode, and the
-scratch span must never enter the prefix cache.
-"""
-
+import os
 import unittest
+import uuid
+from multiprocessing import shared_memory
 
 import requests
 import torch
@@ -30,16 +24,31 @@ register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 PROMPT = "The capital of France is Paris. The capital of Germany is"
 
 
-class TestSessionContextForward(CustomTestCase):
+class TestContextForward(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("context forward requires CUDA")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major == 9:
+            attention_backend = "fa3"
+        elif major in (10, 12):
+            attention_backend = "fa4"
+        else:
+            raise unittest.SkipTest(f"unsupported compute capability: SM{major}")
+
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-return-hidden-states"],
+            other_args=[
+                "--enable-return-hidden-states",
+                "--attention-backend",
+                attention_backend,
+            ],
         )
         tokenizer = AutoTokenizer.from_pretrained(cls.model)
         cls.prompt_ids = tokenizer.encode(PROMPT)
@@ -49,6 +58,9 @@ class TestSessionContextForward(CustomTestCase):
             cls.model, torch_dtype=torch.bfloat16
         ).get_input_embeddings()
         cls.injected_embedding = embed_tokens.weight[cls.injected_id].float().tolist()
+        cls.placeholder_embedding = (
+            embed_tokens.weight[cls.placeholder_id].float().tolist()
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -60,15 +72,40 @@ class TestSessionContextForward(CustomTestCase):
         response.raise_for_status()
         return response.json()
 
-    def test_embeds_inject_over_placeholder_ids(self):
-        n = len(self.prompt_ids)
-        # seed the radix prefix
+    def _seed_prefix(self):
         self._generate(
             {
                 "input_ids": self.prompt_ids,
                 "sampling_params": {"max_new_tokens": 1, "temperature": 0},
             }
         )
+
+    def test_bidirectional_token_depends_on_its_future_neighbor(self):
+        n = len(self.prompt_ids)
+        self._seed_prefix()
+
+        def first_query_hidden(future_embedding):
+            forward = self._generate(
+                {
+                    "input_ids": self.prompt_ids + [self.placeholder_id] * 2,
+                    "input_embeds": [self.injected_embedding, future_embedding],
+                    "query_attention": "bidirectional",
+                    "token_positions": [n, n + 1],
+                    "sampling_params": {"max_new_tokens": 0},
+                    "return_hidden_states": True,
+                }
+            )
+            self.assertEqual(forward["meta_info"].get("cached_tokens", 0), n)
+            return torch.tensor(forward["meta_info"]["hidden_states"][-1][-2])
+
+        with_future_token = first_query_hidden(self.placeholder_embedding)
+        with_zero_future = first_query_hidden([0.0] * len(self.placeholder_embedding))
+        max_delta = (with_future_token - with_zero_future).abs().max().item()
+        self.assertGreater(max_delta, 1e-3)
+
+    def test_embeds_inject_over_placeholder_ids(self):
+        n = len(self.prompt_ids)
+        self._seed_prefix()
 
         # ids claim " Madrid" but the embeds encode " Berlin": the hidden
         # state must match a plain extend of " Berlin", proving the client
@@ -98,8 +135,49 @@ class TestSessionContextForward(CustomTestCase):
         cos = torch.nn.functional.cosine_similarity(hidden, expected, dim=0).item()
         self.assertGreater(cos, 0.999)
 
+    def test_hidden_states_write_to_caller_owned_buffer(self):
+        n = len(self.prompt_ids)
+        self._seed_prefix()
+        hidden_size = len(self.injected_embedding)
+        name = f"sgl_shm_hs_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        segment = shared_memory.SharedMemory(
+            name=name,
+            create=True,
+            size=hidden_size * torch.float32.itemsize,
+        )
+        ref = {
+            "transport": "shm",
+            "name": name,
+            "dtype": "float32",
+            "shape": [1, hidden_size],
+        }
+        try:
+            forward = self._generate(
+                {
+                    "input_ids": self.prompt_ids + [self.placeholder_id],
+                    "input_embeds": [self.injected_embedding],
+                    "query_attention": "bidirectional",
+                    "token_positions": [n],
+                    "sampling_params": {"max_new_tokens": 0},
+                    "return_hidden_states": True,
+                    "hidden_states_buffer": ref,
+                }
+            )
+            self.assertEqual(forward["meta_info"]["hidden_states"], ref)
+            hidden = torch.frombuffer(segment.buf, dtype=torch.float32).clone()
+            self.assertEqual(hidden.numel(), hidden_size)
+            self.assertTrue(torch.isfinite(hidden).all())
+            self.assertGreater(hidden.abs().max().item(), 0)
+
+            probe = shared_memory.SharedMemory(name=name)
+            probe.close()
+        finally:
+            segment.close()
+            segment.unlink()
+
     def test_scratch_span_never_enters_the_prefix_cache(self):
         n = len(self.prompt_ids)
+        self._seed_prefix()
         payload = {
             "input_ids": self.prompt_ids + [self.placeholder_id],
             "input_embeds": [self.injected_embedding],
@@ -115,6 +193,7 @@ class TestSessionContextForward(CustomTestCase):
 
     def test_multi_dim_positions_round_trip(self):
         n = len(self.prompt_ids)
+        self._seed_prefix()
         forward = self._generate(
             {
                 "input_ids": self.prompt_ids + [self.placeholder_id] * 2,

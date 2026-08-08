@@ -48,7 +48,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import PlainValidator, StrictFloat
 
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
@@ -174,7 +174,11 @@ class GenerateReqInput:
     ] = None
     # Embeddings for input_ids, or a shm TensorRef dict (requires input_ids).
     input_embeds: Optional[
-        Union[List[List[List[float]]], List[List[float]], Dict[str, Any]]
+        Union[
+            List[List[List[StrictFloat]]],
+            List[List[StrictFloat]],
+            Dict[str, Any],
+        ]
     ] = None
     # None (causal) or "bidirectional" for the extend span.
     query_attention: Optional[str] = None
@@ -232,7 +236,9 @@ class GenerateReqInput:
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
     ] = False
-    # None (inline) or "shm" TensorRef. Prefill-only, single request.
+    # Caller-owned shm TensorRef for prefill hidden states.
+    hidden_states_buffer: Optional[Dict[str, Any]] = None
+    # Rejected legacy field; retained so old clients cannot silently fall back inline.
     hidden_states_transport: Optional[str] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -379,6 +385,11 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        if self.hidden_states_transport is not None:
+            raise ValueError(
+                "hidden_states_transport is no longer supported; supply a "
+                "caller-owned hidden_states_buffer"
+            )
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -430,14 +441,14 @@ class GenerateReqInput:
         else:
             if isinstance(self.input_embeds, dict):
                 raise ValueError("shm input_embeds refs require input_ids")
-            if isinstance(self.input_embeds[0][0], float):
-                self.is_single = True
-                self.batch_size = 1
-            else:
-                self.is_single = False
-                self.batch_size = len(self.input_embeds)
-        if not self.is_single and self.hidden_states_transport is not None:
-            raise ValueError("hidden_states_transport supports single requests only")
+            if not self.input_embeds or not isinstance(self.input_embeds[0], list):
+                raise ValueError("input_embeds must be a non-empty 2D or 3D array")
+            self.is_single = not self.input_embeds[0] or not isinstance(
+                self.input_embeds[0][0], list
+            )
+            self.batch_size = 1 if self.is_single else len(self.input_embeds)
+        if not self.is_single and self.hidden_states_buffer is not None:
+            raise ValueError("hidden_states_buffer supports single requests only")
         if not self.is_single and (
             self.query_attention is not None or self.token_positions is not None
         ):
@@ -460,6 +471,12 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        if self.parallel_sample_num != 1:
+            if self.query_attention is not None:
+                raise ValueError("query_attention requires n=1")
+            if self.hidden_states_buffer is not None:
+                raise ValueError("hidden_states_buffer requires n=1")
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -778,8 +795,6 @@ class GenerateReqInput:
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
-            query_attention=self.query_attention,
-            token_positions=self.token_positions,
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
@@ -885,7 +900,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
-    hidden_states_transport: Optional[str] = None
+    hidden_states_buffer: Optional[Dict[str, Any]] = None
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -1275,7 +1290,7 @@ TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
-# Inline chunks, or shm TensorRef when hidden_states_transport="shm".
+# Inline chunks, or a caller-owned shm TensorRef.
 OutputHiddenStates = Optional[
     List[Optional[Union[List[HiddenStateChunk], Dict[str, Any]]]]
 ]
