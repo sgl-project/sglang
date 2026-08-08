@@ -137,9 +137,12 @@ def _repo_relative_path(p: str) -> str:
     return p[idx + len(marker) :] if idx >= 0 else p
 
 
-# The floor matches the historical fixed default, so a short test keeps the
-# budget it already had.
-DERIVED_TIMEOUT_FLOOR = 1200.0
+# The floor covers a test that is normally quick but occasionally crawls, which
+# the multiplier alone cannot: test_encoder_dp runs 200-426s across five nightly
+# runs and once took over 1185s, while 1.5 * its est_time is only 765s. Raising
+# the multiplier would not have helped -- anything under the floor is decided by
+# the floor.
+DERIVED_TIMEOUT_FLOOR = 1800.0
 DERIVED_TIMEOUT_FACTOR = 1.5
 
 
