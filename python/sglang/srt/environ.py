@@ -1388,6 +1388,43 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+@contextmanager
+def temp_set_env(*, allow_sglang: bool = True, **env_vars: Any):
+    """Temporarily set environment variables, restoring originals on exit.
+
+    Unlike ``sglang.srt.utils.common.temp_set_env``, this helper is safe for
+    descriptor-backed entries from ``envs`` and keeps their ``_set_to_none``
+    state in sync. ``allow_sglang`` is accepted for API compatibility.
+    """
+    del allow_sglang
+    with ExitStack() as exit_stack:
+        for key, value in env_vars.items():
+            field = getattr(envs, key, None)
+            if isinstance(field, EnvField):
+                exit_stack.enter_context(field.override(value))
+                continue
+
+            backup_present = key in os.environ
+            backup_value = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+
+            def _restore(
+                name: str = key,
+                present: bool = backup_present,
+                previous: Optional[str] = backup_value,
+            ):
+                if present:
+                    os.environ[name] = previous
+                else:
+                    os.environ.pop(name, None)
+
+            exit_stack.callback(_restore)
+        yield
+
+
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
         if new_name is None:
