@@ -142,6 +142,9 @@ def capture_c4_state_windows_unified(
     # ``cleanup_after_caching_req`` and blow the staging capacity under peak
     # concurrency, excluding real boundaries from reuse (#cached-token=0).
     stride = max(1, int(getattr(token_to_kv_pool, "_swa_offload_page_stride", 1)))
+    # Mirror the bigram shift capture_swa_windows applies at chunk end and tail:
+    # a state tile keyed at the token boundary would be orphaned the same way.
+    bigram = bool(getattr(token_to_kv_pool, "_swa_capture_bigram_key", False))
 
     pt = 0
     for i in range(forward_batch.batch_size):
@@ -155,7 +158,8 @@ def capture_c4_state_windows_unified(
         boundary = (total // page) * page
         # TRUE sequence tail page (page-aligned full seq len); captured even when
         # not stride-aligned, matching capture_swa_windows' forced tail.
-        tail_B = (int(orig_l[i]) // page) * page if orig_l is not None else -1
+        orig = int(orig_l[i]) if orig_l is not None else -1
+        tail_B = (orig // page) * page if orig_l is not None else -1
         B = ((cs // page) + 1) * page
         if B > boundary:
             continue  # no page boundary crossed in this chunk -> nothing to stage
@@ -177,21 +181,23 @@ def capture_c4_state_windows_unified(
             if (B // page) % stride != 0 and B != tail_B:
                 B += page
                 continue
+            # Same bigram shift as the SWA carrier capture (see `bigram` above).
+            B_key = B - page if bigram and (B == total or B == orig) else B
             off0 = 0  # pack window at tile start (matches capture/restore)
             if off0 + win > slot_page:
                 raise AssertionError(
-                    f"unified state window out of range: B={B} win={win} cs={cs} "
-                    f"off0={off0} ring_size={slot_page}"
+                    f"unified state window out of range: B={B_key} win={win} "
+                    f"cs={cs} off0={off0} ring_size={slot_page}"
                 )
             # Under heavy reuse a tiny chunk crossing a page boundary can make the
             # window [B-win, B) reach back into the overlap prefix (pre_kv_state).
             # That is valid iff buf_lo >= 0; if the needed prefix is unavailable,
             # skip this boundary (excluded from reuse, correctness preserved)
             # rather than crash.
-            if pre_len + (B - win - cs) < 0:
+            if pre_len + (B_key - win - cs) < 0:
                 B += page
                 continue
-            key = (rid, int(B))
+            key = (rid, int(B_key))
             hidx = staging.get(key)
             if hidx is None:
                 hidx = hp.alloc(slot_page)
@@ -205,13 +211,13 @@ def capture_c4_state_windows_unified(
                             "reuse (recomputed) -- correctness-safe, reuse-only loss.",
                             n,
                             rid,
-                            int(B),
+                            int(B_key),
                         )
                     B += page
                     continue
                 staging[key] = hidx
-            buf_lo = pre_len + (B - win - cs)
-            buf_hi = pre_len + (B - cs)
+            buf_lo = pre_len + (B_key - win - cs)
+            buf_hi = pre_len + (B_key - cs)
             if buf_lo >= pre_len:
                 win_slice = new_tok[buf_lo - pre_len : buf_hi - pre_len]
             else:
@@ -251,7 +257,7 @@ def capture_c4_state_windows_unified(
                         )
                         + 1
                     )
-                    _crc[(rid, int(B), li)] = int(
+                    _crc[(rid, int(B_key), li)] = int(
                         (flat.to(torch.int64) * _idx).sum().item()
                     )
             B += page
@@ -360,6 +366,7 @@ class CompressorHip(_CompressorBase):
         backend,
         stride: int = 1,
         tail_B: int = -1,
+        orig: int = -1,
     ) -> None:
         """Test-only reference oracle for capture_c4_state_windows_unified, kept
         for the byte-parity cross-check in TestUnifiedCaptureEquivalence (no
@@ -417,6 +424,7 @@ class CompressorHip(_CompressorBase):
         pre_len = valid_kv_len - extend_len
 
         stride = max(1, int(stride))
+        bigram = bool(getattr(token_to_kv_pool, "_swa_capture_bigram_key", False))
         cs = prefix_len
         total = prefix_len + extend_len
         boundary = (total // page) * page
@@ -428,18 +436,20 @@ class CompressorHip(_CompressorBase):
             if (B // page) % stride != 0 and B != tail_B:
                 B += page
                 continue
+            # Same bigram shift as capture_swa_windows / the unified capture.
+            B_key = B - page if bigram and (B == total or B == orig) else B
             off0 = 0  # pack window at tile start (matches capture/restore)
             if off0 + win > slot_page:
                 raise AssertionError(
-                    f"state window out of range: B={B} win={win} cs={cs} "
+                    f"state window out of range: B={B_key} win={win} cs={cs} "
                     f"off0={off0} ring_size={slot_page}"
                 )
             # See capture_c4_state_windows_unified: allow windows reaching into the
             # overlap prefix (buf_lo >= 0); skip (do not crash) when unavailable.
-            if pre_len + (B - win - prefix_len) < 0:
+            if pre_len + (B_key - win - prefix_len) < 0:
                 B += page
                 continue
-            key = (rid, int(B))
+            key = (rid, int(B_key))
             hidx = staging.get(key)
             if hidx is None:
                 hidx = hp.alloc(slot_page)
@@ -458,13 +468,13 @@ class CompressorHip(_CompressorBase):
                             "correctness-safe, reuse-only loss.",
                             n,
                             rid,
-                            int(B),
+                            int(B_key),
                         )
                     B += page
                     continue
                 staging[key] = hidx
-            buf_lo = pre_len + (B - win - prefix_len)
-            buf_hi = pre_len + (B - prefix_len)
+            buf_lo = pre_len + (B_key - win - prefix_len)
+            buf_hi = pre_len + (B_key - prefix_len)
             win_slice = state_buf[buf_lo:buf_hi]
             flat = win_slice.contiguous().view(torch.uint8).reshape(-1)
             if flat.numel() != win * slot_bytes:
@@ -485,7 +495,7 @@ class CompressorHip(_CompressorBase):
                         )
                         + 1
                     )
-                    _crc[(rid, int(B), li)] = int(
+                    _crc[(rid, int(B_key), li)] = int(
                         (flat.to(torch.int64) * _idx).sum().item()
                     )
             B += page

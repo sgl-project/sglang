@@ -1423,6 +1423,10 @@ class DeepseekV4HipRadixBackend(
             seqs_l = seqs.tolist()
             req_l = forward_batch.req_pool_indices.tolist()
             stride = max(1, int(getattr(pool, "_swa_offload_page_stride", 1)))
+            # Key chunk-end and tail windows at the node boundary, which sits one
+            # page below the token boundary under EAGLE's bigram radix key.
+            # See _swa_capture_bigram_key in hybrid_pool_assembler.
+            bigram = bool(getattr(pool, "_swa_capture_bigram_key", False))
             _orig = getattr(forward_batch, "orig_seq_lens", None)
             orig_l = _orig.tolist() if _orig is not None else None
             plan = []
@@ -1435,30 +1439,37 @@ class DeepseekV4HipRadixBackend(
                 cs = total - e
                 rid = int(req_l[i])
                 boundary = (total // page) * page  # last page-aligned pos in chunk
-                tail_B = (int(orig_l[i]) // page) * page if orig_l is not None else -1
+                orig = int(orig_l[i]) if orig_l is not None else -1
+                tail_B = (orig // page) * page if orig_l is not None else -1
                 B = ((cs // page) + 1) * page  # first page boundary after cs
                 while B <= boundary:
+                    # stride gate: keep every `stride`-th page boundary, plus the
+                    # TRUE sequence tail page `tail_B` (matched directly). Gated on
+                    # the token boundary, before the shift below, so the knob keeps
+                    # its meaning and its host-pool sizing.
+                    if (B // page) % stride != 0 and B != tail_B:
+                        B += page
+                        continue
+                    # Only chunk end and tail become node boundaries on insert;
+                    # interior boundaries are claimed by range containment, so they
+                    # stay keyed where they are.
+                    B_key = B - page if bigram and (B == total or B == orig) else B
                     # Window straddles before this chunk's flat-KV start (only
                     # with a non-page-aligned prefix-cache `cs`): not present in
                     # `kv`, skip (reuse recomputes it), like the host-pool-full /
                     # stride skips.
-                    if B - win < cs:
+                    if B_key - win < cs:
                         if _SWA_DBG_CHECKSUM:
                             logger.warning(
                                 "[CAP-DBG] SWA window straddles chunk start, skip "
                                 "B=%d win=%d cs=%d",
-                                B,
+                                B_key,
                                 win,
                                 cs,
                             )
                         B += page
                         continue
-                    # stride gate: keep every `stride`-th page boundary, plus the
-                    # TRUE sequence tail page `tail_B` (matched directly).
-                    if (B // page) % stride != 0 and B != tail_B:
-                        B += page
-                        continue
-                    key = (rid, int(B))
+                    key = (rid, int(B_key))
                     hidx = staging.get(key)
                     if hidx is None:
                         hidx = host_pool.alloc(win)
@@ -1473,16 +1484,16 @@ class DeepseekV4HipRadixBackend(
                         staging[key] = hidx
                         if _SWA_DBG_CHECKSUM:
                             logger.warning("[CAP-DBG] SWA staged key=%s", key)
-                    h = int(B) % win
+                    h = int(B_key) % win
                     page_row = int(hidx[0].item()) // slot_page
                     plan.append(
                         (
-                            offset + (B - win - cs),
-                            offset + (B - cs),
+                            offset + (B_key - win - cs),
+                            offset + (B_key - cs),
                             page_row,
                             h,
                             rid,
-                            int(B),
+                            int(B_key),
                         )
                     )
                     B += page

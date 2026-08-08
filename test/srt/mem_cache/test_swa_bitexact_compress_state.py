@@ -391,6 +391,108 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
         # byte-exact parity between the two paths at the gated boundaries
         self.assertTrue(torch.equal(hp_leg.data_refs[0], hp_uni.data_refs[0]))
 
+    def _stage_both_paths(self, *, extend_len, orig, stride, bigram):
+        """Run the oracle and the unified capture over the same input and return
+        their staging key sets. They must always agree; the caller asserts on the
+        keys themselves."""
+        page, swa_ring, ring_size, ratio = 256, 128, 8, 4
+        last_dim, dtype = 16, torch.bfloat16
+        slot_bytes = last_dim * torch.tensor([], dtype=dtype).element_size()
+        prefix_len, rid = 0, 7
+
+        pre_state = torch.randint(0, 255, (ratio, last_dim), dtype=torch.int32).to(
+            dtype
+        )
+        new_tok = torch.randint(0, 255, (extend_len, last_dim), dtype=torch.int32).to(
+            dtype
+        )
+        state_buf = torch.cat([pre_state, new_tok], dim=0)
+        tail_B = (orig // page) * page
+
+        hp_leg = _fake_host_pool(
+            ring_size=ring_size, slot_bytes=slot_bytes, num_pages=16
+        )
+        be_leg = _fake_backend(hp_leg, page=page, swa_ring=swa_ring)
+        be_leg.token_to_kv_pool._swa_capture_bigram_key = bigram
+        _REFERENCE(
+            _fake_self(ratio=ratio),
+            kv_and_score_buffer=types.SimpleNamespace(kv_score=state_buf),
+            valid_kv_len=state_buf.size(0),
+            prefix_len=prefix_len,
+            extend_len=extend_len,
+            rid=rid,
+            backend=be_leg,
+            stride=stride,
+            tail_B=tail_B,
+            orig=orig,
+        )
+
+        hp_uni = _fake_host_pool(
+            ring_size=ring_size, slot_bytes=slot_bytes, num_pages=16
+        )
+        be_uni = _fake_backend(hp_uni, page=page, swa_ring=swa_ring)
+        be_uni.token_to_kv_pool._swa_capture_bigram_key = bigram
+        be_uni.token_to_kv_pool._swa_offload_page_stride = stride
+        be_uni.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.zeros((rid + 4, extend_len + page), dtype=torch.int64)
+        )
+        be_uni.token_to_kv_pool.translate_loc_from_full_to_swa = lambda x: x
+        fb = types.SimpleNamespace(
+            batch_size=1,
+            extend_prefix_lens_cpu=[prefix_len],
+            extend_seq_lens_cpu=[extend_len],
+            req_pool_indices=torch.tensor([rid], dtype=torch.int64),
+            orig_seq_lens=torch.tensor([orig], dtype=torch.int64),
+        )
+        capture_c4_state_windows_unified(
+            backend=be_uni,
+            state_pool=self._fake_state_pool(pre_state),
+            kv_score_input=new_tok,
+            forward_batch=fb,
+            is_indexer=False,
+            layer_id=0,
+            ratio=ratio,
+        )
+
+        leg_keys = set(hp_leg._capture_staging)
+        uni_keys = set(hp_uni._capture_staging)
+        self.assertEqual(leg_keys, uni_keys, "oracle and unified capture disagree")
+        self.assertTrue(torch.equal(hp_leg.data_refs[0], hp_uni.data_refs[0]))
+        return leg_keys
+
+    def test_bigram_shifts_page_aligned_tail_down_one_page(self):
+        """Under EAGLE the radix key is a bigram view, so an insert of ``n``
+        tokens ends the node one page below ``n`` when ``n`` is page-aligned. A
+        window keyed at the token boundary is then unclaimable and gets freed
+        unused, which collapses the reuse boundary to 0 (#cached-token=0).
+
+        extend=768 with stride=3 leaves exactly one gated boundary, the tail at
+        768, so the shift moves the single staged key 768 -> 512 with nothing to
+        alias against."""
+        rid = 7
+        self.assertEqual(
+            self._stage_both_paths(extend_len=768, orig=768, stride=3, bigram=False),
+            {(rid, 768)},
+        )
+        self.assertEqual(
+            self._stage_both_paths(extend_len=768, orig=768, stride=3, bigram=True),
+            {(rid, 512)},
+        )
+
+    def test_bigram_leaves_unaligned_tail_alone(self):
+        """The shift must key off page alignment, not off EAGLE alone: when ``n``
+        is NOT page-aligned the node already ends at ``(n//page)*page`` == the
+        tail page, so shifting would push the window one page too low. extend=700
+        ends the node at 512, which is where the unshifted tail already lands."""
+        for bigram in (False, True):
+            with self.subTest(bigram=bigram):
+                self.assertEqual(
+                    self._stage_both_paths(
+                        extend_len=700, orig=700, stride=1, bigram=bigram
+                    ),
+                    {(7, 256), (7, 512)},
+                )
+
     def test_unified_ratio_128_and_no_pool_noop(self):
         hp = _fake_host_pool(ring_size=8, slot_bytes=32, num_pages=4)
         be = _fake_backend(hp, page=256, swa_ring=128)

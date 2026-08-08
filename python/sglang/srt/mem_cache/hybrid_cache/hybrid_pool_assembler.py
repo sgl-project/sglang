@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     import torch
@@ -714,6 +715,15 @@ def build_deepseek_v4_hicache_stack(
         kvcache._swa_offload_page_stride = max(
             1, int(getattr(server_args, "hicache_swa_offload_page_stride", 1))
         )
+        # EAGLE makes the radix key a bigram view (len == tokens - 1): a node
+        # inserted with n tokens ends at ((n-1)//page)*page, one page below n
+        # whenever n is page-aligned -- which every chunked-prefill insert is.
+        # Windows keyed at the token boundary would sit one page past every node
+        # that could claim them and be freed unused, collapsing reuse to 0.
+        # Both capture sites read this flag and must agree boundary for boundary.
+        kvcache._swa_capture_bigram_key = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        ).is_eagle()
         if not hasattr(swa_host_pool, "_capture_staging"):
             swa_host_pool._capture_staging = {}
         if not hasattr(swa_host_pool, "_capture_crc"):
