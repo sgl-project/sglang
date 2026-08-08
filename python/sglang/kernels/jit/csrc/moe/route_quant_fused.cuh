@@ -60,8 +60,6 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
   }
 }
 
-}  // namespace sglang
-
 template <bool kUsePDL>
 struct RouteQuantFusedKernel {
   static void
@@ -78,7 +76,7 @@ struct RouteQuantFusedKernel {
       bool renormalize,
       bool apply_scale) {
     using namespace host;
-    using Trait = sglang::RouteQuantTrait;
+    using Trait = RouteQuantTrait;
 
     auto M_ = SymbolicSize{"num_tokens"};
     auto N_ = SymbolicSize{"num_experts"};
@@ -98,7 +96,7 @@ struct RouteQuantFusedKernel {
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_strides({-1, 1}).with_device(device).verify(out_packed);
 
     RuntimeCheck(
-        N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
+        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
         "route_quant_fused is specialized for N=896, K=16");
     RuntimeCheck(scores.stride(0) % 4 == 0, "route_quant_fused: scores row stride must be a multiple of 4");
 
@@ -108,10 +106,10 @@ struct RouteQuantFusedKernel {
     TensorMatcher({M_, -1}).with_dtype<bf16_t, fp32_t>(x_dtype).with_device(device).with_strides({-1, 1}).verify(x);
     const auto quant_params =
         x_dtype.is_type<fp32_t>()
-            ? build_quant_context<sglang::RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
-            : build_quant_context<sglang::RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
+            ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
+            : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
     RuntimeCheck(
-        quant_params.hidden_size == sglang::kQuantHidden_,
+        quant_params.hidden_size == kQuantHidden_,
         "route_quant_fused is specialized for a 3584-wide activation row");
     RuntimeCheck(
         quant_params.num_tokens == static_cast<uint32_t>(M_.unwrap()),
@@ -120,7 +118,7 @@ struct RouteQuantFusedKernel {
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
-    const auto params = sglang::RouteQuantFusedParams{
+    const auto params = RouteQuantFusedParams{
         .route =
             {scores.data_ptr(),
              static_cast<const fp32_t*>(bias.data_ptr()),
@@ -139,9 +137,9 @@ struct RouteQuantFusedKernel {
         .quant = quant_params,
     };
 
-#define SGL_ROUTE_QUANT_LAUNCH(TS, TX)                                            \
-  LaunchKernel(2 * M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
-      .enable_pdl(kUsePDL)(sglang::route_quant_fused_kernel<kUsePDL, TS, TX>, params)
+#define SGL_ROUTE_QUANT_LAUNCH(TS, TX)                                    \
+  LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
+      .enable_pdl(kUsePDL)(route_quant_fused_kernel<kUsePDL, TS, TX>, params)
 
     if (score_dtype.is_type<fp32_t>()) {
       if (x_dtype.is_type<fp32_t>()) {
@@ -159,3 +157,5 @@ struct RouteQuantFusedKernel {
 #undef SGL_ROUTE_QUANT_LAUNCH
   }
 };
+
+}  // namespace sglang
