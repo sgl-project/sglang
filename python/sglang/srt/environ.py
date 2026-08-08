@@ -880,6 +880,11 @@ class Envs:
 
     # Flash Attention
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+    # Selects the SM100 relative-bias decode kernel over the shear-prep + FA4
+    # prefill chain on decode.
+    # "0": always use the original FA4 chain
+    # "auto": pick the bias decode kernel when the shapes are profitable
+    SGLANG_OPT_USE_FA4_BIAS_DECODE = EnvStr("auto")
 
     # Kernels
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend

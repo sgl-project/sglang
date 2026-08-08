@@ -1813,6 +1813,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # it -- so rel_logits_proj overlaps the KV-write above.
                 rel_bias_event.wait()
             kwargs["rel_bias"] = rel_bias
+            kwargs["decode_uniform_q"] = True
             if metadata is self.full_cg_prefill_metadata:
                 # Full-CG reuses the cu_seqlens pointer with new values each replay.
                 # Disable its pointer-keyed schedule cache so the graph refreshes it.

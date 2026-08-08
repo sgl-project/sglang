@@ -60,6 +60,10 @@ from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     DescaleTensors,
     FlashAttentionForwardSm100,
 )
+from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
+    FlashAttentionDecodeSm100Bias,
+    choose_swa_prediction_tile,
+)
 from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm120 import (
     FlashAttentionForwardSm120,
 )
@@ -70,6 +74,7 @@ from sglang.kernels.ops.attention.flash_attn.cute.sm100_hd256_2cta_fmha_forward 
     BlackwellFusedMultiHeadAttentionForward,
 )
 from sglang.kernels.ops.attention.flash_attn.cute.utils import AuxData
+from sglang.srt.environ import envs
 
 
 def _parse_arch_str(arch_str):
@@ -219,13 +224,6 @@ def _round_up_to_tile(size: int, tile_size: int) -> int:
 
 
 def _shear_bias_empty(shape, dtype, device):
-    # Grow-only per-device workspace: the sheared-bias staging tensor is large
-    # (total_q x num_head x rel_extent_padded) and call shapes vary, so per-call
-    # torch.empty fragments the caching allocator until GPU memory is exhausted.
-    # Contents never persist across calls (written by the shear kernel, read by
-    # the fwd kernel within the same call); assumes attention calls on a device
-    # are serialized. Bypassed under graph capture (a capture-pool pointer must
-    # not leak into eager use) and fake mode (a fake tensor must not be cached).
     if is_fake_mode() or torch.cuda.is_current_stream_capturing():
         return torch.empty(shape, dtype=dtype, device=device)
     nbytes = math.prod(shape) * dtype.itemsize
@@ -329,6 +327,7 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    decode_uniform_q: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -690,6 +689,7 @@ def _flash_attn_fwd(
         if is_fake_mode()
         else torch.cuda.get_device_properties(device).multi_processor_count
     )
+    num_splits_requested = num_splits
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
@@ -773,6 +773,402 @@ def _flash_attn_fwd(
     use_clc_scheduler = (
         requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
     )
+
+    bias_decode_mode = envs.SGLANG_OPT_USE_FA4_BIAS_DECODE.get()
+    bias_decode_paged = (
+        page_table is not None
+        and seqused_k is not None
+        and seqused_k.dtype == torch.int32
+        and page_size in (8, 16, 32, 64, 128, 256)
+    )
+    # Decode arrives as packed varlen Q with uniform per-sequence length:
+    # total_q == batch * max_seqlen_q forces every length to max_seqlen_q
+    # (sum equals batch times max only when all terms equal the max), so the
+    # packed rank-3 Q/O/bias can be viewed as dense rank-4 without a gather.
+    # The shape check alone is NOT sufficient under CUDA graphs — prefill
+    # graphs capture with uniform dummy lengths but replay ragged, which
+    # would bake a wrong dense view into the graph. Only the decode call
+    # path may assert uniformity, via decode_uniform_q.
+    bias_decode_uniform_q = (
+        decode_uniform_q
+        and cu_seqlens_q is not None
+        and max_seqlen_q is not None
+        and max_seqlen_q <= 32  # decode/spec-length only; prefill stays on FA4
+        and q is not None
+        and q.dim() == 3
+        and q.shape[0] == batch_size * max_seqlen_q
+        and (rel_bias is None or rel_bias.dim() == 3)
+    )
+    bias_decode_seqlen_q = max_seqlen_q if bias_decode_uniform_q else seqlen_q
+    # Per-sequence KV length bound for split/profitability heuristics: paged
+    # lengths live on-device in seqused_k, so use the page-table capacity.
+    bias_decode_seqlen_k = (
+        page_table.shape[1] * page_size if bias_decode_paged else seqlen_k
+    )
+    bias_decode_grouped_head_tile = min(32, 1 << (qhead_per_kvhead - 1).bit_length())
+    bias_decode_mxfp8 = (
+        qk_blockscaled
+        and v_blockscaled
+        and q is not None
+        and k is not None
+        and q.dtype == torch.float8_e4m3fn
+        and v.dtype == torch.float8_e4m3fn
+        and head_dim == 128
+        and qk_sf_vec_size == 32
+        and v_sf_vec_size == 32
+        and sfq.dim() == 6
+        and qhead_per_kvhead <= bias_decode_grouped_head_tile
+        and (
+            bias_decode_seqlen_q == 1
+            or (
+                not local
+                and bias_decode_seqlen_q is not None
+                and bias_decode_grouped_head_tile
+                * (1 << (bias_decode_seqlen_q - 1).bit_length())
+                <= 32
+            )
+        )
+        and rel_bias is not None
+        and rel_bias.dtype == torch.bfloat16
+    )
+    if bias_decode_mxfp8 and bias_decode_paged:
+        num_pages, _, kv_heads, _ = k.shape
+        sf_groups = head_dim // 32
+        bias_decode_mxfp8 = (
+            page_size <= 64
+            and tuple(sfk.shape) == (num_pages, page_size, kv_heads, sf_groups)
+            and sfk.stride()
+            == (
+                page_size * kv_heads * sf_groups,
+                sf_groups,
+                page_size * sf_groups,
+                1,
+            )
+            and tuple(sfv.shape)
+            == (num_pages, math.ceil(page_size / 32), kv_heads, head_dim)
+        )
+    elif bias_decode_mxfp8:
+        bias_decode_mxfp8 = sfk.dim() == 6 and sfv.dim() == 6
+
+    # Decode wins at every benched single-row-tile shape (b 1-64, kv
+    # 512-64000, q 1/4; see bench_rel_bias_attention_kvcache.py). At two row
+    # tiles (q=8 sweep, fig_kernel_latency_sweep.png) it still wins except
+    # two pockets: mid batch*kv_heads at deep KV (prefill fully occupied,
+    # decode pays the 2x KV re-stream) and huge batch at shallow KV. Three+
+    # row tiles are unmeasured -> prefill.
+    # seqlen_q is None for ragged varlen prefill (rejected downstream anyway).
+    bias_decode_row_tiles = (
+        bias_decode_grouped_head_tile
+        * (1 << (bias_decode_seqlen_q - 1).bit_length())
+        if bias_decode_seqlen_q is not None
+        else 0
+    )
+    bias_decode_single_row_tile = 0 < bias_decode_row_tiles <= 32
+    bias_decode_bh = batch_size * num_head_kv
+    bias_decode_profitable = bias_decode_single_row_tile or (
+        bias_decode_row_tiles == 64
+        and not (8 < bias_decode_bh < 64 and bias_decode_seqlen_k >= 16384)
+        and not (bias_decode_bh > 64 and bias_decode_seqlen_k < 8192)
+    )
+    use_bias_decode_sm100 = (
+        bias_decode_mode != "0"
+        and (bias_decode_mode == "force" or bias_decode_profitable)
+        and arch // 10 == 10
+        and rel_bias is not None
+        and q is not None
+        and k is not None
+        and (q.dtype == k.dtype == v.dtype == torch.bfloat16 or bias_decode_mxfp8)
+        and out.dtype == torch.bfloat16
+        and head_dim == head_dim_v
+        and head_dim % 64 == 0
+        and head_dim <= 256
+        and (cu_seqlens_q is None or bias_decode_uniform_q)
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and (bias_decode_paged or (seqused_k is None and page_table is None))
+        and (bias_decode_mxfp8 or not (qk_blockscaled or v_blockscaled))
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and learnable_sink is None
+        and aux_tensors is None
+        and not requires_grad
+        and lse is None
+        and (causal or (local and window_size_right == 0))
+        and bias_decode_seqlen_k >= 8
+    )
+    if use_bias_decode_sm100:
+        decode_q, decode_out, decode_bias = q, out, rel_bias
+        if bias_decode_uniform_q and cu_seqlens_q is not None:
+            dense_q_shape = (batch_size, max_seqlen_q)
+            decode_q = q.view(*dense_q_shape, *q.shape[1:])
+            decode_out = out.view(*dense_q_shape, *out.shape[1:])
+            decode_bias = rel_bias.view(*dense_q_shape, *rel_bias.shape[1:])
+        grouped_head_tile = bias_decode_grouped_head_tile
+        decode_window_left = window_size_left if local else None
+        prediction_tile = (
+            choose_swa_prediction_tile(
+                bias_decode_seqlen_q,
+                grouped_head_tile,
+                decode_window_left,
+                bf16_eager=True,
+            )
+            if decode_window_left is not None
+            else min(
+                32 // grouped_head_tile,
+                1 << (bias_decode_seqlen_q - 1).bit_length(),
+            )
+        )
+        # 128-token tiles double split parallelism where tile count (not the
+        # 64-CTA target) caps splits. Benched at q 1/4/8, bs 1-256: kv 1k
+        # wins +4-15% at bs<=8 (worst pocket -7% at bs16); kv 2k is net
+        # negative at small bs, and kv<=512 stays on 256-tile single-split
+        # direct mode (no reduction kernel), so only 1k flips.
+        if (
+            512 < bias_decode_seqlen_k <= 1024
+            and not bias_decode_mxfp8
+            and (not bias_decode_paged or page_size <= 128)
+        ):
+            sequence_tile = 128
+        else:
+            sequence_tile = 256
+        max_tile_splits = math.ceil(bias_decode_seqlen_k / sequence_tile)
+        if num_splits_requested < 1:
+            decode_target_ctas = 64
+            decode_splits = max(
+                1,
+                min(
+                    decode_target_ctas // max(1, batch_size * num_head_kv),
+                    max_tile_splits,
+                ),
+            )
+            # A split adds a ~5.3us reduction-kernel launch; at <=2 tiles per
+            # sequence it saves at most one tile of main-kernel time and
+            # loses at every measured shape (b1 kv=512 q1: 4.3 vs 5.9us).
+            if max_tile_splits <= 2:
+                decode_splits = 1
+        else:
+            decode_splits = max(1, min(num_splits, max_tile_splits))
+        # Paged launches always take the deterministic kernel reduction; the
+        # direct single-split entry point is dense-only.
+        reduction_mode = (
+            "kernel"
+            if bias_decode_paged or decode_splits > 1
+            else "direct"
+        )
+
+        bias_smem_extent = decode_bias.shape[-1]
+        if (
+            decode_bias.dtype != torch.bfloat16
+            or bias_smem_extent * grouped_head_tile * prediction_tile * 2
+            > 16 * 1024
+        ):
+            bias_smem_extent = None
+        decode_key = (
+            head_dim,
+            grouped_head_tile,
+            prediction_tile,
+            sequence_tile,
+            reduction_mode,
+            decode_window_left,
+            page_size if bias_decode_paged else None,
+            bias_decode_mxfp8,
+            bias_smem_extent,
+        )
+        o_partial = m_partial = l_partial = None
+        if reduction_mode == "kernel":
+            o_partial = torch.empty(
+                decode_splits, *decode_out.shape, dtype=torch.float32, device=device
+            )
+            partial_stats_shape = (decode_splits, *decode_out.shape[:-1])
+            m_partial = torch.empty(
+                partial_stats_shape, dtype=torch.float32, device=device
+            )
+            l_partial = torch.empty_like(m_partial)
+        page_table_flat = table_offsets = None
+        if bias_decode_paged:
+            row_pitch = page_table.stride(0)
+            page_table_flat = page_table.as_strided(
+                (row_pitch * (batch_size - 1) + page_table.shape[1],), (1,)
+            )
+            table_offsets = (
+                torch.arange(batch_size, dtype=torch.int32, device=device)
+                * row_pitch
+            )
+        if decode_key not in _flash_attn_fwd.compile_cache_bias_decode:
+            decode = FlashAttentionDecodeSm100Bias(
+                head_dim,
+                grouped_head_tile,
+                prediction_tile=prediction_tile,
+                sequence_tile=sequence_tile,
+                reduction_mode=reduction_mode,
+                rel_bias_layout="compact",
+                bias_smem_extent=bias_smem_extent,
+                qk_blockscaled=bias_decode_mxfp8,
+                v_dequant=bias_decode_mxfp8,
+                window_size_left=decode_window_left,
+                page_size=page_size if bias_decode_paged else None,
+                use_pdl=is_arch_support_pdl(),
+            )
+            paged_mxfp8 = bias_decode_mxfp8 and bias_decode_paged
+            decode.can_implement(
+                decode_splits,
+                decode_q.shape,
+                k.shape,
+                decode_bias.shape,
+                torch2cute_dtype_map[q.dtype],
+                torch2cute_dtype_map[v.dtype],
+                torch2cute_dtype_map[out.dtype],
+                sf_dtype=cutlass.Float8E8M0FNU if bias_decode_mxfp8 else None,
+                v_sf_dtype=cutlass.Float8E8M0FNU if bias_decode_mxfp8 else None,
+                v_shape_bshd=v.shape,
+                v_sf_shape=sfv.shape if paged_mxfp8 else None,
+                k_sf_shape=sfk.shape if paged_mxfp8 else None,
+                k_sf_stride=sfk.stride() if paged_mxfp8 else None,
+            )
+            if bias_decode_mxfp8:
+                # The bf16 wrappers below assert non-blockscaled; MXFP8 goes
+                # through the generic entry point with the SF operands.
+                def opt(t, **kw):
+                    return to_cute_tensor(t, **kw) if t is not None else None
+
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key] = cute.compile(
+                    decode,
+                    decode_splits,
+                    to_cute_tensor(decode_q),
+                    to_cute_tensor(k),
+                    to_cute_tensor(v),
+                    to_cute_tensor(sfq, assumed_align=16),
+                    to_cute_tensor(sfk, assumed_align=16),
+                    to_cute_tensor(sfv, assumed_align=16),
+                    to_cute_tensor(decode_out),
+                    to_cute_tensor(decode_bias),
+                    opt(o_partial),
+                    opt(m_partial),
+                    opt(l_partial),
+                    softmax_scale,
+                    None,  # mCuSeqlensQ
+                    None,  # mCuSeqlensK
+                    None,  # mSeqUsedQ
+                    opt(seqused_k, assumed_align=4),
+                    None,  # max_seqlen_q
+                    None,  # max_seqlen_k
+                    opt(page_table_flat, assumed_align=4),
+                    opt(table_offsets, assumed_align=4),
+                    current_stream,
+                    options="--enable-tvm-ffi",
+                )
+            elif bias_decode_paged:
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key] = cute.compile(
+                    decode.paged_bf16_bias,
+                    decode_splits,
+                    to_cute_tensor(seqused_k, assumed_align=4),
+                    to_cute_tensor(table_offsets, assumed_align=4),
+                    to_cute_tensor(page_table_flat, assumed_align=4),
+                    to_cute_tensor(k),
+                    to_cute_tensor(v),
+                    to_cute_tensor(decode_q),
+                    to_cute_tensor(decode_out),
+                    to_cute_tensor(decode_bias),
+                    to_cute_tensor(o_partial),
+                    to_cute_tensor(m_partial),
+                    to_cute_tensor(l_partial),
+                    softmax_scale,
+                    current_stream,
+                    options="--enable-tvm-ffi",
+                )
+            elif reduction_mode == "direct":
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key] = cute.compile(
+                    decode.dense_bf16_bias_direct,
+                    to_cute_tensor(decode_q),
+                    to_cute_tensor(k),
+                    to_cute_tensor(v),
+                    to_cute_tensor(decode_out),
+                    to_cute_tensor(decode_bias),
+                    softmax_scale,
+                    current_stream,
+                    options="--enable-tvm-ffi",
+                )
+            else:
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key] = cute.compile(
+                    decode.dense_bf16_bias,
+                    decode_splits,
+                    to_cute_tensor(decode_q),
+                    to_cute_tensor(k),
+                    to_cute_tensor(v),
+                    to_cute_tensor(decode_out),
+                    to_cute_tensor(decode_bias),
+                    to_cute_tensor(o_partial),
+                    to_cute_tensor(m_partial),
+                    to_cute_tensor(l_partial),
+                    softmax_scale,
+                    current_stream,
+                    options="--enable-tvm-ffi",
+                )
+        if not is_fake_mode():
+            if bias_decode_mxfp8:
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key](
+                    decode_splits,
+                    decode_q.detach().view(torch.uint8),
+                    k.detach().view(torch.uint8),
+                    v.detach().view(torch.uint8),
+                    sfq,
+                    sfk,
+                    sfv,
+                    decode_out.detach(),
+                    decode_bias,
+                    o_partial,
+                    m_partial,
+                    l_partial,
+                    softmax_scale,
+                    None,
+                    None,
+                    None,
+                    seqused_k,
+                    None,
+                    None,
+                    page_table_flat,
+                    table_offsets,
+                )
+            elif bias_decode_paged:
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key](
+                    decode_splits,
+                    seqused_k,
+                    table_offsets,
+                    page_table_flat,
+                    k.detach(),
+                    v.detach(),
+                    decode_q.detach(),
+                    decode_out.detach(),
+                    decode_bias,
+                    o_partial,
+                    m_partial,
+                    l_partial,
+                    softmax_scale,
+                )
+            elif reduction_mode == "direct":
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key](
+                    decode_q.detach(),
+                    k.detach(),
+                    v.detach(),
+                    decode_out.detach(),
+                    decode_bias,
+                    softmax_scale,
+                )
+            else:
+                _flash_attn_fwd.compile_cache_bias_decode[decode_key](
+                    decode_splits,
+                    decode_q.detach(),
+                    k.detach(),
+                    v.detach(),
+                    decode_out.detach(),
+                    decode_bias,
+                    o_partial,
+                    m_partial,
+                    l_partial,
+                    softmax_scale,
+                )
+        return out, None
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
@@ -906,9 +1302,6 @@ def _flash_attn_fwd(
 
         rows_per_cta = 4
         group_tile_bias = _group_tile_bias(qhead_per_kvhead_packgqa)
-        # Decode and target verification fit each sequence in one packed-Q block.
-        # In that case the batch index is already a scheduler coordinate, so the
-        # prefix-sum/block-map preparation kernel is pure launch overhead.
         max_m_blocks_leq_one = seqlen_q_packgqa <= group_tile_bias
         use_pdl = is_arch_support_pdl()
         bias_max_seqlen_q = max_seqlen_q if max_seqlen_q is not None else seqlen_q
@@ -1568,6 +1961,7 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
+_flash_attn_fwd.compile_cache_bias_decode = get_jit_cache("fwd_bias_decode")
 _flash_attn_fwd.compile_cache_shear_bias = get_jit_cache("fwd_shear_bias")
 _flash_attn_fwd.compile_cache_prepare_shear_bias = get_jit_cache(
     "fwd_prepare_shear_bias"
@@ -1686,6 +2080,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         qk_sf_vec_size: Optional[int] = None,
         v_sf_vec_size: Optional[int] = None,
         rel_bias_prep_cache: Optional[dict] = None,
+        decode_uniform_q: bool = False,
         return_lse: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
@@ -1734,6 +2129,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             qk_sf_vec_size=qk_sf_vec_size,
             v_sf_vec_size=v_sf_vec_size,
             rel_bias_prep_cache=rel_bias_prep_cache,
+            decode_uniform_q=decode_uniform_q,
         )
         ctx.save_for_backward(
             q,
@@ -1849,6 +2245,7 @@ def flash_attn_varlen_func(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    decode_uniform_q: bool = False,
     return_lse: bool = False,
 ):
     """
@@ -1927,6 +2324,7 @@ def flash_attn_varlen_func(
         qk_sf_vec_size,
         v_sf_vec_size,
         rel_bias_prep_cache,
+        decode_uniform_q,
         return_lse,
     )
 
