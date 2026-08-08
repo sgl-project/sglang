@@ -18,6 +18,7 @@ on:
           - 'all'
           - '1-gpu-large'
           - '4-gpu-h100'
+          - '4-gpu-b200'
           - '8-gpu-b200'
           - '8-gpu-h200'
 
@@ -44,6 +45,16 @@ jobs:
       runner_config: 4-gpu-h100
       runs_on: 4-gpu-h100
       run_timeout_minutes: 60
+    secrets: inherit
+
+  weekly-4-gpu-b200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-b200')
+    uses: ./.github/workflows/_scheduled-test-stage.yml
+    with:
+      stage: weekly
+      runner_config: 4-gpu-b200
+      runs_on: 4-gpu-b200
+      run_timeout_minutes: 120
     secrets: inherit
 
   weekly-8-gpu-b200:
