@@ -125,13 +125,27 @@ class TestGetDcpLens(CustomTestCase):
             real_kv_size + physical_page_size,
         )
 
-    def test_model_config_uses_non_dcp_tp_size_for_kv_heads(self):
+    @staticmethod
+    def _kv_head_config(*, is_draft_model: bool):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(model_type="qwen3_5_text")
         model_config.hf_text_config = SimpleNamespace(num_key_value_heads=8)
+        model_config.is_draft_model = is_draft_model
+        return model_config
+
+    def test_model_config_uses_non_dcp_tp_size_for_kv_heads(self):
+        model_config = self._kv_head_config(is_draft_model=False)
 
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
+
+    def test_a_draft_keeps_kv_heads_tp_sharded_under_dcp(self):
+        """The draft pool must match what a TP-sharded draft builds; sizing it
+        with the target's dcp_size over-allocates by that factor."""
+        model_config = self._kv_head_config(is_draft_model=True)
+
+        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
+        self.assertEqual(model_config.get_num_kv_heads(16), 1)
 
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
         hidden_size = 4
