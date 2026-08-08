@@ -119,6 +119,10 @@ class BeamCoordinator:
             return "Beam search is not supported with hisparse."
         if self.server_args.pp_size > 1:
             return "Beam search is not supported with pipeline parallelism."
+        if self.server_args.enable_dp_attention:
+            # The cross-rank token sync reads batch_size() (== len(reqs)), which
+            # excludes the member rows the forward actually runs.
+            return "Beam search is not supported with dp attention."
         if self.server_args.enable_hierarchical_cache:
             return "Beam search is not supported with hierarchical cache."
         if self.model_config.is_encoder_decoder:
