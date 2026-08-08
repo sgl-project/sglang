@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -59,6 +60,23 @@ try:
 except ImportError:
     use_deepep = False
 
+# DeepEP V2 introduces `ElasticBuffer` alongside the legacy `Buffer`
+# (deepseek-ai/DeepEP#605, merged 2026-04-29). On V2 both classes are
+# exported from `deep_ep.__init__`, so the existing `from deep_ep import
+# Buffer` surface above continues to work unchanged — `ElasticBuffer` is
+# an additional, MoE-shape ctor with auto-QP sizing that callers may
+# opt into. The probe below is orthogonal to `use_deepep` and does not
+# affect the default code path. V2 usage is further gated on
+# `SGLANG_DEEPEP_USE_V2=1`. Mirrors the `HAVE_DEEP_EP_V2` probe shape
+# already used in NVIDIA/Megatron-LM's `fused_a2a.py`.
+try:
+    from deep_ep import ElasticBuffer
+
+    have_deepep_v2 = True
+except ImportError:
+    ElasticBuffer = None
+    have_deepep_v2 = False
+
 from enum import Enum, IntEnum, auto
 
 import torch
@@ -76,6 +94,45 @@ def _is_mnnvl_fabric_supported() -> bool:
     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
     return is_mnnvl_fabric_supported(torch.cuda.current_device())
+
+
+_V2_TIMING = get_bool_env_var("SGLANG_DEEPEP_V2_TIMING", default="false")
+_v2_timing_state = {"n": 0, "dispatch_s": 0.0, "combine_s": 0.0}
+
+
+class _V2Timer:
+    """Env-gated (SGLANG_DEEPEP_V2_TIMING=1) wall-clock timer for the V2
+    dispatch/combine call sites. Synchronizes CUDA around the timed region —
+    measurement-only, never enabled in a perf run."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+    def __enter__(self):
+        if _V2_TIMING:
+            torch.cuda.synchronize()
+            self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if _V2_TIMING:
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - self.t0
+            st = _v2_timing_state
+            st[f"{self.kind}_s"] += dt
+            if self.kind == "combine":
+                st["n"] += 1
+                logger.info(
+                    "[V2-TIMING] call=%d %s=%.1fms cum(dispatch=%.2fs combine=%.2fs)",
+                    st["n"],
+                    self.kind,
+                    dt * 1e3,
+                    st["dispatch_s"],
+                    st["combine_s"],
+                )
+            else:
+                logger.info("[V2-TIMING] %s=%.1fms", self.kind, dt * 1e3)
+        return False
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -200,6 +257,28 @@ class DeepEPBuffer:
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
 
+        # Opt-in V2 path: construct `deep_ep.ElasticBuffer` instead of the
+        # legacy `deep_ep.Buffer`. V2 uses a MoE-shape ctor and infers the
+        # dispatch layout internally (no `get_dispatch_config` /
+        # `get_combine_config` / `get_nvl_buffer_size_hint` /
+        # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
+        # the default code path is byte-identical to V1.
+        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+            # Cache on `state.buffer` — the SAME slot the guard at the top of
+            # this function checks. An earlier revision wrote `cls._buffer`
+            # here, which the guard never reads, so every `_get_buffer()`
+            # (2x per MoE layer per token) constructed a fresh ElasticBuffer:
+            # measured ~0.35s/ctor => ~34s/token on a 2-node EP16 serve while
+            # the dispatch/combine kernels themselves were 7ms p50.
+            state.buffer = cls._build_v2_buffer(
+                group,
+                hidden_size,
+                deepep_mode,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+            )
+            return state.buffer
+
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
@@ -285,8 +364,101 @@ class DeepEPBuffer:
         return state.buffer
 
     @classmethod
+    def _build_v2_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+    ):
+        """Construct a DeepEP V2 `ElasticBuffer` for opt-in V2 usage.
+
+        DeepEP V2 (deepseek-ai/DeepEP#605) collapses the V1 NVL/RDMA
+        byte-pool ctor into a single MoE-shape ctor and derives the
+        internal buffer size from `num_max_tokens_per_rank`, `hidden`,
+        and `num_topk`. `num_allocated_qps=0` asks V2 to auto-size and
+        auto-cap the Queue-Pair budget — on AWS EFA this clamps to the
+        safe 128-slot GIN ring ceiling (see the EFA fast-path in
+        `deep_ep/buffers/elastic.py`).
+
+        V2 does not expose `get_dispatch_config` / `get_combine_config`
+        / `num_qps_per_rank`, so the matching V1 code above is skipped.
+        """
+        # Keep the num_tokens / num_topk source consistent with the V1
+        # low-latency path. For the normal path where
+        # `num_max_dispatch_tokens_per_rank == -1`, fall back to the
+        # SGLang env default that already bounds the V1 path.
+        if num_max_dispatch_tokens_per_rank <= 0:
+            num_max_dispatch_tokens_per_rank = (
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            )
+        # V2 sizes its internal slots from `num_max_tokens_per_rank` and
+        # HARD-asserts `num_tokens <= num_max_tokens_per_rank` on every
+        # dispatch (csrc/elastic/buffer.hpp:684). The env default (128)
+        # was tuned for the V1 low-latency DECODE path; in normal mode a
+        # chunked-prefill batch dispatches up to `chunked_prefill_size`
+        # tokens from a rank in one shot (measured: concurrency 8 x
+        # ISL 512 aborts all ranks on the assert). Bound by the server's
+        # prefill chunk so prefill batches always fit.
+        if deepep_mode.enable_normal():
+            # The scheduler packs multiple prefill chunks into one forward
+            # batch bounded by `max_prefill_tokens` (default 16384), which
+            # exceeds `chunked_prefill_size` (8192) — measured: an 8192
+            # buffer still hit the assert under concurrency 8. Bound by the
+            # larger of the two packing caps.
+            chunk, max_prefill = None, None
+            try:
+                from sglang.srt.managers.schedule_batch import (
+                    global_server_args_dict,
+                )
+
+                chunk = global_server_args_dict.get("chunked_prefill_size")
+                max_prefill = global_server_args_dict.get("max_prefill_tokens")
+            except Exception:
+                pass
+            num_max_dispatch_tokens_per_rank = max(
+                num_max_dispatch_tokens_per_rank,
+                chunk or 8192,
+                max_prefill or 16384,
+            )
+        # `num_topk` is not known at buffer-construction time in SGLang
+        # (the router choice is per-forward). DeepEP V2 accepts
+        # `num_topk=0` and falls back to a group-size-based conservative
+        # hint, so we pass 0 here and let V2 compute the ceiling.
+        num_topk = 0
+        # Low-latency mode still requires `num_experts % group.size() ==
+        # 0`. The normal mode works with `num_experts == -1`.
+        if deepep_mode.enable_low_latency():
+            assert num_experts != -1 and num_experts % group.size() == 0
+
+        logger.info(
+            "SGLANG_DEEPEP_USE_V2=1: constructing deep_ep.ElasticBuffer "
+            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d).",
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_topk,
+        )
+        return ElasticBuffer(
+            group=group,
+            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            hidden=hidden_size,
+            num_topk=num_topk,
+            use_fp8_dispatch=False,
+            allow_hybrid_mode=True,
+            # num_allocated_qps=0 -> V2 auto-sizes with an EFA safety cap
+            # (see deep_ep/buffers/elastic.py _is_efa_fabric()).
+            num_allocated_qps=0,
+        )
+
+    @classmethod
     def clean_buffer(cls):
         state = cls._state()
+        # DeepEP V2's `ElasticBuffer` does not expose `low_latency_mode`
+        # or `clean_low_latency_buffer` — low-latency cleanup is handled
+        # internally via `EPHandle` lifetime. Fall through for V2.
+        if not hasattr(state.buffer, "clean_low_latency_buffer"):
+            return
         if not state.buffer.low_latency_mode:
             return
         state.buffer.clean_low_latency_buffer(
@@ -551,6 +723,89 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
+
+        if ElasticBuffer is not None and isinstance(buffer, ElasticBuffer):
+            # DeepEP V2 `ElasticBuffer.dispatch` infers the layout internally
+            # from `topk_idx` — there is no `get_dispatch_layout` on V2 (its
+            # absence crashes here otherwise). Returns a 5-tuple
+            # `(recv_x, recv_topk_idx, recv_topk_weights, EPHandle, event)`
+            # and carries `num_recv_tokens_per_expert_list` on the handle.
+            # `async_finish` is renamed `async_with_compute_stream`; the V2
+            # contract requires `allocate_on_comm_stream=True` whenever
+            # `previous_event` is set. Mirrors the proven Megatron
+            # fused_a2a.py V2 translation (Wave 27 measured on EFA).
+            #
+            # The incoming `previous_event` is a V1 `Buffer.capture()` product
+            # (python `EventOverlap`); V2's wrapper passes it RAW to pybind
+            # arg17 which requires `deep_ep._C.EventHandle | None` ->
+            # TypeError. Re-derive via the ElasticBuffer's own capture()
+            # (exactly what the Megatron translation does) and drop the V1 one.
+            _prev_evt = None
+            _alloc_on_comm = False
+            if self.async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            previous_event = _prev_evt
+            _num_tokens = (x[0] if isinstance(x, tuple) else x).shape[0]
+            _cap = getattr(buffer, "num_max_tokens_per_rank", -1)
+            if _num_tokens > 0.75 * _cap:
+                logger.warning(
+                    "[V2-SIZE] dispatch num_tokens=%d approaching/exceeding "
+                    "buffer num_max_tokens_per_rank=%d",
+                    _num_tokens,
+                    _cap,
+                )
+            _deepep_precompile_tp_barrier()
+            with _V2Timer("dispatch"), torch.no_grad():
+                (
+                    recv_x,
+                    recv_topk_ids,
+                    recv_topk_weights,
+                    self.handle,
+                    event,
+                ) = buffer.dispatch(
+                    x,
+                    topk_idx=topk_ids,
+                    topk_weights=topk_weights,
+                    num_experts=self.num_experts,
+                    # Do NOT pass num_max_tokens_per_rank here: elastic.py's
+                    # dispatch resolves `value_or(passed, ctor_value)`, so the
+                    # dispatcher's decode-tuned value (128) would override the
+                    # prefill-sized ctor capacity and re-trip the
+                    # buffer.hpp:684 assert on large prefill batches.
+                    num_max_tokens_per_rank=None,
+                    expert_alignment=(
+                        128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+                    ),
+                    num_sms=0,
+                    num_qps=0,
+                    previous_event=previous_event,
+                    async_with_compute_stream=self.async_finish,
+                    allocate_on_comm_stream=_alloc_on_comm,
+                    do_expand=False,
+                )
+            num_recv_tokens_per_expert = getattr(
+                self.handle, "num_recv_tokens_per_expert_list", None
+            )
+            if isinstance(num_recv_tokens_per_expert, torch.Tensor):
+                num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+                num_recv_tokens_per_expert,
+                num_tokens_per_rank=None,
+                num_tokens_per_rdma_rank=None,
+                num_tokens_per_expert=None,
+            )
+            return (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                event,
+            )
+
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -630,6 +885,33 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        if ElasticBuffer is not None and isinstance(buffer, ElasticBuffer):
+            # V2 combine: `async_finish` -> `async_with_compute_stream`, no
+            # `config` kwarg (SM/QP auto-derived from the dispatch handle via
+            # num_sms=0 — a mismatch triggers CUDA 719 at csrc/jit/handle.hpp:86).
+            # Same event-type trap as dispatch (take-10): the incoming
+            # `previous_event` is a V1 `Buffer.capture()` EventOverlap; V2's
+            # pybind combine requires `deep_ep._C.EventHandle | None`.
+            # Re-derive via the ElasticBuffer's own capture().
+            _prev_evt = None
+            _alloc_on_comm = False
+            if self.async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            with _V2Timer("combine"):
+                combined_x, _, event = buffer.combine(
+                    x,
+                    self.handle,
+                    num_sms=0,
+                    num_qps=0,
+                    previous_event=_prev_evt,
+                    async_with_compute_stream=self.async_finish,
+                    allocate_on_comm_stream=_alloc_on_comm,
+                )
+            return combined_x, event
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
