@@ -280,7 +280,7 @@ class TestSubBlockNumerics(unittest.TestCase):
         self.assertGreater(_cosine(routed, ref), 0.99)
 
         num_blocks = (self.seq_len + 63) // 64
-        topk = impl.router.route(q, k, sparsity=0.75).topk
+        topk = impl.router.route(q, k, sparsity=0.75, softmax_scale=HEAD_DIM**-0.5).topk
         random_index = torch.randint(
             num_blocks,
             (1, NUM_HEADS, num_blocks, topk),

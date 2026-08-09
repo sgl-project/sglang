@@ -24,7 +24,6 @@ import torch
 import triton
 import triton.language as tl
 
-NEG = -1.0e30
 _NEG = tl.constexpr(-1.0e30)  # Triton only lets @jit read constexpr globals
 _LN2 = tl.constexpr(0.6931471805599453)
 
@@ -85,15 +84,10 @@ def _score_kernel(
     lse = m + tl.log2(s)
     lse = tl.where(m > _NEG / 2, lse, _NEG)  # whole group was padding
 
-    # Fold NQR query sub-cells of a query block together. Log-sum-exp is
+    # Fold the NQR query sub-cells of a query block together. Log-sum-exp is
     # associative, so reducing NK then NQ is the same one log-sum-exp over all
-    # NQ*NK sub-block pairs -- and doing it in two stages keeps both reductions
-    # on an axis that is already contiguous in registers.
-    #
-    # NQR=1 leaves the query sub-cells apart, which is what the caller wants
-    # when each of them is to be normalised by its own softmax denominator
-    # before they are combined: that denominator runs over every key block, so
-    # it cannot be known while this kernel still holds only one key tile.
+    # NQ*NK sub-block pairs -- and two stages keeps both reductions on an axis
+    # that is already contiguous in registers.
     if NQR > 1:
         lse = tl.reshape(lse, (BLK_M // NQR, NQR, BLK_N // NK))
         m2 = tl.max(lse, axis=1)
@@ -118,24 +112,14 @@ def _score_kernel(
     )
 
 
-def fused_scores(
-    qp,
-    kp,
-    out,
-    n_k,
-    n_valid,
-    n_q=1,
-    m_valid=None,
-    num_warps=4,
-    num_stages=3,
-    blk_m=128,
-    blk_n=128,
-):
-    """qp: [L, Gq*n_q, D] bf16 (already carrying softmax_scale*log2e),
-    kp: [L, Gk*n_k, D] bf16 -> out, natural-log scores.
+BLK_M = BLK_N = 128  # score tile; must hold whole blocks, so a multiple of n_q and n_k
 
-    The n_q query sub-cells of a query block are folded together by log-sum-exp,
-    so out is [L, Gq, Gk].
+
+def fused_scores(qp, kp, out, *, n_k, n_valid, n_q, m_valid):
+    """qp: [L, Gq*n_q, D] bf16 (already carrying softmax_scale*log2e),
+    kp: [L, Gk*n_k, D] bf16 -> out: [L, Gq, Gk], natural-log scores.
+
+    The n_q query sub-cells of a query block are folded together by log-sum-exp.
 
     ``n_valid`` / ``m_valid`` are the counts of key / query sub-cells holding at
     least one real token; the rest pooled to zero and must not contribute.
@@ -143,9 +127,7 @@ def fused_scores(
     L, M, D = qp.shape
     N = kp.shape[1]
     Mout, Nout = out.shape[1], out.shape[2]
-    assert blk_n % n_k == 0, "the key tile must hold whole blocks"
-    assert blk_m % n_q == 0, "the query tile must hold whole blocks"
-    grid = (triton.cdiv(M, blk_m), triton.cdiv(N, blk_n), L)
+    grid = (triton.cdiv(M, BLK_M), triton.cdiv(N, BLK_N), L)
     _score_kernel[grid](
         qp,
         kp,
@@ -158,17 +140,17 @@ def fused_scores(
         out.stride(2),
         out.stride(0),
         M,
-        M if m_valid is None else m_valid,
+        m_valid,
         n_valid,
         Nout,
         Mout,
-        BLK_M=blk_m,
-        BLK_N=blk_n,
+        BLK_M=BLK_M,
+        BLK_N=BLK_N,
         NK=n_k,
         NQR=n_q,
         D=D,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=4,
+        num_stages=3,
     )
     return out
 
@@ -303,13 +285,9 @@ def topk_iters(G, k):
     return 16 if L <= 2.5 else 24 if L <= 3.5 else 32
 
 
-def fused_topk(scores2d, k, iters=None, num_warps=None):
+def fused_topk(scores2d, k):
     """scores2d: [rows, G] contiguous -> [rows, k] int32 column ids (unsorted)."""
     rows, G = scores2d.shape
-    if iters is None:
-        iters = topk_iters(G, k)
-    if num_warps is None:  # short rows do not fill four warps
-        num_warps = 4 if G >= 1024 else 2
     out = torch.empty(rows, k, dtype=torch.int32, device=scores2d.device)
     _topk_kernel[(rows,)](
         scores2d,
@@ -317,7 +295,7 @@ def fused_topk(scores2d, k, iters=None, num_warps=None):
         G,
         k,
         BLK=triton.next_power_of_2(G),
-        ITERS=iters,
-        num_warps=num_warps,
+        ITERS=topk_iters(G, k),
+        num_warps=4 if G >= 1024 else 2,  # short rows do not fill four warps
     )
     return out

@@ -39,7 +39,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (
-    BLOCK,
     SubBlockRouter,
     load_bsa_attn_blk64_fwd,
 )
@@ -276,14 +275,15 @@ class SubBlockAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """q, k, v: ``[1, S, H, 128]`` bf16 -> same shape."""
         bsa_attn_blk64_fwd = load_bsa_attn_blk64_fwd()
-        plan = self.router.route(q, k, sparsity=self.schedule.sparsity)
+        plan = self.router.route(
+            q, k, sparsity=self.schedule.sparsity, softmax_scale=self.softmax_scale
+        )
         # Proof that the sparse path actually ran, with the shape it ran on --
         # the construction-time log above only says the layer was eligible.
         logger.info_once(
             f"SubBlock sparse attention active: S={k.shape[1]} heads={q.shape[2]} "
-            f"keeping up to {plan.topk}/{plan.num_blocks} key blocks per query block "
-            f"(mean density {plan.mean_density:.4f}, "
-            f"sparsity {1 - plan.mean_density:.4f})"
+            f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
+            f"(sparsity {1 - plan.density:.4f})"
         )
         out = bsa_attn_blk64_fwd(
             q,
@@ -292,7 +292,7 @@ class SubBlockAttentionImpl(AttentionImpl):
             plan.index,
             plan.topk,
             block_sizes=_cached_block_sizes(k.shape[1], k.device),
-            q2k_block_nums=plan.block_nums,
+            q2k_block_nums=None,  # the budget is uniform across rows
             softmax_scale=self.softmax_scale,
         )
         return out[0] if isinstance(out, tuple) else out
@@ -388,7 +388,6 @@ class SubBlockAttentionImpl(AttentionImpl):
 
 
 __all__ = [
-    "BLOCK",
     "SubBlockAttentionBackend",
     "SubBlockAttentionImpl",
     "SubBlockAttentionMetadata",
