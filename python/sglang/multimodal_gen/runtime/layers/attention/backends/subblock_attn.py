@@ -14,7 +14,7 @@ why the layer cutoff defaults to zero -- see the defaults below. The schedule
 is configured through ``--attention-backend-config``::
 
     --attention-backend subblock \
-    --attention-backend-config '{"sparsity": 0.80, "skip_first_steps": 10,
+    --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10,
                                  "skip_first_layers": 0, "n_k": 4}'
 
 Requirements inherited from the kernel: SM100 (B200), bf16, head_dim 128. Any
@@ -54,10 +54,11 @@ SUBBLOCK_HEAD_DIM = 128
 # Defaults for the schedule; override through --attention-backend-config.
 # Sparsity is the speed lever, and it saturates: on MiniMax-H3 t2va at 37.7k
 # tokens, 0.75 gives 1.14x, 0.80 gives 1.18x and 0.85 gives 1.21x -- cutting the
-# block budget by a further 40% buys 6% because attention is no longer the bulk
+# block budget by 40% past 0.75 buys 6%, because attention is no longer the bulk
 # of the step. 0.85 was the worst arm on cosine-vs-dense on both clips rendered
-# across the three grades, so the default stops at 0.80.
-DEFAULT_SPARSITY = 0.80
+# across all three grades, and 0.80 costs 0.017 / 0.006 cos_c against 0.75 on
+# those same two clips for 3.5% of the time, so the default takes the quality.
+DEFAULT_SPARSITY = 0.75
 # The two cutoffs were swept independently on MiniMax-H3 t2va (1344x768, 5 s,
 # 50 steps, n_k=4, sparsity 0.75) and behave nothing alike. Lowering the step
 # cutoff from 10 to 5 halves cosine-vs-dense (0.558 -> 0.310 on two clips) and
@@ -79,7 +80,7 @@ DEFAULT_N_K = 4
 #     sparsity 0.90   +0.062   paired t = +2.6   better on 13/15
 #     sparsity 0.75   +0.008   paired t = +2.1   better on 10/15
 # The margin shrinks as the budget loosens, which is the pattern every estimator
-# comparison here has followed: at the shipped 118 of 590 blocks the rules mostly
+# comparison here has followed: at the shipped 148 of 590 blocks the rules mostly
 # agree on what to keep.
 DEFAULT_N_Q = 4
 # Below this many keys the router costs more than the blocks it saves, and the

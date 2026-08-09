@@ -136,7 +136,25 @@ def load_bsa_attn_blk64_fwd():
 
 LOG2E = 1.4426950408889634
 BLOCK = 64  # the kernel's block granularity (kSparseBlockSize=64)
+BUDGET_GRANULARITY = 8  # blocks per query row the kernel bills in, padding to fit
 VALID_N = (1, 2, 4, 8)  # sub-blocks per 64-token block -> 64 / 32 / 16 / 8 tokens
+
+
+def _snap_up_to_8(topk: int, num_blocks: int) -> int:
+    """Round a block budget up to what the kernel is going to charge for anyway.
+
+    ``bsa_attn_blk64_fwd`` pads each query row's block count up to a multiple of
+    ``BUDGET_GRANULARITY`` with phantom slots that repeat the last real block and
+    are then masked out of the softmax. Asking for 148 blocks therefore costs
+    exactly what 152 costs, with four of the slots computed and thrown away.
+    Measured at S=37.7k on B200, 2 prompts in one session: 152 blocks take
+    16.055 s against 16.061 s for 148, and 120 take 15.490 s against 15.496 s
+    for 118 -- free, inside the noise. So take the blocks.
+
+    The consequence for the caller is that ``sparsity`` is an upper bound rather
+    than an exact figure: 0.75 of 590 blocks becomes 152 kept, 0.7424 dropped.
+    """
+    return min(num_blocks, max(1, -(-topk // BUDGET_GRANULARITY)) * BUDGET_GRANULARITY)
 
 
 class RoutingPlan(msgspec.Struct, frozen=True):
@@ -230,7 +248,7 @@ class SubBlockRouter:
         gk = -(-k.shape[1] // BLOCK)
         scores = self.scores(q, k, softmax_scale)  # [B, H, Gq, Gk]
         gq = scores.shape[2]
-        topk = max(1, min(gk, math.ceil((1.0 - sparsity) * gk)))
+        topk = _snap_up_to_8(math.ceil((1.0 - sparsity) * gk), gk)
         # One pass over the score matrix instead of torch.topk's several; the kernel
         # accepts the blocks in any order, so nothing sorts them.
         index = fused_topk(scores.reshape(-1, gk), topk).view(b, h, gq, topk)

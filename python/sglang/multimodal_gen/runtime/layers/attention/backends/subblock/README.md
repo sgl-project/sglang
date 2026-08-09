@@ -8,7 +8,7 @@ runs before attention and hands the kernel a `q2k_block_index`.
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --num-gpus 8 --ulysses-degree 8 \
   --attention-backend subblock \
-  --attention-backend-config '{"sparsity": 0.80, "n_k": 4}'
+  --attention-backend-config '{"sparsity": 0.75, "n_k": 4}'
 ```
 
 Requirements come from the kernel: **SM100 (B200), bfloat16, head_dim 128**.
@@ -43,7 +43,7 @@ is the one measurement in this family that has held up: see `n_q` below.
 
 | key | default | meaning |
 | --- | ---: | --- |
-| `sparsity` | 0.80 | fraction of key blocks dropped per query block |
+| `sparsity` | 0.75 | key blocks dropped per query block, as an upper bound |
 | `n_k` | 4 | key sub-blocks per 64-token block (1, 2, 4, 8) |
 | `skip_first_steps` | 10 | leading denoise forwards kept dense |
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
@@ -60,7 +60,7 @@ own dense render, scored as cosine of the decoded video:
 | sparsity 0.90 | +0.062 | +2.6 | 13/15 |
 | sparsity 0.75 | +0.008 | +2.1 | 10/15 |
 
-The margin shrinks as the budget loosens — at the shipped 118 of 590 blocks the
+The margin shrinks as the budget loosens — at the shipped 148 of 590 blocks the
 rules mostly agree on what to keep — and it costs 0.5% of the denoise time.
 Nothing else in this family has separated from anything else: see `n_k` below,
 and a temperature sweep of the sub-block reduction (whose T -> infinity limit is
@@ -91,15 +91,14 @@ to 0. Do not lower `skip_first_steps` without looking at the output.
 ## Measured
 
 MiniMax-H3 t2va, 1344x768 / 5 s / 50 steps, 8x B200, Ulysses-8, bf16, at the
-shipped defaults (sparsity 0.80, `n_q=n_k=4`, 118 of 590 key blocks per query
-block). Five prompts per arm, all arms in one session on one node, first
-(cold) sample of each arm dropped:
+shipped defaults (sparsity 0.75, `n_q=n_k=4`, 148 of 590 key blocks per query
+block). Two prompts, both arms in one session on one node, cold sample dropped:
 
 | | DiT denoise | vs dense |
 | --- | ---: | ---: |
-| dense (FlashAttention) | 18.295 s | 1.000x |
-| SubBlock | 15.536 s | **1.178x** |
-| SubBlock + [flashinfer#4397][fi] | 14.328 s | **1.277x** |
+| dense (FlashAttention) | 18.270 s | 1.000x |
+| SubBlock | 16.061 s | **1.138x** |
+| SubBlock + [flashinfer#4397][fi] | 15.012 s | **1.217x** |
 
 Spread within an arm is under 0.07 s. End to end the ratio is slightly lower —
 VAE decode is a fixed ~1.5 s the backend does not touch.
@@ -108,24 +107,60 @@ VAE decode is a fixed ~1.5 s the backend does not touch.
 layout in one pass instead of three — `bsa_attn_blk64_fwd` was otherwise
 re-tiling every activation on every call. It is bit-identical (verified
 element-wise on captured H3 tensors) and **not required**: the patch alone is
-worth 1.084x on top of the backend.
+worth 1.070x here, and 1.084x at sparsity 0.80, where the tile rebuild is a
+larger share of what is left to do.
 
 [fi]: https://github.com/flashinfer-ai/flashinfer/pull/4397
 
-Sparsity is the speed lever and it saturates. Same methodology, `n_q=n_k=4`,
+### The budget is billed in groups of 8
+
+The kernel pads each query row's block count up to a multiple of 8 with phantom
+slots that repeat the last real block and are masked out of the softmax, so a
+budget of 148 blocks costs exactly what 152 costs and throws four away. The
+router snaps the budget up instead: 590 blocks at sparsity 0.75 keeps 152, not
+148. Measured at S=37.7k, two prompts in one session, 152 takes 16.055 s against
+16.061 s for 148 and 120 takes 15.490 s against 15.496 s for 118 — free.
+
+This makes `sparsity` an upper bound rather than an exact figure (0.75 requested,
+0.7424 delivered); the log line reports what was actually kept. Rounding *down*
+instead is the other consistent option — 144 blocks runs 0.9% faster than 152 —
+but neither direction moved cosine-vs-dense out of the ±0.012 per-clip noise
+floor on the two clips measured, so the free blocks are the better trade.
+
+### Choosing the budget
+
+Sparsity is the speed lever and it saturates. Five prompts per arm, one session,
 stock FlashInfer:
 
 | | blocks kept | denoise | vs dense |
 | --- | ---: | ---: | ---: |
 | dense | 590/590 | 18.294 s | 1.000x |
-| sparsity 0.75 | 148/590 | 16.105 s | 1.136x |
-| sparsity 0.80 | 118/590 | 15.527 s | **1.178x** |
+| sparsity 0.75 | 148/590 | 16.105 s | **1.136x** |
+| sparsity 0.80 | 118/590 | 15.527 s | 1.178x |
 | sparsity 0.85 | 89/590 | 15.112 s | 1.211x |
 
-Cutting the budget a further 40% past 0.80 buys 6%, and 0.85 was the worst arm
-on cosine-vs-dense on both clips rendered across all three grades, so the
-default takes the knee. `n_k` moves the denoise time by 0.3% across its whole
-range (17.30 s at 1, 17.35 s at 8) — it is a quality knob, not a speed one.
+Cutting the block budget 40% past 0.75 buys 6%, because at 37.7k tokens
+attention is no longer the bulk of the step. Two clips rendered across the whole
+grid, one session each, `n` = `n_q` = `n_k`, cosine of the decoded video against
+that session's dense render:
+
+| | night-market cos_c | cats cos_c |
+| --- | ---: | ---: |
+| sparsity 0.75, n=1 | 0.6731 | 0.5082 |
+| sparsity 0.75, n=4 | 0.6675 | 0.5159 |
+| sparsity 0.80, n=1 | 0.6581 | 0.4717 |
+| sparsity 0.80, n=4 | 0.6621 | 0.5136 |
+| sparsity 0.85, n=1 | 0.6161 | 0.4430 |
+| sparsity 0.85, n=4 | 0.6470 | 0.4325 |
+
+0.85 is the worst arm on both clips. 0.80 costs 0.017 and 0.006 cos_c against
+0.75 for 3.5% of the denoise time, so the default takes the quality. The `n=1`
+vs `n=4` ordering is not consistent between the two clips at these budgets —
+with one render per cell that is not evidence either way; `n_q=4` rests on the
+fifteen-prompt paired test above.
+
+`n_k` moves the denoise time by 0.3% across its whole range (17.30 s at 1,
+17.35 s at 8) — it is a quality knob, not a speed one.
 
 **The speedup is bounded by sequence length, not by the method.** The same
 config measured 1.13x at 37.7k tokens, 1.20x at 52k and 1.47x at 96k: the

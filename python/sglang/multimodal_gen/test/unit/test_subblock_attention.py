@@ -18,6 +18,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock.router import (
+    _snap_up_to_8,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn import (
     SubBlockAttentionImpl,
     SubBlockSchedule,
@@ -134,7 +137,7 @@ class TestSubBlockSchedule(unittest.TestCase):
     def test_defaults_when_config_is_empty(self):
         with _patch_schedule({}):
             schedule = SubBlockSchedule.from_server_args()
-        self.assertEqual(schedule.sparsity, 0.80)
+        self.assertEqual(schedule.sparsity, 0.75)
         self.assertEqual(schedule.skip_first_steps, 10)
         # Depth is not protected by default; the early steps are. See the
         # sweep recorded next to the constants.
@@ -155,6 +158,25 @@ class TestSubBlockSchedule(unittest.TestCase):
             with self.subTest(config=config), _patch_schedule(config):
                 with self.assertRaises(ValueError):
                     SubBlockSchedule.from_server_args()
+
+
+class TestBudgetGranularity(unittest.TestCase):
+    """The kernel bills in groups of 8 blocks; the budget should collect them."""
+
+    def test_snaps_up_to_the_billed_count(self):
+        for topk, expected in ((148, 152), (118, 120), (1, 8), (0, 8)):
+            with self.subTest(topk=topk):
+                self.assertEqual(_snap_up_to_8(topk, 590), expected)
+
+    def test_an_exact_multiple_is_left_alone(self):
+        for topk in (8, 120, 152):
+            with self.subTest(topk=topk):
+                self.assertEqual(_snap_up_to_8(topk, 590), topk)
+
+    def test_never_exceeds_the_blocks_that_exist(self):
+        """The cap wins over the granularity: 590 blocks means at most 590."""
+        self.assertEqual(_snap_up_to_8(586, 590), 590)
+        self.assertEqual(_snap_up_to_8(3, 5), 5)
 
 
 class TestSubBlockGating(unittest.TestCase):
