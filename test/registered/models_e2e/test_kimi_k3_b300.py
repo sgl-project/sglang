@@ -44,9 +44,11 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
     # average holds steady when a numerics change moves where the single
     # greedy prompt hits EOS.
     gsm8k_accept_length_thres = 4.5
-    # Both scale with how far that one greedy prompt runs; coarse guards only.
+    # Both scale with how far that one greedy prompt runs, and speed is
+    # end-to-end, so launch and TTFT are amortized over the output -- it sits
+    # well below the steady decode rate the server logs. Coarse guards only.
     accept_length_thres = 4.0
-    bs_1_speed_thres = 380
+    bs_1_speed_thres = 300
 
     @classmethod
     def setUpClass(cls):
