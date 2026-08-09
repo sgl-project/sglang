@@ -30,8 +30,15 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.hisparse_c4_sizing import (
+    HiSparseC4Geometry,
+    HiSparseC4Layout,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -56,6 +63,7 @@ class MemoryPoolConfig:
     c128_max_total_num_tokens: int = 0
     c4_state_pool_size: int = 0
     c128_state_pool_size: int = 0
+    hisparse_c4_layout: Optional[HiSparseC4Layout] = None
 
     mem_fraction_static: Optional[float] = None
 
@@ -648,12 +656,44 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             kvc.server_args.disaggregation_decode_extra_slots or 0
         )
+        self.hisparse_c4_geometry: Optional[HiSparseC4Geometry] = None
+        self._reserved_hisparse_c4_layout: Optional[HiSparseC4Layout] = None
         if kvc.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            hisparse_config = parse_hisparse_config(kvc.server_args)
+            self.c4_shrink_factor = hisparse_config.host_to_device_ratio
+            if self.disaggregation_mode == "decode":
+                req_to_token_context_len = (
+                    self.context_len
+                    + get_req_to_token_extra_context_len(kvc.server_args)
+                )
+                model_top_k = getattr(
+                    kvc.model_config.hf_text_config, "index_topk", None
+                )
+                top_k = hisparse_config.top_k if model_top_k is None else model_top_k
+                if (
+                    kvc.server_args.enable_multi_layer_eagle
+                    and kvc.spec_algorithm.is_eagle()
+                ):
+                    coordinator_instances = 1 + kvc.server_args.speculative_num_steps
+                elif (
+                    kvc.spec_algorithm.is_eagle()
+                    or kvc.spec_algorithm.is_standalone()
+                    or kvc.spec_algorithm.is_dflash()
+                ):
+                    coordinator_instances = 2
+                else:
+                    coordinator_instances = 1
+                self.hisparse_c4_geometry = HiSparseC4Geometry.create(
+                    context_len=req_to_token_context_len,
+                    c4_page_size=kvc.page_size // 4,
+                    device_buffer_size=hisparse_config.device_buffer_size,
+                    top_k=top_k,
+                    local_c4_layers=sum(1 for r in self.compression_ratios if r == 4),
+                    pd_extra_slots=self.disaggregation_decode_extra_slots,
+                    coordinator_instances=coordinator_instances,
+                )
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -735,7 +775,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # full-token capacity here.
         c128_state_ratio = 0
 
-        c4_frac = 1 / (4 * self.c4_shrink_factor)
+        request_level_c4 = self.hisparse_c4_geometry is not None
+        c4_frac = 0 if request_level_c4 else 1 / (4 * self.c4_shrink_factor)
+        hisparse_logical_mapping_bytes = 2 if request_level_c4 else 0
         return (
             self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac * kv_bytes * self.num_layers_ca4
@@ -747,15 +789,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * c4_state_ratio
             * c4_indexer_state_bytes
             * self.num_layers_ca4
+            + hisparse_logical_mapping_bytes
         )
 
-    def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
+    def _compute_dsv4_sizes(
+        self,
+        full_token: int,
+        page_size: int,
+        *,
+        hisparse_c4_size: Optional[int] = None,
+    ) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
-            c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
+            c4_max_total_num_tokens=(
+                hisparse_c4_size
+                if hisparse_c4_size is not None
+                else full_token // (4 * self.c4_shrink_factor)
+            ),
             c128_max_total_num_tokens=full_token // 128,
             c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
             c128_state_pool_size=0,
@@ -791,15 +844,47 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_c128_state_fixed_bytes_for_token_capacity(
         self, token_capacity: int
     ) -> int:
+        return self._get_c128_state_fixed_bytes(
+            self._get_reserved_max_running_requests(token_capacity)
+        )
+
+    def _get_reserved_max_running_requests(self, token_capacity: int) -> int:
         if self.requested_max_running_requests_per_worker is not None:
-            return self._get_c128_state_fixed_bytes(
-                self.requested_max_running_requests_per_worker
-            )
+            return self.requested_max_running_requests_per_worker
 
         estimated = int(token_capacity / self.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
-        max_running_requests = min(estimated, token_capacity // 2)
-        return self._get_c128_state_fixed_bytes(max_running_requests)
+        return min(estimated, token_capacity // 2)
+
+    def _reserve_hisparse_c4_layout(
+        self, token_capacity: int
+    ) -> Optional[HiSparseC4Layout]:
+        if self.hisparse_c4_geometry is None:
+            return None
+        if self._reserved_hisparse_c4_layout is None:
+            max_running_requests = max(
+                1,
+                self._get_reserved_max_running_requests(token_capacity),
+            )
+            self._reserved_hisparse_c4_layout = self.hisparse_c4_geometry.finalize(
+                max_running_requests
+            )
+        return self._reserved_hisparse_c4_layout
+
+    @staticmethod
+    def _hisparse_audit_log(layout: HiSparseC4Layout) -> str:
+        audit = layout.persistent_bytes
+        return (
+            f"mode=pd_decode, M={layout.max_running_requests}, "
+            f"N={layout.req_slot_count}, "
+            f"R={layout.resident_request_capacity}, "
+            f"c4_kv={audit.c4_kv}, c4_data_ptrs={audit.c4_data_ptrs}, "
+            f"allocator_free_pages={audit.allocator_free_pages}, "
+            f"logical_mapping_tail={audit.logical_mapping_tail}, "
+            f"req_to_token={audit.req_to_token}, "
+            f"coordinator_host_pool_ptrs={audit.coordinator_host_pool_ptrs}, "
+            f"coordinator={audit.coordinator}, total={audit.total}"
+        )
 
     def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
@@ -830,6 +915,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             config.c128_state_pool_size = num_req_slots
         else:
             config.c128_state_pool_size = num_req_slots * self.c128_ring_size
+        if self.hisparse_c4_geometry is not None:
+            layout = self.hisparse_c4_geometry.finalize(config.max_running_requests)
+            config.hisparse_c4_layout = layout
+            config.c4_max_total_num_tokens = layout.c4_device_slot_capacity
+            logger.info(
+                "DSV4 HiSparse C4 finalized: reserve_M=%d, %s, c4_slots=%d",
+                (
+                    self._reserved_hisparse_c4_layout.max_running_requests
+                    if self._reserved_hisparse_c4_layout is not None
+                    else layout.max_running_requests
+                ),
+                self._hisparse_audit_log(layout),
+                layout.c4_device_slot_capacity,
+            )
         return config
 
     def calculate_pool_sizes(
@@ -839,25 +938,42 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
-        if self.requested_max_running_requests_per_worker is not None:
-            c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
-                self.requested_max_running_requests_per_worker
-            )
-        else:
-            full_token = int(available_bytes / self.bytes_per_full_token)
-            c128_state_fixed_bytes = (
-                self._get_c128_state_fixed_bytes_for_token_capacity(full_token)
+        provisional_full_token = int(available_bytes / self.bytes_per_full_token)
+        c128_state_fixed_bytes = self._get_c128_state_fixed_bytes_for_token_capacity(
+            provisional_full_token
+        )
+        hisparse_layout = self._reserve_hisparse_c4_layout(provisional_full_token)
+        hisparse_fixed_bytes = (
+            hisparse_layout.persistent_bytes.total if hisparse_layout is not None else 0
+        )
+        persistent_fixed_bytes = c128_state_fixed_bytes + hisparse_fixed_bytes
+        if hisparse_layout is not None and available_bytes <= persistent_fixed_bytes:
+            raise RuntimeError(
+                "DSV4 persistent request footprint leaves no token budget: "
+                f"available_bytes={available_bytes}, "
+                f"c128_state={c128_state_fixed_bytes}, "
+                f"hisparse=({self._hisparse_audit_log(hisparse_layout)})"
             )
 
-        available_bytes_for_tokens = max(available_bytes - c128_state_fixed_bytes, 0)
+        available_bytes_for_tokens = max(available_bytes - persistent_fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
 
-        sizes = self._compute_dsv4_sizes(full_token, page_size)
+        sizes = self._compute_dsv4_sizes(
+            full_token,
+            page_size,
+            hisparse_c4_size=(
+                hisparse_layout.c4_device_slot_capacity
+                if hisparse_layout is not None
+                else None
+            ),
+        )
         logger.info(
             f"DSV4 memory calculation: "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"hisparse_persistent_fixed={hisparse_fixed_bytes / (1 << 30):.2f} GB, "
+            f"remaining_token_budget={available_bytes_for_tokens / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)
@@ -868,7 +984,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         assert (
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
-        sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
+        hisparse_layout = self._reserve_hisparse_c4_layout(max_total_num_tokens)
+        sizes = self._compute_dsv4_sizes(
+            max_total_num_tokens,
+            page_size,
+            hisparse_c4_size=(
+                hisparse_layout.c4_device_slot_capacity
+                if hisparse_layout is not None
+                else None
+            ),
+        )
         return self._to_config(sizes)
 
 
