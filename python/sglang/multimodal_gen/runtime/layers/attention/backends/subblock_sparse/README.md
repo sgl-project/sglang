@@ -4,15 +4,18 @@ Routes FlashInfer's 64-token block-sparse kernel (`bsa_attn_blk64_fwd`) with a
 sub-block score. Nothing is trained and no weights change: a cheap estimator
 runs before attention and hands the kernel a `q2k_block_index`.
 
+The defaults are the recommended configuration — they are what every number
+below was measured at, so the flag is all you need:
+
 ```bash
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
-  --num-gpus 8 --ulysses-degree 8 \
-  --attention-backend subblock_sparse_attn \
-  --attention-backend-config '{"sparsity": 0.75, "n_k": 4}'
+  --num-gpus 8 --ulysses-degree 8 --performance-mode speed \
+  --attention-backend subblock_sparse_attn
 ```
 
-Inline JSON gets mangled by `shlex.split`; pass a **file path** to
-`--attention-backend-config` if the shell eats the quotes.
+`--attention-backend-config` overrides individual keys, e.g.
+`'{"sparsity": 0.85}'` to trade quality for another 6%. Inline JSON gets mangled
+by `shlex.split`; pass a **file path** instead if the shell eats the quotes.
 
 ## What it runs on
 

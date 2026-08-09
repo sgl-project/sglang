@@ -10,11 +10,11 @@ Sparsity is not applied everywhere. The early denoise steps settle the layout
 of the sample and tolerate approximation badly, so the backend falls back to
 dense attention for them. Depth turns out not to matter the same way, which is
 why the layer cutoff defaults to zero -- see the defaults below. The schedule
-is configured through ``--attention-backend-config``::
+is configured through ``--attention-backend-config``, which overrides
+individual keys of the defaults below::
 
     --attention-backend subblock_sparse_attn \
-    --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10,
-                                 "skip_first_layers": 0, "n_k": 4}'
+    --attention-backend-config '{"sparsity": 0.85}'
 
 Requirements inherited from the kernel: compute capability 10.0 (B200 / GB200
 class -- it is built for ``sm_100a``, which does not forward-run on 10.3 or
