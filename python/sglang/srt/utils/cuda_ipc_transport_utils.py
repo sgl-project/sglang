@@ -1,5 +1,7 @@
 import fcntl
 import logging
+import os
+import tempfile
 import threading
 import time
 from multiprocessing import shared_memory
@@ -20,7 +22,14 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
     envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
 )
 
-SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+# Per-user lock path. The old hardcoded /tmp/shm_wr_lock.lock is created by
+# whichever user starts a server first; under a typical umask its mode (0644)
+# then denies every other user's scheduler the write needed to take the flock
+# (PermissionError), breaking cuda_ipc feature transport on shared hosts.
+# Scoping to the current uid also removes false cross-server lock contention.
+SHM_LOCK_FILE = os.path.join(
+    tempfile.gettempdir(), f"sgl_shm_wr_lock_{os.getuid()}.lock"
+)
 
 # Processors set this marker only when their encoder consumes each IPC feature
 # on a single TP rank.  The scheduler then keeps the feature lazy until the
