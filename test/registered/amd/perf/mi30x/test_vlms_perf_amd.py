@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - VLM models benchmark (~120 min)
 register_amd_ci(est_time=7200, suite="nightly-amd-perf-vlm-2-gpu", nightly=True)
 
-PROFILE_DIR = "performance_profiles_vlms_amd"
+RESULT_DIR = "performance_results_vlms_amd"
 
 # VLM models suitable for AMD
 MODEL_DEFAULTS = [
@@ -42,7 +42,7 @@ MODEL_DEFAULTS = [
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -95,8 +95,8 @@ class TestNightlyVLMsPerfAMD(unittest.TestCase):
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_VLM_OUTPUT_LENS", "512"))
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
@@ -123,7 +123,6 @@ class TestNightlyVLMsPerfAMD(unittest.TestCase):
                         output_lens=self.output_lens,
                         other_args=other_args,
                         extra_bench_args=extra_bench_args,
-                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]

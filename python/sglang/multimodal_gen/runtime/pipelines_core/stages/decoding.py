@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -250,7 +253,22 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
-                decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                try:
+                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                except Exception as error:
+                    if "out of memory" in str(error).lower():
+                        if not server_args.pipeline_config.vae_tiling:
+                            logger.warning(
+                                "OOM detected during VAE decoding. Please enable "
+                                "--vae-tiling to reduce peak memory usage."
+                            )
+                        else:
+                            logger.warning(
+                                "OOM detected during VAE decoding with tiling enabled. "
+                                "Please reduce the resolution or enable "
+                                "--vae-cpu-offload."
+                            )
+                    raise
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
@@ -297,14 +315,7 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            # Request-scoped VAE fast-path gate (see flux2_vae_cuda_opt):
-            # quality == "high" opts this decode into the near-lossless fast
-            # paths; the "lossless" default keeps the bit-exact original
-            # module path. VAEs without installed wrappers have no gate.
-            gate = getattr(vae, "_sgl_vae_fast_path_gate", None)
-            if gate is not None:
-                gate.enabled = getattr(batch.sampling_params, "quality", None) == "high"
-            try:
+            with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
                 frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
                 # decode trajectory latents if needed
@@ -333,9 +344,6 @@ class DecodingStage(PipelineStage):
                     trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
                 else:
                     trajectory_decoded = None
-            finally:
-                if gate is not None:
-                    gate.enabled = False
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
@@ -348,6 +356,7 @@ class DecodingStage(PipelineStage):
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
             noise_pred=None,
+            usage=batch.usage,
         )
 
         return output_batch

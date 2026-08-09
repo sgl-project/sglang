@@ -1,13 +1,8 @@
 """Numerics for the FP8 dense-linear GEMM backends (--fp8-gemm-backend).
 
-Runs the quant-method layer path (create_weights ->
-process_weights_after_loading -> apply) against a dequantized-reference
-matmul, covering the per-backend weight preparation (e.g. UE8M0 scale requant
-for DeepGEMM, per-backend MXFP8 scale packing) and the GEMM dispatch.
-Three formats: FP8 blockwise (Fp8LinearMethod), MXFP8 (Fp8LinearMethod with
-use_mxfp8), and per-tensor FP8 (ModelOptFp8LinearMethod, auto dispatch).
-The backend set adapts to the device SM version, so the same file covers
-Hopper (SM90), B200-class (SM100/103), and consumer Blackwell (SM120).
+Real layer path vs a dequantized-reference matmul, in three formats: FP8
+blockwise, MXFP8, and per-tensor FP8 (auto dispatch). Backend sets adapt to
+the device SM, so one file covers SM90 / SM100 / SM120.
 """
 
 import unittest
@@ -16,14 +11,17 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.quantization import fp8_utils
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp8Config,
-    ModelOptFp8LinearMethod,
-)
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.layer_ut_utils import (
+    assert_output_close,
+    init_single_process_dist,
+    load_linear_weights,
+    make_tp1_column_parallel_linear,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
@@ -99,26 +97,17 @@ def _quantize_mxfp8(w: torch.Tensor, block: int = 32):
     return w_fp8.reshape(n, k), scale_e8m0, w_dequant
 
 
-def _create_weights(method, n: int, k: int, device: str = "cuda"):
-    layer = torch.nn.Module()
-    kwargs = {}
-    if isinstance(method, Fp8LinearMethod):
-        # The shape check reads TP world size (needs distributed init); skip it here.
-        kwargs["skip_block_quant_check"] = True
-    method.create_weights(
-        layer,
-        input_size_per_partition=k,
-        output_partition_sizes=[n],
-        input_size=k,
-        output_size=n,
-        params_dtype=torch.bfloat16,
-        weight_loader=lambda *args, **kw: None,
-        **kwargs,
+def _make_linear(quant_config, n: int, k: int):
+    return make_tp1_column_parallel_linear(
+        quant_config, n, k, skip_block_quant_check=True
     )
-    return layer.to(device)
 
 
 class _LinearBackendCheck(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        init_single_process_dist()
+
     def _check_backend(self, backend: str, allowed, shapes, build_layer):
         if backend not in allowed:
             self.skipTest(f"{backend} not in SM{get_device_sm()} backend set")
@@ -130,21 +119,16 @@ class _LinearBackendCheck(CustomTestCase):
                     "FP8_GEMM_RUNNER_BACKEND",
                     Fp8GemmRunnerBackend(backend),
                 ):
-                    method, layer, w_dequant = build_layer(n, k)
-                    method.process_weights_after_loading(layer)
+                    layer, w_dequant = build_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
 
                     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
-                    out = method.apply(layer, x)
+                    out, _ = layer(x)
 
                     ref = x.float() @ w_dequant.T
-                    self.assertEqual(out.shape, (m, n))
-                    cos = torch.nn.functional.cosine_similarity(
-                        out.float().flatten(), ref.flatten(), dim=0
-                    ).item()
-                    self.assertGreater(cos, 0.99)
                     # atol covers single-element UE8M0 scale-rounding outliers
                     # (deep_gemm); a wrong kernel/layout fails by orders more.
-                    torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=1e-1)
+                    assert_output_close(self, out, ref, rtol=5e-2, atol=1e-1)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
@@ -156,13 +140,11 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
             activation_scheme="dynamic",
             weight_block_size=[128, 128],
         )
-        method = Fp8LinearMethod(quant_config)
-        layer = _create_weights(method, n, k)
+        layer = _make_linear(quant_config, n, k)
         w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
         w_fp8, scale_inv, w_dequant = _quantize_fp8_blockwise(w)
-        layer.weight.data.copy_(w_fp8)
-        layer.weight_scale_inv.data.copy_(scale_inv)
-        return method, layer, w_dequant
+        load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_inv)
+        return layer, w_dequant
 
     def _run(self, backend: str):
         self._check_backend(
@@ -197,13 +179,11 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
             activation_scheme="dynamic",
             use_mxfp8=True,
         )
-        method = Fp8LinearMethod(quant_config)
-        layer = _create_weights(method, n, k)
+        layer = _make_linear(quant_config, n, k)
         w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
         w_fp8, scale_e8m0, w_dequant = _quantize_mxfp8(w)
-        layer.weight.data.copy_(w_fp8)
-        layer.weight_scale_inv.data.copy_(scale_e8m0)
-        return method, layer, w_dequant
+        load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_e8m0)
+        return layer, w_dequant
 
     def _run(self, backend: str):
         self._check_backend(backend, _mxfp8_backends(), MXFP8_SHAPES, self._build_layer)
@@ -225,17 +205,22 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
 
     @staticmethod
     def _build_layer(n: int, k: int):
-        quant_config = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
-        method = ModelOptFp8LinearMethod(quant_config)
-        layer = _create_weights(method, n, k)
+        quant_config = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True, packed_modules_mapping={}
+        )
+        layer = _make_linear(quant_config, n, k)
         w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
         scale = (w.float().abs().max() / FP8_MAX).clamp(min=1e-12)
         w_fp8 = (w.float() / scale).to(torch.float8_e4m3fn)
-        layer.weight.data.copy_(w_fp8)
-        layer.weight_scale.data.fill_(scale)
-        layer.input_scale.data.fill_(1.0 / FP8_MAX)
+        # 0-dim scales exercise weight_loader_v2's scalar reshape branch.
+        load_linear_weights(
+            layer,
+            weight=w_fp8,
+            weight_scale=scale,
+            input_scale=torch.tensor(1.0 / FP8_MAX, device="cuda"),
+        )
         w_dequant = w_fp8.float() * scale
-        return method, layer, w_dequant
+        return layer, w_dequant
 
     def test_auto(self):
         self._check_backend("auto", ["auto"], PER_TENSOR_SHAPES, self._build_layer)
