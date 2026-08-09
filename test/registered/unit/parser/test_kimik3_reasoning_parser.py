@@ -50,14 +50,7 @@ def _chunks(text: str, size: int) -> list[str]:
             "",
             "plain reply",
         ),
-        # No think markers at all: the model skipped the think channel, so the
-        # bare text is content, not truncated reasoning.
-        ("still going", "", "still going"),
-        (
-            f"bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}",
-            "",
-            "bare answer",
-        ),
+        ("still going", "still going", ""),
     ],
 )
 def test_non_stream_reasoning_channels(text: str, reasoning: str, content: str) -> None:
@@ -94,9 +87,7 @@ def test_non_stream_recovers_missing_think_separator() -> None:
 @pytest.mark.parametrize(
     ("text", "reasoning", "content"),
     [
-        # A bare partial "<|close|>" suffix carries no think-channel signal:
-        # treated as content with the partial marker stripped.
-        ("deep thought<|close|>", "", "deep thought"),
+        ("deep thought<|close|>", "deep thought", ""),
         ("deep thought<|close|>think", "deep thought", ""),
         (f"{THINK_CLOSE}<|open|>", "", ""),
         (f"{THINK_CLOSE}<|open|>response", "", ""),
@@ -169,3 +160,70 @@ def test_reasoning_parser_registration() -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def _stream_with_finish(detector: KimiK3Detector, chunks: list[str]) -> tuple[str, str]:
+    reasoning, content = _stream(detector, chunks)
+    result = detector.finish()
+    return reasoning + result.reasoning_text, content + result.normal_text
+
+
+@pytest.mark.parametrize(
+    ("text", "reasoning", "content"),
+    [
+        (
+            f"bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}",
+            "",
+            "bare answer",
+        ),
+        (
+            f"{RESPONSE_OPEN}bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}",
+            "",
+            "bare answer",
+        ),
+        ("still going", "still going", ""),
+        ("deep thought<|close|>", "deep thought", ""),
+    ],
+)
+def test_fnc_non_stream_skipped_think_vs_truncated_reasoning(
+    text: str, reasoning: str, content: str
+) -> None:
+    detector = KimiK3Detector(force_reasoning=True, force_nonempty_content=True)
+    result = detector.detect_and_parse(text)
+    assert result.reasoning_text == reasoning
+    assert result.normal_text == content
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 13])
+def test_fnc_streaming_skipped_think_answer(chunk_size: int) -> None:
+    detector = KimiK3Detector(force_reasoning=True, force_nonempty_content=True)
+    text = f"bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+    reasoning, content = _stream_with_finish(detector, _chunks(text, chunk_size))
+    # Streamed as reasoning in real time; finish() re-emits the cleaned
+    # payload as content once the channel close proves skipped-think.
+    assert reasoning == text
+    assert content == "bare answer"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 13])
+def test_fnc_streaming_truncated_reasoning_stays_reasoning(chunk_size: int) -> None:
+    detector = KimiK3Detector(force_reasoning=True, force_nonempty_content=True)
+    reasoning, content = _stream_with_finish(
+        detector, _chunks("still going", chunk_size)
+    )
+    assert reasoning == "still going"
+    assert content == ""
+
+
+@pytest.mark.parametrize("chunk_size", [5, 13])
+def test_fnc_streaming_long_think_streams_without_close(chunk_size: int) -> None:
+    detector = KimiK3Detector(force_reasoning=True, force_nonempty_content=True)
+    text = "x" * 20000
+    reasoning = ""
+    for chunk in _chunks(text, chunk_size):
+        # Live chunks flow immediately — no hold-back to starve SSE idle timeouts.
+        reasoning += detector.parse_streaming_increment(chunk).reasoning_text
+    assert reasoning == text
+    result = detector.finish()
+    assert result.reasoning_text == ""
+    assert result.normal_text == ""

@@ -451,6 +451,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = True,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         # strict-thinking flattens these to single token ids, so the full marker
         # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
@@ -476,8 +477,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             reasoning_default="thinking",
         )
+        # Unlike the base class, K3 cannot use `normal_text == ""` alone:
+        # skipped-think and truncated marker-free reasoning end up identical.
+        self._force_nonempty_content = force_nonempty_content
         self._reasoning_done = False
         self._tools_passthrough = False
+        self._stream_text = ""
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -494,21 +499,10 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         return min(found) if found else -1
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
-        # The model may skip the think channel entirely: it then answers
-        # directly (bare content, optionally wrapped in a response channel) and
-        # emits no think markers at all. With neither the think open nor the
-        # think close marker present, there is no reasoning to extract and
-        # everything is content. force_reasoning only means the think open may
-        # have been consumed as a generation prefix; it must not turn a
-        # think-free answer into reasoning.
-        if (
-            self.think_start_token not in text
-            and self.think_end_token not in text
-            # Also rule out partial think markers: a truncated think-close must
-            # still take the reasoning path (e.g. recovering a missing <|sep|>).
-            and self.think_start_token.removesuffix("<|sep|>") not in text
-            and self.think_end_token.removesuffix("<|sep|>") not in text
-        ):
+        in_reasoning = self._in_reasoning or self.think_start_token in text
+        if not in_reasoning and self.think_end_token not in text:
+            return StreamingParseResult(normal_text=self._clean_content(text))
+        if self._force_nonempty_content and self._is_skipped_think_answer(text):
             return StreamingParseResult(normal_text=self._clean_content(text))
 
         open_idx = text.find(self.think_start_token)
@@ -531,8 +525,19 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             reasoning_text=reasoning_text, normal_text=self._clean_content(rest)
         )
 
+    def _is_skipped_think_answer(self, text: str) -> bool:
+        return (
+            self.think_start_token not in text
+            and self.think_end_token not in text
+            and self.think_start_token.removesuffix("<|sep|>") not in text
+            and self.think_end_token.removesuffix("<|sep|>") not in text
+            and (RESPONSE_CLOSE in text or MESSAGE_CLOSE in text)
+        )
+
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         self._buffer += new_text
+        if self._force_nonempty_content:
+            self._stream_text += new_text
 
         if not self._in_reasoning and not self._reasoning_done:
             open_idx = self._buffer.find(self.think_start_token)
@@ -591,6 +596,17 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return StreamingParseResult(reasoning_text=emit)
 
         return StreamingParseResult(normal_text=self._drain_content())
+
+    def finish(self) -> StreamingParseResult:
+        if not self._force_nonempty_content:
+            return StreamingParseResult()
+        text, self._stream_text = self._stream_text, ""
+        # A skipped-think answer was streamed as reasoning (no channel decision
+        # is possible mid-stream); close evidence re-emits it as content, like
+        # the base class's finish() re-emit of its accumulated reasoning.
+        if self._is_skipped_think_answer(text):
+            return StreamingParseResult(normal_text=self._clean_content(text))
+        return StreamingParseResult()
 
     def _drain_content(self) -> str:
         buf = self._buffer
