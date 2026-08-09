@@ -480,8 +480,11 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           has_metrics=false
-          for dir in /tmp/metrics/metrics-*/; do
-            file="${dir}metrics.json"
+          # Each suite job uploads its METRICS_DATA_FILE directory, which
+          # contains per-case subdirectories with their own metrics.json.
+          # Recursively find every metrics.json and render one table row per
+          # test case.
+          for file in $(find /tmp/metrics -name metrics.json 2>/dev/null); do
             if [ -f "$file" ]; then
               has_metrics=true
               echo "import json" > /tmp/parse_metrics.py

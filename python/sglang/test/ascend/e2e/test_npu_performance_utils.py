@@ -998,7 +998,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         out_path = os.path.join(cls.metrics_data_file, "metrics.json")
         payload = {
             "test_case": cls.tc_name,
-            "test_type": getattr(cls, "test_type", "accuracy"),
+            "test_type": getattr(cls, "test_type", "perf"),
             "metrics": metrics,
             "baselines": baselines,
         }
@@ -1008,6 +1008,14 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             logger.info("Saved per-case metrics to %s", out_path)
         except Exception as e:
             logger.warning("Failed to write metrics.json: %s", e)
+        # The JSONL files are intermediate raw records; remove them after the
+        # aggregated metrics.json has been written so the per-case directory
+        # only keeps the final result.
+        for jsonl_path in glob.glob(pattern):
+            try:
+                os.remove(jsonl_path)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", jsonl_path, e)
 
     @classmethod
     def _backup_plog(cls):

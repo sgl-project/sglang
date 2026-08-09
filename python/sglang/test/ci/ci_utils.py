@@ -162,6 +162,26 @@ def run_unittest_files(
     if coredump_enabled:
         cuda_coredump.cleanup_dump_dir()
 
+    # Directory for per-case full logs. When set (e.g. the workflow passes the
+    # structured logs/log directory), each case's complete output is written to
+    # {SGLANG_TEST_LOG_DIR}/{tc_name}.log and only key lines are echoed to the
+    # job console so the web UI does not time out on huge aggregated logs.
+    log_dir = os.environ.get("SGLANG_TEST_LOG_DIR")
+
+    # Lines that are echoed to the console in full-output mode; everything else
+    # goes to the per-case file only.
+    _KEY_LINE_PATTERNS = re.compile(
+        r"\[METRIC\]|\[METRICS\]|^(PASSED|FAILED|ERROR|SKIPPED|Traceback|"
+        r"AssertionError|TimeoutError|ImportError|ModuleNotFoundError|RuntimeError)|"
+        r"Test Summary|Begin \(|End \(|\u2717|\u2713|\u21bb|\b(PASSED|FAILED):"
+    )
+
+    def _log_console(line: str) -> bool:
+        """Return True when the line should be echoed to the job console."""
+        if log_dir is None:
+            return True
+        return bool(_KEY_LINE_PATTERNS.search(line))
+
     tic = time.perf_counter()
     success = True
     passed_tests = []
@@ -192,23 +212,43 @@ def run_unittest_files(
 
             cmd = ["python3", full_path, "-f"]
 
-            if capture_output:
-                # Capture output for retry decision
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
-                )
-                output_lines = []
-                for line in process.stdout:
-                    logger.info(line.rstrip())
+            # Always capture output so the per-case log can be persisted and the
+            # job console stays lean when SGLANG_TEST_LOG_DIR is set. The
+            # `capture_output` flag only controls whether the full output is kept
+            # in memory for retry decisions.
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
+            )
+            output_lines = []
+            # Full per-case log file (streamed line by line so memory stays bounded
+            # even when the per-case log is not needed for retry decisions).
+            case_log = None
+            if log_dir:
+                try:
+                    tc_name = os.path.splitext(os.path.basename(filename))[0]
+                    case_log = os.path.join(log_dir, f"{tc_name}.log")
+                    os.makedirs(os.path.dirname(case_log), exist_ok=True)
+                    case_log = open(case_log, "w", encoding="utf-8", errors="ignore")
+                except Exception as e:  # pragma: no cover - best effort only
+                    logger.warning(f"Failed to open per-case log: {e}")
+                    case_log = None
+            for line in process.stdout:
+                if capture_output:
                     output_lines.append(line)
-                process.wait()
-            else:
-                process = subprocess.Popen(cmd, stdout=None, stderr=None)
-                process.wait()
+                if case_log is not None:
+                    case_log.write(line)
+                if _log_console(line):
+                    logger.info(line.rstrip())
+            process.wait()
+            if case_log is not None:
+                try:
+                    case_log.close()
+                except Exception:  # pragma: no cover
+                    pass
 
             elapsed = time.perf_counter() - file_tic
             file_elapsed[filename] = elapsed
