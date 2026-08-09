@@ -86,6 +86,10 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+  # Validation branch: pin every job to one image instead of the nightly lookup.
+  # A called workflow does not inherit the caller's env, so this repeats the
+  # value set in pr-test-amd.yml.
+  CUSTOM_IMAGE: rocm/sgl-dev:v0.5.13.post1-ubuntu24.04-py3.14-rocm7.14
 
 concurrency:
   # Mirror pr-test-amd.yml: schedule/dispatch runs key on run_id (unique group,
@@ -119,8 +123,11 @@ jobs:
       github.event.label.name == 'run-ci-extra'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci: true
-      require-run-ci-extra: true
+      # Validation branch: the run must start on PR creation, before any label
+      # can be applied, so drop the label requirement and the actor cooldown.
+      require-run-ci: false
+      require-run-ci-extra: false
+      cool-down-minutes: 0
     secrets: inherit
 
   # =============================================== extra-a (1-gpu-small) ===============================================
@@ -155,7 +162,7 @@ jobs:
       - name: Run test
         timeout-minutes: 45
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --timeout-per-file 1800 ${{ (github.event_name == 'pull_request' || inputs.continue_on_error == true) && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (1-gpu-large) ===============================================
   # Single-GPU lora / spec / quant model e2e tests. Runs on the same 1-gpu
@@ -186,7 +193,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --timeout-per-file 1800 ${{ (github.event_name == 'pull_request' || inputs.continue_on_error == true) && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
@@ -216,7 +223,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --timeout-per-file 1800 ${{ (github.event_name == 'pull_request' || inputs.continue_on_error == true) && '--continue-on-error' || '' }}
 
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job
