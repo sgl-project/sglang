@@ -1,22 +1,24 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.layers.moe.utils import (
+    install_shared_experts_fusion_decision,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.runtime_context import get_context, get_exec
+from sglang.srt.runtime_context import get_context, get_exec, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
-    """The disable decision is a load-time resolution: it lands on the
-    published config bag via declare_load_time_override (bag-only; the
-    ServerArgs instance stays pristine)."""
+    """V4 fuses its shared expert only when explicitly asked to.
 
-    def _make_model(self, n_shared_experts=1):
-        return SimpleNamespace(
-            config=SimpleNamespace(n_shared_experts=n_shared_experts)
-        )
+    The gate is a question the loader asks the model class before any layer
+    exists (``shared_experts_fusion_disable_reason``); the answer is installed
+    on the ACTIVE moe flag, and the config bag keeps the user's intent.
+    """
 
     def _publish(self, enforce):
         override = get_context().override_server_args(
@@ -24,25 +26,47 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        get_flags().moe.disable_shared_experts_fusion = None
+        self.addCleanup(
+            lambda: setattr(get_flags().moe, "disable_shared_experts_fusion", None)
+        )
+
+    def _install(self, n_shared_experts=1):
+        install_shared_experts_fusion_decision(
+            DeepseekV4ForCausalLM,
+            SimpleNamespace(n_shared_experts=n_shared_experts),
+            None,
+        )
 
     def test_disables_shared_fusion_without_enforce(self):
         self._publish(enforce=False)
-        model = self._make_model()
-
-        DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
-
-        self.assertEqual(model.num_fused_shared_experts, 0)
-        # post-init declaration lands on the published config bag
-        self.assertTrue(get_exec().moe.disable_shared_experts_fusion)
+        self.assertEqual(
+            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                SimpleNamespace(n_shared_experts=1), None
+            ),
+            "Config does not support fused shared expert(s).",
+        )
+        self._install()
+        # The decision lands on the ACTIVE flag; the config intent is untouched.
+        self.assertTrue(is_shared_experts_fusion_disabled())
+        self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)
-        model = self._make_model()
+        self.assertIsNone(
+            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                SimpleNamespace(n_shared_experts=1), None
+            )
+        )
+        self._install()
+        self.assertFalse(is_shared_experts_fusion_disabled())
 
-        DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
-
-        self.assertEqual(model.num_fused_shared_experts, 1)
-        self.assertFalse(get_exec().moe.disable_shared_experts_fusion)
+    def test_enforcing_with_more_than_one_shared_expert_is_rejected(self):
+        self._publish(enforce=True)
+        with self.assertRaisesRegex(ValueError, "exactly one shared"):
+            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                SimpleNamespace(n_shared_experts=2), None
+            )
 
 
 if __name__ == "__main__":

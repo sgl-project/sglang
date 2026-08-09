@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+_SUPPORTED_CACHE_DTYPES = (*_SUPPORTED_DTYPES, torch.float32)
+
 
 @cache_once
 def _jit_qknorm_rope_module(
@@ -56,6 +59,13 @@ def can_use_fused_inplace_qknorm_rope(
     cache_dtype: torch.dtype = torch.float32,
     round_norm_before_rope: bool = False,
 ) -> bool:
+    if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
+        logger.warning(
+            "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",
+            dtype,
+            cache_dtype,
+        )
+        return False
     if head_dim not in (64, 128, 256):
         logger.warning(f"Unsupported head_dim={head_dim} for JIT fused QKNorm+RoPE")
         return False

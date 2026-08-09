@@ -306,8 +306,6 @@ class ModelRunner:
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = ps.tp_rank % self.dcp_size
         self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
@@ -938,7 +936,7 @@ class ModelRunner:
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
 
-        if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
+        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -2042,9 +2040,12 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
-        get_context().override(
-            "model_runner.update_model_fields",
-            model_path=model_path,
-            load_format=load_format,
-        )
+        # The record says what model this PROCESS serves; a draft's weight
+        # update is not that (its own state is on the runner).
+        if not self.is_draft_worker:
+            get_context().override(
+                "model_runner.update_model_fields",
+                model_path=model_path,
+                load_format=load_format,
+            )
         self.load_config = load_config
