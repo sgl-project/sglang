@@ -362,7 +362,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):
             draft_backend_factory = DraftBackendFactory(
-                self.server_args,
                 self.draft_runner_list[step],
                 self.topk,
                 self.speculative_num_steps,
