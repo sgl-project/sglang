@@ -3533,6 +3533,12 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
+        # Construction resolves today; step 12 moves this call to publish,
+        # where the pipeline runs once per process against the raw record.
+        # The seam is the point of the split -- nothing else may call it.
+        self._run_resolution_pipeline()
+
+    def _run_resolution_pipeline(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
 
