@@ -26,10 +26,8 @@ class TestOpenAICompletionRustParity(CustomTestCase):
     api_key = "sk-123456"
 
     def _get_logprobs(self, *, rust_frontend):
-        # The assertions below require bit-identical logprobs. A prefill CUDA
-        # graph pads the batch, so the numerics follow whichever requests share
-        # the forward pass, and the two frontends do not always warm up into the
-        # same batch. Pin prefill to eager so only the frontend differs.
+        # Prefill CUDA graph pads the batch, so numerics follow whichever
+        # requests share the forward pass; the assertions below need equality.
         process = popen_launch_server(
             self.model,
             DEFAULT_URL_FOR_TEST,
