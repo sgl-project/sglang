@@ -205,6 +205,7 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
+            self.stripped_think_start = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
@@ -221,6 +222,7 @@ class BaseReasoningFormatDetector:
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
+                self.stripped_think_start = False
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
