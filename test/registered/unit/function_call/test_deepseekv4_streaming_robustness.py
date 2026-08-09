@@ -10,12 +10,9 @@ Coverage areas:
   - Serving-code integration: finish_reason via real _process_tool_call_stream (REQ-4)
   - Parameter parsing and type conversion (REQ-5)
   - Multiple sequential tool calls (REQ-6)
-  - bot_token mismatch resilience (REQ-7)
-  - Regression tests for known bug classes (REQ-8)
+  - bot_token override resilience (REQ-7)
+  - Edge case tests for known parser behaviors (REQ-8)
   - DSPARK truncation simulation (REQ-9)
-
-Tasks 5.2 (TestMalformedJSONRecovery, #32332) and 5.3 (TestFinalDeltaArgLoss,
-#32167) are DEFERRED to their respective fix PRs — SGLang does not use xfail.
 """
 
 import asyncio
@@ -194,33 +191,9 @@ def _opener_token_split(
 
 # ── Serving-code test infrastructure ────────────────────────────────────────
 
-# Lazy-import serving_chat to avoid pulling GPU-only deps on CPU CI.
-_SERVING_CHAT_CLS = None
-
-
-def _get_serving_chat_cls():
-    """Lazily import OpenAIServingChat, stubbing sgl_kernel if needed."""
-    global _SERVING_CHAT_CLS
-    if _SERVING_CHAT_CLS is not None:
-        return _SERVING_CHAT_CLS
-    try:
-        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-
-        _SERVING_CHAT_CLS = OpenAIServingChat
-    except Exception:
-        try:
-            from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-            maybe_stub_sgl_kernel()
-            from sglang.srt.entrypoints.openai.serving_chat import (
-                OpenAIServingChat,
-            )
-
-            _SERVING_CHAT_CLS = OpenAIServingChat
-        except Exception as e:
-            logger.warning("Could not import OpenAIServingChat: %s", e)
-            _SERVING_CHAT_CLS = False  # mark as unavailable
-    return _SERVING_CHAT_CLS
+# conftest.py patches torch.compile and stubs sgl_kernel before this import,
+# so serving_chat can be imported on macOS/CPU.
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
 
 def _make_fake_serving_chat(tokenizer=None):
@@ -229,10 +202,7 @@ def _make_fake_serving_chat(tokenizer=None):
     Only sets attributes that _process_tool_call_stream and
     _check_for_unstreamed_tool_args actually read.
     """
-    cls = _get_serving_chat_cls()
-    if not cls:
-        return None
-    chat = cls.__new__(cls)
+    chat = OpenAIServingChat.__new__(OpenAIServingChat)
     chat.tool_call_parser = "deepseekv4"
     chat.reasoning_parser = None
     chat._reasoning_detector = None
@@ -302,16 +272,22 @@ class TestPreamblePreservation(unittest.TestCase):
         self.full_bare = self.prose + self.bare
 
     def test_prose_and_tool_call_one_delta_wrapped(self):
-        """REQ-1.1: prose + complete wrapped tool call — non-streaming preserves preamble.
+        """REQ-1.1: prose + complete wrapped tool call in one delta.
 
-        NOTE: Streaming `parse_streaming_increment` currently drops preamble
-        when prose and tool call arrive in the same delta (#33813, OPEN).
-        `detect_and_parse` (non-streaming) correctly preserves it.
+        Both non-streaming `detect_and_parse` and streaming
+        `parse_streaming_increment` MUST preserve the preamble prose.
         """
+        # Non-streaming
         det = DeepSeekV4Detector()
         result = det.detect_and_parse(self.full_wrapped, self.tools)
         self.assertIn("Let me check", result.normal_text)
         self.assertTrue(any(c.name == "get_weather" for c in result.calls))
+
+        # Streaming — same delta (prose + tool call together)
+        det2 = DeepSeekV4Detector()
+        result2 = det2.parse_streaming_increment(self.full_wrapped, self.tools)
+        self.assertIn("Let me check", result2.normal_text)
+        self.assertTrue(any(c.name == "get_weather" for c in result2.calls))
 
     def test_prose_and_tool_call_one_delta_bare(self):
         """REQ-1.4: prose + bare invoke in separate deltas preserves preamble."""
@@ -336,7 +312,7 @@ class TestPreamblePreservation(unittest.TestCase):
         with a DSML prefix character (e.g. '<'), streaming normal_text MUST
         equal detect_and_parse normal_text.  When delta 1 ends with '<', the
         detector buffers everything (known behavior) — that case is covered
-        by TestPreambleLossRegression.
+        by TestPreambleSameDelta.
         """
         # Reference normal_text from detect_and_parse
         det_ref = DeepSeekV4Detector()
@@ -802,8 +778,6 @@ class TestUnstreamedToolArgsRecovery(unittest.TestCase):
         parser.parse_stream_chunk('Prose.\n<｜DSML｜invoke name="ba')
 
         chat = _make_fake_serving_chat()
-        if chat is None:
-            self.skipTest("OpenAIServingChat not importable on CPU")
 
         content = _make_content()
         request = _make_request(self.tools)
@@ -840,8 +814,6 @@ class TestFinishReasonViaRealCodePath(unittest.TestCase):
         self.tools = _make_tools()
         self.tokenizer = _get_tokenizer()
         self.chat = _make_fake_serving_chat(self.tokenizer)
-        if self.chat is None:
-            self.skipTest("OpenAIServingChat not importable on CPU")
 
     def _feed_deltas(self, deltas: Sequence[str]) -> Tuple[List[dict], Dict[int, bool]]:
         """Feed deltas through real _process_tool_call_stream, collect SSE."""
@@ -935,30 +907,26 @@ class TestFinishReasonViaRealCodePath(unittest.TestCase):
         )
 
 
-class TestFullPipelineProductionBugReproduction(unittest.TestCase):
-    """REQ-3.5: full integrated pipeline reproducing the ~7-8% production regression.
+class TestStreamEndPartialOpenerIntegration(unittest.TestCase):
+    """REQ-3.5: stream-end partial opener — serving-code integration.
 
-    The failure path: prose + partial DSML opener across 3 separate deltas,
-    then stream end.  The integrated pipeline (detector → has_tool_calls →
-    _check_for_unstreamed_tool_args → finish_reason) must produce:
-    (a) prose emitted as content,
-    (b) no tool_calls in output,
-    (c) finish_reason='stop',
-    (d) _check_for_unstreamed_tool_args returns None.
+    Behavior-pinning test for the current stream-end recovery gap: when
+    a partial DSML opener sits un-parsed in the detector buffer at stream
+    end, the serving code has no mechanism to recover it (the opener was
+    never named, so `_check_for_unstreamed_tool_args` returns None).
 
-    This is a behavior-pinning test: it documents the CURRENT behavior so
-    that any future change to stream-end recovery is detected.
+    This test pins the current behavior so that a future stream-end
+    recovery fix (e.g. a `finalize()` method on the detector) will be
+    detected as a behavior change.
     """
 
     def setUp(self):
         self.tools = _make_tools()
         self.tokenizer = _get_tokenizer()
         self.chat = _make_fake_serving_chat(self.tokenizer)
-        if self.chat is None:
-            self.skipTest("OpenAIServingChat not importable on CPU")
 
     def test_production_bug_scenario(self):
-        """Reproduce the exact failure path from the production regression."""
+        """Stream-end partial opener through the full integrated pipeline."""
         parser_dict: Dict[int, Any] = {}
         has_tool_calls: Dict[int, bool] = {}
         content = _make_content()
@@ -1122,21 +1090,16 @@ class TestOpenerTruncationMidOpener(unittest.TestCase):
 
 
 # =====================================================================
-# Phase 5: Regression Tests for Known Bug Classes (REQ-8)
+# Phase 5: Edge Case Tests for Known Parser Behaviors (REQ-8)
 # =====================================================================
 
 
-class TestPreambleLossRegression(unittest.TestCase):
-    """REQ-8.1: Preamble loss regression (#31786/#33813).
+class TestPreambleSameDelta(unittest.TestCase):
+    """REQ-8.1: Preamble preservation when prose and DSML opener share a delta.
 
-    Behavior-pinning test: when prose and the DSML opener arrive in the
-    same delta, `parse_streaming_increment` currently returns
-    `normal_text=''` (dropping the preamble).  This is the #33813 bug,
-    which is OPEN and only cherry-picked to the production branch.
-
-    When the #33813 fix is merged to main, this test will FAIL —
-    forcing the fix author to flip the assertion to assert prose
-    preservation.
+    When prose and the DSML opener arrive in the same streaming delta,
+    `parse_streaming_increment` MUST preserve the preamble prose in
+    `normal_text` — not silently drop it.
 
     `detect_and_parse` (non-streaming) already preserves preamble.
     """
@@ -1153,20 +1116,18 @@ class TestPreambleLossRegression(unittest.TestCase):
         self.assertIn("Let me help", result.normal_text)
         self.assertTrue(any(c.name == "get_weather" for c in result.calls))
 
-    def test_streaming_same_delta_currently_drops_preamble(self):
-        """parse_streaming_increment drops preamble in same delta (#33813 OPEN).
+    def test_streaming_same_delta_preserves_preamble(self):
+        """parse_streaming_increment MUST preserve preamble in same delta.
 
-        Pinning current behavior: normal_text is '' when prose + tool
-        call arrive in the same streaming delta.  Flip to assertNotEqual
-        when #33813 is merged.
+        When prose and the DSML tool-call opener arrive in the same
+        streaming delta, the preamble prose must be emitted as
+        `normal_text` — not dropped.
         """
         body = PARAM_FMT.format("city", "true", "SF")
         text = "Let me help.\n" + _wrapped_call(_invoke("get_weather", body))
         det = DeepSeekV4Detector()
         result = det.parse_streaming_increment(text, self.tools)
-        # Current buggy behavior: preamble is dropped
-        self.assertEqual(result.normal_text, "")
-        # Tool call IS detected
+        self.assertIn("Let me help", result.normal_text)
         self.assertTrue(any(c.name == "get_weather" for c in result.calls))
 
     def test_streaming_separate_deltas_preserves_preamble(self):
@@ -1181,7 +1142,7 @@ class TestPreambleLossRegression(unittest.TestCase):
 
 
 class TestFenceLeak(unittest.TestCase):
-    """REQ-8.4: Fence leak regression (#29426).
+    """REQ-8.4: Fence leak detection (#29426).
 
     Raw DSML markers must NOT leak into normal_text when the parser
     successfully detects a tool call.
@@ -1289,8 +1250,6 @@ class TestEmptyContentDeltaBeforeTool(unittest.TestCase):
         self.tools = _make_tools()
         self.tokenizer = _get_tokenizer()
         self.chat = _make_fake_serving_chat(self.tokenizer)
-        if self.chat is None:
-            self.skipTest("OpenAIServingChat not importable on CPU")
 
     def test_no_empty_content_sse_chunk(self):
         """No SSE chunk with delta.content='' is emitted to the client."""
