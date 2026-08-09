@@ -38,7 +38,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -59,6 +58,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -344,7 +344,7 @@ class MambaPool:
         #   replayssm_rawv: [num_layers, num_slots, HV, L, V]  (conv/activation dtype)
         #   replayssm_rawk: [num_layers, num_slots, H,  L, K]  (conv/activation dtype)
         #   replayssm_beta: [num_layers, num_slots, HV, L]     (fp32)
-        # The raw rings + beta exist only under --enable-gdn-replayssm-spec: the
+        # The raw rings + beta exist only under --enable-linear-replayssm-spec: the
         # closed-loop exact fold sequentially replays them through the recurrent
         # update at flush -- bit-identical to the recurrent baseline -- instead
         # of folding the chunked `d` records open-loop (which accumulates error
@@ -380,7 +380,7 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        # None under --enable-gdn-replayssm-spec: the spec ring owns rollback
+        # None under --enable-linear-replayssm-spec: the spec ring owns rollback
         # (verify writes ring records, commit moves cursors), so the per-draft
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
@@ -468,7 +468,7 @@ class MambaPool:
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -487,12 +487,13 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-gdn-replayssm-spec) always uses fold-every-commit and
+        # (--enable-linear-replayssm-spec) always uses fold-every-commit and
         # allocates only the raw (v, k, g, beta) window -- no chunked records,
-        # no cursors. The shared g allocation gates on `_replayssm_on`.
-        self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
-        self.replayssm_spec_fold = bool(enable_gdn_replayssm_spec)
-        _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
+        # no cursors (KDA additionally keeps d/k, see the allocation below).
+        # The shared g allocation gates on `_replayssm_on`.
+        self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        self.replayssm_spec_fold = bool(enable_linear_replayssm_spec)
+        _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -570,7 +571,7 @@ class MambaPool:
             # flag is on; otherwise left as None so the legacy State is
             # byte-identical. temporal_state_shape == (HV, V, K). Either the decode
             # ring (--enable-linear-replayssm) or the spec-verify ring
-            # (--enable-gdn-replayssm-spec) shares this allocation.
+            # (--enable-linear-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
             replayssm_rawv = replayssm_rawk = replayssm_beta = None
             if _replayssm_on:
@@ -580,16 +581,23 @@ class MambaPool:
                 num_slots = size + 1
                 # Ring dtype. DECODE ring (--enable-linear-replayssm): records
                 # follow the SSM dtype -- its flush folds `d` directly into the
-                # state. SPEC-verify ring (--enable-gdn-replayssm-spec): d/k feed
+                # state. SPEC-verify ring (--enable-linear-replayssm-spec): d/k feed
                 # ONLY the one-shot output reconstruction (the closed-loop exact
                 # fold replays the raw rings for state instead), so their
                 # quantization noise stays below the bf16 output cast; keep them
                 # in the conv/activation dtype instead of the (fp32-enforced)
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
-                ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
-                # Fold-every-commit: one verify window, no chunked (d, k) records.
-                if self.replayssm_spec_fold:
+                ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
+                # Fold-every-commit: one verify window, no chunked (d, k)
+                # records. KDA is the exception on both counts: its window
+                # stays L-sized (the fused verify ring-write drops
+                # absorb-inflated rows past L), and d/k stay allocated --
+                # forward_decode routes on `replayssm_d is None` (fused vs
+                # decode-ring), so skipping them would flip KDA decode to the
+                # fused path, a behavior change needing its own validation
+                # (memory follow-up).
+                if self.replayssm_spec_fold and not cache_params.is_kda:
                     record_len = (
                         speculative_num_draft_tokens
                         if speculative_num_draft_tokens is not None
@@ -597,6 +605,7 @@ class MambaPool:
                     )
                 else:
                     record_len = L
+                if not self.replayssm_spec_fold or cache_params.is_kda:
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,
@@ -626,7 +635,22 @@ class MambaPool:
                 # flush replays these through the recurrent update sequentially
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
-                if enable_gdn_replayssm_spec:
+                if enable_linear_replayssm_spec:
+                    if cache_params.is_kda:
+                        # Backstop for the KDA ring invariants; this pool is
+                        # sized with the final adaptive-aware draft maximum.
+                        if L & (L - 1) != 0:
+                            raise ValueError(
+                                f"spec-verify ring length must be a power of two, got {L}"
+                            )
+                        if (
+                            speculative_num_draft_tokens is not None
+                            and L < 2 * speculative_num_draft_tokens
+                        ):
+                            raise ValueError(
+                                f"spec-verify ring too small: {L} < "
+                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+                            )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,
@@ -662,7 +686,11 @@ class MambaPool:
                 # The recurrent-verify fallback cannot be reached under the flag
                 # (GDN + linear chain + triton enforced in server_args; the
                 # backend asserts loudly if it ever is).
-                if enable_gdn_replayssm_spec:
+                # ReplaySSM skips this dominant scratch (~9GB @ K3 dspark γ=7): the
+                # KDA verify kernel takes intermediate_states_buffer=None (skips the
+                # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
+                # replays the ring into the checkpoint instead. This is the memory win.
+                if enable_linear_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -795,7 +823,7 @@ class MambaPool:
                         f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "
                         f"rawk={get_tensor_size_bytes(replayssm_rawk) / GB:.3f}GB, "
                         f"beta={get_tensor_size_bytes(replayssm_beta) / GB:.3f}GB "
-                        if enable_gdn_replayssm_spec
+                        if enable_linear_replayssm_spec
                         else ""
                     )
                 )
@@ -818,12 +846,12 @@ class MambaPool:
             # all GDN layers of one verify step; advanced by commit_gdn_replayssm_spec.
             self.replayssm_cache_base = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
+                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_is_flush = (
                 torch.zeros((size + 1,), dtype=torch.int8, device=device)
-                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
+                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
@@ -1130,7 +1158,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1157,7 +1185,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
-            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
 
     def _init_mamba_pool(
@@ -1173,7 +1201,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1187,7 +1215,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
-            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -1593,6 +1621,7 @@ class KVCache(abc.ABC):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        allocation_label: Optional[str] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -1606,6 +1635,7 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
+        self.allocation_label = allocation_label
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -1626,19 +1656,27 @@ class KVCache(abc.ABC):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
         """
+        cache_name = (
+            f"{self.allocation_label} KV Cache"
+            if self.allocation_label is not None
+            else "KV Cache"
+        )
         kv_size_bytes = self.get_kv_size_bytes()
         if isinstance(kv_size_bytes, tuple):
             k_size, v_size = kv_size_bytes
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"{cache_name} {'VA upper bound' if self.post_capture_active else 'is allocated'}. dtype: {self.dtype}, "
+                f"#tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, "
+                f"V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"{cache_name} {'VA upper bound' if self.post_capture_active else 'is allocated'}. dtype: {self.dtype}, "
+                f"#tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -1721,6 +1759,7 @@ class MHATokenToKVPool(KVCache):
         kv_cache_layout: Optional[str] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        allocation_label: Optional[str] = None,
     ):
         self.k_buffer = None
         self.v_buffer = None
@@ -1737,6 +1776,7 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            allocation_label,
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
@@ -3651,7 +3691,7 @@ class HybridLinearKVPool(KVCache):
 
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
-        # is dense over only full-attention layers. Shape discovery does not
+        # is dense over only full-attention layers.  Shape discovery does not
         # need a global layer lookup, so delegate it to that backing pool.
         return self.full_kv_pool.get_kv_buffer_shape()
 
@@ -3829,7 +3869,11 @@ class HybridLinearKVPool(KVCache):
             )
 
     def get_v_head_dim(self):
-        return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        # Use start_layer to handle pipeline parallelism where layer 0
+        # may not be present in this stage's buffer.
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
 
     def set_mla_kv_buffer(
         self,
@@ -4059,7 +4103,13 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        # loc is widened under DCP; the kernel divides by the world size itself.
+        maybe_detect_oob(
+            loc,
+            0,
+            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            "set_mla_kv_buffer (MLA)",
+        )
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
@@ -4332,58 +4382,28 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
-        self._create_index_buffers()
+        self.index_key_cache = self._create_index_key_cache()
         self._finalize_allocation_log(size)
 
-    def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
-        return (
-            num_pages,
-            self.page_size
-            * (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4),
-        )
+    def _create_index_key_cache(self) -> IndexKeyCache:
+        return IndexKeyCache(self, self.index_buf_size)
 
-    def _create_index_buffers(self):
-        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
-        with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
-        ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    self._index_buffer_shape(num_pages),
-                    dtype=self.index_k_with_scale_buffer_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+    @property
+    def index_k_with_scale_buffer(self):
+        # Preserve direct HiCache access while storage lives behind the facade.
+        return self.index_key_cache.buffer
 
     def _clear_buffers(self):
         super()._clear_buffers()
-        del self.index_k_with_scale_buffer
+        self.index_key_cache.clear()
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
         super().move_kv_cache(tgt_loc, src_loc)
-
-        if tgt_loc.numel() == 0:
-            return
-
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for index_k in self.index_k_with_scale_buffer:
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+        self.index_key_cache.move(tgt_loc, src_loc)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self.index_key_cache.get_local_buffer(layer_id)
 
     def get_index_k_continuous(
         self,
@@ -4391,12 +4411,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetK.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
-        )
+        return self.index_key_cache.get_k_continuous(layer_id, seq_len, page_indices)
 
     def get_index_k_scale_continuous(
         self,
@@ -4404,11 +4419,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+        return self.index_key_cache.get_k_scale_continuous(
+            layer_id, seq_len, page_indices
         )
 
     def get_index_k_scale_buffer(
@@ -4419,27 +4431,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        """
-        Fused method to get both index K and scale data in a single call using Triton.
-        More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
-
-        :param layer_id: Layer index
-        :param seq_len: Sequence length
-        :param page_indices: Page indices tensor
-        :return: tuple of (k_fp8, k_scale) where
-                 k_fp8: (seq_len, index_head_dim), uint8
-                 k_scale: (seq_len, 4), uint8
-        """
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        return index_buf_accessor.GetKAndS.execute(
-            self,
-            buf,
-            page_indices=page_indices,
-            seq_len_tensor=seq_len_tensor,
-            seq_len_sum=seq_len_sum,
-            max_seq_len=max_seq_len,
+        return self.index_key_cache.get_k_and_scale(
+            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
         )
 
     def set_index_k_scale_buffer(
@@ -4449,68 +4442,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
-            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
-        )
+        self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
-        # Retract frees the slots/pages and they get reused by other reqs'
-        # set_index_k_scale_buffer, so we must offload it here too -- otherwise
-        # resume restores kv_buffer but leaves foreign index/scale in place and
-        # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
-
-        page_indices = indices[:: self.page_size] // self.page_size
-        torch.cuda.synchronize()
-        index_k_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
-            index_k_cpu.append([])
-            for i in range(0, len(page_indices), page_chunk_size):
-                chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.index_k_with_scale_buffer[layer_id][
-                    chunk_page_indices
-                ].to("cpu", non_blocking=True)
-                index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
-
-        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         super().load_cpu_copy(
             kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
         )
-
-        page_indices = indices[:: self.page_size] // self.page_size
-        index_k_cpu = kv_cache_cpu_dict["index_k"]
-        torch.cuda.synchronize()
-        chunk_size = self.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.page_size)
-        for layer_id in range(self.layer_num):
-            for i in range(0, len(page_indices), page_chunk_size):
-                chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
-                assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(
-                    self.index_k_with_scale_buffer[0].device, non_blocking=True
-                )
-                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
 
     def get_state_buf_infos(self):
-        data_ptrs = [
-            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        data_lens = [
-            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        item_lens = [
-            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
-        return data_ptrs, data_lens, item_lens
+        return self.index_key_cache.state_buf_infos()
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
@@ -5050,4 +4995,6 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
     def get_v_head_dim(self):
-        return self.main_pool.get_value_buffer(0).shape[-1]
+        # Use start_layer to handle pipeline parallelism where layer 0
+        # may not be present in this stage's buffer.
+        return self.main_pool.get_value_buffer(self.main_pool.start_layer).shape[-1]

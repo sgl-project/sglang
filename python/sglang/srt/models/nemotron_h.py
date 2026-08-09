@@ -89,12 +89,7 @@ from sglang.srt.models.nemotron_h_utils import (
     pad_to_original_num_tokens,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-    get_server_args,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
@@ -284,17 +279,11 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        overlap = _is_cuda and not torch.compiler.is_compiling()
-        if (
-            overlap
-            and get_moe_a2a_backend().is_flashinfer()
-            and not get_is_capture_mode()
+        if _is_cuda and (
+            not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            overlap = False
-        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
-        else:
-            return self._forward_core_normal(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
@@ -944,7 +933,7 @@ class NemotronHForCausalLM(nn.Module):
                         else lora_config.lora_vocab_padding_size
                     ),
                     quant_config=quant_config,
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

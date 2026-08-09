@@ -960,6 +960,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
+        kv_tp_rank: Optional[int] = None,
+        kv_tp_size: Optional[int] = None,
     ):
         self.with_bias = bias
         self.hidden_size = hidden_size
@@ -975,12 +977,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         if tp_size is None:
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        if kv_tp_rank is None:
+            kv_tp_rank = tp_rank
+        if kv_tp_size is None:
+            kv_tp_size = tp_size
+        self.kv_tp_rank, self.kv_tp_size = kv_tp_rank, kv_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
+        if kv_tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+            self.num_kv_head_replicas = divide(kv_tp_size, self.total_num_kv_heads)
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, kv_tp_size)
             self.num_kv_head_replicas = 1
         self.q_proj_shard_size = self.num_heads * self.head_size
         self.kv_proj_shard_size = self.num_kv_heads * self.head_size
@@ -1102,7 +1109,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id=shard_id,
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
-                tp_rank=self.tp_rank,
+                tp_rank=(self.tp_rank if shard_id == "q" else self.kv_tp_rank),
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -1156,7 +1163,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
-            tp_rank=self.tp_rank,
+            tp_rank=(self.tp_rank if loaded_shard_id == "q" else self.kv_tp_rank),
             use_presharded_weights=self.use_presharded_weights,
         )
 
@@ -1179,8 +1186,13 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
+            shard_tp_rank, shard_tp_size = (
+                (self.kv_tp_rank, self.kv_tp_size)
+                if loaded_shard_id in ("k", "v")
+                else (self.tp_rank, self.tp_size)
+            )
+            shard_size = loaded_weight.size(output_dim) // shard_tp_size
+            start_idx = shard_tp_rank * shard_size
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1326,7 +1338,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             if loaded_shard_id == "q":
                 shard_id = self.tp_rank
             else:
-                shard_id = self.tp_rank // self.num_kv_head_replicas
+                shard_id = self.kv_tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
             if _is_cpu:
@@ -1560,7 +1572,13 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+    def forward(
+        self,
+        input_,
+        skip_all_reduce=False,
+        forward_batch=None,
+        output_tensor=None,
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1581,7 +1599,20 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if output_tensor is None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+            else:
+                apply_into = getattr(self.quant_method, "apply_into", None)
+                if apply_into is None:
+                    raise RuntimeError(
+                        f"{type(self.quant_method).__name__} cannot write into "
+                        "caller-owned linear output"
+                    )
+                output_parallel = apply_into(
+                    self, input_parallel, output_tensor, bias=bias_
+                )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by

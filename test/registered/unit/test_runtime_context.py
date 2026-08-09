@@ -19,7 +19,6 @@ from sglang.srt.runtime_context import (
     get_context,
     get_flags,
     get_parallel,
-    get_schedule,
     get_server_args,
     reset_context,
 )
@@ -261,9 +260,9 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         # unnamed fields keep their dataclass defaults
         self.assertEqual(published.tp_size, 1)
 
-    def test_fields_carry_provenance(self):
-        published = get_context().override_server_args(tp_size=4).install()
-        self.assertIn(("test-override", {"tp_size": 4}), published._runtime_mutations)
+    def test_unknown_fields_are_rejected(self):
+        with self.assertRaises(ValueError):
+            get_context().override_server_args(not_a_config_field=1).install()
 
     def test_restore_reinstates_previous_publish(self):
         previous = object()
@@ -299,12 +298,11 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
-        # raise under the strict harness; override() stays the entry point.
+        # raise.
         published = get_context().override_server_args(tp_size=2).install()
         with self.assertRaises(AttributeError):
             published.tp_size = 4
-        published.override(source="test", tp_size=4)
-        self.assertEqual(published.tp_size, 4)
+        self.assertEqual(published.tp_size, 2)
 
     def test_restore_resets_the_capture_seed(self):
         # install() seeds flags.capture from the published dummy; restore()
@@ -404,6 +402,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             tbo_token_distribution_threshold=0.48,
             disable_flashinfer_cutlass_moe_fp4_allgather=False,
             quantization=None,
+            disable_shared_experts_fusion=False,
         )
         defaults.update(kw)
         initialize_moe_config(SimpleNamespace(**defaults))
@@ -760,6 +759,33 @@ class TestForwardFlags(_IsolatedServerArgs):
             self.assertEqual(probe(torch.zeros(())).item(), 28)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
+    def test_parallel_config_leaves_trace_under_torch_compile(self):
+        # Regression: parallel config leaves resolve through
+        # ``ParallelContext.__getattr__`` (the bag fallback), and gate helpers
+        # such as ``enable_moe_dense_fully_dp()`` read them inside compiled
+        # model forwards — the fallback body must stay dynamo-traceable
+        # (``object.__getattribute__`` graph-breaks). fullgraph=True turns any
+        # graph break back into a failure.
+        import torch
+
+        from sglang.srt.runtime_context import get_parallel
+
+        reset_context()
+        with get_context().override_server_args(moe_dense_tp_size=1, dwdp_size=4):
+
+            @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+            def probe(x):
+                par = get_parallel()
+                if par.enable_prefill_context_parallel:
+                    x = x + 1
+                if par.moe_dense_tp_size == 1:
+                    x = x + 2
+                if par.dwdp_size > 1:
+                    x = x + 4
+                return x
+
+            self.assertEqual(probe(torch.zeros(())).item(), 6)
+
     def test_graph_visible_flags_are_process_visible_across_threads(self):
         # Documented divergence from the contextvar-backed flags: plain slots
         # are process-global (the storage form these flags had before the
@@ -937,35 +963,6 @@ class TestPublishLifecycle(_IsolatedServerArgs):
     def test_capture_tier_defaults_for_sentinel_publish(self):
         get_context().set_server_args(object())
         self.assertFalse(get_flags().capture.enable_torch_compile)
-
-    def test_declare_load_time_override_writes_the_bag(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        args = self._publish(page_size=1)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        # The declaration lands on the config bag; the pristine startup record
-        # (server_args) is untouched.
-        self.assertEqual(get_schedule().page_size, 64)
-        self.assertEqual(args.page_size, 1)
-
-    def test_declare_load_time_override_validates_whitelist(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        args = self._publish(page_size=1)
-        with self.assertRaises(ValueError):
-            declare_load_time_override("bad", {"nope": 1})
-        self.assertEqual(args.page_size, 1)
-
-    def test_declare_load_time_override_records_provenance(self):
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        self._publish(page_size=1)
-        declare_load_time_override("model.load_time", {"page_size": 64})
-        self.assertEqual(get_schedule().page_size, 64)
-        self.assertIn(
-            ("model.load_time", {"page_size": 64}),
-            get_context().overrides_log(),
-        )
 
 
 if __name__ == "__main__":

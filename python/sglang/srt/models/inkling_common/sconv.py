@@ -143,22 +143,16 @@ class ShortConvolution(nn.Module):
     def _apply_training_sconv_kernel(
         self,
         hidden_states: torch.Tensor,
-        weight: torch.Tensor,
         sconv_cache: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         has_initial_state: torch.Tensor,
         precomputed: SconvDecodeMetadata | SconvExtendMetadata,
-        is_decode: bool = False,
     ) -> torch.Tensor:
-        y = causal_conv1d(
-            x=hidden_states,
-            weight=weight,
+        y = self._apply_causal_sconv_kernel(
+            hidden_states=hidden_states,
             sconv_cache=sconv_cache,
-            activation=self.activation,
-            use_residual=self.use_residual,
-            is_decode=is_decode,
-            **precomputed,
+            precomputed=precomputed,
         )
         update_sconv_cache(
             x=hidden_states,
@@ -168,6 +162,41 @@ class ShortConvolution(nn.Module):
             query_start_loc=query_start_loc,
         )
         return y
+
+    def _apply_causal_sconv_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        sconv_cache: torch.Tensor,
+        precomputed: SconvDecodeMetadata | SconvExtendMetadata,
+    ) -> torch.Tensor:
+        return causal_conv1d(
+            x=hidden_states,
+            weight=self._weight_2d(),
+            sconv_cache=sconv_cache,
+            activation=self.activation,
+            use_residual=self.use_residual,
+            **precomputed,
+        )
+
+    def _apply_decode_sconv_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        sconv_cache: torch.Tensor,
+        cache_indices: torch.Tensor,
+        precomputed: SconvDecodeMetadata | SconvExtendMetadata,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        return fused_causal_conv1d_update_decode(
+            x=hidden_states,
+            weight=self._weight_2d(),
+            sconv_cache=sconv_cache,
+            cache_indices=cache_indices,
+            cache_mask=precomputed["cache_mask"],
+            activation=self.activation,
+            use_residual=self.use_residual,
+            track_mask=forward_batch.mamba_track_mask,
+            track_indices=forward_batch.mamba_track_indices,
+        )
 
     def _prepare_extend_sconv_cache(
         self,
@@ -378,17 +407,12 @@ class ShortConvolution(nn.Module):
         cache_indices = meta.cache_indices
         sconv_cache = self._sconv_cache()
         precomputed = meta.precomputed
-        weight = self._weight_2d()
 
         if forward_batch.forward_mode.is_target_verify():
-            y = causal_conv1d(
-                x=hidden_states,
-                weight=weight,
+            y = self._apply_causal_sconv_kernel(
+                hidden_states=hidden_states,
                 sconv_cache=sconv_cache,
-                activation=self.activation,
-                use_residual=self.use_residual,
-                is_decode=False,
-                **precomputed,
+                precomputed=precomputed,
             )
             self._save_intermediate_conv_windows(
                 forward_batch=forward_batch,
@@ -403,14 +427,10 @@ class ShortConvolution(nn.Module):
             )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
-                y = causal_conv1d(
-                    x=hidden_states,
-                    weight=weight,
+                y = self._apply_causal_sconv_kernel(
+                    hidden_states=hidden_states,
                     sconv_cache=sconv_cache,
-                    activation=self.activation,
-                    use_residual=self.use_residual,
-                    is_decode=False,
-                    **precomputed,
+                    precomputed=precomputed,
                 )
                 self._update_sconv_cache_for_draft_extend(
                     forward_batch,
@@ -421,13 +441,11 @@ class ShortConvolution(nn.Module):
             else:
                 y = self._apply_training_sconv_kernel(
                     hidden_states=hidden_states,
-                    weight=weight,
                     sconv_cache=sconv_cache,
                     cache_indices=cache_indices,
                     query_start_loc=meta.query_start_loc,
                     has_initial_state=meta.has_initial_state,
                     precomputed=precomputed,
-                    is_decode=False,
                 )
         else:
             # Fused decode: prefix construction + conv + cache update + prefix-cache
@@ -436,16 +454,12 @@ class ShortConvolution(nn.Module):
             # into the persistent ping-pong slot in-register (no separate
             # copy_if_needed launch). track_mask is None when prefix caching with the
             # mamba extra buffer is disabled, which disables the track-copy path.
-            y = fused_causal_conv1d_update_decode(
-                x=hidden_states,
-                weight=weight,
+            y = self._apply_decode_sconv_kernel(
+                hidden_states=hidden_states,
                 sconv_cache=sconv_cache,
                 cache_indices=cache_indices,
-                cache_mask=precomputed["cache_mask"],
-                activation=self.activation,
-                use_residual=self.use_residual,
-                track_mask=forward_batch.mamba_track_mask,
-                track_indices=forward_batch.mamba_track_indices,
+                precomputed=precomputed,
+                forward_batch=forward_batch,
             )
 
         return y

@@ -55,7 +55,7 @@ jobs:
           if [[ -n "${{ inputs.job_filter }}" ]]; then
             echo "workflows=pr-test-amd.yml" >> "$GITHUB_OUTPUT"
           else
-            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" >> "$GITHUB_OUTPUT"
+            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml,nightly-amd-mi355x-disagg.yml" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch Actions data snapshot
@@ -121,6 +121,7 @@ jobs:
       nightly_jobs: ${{ steps.parse.outputs.nightly_jobs }}
       pr_rocm720_jobs: ${{ steps.parse.outputs.pr_rocm720_jobs }}
       nightly_rocm720_jobs: ${{ steps.parse.outputs.nightly_rocm720_jobs }}
+      disagg_jobs: ${{ steps.parse.outputs.disagg_jobs }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -159,6 +160,15 @@ jobs:
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "nightly_rocm720_jobs=$nightly_rocm720_jobs" >> $GITHUB_OUTPUT
           echo "Nightly ROCm 7.2 jobs: $nightly_rocm720_jobs"
+
+          # Parse nightly-amd-mi355x-disagg.yml (exclude utility jobs)
+          # Excluded: setup, collect-results -- both run on ubuntu-latest and the
+          # snapshot only keeps self-hosted jobs, so they would report as empty.
+          disagg_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-amd-mi355x-disagg.yml | \
+            grep -v -E '^(setup|collect-results)$' | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "disagg_jobs=$disagg_jobs" >> $GITHUB_OUTPUT
+          echo "MI355X disagg jobs: $disagg_jobs"
 
   # PR CI reports using dynamic matrix
   pr-ci-reports:
@@ -316,6 +326,45 @@ jobs:
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary
 
+  # MI355X 2N 1P1D disagg nightly reports using dynamic matrix
+  nightly-disagg-reports:
+    name: Nightly MI355X Disagg - ${{ matrix.job_name }}
+    needs: [parse-workflows, fetch-actions-data]
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.disagg_jobs) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Generate MI355X Disagg Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "nightly-amd-mi355x-disagg.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
+            --summary
+
   # Runner fleet report - cross-workflow runner analytics in a single pass
   runner-fleet-report:
     name: Runner Fleet Report
@@ -346,7 +395,7 @@ jobs:
           python scripts/ci/utils/query_job_status.py \
             --repo ${{ github.repository }} \
             --runner-report \
-            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" \
+            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml,nightly-amd-mi355x-disagg.yml" \
             --hours ${{ inputs.hours || '24' }} \
             --input-data-file ci-data/actions-job-snapshot.json \
             --summary

@@ -73,7 +73,7 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1210,6 +1210,8 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    supports_cuda_vmm_feature_transport = True
+
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
@@ -1280,7 +1282,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
-                        use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=get_parallel().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:
