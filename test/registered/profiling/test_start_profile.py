@@ -34,14 +34,6 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 OUTPUT_DIR = "./profiler_dir"
 
-# ROCm's HIP runtime can deadlock inside hipGraphLaunch while a torch-profiler
-# (rocprofiler-sdk) session is attached: the scheduler wedges in
-# at::cuda::CUDAGraph::replay until the watchdog SIGQUITs the whole server. This
-# suite is the only place in CI that attaches and detaches the profiler around
-# live decoding, so it is the only place that trips it. What is under test is the
-# /start_profile request surface, not graph replay, so run it eagerly on HIP.
-_SERVER_ARGS = ["--disable-cuda-graph"] if is_hip() else []
-
 
 def _is_nsys_available():
     """Check if nsys (Nsight Systems) is available on the system."""
@@ -59,11 +51,17 @@ class TestStartProfile(CustomTestCase):
         envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # ROCm's HIP runtime can deadlock inside hipGraphLaunch while a
+        # torch-profiler (rocprofiler-sdk) session is attached, wedging the
+        # scheduler in at::cuda::CUDAGraph::replay until the watchdog kills the
+        # server. These tests cover the /start_profile request surface rather
+        # than graph replay, so run them eagerly on HIP.
+        other_args = ["--disable-cuda-graph"] if is_hip() else []
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=_SERVER_ARGS,
+            other_args=other_args,
         )
 
     @classmethod
