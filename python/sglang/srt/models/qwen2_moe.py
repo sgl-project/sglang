@@ -211,7 +211,6 @@ class Qwen2MoeMLP(nn.Module):
         # down_proj. Aiter-only; default off.
         self._fp8_silu_fuse = False
         if _use_aiter and get_exec().kernel.enable_dense_fp8:
-            quant_method = getattr(self.down_proj, "quant_method", None)
             # Gate on use_aiter_fp8_per_token (set in __init__): it implies the
             # bpreshuffle per-token path the tuple needs; use_per_token_if_dynamic is
             # only set later in process_weights_after_loading.
@@ -604,7 +603,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
-        elif self.alt_stream is not None and get_is_capture_mode():
+        elif (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+        ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states, use_fused_gate=use_fused_gate
             )

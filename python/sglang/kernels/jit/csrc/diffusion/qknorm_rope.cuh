@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 struct QKNormRopeParams {
   void* __restrict__ q_ptr;
@@ -277,6 +277,7 @@ struct QKNormRopeKernel {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    if (num_tokens == 0 || (num_qo_heads == 0 && num_kv_heads == 0)) return;
     const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
     const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
     const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
@@ -313,4 +314,4 @@ struct QKNormRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

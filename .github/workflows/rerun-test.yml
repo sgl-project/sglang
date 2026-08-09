@@ -31,11 +31,6 @@ on:
         required: false
         type: string
         default: "20"
-      grace_blackwell:
-        description: "Set GRACE_BLACKWELL for the install step (cuda only)"
-        required: false
-        type: string
-        default: "0"
       rdma_devices:
         description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
         required: false
@@ -62,8 +57,6 @@ env:
   SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
-  FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
   actions: write
@@ -104,10 +97,11 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
+      - uses: ./.github/actions/download-rust-ext
+
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
-        env:
-          GRACE_BLACKWELL: ${{ inputs.grace_blackwell }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -117,7 +111,7 @@ jobs:
           # then dies with `ModuleNotFoundError: No module named 'sglang'`.
           # /rerun-test resolves install_script from runner_configs.yml; a manual
           # workflow_dispatch must pass it explicitly (it can't be derived from
-          # runs_on, which is shared across configs, e.g. default vs deepep).
+          # runs_on, which can be shared across runner configs).
           if [ -z "${{ inputs.install_script }}" ]; then
             echo "::error::install_script is required for cuda mode (empty would silently skip installing sglang). Pass e.g. scripts/ci/cuda/ci_install_dependency.sh"
             exit 1
@@ -195,6 +189,8 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - uses: ./.github/actions/download-rust-ext
+
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -240,7 +236,12 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # The image ships ~65G free and the suite peaks around 30G; deleting
+          # these trees is ~1M unlinks (~80s), so only pay it when actually low.
+          avail_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          if [ "${avail_gb}" -lt 40 ]; then
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          fi
           df -h
 
       - name: Checkout code
@@ -270,9 +271,16 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Worth the most of the three jobs: this runner is hosted, so it has no
+      # persistent cargo target dir and every dispatch compiled cold. Its
+      # setup-python pins the same 3.10 the modules were built against.
+      - uses: ./.github/actions/download-rust-ext
+        id: rust_ext
+
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
       - name: Install protoc + Rust toolchain
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 

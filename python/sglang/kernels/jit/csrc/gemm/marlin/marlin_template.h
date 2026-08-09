@@ -29,6 +29,8 @@
       std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value, \
       "only float16 and bfloat16 is supported");
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -1618,3 +1620,5 @@ __global__ void Marlin(
 }  // namespace device::marlin
 
 #endif
+
+}  // namespace sglang

@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
 

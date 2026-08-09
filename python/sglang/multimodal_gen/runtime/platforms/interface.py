@@ -43,6 +43,7 @@ class AttentionBackendEnum(enum.Enum):
     LASER_ATTN = enum.auto()
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
+    SOL_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -60,6 +61,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.SOL_ATTN,
         }
 
 
@@ -224,6 +226,10 @@ class Platform:
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         raise NotImplementedError
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        torch.get_device_module(device).set_device(device)
 
     @classmethod
     def get_attn_backend_cls_str(
