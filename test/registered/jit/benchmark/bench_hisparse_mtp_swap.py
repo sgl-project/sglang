@@ -152,7 +152,7 @@ def _build_state(batch_size: int) -> _BenchmarkState:
         device_buffer_locs=device_buffer_locs,
         host_cache=host_cache,
         device_buffer=device_buffer,
-        req_pool_indices=torch.arange(batch_size, dtype=torch.int32, device=DEVICE),
+        req_pool_indices=torch.arange(batch_size, dtype=torch.int64, device=DEVICE),
         seq_lens=torch.full(
             (batch_size * NUM_STEPS,), SEQ_LEN, dtype=torch.int32, device=DEVICE
         ),

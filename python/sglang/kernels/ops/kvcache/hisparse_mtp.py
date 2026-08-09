@@ -4,15 +4,17 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-_MIN_TOP_K = 1024
-_MAX_STEPS = 4
-_MAX_OCCURRENCES = 8192
 _GATHER_BLOCK_SIZE = 64
 
 
@@ -24,10 +26,8 @@ class HiSparseMTPSwapState(NamedTuple):
     for the packed CLOCK states followed by one reference-epoch row per
     request: ``[1 + num_requests, hot_buffer_size]``.
 
-    ``scratch_locs`` stores the physical locations assigned to unique misses.
-    ``scratch_state`` likewise uses its first row for four contiguous counter
-    banks and one metadata row per request. Its shape is
-    ``[1 + num_requests, max(4 * num_requests, 5 * max_occurrences)]``.
+    ``scratch_locs`` and ``scratch_state`` hold reusable miss locations,
+    counters, and metadata shared by all layers.
     """
 
     cache_index: torch.Tensor
@@ -50,6 +50,7 @@ def _jit_mtp_swap_module(
         hot_buffer_size,
         item_size_bytes,
         num_steps,
+        is_arch_support_pdl(),
     )
     return load_jit(
         "hisparse_mtp_swap",
@@ -79,30 +80,11 @@ def load_cache_to_device_buffer_mtp_mla(
     num_real_reqs: torch.Tensor,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair."""
-    if top_k_tokens.ndim != 3:
-        raise ValueError("top_k_tokens must have shape [batch, steps, top_k].")
-
-    batch_size, num_steps, num_top_k = top_k_tokens.shape
+    _, num_steps, num_top_k = top_k_tokens.shape
+    if not 2 <= num_steps <= 4:
+        raise ValueError(f"HiSparse MTP swap requires 2-4 steps, got {num_steps}.")
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
-    total_occurrences = num_steps * num_top_k
-    if not (
-        num_top_k <= hot_buffer_size
-        and 1 < num_steps <= _MAX_STEPS
-        and num_top_k >= _MIN_TOP_K
-        and total_occurrences <= _MAX_OCCURRENCES
-    ):
-        raise ValueError(
-            "HiSparse MTP swap requires hot_buffer_size >= top_k >= 1024, "
-            "2-4 steps, and at most 8192 total occurrences."
-        )
-    if page_size <= 0:
-        raise ValueError("device_buffer_tokens must include an extra page.")
-    if top_k_device_locs.shape != top_k_tokens.shape:
-        raise ValueError("top_k_device_locs must match top_k_tokens.")
-    if seq_lens.numel() < batch_size * num_steps:
-        raise ValueError("seq_lens must provide one length per request and MTP step.")
-
     item_size_bytes = host_cache.stride(0) * host_cache.element_size()
     module = _jit_mtp_swap_module(
         item_size_bytes,

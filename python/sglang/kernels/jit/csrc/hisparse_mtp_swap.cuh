@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-namespace {
+namespace sglang {
 
 #ifdef USE_ROCM
 constexpr int WARP_SIZE = 64;
@@ -412,14 +412,7 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <
-    int BLOCK_SIZE,
-    int NUM_TOP_K,
-    int HOT_BUFFER_SIZE,
-    int ITEM_SIZE_BYTES,
-    int NUM_STEPS,
-    typename SeqLensT,
-    typename ReqPoolIndicesT>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS>
 __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -428,8 +421,8 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     const void* __restrict__ host_cache_k,
     void* __restrict__ device_buffer_k,
     int32_t* __restrict__ top_k_device_locs,
-    const ReqPoolIndicesT* __restrict__ req_pool_indices,
-    const SeqLensT* __restrict__ seq_lens,
+    const int64_t* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ seq_lens,
     MtpCacheState cache_state,
     MtpMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
@@ -439,13 +432,18 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
     int64_t top_k_device_locs_stride,
     int64_t page_size) {
   const int bid = blockIdx.x;
-  if (bid >= num_real_reqs[0]) return;
-
   const int tid = threadIdx.x;
+  constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
+  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
+  if (bid >= num_real_reqs[0]) {
+    for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
+      req_top_k_device_locs[i] = 0;
+    return;
+  }
+
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-  constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
   const int64_t total_warps = static_cast<int64_t>(gridDim.y) * NUM_WARPS;
   const int64_t global_warp = static_cast<int64_t>(blockIdx.y) * NUM_WARPS + warp_id;
   const int64_t occ = static_cast<int64_t>(lane_id) * total_warps + global_warp;
@@ -474,7 +472,6 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
   next_scratch_epoch = next_scratch_epoch > SCRATCH_EPOCH_MASK ? 1 : next_scratch_epoch;
   const int32_t scratch_epoch = static_cast<int32_t>(next_scratch_epoch);
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
-  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
 
   int32_t token = -1;
   int32_t loc = -1;
@@ -588,7 +585,7 @@ __global__ void load_cache_to_device_buffer_mtp_gather_kernel(
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, typename ReqPoolIndicesT>
+template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool USE_PDL>
 __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -597,7 +594,7 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
     const int64_t* __restrict__ host_cache_locs,
     const void* __restrict__ host_cache_k,
     void* __restrict__ device_buffer_k,
-    const ReqPoolIndicesT* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ req_pool_indices,
     MtpCacheState cache_state,
     MtpMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
@@ -605,7 +602,7 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
     int64_t top_k_device_locs_stride,
     int64_t buffer_stride_0,
     int64_t host_stride) {
-  device::PDLWaitPrimary<true>();
+  device::PDLWaitPrimary<USE_PDL>();
   const int bid = blockIdx.x;
   if (bid >= num_real_reqs[0]) return;
 
@@ -896,7 +893,7 @@ __global__ void load_cache_to_device_buffer_mtp_commit_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool USE_PDL>
 void load_cache_to_device_buffer_mtp(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -984,124 +981,56 @@ void load_cache_to_device_buffer_mtp(
       scratch_stride_0,
       scratch_state_stride_0,
       num_request_slots};
-  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+  auto cuda_device = SymbolicDevice{};
+  cuda_device.set_options<kDLCUDA>();
+  TensorMatcher({bs}).with_dtype<int64_t>().with_device(cuda_device).verify(req_pool_indices);
+  TensorMatcher({bs * NUM_STEPS}).with_dtype<int32_t>().with_device(cuda_device).verify(seq_lens);
+  const auto device = cuda_device.unwrap();
 
-  bool use_pdl = false;
-#ifndef USE_ROCM
-  static thread_local int cached_pdl_device = -1;
-  static thread_local bool cached_use_pdl = false;
-  const int current_device = top_k_tokens.device().device_id;
-  if (cached_pdl_device != current_device) {
-    int compute_capability_major = 0;
-    RuntimeDeviceCheck(
-        cudaDeviceGetAttribute(&compute_capability_major, cudaDevAttrComputeCapabilityMajor, current_device));
-    cached_pdl_device = current_device;
-    cached_use_pdl = compute_capability_major >= 9;
-  }
-  use_pdl = cached_use_pdl;
-#endif
-  auto launch =
-      [&](auto gather_kernel_fn, auto commit_kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
-        const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        const dim3 gather_grid(static_cast<uint32_t>(bs), tiles);
-        LaunchKernel(gather_grid, BLOCK_SIZE, device)(
-            gather_kernel_fn,
-            static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-            static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-            static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-            static_cast<int32_t*>(device_buffer_locs.data_ptr()),
-            host_cache_k.data_ptr(),
-            device_buffer_k.data_ptr(),
-            static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-            req_pool_indices_ptr,
-            seq_lens_ptr,
-            cache_state,
-            miss_workspace,
-            static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-            buffer_stride_0,
-            host_stride,
-            top_k_tokens_stride,
-            top_k_device_locs_stride,
-            page_size);
+  const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
+  LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
+      load_cache_to_device_buffer_mtp_gather_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, ITEM_SIZE_BYTES, NUM_STEPS>,
+      static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+      static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+      static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+      static_cast<int32_t*>(device_buffer_locs.data_ptr()),
+      host_cache_k.data_ptr(),
+      device_buffer_k.data_ptr(),
+      static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int32_t*>(seq_lens.data_ptr()),
+      cache_state,
+      miss_workspace,
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      buffer_stride_0,
+      host_stride,
+      top_k_tokens_stride,
+      top_k_device_locs_stride,
+      page_size);
 
-        const dim3 commit_grid(static_cast<uint32_t>(bs));
-        LaunchKernel(commit_grid, 512, device)
-            .enable_pdl(use_pdl)(
-                commit_kernel_fn,
-                static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-                static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-                static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-                static_cast<int32_t*>(device_buffer_locs.data_ptr()),
-                static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-                host_cache_k.data_ptr(),
-                device_buffer_k.data_ptr(),
-                req_pool_indices_ptr,
-                cache_state,
-                miss_workspace,
-                static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-                top_k_tokens_stride,
-                top_k_device_locs_stride,
-                buffer_stride_0,
-                host_stride);
-      };
-
-  const auto seq_dtype = seq_lens.dtype();
-  const auto rpi_dtype = req_pool_indices.dtype();
-  const bool seq_is_i64 = seq_dtype.code == kDLInt && seq_dtype.bits == 64;
-  const bool rpi_is_i64 = rpi_dtype.code == kDLInt && rpi_dtype.bits == 64;
-  if (seq_is_i64 && rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_mtp_gather_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            ITEM_SIZE_BYTES,
-            NUM_STEPS,
-            int64_t,
-            int64_t>,
-        load_cache_to_device_buffer_mtp_commit_kernel<NUM_TOP_K, HOT_BUFFER_SIZE, ITEM_SIZE_BYTES, NUM_STEPS, int64_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
-  } else if (seq_is_i64) {
-    launch(
-        load_cache_to_device_buffer_mtp_gather_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            ITEM_SIZE_BYTES,
-            NUM_STEPS,
-            int64_t,
-            int32_t>,
-        load_cache_to_device_buffer_mtp_commit_kernel<NUM_TOP_K, HOT_BUFFER_SIZE, ITEM_SIZE_BYTES, NUM_STEPS, int32_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
-  } else if (rpi_is_i64) {
-    launch(
-        load_cache_to_device_buffer_mtp_gather_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            ITEM_SIZE_BYTES,
-            NUM_STEPS,
-            int32_t,
-            int64_t>,
-        load_cache_to_device_buffer_mtp_commit_kernel<NUM_TOP_K, HOT_BUFFER_SIZE, ITEM_SIZE_BYTES, NUM_STEPS, int64_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
-  } else {
-    launch(
-        load_cache_to_device_buffer_mtp_gather_kernel<
-            BLOCK_SIZE,
-            NUM_TOP_K,
-            HOT_BUFFER_SIZE,
-            ITEM_SIZE_BYTES,
-            NUM_STEPS,
-            int32_t,
-            int32_t>,
-        load_cache_to_device_buffer_mtp_commit_kernel<NUM_TOP_K, HOT_BUFFER_SIZE, ITEM_SIZE_BYTES, NUM_STEPS, int32_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()),
-        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
-  }
+  LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
+      .enable_pdl(USE_PDL)(
+          load_cache_to_device_buffer_mtp_commit_kernel<
+              NUM_TOP_K,
+              HOT_BUFFER_SIZE,
+              ITEM_SIZE_BYTES,
+              NUM_STEPS,
+              USE_PDL>,
+          static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+          static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+          static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+          static_cast<int32_t*>(device_buffer_locs.data_ptr()),
+          static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+          host_cache_k.data_ptr(),
+          device_buffer_k.data_ptr(),
+          static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+          cache_state,
+          miss_workspace,
+          static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+          top_k_tokens_stride,
+          top_k_device_locs_stride,
+          buffer_stride_0,
+          host_stride);
 }
 
-}  // namespace
+}  // namespace sglang

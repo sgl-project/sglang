@@ -137,7 +137,7 @@ def _run_swap(
         out.fill_(-1)
     num_reqs = top_k_tokens.size(0)
     if req_pool_indices is None:
-        req_pool_indices = torch.arange(num_reqs, dtype=torch.int32, device=DEVICE)
+        req_pool_indices = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
     if num_real_reqs is None:
         num_real_reqs = torch.tensor([num_reqs], dtype=torch.int32, device=DEVICE)
     load_cache_to_device_buffer_mtp_mla(
@@ -374,7 +374,7 @@ class TestHiSparseMTPSwap(CustomTestCase):
         _run_swap(top_k_tokens=top_k_tokens, seq_lens=seq_lens, state=state)
         torch.cuda.synchronize()
         graph_out = torch.full_like(top_k_tokens, -1)
-        req_pool_indices = torch.arange(1, dtype=torch.int32, device=DEVICE)
+        req_pool_indices = torch.arange(1, dtype=torch.int64, device=DEVICE)
         num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
