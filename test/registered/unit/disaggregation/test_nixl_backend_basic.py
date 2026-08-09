@@ -271,7 +271,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertEqual(info.dst_dcp_size, 1)
         self.assertEqual(info.dst_dcp_rank, 0)
-        self.assertIsNone(info.staging)
+        self.assertEqual(info.staging_base_ptr, 0)
+        self.assertEqual(info.staging_total_size, 0)
 
 
 class TestNixlTransferStatus(CustomTestCase):
