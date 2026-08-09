@@ -64,26 +64,15 @@ on:
         default: false
 
       scheduled:
-        description: >
-          This is a nightly/weekly run, not a per-commit one. Turns on the three
-          things that differ, none of which any per-commit stage wants: per-file
-          budgets derived from est_time (a scheduled suite mixes 30s and 2h
-          tests), the full jit_kernel grids, and metrics upload. Shards also run
-          one at a time unless the caller was dispatched with full_parallel,
-          leaving the pool to per-commit CI.
+        description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
         type: boolean
         default: false
       precision_baseline:
-        description: >
-          Export the rolling-baseline env that test_nightly_precision_regression.py
-          reads. Kept separate from `scheduled` because HF_TOKEN is part of that
-          set: the baseline-store token is scoped to that one repo, so exporting
-          it on a stage that does not need it shadows the runner's own token and
-          turns every gated model into a 404.
+        description: 'Export the rolling-baseline env that test_nightly_precision_regression.py reads. Separate from `scheduled` because it sets HF_TOKEN; see the step for why that must not reach any other stage.'
         type: boolean
         default: false
       job_timeout_minutes:
-        description: 'Job-level cap, covering install and warmup on top of run_timeout_minutes. A scheduled stage needs far more than a per-commit one.'
+        description: 'Job-level cap, covering install and warmup on top of run_timeout_minutes.'
         type: string
         default: '240'
 
@@ -190,11 +179,9 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
-      # Written through $GITHUB_ENV rather than the step's `env:`, because
-      # HF_TOKEN must be left ALONE on every other stage. The baseline-store
-      # token is scoped to that one repo, and an `env:` entry sets the key
-      # unconditionally -- both a wrong value and an empty one shadow the
-      # runner's own HF_TOKEN, turning every gated model into a 401.
+      # Via $GITHUB_ENV, not the step's `env:`: an `env:` entry sets HF_TOKEN
+      # unconditionally, and both a wrong value and an empty one shadow the
+      # runner's own token, turning every gated model into a 401.
       - name: Export precision baseline env
         if: inputs.precision_baseline
         env:
