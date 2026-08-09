@@ -307,8 +307,13 @@ def sample_tokens(
     # use of multinomial_with_seed") has no analogue on this path.
     sampled = mx.argmax(log_weights + noise, axis=-1)
 
-    greedy_rows = mx.array([p.is_greedy for p in params])
-    return mx.where(greedy_rows, mx.argmax(logits32, axis=-1), sampled)
+    greedy = [p.is_greedy for p in params]
+    if not any(greedy):
+        return sampled
+    # A batch that mixes greedy rows in still runs them through the sampled
+    # path above (the row exists either way); overwrite those rows with the
+    # unnoised argmax, which is what makes greedy rows consume no randomness.
+    return mx.where(mx.array(greedy), mx.argmax(logits32, axis=-1), sampled)
 
 
 def _gumbel_noise(
