@@ -40,12 +40,11 @@ class TestKimiK3B300LowLatency(GSM8KMixin, SpecDecodingMixin, CustomTestCase):
 
     gsm8k_score_threshold = 0.95
     gsm8k_num_examples = 200
-    # Acceptance is gated here: avg_spec_accept_length is averaged over 200
-    # questions, so it holds steady when a numerics change shifts where the
-    # single greedy prompt below hits EOS.
+    # Gated on GSM8K rather than on test_bs_1_speed below: a 200-question
+    # average holds steady when a numerics change moves where the single
+    # greedy prompt hits EOS.
     gsm8k_accept_length_thres = 4.5
-    # test_bs_1_speed runs one greedy prompt, so both metrics scale with how
-    # far that generation happens to run. Keep them as coarse guards only.
+    # Both scale with how far that one greedy prompt runs; coarse guards only.
     accept_length_thres = 4.0
     bs_1_speed_thres = 380
 
