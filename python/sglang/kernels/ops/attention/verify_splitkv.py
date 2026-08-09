@@ -149,6 +149,8 @@ def _verify_prefix_stage1(
     kv_group_num: tl.constexpr,
     N_SPLITS: tl.constexpr,
     L_EXT: tl.constexpr,  # padded power-of-2 row tile (>= real l_ext)
+    HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -190,7 +192,11 @@ def _verify_prefix_stage1(
             + cur_head * stride_qh
             + offs_d[None, :]
         )
-        q = tl.load(Q + offs_q, mask=mask_l[:, None], other=0.0)
+        q = tl.load(
+            Q + offs_q,
+            mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
+            other=0.0,
+        )
         q_k = q.to(K_Buffer.dtype.element_ty)
 
         base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
@@ -206,7 +212,11 @@ def _verify_prefix_stage1(
             )
             # K block: [D, BLOCK_N]
             offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-            k = tl.load(K_Buffer + offs_buf_k, mask=n_mask[None, :], other=0.0)
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_d[:, None] < HEAD_DIM) & n_mask[None, :],
+                other=0.0,
+            )
             qk = tl.dot(q_k, k)  # [L_EXT, BLOCK_N]
             qk *= sm_scale * k_scale  # fp8 dequant of prefix K (k_scale==1 if bf16)
             # NO causal mask: full prefix is visible to all draft tokens.
@@ -214,7 +224,11 @@ def _verify_prefix_stage1(
 
             # V block: [BLOCK_N, Dv]
             offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
-            v = tl.load(V_Buffer + offs_buf_v, mask=n_mask[:, None], other=0.0)
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+                other=0.0,
+            )
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -234,7 +248,11 @@ def _verify_prefix_stage1(
             + offs_l[:, None] * stride_ol
             + offs_dv[None, :]
         )
-        tl.store(Att_Out + offs_o, acc / e_sum[:, None], mask=mask_l[:, None])
+        tl.store(
+            Att_Out + offs_o,
+            acc / e_sum[:, None],
+            mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+        )
 
         offs_lse = (
             cur_batch * stride_lb
@@ -286,6 +304,8 @@ def _verify_combine_stage2(
     kv_group_num: tl.constexpr,
     N_SPLITS: tl.constexpr,
     L_EXT: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
 ):
@@ -310,7 +330,11 @@ def _verify_combine_stage2(
         + offs_s[:, None] * stride_ls
         + offs_l[None, :]
     )
-    lse = tl.load(offs_lse + Att_Lse)  # [N_SPLITS, L_EXT]
+    lse = tl.load(
+        offs_lse + Att_Lse,
+        mask=mask_l[None, :],
+        other=float("-inf"),
+    )  # [N_SPLITS, L_EXT]
     m_p = tl.max(lse, 0)  # [L_EXT]
     w = tl.exp(lse - m_p[None, :])  # [N_SPLITS, L_EXT]; -inf->0
     denom_p = tl.sum(w, 0)  # [L_EXT]
@@ -324,7 +348,11 @@ def _verify_combine_stage2(
         + offs_l[None, :, None] * stride_ol
         + offs_dv[None, None, :]
     )
-    ao = tl.load(offs_ao + Att_Out)  # [N_SPLITS, L_EXT, Dv]
+    ao = tl.load(
+        offs_ao + Att_Out,
+        mask=mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
+        other=0.0,
+    )  # [N_SPLITS, L_EXT, Dv]
     o_prefix = tl.sum(ao * w[:, :, None], 0)  # [L_EXT, Dv]
     o_prefix = o_prefix / denom_p[:, None]
     lse_prefix = m_p + tl.log(denom_p)  # [L_EXT]
@@ -336,20 +364,32 @@ def _verify_combine_stage2(
         + cur_head * stride_qh
         + offs_d[None, :]
     )
-    q = tl.load(Q + offs_q, mask=mask_l[:, None], other=0.0).to(tl.float32)
+    q = tl.load(
+        Q + offs_q,
+        mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
 
     offs_ke = (
         (cur_q_start + offs_l)[:, None] * stride_kebs
         + cur_kv_head * stride_keh
         + offs_d[None, :]
     )
-    ke = tl.load(K_Extend + offs_ke, mask=mask_l[:, None], other=0.0).to(tl.float32)
+    ke = tl.load(
+        K_Extend + offs_ke,
+        mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
     offs_ve = (
         (cur_q_start + offs_l)[:, None] * stride_vebs
         + cur_kv_head * stride_veh
         + offs_dv[None, :]
     )
-    ve = tl.load(V_Extend + offs_ve, mask=mask_l[:, None], other=0.0).to(tl.float32)
+    ve = tl.load(
+        V_Extend + offs_ve,
+        mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
 
     # scores[i,j] = q_i . k_j  (i query, j key)  -> [L_EXT, L_EXT]
     qk = tl.sum(q[:, None, :] * ke[None, :, :], 2) * sm_scale
@@ -374,7 +414,11 @@ def _verify_combine_stage2(
         + cur_head * stride_ooh
         + offs_dv[None, :]
     )
-    tl.store(O_Out + offs_oo, o.to(O_Out.dtype.element_ty), mask=mask_l[:, None])
+    tl.store(
+        O_Out + offs_oo,
+        o.to(O_Out.dtype.element_ty),
+        mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+    )
 
 
 class VerifySplitKV:
@@ -471,6 +515,8 @@ class VerifySplitKV:
             kv_group_num=self.group,
             N_SPLITS=self.n_splits,
             L_EXT=self.l_pad,
+            HEAD_DIM=self.head_dim,
+            V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
@@ -511,6 +557,8 @@ class VerifySplitKV:
             kv_group_num=self.group,
             N_SPLITS=self.n_splits,
             L_EXT=self.l_pad,
+            HEAD_DIM=self.head_dim,
+            V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             num_warps=1,
@@ -658,6 +706,12 @@ def can_handle(
     if q_extend.shape[2] != k_buffer.shape[2]:
         return False
     if v_extend.shape[2] != v_buffer.shape[2]:
+        return False
+    # MLA (head_dim != v_head_dim, e.g. DeepSeek 576 vs 512) uses a shared
+    # latent KV cache and an absorbed-attention layout the split-KV verify
+    # kernel is not built for; it GPU-faults on that shape. Fall back to
+    # extend_attention_fwd, which handles MLA correctly.
+    if q_extend.shape[2] != v_extend.shape[2]:
         return False
     # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
     # target-verify step runs inside a captured CUDA/HIP graph, where a

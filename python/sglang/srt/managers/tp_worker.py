@@ -46,7 +46,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.graph_memory_usage import (
+    merge_graph_memory_usage,
+    merge_graph_time_usage,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -95,6 +100,23 @@ class BaseTpWorker(ABC):
             self.model_runner.full_max_total_num_tokens,
             self.model_runner.swa_max_total_num_tokens,
         )
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_memory_usage(
+            *(runner.graph_memory_usage for runner in runners)
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
+
+    @property
+    def weight_load_time(self) -> float:
+        runners = self.model_runner_list or [self.model_runner]
+        return sum(runner.weight_load_time for runner in runners)
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
@@ -288,6 +310,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        draft_attention_backend: Optional[str] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -303,6 +326,8 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: target's effective context length; the draft runs at
         # absolute target positions. None keeps server_args.context_length.
         self.context_length = context_length
+        # Draft worker: the attention backend the algorithm resolved for it.
+        self.draft_attention_backend = draft_attention_backend
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -384,7 +409,8 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -408,14 +434,14 @@ class TpModelWorker(BaseTpWorker):
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
             model_path=(
-                self.server_args.model_path
+                get_model().model_path
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_path
+                else get_spec().speculative_draft_model_path
             ),
             model_revision=(
-                self.server_args.revision
+                get_model().revision
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_revision
+                else get_spec().speculative_draft_model_revision
             ),
             is_draft_model=self.is_draft_worker,
             context_length=self.context_length,
@@ -426,7 +452,7 @@ class TpModelWorker(BaseTpWorker):
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
-            mem_fraction_static=self.server_args.mem_fraction_static,
+            mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
@@ -435,6 +461,7 @@ class TpModelWorker(BaseTpWorker):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -442,11 +469,11 @@ class TpModelWorker(BaseTpWorker):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         self.model_runner_list.append(self.model_runner)
-        for i in range(1, self.server_args.speculative_num_steps):
+        for i in range(1, get_spec().speculative_num_steps):
             self.model_runner_list.append(
                 ModelRunner(
                     model_config=self.model_config,
-                    mem_fraction_static=self.server_args.mem_fraction_static,
+                    mem_fraction_static=get_schedule().mem_fraction_static,
                     gpu_id=self.gpu_id,
                     ps=self.ps,
                     nccl_port=self.nccl_port,
@@ -455,6 +482,7 @@ class TpModelWorker(BaseTpWorker):
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
+                    draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
                 )
             )
@@ -462,7 +490,7 @@ class TpModelWorker(BaseTpWorker):
     def _init_dllm_algorithm(self):
         from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 
-        if self.server_args.dllm_algorithm is not None:
+        if get_exec().dllm.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
         else:
             self.dllm_algorithm = None
@@ -484,13 +512,14 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
+            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
+            - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,
-            self.server_args.max_prefill_tokens,
+            get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
-            self.server_args.max_queued_requests,
+            get_schedule().max_queued_requests,
             max_req_len,
             max_req_len - 5,
             self.random_seed,

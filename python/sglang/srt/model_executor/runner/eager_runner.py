@@ -26,7 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
-    cp_split_before_forward,
+    cp_shard_model_inputs,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -259,8 +259,12 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        if forward_batch.needs_forward_metadata_init():
-            if model_runner.dcp_size > 1 and hasattr(
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+
+        if forward_batch.needs_forward_metadata_init() or cp_v2_active:
+            if model_runner.ps.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
@@ -285,7 +289,6 @@ class EagerRunner(BaseRunner):
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
@@ -341,21 +344,21 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        prepare_cp_forward(forward_batch)
         input_embeds = kwargs.get("input_embeds")
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
-        input_embeds, positions = cp_split_before_forward(
+        with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
-        )
-
-        hidden_states = model.model(
-            forward_batch.input_ids,
-            positions,
-            forward_batch,
-            input_embeds=input_embeds,
-            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-        )
+        ) as (sharded_input_embeds, sharded_positions):
+            model_kwargs = {"input_embeds": sharded_input_embeds}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            hidden_states = model.model(
+                forward_batch.input_ids,
+                sharded_positions,
+                forward_batch,
+                **model_kwargs,
+            )
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
@@ -371,12 +374,18 @@ class EagerRunner(BaseRunner):
         hidden_states = cp_gather_after_forward(
             hidden_states, forward_batch, torch.cuda.current_stream()
         )
+        logits_kwargs = {}
+        # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            **logits_kwargs,
         )
 
     def _execute_idle(

@@ -40,7 +40,7 @@ def _fmix32(x, C1: tl.constexpr, C2: tl.constexpr):
     return x
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_u32", "seed1", "seed2"])
 def hash_tiles32_kernel_blocked(
     in_ptr,
     out_ptr,
@@ -100,7 +100,7 @@ def hash_tiles32_kernel_blocked(
     tl.store(out_ptr + pid, out)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_elems"])
 def add_tree_reduce_u64_kernel(in_ptr, out_ptr, n_elems, CHUNK: tl.constexpr):
     pid = tl.program_id(axis=0)
     start = pid * CHUNK
