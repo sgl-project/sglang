@@ -328,7 +328,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         moe_ep_size=server_args.ep_size,
         moe_dp_rank=None,
         moe_dp_size=server_args.moe_dp_size,
-        dcp_size=server_args.dcp_size,
+        attn_dcp_size=server_args.dcp_size,
         gpu_id=gpu_id,
     )
     runner_kwargs = dict(
