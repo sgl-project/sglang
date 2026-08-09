@@ -42,7 +42,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Ling-3.0-flash is a hybrid-attention Mixture-of-Experts (MoE) language model from the BailingMoeV3 family. It interleaves Kimi Delta Attention (KDA) linear-attention layers with gated Multi-head Latent Attention (MLA) full-attention layers, on top of a fine-grained MoE feed-forward network. This keeps per-token inference cost close to a small model — **124B total parameters with only 5.1B active** — while retaining large-model capacity.
 
-It is a hybrid-reasoning model with thinking enabled by default, and it supports structured tool calling. Native context length is 128K, extendable to 256K with YaRN.
+It is a hybrid-reasoning model with thinking enabled by default, and it supports structured tool calling. Native context length is 256K.
 
 **Available Models:**
 
@@ -61,7 +61,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 - Both the chat template and the `ling3` reasoning parser default to thinking on. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (see §3.1).
 - `--mem-fraction-static 0.8` reserves headroom for CUDA graphs and concurrent decoding; with the default allocation the NEXTN recipes can OOM under concurrent requests (e.g. a 32-thread GSM8K run).
 - The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes have it on; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
-- Native context is 128K. The recipes set `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` to acknowledge the longer context explicitly, then use `--context-length 262144` and YaRN with factor 2.0 to extend it to 256K.
+- Native context is 256K; SGLang reads it from the checkpoint's `max_position_embeddings`, so no `--context-length` flag is needed.
 - The **HiCache** card in the [Playground](#playground) exposes the validated Mooncake L3 path. It adds the hybrid-KDA scheduler and prefix-key settings together; see §3.3 for the required services.
 
 ## 3. Advanced Usage
