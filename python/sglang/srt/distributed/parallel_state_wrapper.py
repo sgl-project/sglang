@@ -49,7 +49,3 @@ class ParallelState:
         )
         kwargs.update(overrides)
         return ParallelState(**kwargs)
-
-
-def compute_dcp_rank(*, tp_rank: int, dcp_size: int) -> int:
-    return tp_rank % dcp_size

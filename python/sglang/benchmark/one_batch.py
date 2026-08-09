@@ -69,10 +69,7 @@ from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
-from sglang.srt.distributed.parallel_state_wrapper import (
-    ParallelState,
-    compute_dcp_rank,
-)
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
@@ -325,7 +322,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         attn_tp_size=attn_tp_size,
         attn_cp_rank=0,
         attn_cp_size=server_args.attn_cp_size,
-        attn_dcp_rank=compute_dcp_rank(tp_rank=tp_rank, dcp_size=server_args.dcp_size),
+        attn_dcp_rank=tp_rank % server_args.dcp_size,
         attn_dcp_size=server_args.dcp_size,
         attn_dp_rank=attn_dp_rank,
         attn_dp_size=attn_dp_size,
