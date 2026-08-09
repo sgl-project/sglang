@@ -111,4 +111,6 @@ def rust_preprocess_images(
             torch.from_numpy(pix.reshape(-1, 3, patch_size, patch_size))
         )
         grids.append(torch.tensor(grid, dtype=torch.int64))
-    return torch.cat(pixel_values), torch.stack(grids)
+    # Single image (the common case): skip torch.cat's whole-buffer copy.
+    pixels = pixel_values[0] if len(pixel_values) == 1 else torch.cat(pixel_values)
+    return pixels, torch.stack(grids)
