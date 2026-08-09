@@ -20,7 +20,16 @@ register_amd_ci(
     suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35-triton-dcp",
     nightly=True,
 )
-register_cuda_ci(est_time=4800, stage="nightly", runner_config="4-gpu-b200")
+# Disabled at the registry so its est_time stops counting toward shard sizing.
+# The server deadlocks on the first real request: TP0 blocks in cuModuleLoadData
+# JIT-loading the DCP extend-attention kernel while TP1-3 spin in cuLaunchKernelEx
+# on the GDN causal_conv1d layer, so the scheduler watchdog kills it after 300s.
+register_cuda_ci(
+    est_time=4800,
+    stage="nightly",
+    runner_config="4-gpu-b200",
+    disabled="TP4/DCP4 + triton backend deadlocks on the first prefill (watchdog timeout)",
+)
 
 QWEN35_MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B-FP8")
 SERVER_LAUNCH_TIMEOUT = 4800
