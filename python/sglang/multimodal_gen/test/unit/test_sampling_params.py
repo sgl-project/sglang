@@ -29,6 +29,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     _json_safe,
 )
+from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
@@ -104,6 +105,29 @@ class TestSamplingParamsValidate(unittest.TestCase):
             ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
         ):
             SamplingParams(enable_teacache=True, enable_spectrum=True)
+
+    def test_spectrum_params_reject_invalid_controls(self):
+        invalid_controls = (
+            {"window_size": 0},
+            {"flex_window": -0.1},
+            {"w": 1.1},
+            {"lam": -0.1},
+            {"warmup_steps": -1},
+            {"m": 0},
+            {"history_size": 0},
+            {"tau_num_steps": 0},
+            {"taylor_order": 4},
+        )
+        for kwargs in invalid_controls:
+            with self.assertRaises(ValueError):
+                SpectrumParams(**kwargs)
+
+    def test_spectrum_dict_is_validated_when_sampling_params_constructs_it(self):
+        with self.assertRaisesRegex(ValueError, "history_size"):
+            SamplingParams(
+                enable_spectrum=True,
+                spectrum_params={"history_size": 0},
+            )
 
 
 class TestSamplingParamsSubclass(unittest.TestCase):

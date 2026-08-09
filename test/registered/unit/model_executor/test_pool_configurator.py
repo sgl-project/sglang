@@ -96,7 +96,7 @@ def _make_model_runner(
     )
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
-    mc.get_num_kv_heads = lambda tp_size: num_kv_heads
+    mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config

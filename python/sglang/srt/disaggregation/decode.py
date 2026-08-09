@@ -88,7 +88,7 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.runtime_context import get_disagg, get_parallel
-from sglang.srt.utils import get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -406,6 +406,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size > 1:
+            # Match the allocator, which charges whole pages for both pools.
+            full_len = ceil_align(full_len, page_size)
+            swa_len = ceil_align(swa_len, page_size)
         swa_reserved = self.num_reserved_decode_tokens
         if self.scheduler.server_args.disable_radix_cache:
             swa_reserved = 0
@@ -1120,8 +1125,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
             if uses_swa_tail_prealloc:
-                # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
+                # SWA has no radix cache eviction, so decrement its
+                # page-aligned requirement directly.
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
