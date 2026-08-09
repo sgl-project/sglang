@@ -13,7 +13,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
@@ -71,7 +71,7 @@ def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
     if (
-        runner.server_args.dcp_size > 1
+        get_parallel().dcp_enabled
         and runner.server_args.speculative_algorithm is not None
     ):
         _, decode_backend = runner.server_args.get_attention_backends()
@@ -460,8 +460,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
                 spec, _ = spec_result
+                cfg = runner.model_config
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
+                if spec.hybrid_backend_class_name is not None:
+                    hybrid_backend_cls = import_backend_class(
+                        spec.hybrid_backend_class_name
+                    )
             else:
                 raise ValueError(
                     "Expected hybrid GDN or NemotronH models, but got unknown model. "

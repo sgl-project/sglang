@@ -1210,6 +1210,8 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    supports_cuda_vmm_feature_transport = True
+
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={

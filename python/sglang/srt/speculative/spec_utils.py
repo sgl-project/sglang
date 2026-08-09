@@ -348,7 +348,7 @@ def select_top_k_tokens(
     )
 
 
-def _sample_simulated_acc_len(
+def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
@@ -401,7 +401,7 @@ def generate_simulated_accept_index(
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
-    simulate_acc_len = _sample_simulated_acc_len(
+    simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 

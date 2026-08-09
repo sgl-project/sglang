@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace {
+namespace sglang {
 
 struct CausalConv1dParams {
   const void* __restrict__ x;           // [T, D]
@@ -214,4 +214,4 @@ struct CausalConv1dKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
