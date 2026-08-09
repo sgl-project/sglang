@@ -17,6 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -27,11 +28,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
@@ -48,6 +51,9 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    SIMULATE_ACC_TOKEN_MODE,
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
@@ -166,6 +172,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.ps = ps
@@ -324,20 +332,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
-        target_model = self.model_runner.model
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
-        ) is not None and (
-            hasattr(
-                self.model_runner.attn_backend,
-                "update_mamba_state_after_mtp_verify",
-            )
-            or hasattr(target_model, "update_conv_state_after_mtp_verify")
+        ) is not None and hasattr(
+            self.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
         )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (
-            self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -399,7 +403,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
@@ -1264,7 +1268,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = self.server_args.mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != batch.seq_lens // mamba_track_interval
@@ -1289,17 +1293,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
-            )
-        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
-            # Inkling's short convolutions access the mamba pool directly, so
-            # their accepted verify state is committed by the model rather
-            # than an attention-backend wrapper.
-            model_runner.model.update_conv_state_after_mtp_verify(
-                req_to_token_pool=model_runner.req_to_token_pool,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
             )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
@@ -1390,10 +1384,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
-            )
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1435,7 +1425,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH prefill expected out_cache_loc, but got None."
                 )
             positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
+                self.model_runner.prefill_attention_backend_str,
                 draft_seq_lens,
                 ctx_lens,
                 int(sum(batch.extend_lens)),
@@ -1728,6 +1718,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        # Only the greedy branch sets target_predict; the simulated-acceptance
+        # override below checks for it.
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1811,6 +1804,46 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        if SIMULATE_ACC_LEN > 0:
+            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+                raise ValueError(
+                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                    "'real-draft-token'."
+                )
+
+            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
+                # The sampling-verify branch does not materialize the target argmax.
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+            # The Triton path may have written new_seq_lens from the real
+            # accept_len; recompute it from the forced commit_lens.
+            new_seq_lens = None
+
+        if batch.return_logprob:
+            output_indices = torch.arange(
+                bs * block_size, dtype=torch.int64, device=device
+            ).view(bs, block_size)
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                out_tokens.reshape(-1),
+                output_indices,
+                block_size - 1,
+            )
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1858,4 +1891,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            routed_experts_output=target_out.routed_experts_output,
+            indexer_topk_output=target_out.indexer_topk_output,
         )

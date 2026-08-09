@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_exec, get_schedule, get_serving, get_spec
 from sglang.srt.utils.common import (
     Range,
     ceil_align,
@@ -51,6 +52,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Literal,
     NamedTuple,
     Optional,
     Set,
@@ -95,7 +97,11 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -114,6 +120,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -133,6 +140,47 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+ReturnHiddenStatesMode = Union[bool, Literal["last"]]
+
+
+def get_return_hidden_states_mode(
+    return_hidden_states: ReturnHiddenStatesMode,
+) -> CaptureHiddenMode:
+    if return_hidden_states is True:
+        return CaptureHiddenMode.FULL
+    if return_hidden_states == "last":
+        return CaptureHiddenMode.LAST
+    if return_hidden_states is False:
+        return CaptureHiddenMode.NULL
+    raise ValueError(
+        "return_hidden_states must be a boolean or the string literal 'last'."
+    )
+
+
+def get_request_return_hidden_states_mode(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> CaptureHiddenMode:
+    if isinstance(return_hidden_states, list):
+        return max(
+            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
+            default=CaptureHiddenMode.NULL,
+        )
+    return get_return_hidden_states_mode(return_hidden_states)
+
+
+def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
+    mode = CaptureHiddenMode.NULL
+    for req in reqs:
+        mode = max(mode, req.return_hidden_states_mode)
+    return mode
+
+
+def need_return_hidden_states(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> bool:
+    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -141,6 +189,21 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
             f"MM pad_values may overlap with valid token IDs. "
             f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
         )
+
+
+def split_cached_prefix_by_tier(
+    prefix_len: int, host_hit_len: int, storage_hit_len: int
+) -> tuple[int, int, int]:
+    """Split a request's cached prefix into (device, host, storage) tokens.
+
+    prefix_len is len(prefix_indices) AFTER host load-back, so it contains the
+    host-loaded portion; host_hit_len in turn contains the storage-prefetched
+    portion (storage is clamped to it to handle edge cases).
+    """
+    storage = min(host_hit_len, storage_hit_len)
+    host = host_hit_len - storage
+    device = max(0, prefix_len - host_hit_len)
+    return device, host, storage
 
 
 def _compute_pad_value(hash: int) -> int:
@@ -289,6 +352,10 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def set_hash(self, hash_value: int) -> None:
+        self.hash = hash_value
+        self.pad_value = _compute_pad_value(hash_value)
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
@@ -364,11 +431,14 @@ class MultimodalDataItem:
     def reconstruct(self, target_device: int, ipc_consumer_count: int = 1):
         """materialize cuda ipc proxy tensors in-place on target_device"""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            if ipc_consumer_count == 1:
+            consumer_count = self._resolve_transport_consumer_count(
+                self.feature, ipc_consumer_count
+            )
+            if consumer_count == 1:
                 self.feature = self.feature.reconstruct_on_target_device(target_device)
             else:
                 self.feature = self.feature.reconstruct_on_target_device(
-                    target_device, consumer_count=ipc_consumer_count
+                    target_device, consumer_count=consumer_count
                 )
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
@@ -407,7 +477,20 @@ class MultimodalDataItem:
     def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
         """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            consumer_count = self._resolve_transport_consumer_count(
+                self.feature, consumer_count
+            )
             self.feature.acknowledge_consumption(consumer_count)
+
+    @staticmethod
+    def _resolve_transport_consumer_count(proxy, requested_count: int) -> int:
+        """Clamp a group acknowledgement to the proxy's actual consumer set."""
+        proxy_count = getattr(
+            proxy,
+            "total_consumer_count",
+            getattr(proxy, "consumer_count", requested_count),
+        )
+        return min(requested_count, proxy_count)
 
 
 @dataclasses.dataclass
@@ -686,6 +769,12 @@ class ReqLogprob:
     input_token_logprobs_idx: Optional[List[int]] = None
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
+    # Flat replacements for the rows above (see
+    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # emptied and the arrays ship instead.
+    input_top_logprobs_val_flat: Optional[np.ndarray] = None
+    input_top_logprobs_idx_flat: Optional[np.ndarray] = None
+    input_top_logprobs_flat_null_prefix: Optional[int] = None
     input_token_ids_logprobs_val: Optional[List[List[float]]] = None
     input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
     output_token_logprobs_val: Optional[list] = None
@@ -724,6 +813,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
+        return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
@@ -733,7 +823,7 @@ class Req(ReqDllmMixin):
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
-        return_hidden_states: bool = False,
+        return_hidden_states: ReturnHiddenStatesMode = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
@@ -780,6 +870,8 @@ class Req(ReqDllmMixin):
 
         self.session = session
         self.session_id = session_id
+        # Used by the session radix cache to reject registration after a close/reopen.
+        self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
@@ -808,6 +900,8 @@ class Req(ReqDllmMixin):
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
+        self._think_end_matcher: Optional[TokenSequenceMatcher] = None
+        self._think_end_match_len = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -818,6 +912,9 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.return_hidden_states_mode = get_return_hidden_states_mode(
+            return_hidden_states
+        )
 
         # extra key for classifying the request (e.g. cache_salt)
         if lora_id is not None:
@@ -907,6 +1004,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # per-component nodes this req skipped locking (e.g. mamba on the decode
+        # hold, already COW'd), so their dec releases only what it took.
+        self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -939,6 +1039,7 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
@@ -1064,6 +1165,12 @@ class Req(ReqDllmMixin):
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+        # Decode-side cached-prefix length; base of the staging chunk grid
+        # (start_send_idx starts here but advances with every send).
+        self.disagg_decode_prefix_len: int = 0
+        # At-rest device-resident prefix end, snapshotted on the request's
+        # first prefill batch; the cached-prefix early-send never goes past it.
+        self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -1094,7 +1201,7 @@ class Req(ReqDllmMixin):
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        spec_alg = get_server_args().speculative_algorithm
+        spec_alg = get_spec().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
@@ -1115,7 +1222,7 @@ class Req(ReqDllmMixin):
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
-        if get_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
+        if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
 
@@ -1447,7 +1554,28 @@ class Req(ReqDllmMixin):
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
                 for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
+                    # Seatbelt, not validation: patterns are checked at ingress
+                    # (Python's `normalize`, or the rust server's stricter
+                    # `stop_regex_bound`). This runs per decode step on the hot
+                    # path, so an `re.error` escaping here would take the whole
+                    # scheduler down over one malformed request. Fail that request
+                    # instead.
+                    try:
+                        matched = re.search(stop_regex_str, tail_str)
+                    except (re.error, RecursionError) as e:
+                        logger.warning(
+                            "req %s: invalid stop_regex %r (%s); aborting the request",
+                            self.rid,
+                            stop_regex_str,
+                            e,
+                        )
+                        self.finished_reason = FINISH_ABORT(
+                            f"invalid stop_regex {stop_regex_str!r}: {e}",
+                            HTTPStatus.BAD_REQUEST,
+                            "BadRequestError",
+                        )
+                        break
+                    if matched:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
@@ -1460,7 +1588,9 @@ class Req(ReqDllmMixin):
 
     def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
         for i, token_id in enumerate(new_accepted_tokens):
-            if token_id >= self.vocab_size or token_id < 0:
+            if token_id < 0 or (
+                self.vocab_size is not None and token_id >= self.vocab_size
+            ):
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
                 if self.sampling_params.stop_token_ids:
                     self.output_ids[offset] = next(
@@ -1474,6 +1604,18 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _cap_finished_len_at_max_new_tokens(self) -> None:
+        """Demote a stop matched beyond the length budget to a length finish.
+
+        Speculative decoding can accept a run that both crosses
+        ``max_new_tokens`` and contains a stop; a stop located past the cap
+        must not extend the emitted output beyond the cap.
+        """
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if self.finished_len is not None and self.finished_len > max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
+
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -1483,26 +1625,33 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
-            return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
         if self._check_vocab_boundary_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
             return
 
         # Stop string beats EOS/stop-token matched in the same step (speculative
         # decoding can accept >1 token): token-based would trim only the last
         # token and leak the stop string.
         if self._check_str_based_finish(new_accepted_len):
+            self._cap_finished_len_at_max_new_tokens()
             return
 
+        # Stop token/EOS beats the length cap for the same reason: a spec accept
+        # run can cross max_new_tokens in the very step the EOS lands, and a
+        # length-first finish would keep the over-accepted tokens after the EOS
+        # (up to the cap) in the emitted output.
         if self._check_token_based_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         if self.grammar is not None and self.grammar.is_terminated():
@@ -1522,6 +1671,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -1656,19 +1806,26 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
-    def update_reasoning_tokens(self, token_id, think_end_id):
+    def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
             return
 
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        try:
-            end_pos = token_id.index(think_end_id)
-            self.reasoning_tokens += end_pos + 1
-            self._is_reasoning_over = True
-        except ValueError:
-            self.reasoning_tokens += len(token_id)
+        if self._think_end_matcher is None:
+            self._think_end_matcher = TokenSequenceMatcher(think_end_ids)
+
+        matched = self._think_end_match_len
+        for position, token in enumerate(token_id):
+            matched = self._think_end_matcher.advance(matched, token)
+            if matched == len(self._think_end_matcher):
+                self.reasoning_tokens += position + 1
+                self._is_reasoning_over = True
+                return
+
+        self._think_end_match_len = matched
+        self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
@@ -1880,6 +2037,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
+    after_idle_gap: bool = False
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -1955,6 +2113,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+    return_hidden_states_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
 
     # Has grammar
     has_grammar: bool = False
@@ -2013,6 +2172,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
+        return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
+
         batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -2024,7 +2185,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             has_grammar=any(req.grammar for req in reqs),
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
-            return_hidden_states=any(req.return_hidden_states for req in reqs),
+            return_hidden_states=return_hidden_states_mode.need_capture(),
+            return_hidden_states_mode=return_hidden_states_mode,
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
@@ -2290,24 +2452,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
+                    # after prefetch completes.
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ) = split_cached_prefix_by_tier(
+                        prefix_len=len(req.prefix_indices),
+                        host_hit_len=req.host_hit_length,
+                        storage_hit_len=req.storage_hit_length,
+                    )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
@@ -2897,7 +3052,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if server_args.enable_mamba_extra_buffer():
-            mamba_track_interval = server_args.mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
@@ -2936,6 +3091,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
+            self.return_hidden_states = False
+            self.return_hidden_states_mode = CaptureHiddenMode.NULL
             return
 
         if len(keep_indices) == len(self.reqs):
@@ -2985,6 +3142,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_ids_logprobs = None
 
         self.has_grammar = any(req.grammar for req in self.reqs)
+        self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
+        self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
@@ -3046,9 +3205,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.return_logprob = self.return_logprob or other.return_logprob
         self.has_grammar = self.has_grammar or other.has_grammar
-        self.return_hidden_states = (
-            self.return_hidden_states or other.return_hidden_states
+        self.return_hidden_states_mode = max(
+            self.return_hidden_states_mode, other.return_hidden_states_mode
         )
+        self.return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
@@ -3071,6 +3231,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             has_grammar=self.has_grammar,
+            return_hidden_states=self.return_hidden_states,
+            return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
@@ -3091,13 +3253,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
+            after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
         )
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
-            server_args = get_server_args()
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
@@ -3105,13 +3267,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
+            self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval iterations to reduce the overhead.
-                    if swa_maintenance_step and req.decode_batch_idx >= 1:
+                    # 2. Evict only once >= eviction_interval tokens have slid
+                    # out of the window, amortizing eviction work while keeping
+                    # each request's overshoot within the interval the pool
+                    # budget reserves. Gating on accumulated tokens (rather
+                    # than an iteration-counter phase) cannot starve because
+                    # seqlen progress is monotonic per KV handle.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.kv is not None
+                        and req.seqlen - 1 - sliding_window_size
+                        >= req.kv.swa_evicted_seqlen + eviction_interval
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # DSV4-NPU only (no-op elsewhere): the small paged compress-state
@@ -3130,7 +3302,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.swa_uuid_for_lock
+                            req.last_node,
+                            req.swa_uuid_for_lock,
+                            skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
@@ -3141,13 +3315,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             continue
                         else:
                             pre_len = (
-                                pre_len - server_args.chunked_prefill_size
-                                if server_args.chunked_prefill_size > 0
+                                pre_len - get_schedule().chunked_prefill_size
+                                if get_schedule().chunked_prefill_size > 0
                                 else pre_len
                             )
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+            self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"

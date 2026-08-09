@@ -8,10 +8,19 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
+    pack_qkv_destination_major,
+)
+from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
     get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends import (
+    flash_attn as _fa_backend,
 )
 from sglang.srt.utils.common import torch_release
 
@@ -35,12 +44,45 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+_A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def _a2a_staging_buffer(
+    role: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Reusable staging buffer for a Ulysses collective.
+
+    A buffer of a given role is fully consumed (in stream order) before the
+    next collective with the same role overwrites it, so caching by
+    (role, shape, dtype) is exact and removes per-block allocator churn.
+    Bypassed under autograd and CUDA graph capture: a buffer first allocated
+    while capturing would live in the graph's private memory pool and must
+    not be shared with eager replays.
+    """
+    if (
+        torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or device.type != "cuda"
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return torch.empty(shape, dtype=dtype, device=device)
+    key = (role, tuple(shape), dtype, device.index)
+    buffer = _A2A_STAGING_BUFFERS.get(key)
+    if buffer is None:
+        buffer = torch.empty(shape, dtype=dtype, device=device)
+        _A2A_STAGING_BUFFERS[key] = buffer
+    return buffer
+
+
+def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
-    output = torch.empty_like(x)
+    if role is None:
+        output = torch.empty_like(x)
+    else:
+        output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
     torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
@@ -66,6 +108,159 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
+def _ipc_ready_group():
+    """The ulysses group when the 2-rank IPC transport is usable, else None."""
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        ipc_a2a_ready,
+    )
+
+    group = get_sp_group().ulysses_group
+    return group if ipc_a2a_ready(group) else None
+
+
+def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
+    """2-rank IPC path for the varlen A2A pair; None when unavailable."""
+    if head_dim != 2:
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    r = IPC_A2A.rank
+    off = [0, seq_lens[0]]
+    if direction == "input":
+        # [b, s_local, h_global, d] -> [b, sum(seq_lens), h_global/2, d]
+        b, s_local, h_global, d = x.shape
+        half = h_global // 2
+        peer_len = seq_lens[1 - r]
+        send = x[:, :, (1 - r) * half : (2 - r) * half].contiguous()
+        out = x.new_empty(b, seq_lens[0] + seq_lens[1], half, d)
+        out.narrow(1, off[r], s_local).copy_(x[:, :, r * half : (r + 1) * half])
+        theirs = IPC_A2A.exchange(group, send, (b, peer_len, half, d))
+        if theirs is None:
+            return None
+        out.narrow(1, off[1 - r], peer_len).copy_(theirs)
+        return out
+    # output: [b, s_global, h_local, d] -> [b, seq_lens[r], 2*h_local, d].
+    # The staging buffer IS the gathered result: each rank writes its head
+    # half of the peer's slot directly; no intermediate copy.
+    b, s_global, h_local, d = x.shape
+    my_len = seq_lens[r]
+    peer_len = seq_lens[1 - r]
+    n_out = b * my_len * 2 * h_local * d
+    n_peer_out = b * peer_len * 2 * h_local * d
+    pair = IPC_A2A.get_staging(n_out, n_peer_out, x.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    pst = peer[slot].narrow(0, 0, n_peer_out).view(b, peer_len, 2 * h_local, d)
+    pst[:, :, r * h_local : (r + 1) * h_local].copy_(
+        x.narrow(1, off[1 - r], peer_len), non_blocking=True
+    )
+    IPC_A2A.signal()
+    out = local[slot].narrow(0, 0, n_out).view(b, my_len, 2 * h_local, d)
+    out[:, :, r * h_local : (r + 1) * h_local].copy_(x.narrow(1, off[r], my_len))
+    IPC_A2A.wait()
+    return out
+
+
+def _ipc_input_a2a_qkv(q, k, v):
+    """The three input A2As of one attention as a single IPC exchange;
+    None when unavailable."""
+    if get_ulysses_parallel_world_size() != 2:
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    b, s_local, h_global, d = q.shape
+    half = h_global // 2
+    r = IPC_A2A.rank
+    n = b * s_local * half * d
+    pair = IPC_A2A.get_staging(3 * n, 3 * n, q.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    outs = []
+    for i, t in enumerate((q, k, v)):
+        send = t[:, :, (1 - r) * half : (2 - r) * half].contiguous()
+        peer[slot].narrow(0, i * n, n).copy_(send.view(-1), non_blocking=True)
+        out = t.new_empty(b, 2 * s_local, half, d)
+        out.narrow(1, r * s_local, s_local).copy_(t[:, :, r * half : (r + 1) * half])
+        outs.append(out)
+    IPC_A2A.signal_and_wait()
+    for i, out in enumerate(outs):
+        theirs = local[slot].narrow(0, i * n, n).view(b, s_local, half, d)
+        out.narrow(1, (1 - r) * s_local, s_local).copy_(theirs)
+    return tuple(outs)
+
+
+def _ipc_input_a2a_qkv_segmented(txt_q, img_q, txt_k, img_k, txt_v, img_v, local_pad):
+    """Joint-attention input A2A that reads the (txt, img) pair directly in
+    join_seqs layout [txt_real | img | txt_pad], skipping the per-projection
+    joint cats. The staging buffer IS the gathered q/k/v: each rank writes its
+    own sequence span of the peer's slot; returns (q, k, v) staging views or
+    None when unavailable."""
+    if get_ulysses_parallel_world_size() != 2:
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    b, txt_len, h_global, d = txt_q.shape
+    img_len = img_q.shape[1]
+    half = h_global // 2
+    r = IPC_A2A.rank
+    L = txt_len + img_len
+    real = txt_len - local_pad
+    n = b * 2 * L * half * d
+    pair = IPC_A2A.get_staging(3 * n, 3 * n, txt_q.dtype, group)
+    if pair is None:
+        return None
+    local, peer = pair
+    slot = IPC_A2A.next_slot()
+    ph = slice((1 - r) * half, (2 - r) * half)
+    lh = slice(r * half, (r + 1) * half)
+    base = r * L
+    outs = []
+    peer_dsts, peer_srcs = [], []
+    loc_dsts, loc_srcs = [], []
+    for i, (txt, img) in enumerate(((txt_q, img_q), (txt_k, img_k), (txt_v, img_v))):
+        pst = peer[slot].narrow(0, i * n, n).view(b, 2 * L, half, d)
+        pspan = pst[:, base : base + L]
+        peer_dsts += [pspan[:, 0:real], pspan[:, real : real + img_len]]
+        peer_srcs += [txt[:, 0:real, ph], img[:, :, ph]]
+        if local_pad:
+            peer_dsts.append(pspan[:, real + img_len :])
+            peer_srcs.append(txt[:, real:, ph])
+        out = local[slot].narrow(0, i * n, n).view(b, 2 * L, half, d)
+        lspan = out[:, base : base + L]
+        loc_dsts += [lspan[:, 0:real], lspan[:, real : real + img_len]]
+        loc_srcs += [txt[:, 0:real, lh], img[:, :, lh]]
+        if local_pad:
+            loc_dsts.append(lspan[:, real + img_len :])
+            loc_srcs.append(txt[:, real:, lh])
+        outs.append(out)
+    torch._foreach_copy_(peer_dsts, peer_srcs)
+    # signal as soon as the peer's data is in flight; our local-half writes
+    # overlap with the peer's wait
+    IPC_A2A.signal()
+    torch._foreach_copy_(loc_dsts, loc_srcs)
+    IPC_A2A.wait()
+    return tuple(outs)
+
+
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
@@ -88,6 +283,11 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if world_size == 2 and head_dim == 2:
+        fast = _ipc_varlen_fast(x, [x.shape[1], x.shape[1]], 2, "input")
+        if fast is not None:
+            return fast
+
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
@@ -108,7 +308,7 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     h_local, s_global = h_global // world_size, s_local * world_size
 
     x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+    x = _usp_all_to_all_single(x, role="usp_input")
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
@@ -120,6 +320,128 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
 
     return x
+
+
+def _usp_input_all_to_all_packed_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange 3D Q/K/V with one destination-major Ulysses collective."""
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    assert q.ndim == 3 and q.shape == k.shape == v.shape
+    s_local, h_global, head_size = q.shape
+    assert h_global % world_size == 0
+    h_local = h_global // world_size
+
+    if (
+        q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+        and not torch.compiler.is_compiling()
+    ):
+        packed = pack_qkv_destination_major(
+            q,
+            k,
+            v,
+            world_size,
+            out=_a2a_staging_buffer(
+                "usp_packed_qkv_src",
+                (world_size, s_local, h_local, 3 * head_size),
+                q.dtype,
+                q.device,
+            ),
+        )
+    else:
+        packed = torch.empty(
+            (world_size, s_local, h_local, 3 * head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        for index, tensor in enumerate((q, k, v)):
+            head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
+                1, 0, 2, 3
+            )
+            packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
+
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
+    q, k, v = packed.split(head_size, dim=-1)
+    return q, k, v
+
+
+def _can_use_packed_qkv_a2a_4d(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
+) -> bool:
+    return (
+        q.is_cuda
+        and q.ndim == 4
+        and q.shape == k.shape == v.shape
+        and q.dtype == k.dtype == v.dtype
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.shape[2] % world_size == 0
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _usp_input_all_to_all_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ulysses input exchange for Q/K/V with heads at dim=2.
+
+    [b, s_local, h, d] x3 -> [b, s_global, h_local, d] x3. Q/K/V are packed
+    destination-major by one relayout kernel and exchanged in a single
+    collective instead of three; only data movement changes, so the result is
+    bit-identical to the unpacked path, which stays as the fallback for
+    ineligible inputs (CPU, GQA-mismatched shapes, non-contiguous layouts).
+    Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+    if not _can_use_packed_qkv_a2a_4d(q, k, v, world_size):
+        return (
+            _usp_input_all_to_all(q, head_dim=2),
+            _usp_input_all_to_all(k, head_dim=2),
+            _usp_input_all_to_all(v, head_dim=2),
+        )
+
+    b, s_local, h_global, d = q.shape
+    h_local = h_global // world_size
+    rows = b * s_local
+    packed = pack_qkv_destination_major(
+        q.view(rows, h_global, d),
+        k.view(rows, h_global, d),
+        v.view(rows, h_global, d),
+        world_size,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src", (world_size, rows, h_local, 3 * d), q.dtype, q.device
+        ),
+    )
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    if b == 1:
+        # Received chunks are already sequence-major: rank j's rows arrive at
+        # offset j * s_local, so flattening the leading dims is a free view.
+        packed = packed.view(1, world_size * s_local, h_local, 3 * d)
+    else:
+        packed = (
+            packed.view(world_size, b, s_local, h_local, 3 * d)
+            .permute(1, 0, 2, 3, 4)
+            .contiguous()
+            .view(b, world_size * s_local, h_local, 3 * d)
+        )
+    q, k, v = packed.split(d, dim=-1)
+    # Copy out before the staging buffer is recycled by the next collective.
+    return q.contiguous(), k.contiguous(), v.contiguous()
 
 
 def _usp_input_all_to_all_varlen(
@@ -147,6 +469,11 @@ def _usp_input_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if world_size == 2:
+        fast = _ipc_varlen_fast(x, seq_lens, head_dim, "input")
+        if fast is not None:
+            return fast
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
@@ -221,6 +548,12 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if world_size == 2 and head_dim == 2 and x.shape[1] % 2 == 0:
+        half_len = x.shape[1] // 2
+        fast = _ipc_varlen_fast(x, [half_len, half_len], 2, "output")
+        if fast is not None:
+            return fast
+
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
@@ -241,7 +574,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     s_local, h_global = s_global // world_size, h_local * world_size
 
     x = x.permute(permute_order).contiguous()
-    x = _usp_all_to_all_single(x)
+    x = _usp_all_to_all_single(x, role="usp_output")
     x = x.reshape(world_size, s_local, b, h_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
@@ -250,7 +583,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
-        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
+        x = usp_merge_heads(x).reshape(b, s_local, h_global, d)
 
     return x
 
@@ -280,6 +613,11 @@ def _usp_output_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if world_size == 2:
+        fast = _ipc_varlen_fast(x, seq_lens, head_dim, "output")
+        if fast is not None:
+            return fast
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
@@ -342,6 +680,7 @@ def ring_attn(
     attn_impl: "AttentionImpl",
     is_causal: bool = False,
     dropout_p: float = 0.0,
+    return_softmax_lse: bool = False,
 ):
     """
     Ring Attention implementation.
@@ -415,15 +754,169 @@ def ring_attn(
     if use_segment_id:
         # For torch >= 2.6, segment_id is required. The value '1' is a placeholder
         # as we are not using complex segmentation features.
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             seq_dim=1,  # segment_id
             **attn_kwargs,
         )
     else:
-        out, *_ = _templated_ring_attention(
+        out, lse, *_ = _templated_ring_attention(
             **attn_kwargs,
         )
 
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])
+    if return_softmax_lse:
+        return output, lse
     return output
+
+
+def _merge_attention_partials(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+) -> torch.Tensor:
+    """Merge two attention partials computed over disjoint KV sets.
+
+    `out_*` are `[B, S, H, D]`; `lse_*` are the dense-FA LSE layout `[B, H, S]`.
+    Each partial is self-normalized over its own KV, so the exact combine is a
+    two-term logsumexp reweighting; done in fp32 for stability.
+    """
+    lse_a = lse_a.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    lse_b = lse_b.transpose(1, 2).unsqueeze(-1).to(torch.float32)
+    new_lse = torch.logaddexp(lse_a, lse_b)
+    return out_a.to(torch.float32) * torch.exp(lse_a - new_lse) + out_b.to(
+        torch.float32
+    ) * torch.exp(lse_b - new_lse)
+
+
+def _ring_merge_attention(
+    out_acc: torch.Tensor | None,
+    lse_acc: torch.Tensor | None,
+    step_out: torch.Tensor,
+    step_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Online-softmax combine of one more ring step's partial attention.
+
+    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
+    layout `[H, T]`. Both are already self-normalized over their own KV
+    chunk, so combining chunks is the standard two-term logsumexp merge
+    (exact up to float rounding); done in fp32 for stability.
+    """
+    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
+    step_out = step_out.to(torch.float32)
+    if out_acc is None:
+        return step_out, step_lse
+    new_lse = torch.logaddexp(lse_acc, step_lse)
+    out_acc = out_acc * torch.exp(lse_acc - new_lse) + step_out * torch.exp(
+        step_lse - new_lse
+    )
+    return out_acc, new_lse
+
+
+def _ring_attention_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float,
+    real_seq_len: int,
+    ring_ws: int,
+) -> torch.Tensor:
+    """Ring-rotated varlen attention over one rank's local packed chunk.
+
+    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
+    real rows followed by however many of this chunk's rows are padding).
+    KV is P2P-rotated around the ring one hop per step (send this step's
+    buffer to the next rank, receive the following step's buffer from the
+    previous rank) so the hop for step+1 overlaps this step's attention
+    compute -- unlike a single blocking all_gather, no step waits on the
+    full ring's transfer before its own compute can start. Each hop's
+    *real* prefix is attended locally and merged via online softmax.
+    Padding rows never contribute to any KV chunk (their output is unused
+    downstream, but must not be corrupted by attending across the padding
+    boundary), and a chunk that is entirely padding is skipped outright.
+    """
+    ring_pg = get_sp_group().ring_group
+    assert ring_pg is not None, "Ring process group is not initialized."
+    ring_chunk_len = q.shape[0]
+    _, ring_rank = get_ring_ctx()
+
+    # `isend`/`irecv` (unlike collectives) address peers by global rank even
+    # under a sub-group, so resolve this ring's neighbors once up front.
+    next_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank + 1) % ring_ws
+    )
+    prev_global_rank = torch.distributed.get_global_rank(
+        ring_pg, (ring_rank - 1) % ring_ws
+    )
+
+    # K and V travel as one stacked buffer so each hop is a single P2P
+    # send/recv pair instead of two; stacking also makes the buffer
+    # contiguous, so no separate .contiguous() call is needed.
+    kv0 = torch.stack((k, v))
+    kv_bufs = [kv0, torch.empty_like(kv0)]
+    cur = 0
+
+    q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
+    out_acc: torch.Tensor | None = None
+    lse_acc: torch.Tensor | None = None
+    pending_ops = None
+    for step in range(ring_ws):
+        nxt = 1 - cur
+        if step < ring_ws - 1:
+            # kick off next hop before this step's compute so the transfer
+            # overlaps it; wait for completion only after issuing compute.
+            pending_ops = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        kv_bufs[cur],
+                        next_global_rank,
+                        group=ring_pg,
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        kv_bufs[nxt],
+                        prev_global_rank,
+                        group=ring_pg,
+                    ),
+                ]
+            )
+
+        src_rank = (ring_rank - step) % ring_ws
+        remote_used = min(
+            max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
+        )
+        if remote_used > 0:
+            k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
+            result = flash_attn_varlen_func(
+                q,
+                kv_bufs[cur][0, :remote_used],
+                kv_bufs[cur][1, :remote_used],
+                cu_seqlens_q=q_cu,
+                cu_seqlens_k=k_cu,
+                max_seqlen_q=ring_chunk_len,
+                max_seqlen_k=remote_used,
+                softmax_scale=softmax_scale,
+                causal=False,
+                ver=_fa_backend.fa_ver,
+                return_softmax_lse=True,
+            )
+            if not isinstance(result, tuple):
+                raise RuntimeError(
+                    "flash_attn_varlen_func did not return softmax_lse; ring "
+                    "parallelism requires a backend that supports "
+                    "return_softmax_lse=True."
+                )
+            step_out, step_lse, *_ = result
+            out_acc, lse_acc = _ring_merge_attention(
+                out_acc, lse_acc, step_out, step_lse
+            )
+
+        if pending_ops is not None:
+            for op in pending_ops:
+                op.wait()
+            pending_ops = None
+            cur = nxt
+    return out_acc.to(q.dtype)
