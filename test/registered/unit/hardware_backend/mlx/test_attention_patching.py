@@ -1222,7 +1222,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
         )
-        batch = SimpleNamespace()
+        batch = SimpleNamespace(
+            mamba_track_mask_cpu=None,
+            mamba_track_mask_next_cpu=None,
+            mamba_decode_batch_idx_cpu=None,
+        )
         result = SimpleNamespace()
         i = 0
         logits_output = SimpleNamespace(customized_info=None)
