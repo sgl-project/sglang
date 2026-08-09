@@ -42,11 +42,14 @@ def _score_kernel(
     stride_on,
     stride_ol,
     M,
+    M_VALID,
     N_VALID,
     NOUT,
+    MOUT,
     BLK_M: tl.constexpr,
     BLK_N: tl.constexpr,
     NK: tl.constexpr,
+    NQR: tl.constexpr,
     D: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -71,37 +74,79 @@ def _score_kernel(
 
     # a sub-cell past the last real one must not contribute to its group's log-sum-exp
     acc = tl.where(offs_n[None, :] < N_VALID, acc, _NEG)
+    # same on the query side: with NQ > 1 the last query block can own sub-cells that
+    # are entirely padding, and those pool to zero -- an exp2(0) = 1 term that would
+    # otherwise be folded into the block's score.
+    acc = tl.where(offs_m[:, None] < M_VALID, acc, _NEG)
 
     acc = tl.reshape(acc, (BLK_M, BLK_N // NK, NK))
     m = tl.max(acc, axis=2)
     s = tl.sum(tl.exp2(acc - m[:, :, None]), axis=2)
+    lse = m + tl.log2(s)
+    lse = tl.where(m > _NEG / 2, lse, _NEG)  # whole group was padding
+
+    # Fold NQR query sub-cells of a query block together. Log-sum-exp is
+    # associative, so reducing NK then NQ is the same one log-sum-exp over all
+    # NQ*NK sub-block pairs -- and doing it in two stages keeps both reductions
+    # on an axis that is already contiguous in registers.
+    #
+    # NQR=1 leaves the query sub-cells apart, which is what the caller wants
+    # when each of them is to be normalised by its own softmax denominator
+    # before they are combined: that denominator runs over every key block, so
+    # it cannot be known while this kernel still holds only one key tile.
+    if NQR > 1:
+        lse = tl.reshape(lse, (BLK_M // NQR, NQR, BLK_N // NK))
+        m2 = tl.max(lse, axis=1)
+        s2 = tl.sum(tl.exp2(lse - m2[:, None, :]), axis=1)
+        lse = tl.where(m2 > _NEG / 2, m2 + tl.log2(s2), _NEG)
+
     # exp2/log2 internally (they map to the hardware instructions), then back to natural
     # log units so the fused and reference backends return the same numbers, not just the
     # same ranking. One multiply in registers.
-    out = (m + tl.log2(s)) * _LN2
-    out = tl.where(m > _NEG / 2, out, _NEG)  # whole group was padding
+    out = lse * _LN2
     out = out.to(O.dtype.element_ty)  # bf16 halves what the selection step has to read
 
     offs_o = pid_n * (BLK_N // NK) + tl.arange(0, BLK_N // NK)
+    offs_q = pid_m * (BLK_M // NQR) + tl.arange(0, BLK_M // NQR)
     tl.store(
         O
         + pid_l * stride_ol
-        + offs_m[:, None] * stride_om
+        + offs_q[:, None] * stride_om
         + offs_o[None, :] * stride_on,
         out,
-        mask=(offs_m[:, None] < M) & (offs_o[None, :] < NOUT),
+        mask=(offs_q[:, None] < MOUT) & (offs_o[None, :] < NOUT),
     )
 
 
 def fused_scores(
-    qp, kp, out, n_k, n_valid, num_warps=4, num_stages=3, blk_m=128, blk_n=128
+    qp,
+    kp,
+    out,
+    n_k,
+    n_valid,
+    n_q_reduce=1,
+    m_valid=None,
+    num_warps=4,
+    num_stages=3,
+    blk_m=128,
+    blk_n=128,
 ):
-    """qp: [L, M, D] bf16 (already carrying softmax_scale*log2e), kp: [L, N, D] bf16,
-    out: [L, M, Nout] fp32 with Nout = ceil(N / n_k). All contiguous."""
+    """qp: [L, Gq*n_q, D] bf16 (already carrying softmax_scale*log2e),
+    kp: [L, Gk*n_k, D] bf16 -> out, natural-log scores.
+
+    ``n_q_reduce`` query sub-cells are folded together by log-sum-exp, so out is
+    [L, Gq*n_q // n_q_reduce, Gk]: pass n_q to get one score per query block, or
+    1 to keep the query sub-blocks apart for a caller that will normalise each
+    by its own denominator first.
+
+    ``n_valid`` / ``m_valid`` are the counts of key / query sub-cells holding at
+    least one real token; the rest pooled to zero and must not contribute.
+    """
     L, M, D = qp.shape
     N = kp.shape[1]
-    Nout = out.shape[2]
-    assert blk_n % n_k == 0
+    Mout, Nout = out.shape[1], out.shape[2]
+    assert blk_n % n_k == 0, "the key tile must hold whole blocks"
+    assert blk_m % n_q_reduce == 0, "the query tile must hold whole blocks"
     grid = (triton.cdiv(M, blk_m), triton.cdiv(N, blk_n), L)
     _score_kernel[grid](
         qp,
@@ -115,11 +160,14 @@ def fused_scores(
         out.stride(2),
         out.stride(0),
         M,
+        M if m_valid is None else m_valid,
         n_valid,
         Nout,
+        Mout,
         BLK_M=blk_m,
         BLK_N=blk_n,
         NK=n_k,
+        NQR=n_q_reduce,
         D=D,
         num_warps=num_warps,
         num_stages=num_stages,

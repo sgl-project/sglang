@@ -64,6 +64,13 @@ DEFAULT_SPARSITY = 0.75
 DEFAULT_SKIP_FIRST_STEPS = 10
 DEFAULT_SKIP_FIRST_LAYERS = 0
 DEFAULT_N_K = 4
+# Query-side splitting. Splitting Q *alone* is worse than not splitting, which
+# is where the "n_q is worthless" reading came from; splitting both sides by the
+# same factor measured better than n_q=1 end to end at sparsity 0.9 (+0.031
+# cosine against the dense render, all five clips, paired t = +2.9) for 0.6% of
+# the denoise time. Left at 1 until that reproduces at the 0.75 default, where
+# no estimator has yet separated from any other.
+DEFAULT_N_Q = 1
 # Below this many keys the router costs more than the blocks it saves, and the
 # top-k budget collapses to a handful of blocks.
 DEFAULT_MIN_SEQ_LEN = 4096
@@ -133,6 +140,7 @@ class KeySplitSchedule(msgspec.Struct, frozen=True):
     skip_first_steps: int
     skip_first_layers: int
     n_k: int
+    n_q: int
     min_seq_len: int
 
     @classmethod
@@ -149,6 +157,7 @@ class KeySplitSchedule(msgspec.Struct, frozen=True):
                 config.get("skip_first_layers", DEFAULT_SKIP_FIRST_LAYERS)
             ),
             n_k=int(config.get("n_k", DEFAULT_N_K)),
+            n_q=int(config.get("n_q", DEFAULT_N_Q)),
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
         )
         if not 0.0 <= schedule.sparsity < 1.0:
@@ -200,7 +209,9 @@ class KeySplitAttentionImpl(AttentionImpl):
             and self.schedule.sparsity > 0.0
         )
         self.router = (
-            SubBlockRouter(n_k=self.schedule.n_k) if self.layer_enabled else None
+            SubBlockRouter(n_k=self.schedule.n_k, n_q=self.schedule.n_q)
+            if self.layer_enabled
+            else None
         )
         self.dense_impl = self._build_dense_impl(causal=causal)
         if self.layer_enabled:
