@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     preprocess_condition_image,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context,
     autocast_enabled,
@@ -25,12 +24,11 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     temporary_module_dtype,
 )
 
-logger = init_logger(__name__)
-
 
 class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
     """Turn the condition frame into a Qwen3-VL image and a clean latent."""
 
+    # Outputs live in batch.extra and the posterior is sampled, so no cross-request reuse.
     deduplicated_output_fields = ()
 
     @torch.no_grad()

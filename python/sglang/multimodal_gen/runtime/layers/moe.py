@@ -87,7 +87,6 @@ class LingBotVideoGroupedExperts(nn.Module):
         self, num_experts: int, hidden_size: int, intermediate_size: int
     ) -> None:
         super().__init__()
-        self.num_experts = num_experts
         self.w13_weight = nn.Parameter(
             torch.empty(num_experts, 2 * intermediate_size, hidden_size)
         )

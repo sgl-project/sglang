@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 TOKEN_LENGTH = 37698
 HIDDEN_STATE_SKIP_LAYER = 0
@@ -33,7 +30,6 @@ PROMPT_TEMPLATE = (
     "<|im_start|>assistant\n"
 )
 IMG_PROMPT_TEMPLATE = "<|vision_start|><|image_pad|><|vision_end|>"
-VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):
@@ -62,8 +58,8 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
         return template.format(text)
 
     def _compute_crop_start(self) -> int:
-        processor = self.tokenizers[0]
         if self._crop_start is None:
+            processor = self.tokenizers[0]
             marker = "<|USER_INPUT_MARKER|>"
             marked = self.prompt_template.format(marker)
             marker_pos = marked.find(marker)
@@ -120,14 +116,8 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
 
         inputs = self._build_prompt_inputs(prompt, images)
         inputs = inputs.to(device)
-        outputs = text_encoder(
-            **inputs,
-            output_hidden_states=self.hidden_state_skip_layer is not None,
-        )
-        if self.hidden_state_skip_layer is not None:
-            prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
-        else:
-            prompt_embeds = outputs.last_hidden_state
+        outputs = text_encoder(**inputs, output_hidden_states=True)
+        prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
 
         prompt_mask = inputs["attention_mask"]
         crop_start = self._compute_crop_start()
@@ -146,7 +136,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        dtype = next(self.transformer.parameters(), torch.tensor([])).dtype
+        dtype = next(self.transformer.parameters()).dtype
         if dtype not in (torch.bfloat16, torch.float16, torch.float32):
             dtype = torch.bfloat16
 

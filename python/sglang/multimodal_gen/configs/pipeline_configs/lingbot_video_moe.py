@@ -44,16 +44,11 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         default_factory=lambda: (Qwen3VLConfig(),)
     )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
-    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
-        default_factory=lambda: (None,)
-    )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (_qwen3vl_postprocess_text,))
     )
     precision: str = "bf16"
     vae_precision: str = "bf16"
-    should_use_guidance: bool = True
-    embedded_cfg_scale: float = 6.0
     # Second-pass settings, used only by LingBotVideoRefinerPipeline.
     refiner_height: int = 1088
     refiner_width: int = 1920
@@ -76,19 +71,18 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(auto_dit_layerwise_offload=True)
+        # torch.compile is left opt-in: the fp32-pinned norms and the per-block
+        # dtype round-trips have not been checked against the bf16 baseline.
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            speed_mode_enable_torch_compile_by_default=False,
+        )
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]
 
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
-
-    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {}
-
-    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {}
 
     def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
         return torch.float32

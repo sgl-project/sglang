@@ -2,19 +2,12 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-
-
-def is_blocks(name: str, module) -> bool:
-    return "blocks" in name and str.isdigit(name.split(".")[-1])
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 
 @dataclass
 class LingBotVideoMoEArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
-
-    param_names_mapping: dict = field(default_factory=dict)
-    reverse_param_names_mapping: dict = field(default_factory=dict)
-    lora_param_names_mapping: dict = field(default_factory=dict)
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
 
     patch_size: tuple[int, int, int] = (1, 2, 2)
     in_channels: int = 16
@@ -29,7 +22,6 @@ class LingBotVideoMoEArchConfig(DiTArchConfig):
     norm_eps: float = 1e-6
     rope_theta: float = 256.0
     axes_dims: tuple[int, ...] = (32, 48, 48)
-    axes_lens: tuple[int, ...] = (4096, 512, 512)
 
     qkv_bias: bool = False
     out_bias: bool = True

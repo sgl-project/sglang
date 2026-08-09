@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import PIL.Image
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -129,7 +130,8 @@ def test_vlm_images_read_the_condition_frame_from_batch_extra():
 def test_condition_image_is_cover_resized_then_center_cropped():
     height, width = 32, 64
     # Portrait source: cover-resize scales on width, so the crop trims the height.
-    pixel = preprocess_condition_image(PIL.Image.new("RGB", (32, 128)), height, width)
+    source = PIL.Image.new("RGB", (32, 128), (255, 128, 0))
+    pixel = preprocess_condition_image(source, height, width)
 
     assert tuple(pixel.shape) == (1, 3, 1, height, width)
     assert pixel.dtype == torch.float32
@@ -266,11 +268,8 @@ def test_single_frame_survives_multi_gpu_frame_alignment():
 
 
 def test_refiner_rejects_single_frame_requests():
-    try:
+    with pytest.raises(ValueError, match="single-frame"):
         _adjusted(1, [], pipeline_class_name=REFINER_PIPELINE_NAME)
-        raise AssertionError("expected ValueError for a single-frame refiner request")
-    except ValueError as err:
-        assert "single-frame" in str(err)
 
 
 def test_refiner_accepts_video_requests():
@@ -285,6 +284,22 @@ def test_video_request_keeps_the_video_negative_prompt():
 
     assert params.negative_prompt == DEFAULT_NEGATIVE_PROMPT
     assert params.data_type == DataType.VIDEO
+
+
+def test_sequence_shard_is_on_and_frames_stay_as_requested():
+    # The DiT shards the joint sequence itself, so latent frames must not be
+    # rounded up to num_gpus: 9 frames would otherwise become 13.
+    params = _adjusted(9, [])
+
+    assert params.enable_sequence_shard
+    assert not params.adjust_frames
+    assert params.num_frames == 9
+
+
+def test_sequence_shard_can_be_turned_off_by_the_request():
+    params = _adjusted(81, ["enable_sequence_shard"], enable_sequence_shard=False)
+
+    assert not params.enable_sequence_shard
 
 
 def test_refiner_sigmas_start_at_the_threshold_and_descend():
@@ -317,19 +332,16 @@ def test_refiner_sigma_tail_steps_extend_the_schedule():
     assert len(tailed) == len(plain) + 2
 
 
-def test_refiner_rejects_a_threshold_outside_the_unit_range():
-    for t_thresh in (0.0, 1.5):
-        try:
-            compute_refiner_sigmas(
-                sigma_max=1.0,
-                sigma_min=0.0,
-                num_inference_steps=8,
-                shift=3.0,
-                t_thresh=t_thresh,
-            )
-            raise AssertionError(f"expected ValueError for t_thresh={t_thresh}")
-        except ValueError:
-            pass
+@pytest.mark.parametrize("t_thresh", [0.0, 1.5])
+def test_refiner_rejects_a_threshold_outside_the_unit_range(t_thresh):
+    with pytest.raises(ValueError, match="t_thresh"):
+        compute_refiner_sigmas(
+            sigma_max=1.0,
+            sigma_min=0.0,
+            num_inference_steps=8,
+            shift=3.0,
+            t_thresh=t_thresh,
+        )
 
 
 def test_refiner_latent_interpolates_toward_noise_at_the_threshold():

@@ -5,6 +5,7 @@ import os
 import tempfile
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
+from sglang.multimodal_gen.runtime.distributed import sp_shard_utils as sps
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
@@ -205,6 +207,49 @@ def test_attention_single_sample_matches_direct_attention(monkeypatch):
     torch.testing.assert_close(out, expected)
 
 
+def test_attention_rejects_heads_not_divisible_by_ulysses_degree(monkeypatch):
+    monkeypatch.setattr(dits_lingbot_video_moe, "get_tp_world_size", lambda: 1)
+    monkeypatch.setattr(
+        dits_lingbot_video_moe, "get_ulysses_parallel_world_size", lambda: 3
+    )
+    with pytest.raises(ValueError, match="ulysses_degree"):
+        LingBotVideoAttention(
+            hidden_size=32, num_heads=4, norm_eps=1e-6, qkv_bias=True, out_bias=True
+        )
+
+
+def test_shard_sequence_is_off_without_sequence_parallelism():
+    # sp_size must short-circuit first: get_forward_context() asserts when unset.
+    model = object.__new__(LingBotVideoTransformer3DModel)
+    model.sp_size = 1
+    assert model._shard_sequence() is False
+
+
+@pytest.mark.parametrize("sp_size", [2, 3, 4])
+def test_joint_shard_reassembles_the_global_sequence(monkeypatch, sp_size):
+    gt, gh, gw, text_len = 3, 2, 2, 7
+    joint_seq_len = gt * gh * gw + text_len
+    dev = torch.device("cpu")
+    positions = _joint_position_ids(torch.tensor([text_len]), gt, gh, gw, text_len, dev)
+    hidden = torch.arange(joint_seq_len, dtype=torch.float32).view(1, joint_seq_len, 1)
+
+    monkeypatch.setattr(sps, "get_sp_world_size", lambda: sp_size)
+    chunks, pos_chunks = [], []
+    for rank in range(sp_size):
+        monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda rank=rank: rank)
+        shard = sps.build_shard_plan(joint_seq_len)
+        chunks.append(sps.shard_like(hidden, shard))
+        pos_chunks.append(
+            sps.shard_like(
+                positions.reshape(1, joint_seq_len, 3), shard, pad_mode="repeat_last"
+            ).reshape(-1, 3)
+        )
+
+    gathered = torch.cat(chunks, dim=1)[:, :joint_seq_len]
+    torch.testing.assert_close(gathered, hidden)
+    torch.testing.assert_close(torch.cat(pos_chunks)[:joint_seq_len], positions)
+
+
 class _FakeBatchEncoding(dict):
     def to(self, _device):
         return self
@@ -266,16 +311,10 @@ def test_check_inputs_enforces_frame_and_size_contract():
     check = LingBotVideoTextEncodingStage.check_inputs
     check(480, 832, 1)
     check(480, 832, 81)
-    try:
+    with pytest.raises(ValueError, match=r"4n\+1"):
         check(480, 832, 82)
-        raise AssertionError("expected ValueError for num_frames=82")
-    except ValueError:
-        pass
-    try:
+    with pytest.raises(ValueError, match="multiples of 16"):
         check(480, 830, 81)
-        raise AssertionError("expected ValueError for width=830")
-    except ValueError:
-        pass
 
 
 def test_decode_scale_and_shift_invert_vae_normalization():

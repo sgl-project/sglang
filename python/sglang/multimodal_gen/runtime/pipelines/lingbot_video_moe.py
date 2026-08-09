@@ -41,7 +41,7 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage_if(
             config.rewriter_url is not None,
             LingBotVideoPromptRewriteStage(
-                url=config.rewriter_url or "",
+                url=config.rewriter_url,
                 expand_model=config.rewriter_expand_model,
                 map_model=config.rewriter_map_model,
                 timeout=config.rewriter_timeout,

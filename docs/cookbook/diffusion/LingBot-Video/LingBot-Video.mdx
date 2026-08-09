@@ -1,0 +1,127 @@
+---
+title: LingBot Video
+metatags:
+    description: "Serve LingBot-Video MoE text-to-video, image-to-video, and text-to-image generation with SGLang-diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "text-to-image", "MoE"]} />
+
+## 1. Model Introduction
+
+LingBot-Video is a Mixture-of-Experts video diffusion model from inclusionAI. The 30B checkpoint activates 3B parameters per token, and one set of weights covers three tasks: text-to-video, image-to-video, and text-to-image.
+
+Two things make it different from the other video recipes here:
+
+- **Qwen3-VL is the text encoder.** For image-to-video the condition frame is passed to the encoder as an image, so the caption and the reference frame are encoded together rather than through a separate image encoder.
+- **Prompts are structured JSON captions**, not free text. See [Prompt format](#4-prompt-format).
+
+An optional second pass (the refiner) re-denoises the clip at a higher resolution with a separate set of DiT weights.
+
+## 2. SGLang-diffusion Installation
+
+Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-diffusion/installation) for installation instructions.
+
+## 3. Deployment
+
+```bash Command
+sglang serve --model-path robbyant/lingbot-video-moe-30b-a3b
+```
+
+The DiT uses layer-wise offload by default, so a single GPU is enough to bring the model up. If the GPU is still short on memory, move the text encoder out between stages:
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --text-encoder-cpu-offload
+```
+
+Across multiple GPUs, sequence parallelism splits the joint video and text sequence:
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --num-gpus 4 \
+  --ulysses-degree 4
+```
+
+`--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel all work, and can be combined. `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
+
+`torch.compile` is not enabled by default for this model, including under `--performance-mode speed`. The fp32-pinned norms have not been checked against the eager baseline, so enable `--enable-torch-compile` only if you verify output quality yourself.
+
+## 4. Prompt format
+
+The model is trained on structured JSON captions. A raw natural-language prompt is out of distribution and produces degraded output rather than an error, so pass a JSON object:
+
+```json Example
+{
+  "comprehensive_description": "A red fox trots across fresh snow in a pine forest, morning light, shallow depth of field.",
+  "camera": "slow dolly following the fox",
+  "style": "cinematic live action"
+}
+```
+
+If you have a prompt-rewriting service, set `rewriter_url` on the pipeline config to have SGLang expand free text into a caption before denoising. The rewrite stage is skipped entirely when the URL is unset, which is the default.
+
+## 5. Generation
+
+### 5.1 Text-to-video
+
+```bash Command
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --prompt '{"comprehensive_description": "A red fox trots across fresh snow in a pine forest."}' \
+  --num-frames 81 \
+  --save-output \
+  --output-path outputs
+```
+
+Defaults are 81 frames at 480x480 and 16 fps, 40 denoising steps, guidance scale 6.0, and flow shift 3.0. `num_frames` must be 1 or `4n+1`, and height and width must be multiples of 16.
+
+### 5.2 Image-to-video
+
+Pass a condition image; the first frame is pinned to it for the whole denoising loop.
+
+```bash Command
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --prompt '{"comprehensive_description": "The fox lifts its head and looks toward the camera."}' \
+  --image-path fox.png \
+  --num-frames 81 \
+  --save-output \
+  --output-path outputs
+```
+
+Image conditioning does not support sequence parallelism yet. Serve with `--ulysses-degree 1 --ring-degree 1` for image-to-video requests; the server raises an error rather than generating a corrupted clip.
+
+### 5.3 Text-to-image
+
+`--num-frames 1` produces a still image. The request keeps its own negative prompt, which drops the motion and temporal-stability terms that only apply to video, and frame-count alignment is disabled so a single frame is not rounded up into a short clip.
+
+```bash Command
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --prompt '{"comprehensive_description": "A red fox sitting in fresh snow, morning light."}' \
+  --num-frames 1 \
+  --save-output \
+  --output-path outputs
+```
+
+### 5.4 Refiner second pass
+
+The refiner decodes the base clip, resizes it to the refiner resolution, re-encodes it, and denoises again from `t_thresh` down using the DiT weights in the checkpoint's `refiner` subfolder. Opt in with:
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --pipeline-class-name LingBotVideoRefinerPipeline
+```
+
+This keeps both sets of DiT weights resident, so it costs roughly twice the DiT memory of the single-pass pipeline. Defaults for the second pass are 1088x1920, 8 steps, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
+
+## 6. Notes
+
+- The refiner conditions on zeros rather than on the negative prompt, and reseeds instead of continuing the base pass random stream.
+- Text-only requests batch normally. Image requests are kept out of batches by the scheduler.
+- Latents stay fp32 through the denoising loop while the DiT bulk runs in bf16; the norms, router, and timestep embedder are pinned to fp32.
