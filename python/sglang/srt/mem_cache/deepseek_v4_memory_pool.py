@@ -48,6 +48,13 @@ def get_compress_state_ring_size(
         return 8 if compress_ratio == 4 else 128
 
 
+def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in `c_plan.cuh`
+    (the bound is derived there)."""
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return max(0, ring_size - window_size + 2)
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,

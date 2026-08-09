@@ -246,7 +246,6 @@ class CompressorPrefillPlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
         num_q_tokens: int,
-        num_draft_tokens: int = 0,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
@@ -286,7 +285,6 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
-            int(num_draft_tokens),
             bool(use_cuda_graph),
         )
         return CompressorPrefillPlan(
