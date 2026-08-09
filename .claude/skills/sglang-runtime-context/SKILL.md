@@ -49,12 +49,40 @@ resolved configuration lives in the namespace bags.**
   `get_context().override(source, **fields)`. It writes the bag leaves in place
   (namespace readers see the new value) and records provenance in the overrides log.
   There is **no write-through** to the `ServerArgs` instance — it stays pristine.
-  `ServerArgs.override(...)` (instance-only) is being retired; its call sites are
-  ratcheted down and new ones are rejected.
-- **Nested publishes**: a construction step that must publish a private copy (the
-  draft-worker build publishes the draft's rewritten config for the duration of the
-  build) wraps itself in `get_context().preserve_config()` — the enclosing lifecycle,
-  including its post-publish overrides, is value-snapshotted and reinstated on exit.
+  There is no in-place mutation entry on the instance at all: it is read-only after
+  resolution.
+- **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
+  `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
+  tokenizer/chat-template load. They are resolution, not mutation, and they write
+  **in place** via `arg_groups.overrides.declare_late_resolution(server_args,
+  source, **fields)`, which refuses the published instance. In place is the point:
+  every holder of that object must see the resolved value — the HTTP server, the
+  multi-tokenizer workers it is serialized for, the schedulers it forks. Returning a
+  variant here is a bug: the launcher rebinds its local and everyone else keeps the
+  unresolved object.
+- **A value another runner / worker owns is a constructor argument, not a config
+  copy.** The draft worker's `context_length`, load format and attention backend
+  travel as arguments to `TpModelWorker` / `ModelRunner` and live on the runner
+  (`ModelRunner.draft_attention_backend`, `kv_cache_dtype_str`, …); the encoder
+  DP worker's device is `MMEncoder(gpu_id=...)`. There is no `ServerArgs.derive`
+  any more — a config object is never copied-and-edited; test doubles that need a
+  modified copy use `sglang.test.test_utils.server_args_variant`.
+
+**Why a bag override cannot stand in for late resolution or per-runner
+construction.** The bags are projected at
+publish *from the instance's fields*, so anything the runtime must read has to be on
+the instance before publish — an override afterwards puts instance and bags back out
+of agreement, and whole-object readers (`ModelConfig.from_server_args`,
+`build_load_config`, `MMEncoder`'s own `self.server_args.X`) never see it. And bags do
+not cross a process boundary: a child publishes from the object it receives and
+re-projects its own bags, so a parent-side override is lost. Values that feed
+construction before any bag exists (group init reads `server_args.tp_size`) have no
+bag to override at all.
+
+- **Nested publishes**: a construction step that must publish a private copy wraps
+  itself in `get_context().preserve_config()` — the enclosing lifecycle, including its
+  post-publish overrides, is value-snapshotted and reinstated on exit. The draft build
+  no longer needs it: per-runner values are constructor arguments now.
 
 ### Reads that legitimately stay on a `ServerArgs` instance
 
@@ -69,10 +97,11 @@ resolved configuration lives in the namespace bags.**
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
   `entrypoints/`, and the tokenizer-process multimodal processors read
   `self.server_args`: several `Engine`s can share one process, and the process-global
-  bags are last-publish-wins across engines. `base_gpu_id` also differs per worker
-  (the encode-server DP workers each specialize their own copy), so no process-global
-  value can stand in for it — `BaseMultimodalProcessor._fast_image_processor_device`
-  is the shape to copy.
+  bags are last-publish-wins across engines. `base_gpu_id` also differs per engine,
+  so no process-global value can stand in for it —
+  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy. (The
+  encode-server DP workers used to specialize a config copy for the same reason;
+  their device now travels as `MMEncoder(gpu_id=...)`.)
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
@@ -113,14 +142,20 @@ Never assign `server_args` fields from model code. Declare instead
   callable receives *pristine* `server_args` + `hf_config` and must not write.
 - Normalization that must see earlier declarations → a post-process pass invoked via
   `run_post_process_pass` at its slot (reads a view, returns a declaration dict).
-- Values only knowable at weight-load time → `declare_load_time_override(source, {...})`
-  — validates the whitelist, then routes through `get_context().override` (**bag-only**;
-  the declaration lands on the published bags, not on any `ServerArgs` instance).
-  Scope caveat for draft models: only a draft build that publishes a private copy
-  under `preserve_config` discards its declarations with the scope. Draft loads
-  that skip publish share the process bags, so their declarations land
-  process-wide — declares reachable from a draft load must be draft-safe (guard
-  or same-value).
+- Values only knowable at load time are **per-runner state**, not declarations:
+  there is no `declare_load_time_override` any more. A model-family decision that
+  its checkpoint drives (shared-experts fusion) is a question the *loader* asks
+  the model class — `shared_experts_fusion_disable_reason(hf_config,
+  quant_config)`, a classmethod answering without an instance — at the single
+  model-instantiation point, and
+  `install_shared_experts_fusion_decision` writes the answer to the ACTIVE moe
+  flag before that model's layers build and read it
+  (`is_shared_experts_fusion_disabled`, config-intent fallback).
+  `draft_model_build_scope` brackets every draft build and routes the draft's
+  answer to the speculative leaf, so a draft's decision never overwrites the
+  target's. A process-level load-time fact (the sm80 dtype fallback —
+  device-driven, identical for every runner) records directly via
+  `get_context().override`.
 
 Declarable fields form a whitelist: `Arg(..., resolvable=True)` in the `ServerArgs`
 dataclass. A declaration against a non-whitelisted field fails at its slot.
@@ -209,18 +244,18 @@ ONE thread — do not design for TBO threads that don't exist.
 ## Guardrails (these fail CI; what to do when they fire)
 
 1. **Strict mutation guard** (always on): bare `server_args.x = ...` after resolution
-   raises unconditionally — `ServerArgs.__setattr__` no longer consults
-   `SGLANG_STRICT_CONFIG_MUTATION` (the env var survives only as a legacy harness
-   flag). Projected bags are sealed the same way (leaf assignment raises — write via
-   `get_context().override`).
+   raises unconditionally in `ServerArgs.__setattr__` — this *is* the guarantee that
+   no writer can desync the bags, so there is no writer ratchet any more. Change
+   resolved config with `get_context().override`; hand a per-runner value to its
+   runner as a constructor argument. Projected bags are sealed the same way (leaf
+   assignment raises).
 2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
    package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
    raise the baseline.
-3. **Writer ratchet** (`test_server_args_writer_ratchet.py`): `ServerArgs.override`
-   call sites are pinned exactly and may only shrink — instance writes never reach the
-   bags, so namespace readers desync from the writer. New post-publish writes go through
-   `get_context().override`; rerouting a writer means flipping **all its readers to the
-   bag in the same commit** (no transitional dual-write).
+3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
+   `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
+   calls either form. Rerouting a writer to the bags means flipping **all its readers
+   in the same commit** (no transitional dual-write).
 4. **Legacy-accessor ratchet** (`test_legacy_global_ratchet.py`): `get_global_server_args`
    call sites must not grow — new code uses `runtime_context.get_server_args()` (and
    business decisions should read the bags).
@@ -278,7 +313,7 @@ Never module-skip a test "until the migration settles" — seed the context inst
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
 `publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
-`declare_load_time_override`), `python/sglang/srt/server_args.py` (`NS` metadata,
+`declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
 `test_server_args_writer_ratchet.py`, `test_legacy_global_ratchet.py`,
