@@ -67,10 +67,6 @@ on:
         description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
         type: boolean
         default: false
-      precision_baseline:
-        description: 'Export the rolling-baseline env that test_nightly_precision_regression.py reads. Separate from `scheduled` because it sets HF_TOKEN; see the step for why that must not reach any other stage.'
-        type: boolean
-        default: false
       job_timeout_minutes:
         description: 'Job-level cap, covering install and warmup on top of run_timeout_minutes.'
         type: string
@@ -179,11 +175,10 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
-      # Via $GITHUB_ENV, not the step's `env:`: an `env:` entry sets HF_TOKEN
-      # unconditionally, and both a wrong value and an empty one shadow the
-      # runner's own token, turning every gated model into a 401.
+      # Only test_nightly_precision_regression.py reads these; the others are
+      # inert wherever it does not run.
       - name: Export precision baseline env
-        if: inputs.precision_baseline
+        if: inputs.scheduled
         env:
           BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
         run: |
@@ -193,7 +188,7 @@ jobs:
             echo "SGLANG_PRECISION_HF_REVISION=${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}"
             echo "SGLANG_PRECISION_COMMIT=${{ github.sha }}"
             echo "SGLANG_PRECISION_FORCE_UPDATE=${{ fromJson(inputs.caller_inputs).force_baseline_update && '1' || '0' }}"
-            echo "HF_TOKEN=${BASELINE_HF_TOKEN}"
+            echo "SGLANG_PRECISION_HF_TOKEN=${BASELINE_HF_TOKEN}"
           } >> "$GITHUB_ENV"
 
       - name: Run test

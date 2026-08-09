@@ -9,6 +9,8 @@ Env knobs:
   SGLANG_PRECISION_COMMIT         override sglang sha (7-40 hex) tagged on push
   SGLANG_PRECISION_HF_REPO        required HF dataset repo for cross-runner
                                   baseline storage; see precision_baseline_store
+  SGLANG_PRECISION_HF_TOKEN       write token for that repo (not HF_TOKEN, which
+                                  carries the runner's gated-model read token)
 """
 
 from __future__ import annotations
