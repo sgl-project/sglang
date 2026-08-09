@@ -38,10 +38,17 @@ if [[ "${LANGUAGE_ONLY:-0}" == "1" ]]; then
   EXTRA_SERVER_ARGS+=(--language-only)
 fi
 
-# Target verification and draft decoding keep separate graph pools.  With MTP,
+# Target verification and draft decoding keep separate graph pools. With MTP,
 # the default graph range leaves too little headroom for sparse-prefill
-# workspaces on an 80 GB GPU when mem-fraction-static is 0.85.
-CUDA_GRAPH_ARGS=(--cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}")
+# workspaces on an 80 GB GPU.
+if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  CUDA_GRAPH_ARGS=(
+    --cuda-graph-backend-decode disabled
+    --cuda-graph-backend-prefill disabled
+  )
+else
+  CUDA_GRAPH_ARGS=(--cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}")
+fi
 
 SPECULATIVE_ARGS=()
 if [[ "${DISABLE_SPECULATIVE:-0}" != "1" ]]; then
@@ -60,6 +67,9 @@ if [[ "${DISABLE_DSA:-0}" == "1" ]]; then
   MODEL_OVERRIDE_ARGS='{"im_start_token":"<|img|>","im_token":"<|imgpad|>","im_end_token":"<|endofimg|>","audio_start_token":"<|audio_comp_start|>","audio_token":"<|audio_comp_pad|>","audio_end_token":"<|audio_comp_end|>","index_topk":null}'
 fi
 
+# A small SWA pool is sufficient because old SWA states are evictable. Keep
+# the saved memory in the full-attention pool so 128K requests fit while
+# retaining enough runtime headroom for DeepEP/NVSHMEM.
 exec "${PYTHON_BIN}" -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --context-length "${CONTEXT_LENGTH}" \
@@ -68,11 +78,11 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --tp-size 8 \
   --ep-size 8 \
   --port "${SGL_PORT}" \
-  --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
+  --mem-fraction-static "${MEM_FRACTION_STATIC:-0.87}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --chunked-prefill-size 16384 \
   --trust-remote-code \
-  --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO:-0.2}" \
+  --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO:-0.03}" \
   --prefill-attention-backend fa3 \
   --decode-attention-backend fa3 \
   --page-size 64 \

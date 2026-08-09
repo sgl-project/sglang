@@ -123,28 +123,6 @@ from sglang.srt.utils import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 
 
-class _ServerArgsCompat:
-    """Compatibility adapter for the pre-runtime-context Dots3 implementation."""
-
-    def __getitem__(self, name):
-        return getattr(get_server_args(), name)
-
-    def __setitem__(self, name, value):
-        setattr(get_server_args(), name, value)
-
-
-global_server_args_dict = _ServerArgsCompat()
-align = ceil_align
-
-
-def get_attention_tp_rank():
-    return get_parallel().attn_tp_rank
-
-
-def get_attention_tp_size():
-    return get_parallel().attn_tp_size
-
-
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _device_sm = get_device_sm()
@@ -242,14 +220,8 @@ class Dots3MLP(nn.Module):
 
 
 class Dots3MoEGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        prefix: str = "",
-        is_nextn: bool = False,
-    ):
+    def __init__(self, config):
         super().__init__()
-        self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
@@ -289,10 +261,9 @@ class Dots3MoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
             0
-            if global_server_args_dict["disable_shared_experts_fusion"]
+            if get_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
         self.config = config
@@ -311,14 +282,12 @@ class Dots3MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = Dots3MoEGate(
-            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
-        )
+        self.gate = Dots3MoEGate(config)
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            + get_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -342,9 +311,6 @@ class Dots3MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
 
-        self.shared_experts_is_int8 = False
-        self.shared_experts_is_fp8 = False
-        self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
@@ -371,20 +337,15 @@ class Dots3MoE(nn.Module):
                     "moe_wna16",
                 }
             )
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
-            )
-            self.shared_experts_is_fp8 = (
+            shared_experts_is_fp8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
-            if self.shared_experts_is_fp8:
+            if shared_experts_is_fp8:
                 assert (
                     self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                     == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                 )
-                self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
 
         self.top_k = config.num_experts_per_tok
 
@@ -393,7 +354,7 @@ class Dots3MoE(nn.Module):
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
+                + get_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -661,14 +622,6 @@ class Dots3MoE(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
 
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
 # Aligned with HF's implementation, using sliding window inclusive with the last token.
 # SGLang assumes exclusive.
 def get_attention_sliding_window_size(config):
@@ -730,8 +683,8 @@ class Dots3AttentionMLA(nn.Module):
     ) -> None:
         super().__init__()
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -777,9 +730,11 @@ class Dots3AttentionMLA(nn.Module):
         # For tensor parallel attention
         assert self.q_lora_rank is not None, "Dots3AttentionMLA requires q_lora_rank."
         scale_block_n = _get_scale_block_n(quant_config)
-        self.qk_rope_head_dim_padded = align(self.qk_rope_head_dim, scale_block_n)
+        self.qk_rope_head_dim_padded = ceil_align(
+            self.qk_rope_head_dim, scale_block_n
+        )
         # NOTE(xiaozhi): For the sake of DeepGEMM kernel, we align the g_proj_local_dim to 8.
-        self.g_proj_local_dim_padded = align(
+        self.g_proj_local_dim_padded = ceil_align(
             self.g_proj_local_dim, max(8, scale_block_n)
         )
         self.use_nsa = (
@@ -851,7 +806,7 @@ class Dots3AttentionMLA(nn.Module):
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
-            device=global_server_args_dict["device"],
+            device=get_server_args().device,
         )
 
         # Optional NSA (Native Sparse Attention) indexer.
@@ -968,11 +923,7 @@ class Dots3AttentionMLA(nn.Module):
                 return Dots3AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return Dots3AttnForwardMethod.MLA
-        elif attention_backend == "flashmla":
-            return Dots3AttnForwardMethod.MLA
-        elif attention_backend == "triton":
-            return Dots3AttnForwardMethod.MLA
-        elif attention_backend == "nsa":
+        elif attention_backend in ("flashmla", "triton", "nsa"):
             return Dots3AttnForwardMethod.MLA
         else:
             raise NotImplementedError(
@@ -1099,7 +1050,7 @@ class Dots3AttentionMLA(nn.Module):
         return None, attn_forward_method, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        hidden_states, attn_forward_method, forward_batch, inner_state = (
+        hidden_states, attn_forward_method, _, inner_state = (
             intermediate_state
         )
         if inner_state is None:
@@ -1522,9 +1473,8 @@ class Dots3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
+        self.speculative_algorithm = get_server_args().speculative_algorithm
         self.layer_id = layer_id
-        self.is_nextn = is_nextn
         self.self_attn = Dots3AttentionMLA(
             config=config,
             quant_config=quant_config,
@@ -1876,7 +1826,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -1896,7 +1846,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         self, architecture: str = "Dots3NoteOmniForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if global_server_args_dict["disable_shared_experts_fusion"]:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
@@ -2232,8 +2182,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None
         ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor, cat_dim: int, is_scale: bool
@@ -2257,7 +2207,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             align_size: int,
         ) -> torch.Tensor:
             original_size = weight.shape[cat_dim]
-            aligned_size = align(original_size, align_size)
+            aligned_size = ceil_align(original_size, align_size)
             if aligned_size == original_size:
                 return weight
             pad_shape = list(weight.shape)

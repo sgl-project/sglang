@@ -1,4 +1,3 @@
-import json
 import math
 from functools import lru_cache
 
@@ -16,8 +15,6 @@ DEFAULT_CHUNK_LENGTH_S = 60
 DEFAULT_CONV_TEMPORAL_STRIDE = 8
 DEFAULT_MERGE_FACTOR = 1
 N_SAMPLES = DEFAULT_CHUNK_LENGTH_S * SAMPLE_RATE
-STRIDE = HOP_LENGTH * DEFAULT_CONV_TEMPORAL_STRIDE * DEFAULT_MERGE_FACTOR
-ENCODER_SEQ_LEN = N_SAMPLES // HOP_LENGTH // 2
 
 
 class OmniAudioConfig:
@@ -55,11 +52,6 @@ class OmniAudioConfig:
                 "rope_type": "default",
             },
         )
-
-    @classmethod
-    def from_json(cls, path):
-        with open(path, "r") as f:
-            return cls(**json.load(f))
 
     @property
     def conv_temporal_stride(self) -> int:
@@ -248,7 +240,6 @@ class AudioAdapter(nn.Module):
 class OmniAudioModel(nn.Module):
     def __init__(self, config: OmniAudioConfig):
         super().__init__()
-        self.config = config
         if config.encoder_type != "dots":
             raise ValueError("Dots omni only supports encoder_type='dots'")
         self.merge_factor = config.merge_factor

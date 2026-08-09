@@ -264,17 +264,13 @@ class DotsNoteOmniImagePreprocessor:
         return pixel_values, grids, token_strings
 
 
-def get_audio_token_count(num_samples: int, config: OmniAudioConfig) -> int:
-    return compute_audio_token_length(
+def get_audio_token_string(num_samples: int, config: OmniAudioConfig) -> str:
+    count = compute_audio_token_length(
         num_samples,
         chunk_seconds=config.chunk_seconds,
         conv_temporal_stride=config.conv_temporal_stride,
         merge_factor=config.merge_factor,
     )
-
-
-def get_audio_token_string(num_samples: int, config: OmniAudioConfig) -> str:
-    count = get_audio_token_count(num_samples, config)
     return (
         config.audio_comp_start + config.audio_comp_span * count + config.audio_comp_end
     )

@@ -174,18 +174,6 @@ def apply_rotary_pos_emb(
     return q, k
 
 
-class WhisperPositionalEmbedding(nn.Embedding):
-    def __init__(
-        self, num_positions: int, embedding_dim: int, padding_idx: int | None = None
-    ):
-        super().__init__(num_positions, embedding_dim)
-
-    def forward(self, input_ids, past_key_values_length=0):
-        return self.weight[
-            past_key_values_length : past_key_values_length + input_ids.shape[1]
-        ]
-
-
 class WhisperAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
