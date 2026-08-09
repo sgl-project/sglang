@@ -50,13 +50,10 @@ yet separated from any other on the output.
 Usage
 -----
     router = SubBlockRouter(n_k=4)
-    index, nums = router.route(q, k, sparsity=0.9)          # q, k: [B, S, H, D]
-    out, _ = bsa_attn_blk64_fwd(q, k, v, index, router.last_topk,
-                                block_sizes=router.block_sizes(S, q.device))
-
-or in one call::
-
-    out = subblock_sparse_attention(q, k, v, sparsity=0.9, n_k=4)
+    plan = router.route(q, k, sparsity=0.9)                 # q, k: [B, S, H, D]
+    out, _ = bsa_attn_blk64_fwd(q, k, v, plan.index, plan.topk,
+                                block_sizes=SubBlockRouter.block_sizes(S, q.device),
+                                q2k_block_nums=plan.block_nums)
 """
 
 from __future__ import annotations
@@ -491,41 +488,3 @@ class SubBlockRouter:
     def cost_units(n_q: int, n_k: int) -> float:
         """Scoring cost in units of 1/16384 of the dense attention being gated."""
         return 4.0 * n_q * n_k
-
-
-def block_sizes(seq_len: int, device) -> torch.Tensor:
-    """Real token count per 64-block, for the kernel's tail masking."""
-    return SubBlockRouter.block_sizes(seq_len, device)
-
-
-@torch.no_grad()
-def subblock_sparse_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    sparsity: Optional[float] = None,
-    topk: Optional[Union[int, torch.Tensor]] = None,
-    n_k: int = 4,
-    n_q: int = 1,
-    softmax_scale: Optional[float] = None,
-    router: Optional[SubBlockRouter] = None,
-    return_lse: bool = False,
-):
-    """Route with sub-block pooling, then run FlashInfer's 64-block sparse attention.
-
-    q, k, v: ``[B, S, H, D]`` bf16, ``D == 128``, SM100 only (kernel restriction).
-    """
-    bsa_attn_blk64_fwd = load_bsa_attn_blk64_fwd()
-    router = router or SubBlockRouter(n_k=n_k, n_q=n_q)
-    plan = router.route(q, k, sparsity=sparsity, topk=topk, softmax_scale=softmax_scale)
-    return bsa_attn_blk64_fwd(
-        q,
-        k,
-        v,
-        plan.index,
-        plan.topk,
-        block_sizes=SubBlockRouter.block_sizes(k.shape[1], k.device),
-        q2k_block_nums=plan.block_nums,
-        softmax_scale=softmax_scale,
-        return_lse=return_lse,
-    )
