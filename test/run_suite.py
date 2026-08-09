@@ -381,7 +381,10 @@ def main():
     parser.add_argument(
         "--nightly",
         action="store_true",
-        help="Run nightly tests instead of per-commit tests.",
+        help=(
+            "Include tests registered with nightly=True (AMD/CPU/NPU). CUDA "
+            "scheduled suites are selected by name and take no flag."
+        ),
     )
     parser.add_argument(
         "--timeout-per-file",
