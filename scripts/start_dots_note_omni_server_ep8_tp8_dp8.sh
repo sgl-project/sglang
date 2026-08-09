@@ -15,6 +15,29 @@ CONTEXT_LENGTH="${CONTEXT_LENGTH:-393216}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-256}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 
+MODEL_CONFIG_PATH="${MODEL_PATH}/config.json"
+if [[ ! -f "${MODEL_CONFIG_PATH}" ]]; then
+  echo "Model config not found: ${MODEL_CONFIG_PATH}" >&2
+  exit 1
+fi
+CHECKPOINT_PRECISION="$("${PYTHON_BIN}" -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    config = json.load(config_file)
+quant_config = config.get("quantization_config", config.get("quant_config"))
+print("quantized" if quant_config is not None else "bf16")
+' "${MODEL_CONFIG_PATH}")"
+if [[ "${CHECKPOINT_PRECISION}" == "bf16" ]]; then
+  MOE_RUNNER_BACKEND="deep_gemm"
+  DEEPEP_DISPATCHER_OUTPUT_DTYPE="bf16"
+else
+  MOE_RUNNER_BACKEND="auto"
+  DEEPEP_DISPATCHER_OUTPUT_DTYPE="auto"
+fi
+echo "Detected ${CHECKPOINT_PRECISION} checkpoint; MoE runner=${MOE_RUNNER_BACKEND}, DeepEP dispatcher dtype=${DEEPEP_DISPATCHER_OUTPUT_DTYPE}."
+
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -42,11 +65,13 @@ fi
 # the default graph range leaves too little headroom for sparse-prefill
 # workspaces on an 80 GB GPU.
 if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  DEEPEP_MODE="${DEEPEP_MODE:-normal}"
   CUDA_GRAPH_ARGS=(
     --cuda-graph-backend-decode disabled
     --cuda-graph-backend-prefill disabled
   )
 else
+  DEEPEP_MODE="${DEEPEP_MODE:-auto}"
   CUDA_GRAPH_ARGS=(--cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}")
 fi
 
@@ -91,7 +116,9 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   "${CUDA_GRAPH_ARGS[@]}" \
   "${SPECULATIVE_ARGS[@]}" \
   --moe-a2a-backend deepep \
-  --deepep-mode auto \
+  --moe-runner-backend "${MOE_RUNNER_BACKEND}" \
+  --deepep-dispatcher-output-dtype "${DEEPEP_DISPATCHER_OUTPUT_DTYPE}" \
+  --deepep-mode "${DEEPEP_MODE}" \
   --enable-nccl-nvls \
   --enable-multimodal \
   --json-model-override-args "${MODEL_OVERRIDE_ARGS}" \
