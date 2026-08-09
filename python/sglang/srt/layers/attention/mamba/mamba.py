@@ -617,7 +617,9 @@ class MambaMixer2(torch.nn.Module):
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
-                return_intermediate_states=True,
+                return_track_states=True,
+                track_seq_idx=metadata.track_ssm_seq_idx,
+                track_end_locs=metadata.track_ssm_end_locs,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(

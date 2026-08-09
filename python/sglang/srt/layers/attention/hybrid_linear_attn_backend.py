@@ -89,6 +89,8 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        track_ssm_seq_idx = None
+        track_ssm_end_locs = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -219,6 +221,8 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
+                        track_ssm_seq_idx,
+                        track_ssm_end_locs,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
@@ -237,6 +241,8 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            track_ssm_seq_idx=track_ssm_seq_idx,
+            track_ssm_end_locs=track_ssm_end_locs,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -325,17 +331,8 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
-        if isinstance(self, Mamba2AttnBackend):
-            num_h_states = extend_seq_lens // mamba_cache_chunk_size
-        else:
-            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
-
-        track_ssm_src_offset = torch.zeros_like(num_h_states)
-        track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
-
         lens_to_track = mamba_track_seqlens - prefix_lens
         lens_masked = lens_to_track[mamba_track_mask]
-        offset_masked = track_ssm_src_offset[mamba_track_mask]
         dst_masked = mamba_track_indices[mamba_track_mask]
 
         is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
@@ -347,16 +344,39 @@ class MambaAttnBackendBase(AttentionBackend):
         # Unaligned: intermediate state from h.
         # TODO: handle mamba_cache_chunk_size % page size != 0
         not_aligned = ~is_aligned
-        track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
-        )
         track_ssm_h_dst = dst_masked[not_aligned]
+        track_ssm_seq_idx = None
+        track_ssm_end_locs = None
+
+        if isinstance(self, Mamba2AttnBackend):
+            query_start_loc = torch.zeros_like(extend_seq_lens)
+            query_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+            aligned_len = (
+                lens_masked[not_aligned] // mamba_cache_chunk_size
+            ) * mamba_cache_chunk_size
+            track_ssm_seq_idx = torch.nonzero(mamba_track_mask, as_tuple=True)[0][
+                not_aligned
+            ]
+            track_ssm_end_locs = query_start_loc[track_ssm_seq_idx] + aligned_len
+            track_ssm_h_src = torch.arange(track_ssm_seq_idx.numel())
+        else:
+            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
+            track_ssm_src_offset = torch.zeros_like(num_h_states)
+            track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
+            track_ssm_h_src = track_ssm_src_offset[mamba_track_mask][not_aligned] + (
+                lens_masked[not_aligned] // mamba_cache_chunk_size
+            )
+
+        def to_device(t):
+            return None if t is None else t.to(self.device, non_blocking=True)
 
         return (
-            track_ssm_h_src.to(self.device, non_blocking=True),
-            track_ssm_h_dst.to(self.device, non_blocking=True),
-            track_ssm_final_src.to(self.device, non_blocking=True),
-            track_ssm_final_dst.to(self.device, non_blocking=True),
+            to_device(track_ssm_h_src),
+            to_device(track_ssm_h_dst),
+            to_device(track_ssm_final_src),
+            to_device(track_ssm_final_dst),
+            to_device(track_ssm_seq_idx),
+            to_device(track_ssm_end_locs),
         )
 
     def init_forward_metadata_capture_cpu_graph(
