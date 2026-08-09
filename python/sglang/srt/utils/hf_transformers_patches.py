@@ -84,19 +84,22 @@ def normalize_deepseek_v4_compat(config) -> None:
     Upstream renamed the field *and reshaped it*:
 
     - old (transformers < 4.57): ``compress_ratios: list[int]``, indexed by
-      layer id, values in ``{4, 128}``.
+      layer id. Values follow upstream's
+      ``_COMPRESS_RATIO_TO_LAYER_TYPE = {0: "sliding_attention",
+      4: "compressed_sparse_attention", 128: "heavily_compressed_attention"}``
+      — i.e. ``0`` marks a sliding-window layer (no compression), ``4`` /
+      ``128`` mark the two compressed attention types.
     - new (>= 4.57): ``compress_rates: dict[str, int]`` keyed by layer-type
       label, paired with ``layer_types: list[str]`` giving the per-layer
-      schedule.
+      schedule. ``compress_rates`` only carries the two compressed types;
+      sliding-attention layers are not entries in that dict.
 
     sglang readers still consume the legacy ``list[int]`` shape
     (``models/deepseek_v4.py`` does ``config.compress_ratios[layer_id]``;
     ``configs/model_config.py`` filters it by ``== 4``; the NPU backend
-    checks ``4 in ...`` / ``128 in ...``). Copying the new dict onto the
-    legacy name unchanged would swap the container type and turn the
-    original ``AttributeError`` into a ``KeyError`` — the same crash in a
-    new location. Expand the mapping into the legacy list here so every
-    downstream reader keeps its indexing semantics.
+    checks ``4 in ...`` / ``128 in ...``). Rebuild that per-layer list
+    here: sliding-attention layers emit ``0`` (matching the legacy
+    encoding), the two compressed types resolve through ``compress_rates``.
 
     sglang currently aliases the ``deepseek_v4`` model_type onto upstream's
     ``DeepseekV3Config`` (see ``hf_transformers/common.py``), so upstream's
@@ -114,14 +117,20 @@ def normalize_deepseek_v4_compat(config) -> None:
     if not isinstance(rates, dict) or not isinstance(layer_types, (list, tuple)):
         return
 
-    try:
-        config.compress_ratios = [rates[lt] for lt in layer_types]
-    except KeyError as exc:
-        missing = exc.args[0]
-        raise ValueError(
-            f"DeepseekV4Config layer_type {missing!r} has no entry in "
-            f"compress_rates {sorted(rates)}"
-        ) from exc
+    def _legacy_ratio(lt: str) -> int:
+        # Sliding-attention layers have no compression rate upstream; encode
+        # them as ``0`` to preserve the legacy shape.
+        if lt == "sliding_attention":
+            return 0
+        try:
+            return rates[lt]
+        except KeyError:
+            raise ValueError(
+                f"DeepseekV4Config layer_type {lt!r} has no entry in "
+                f"compress_rates {sorted(rates)}"
+            ) from None
+
+    config.compress_ratios = [_legacy_ratio(lt) for lt in layer_types]
 
 
 def normalize_rope_scaling_compat(config) -> None:
