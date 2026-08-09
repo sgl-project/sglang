@@ -1669,7 +1669,11 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if server_args.attention_backend == "flashinfer":
+        # The configured pair, not the base field: a launch that pins
+        # flashinfer for one phase only (`--decode-attention-backend
+        # flashinfer`) runs the same kernels and must meet the same version
+        # floor, but read the base field alone and the guard never fired.
+        if "flashinfer" in server_args.get_attention_backends():
             assert_pkg_version(
                 "flashinfer_python",
                 "0.6.17",

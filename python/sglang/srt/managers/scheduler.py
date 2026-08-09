@@ -28,6 +28,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_device,
     get_disagg,
     get_exec,
@@ -1513,9 +1514,12 @@ class Scheduler(
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
-        env_var, default_size = backend_sizes.get(
-            get_exec().kernel.attention_backend, (None, None)
-        )
+        # Both entries are prefill knobs (SPLIT_TILE / PREFILL_TRUNCATION), so
+        # the prefill half of the pair decides. Reading the base field alone
+        # left truncation unset whenever the operator configured only
+        # `--prefill-attention-backend`.
+        prefill_backend, _ = attention_backends()
+        env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )

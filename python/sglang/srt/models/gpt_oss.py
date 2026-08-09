@@ -418,12 +418,15 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
-        attn_backend = get_exec().kernel.attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        # bfloat16 unconditionally: FA4 *asserts* bfloat16, triton/fa3 take it
+        # natively, and the one consumer that wants float32 (trtllm_mha)
+        # upcasts at its call site -- exact, the checkpoint value is bfloat16.
+        # No backend read here on purpose: at model-build time the process
+        # config pair cannot say which backend serves *this runner's* forwards
+        # (a draft runner's backend arrives after construction), so any
+        # dtype-by-backend rule picks wrong for some runner.
         self.sinks = nn.Parameter(
-            torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
+            torch.empty(self.num_heads, dtype=torch.bfloat16), requires_grad=False
         )
 
         self.o_proj = RowParallelLinear(

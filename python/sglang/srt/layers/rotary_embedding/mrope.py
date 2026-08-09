@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import attention_backends, get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
@@ -143,7 +143,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_exec().kernel.attention_backend):
+            # Both halves of the pair: this runs in prefill and decode, so a
+            # backend that cannot host the triton kernel disqualifies it even
+            # when the other one could (`--prefill-attention-backend
+            # torch_native` with the base field unset used to read as None,
+            # which `support_triton` answers True for).
+            prefill_backend, decode_backend = attention_backends()
+            if support_triton(prefill_backend) and support_triton(decode_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:
