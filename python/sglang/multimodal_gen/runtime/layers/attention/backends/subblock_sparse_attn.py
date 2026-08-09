@@ -2,7 +2,7 @@
 """SubBlock block-sparse attention backend.
 
 Routes FlashInfer's 64-token block-sparse kernel with a K-side sub-block
-log-sum-exp score (see ``backends/subblock/``). Everything is training-free:
+log-sum-exp score (see ``backends/subblock_sparse/``). Everything is training-free:
 the router runs before attention and produces the ``q2k_block_index`` the
 kernel consumes.
 
@@ -12,7 +12,7 @@ dense attention for them. Depth turns out not to matter the same way, which is
 why the layer cutoff defaults to zero -- see the defaults below. The schedule
 is configured through ``--attention-backend-config``::
 
-    --attention-backend subblock \
+    --attention-backend subblock_sparse_attn \
     --attention-backend-config '{"sparsity": 0.75, "skip_first_steps": 10,
                                  "skip_first_layers": 0, "n_k": 4}'
 
@@ -40,8 +40,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (
-    SubBlockRouter,
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+    SubBlockSparseRouter,
     load_bsa_attn_blk64_fwd,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
@@ -51,7 +51,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 # The kernel is fixed at 64-token blocks and 128-wide heads.
-SUBBLOCK_HEAD_DIM = 128
+SUBBLOCK_SPARSE_HEAD_DIM = 128
 
 # Defaults for the schedule; override through --attention-backend-config.
 # Sparsity is the speed lever, and it saturates: on MiniMax-H3 t2va at 37.7k
@@ -106,48 +106,48 @@ def _cached_block_sizes(seq_len: int, device: torch.device) -> torch.Tensor:
     Rebuilding it per call costs an arange plus a clamp launch on the critical
     path for a tensor that only depends on the sequence length.
     """
-    return SubBlockRouter.block_sizes(seq_len, device)
+    return SubBlockSparseRouter.block_sizes(seq_len, device)
 
 
-class SubBlockAttentionBackend(AttentionBackend):
+class SubBlockSparseAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [SUBBLOCK_HEAD_DIM]
+        return [SUBBLOCK_SPARSE_HEAD_DIM]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.SUBBLOCK
+        return AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
 
     @staticmethod
-    def get_impl_cls() -> type[SubBlockAttentionImpl]:
-        return SubBlockAttentionImpl
+    def get_impl_cls() -> type[SubBlockSparseAttentionImpl]:
+        return SubBlockSparseAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type[SubBlockAttentionMetadata]:
-        return SubBlockAttentionMetadata
+    def get_metadata_cls() -> type[SubBlockSparseAttentionMetadata]:
+        return SubBlockSparseAttentionMetadata
 
     @staticmethod
-    def get_builder_cls() -> type[SubBlockAttentionMetadataBuilder]:
-        return SubBlockAttentionMetadataBuilder
+    def get_builder_cls() -> type[SubBlockSparseAttentionMetadataBuilder]:
+        return SubBlockSparseAttentionMetadataBuilder
 
 
 @dataclass
-class SubBlockAttentionMetadata(AttentionMetadata):
+class SubBlockSparseAttentionMetadata(AttentionMetadata):
     current_timestep: int
 
 
-class SubBlockAttentionMetadataBuilder(AttentionMetadataBuilder):
+class SubBlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     def prepare(self) -> None:
         pass
 
     def build(  # type: ignore[override]
         self, current_timestep: int, **kwargs: dict[str, Any]
-    ) -> SubBlockAttentionMetadata:
-        return SubBlockAttentionMetadata(current_timestep=current_timestep)
+    ) -> SubBlockSparseAttentionMetadata:
+        return SubBlockSparseAttentionMetadata(current_timestep=current_timestep)
 
 
-class SubBlockSchedule(msgspec.Struct, frozen=True):
+class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     """When sparsity is allowed to apply, and how much of it."""
 
     sparsity: float
@@ -158,11 +158,11 @@ class SubBlockSchedule(msgspec.Struct, frozen=True):
     min_seq_len: int
 
     @classmethod
-    def from_server_args(cls) -> SubBlockSchedule:
+    def from_server_args(cls) -> SubBlockSparseSchedule:
         from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         config = get_global_server_args().attention_backend_config or {}
-        schedule = SubBlockSchedule(
+        schedule = SubBlockSparseSchedule(
             sparsity=float(config.get("sparsity", DEFAULT_SPARSITY)),
             skip_first_steps=int(
                 config.get("skip_first_steps", DEFAULT_SKIP_FIRST_STEPS)
@@ -186,7 +186,7 @@ class SubBlockSchedule(msgspec.Struct, frozen=True):
         return schedule
 
 
-class SubBlockAttentionImpl(AttentionImpl):
+class SubBlockSparseAttentionImpl(AttentionImpl):
     """Block-sparse attention with a dense fallback for the excluded region.
 
     One impl instance is built per attention module, so ``prefix`` fixes the
@@ -213,25 +213,25 @@ class SubBlockAttentionImpl(AttentionImpl):
         )
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
 
-        self.schedule = SubBlockSchedule.from_server_args()
+        self.schedule = SubBlockSparseSchedule.from_server_args()
         self.layer_idx = _dit_layer_index(prefix)
         # A layer outside the DiT stack (token refiner, cross attention) never
         # runs sparse: its sequences are short and its budget meaningless.
         self.layer_enabled = (
             self.layer_idx is not None
             and self.layer_idx >= self.schedule.skip_first_layers
-            and head_size == SUBBLOCK_HEAD_DIM
+            and head_size == SUBBLOCK_SPARSE_HEAD_DIM
             and self.schedule.sparsity > 0.0
         )
         self.router = (
-            SubBlockRouter(n_k=self.schedule.n_k, n_q=self.schedule.n_q)
+            SubBlockSparseRouter(n_k=self.schedule.n_k, n_q=self.schedule.n_q)
             if self.layer_enabled
             else None
         )
         self.dense_impl = self._build_dense_impl(causal=causal)
         if self.layer_enabled:
             logger.info_once(
-                f"SubBlock attention: sparsity={self.schedule.sparsity:.3f} "
+                f"SubBlock sparse attention: sparsity={self.schedule.sparsity:.3f} "
                 f"n_k={self.schedule.n_k} n_q={self.schedule.n_q}, dense for the first "
                 f"{self.schedule.skip_first_steps} denoise steps and the first "
                 f"{self.schedule.skip_first_layers} DiT layers"
@@ -305,7 +305,7 @@ class SubBlockAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: SubBlockAttentionMetadata | None = None,
+        attn_metadata: SubBlockSparseAttentionMetadata | None = None,
     ) -> torch.Tensor:
         """query/key/value: ``[B, S, H, D]``."""
         if not self._sparse_ready(query, key):
@@ -391,9 +391,9 @@ class SubBlockAttentionImpl(AttentionImpl):
 
 
 __all__ = [
-    "SubBlockAttentionBackend",
-    "SubBlockAttentionImpl",
-    "SubBlockAttentionMetadata",
-    "SubBlockAttentionMetadataBuilder",
-    "SubBlockSchedule",
+    "SubBlockSparseAttentionBackend",
+    "SubBlockSparseAttentionImpl",
+    "SubBlockSparseAttentionMetadata",
+    "SubBlockSparseAttentionMetadataBuilder",
+    "SubBlockSparseSchedule",
 ]

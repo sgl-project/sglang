@@ -10,6 +10,6 @@ Q/K and turns the scores into the ``q2k_block_index`` that FlashInfer's
 the measurements behind its defaults are documented there.
 """
 
-from .router import SubBlockRouter, load_bsa_attn_blk64_fwd
+from .router import SubBlockSparseRouter, load_bsa_attn_blk64_fwd
 
-__all__ = ["SubBlockRouter", "load_bsa_attn_blk64_fwd"]
+__all__ = ["SubBlockSparseRouter", "load_bsa_attn_blk64_fwd"]

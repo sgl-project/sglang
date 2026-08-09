@@ -1,4 +1,4 @@
-# SubBlock — training-free block-sparse attention for the MiniMax-H3 DiT
+# SubBlock sparse attention — training-free block sparsity for the MiniMax-H3 DiT
 
 Routes FlashInfer's 64-token block-sparse kernel (`bsa_attn_blk64_fwd`) with a
 sub-block score. Nothing is trained and no weights change: a cheap estimator
@@ -7,7 +7,7 @@ runs before attention and hands the kernel a `q2k_block_index`.
 ```bash
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --num-gpus 8 --ulysses-degree 8 \
-  --attention-backend subblock \
+  --attention-backend subblock_sparse_attn \
   --attention-backend-config '{"sparsity": 0.75, "n_k": 4}'
 ```
 
@@ -88,8 +88,8 @@ on one node, cold sample dropped; spread within an arm is under 0.07 s.
 | | DiT denoise | vs dense |
 | --- | ---: | ---: |
 | dense (FlashAttention) | 18.270 s | 1.000x |
-| SubBlock | 16.061 s | **1.138x** |
-| SubBlock + [flashinfer#4397][fi] | 15.012 s | **1.217x** |
+| SubBlock sparse | 16.061 s | **1.138x** |
+| SubBlock sparse + [flashinfer#4397][fi] | 15.012 s | **1.217x** |
 
 [flashinfer-ai/flashinfer#4397][fi] rebuilds the kernel's internal Q/K/V tile
 layout in one pass instead of three. It is bit-identical and **not required**:
@@ -117,11 +117,11 @@ are comparable.
 
 | | |
 | --- | --- |
-| `router.py` | `SubBlockRouter` — pooling, scoring, selection, `RoutingPlan` |
+| `router.py` | `SubBlockSparseRouter` — pooling, scoring, selection, `RoutingPlan` |
 | `kernels.py` | Triton pooling / segmented-LSE / fused top-k |
-| `../subblock_attn.py` | the `AttentionBackend`: schedule, gating, dense fallback |
+| `../subblock_sparse_attn.py` | the `AttentionBackend`: schedule, gating, dense fallback |
 
-Tests: `test/unit/test_subblock_attention.py`. The trick that makes the sparse
+Tests: `test/unit/test_subblock_sparse_attention.py`. The trick that makes the sparse
 kernel checkable against dense is running it at a sparsity just above 0 — every
 block is then inside the budget, so the result must reproduce dense attention up
 to bf16 rounding, which pins the routing indices, the ragged tail block sizes

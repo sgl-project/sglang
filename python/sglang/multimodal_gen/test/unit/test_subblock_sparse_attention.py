@@ -18,12 +18,12 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.attention.backends.subblock.router import (
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.router import (
     _snap_up_to_8,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn import (
-    SubBlockAttentionImpl,
-    SubBlockSchedule,
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+    SubBlockSparseAttentionImpl,
+    SubBlockSparseSchedule,
     _dit_layer_index,
 )
 
@@ -37,7 +37,7 @@ def _sm100_available() -> bool:
     if torch.cuda.get_device_capability(0)[0] != 10:
         return False
     try:
-        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
             load_bsa_attn_blk64_fwd,
         )
 
@@ -69,7 +69,7 @@ def _patch_step(step: int):
         current_timestep = step
 
     return patch(
-        "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn.get_forward_context",
+        "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.get_forward_context",
         return_value=_Ctx(),
     )
 
@@ -126,7 +126,7 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     )
 
 
-class TestSubBlockSchedule(unittest.TestCase):
+class TestSubBlockSparseSchedule(unittest.TestCase):
     def test_dit_layer_index_only_matches_top_level_blocks(self):
         self.assertEqual(_dit_layer_index("blocks.7.attn"), 7)
         self.assertEqual(_dit_layer_index("blocks.0.attn"), 0)
@@ -136,7 +136,7 @@ class TestSubBlockSchedule(unittest.TestCase):
 
     def test_defaults_when_config_is_empty(self):
         with _patch_schedule({}):
-            schedule = SubBlockSchedule.from_server_args()
+            schedule = SubBlockSparseSchedule.from_server_args()
         self.assertEqual(schedule.sparsity, 0.75)
         self.assertEqual(schedule.skip_first_steps, 10)
         # Depth is not protected by default; the early steps are. See the
@@ -149,7 +149,7 @@ class TestSubBlockSchedule(unittest.TestCase):
         for config in ({"sparsity": 1.0}, {"n_k": 3}, {"skip_first_steps": -1}):
             with self.subTest(config=config), _patch_schedule(config):
                 with self.assertRaises(ValueError):
-                    SubBlockSchedule.from_server_args()
+                    SubBlockSparseSchedule.from_server_args()
 
 
 class TestBudgetGranularity(unittest.TestCase):
@@ -169,11 +169,11 @@ class TestBudgetGranularity(unittest.TestCase):
 class TestSubBlockGating(unittest.TestCase):
     """The schedule must decide sparsity from the layer and the step alone."""
 
-    def _impl(self, prefix: str, **config) -> SubBlockAttentionImpl:
+    def _impl(self, prefix: str, **config) -> SubBlockSparseAttentionImpl:
         with _patch_schedule(config), patch.object(
-            SubBlockAttentionImpl, "_build_dense_impl", return_value=None
+            SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
         ):
-            return SubBlockAttentionImpl(
+            return SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,
                 head_size=HEAD_DIM,
                 causal=False,
@@ -196,9 +196,9 @@ class TestSubBlockGating(unittest.TestCase):
 
     def test_head_dim_other_than_128_is_dense(self):
         with _patch_schedule({}), patch.object(
-            SubBlockAttentionImpl, "_build_dense_impl", return_value=None
+            SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
         ):
-            impl = SubBlockAttentionImpl(
+            impl = SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,
                 head_size=64,
                 causal=False,
@@ -230,9 +230,9 @@ class TestSubBlockGating(unittest.TestCase):
 class TestSubBlockNumerics(unittest.TestCase):
     seq_len = 8192
 
-    def _impl(self, **config) -> SubBlockAttentionImpl:
+    def _impl(self, **config) -> SubBlockSparseAttentionImpl:
         with _patch_schedule(config):
-            return SubBlockAttentionImpl(
+            return SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,
                 head_size=HEAD_DIM,
                 causal=False,
@@ -267,8 +267,8 @@ class TestSubBlockNumerics(unittest.TestCase):
         number of blocks but chosen at random the output collapses, so a high
         cosine here measures the routing, not a forgiving fixture.
         """
-        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (
-            SubBlockRouter,
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+            SubBlockSparseRouter,
             load_bsa_attn_blk64_fwd,
         )
 
@@ -296,7 +296,7 @@ class TestSubBlockNumerics(unittest.TestCase):
             v,
             random_index,
             topk,
-            block_sizes=SubBlockRouter.block_sizes(self.seq_len, device),
+            block_sizes=SubBlockSparseRouter.block_sizes(self.seq_len, device),
             q2k_block_nums=None,
             softmax_scale=HEAD_DIM**-0.5,
         )
