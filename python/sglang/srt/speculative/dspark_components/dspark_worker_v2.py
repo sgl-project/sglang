@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
@@ -63,7 +64,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_cuda_alike
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not server_args.disable_cuda_graph and not self._is_pd_prefill
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            and not self._is_pd_prefill
         )
         if (
             server_args.enable_dp_attention
@@ -143,6 +145,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             if server_args.enable_dp_attention
             else parallel.tp_group
         )
+        self._draft_graph_group = (
+            parallel.attn_tp_group
+            if self._draft_dp_context_enabled
+            else parallel.tp_group
+        )
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -183,6 +190,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
+            tp_sync=self._tp_sync,
         )
         if (
             server_args.enable_dp_attention
@@ -333,8 +341,17 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
-        if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        available_mem = None
+        if is_cuda_alike() and capture_decode_cuda_graph:
+            graph_group = self._draft_graph_group
+            available_mem = get_available_gpu_memory(
+                self.device,
+                self.gpu_id,
+                distributed=graph_group.world_size > 1,
+                cpu_group=(
+                    graph_group.cpu_group if graph_group.world_size > 1 else None
+                ),
+            )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -344,7 +361,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = self._maybe_build_draft_sampler()
+                self._draft_sampler = self._maybe_build_draft_sampler(
+                    available_memory_gb=available_mem
+                )
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
@@ -354,7 +373,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self):
+    def _maybe_build_draft_sampler(self, *, available_memory_gb: Optional[float]):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -362,6 +381,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             tp_rank=self.ps.tp_rank,
             tp_sync=self._tp_sync,
+            available_memory_gb=available_memory_gb,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence

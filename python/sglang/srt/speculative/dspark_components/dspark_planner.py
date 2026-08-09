@@ -35,6 +35,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
 )
+from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
@@ -78,6 +79,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        tp_sync: DsparkTpSync,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -85,6 +87,7 @@ class DSparkVerifyPlanner:
         self.device = device
         self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
+        self._tp_sync = tp_sync
         self._align_verify_tokens_to_graph_tier = (
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -308,8 +311,11 @@ class DSparkVerifyPlanner:
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
         resolved = future_map.resolve_confidence_cpu(batch)
-        draft_input.verify_token_budget = self._budget_from_resolved(
+        local_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
+        )
+        draft_input.verify_token_budget = self._tp_sync.broadcast_optional_int(
+            local_budget
         )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
@@ -377,17 +383,22 @@ class DSparkVerifyPlanner:
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ) -> Optional[int]:
-        """Per-step verify-token budget: under overlap it was precomputed into
-        the draft input by prepare_verify_budget; otherwise compute it now."""
+        """Resolve one shared budget before any layout-dependent branch."""
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
-        return self.compute_budget_sync(
+
+        # Preserve per-rank planner state before selecting one shared decision.
+        local_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
         )
+        draft_input.verify_token_budget = self._tp_sync.broadcast_optional_int(
+            local_budget
+        )
+        return draft_input.verify_token_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
@@ -589,6 +600,7 @@ class DSparkVerifyPlanner:
             budget=budget,
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
+        self._tp_sync.sync(verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -607,12 +619,6 @@ class DSparkVerifyPlanner:
                 sort_survival=compute_sort_survival(confidence),
                 verify_lens=verify_lens,
             )
-
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
-        )
-        if group_size > 1:
-            broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
 
@@ -764,12 +770,6 @@ def uniform_ragged_layout(
         grid=grid,
         graph_num_tokens_floor=graph_num_tokens_floor,
     )
-
-
-def verify_lens_broadcast_group(*, tp_size: int) -> tuple:
-    if is_dp_attention_enabled():
-        return get_parallel().attn_tp_group, get_parallel().attn_tp_size
-    return get_tp_group(), tp_size
 
 
 def verify_layout_grid(

@@ -141,9 +141,12 @@ class DsparkDraftSampler:
             self.confidence_out[:bs].copy_(confidence)
 
 
-def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
+def _resolve_folded_sampling(
+    *, model, gamma, max_bs, device, tp_rank, available_memory_gb: Optional[float]
+) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
-    must decide before capture from a free-memory probe."""
+    must decide before capture from a free-memory probe. With TP > 1, pass
+    the group-min ``available_memory_gb`` so ranks fold identically."""
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
     if mode == DsparkFoldedSampling.OFF:
         return False
@@ -153,8 +156,11 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
-    available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
-    if available_gb - need_gb >= _CAPTURE_HEADROOM_GB:
+    if available_memory_gb is None:
+        available_memory_gb = get_available_gpu_memory(
+            device, torch.cuda.current_device()
+        )
+    if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
         logger.warning(
@@ -163,7 +169,7 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
             "the eager proposal path. Set SGLANG_DSPARK_FOLDED_SAMPLING=%d "
             "to force.",
             need_gb,
-            available_gb,
+            available_memory_gb,
             int(DsparkFoldedSampling.FORCE),
         )
     return False
@@ -177,6 +183,7 @@ def maybe_build_draft_sampler(
     device,
     tp_rank: int,
     tp_sync: DsparkTpSync,
+    available_memory_gb: Optional[float] = None,
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
@@ -195,7 +202,12 @@ def maybe_build_draft_sampler(
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
     folded_sampling = _resolve_folded_sampling(
-        model=draft_model, gamma=gamma, max_bs=max_bs, device=device, tp_rank=tp_rank
+        model=draft_model,
+        gamma=gamma,
+        max_bs=max_bs,
+        device=device,
+        tp_rank=tp_rank,
+        available_memory_gb=available_memory_gb,
     )
     if tp_rank == 0:
         logger.info(
