@@ -20,6 +20,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -32,6 +33,7 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
@@ -571,6 +573,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -580,6 +588,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
+        )
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -796,14 +807,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
                 continue
-
+            if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
+                mapped = mapped.replace(
+                    ".mlp.shared_experts.",
+                    f".mlp.experts.{self.config.n_routed_experts}.",
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
                     continue
