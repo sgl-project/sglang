@@ -14,7 +14,6 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
