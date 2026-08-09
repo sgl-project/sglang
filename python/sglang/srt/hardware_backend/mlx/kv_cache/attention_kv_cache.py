@@ -141,9 +141,18 @@ class ContiguousAttentionKVCache:
         self.values[:, :, self.offset : end, :] = v
         self.offset = end
 
-    def get_kv(self) -> tuple[mx.array, mx.array]:
-        """Return valid K/V: (1, n_kv_heads, offset, head_dim)."""
-        return self.keys[:, :, : self.offset, :], self.values[:, :, : self.offset, :]
+    def get_kv(self, window: int | None = None) -> tuple[mx.array, mx.array]:
+        """Return valid K/V: (1, n_kv_heads, min(offset, window), head_dim).
+
+        ``window`` keeps only the trailing window a sliding-window layer can
+        attend to.  Slicing here rather than slicing the full history and then
+        slicing again costs one op instead of two per request per layer.
+        """
+        start = 0 if window is None else max(0, self.offset - window)
+        return (
+            self.keys[:, :, start : self.offset, :],
+            self.values[:, :, start : self.offset, :],
+        )
 
     def reset(self) -> None:
         """Reset for reuse, keeping allocated buffers."""
@@ -239,9 +248,18 @@ class WindowedAttentionKVCache:
         """Write one token. k, v shape: (1, n_kv_heads, 1, head_dim)."""
         self._append(k, v)
 
-    def get_kv(self) -> tuple[mx.array, mx.array]:
-        """Return buffered trailing K/V: (1, n_kv_heads, local, head_dim)."""
-        return self.keys[:, :, : self._local, :], self.values[:, :, : self._local, :]
+    def get_kv(self, window: int | None = None) -> tuple[mx.array, mx.array]:
+        """Return buffered trailing K/V: (1, n_kv_heads, kept, head_dim).
+
+        ``window`` mirrors :meth:`ContiguousAttentionKVCache.get_kv`, but the
+        slice is buffer-relative: this buffer holds at most ``2 * window``
+        tokens, so the trailing window starts from ``_local``, not ``offset``.
+        """
+        start = 0 if window is None else max(0, self._local - window)
+        return (
+            self.keys[:, :, start : self._local, :],
+            self.values[:, :, start : self._local, :],
+        )
 
 
 class PoolBackedAttentionKVCache:

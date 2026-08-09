@@ -57,6 +57,11 @@ class BatchedDecodeContext:
     needs_padding: bool = field(init=False)
     pad_sizes: list[int] = field(init=False)
     positions: Optional[mx.array] = field(init=False)
+    # Padding metadata memo, keyed by window size.  It depends only on
+    # ``seq_lens`` and the window, so every layer sharing a window reuses one
+    # entry instead of rebuilding it (gpt-oss decodes 24 attention layers per
+    # step, in two window classes).
+    _padding_by_window: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         seq_lens = self.seq_lens
@@ -80,6 +85,47 @@ class BatchedDecodeContext:
                 "BatchedDecodeContext requires full_kv_pool_index_by_layer "
                 "when the fused AOT RoPE + pool-scatter kernel is active"
             )
+
+    def decode_padding(
+        self, window: int | None
+    ) -> tuple[list[int], Optional[mx.array]]:
+        """Right-pad sizes and the keep-mask for one decode step.
+
+        Requests are padded to a common KV width so they can be batched into
+        one SDPA call.  Without a window that width is ``max_len``; a
+        sliding-window layer only reads the trailing ``window`` keys, so its
+        width is ``max(min(seq_len + 1, window))`` instead -- which is why the
+        context's full-length metadata cannot be reused for it.
+
+        The mask is boolean (``True`` keeps the key), broadcast-shaped
+        ``(B, 1, 1, width)``, and ``None`` when no request needs padding.
+        Cached per window: all layers in the step share one build.
+        """
+        cached = self._padding_by_window.get(window, None)
+        if cached is not None:
+            return cached
+
+        if window is None:
+            pad_sizes = self.pad_sizes
+            keep = (
+                self.positions[None, :] < self.valid_lens[:, None]
+                if self.needs_padding
+                else None
+            )
+        else:
+            eff_lens = [min(n + 1, window) for n in self.seq_lens]
+            max_eff = max(eff_lens)
+            pad_sizes = [max_eff - n for n in eff_lens]
+            keep = (
+                mx.arange(max_eff)[None, :]
+                < mx.array(eff_lens, dtype=mx.int32)[:, None]
+                if min(eff_lens) < max_eff
+                else None
+            )
+
+        result = (pad_sizes, None if keep is None else keep[:, None, None, :])
+        self._padding_by_window[window] = result
+        return result
 
     @classmethod
     def from_decode(
@@ -168,8 +214,27 @@ class MLXAttentionWrapper(nn.Module):
             raise RuntimeError(
                 f"Cannot determine attention scale for {type(inner).__name__}"
             )
+        n_heads = get_num_heads(inner)
+        n_kv_heads = get_num_kv_heads(inner)
+        if n_heads is None or n_kv_heads is None:
+            raise RuntimeError(
+                f"Cannot determine attention head counts for {type(inner).__name__}"
+            )
         object.__setattr__(self, "_scale", scale)
-        object.__setattr__(self, "_sinks", getattr(inner, "sinks", None))
+        object.__setattr__(self, "_n_heads", n_heads)
+        object.__setattr__(self, "_n_kv_heads", n_kv_heads)
+        # None for modules that expose head_dim only through a projection
+        # shape; _batched_decode falls back to the runtime K shape.
+        object.__setattr__(self, "_head_dim", get_head_dim(inner))
+        object.__setattr__(self, "_has_q_norm", hasattr(inner, "q_norm"))
+        object.__setattr__(self, "_has_k_norm", hasattr(inner, "k_norm"))
+        # Only pass sinks when the module has them: the kwarg requires a
+        # recent mlx and must not constrain models without sinks.
+        sinks = getattr(inner, "sinks", None)
+        object.__setattr__(self, "_sinks", sinks)
+        object.__setattr__(
+            self, "_sink_kwargs", {} if sinks is None else {"sinks": sinks}
+        )
 
     def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
         ctx = get_context()
@@ -181,18 +246,14 @@ class MLXAttentionWrapper(nn.Module):
         inner = self._inner
         layer_idx = self._layer_idx
         B = ctx.batch_size
-        n_heads = get_num_heads(inner)
-        n_kv_heads = get_num_kv_heads(inner)
-        if n_heads is None or n_kv_heads is None:
-            raise RuntimeError(
-                f"Cannot determine attention head counts for {type(inner).__name__}"
-            )
+        n_heads = self._n_heads
+        n_kv_heads = self._n_kv_heads
 
         q_proj_output = inner.q_proj(x)
         keys = inner.k_proj(x)
         values = inner.v_proj(x)
 
-        head_dim = get_head_dim(inner)
+        head_dim = self._head_dim
         if head_dim is None:
             head_dim = keys.shape[-1] // n_kv_heads
 
@@ -214,9 +275,9 @@ class MLXAttentionWrapper(nn.Module):
         keys = keys.reshape(B, 1, n_kv_heads, head_dim)
         values = values.reshape(B, 1, n_kv_heads, head_dim)
 
-        if hasattr(inner, "q_norm"):
+        if self._has_q_norm:
             queries = inner.q_norm(queries)
-        if hasattr(inner, "k_norm"):
+        if self._has_k_norm:
             keys = inner.k_norm(keys)
 
         queries = queries.transpose(0, 2, 1, 3)
@@ -247,16 +308,10 @@ class MLXAttentionWrapper(nn.Module):
             keys = inner.rope(keys, offset=offsets)
 
         layer_caches = ctx.attention_layer_caches[cache_idx]
-        if window is None:
-            pad_sizes = ctx.pad_sizes
-        else:
-            # Sliding-window layer: the cache keeps the full history but the
-            # newest token only attends to the trailing ``window`` keys.  The
-            # padding metadata shared on the context is full-length, so it is
-            # rebuilt locally for the windowed lengths.
-            eff_lens = [min(n + 1, window) for n in ctx.seq_lens]
-            max_eff = max(eff_lens)
-            pad_sizes = [max_eff - n for n in eff_lens]
+        # A sliding-window layer reads only the trailing ``window`` keys, so its
+        # padded width differs from the unwindowed one.  Both are memoised on
+        # the context and shared by every layer of their kind.
+        pad_sizes, attn_mask = ctx.decode_padding(window)
 
         # TODO: replace per-request loop with native batched/ragged
         # attention once mx.fast.scaled_dot_product_attention supports
@@ -267,10 +322,7 @@ class MLXAttentionWrapper(nn.Module):
         for i in range(B):
             layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
 
-            k_all, v_all = layer_caches[i].get_kv()
-            if window is not None and k_all.shape[2] > window:
-                k_all = k_all[:, :, -window:, :]
-                v_all = v_all[:, :, -window:, :]
+            k_all, v_all = layer_caches[i].get_kv(window)
 
             pad = pad_sizes[i]
             if pad > 0:
@@ -285,34 +337,13 @@ class MLXAttentionWrapper(nn.Module):
         keys_b = mx.concatenate(all_k, axis=0)
         values_b = mx.concatenate(all_v, axis=0)
 
-        pad_mask = None
-        if window is None:
-            if ctx.needs_padding:
-                pad_mask = ctx.positions[None, :] >= ctx.valid_lens[:, None]
-        elif max(pad_sizes) > 0:
-            eff = mx.array(eff_lens, dtype=mx.int32)
-            pad_mask = mx.arange(max_eff)[None, :] >= eff[:, None]
-
-        attn_mask = None
-        if pad_mask is not None:
-            attn_mask = mx.where(
-                pad_mask[:, None, None, :],
-                mx.array(mx.finfo(queries.dtype).min, dtype=queries.dtype),
-                mx.array(0.0, dtype=queries.dtype),
-            )
-
-        # Only pass sinks when the module has them: the kwarg requires a
-        # recent mlx and must not constrain models without sinks.
-        sink_kwargs = {}
-        if self._sinks is not None:
-            sink_kwargs["sinks"] = self._sinks
         output = mx.fast.scaled_dot_product_attention(
             queries,
             keys_b,
             values_b,
             scale=self._scale,
             mask=attn_mask,
-            **sink_kwargs,
+            **self._sink_kwargs,
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, 1, -1)
