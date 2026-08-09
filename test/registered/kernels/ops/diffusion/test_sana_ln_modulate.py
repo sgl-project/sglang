@@ -36,17 +36,17 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     emb = torch.randn(batch, nmod, hidden, device="cuda").bfloat16()
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
     # default-stream eager serving must stay on the untouched eager chain
-    n_sigs = len(sana._SANA_FUSED_LN_MOD_OK_SIGS)
+    n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
     _sana_ln_modulate(norm, x, scale, shift)
-    assert len(sana._SANA_FUSED_LN_MOD_OK_SIGS) == n_sigs
+    assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
     # the fusion engages on non-default streams (the BCG warmup/capture path)
     with torch.cuda.stream(torch.cuda.Stream()):
         out = _sana_ln_modulate(norm, x, scale, shift)
-        assert len(sana._SANA_FUSED_LN_MOD_OK_SIGS) == n_sigs + 1  # verified
+        assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
         out2 = _sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
     torch.cuda.synchronize()
     assert torch.equal(out, _eager_ln_modulate(norm, x, scale, shift))
-    assert torch.equal(out2, out) and not sana._SANA_FUSED_LN_MOD_DISABLED
+    assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from typing import Iterator, Optional, Union
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 
 def precision_to_dtype(precision: str, field_name: str = "precision") -> torch.dtype:

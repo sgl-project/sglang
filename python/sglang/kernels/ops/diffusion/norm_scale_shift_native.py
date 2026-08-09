@@ -24,7 +24,7 @@ def _blackwell_or_newer(device: torch.device) -> bool:
     )
 
 
-def _qwen_activation(t, like=None) -> bool:
+def _nss_activation(t, like=None) -> bool:
     return (
         isinstance(t, torch.Tensor)
         and t.is_cuda
@@ -61,16 +61,16 @@ def _row_bf16(t, device: torch.device):
 @cache_once
 def norm_scale_shift_module() -> Module:
     return load_jit(
-        "qwen_image_norm_scale_shift_native",
+        "norm_scale_shift_native",
         cuda_files=["diffusion/norm_scale_shift.cuh"],
         cuda_wrappers=[
             (
-                "qwen_image_nss_bf16_row",
-                "norm_scale_shift::QwenImageNormScaleShiftKernel::run",
+                "nss_bf16_row",
+                "norm_scale_shift::NormScaleShiftKernel::run",
             ),
             (
-                "qwen_image_srnss_bf16_row",
-                "norm_scale_shift::" "QwenImageScaleResidualNormScaleShiftKernel::run",
+                "srnss_bf16_row",
+                "norm_scale_shift::ScaleResidualNormScaleShiftKernel::run",
             ),
         ],
     )
@@ -82,7 +82,7 @@ _module = norm_scale_shift_module
 def try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
     if norm_type != "layer" or weight is not None or bias is not None:
         return None
-    if not _qwen_activation(x) or not _blackwell_or_newer(x.device):
+    if not _nss_activation(x) or not _blackwell_or_newer(x.device):
         return None
 
     scale = _row_bf16(scale, x.device)
@@ -91,7 +91,7 @@ def try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
         return None
 
     y = torch.empty_like(x)
-    _module().qwen_image_nss_bf16_row(
+    _module().nss_bf16_row(
         y.view(-1, _HIDDEN), x.view(-1, _HIDDEN), scale, shift, float(eps)
     )
     return y
@@ -103,8 +103,8 @@ def try_fused_scale_residual_norm_scale_shift(
     if norm_type != "layer" or weight is not None or bias is not None:
         return None
     if not (
-        _qwen_activation(x)
-        and _qwen_activation(residual, x)
+        _nss_activation(x)
+        and _nss_activation(residual, x)
         and _blackwell_or_newer(x.device)
     ):
         return None
@@ -117,7 +117,7 @@ def try_fused_scale_residual_norm_scale_shift(
 
     y = torch.empty_like(x)
     residual_out = torch.empty_like(x)
-    _module().qwen_image_srnss_bf16_row(
+    _module().srnss_bf16_row(
         y.view(-1, _HIDDEN),
         residual_out.view(-1, _HIDDEN),
         residual.view(-1, _HIDDEN),

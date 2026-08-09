@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -66,31 +67,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
-
-def _get_qkv_projections(
-    attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
-    else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
+_get_qkv_projections = get_qkv_projections
 
 
 class Flux2SwiGLU(nn.Module):
