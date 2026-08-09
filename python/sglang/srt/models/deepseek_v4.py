@@ -1331,6 +1331,12 @@ class MQALayer(MqaAttentionBase):
                     token_to_kv_pool.swa_kv_pool.page_size,
                     False,
                 )
+                if use_cp:
+                    # DSA CP: kv here is this rank's shard (round-robin token
+                    # subset), but swa_loc is in GLOBAL logical order, so the
+                    # in-kernel store would write local row i at global slot i.
+                    # Skip it and store the all-gathered kv below instead.
+                    swa_cache, swa_loc = None, None
 
             from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
                 fused_qk_norm_rope_swa_store,
@@ -1364,6 +1370,14 @@ class MQALayer(MqaAttentionBase):
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
+                )
+                # The fused kernel above skipped its SWA store under CP; write
+                # the globally-ordered kv at the global swa_out_cache_loc, the
+                # same way the non-fused CP branch does.
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
                 )
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
@@ -3133,7 +3147,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        # CP-v2 builds attn_cp_metadata in prepare_cp_forward and reindexes the
+        # core metadata inside the attention backend. Running the CP-v1 hook on
+        # top would overwrite the v2 metadata object and reindex a second time.
+        # (Mirrors deepseek_v4_nextn.py's guard.)
+        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
