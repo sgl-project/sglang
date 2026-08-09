@@ -149,7 +149,9 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          if [[ "${{ inputs.run_all_tests }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
+          # Validation branch: a PR here exists only to exercise CUSTOM_IMAGE,
+          # so skip change detection and run every stage.
+          if [[ "${{ inputs.run_all_tests }}" == "true" || "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "pull_request" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
             echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }}, event=${{ github.event_name }})"
           else
