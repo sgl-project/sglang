@@ -15,7 +15,11 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     nvfp4_marlin_process_global_scale,
     prepare_nvfp4_layer_for_marlin,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
+from sglang.srt.utils.common import (
+    is_sm80_supported,
+    is_sm90_supported,
+    is_sm120_supported,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -115,11 +119,11 @@ def test_gptq_marlin_gemm(
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported()),
-    reason="NVFP4 Marlin fallback tests require CUDA SM8X/SM9X",
+    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
+    reason="NVFP4 Marlin fallback tests require CUDA SM8X/SM9X/SM120",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
+def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90_sm120(dtype):
     major, minor = torch.cuda.get_device_capability()
     capability = major * 10 + minor
     assert check_marlin_supported(
@@ -141,8 +145,8 @@ def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported()),
-    reason="NVFP4 Marlin dense numeric test requires CUDA SM80, SM86, or SM90",
+    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
+    reason="NVFP4 Marlin dense numeric test requires CUDA SM80, SM86, SM90 or SM120",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
