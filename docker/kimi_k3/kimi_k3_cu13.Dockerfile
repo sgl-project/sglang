@@ -10,7 +10,7 @@
 #        topk 11->16, SWITCH_HIDDEN += 3584, EP>8 SourceMeta alignment,
 #        cross-node timeout headroom, CUDA-13 cccl include; rebuilt for
 #        sm_90, sm_100a, and sm_103a
-#   3. DeepGEMM upgrade to 0.1.5.post1:
+#   3. DeepGEMM upgrade to 0.1.5.post2:
 #        official MegaMoE runtime-JIT header with Kimi-K3 SiTU support
 #   4. FlashInfer CuTeDSL MLA DCP patch:
 #        apply the seven runtime-file diffs; exclude tests absent from the wheel
@@ -26,7 +26,7 @@
 
 FROM lmsysorg/sglang:v0.5.16 AS base
 
-ARG SGL_DEEP_GEMM_VERSION="0.1.5.post1"
+ARG SGL_DEEP_GEMM_VERSION="0.1.5.post2"
 
 # Current Kimi-K3 source auto-discovers and builds its PyO3 extensions.
 ARG RUST_VERSION="1.90.0"
@@ -52,10 +52,12 @@ ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 # --- 1. Kimi-K3 SGLang code (replaces the base's stock sglang, editable) ---
 # Keep the installed extension modules, but discard Rust and pip build
 # artifacts that are not used at runtime.
+ARG SGLANG_COMMIT="25035bff8d34f3fcce2c1a2a5b1fe610225e84ed"
 RUN rm -rf /sgl-workspace/sglang && \
-    git clone --branch main \
+    git clone --no-checkout \
       https://github.com/sgl-project/sglang.git /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang && \
+    git checkout --detach "${SGLANG_COMMIT}" && \
     rm -rf .git && \
     test ! -e .git && \
     pip install -e python --no-deps && \

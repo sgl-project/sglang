@@ -4,7 +4,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (
     SolAttnBackend,
     SolAttnImpl,
@@ -111,10 +110,8 @@ class TestSolAttnBackend(unittest.TestCase):
         )
         self.assertTrue(cls_str.endswith("SolAttnBackend"))
 
-    def test_minimax_h3_whitelist_includes_sol_attn(self):
-        backends = MiniMaxH3DiTArchConfig()._supported_attention_backends
-        self.assertIn(AttentionBackendEnum.SOL_ATTN, backends)
-        self.assertIn(AttentionBackendEnum.FA, backends)
+    def test_supports_packed_varlen(self):
+        self.assertTrue(SolAttnBackend.supports_packed_varlen())
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ def test_video_api_forwards_profiling_options():
         profile=True,
         num_profiled_timesteps=3,
         profile_all_stages=False,
+        quality="high",
     )
     server_args = SimpleNamespace(
         backend="auto",
@@ -48,3 +49,4 @@ def test_video_api_forwards_profiling_options():
     assert kwargs["profile"] is True
     assert kwargs["num_profiled_timesteps"] == 3
     assert kwargs["profile_all_stages"] is False
+    assert kwargs["quality"] == "high"

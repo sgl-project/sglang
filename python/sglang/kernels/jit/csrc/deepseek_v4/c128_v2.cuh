@@ -31,7 +31,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 using PlanD = device::compress::DecodePlan;
 using PlanC = device::compress::CompressPlan;
@@ -509,4 +509,4 @@ struct FlashCompress128Kernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

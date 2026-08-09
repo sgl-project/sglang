@@ -60,11 +60,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
-    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    resolve_mxfp8_dense_gemm_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -84,8 +84,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_musa,
@@ -263,7 +265,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -470,7 +472,9 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
+        self.mxfp8_dense_backend = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+            self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
@@ -730,7 +734,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        backend = get_fp8_gemm_runner_backend()
+        backend = self.mxfp8_dense_backend
         if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
@@ -783,13 +787,28 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_deep_gemm():
+        elif backend.is_deep_gemm():
             from sglang.srt.layers.deep_gemm_wrapper.configurer import (
                 DEEPGEMM_SCALE_UE8M0,
             )
 
             n, k = layer.weight.shape
             scale_u8 = layer.weight_scale_inv.data
+            layer.weight_scale_inv_swizzled = None
+            if n % 64 != 0 or k % 128 != 0:
+                if not (is_blackwell_supported() and is_flashinfer_available()):
+                    raise RuntimeError(
+                        f"--fp8-gemm-backend=deep_gemm cannot serve MXFP8 weight shape "
+                        f"({n}, {k}) (needs N % 64 == 0 and K % 128 == 0), and this "
+                        "device has no FlashInfer MXFP8 fallback kernel."
+                    )
+                from flashinfer import block_scale_interleave
+
+                copy_or_rebind_param(
+                    layer,
+                    "weight_scale_inv_swizzled",
+                    block_scale_interleave(scale_u8.contiguous()).contiguous(),
+                )
             scale_fp32 = (
                 (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
                 .view(torch.float32)
@@ -807,9 +826,6 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
-        else:
-            # Triton path consumes canonical 2D UE8M0 uint8 scales directly.
-            return
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -959,32 +975,15 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            backend = get_fp8_gemm_runner_backend()
+            backend = self.mxfp8_dense_backend
+            extra_kwargs = {}
             if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
-            elif get_fp8_gemm_runner_backend().is_deep_gemm():
-                weight_scale = getattr(
-                    layer, "weight_scale_inv_deepgemm", layer.weight_scale_inv
-                )
-                if isinstance(x, tuple):
-                    return self.w8a8_mxfp8_linear(
-                        input=x[0],
-                        weight=layer.weight,
-                        weight_scale=weight_scale,
-                        input_scale=x[1],
-                        bias=bias,
-                        weight_scale_fallback=layer.weight_scale_inv,
-                    )
-                return self.w8a8_mxfp8_linear(
-                    input=x,
-                    weight=layer.weight,
-                    weight_scale=weight_scale,
-                    input_scale=None,
-                    bias=bias,
-                    weight_scale_fallback=layer.weight_scale_inv,
-                )
+            elif backend.is_deep_gemm():
+                weight_scale = layer.weight_scale_inv_deepgemm
+                extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
@@ -994,6 +993,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
+                    **extra_kwargs,
                 )
             return self.w8a8_mxfp8_linear(
                 input=x,
@@ -1001,6 +1001,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
+                **extra_kwargs,
             )
 
         if self.block_quant:
@@ -1788,11 +1789,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from triton_kernels.tensor import convert_layout, wrap_torch_tensor
             from triton_kernels.tensor_details import layout
 
-            scale_layout, scale_layout_opts = (
-                layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=1, num_warps=num_warps
-                )
+            scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=-2, num_warps=num_warps
             )
+            scale_layout_opts = {}
             scale = scale.transpose(-2, -1)
             scale = convert_layout(
                 wrap_torch_tensor(scale), scale_layout, **scale_layout_opts

@@ -9,7 +9,6 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -63,63 +62,6 @@ def _resolve_draft_attention_backend_fallback(
     return draft_backend
 
 
-def _draft_load_format_fields() -> dict:
-    draft_load_format = get_spec().speculative_draft_load_format
-    if draft_load_format is None:
-        return {}
-    return dict(load_format=draft_load_format)
-
-
-def draft_server_args_overrides(target_model_config, draft_backend) -> dict:
-    """Pre-publish field adjustments for a draft ``ServerArgs`` copy.
-
-    Downstream draft-worker logic keys on ``speculative_draft_attention_backend``
-    (backend selection in ``_get_attention_backend``, the fa4-draft KV dtype
-    override in ``configure_kv_cache_dtype``); ``context_length`` keeps the
-    draft aligned with the target; ``disable_chunked_prefix_cache`` is the
-    target's resolved gate (bag-only, absent from the pristine copy).
-    """
-    return dict(
-        skip_tokenizer_init=True,
-        speculative_draft_attention_backend=draft_backend,
-        prefill_attention_backend=None,
-        decode_attention_backend=None,
-        attention_backend=draft_backend,
-        context_length=target_model_config.context_len,
-        disable_chunked_prefix_cache=get_schedule().disable_chunked_prefix_cache,
-        **_draft_load_format_fields(),
-    )
-
-
-def draft_server_args_copy(server_args: ServerArgs, target_model_config) -> ServerArgs:
-    """A draft-only ``ServerArgs`` for the workers that build their own draft.
-
-    Starts from the config the process resolved, not from the pristine seed:
-    the copy is published while the draft builds, and load-time overrides made
-    before this point (the chunked-prefix gate, the SM100 GDN prefill default)
-    are part of what the draft's layers must see. On top of that,
-    ``context_length`` follows the target (the draft reads target KV) and
-    ``load_format`` follows ``--speculative-draft-load-format``. The target's
-    own instance is untouched.
-    """
-    draft_load_format = get_spec().speculative_draft_load_format
-    if draft_load_format is not None:
-        logger.info(f"Using draft model load_format: '{draft_load_format}'")
-
-    resolved = {}
-    for _source, fields in get_context().overrides_log():
-        resolved.update(fields)
-
-    return server_args.derive(
-        "draft_worker.copy",
-        **{
-            **resolved,
-            "context_length": target_model_config.context_len,
-            **_draft_load_format_fields(),
-        },
-    )
-
-
 def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
@@ -138,20 +80,23 @@ def build_draft_tp_worker(
             server_args=server_args, algo_label=algo_label
         )
     )
-    draft_server_args = server_args.derive(
-        "draft_worker.build",
-        **draft_server_args_overrides(target_model_config, draft_backend),
-    )
+    from sglang.srt.layers.moe.utils import draft_model_build_scope
 
-    # The draft's layers must resolve config from the draft's own bags.
-    with get_context().preserve_config():
-        get_context().set_server_args(draft_server_args)
+    # The draft's model construction runs its own MoE gates; the scope routes
+    # their fusion decision to the speculative leaf and gives the target its
+    # ACTIVE value back. It deliberately does not swap runner_backend: these
+    # workers run the draft outside speculative_moe_backend_context, so a
+    # construction-only swap would build and execute under different backends.
+    with draft_model_build_scope():
         draft_worker = TpModelWorker(
-            server_args=draft_server_args,
+            server_args=server_args,
             gpu_id=gpu_id,
             ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            # The draft runs at absolute target positions.
+            context_length=target_model_config.context_len,
+            draft_attention_backend=draft_backend,
         )
 
     draft_model_runner = draft_worker.model_runner
