@@ -1,5 +1,4 @@
 import logging
-from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -243,10 +242,11 @@ class SWAKVPool(BaseSWAKVPool):
             loc = swa_loc
         if isinstance(pool, MLATokenToKVPool):
             pool.set_kv_buffer(
-                SimpleNamespace(layer_id=layer_id_pool),
+                None,
                 loc,
                 cache_k,
                 cache_v,
+                layer_id_override=layer_id_pool,
             )
         else:
             pool.set_kv_buffer(
@@ -275,10 +275,11 @@ class SWAKVPool(BaseSWAKVPool):
         if not isinstance(pool, MLATokenToKVPool):
             raise TypeError(f"Layer {layer.layer_id} is not backed by an MLA KV pool")
         pool.set_mla_kv_buffer(
-            SimpleNamespace(layer_id=layer_id_pool),
+            None,
             loc,
             cache_k_nope,
             cache_k_rope,
+            layer_id_override=layer_id_pool,
         )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MLATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -77,6 +77,45 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
             None,
         )
         self.assertIs(recorded["full_loc"], loc)
+
+    def test_mla_routes_local_layer_id_without_fake_layer(self):
+        pool = object.__new__(SWAKVPool)
+        pool.layers_mapping = {7: (1, False), 8: (2, True)}
+        recorded = {}
+
+        def make_mla_pool(name):
+            mla_pool = object.__new__(MLATokenToKVPool)
+
+            def set_kv(layer, loc, k, v, layer_id_override=None):
+                recorded[f"{name}_kv"] = (layer, loc, layer_id_override)
+
+            def set_mla(layer, loc, k_nope, k_rope, layer_id_override=None):
+                recorded[f"{name}_mla"] = (layer, loc, layer_id_override)
+
+            mla_pool.set_kv_buffer = set_kv
+            mla_pool.set_mla_kv_buffer = set_mla
+            return mla_pool
+
+        pool.full_kv_pool = make_mla_pool("full")
+        pool.swa_kv_pool = make_mla_pool("swa")
+        full_loc = torch.tensor([3, 4])
+        swa_loc = torch.tensor([7, 8])
+
+        pool.set_kv_buffer(
+            SimpleNamespace(layer_id=7), KVWriteLoc(full_loc, swa_loc), None, None
+        )
+        pool.set_mla_kv_buffer(
+            SimpleNamespace(layer_id=8), KVWriteLoc(full_loc, swa_loc), None, None
+        )
+
+        full_layer, recorded_full_loc, full_layer_id = recorded["full_kv"]
+        swa_layer, recorded_swa_loc, swa_layer_id = recorded["swa_mla"]
+        self.assertIsNone(full_layer)
+        self.assertIs(recorded_full_loc, full_loc)
+        self.assertEqual(full_layer_id, 1)
+        self.assertIsNone(swa_layer)
+        self.assertIs(recorded_swa_loc, swa_loc)
+        self.assertEqual(swa_layer_id, 2)
 
 
 if __name__ == "__main__":
