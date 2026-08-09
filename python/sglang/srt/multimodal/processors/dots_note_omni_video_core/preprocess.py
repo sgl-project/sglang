@@ -160,12 +160,12 @@ def extract_frames_v2(
     duration = float(metadata.duration_seconds or 0)
     original_height = int(metadata.height)
     original_width = int(metadata.width)
-    total_frames = int(getattr(metadata, "num_frames", 0) or 0)
+    total_frames = int(metadata.num_frames or 0)
     if duration <= 0 or original_height <= 0 or original_width <= 0:
         raise ValueError(
             f"bad metadata: dur={duration} h={original_height} w={original_width}"
         )
-    original_fps = float(getattr(metadata, "average_fps", 0) or 0) or 25.0
+    original_fps = float(metadata.average_fps or 0) or 25.0
     if total_frames <= 0:
         total_frames = max(1, int(duration * original_fps))
 
@@ -223,7 +223,7 @@ def extract_frames_v2(
     timestamps = [round(index / original_fps, 3) for index in indices[: len(frames)]]
     encoded_frames = []
     for timestamp, frame in zip(timestamps, frames):
-        array = frame.numpy() if hasattr(frame, "numpy") else frame
+        array = frame.numpy()
         image = Image.fromarray(array)
         if image.size != (target_width, target_height):
             image = image.resize((target_width, target_height), Image.BICUBIC)
@@ -278,13 +278,13 @@ def _normalize_sample(sample):
     raw_meta = sample.get("meta")
     if raw_meta is None:
         raw_meta = {}
-    if hasattr(raw_meta, "tolist"):
+    if isinstance(raw_meta, np.ndarray):
         raw_meta = raw_meta.tolist()
     meta = raw_meta if isinstance(raw_meta, dict) else dict(raw_meta)
     conversations = sample.get("conversations")
     if conversations is None:
         conversations = []
-    if hasattr(conversations, "tolist"):
+    if isinstance(conversations, np.ndarray):
         conversations = conversations.tolist()
     return meta, [dict(conversation) for conversation in conversations]
 

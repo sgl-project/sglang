@@ -80,8 +80,8 @@ class VisionAttention(nn.Module):
         dim = config.embed_dim
         self.num_heads = config.num_attention_heads
         self.is_causal = config.is_causal
-        self.use_qk_norm = getattr(config, "use_qk_norm", False)
-        bias = getattr(config, "use_bias", True)
+        self.use_qk_norm = config.use_qk_norm
+        bias = config.use_bias
         self.qkv = nn.Linear(dim, dim * 3, bias=bias)
         self.proj = nn.Linear(dim, dim, bias=bias)
         if self.use_qk_norm:

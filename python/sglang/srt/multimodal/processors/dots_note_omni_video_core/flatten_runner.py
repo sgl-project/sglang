@@ -3,6 +3,8 @@
 import hashlib
 import random
 
+import numpy as np
+
 from .video_qa_flattener import (
     _VIDEO_KEY_RE,
     _VIDEO_MARKER_RE,
@@ -19,11 +21,11 @@ def _derive_seed(record_key: str) -> int:
 def _normalize_conversations(conversations):
     if conversations is None:
         return []
-    if hasattr(conversations, "tolist"):
+    if isinstance(conversations, np.ndarray):
         conversations = conversations.tolist()
     normalized = []
     for conversation in conversations:
-        if hasattr(conversation, "tolist") and not isinstance(conversation, dict):
+        if isinstance(conversation, np.ndarray):
             conversation = conversation.tolist()
         normalized.append(dict(conversation))
     return normalized

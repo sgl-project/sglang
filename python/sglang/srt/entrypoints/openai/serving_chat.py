@@ -40,6 +40,9 @@ from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentVideoPart,
+    ChatCompletionMessageUserParam,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice,
@@ -212,18 +215,21 @@ def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
     role and system tokens.
     """
     for message in reversed(request.messages or []):
-        if getattr(message, "role", None) != "user":
+        if not isinstance(message, ChatCompletionMessageUserParam):
             continue
-        content = getattr(message, "content", None)
+        content = message.content
         if not isinstance(content, list):
             continue
-        has_video = any(getattr(part, "type", None) == "video_url" for part in content)
+        has_video = any(
+            isinstance(part, ChatCompletionMessageContentVideoPart)
+            for part in content
+        )
         if not has_video:
             continue
         return "".join(
-            getattr(part, "text", "") or ""
+            part.text
             for part in content
-            if getattr(part, "type", None) == "text"
+            if isinstance(part, ChatCompletionMessageContentTextPart)
         )
     return None
 

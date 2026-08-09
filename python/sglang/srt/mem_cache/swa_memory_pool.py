@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     KVCache,
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -96,9 +97,16 @@ class SWAKVPool(BaseSWAKVPool):
             layer_num=self.swa_layer_nums,
             **swa_kv_pool_kwargs,
         )
-        for attr in ("dsa_kv_cache_store_fp8", "kv_cache_dim", "index_head_dim"):
-            if hasattr(self.full_kv_pool, attr):
-                setattr(self, attr, getattr(self.full_kv_pool, attr))
+        self.dsa_kv_cache_store_fp8 = False
+        self.kv_cache_dim = None
+        self.index_head_dim = None
+        if isinstance(self.full_kv_pool, MLATokenToKVPool):
+            self.dsa_kv_cache_store_fp8 = (
+                self.full_kv_pool.dsa_kv_cache_store_fp8
+            )
+            self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
+        if isinstance(self.full_kv_pool, DSATokenToKVPool):
+            self.index_head_dim = self.full_kv_pool.index_head_dim
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):

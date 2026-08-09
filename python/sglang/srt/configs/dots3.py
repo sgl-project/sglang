@@ -70,6 +70,7 @@ class Dots3Config(PretrainedConfig):
         swa_kv_lora_rank=512,
         swa_qk_nope_head_dim=128,
         swa_qk_rope_head_dim=64,
+        swa_rope_theta=None,
         swa_num_attention_heads=32,
         swa_num_key_value_heads=32,
         swa_v_head_dim=128,
@@ -95,6 +96,14 @@ class Dots3Config(PretrainedConfig):
         index_n_heads=None,
         index_head_dim=None,
         index_topk=None,
+        language_only=False,
+        # Multimodal special tokens
+        im_start_token="<|img|>",
+        im_token="<|imgpad|>",
+        im_end_token="<|endofimg|>",
+        audio_start_token="<|audio_comp_start|>",
+        audio_token="<|audio_comp_pad|>",
+        audio_end_token="<|audio_comp_end|>",
         **kwargs,
     ):
         # General model parameters
@@ -136,6 +145,7 @@ class Dots3Config(PretrainedConfig):
         self.swa_kv_lora_rank = swa_kv_lora_rank
         self.swa_qk_nope_head_dim = swa_qk_nope_head_dim
         self.swa_qk_rope_head_dim = swa_qk_rope_head_dim
+        self.swa_rope_theta = rope_theta if swa_rope_theta is None else swa_rope_theta
         self.swa_num_attention_heads = swa_num_attention_heads
         self.swa_num_key_value_heads = swa_num_key_value_heads
         self.swa_v_head_dim = swa_v_head_dim
@@ -165,6 +175,14 @@ class Dots3Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        self.language_only = language_only
+
+        self.im_start_token = im_start_token
+        self.im_token = im_token
+        self.im_end_token = im_end_token
+        self.audio_start_token = audio_start_token
+        self.audio_token = audio_token
+        self.audio_end_token = audio_end_token
 
         super().__init__(
             pad_token_id=pad_token_id,

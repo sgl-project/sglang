@@ -399,6 +399,10 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 
         self._moe_runner_config = MoeRunnerConfig(inplace=False)
+        self.register_buffer("_fused_w13_fp8", None, persistent=False)
+        self.register_buffer("_fused_w13_scale", None, persistent=False)
+        self.register_buffer("_fused_w2_fp8", None, persistent=False)
+        self.register_buffer("_fused_w2_scale", None, persistent=False)
         self.register_load_state_dict_post_hook(
             MoESwiGLUFFNFP8._post_load_pack_fused_fp8
         )
@@ -436,26 +440,10 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
             w2_chunks.append(q2.contiguous())
             s2_chunks.append(s2)
 
-        self.register_buffer(
-            "_fused_w13_fp8",
-            torch.stack(w13_chunks, dim=0).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w13_scale",
-            torch.stack(s13_chunks, dim=0).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w2_fp8",
-            torch.stack(w2_chunks, dim=0).contiguous(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_fused_w2_scale",
-            torch.stack(s2_chunks, dim=0).contiguous(),
-            persistent=False,
-        )
+        self._fused_w13_fp8 = torch.stack(w13_chunks, dim=0).contiguous()
+        self._fused_w13_scale = torch.stack(s13_chunks, dim=0).contiguous()
+        self._fused_w2_fp8 = torch.stack(w2_chunks, dim=0).contiguous()
+        self._fused_w2_scale = torch.stack(s2_chunks, dim=0).contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
@@ -488,7 +476,7 @@ class MoESwiGLUFFNFP8(MoESwiGLUFFN):
         topk_ids = topk_indices.to(torch.int32)
         topk_output = StandardTopKOutput(routed_weights, topk_ids, gate_logits)
 
-        if not hasattr(self, "_fused_w13_fp8"):
+        if self._fused_w13_fp8 is None:
             self._pack_fused_fp8_weights()
 
         b1 = b2 = None
@@ -736,12 +724,12 @@ class DotsMoEVitModel(PreTrainedModel):
     @property
     def dtype(self) -> torch.dtype:
         mlp = self.blocks[0].mlp
-        if hasattr(mlp, "fc13"):
+        if isinstance(mlp, DotsSwiGLUFFN):
             return mlp.fc13.weight.dtype
-        if hasattr(mlp, "fc1"):
+        if isinstance(mlp, DotsSwiGLUFFNFP8):
             return mlp.fc1.weight.dtype
         expert = mlp.experts[0]
-        if hasattr(expert, "fc13"):
+        if isinstance(expert, DotsSwiGLUFFN):
             return expert.fc13.weight.dtype
         return expert.fc1.weight.dtype
 

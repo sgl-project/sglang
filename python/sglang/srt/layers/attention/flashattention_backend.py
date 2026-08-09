@@ -3189,9 +3189,9 @@ class FlashAttentionBackend(AttentionBackend):
         this active dense backend preserves pre-planned sparse/DSA schedules
         and gives every row-dependent FA tensor the same request dimension.
         """
-        metadata = getattr(self, "forward_metadata", None)
-        page_table = getattr(metadata, "page_table", None)
-        original_bs = getattr(forward_batch, "_original_batch_size", None)
+        metadata = self.forward_metadata
+        page_table = metadata.page_table if metadata is not None else None
+        original_bs = forward_batch._original_batch_size
         if (
             original_bs is not None
             and original_bs != forward_batch.batch_size
@@ -3296,7 +3296,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def forward_swa_mla_absorbed(self, q, layer, forward_batch):
         """Page64 fallback for SWA-shaped MLA decode and speculative steps."""
-        from sglang.srt.layers.attention.flashmla_ops.flashmla_fallback import (
+        from sglang.srt.layers.attention.swa_mla_fallback.forward import (
             forward_dense_kvlora_swa_torch_fallback,
         )
 

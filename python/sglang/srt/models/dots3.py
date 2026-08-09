@@ -21,7 +21,8 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, List, Optional, Protocol, Tuple, Union
+from typing import runtime_checkable
 
 import torch
 import torch.nn.functional as F
@@ -67,7 +68,10 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    SupportsWeightBlockSize,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_einsum_fp8,
@@ -136,16 +140,28 @@ from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
 logger = logging.getLogger(__name__)
 
 
+@runtime_checkable
+class _SupportsWeightLoader(Protocol):
+    weight_loader: Callable[..., Any]
+
+
 def _get_scale_block_n(
     quant_config: Optional[QuantizationConfig],
 ) -> int:
     if (
-        quant_config is not None
-        and hasattr(quant_config, "weight_block_size")
+        isinstance(quant_config, SupportsWeightBlockSize)
         and quant_config.weight_block_size is not None
     ):
         return quant_config.weight_block_size[0]
     return 1
+
+
+def _get_param_weight_loader(param: nn.Parameter):
+    return (
+        param.weight_loader
+        if isinstance(param, _SupportsWeightLoader)
+        else default_weight_loader
+    )
 
 
 class Dots3AttnForwardMethod(IntEnum):
@@ -311,6 +327,7 @@ class Dots3MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
 
+        self.shared_experts = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
@@ -328,9 +345,8 @@ class Dots3MoE(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = (
-                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
-                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+            is_packed_weight = quant_config is not None and (
+                quant_config.get_name()
                 in {
                     "awq",
                     "awq_marlin",
@@ -657,7 +673,7 @@ class Dots3AttentionMLA(nn.Module):
                     num_attention_heads=config.swa_num_attention_heads,
                     num_key_value_heads=config.swa_num_key_value_heads,
                     v_head_dim=config.swa_v_head_dim,
-                    rope_theta=getattr(config, "swa_rope_theta", config.rope_theta),
+                    rope_theta=config.swa_rope_theta,
                 )
             else:
                 return cls(
@@ -738,9 +754,9 @@ class Dots3AttentionMLA(nn.Module):
             self.g_proj_local_dim, max(8, scale_block_n)
         )
         self.use_nsa = (
-            getattr(config, "index_n_heads", None) is not None
-            and getattr(config, "index_head_dim", None) is not None
-            and getattr(config, "index_topk", None) is not None
+            config.index_n_heads is not None
+            and config.index_head_dim is not None
+            and config.index_topk is not None
             and layer_type == "full_attention"
         )
         fused_qkv_out_size = (
@@ -885,10 +901,15 @@ class Dots3AttentionMLA(nn.Module):
         self, forward_batch: ForwardBatch
     ) -> Dots3AttnForwardMethod:
         backend = get_attn_backend()
-        if hasattr(backend, "selected_swa_backend") and self.use_swa:
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            DotsHybridAttnBackend,
+        )
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+        if isinstance(backend, DotsHybridAttnBackend) and self.use_swa:
             backend = backend.selected_swa_backend(forward_batch)
-        elif select_backend := getattr(backend, "_select_backend", None):
-            backend = select_backend(forward_batch.forward_mode)
+        elif isinstance(backend, HybridAttnBackend):
+            backend = backend._select_backend(forward_batch.forward_mode)
         backend_name = type(backend).__name__.lower()
         if "flashattention" in backend_name:
             attention_backend = "fa3"
@@ -960,13 +981,15 @@ class Dots3AttentionMLA(nn.Module):
         weight_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if weight.dtype == torch.float8_e4m3fn:
+            import deep_gemm
+
             assert weight_scale is not None
             lhs_fp8 = per_token_group_quant_einsum_fp8(lhs)
-            deep_gemm_wrapper.fp8_einsum(
-                expr="bhr,hdr->bhd",
-                lhs=lhs_fp8,
-                rhs=(weight, weight_scale),
-                out=out,
+            deep_gemm.fp8_einsum(
+                "bhr,hdr->bhd",
+                lhs_fp8,
+                (weight, weight_scale),
+                out,
             )
         else:
             torch.bmm(
@@ -980,10 +1003,14 @@ class Dots3AttentionMLA(nn.Module):
         swa_loc = None
         if self.use_swa:
             backend = get_attn_backend()
-            if hasattr(backend, "selected_swa_backend"):
+            from sglang.srt.layers.attention.dots_hybrid_backend import (
+                DotsHybridAttnBackend,
+            )
+
+            if isinstance(backend, DotsHybridAttnBackend):
                 backend = backend.selected_swa_backend(forward_batch)
-            metadata = getattr(backend, "forward_metadata", None)
-            swa_loc = getattr(metadata, "swa_out_cache_loc", None)
+            metadata = backend.forward_metadata
+            swa_loc = metadata.swa_out_cache_loc
             if swa_loc is None:
                 swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
@@ -1201,10 +1228,17 @@ class Dots3AttentionMLA(nn.Module):
         if topk_indices is not None:
             attn_kwargs["topk_indices"] = topk_indices
 
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            DotsHybridAttnBackend,
+        )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
         backend = get_attn_backend()
         if (
             self.use_swa
-            and hasattr(backend, "forward_swa_mla_absorbed")
+            and isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend))
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -1348,7 +1382,16 @@ class Dots3AttentionMLA(nn.Module):
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
             backend = get_attn_backend()
-            if hasattr(backend, "init_mha_chunk_metadata"):
+            from sglang.srt.layers.attention.dots_hybrid_backend import (
+                DotsHybridAttnBackend,
+            )
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            if isinstance(
+                backend, (DotsHybridAttnBackend, FlashAttentionBackend)
+            ):
                 backend.init_mha_chunk_metadata(forward_batch)
 
         # Fix FA3 bug: V with NaN at padding positions (beyond cu_seqlens_q[-1])
@@ -1417,7 +1460,14 @@ class Dots3AttentionMLA(nn.Module):
 
         # Load full latent cache
         backend = get_attn_backend()
-        assert hasattr(backend, "get_swa_mla_prefill_latent_cache")
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            DotsHybridAttnBackend,
+        )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        assert isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend))
         latent_cache = backend.get_swa_mla_prefill_latent_cache(
             forward_batch, self.attn_mha.layer_id
         )
@@ -1449,7 +1499,14 @@ class Dots3AttentionMLA(nn.Module):
 
     def forward_swa_mha_core(self, q, k, v, g, forward_batch):
         backend = get_attn_backend()
-        assert hasattr(backend, "forward_swa_mla_expanded")
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            DotsHybridAttnBackend,
+        )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        assert isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend))
         attn_output = backend.forward_swa_mla_expanded(
             q, k, v, self.attn_mha, forward_batch
         )
@@ -1803,7 +1860,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # for quark model load
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         self.fuse_qkv_a_g_proj = True
-        assert hasattr(config, "q_lora_rank") and config.q_lora_rank is not None, (
+        assert config.q_lora_rank is not None, (
             "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         )
         if self.fuse_qkv_a_g_proj:
@@ -1902,7 +1959,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         embed_param = next(self.model.embed_tokens.parameters())
         features = []
         for item in items:
-            feature = getattr(item, "precomputed_embeddings", None)
+            feature = item.precomputed_embeddings
             if feature is None:
                 feature = item.feature
             if isinstance(feature, list):
@@ -1971,7 +2028,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # Perform post-processing after loading weights
         if is_nextn:
             # K MTP heads — one self_attn per head module.
-            num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 1) or 1
+            num_nextn_layers = self.config.num_nextn_predict_layers
             head_attns = [
                 self.model.heads[k].decoder.self_attn for k in range(num_nextn_layers)
             ]
@@ -2001,7 +2058,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
             if w.dtype == torch.float8_e4m3fn:
                 assert (
-                    hasattr(self.quant_config, "weight_block_size")
+                    isinstance(self.quant_config, SupportsWeightBlockSize)
                     and self.quant_config.weight_block_size is not None
                 ), (
                     "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
@@ -2013,7 +2070,6 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 ), (
                     f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
                 )
-                assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                 block_scale = self_attn.kv_b_proj.weight_scale_inv
 
                 if not (
@@ -2061,7 +2117,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and hasattr(self.quant_config, "weight_block_size")
+            and isinstance(self.quant_config, SupportsWeightBlockSize)
             and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0(is_nextn)
@@ -2077,7 +2133,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             )
         )
 
-        num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 1) or 1
+        num_nextn_layers = self.config.num_nextn_predict_layers
         num_hidden_layers = (
             num_nextn_layers if is_nextn else self.config.num_hidden_layers
         )
@@ -2098,8 +2154,11 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 )
 
             if layer_id in moe_layers or is_nextn:
-                shared_experts = getattr(layer.mlp, "shared_experts", None)
-                if shared_experts is not None:
+                if (
+                    isinstance(layer.mlp, Dots3MoE)
+                    and layer.mlp.shared_experts is not None
+                ):
+                    shared_experts = layer.mlp.shared_experts
                     for module in [
                         shared_experts.gate_up_proj,
                         shared_experts.down_proj,
@@ -2134,10 +2193,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
     ):
 
         if is_nextn:
-            # Default to 1 nextn layer for checkpoints whose config.json predates
-            # this field. Dots3Config now declares it with default 1, so this
-            # getattr also handles older checkpoints loaded via raw HF AutoConfig.
-            num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 1)
+            num_nextn_layers = self.config.num_nextn_predict_layers
             # compatible with old design: when the main model has only 1 layer,
             # the MTP layer is at id 0; otherwise it starts at num_hidden_layers
             # and spans num_nextn_layers consecutive layer ids.
@@ -2179,7 +2235,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         fuse_qkv_a_g_proj = True
         assert (
-            hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None
+            self.config.q_lora_rank is not None
         ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
         attn_tp_rank = get_parallel().attn_tp_rank
@@ -2261,7 +2317,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                     f"Cannot match fused_qkv_a_g_proj_with_mqa shape for {param_name}: "
                     f"target_dim={target_dim}, fused_dim={fused_dim}."
                 )
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader = _get_param_weight_loader(param)
             futures.append(executor.submit(weight_loader, param, fused_weight))
             cached_a_proj.pop(q_a_proj_name)
             cached_a_proj.pop(kv_a_proj_name)
@@ -2298,7 +2354,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
-                    and hasattr(self.model, "start_layer")
+                    and not is_nextn
                     and (
                         layer_id < self.model.start_layer
                         or layer_id >= self.model.end_layer
@@ -2314,19 +2370,18 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 weight_names.append(name)
 
                 if not is_nextn:
-                    if hasattr(self.config, "num_nextn_predict_layers"):
-                        num_nextn_layers = self.config.num_nextn_predict_layers
-                        if num_nextn_layers > 0 and name.startswith("model.layers"):
-                            name_list = name.split(".")
-                            if (
-                                len(name_list) >= 3
-                                and int(name_list[2]) >= self.config.num_hidden_layers
-                            ):
-                                continue
-                        # Dots3-specific MTP input embedding lives at model.mtp.*.
-                        # Owned by the NextN draft model, not the main model.
-                        if num_nextn_layers > 0 and name.startswith("model.mtp."):
+                    num_nextn_layers = self.config.num_nextn_predict_layers
+                    if num_nextn_layers > 0 and name.startswith("model.layers"):
+                        name_list = name.split(".")
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
                             continue
+                    # Dots3-specific MTP input embedding lives at model.mtp.*.
+                    # Owned by the NextN draft model, not the main model.
+                    if num_nextn_layers > 0 and name.startswith("model.mtp."):
+                        continue
                 else:
                     # Dots3 has a SEPARATE MTP input embedding at model.mtp.embed_tokens
                     # (Eagle-flavor; not shared with main model.embed_tokens). In
@@ -2363,9 +2418,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                             param = params_dict.get(name)
                             if param is None:
                                 continue
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
+                            weight_loader = _get_param_weight_loader(param)
                             futures.append(
                                 executor.submit(weight_loader, param, loaded_weight)
                             )
@@ -2524,9 +2577,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
                             param = params_dict[name]
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
+                            weight_loader = _get_param_weight_loader(param)
                             futures.append(
                                 executor.submit(weight_loader, param, loaded_weight)
                             )
@@ -2615,9 +2666,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
         # can keep the vision and audio towers out of the LLM process.  This is
         # also useful for text-only long-context evaluation, where the towers'
         # weights would otherwise unnecessarily reduce the KV-cache capacity.
-        if self.pp_group.is_first_rank and not getattr(
-            config, "language_only", False
-        ):
+        if self.pp_group.is_first_rank and not config.language_only:
             self.audio_tower = DotsNoteOmniAudioEncoder(str(model_dir))
             self.visual = DotsNoteOmniVisionEncoder(str(model_dir))
         else:

@@ -607,9 +607,32 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     writers), the kv-cache/split-backend defaults, the quant/moe block (read
     before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
     the branch."""
+    from sglang.srt.configs.dots3 import Dots3Config
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     overrides: Dict[str, Any] = {}
+
+    # DeepEPMoE's generic auto path no longer implements unquantized masked
+    # GEMM. Dots3 BF16 checkpoints must use the BF16 DeepGEMM runner and keep
+    # dispatcher activations in BF16; otherwise CUDA graph capture reaches the
+    # deprecated forward_deepgemm_masked assertion.
+    if (
+        isinstance(hf_config, Dots3Config)
+        and hf_config.architectures[0] == "Dots3NoteForCausalLM"
+        and get_quantization_config(hf_config) is None
+        and server_args.quantization is None
+        and server_args.moe_a2a_backend == "deepep"
+    ):
+        if server_args.moe_runner_backend == "auto":
+            overrides["moe_runner_backend"] = "deep_gemm"
+        if server_args.deepep_dispatcher_output_dtype == "auto":
+            overrides["deepep_dispatcher_output_dtype"] = "bf16"
+        if overrides:
+            logger.info(
+                "Use BF16 DeepGEMM MoE and BF16 DeepEP dispatch for "
+                "an unquantized Dots3 checkpoint."
+            )
+
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
         if server_args.is_attention_backend_not_set():

@@ -26,7 +26,10 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    SupportsWeightBlockSize,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -78,6 +81,17 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _get_indexer_weight_block_size(
+    quant_config: Optional[QuantizationConfig],
+) -> List[int]:
+    if (
+        isinstance(quant_config, SupportsWeightBlockSize)
+        and quant_config.weight_block_size is not None
+    ):
+        return quant_config.weight_block_size
+    return [128, 128]
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -111,7 +125,7 @@ def _load_fused_indexer_wk(
         )
         if "weight" in entry and "scale" in entry:
             pending.pop(fused_name + ".weights_proj")
-            block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+            block_size = _get_indexer_weight_block_size(quant_config)
             weights_bf16 = block_quant_dequant(
                 entry["weight"], entry["scale"], block_size, torch.bfloat16
             )

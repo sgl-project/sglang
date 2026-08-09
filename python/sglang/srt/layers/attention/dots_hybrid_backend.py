@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     normalize_page_table_rows,
 )
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -48,10 +49,9 @@ class DotsHybridAttnBackend(AttentionBackend):
         return self.swa_backend if self._is_swa_layer(layer) else self.dsa_backend
 
     def selected_swa_backend(self, forward_batch: ForwardBatch) -> AttentionBackend:
-        select = getattr(self.swa_backend, "_select_backend", None)
         return (
-            select(forward_batch.forward_mode)
-            if select is not None
+            self.swa_backend._select_backend(forward_batch.forward_mode)
+            if isinstance(self.swa_backend, HybridAttnBackend)
             else self.swa_backend
         )
 
@@ -127,7 +127,7 @@ class DotsHybridAttnBackend(AttentionBackend):
 
     def forward_swa_mla_absorbed(self, q, layer, forward_batch):
         """Run decode directly against the page64 latent SWA cache."""
-        from sglang.srt.layers.attention.flashmla_ops.flashmla_fallback import (
+        from sglang.srt.layers.attention.swa_mla_fallback.forward import (
             forward_dense_kvlora_swa_torch_fallback,
         )
 
@@ -167,7 +167,10 @@ class DotsHybridAttnBackend(AttentionBackend):
         return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
         backend = self.selected_swa_backend(forward_batch)
-        init = getattr(backend, "init_mha_chunk_metadata", None)
-        if init is not None:
-            init(forward_batch)
+        if isinstance(backend, FlashAttentionBackend):
+            backend.init_mha_chunk_metadata(forward_batch)

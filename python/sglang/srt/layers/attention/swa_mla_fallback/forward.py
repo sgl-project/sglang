@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.attention.flashmla_ops.flashmla_fallback_ops import (
+from sglang.srt.layers.attention.swa_mla_fallback.ops import (
     apply_swa_score_mask,
     gather_page64_kv_latent,
 )
@@ -26,19 +26,19 @@ def forward_dense_kvlora_swa_torch_fallback(
     """Conservative page64 SWA fallback for dense kvlora decode."""
     if layer.tp_k_head_num != 1:
         raise RuntimeError(
-            "FlashMLA torch SWA fallback currently supports MLA with one "
+            "SWA MLA torch fallback currently supports MLA with one "
             f"KV head, got tp_k_head_num={layer.tp_k_head_num}."
         )
 
     bs, s_q, num_heads, qk_dim = reshape_q.shape
     if qk_dim != kv_cache_dim:
         raise RuntimeError(
-            f"FlashMLA torch SWA fallback got q dim {qk_dim}, "
+            f"SWA MLA torch fallback got q dim {qk_dim}, "
             f"expected kv_cache_dim {kv_cache_dim}."
         )
     if s_q not in (1, 4):
         raise RuntimeError(
-            "FlashMLA torch SWA fallback mask is specialized for s_q=1 "
+            "SWA MLA torch fallback mask is specialized for s_q=1 "
             f"or s_q=4, got s_q={s_q}."
         )
 

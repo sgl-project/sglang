@@ -68,7 +68,7 @@ class Dot3NoteModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if int(getattr(config, "num_nextn_predict_layers", 1) or 1) != 1:
+        if config.num_nextn_predict_layers != 1:
             raise ValueError(
                 "Dots3 MTP currently supports one full-sharing layer only."
             )

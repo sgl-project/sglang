@@ -38,16 +38,12 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, processor, transport_mode, **kwargs):
-        self.image_start_token = getattr(hf_config, "im_start_token", "<|img|>")
-        self.image_token = getattr(hf_config, "im_token", "<|imgpad|>")
-        self.image_end_token = getattr(hf_config, "im_end_token", "<|endofimg|>")
-        self.audio_start_token = getattr(
-            hf_config, "audio_start_token", "<|audio_comp_start|>"
-        )
-        self.audio_token = getattr(hf_config, "audio_token", "<|audio_comp_pad|>")
-        self.audio_end_token = getattr(
-            hf_config, "audio_end_token", "<|audio_comp_end|>"
-        )
+        self.image_start_token = hf_config.im_start_token
+        self.image_token = hf_config.im_token
+        self.image_end_token = hf_config.im_end_token
+        self.audio_start_token = hf_config.audio_start_token
+        self.audio_token = hf_config.audio_token
+        self.audio_end_token = hf_config.audio_end_token
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.image_token,
             image_token_id=self._token_id(processor, self.image_token),
@@ -82,8 +78,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
 
     @staticmethod
     def _token_id(processor, token: str) -> int:
-        tokenizer = getattr(processor, "tokenizer", processor)
-        token_ids = tokenizer.encode(token, add_special_tokens=False)
+        token_ids = processor.encode(token, add_special_tokens=False)
         if len(token_ids) != 1:
             raise ValueError(
                 f"Dots omni special token {token!r} must encode to one id, got "
@@ -153,7 +148,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         video_data=None,
         **kwargs,
     ):
-        video_data = getattr(request_obj, "video_data", None) or video_data
+        video_data = request_obj.video_data or video_data
         if not image_data and not audio_data and not video_data:
             return None
         if video_data:
@@ -172,12 +167,14 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             )
 
         if video_data:
-            question = getattr(request_obj, "video_question", None) or ""
-            sampling_params = getattr(request_obj, "sampling_params", None) or {}
-            if isinstance(sampling_params, dict):
-                max_new_tokens = sampling_params.get("max_new_tokens") or 0
-            else:
-                max_new_tokens = getattr(sampling_params, "max_new_tokens", 0) or 0
+            question = request_obj.video_question or ""
+            sampling_params = request_obj.sampling_params or {}
+            if not isinstance(sampling_params, dict):
+                raise ValueError(
+                    "Dots note omni video preprocessing requires one request's "
+                    "sampling_params as a dictionary."
+                )
+            max_new_tokens = sampling_params.get("max_new_tokens") or 0
             loop = asyncio.get_running_loop()
             preprocess_started = time.perf_counter()
             content = await loop.run_in_executor(
@@ -186,11 +183,11 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                     video_data[0],
                     question,
                     tokenizer=self._tokenizer,
-                    seq=getattr(request_obj, "seq", 131072),
-                    output_reserve=getattr(request_obj, "output_reserve", None),
-                    audio_cap=getattr(request_obj, "audio_cap", 1.0),
-                    audio_sr=getattr(request_obj, "audio_sr", 16000),
-                    k_mode=getattr(request_obj, "k_mode", "eval_ek"),
+                    seq=request_obj.seq,
+                    output_reserve=request_obj.output_reserve,
+                    audio_cap=request_obj.audio_cap,
+                    audio_sr=request_obj.audio_sr,
+                    k_mode=request_obj.k_mode,
                     max_new_tokens=max_new_tokens,
                 ),
             )
@@ -198,7 +195,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             logger.info(
                 "[dots_video_preprocess] rid=%s elapsed=%.3fs frames=%d "
                 "audio_segments=%d content_items=%d",
-                getattr(request_obj, "rid", None),
+                request_obj.rid,
                 preprocess_elapsed,
                 sum(item.get("type") == "image_url" for item in content),
                 sum(item.get("type") == "audio_url" for item in content),

@@ -3,9 +3,11 @@ from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
-from sglang.srt.models.dots_omni_audio_encoder import DotsSpeechEncoder
+from sglang.srt.models.dots_omni_audio_encoder import (
+    DotsSpeechEncoder,
+    DotsWhisperConfig,
+)
 from torch import nn
-from transformers import WhisperConfig
 from transformers.audio_utils import mel_filter_bank
 
 SAMPLE_RATE = 16000
@@ -34,6 +36,8 @@ class OmniAudioConfig:
         self.merge_factor = kwargs.get("merge_factor", DEFAULT_MERGE_FACTOR)
         self.chunk_seconds = kwargs.get("chunk_seconds", DEFAULT_CHUNK_LENGTH_S)
         self.use_conv2d_stem = kwargs.get("use_conv2d_stem", True)
+        self.use_latent_input = kwargs.get("use_latent_input", False)
+        self.latent_dim = kwargs.get("latent_dim")
         self.use_rope = kwargs.get("use_rope", True)
         self.use_rms_norm = kwargs.get("use_rms_norm", True)
         self.use_causal = kwargs.get("use_causal", False)
@@ -139,19 +143,24 @@ def compute_audio_token_length(
 class DotsEncoderWithMask(nn.Module):
     def __init__(self, config: OmniAudioConfig):
         super().__init__()
-        whisper_config = WhisperConfig(**config.whisper_config)
-        whisper_config.use_rope = config.use_rope
-        whisper_config.rope_parameters = config.rope_parameters
-        whisper_config.use_rms_norm = config.use_rms_norm
-        whisper_config.use_causal = config.use_causal
-        whisper_config.use_conv2d_stem = config.use_conv2d_stem
-        whisper_config.downsample_hidden_size = config.downsample_hidden_size
-        whisper_config.conv_chunksize = config.conv_chunksize
-        whisper_config.conv_stem_gradient_checkpointing = (
-            config.conv_stem_gradient_checkpointing
+        whisper_config_kwargs = dict(config.whisper_config)
+        whisper_config_kwargs.update(
+            use_rope=config.use_rope,
+            rope_parameters=config.rope_parameters,
+            use_rms_norm=config.use_rms_norm,
+            use_causal=config.use_causal,
+            use_conv2d_stem=config.use_conv2d_stem,
+            use_latent_input=config.use_latent_input,
+            latent_dim=config.latent_dim,
+            downsample_hidden_size=config.downsample_hidden_size,
+            conv_chunksize=config.conv_chunksize,
+            conv_stem_gradient_checkpointing=(
+                config.conv_stem_gradient_checkpointing
+            ),
+            conv_bucket_step=config.conv_bucket_step,
+            conv_bucket_max_elements=config.conv_bucket_max_elements,
         )
-        whisper_config.conv_bucket_step = config.conv_bucket_step
-        whisper_config.conv_bucket_max_elements = config.conv_bucket_max_elements
+        whisper_config = DotsWhisperConfig(**whisper_config_kwargs)
 
         self.speech_encoder = DotsSpeechEncoder(whisper_config)
         self.merge_factor = config.merge_factor

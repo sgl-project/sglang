@@ -18,7 +18,42 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-__all__ = ["DotsSpeechEncoder"]
+__all__ = ["DotsSpeechEncoder", "DotsWhisperConfig"]
+
+
+class DotsWhisperConfig(WhisperConfig):
+    """Whisper configuration with the fields required by the Dots encoder."""
+
+    def __init__(
+        self,
+        *,
+        use_causal: bool = False,
+        use_rms_norm: bool = False,
+        use_latent_input: bool = False,
+        use_conv2d_stem: bool = False,
+        latent_dim: int | None = None,
+        downsample_hidden_size: int = 480,
+        use_rope: bool = False,
+        rope_parameters: dict | None = None,
+        conv_chunksize: int = 500,
+        conv_stem_gradient_checkpointing: bool = False,
+        conv_bucket_step: int | None = None,
+        conv_bucket_max_elements: int | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.use_causal = use_causal
+        self.use_rms_norm = use_rms_norm
+        self.use_latent_input = use_latent_input
+        self.use_conv2d_stem = use_conv2d_stem
+        self.latent_dim = latent_dim
+        self.downsample_hidden_size = downsample_hidden_size
+        self.use_rope = use_rope
+        self.rope_parameters = rope_parameters or {}
+        self.conv_chunksize = conv_chunksize
+        self.conv_stem_gradient_checkpointing = conv_stem_gradient_checkpointing
+        self.conv_bucket_step = conv_bucket_step
+        self.conv_bucket_max_elements = conv_bucket_max_elements
 
 
 class RMSNorm(nn.Module):
@@ -288,10 +323,10 @@ class WhisperAttention(nn.Module):
 
 # Copied from transformers.models.mbart.modeling_mbart.MBartEncoderLayer with MBart->Whisper
 class WhisperEncoderLayer(nn.Module):
-    def __init__(self, config: WhisperConfig):
+    def __init__(self, config: DotsWhisperConfig):
         super().__init__()
         self.embed_dim = config.d_model
-        use_causal = getattr(config, "use_causal", False)
+        use_causal = config.use_causal
         self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
@@ -299,7 +334,7 @@ class WhisperEncoderLayer(nn.Module):
             is_decoder=use_causal,  # enable causal attention when use_causal=True
         )
         self.use_causal = use_causal
-        norm_cls = RMSNorm if getattr(config, "use_rms_norm", False) else nn.LayerNorm
+        norm_cls = RMSNorm if config.use_rms_norm else nn.LayerNorm
         self.self_attn_layer_norm = norm_cls(self.embed_dim)
         self.dropout = config.dropout
         self.activation_fn = (
@@ -387,7 +422,7 @@ class WhisperEncoderLayer(nn.Module):
 
 
 class DotsSpeechPreTrainedModel(PreTrainedModel):
-    config_class = WhisperConfig
+    config_class = DotsWhisperConfig
     base_model_prefix = "model"
     main_input_name = "input_features"
     supports_gradient_checkpointing = False
@@ -414,15 +449,20 @@ class DotsSpeechEncoder(DotsSpeechPreTrainedModel):
         config: WhisperConfig
     """
 
-    def __init__(self, config: WhisperConfig):
+    def __init__(self, config: DotsWhisperConfig):
+        if not isinstance(config, DotsWhisperConfig):
+            raise TypeError(
+                "DotsSpeechEncoder requires DotsWhisperConfig, not a plain "
+                "transformers.WhisperConfig."
+            )
         super().__init__(config)
         self.dropout = config.dropout
 
         embed_dim = config.d_model
-        self.use_latent_input = getattr(config, "use_latent_input", False)
-        self.use_causal = getattr(config, "use_causal", False)
-        self.use_conv2d_stem = getattr(config, "use_conv2d_stem", False)
-        latent_dim = getattr(config, "latent_dim", None)
+        self.use_latent_input = config.use_latent_input
+        self.use_causal = config.use_causal
+        self.use_conv2d_stem = config.use_conv2d_stem
+        latent_dim = config.latent_dim
         if self.use_latent_input and latent_dim is None:
             raise ValueError(
                 "DotsSpeechEncoder: use_latent_input=True requires config.latent_dim"
@@ -440,7 +480,7 @@ class DotsSpeechEncoder(DotsSpeechPreTrainedModel):
 
         if self.use_conv2d_stem:
             # Conv2D stem: 3 layers of stride-2 for 8x downsampling
-            dhs = getattr(config, "downsample_hidden_size", 480)
+            dhs = config.downsample_hidden_size
             # Causal: keep freq padding, remove time padding (handled by pad(14,0) in forward)
             conv_padding = (1, 0) if self.use_causal else 1
             self.conv2d1 = nn.Conv2d(
@@ -475,8 +515,8 @@ class DotsSpeechEncoder(DotsSpeechPreTrainedModel):
                 embed_dim, embed_dim, kernel_size=3, stride=2, padding=1
             )
 
-        self.use_rope = getattr(config, "use_rope", False)
-        rope_parameters = getattr(config, "rope_parameters", {}) or {}
+        self.use_rope = config.use_rope
+        rope_parameters = config.rope_parameters
         self.rope_parameters = rope_parameters
         if self.use_rope:
             head_dim = embed_dim // config.encoder_attention_heads
@@ -492,7 +532,7 @@ class DotsSpeechEncoder(DotsSpeechPreTrainedModel):
         self.layers = nn.ModuleList(
             [WhisperEncoderLayer(config) for _ in range(config.encoder_layers)]
         )
-        norm_cls = RMSNorm if getattr(config, "use_rms_norm", False) else nn.LayerNorm
+        norm_cls = RMSNorm if config.use_rms_norm else nn.LayerNorm
         self.layer_norm = norm_cls(config.d_model)
 
         self.post_init()

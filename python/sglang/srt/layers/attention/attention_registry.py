@@ -320,7 +320,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     if (
         runner.model_config.hf_config.architectures
         and runner.model_config.hf_config.architectures[0] == "Dots3NoteForCausalLM"
-        and getattr(runner.model_config.hf_config, "index_topk", None) is not None
+        and runner.model_config.hf_config.index_topk is not None
     ):
         from sglang.srt.layers.attention.dots_hybrid_backend import (
             DotsHybridAttnBackend,
@@ -330,7 +330,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         # 1024-wide one for SWA layers. Keep a separate SWA backend for its
         # page table and prefill; decode consumes that cache through the
         # large-kvlora latent fallback in DotsHybridAttnBackend.
-        swa_backend = getattr(full_attn_backend, "prefill_backend", full_attn_backend)
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+        swa_backend = (
+            full_attn_backend.prefill_backend
+            if isinstance(full_attn_backend, HybridAttnBackend)
+            else full_attn_backend
+        )
         return DotsHybridAttnBackend(
             dsa_backend=create_dsa_backend(runner),
             swa_backend=swa_backend,
