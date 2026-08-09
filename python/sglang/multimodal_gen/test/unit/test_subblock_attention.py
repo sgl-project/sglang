@@ -134,12 +134,13 @@ class TestSubBlockSchedule(unittest.TestCase):
     def test_defaults_when_config_is_empty(self):
         with _patch_schedule({}):
             schedule = SubBlockSchedule.from_server_args()
-        self.assertEqual(schedule.sparsity, 0.75)
+        self.assertEqual(schedule.sparsity, 0.80)
         self.assertEqual(schedule.skip_first_steps, 10)
         # Depth is not protected by default; the early steps are. See the
         # sweep recorded next to the constants.
         self.assertEqual(schedule.skip_first_layers, 0)
         self.assertEqual(schedule.n_k, 4)
+        self.assertEqual(schedule.n_q, 4)
 
     def test_config_overrides(self):
         config = {"sparsity": 0.9, "skip_first_steps": 3, "skip_first_layers": 5}

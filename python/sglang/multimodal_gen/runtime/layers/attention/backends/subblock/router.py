@@ -43,9 +43,9 @@ of this query block wants some part of that key block" is a signal that survives
 averaging. That is the best row in the table, and at sparsity 0.9 it also measured better
 end to end than any ``n_q=1`` setting.
 
-``n_q`` still defaults to 1: the score matrix grows from ``[Gq, Gk*n_k]`` to
-``[Gq*n_q, Gk*n_k]``, and at the shipped sparsity of 0.75 no estimator in this family has
-yet separated from any other on the output.
+``n_q`` defaults to 4 with ``n_k``. The score matrix grows from ``[Gq, Gk*n_k]`` to
+``[Gq*n_q, Gk*n_k]``, which costs 0.5% of the denoise time; it is the only change in
+this family that has separated from anything else on the output.
 
 One thing not to retry without new evidence
 -------------------------------------------

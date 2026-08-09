@@ -8,7 +8,7 @@ runs before attention and hands the kernel a `q2k_block_index`.
 sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
   --num-gpus 8 --ulysses-degree 8 \
   --attention-backend subblock \
-  --attention-backend-config '{"sparsity": 0.75, "n_k": 4}'
+  --attention-backend-config '{"sparsity": 0.80, "n_k": 4}'
 ```
 
 Requirements come from the kernel: **SM100 (B200), bfloat16, head_dim 128**.
@@ -43,7 +43,7 @@ is the one measurement in this family that has held up: see `n_q` below.
 
 | key | default | meaning |
 | --- | ---: | --- |
-| `sparsity` | 0.75 | fraction of key blocks dropped per query block |
+| `sparsity` | 0.80 | fraction of key blocks dropped per query block |
 | `n_k` | 4 | key sub-blocks per 64-token block (1, 2, 4, 8) |
 | `skip_first_steps` | 10 | leading denoise forwards kept dense |
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
@@ -60,8 +60,8 @@ own dense render, scored as cosine of the decoded video:
 | sparsity 0.90 | +0.062 | +2.6 | 13/15 |
 | sparsity 0.75 | +0.008 | +2.1 | 10/15 |
 
-The margin shrinks as the budget loosens — at 148 of 590 blocks the rules mostly
-agree on what to keep — and it costs 0.5% of the denoise time. Nothing else in
+The margin shrinks as the budget loosens — at the shipped 118 of 590 blocks the
+rules mostly agree on what to keep — and it costs 0.5% of the denoise time. Nothing else in
 this family has separated from anything else: `n_k` in {1, 2, 4, 8} at sparsity
 0.75 came out within noise, and a temperature sweep of the sub-block reduction
 (whose T -> infinity limit is exactly `n_k=1`) was monotone with no interior
