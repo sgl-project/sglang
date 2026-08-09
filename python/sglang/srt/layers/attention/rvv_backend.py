@@ -56,7 +56,7 @@ class RVVAttnBackend(AttentionBackend):
             layer_id = 0
 
             self.num_head = (
-                model_runner.model_config.num_attention_heads // model_runner.tp_size
+                model_runner.model_config.num_attention_heads // model_runner.ps.tp_size
             )
             self.v_head_dim = pool.get_value_buffer(layer_id).shape[-1]
 
