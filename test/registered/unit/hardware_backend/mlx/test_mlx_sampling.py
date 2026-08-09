@@ -21,8 +21,10 @@ if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.sampling import (
         DEFAULT_SAMPLING_SEED,
         GREEDY_PARAMS,
+        MAX_BOUNDED_TOP_K,
         MlxLogprobSpec,
         MlxSamplingParams,
+        _candidate_width,
         _gumbel_noise,
         _murmur_hash32,
         all_greedy,
@@ -225,6 +227,47 @@ class TestSampleTokens(CustomTestCase):
         )
         mx.eval(solo, with_filtering_mate)
         self.assertEqual(int(with_filtering_mate[0].item()), int(solo[0].item()))
+
+    def test_bounded_top_k_picks_the_same_token_as_the_full_vocab_chain(self):
+        """The bounded top-K chain is an optimization, not a policy change:
+        a seeded row must pick the same token whether or not the batch is
+        eligible for it.  A batchmate without a finite top_k pushes the
+        whole batch back onto the full-vocab chain, so the same seeded row
+        is sampled both ways here."""
+        logits = self._logits(2, key_int=11)
+        seeded = _params(top_k=4, seed=2024)
+        bounded = sample_tokens(
+            last_logits=logits[:1],
+            params=[seeded],
+            positions=[6],
+            key=mx.random.key(0),
+        )
+        # min_p alone leaves top_k at TOP_K_ALL, so this batch falls back.
+        full_vocab = sample_tokens(
+            last_logits=logits,
+            params=[seeded, _params(min_p=0.1)],
+            positions=[6, 2],
+            key=mx.random.key(3),
+        )
+        mx.eval(bounded, full_vocab)
+        self.assertEqual(int(full_vocab[0].item()), int(bounded[0].item()))
+
+    def test_candidate_width_gates_the_bounded_chain(self):
+        """Only a batch whose widest top_k fits inside both the bound and
+        the vocabulary may shrink the chain; anything else must return the
+        full vocab size (which selects the scatter-back path)."""
+        vocab = 4096
+        for label, params, expected in [
+            ("under the bound", [_params(top_k=64)], 64),
+            ("at the bound", [_params(top_k=MAX_BOUNDED_TOP_K)], MAX_BOUNDED_TOP_K),
+            ("past the bound", [_params(top_k=MAX_BOUNDED_TOP_K + 1)], vocab),
+            ("no top_k (TOP_K_ALL)", [_params()], vocab),
+            ("top_k == vocab", [_params(top_k=vocab)], vocab),
+            ("widest row wins", [_params(top_k=4), _params(top_k=64)], 64),
+            ("one unbounded row", [_params(top_k=4), _params(top_p=0.9)], vocab),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(_candidate_width(params, vocab), expected)
 
     def test_seeded_row_varies_with_position(self):
         """Positions feed the hash, so a fixed seed must not freeze the

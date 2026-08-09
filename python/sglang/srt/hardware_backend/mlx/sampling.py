@@ -24,13 +24,21 @@ Semantics mirror the sglang pytorch sampling backend
   ``argmax(log(weights) + gumbel_noise)`` over the masked, unnormalized
   weights is distributed identically to ``torch.multinomial(weights)``
   (normalization only shifts ``log`` by a per-row constant).
+* When every row asks for a small enough ``top_k``
+  (:data:`MAX_BOUNDED_TOP_K`), everything after the sort runs on the
+  ``[B, K]`` candidates instead of ``[B, vocab]``.  Weights are zero
+  outside those K, so their ``log`` is ``-inf`` and the full-vocab
+  argmax could never have picked them — same token, a fraction of the
+  work.  Any row without a bounded ``top_k`` sends the batch back to the
+  full-vocab chain.
 * Rows with ``sampling_seed`` set use deterministic Gumbel noise derived
   from the same MurmurHash3 formula as the CUDA kernel
   (``sglang/kernels/ops/sampling/murmur_hash.py``): hash(seed, position,
-  token_id) -> uniform -> ``-log(-log(u))``.  Noise is always applied in
-  vocab-id space (masked weights are scattered back through the sort),
-  so a seeded row's token never depends on whether a batchmate triggered
-  top-k/top-p/min-p filtering.
+  token_id) -> uniform -> ``-log(-log(u))``.  Seeded noise is keyed on
+  the token id in every branch (the full-vocab chain scatters the masked
+  weights back through the sort; the bounded chain hashes the candidate
+  ids), so a seeded row's token never depends on whether a batchmate
+  triggered top-k/top-p/min-p filtering or on which chain ran.
 * Greedy rows (``top_k == 1`` after sglang normalization, which rewrites
   ``temperature < eps`` to ``temperature=1, top_k=1``) short-circuit to
   ``argmax`` and consume no randomness.
@@ -45,6 +53,11 @@ Known deviations from the pytorch backend (not bugs):
 * Seeded determinism is MLX-local: noise math runs in float32 (Metal has
   no float64) and tie order follows MLX's sort, so the same seed on a
   CUDA backend may pick a different token from the same distribution.
+* Unseeded rows draw their Gumbel noise in whichever space the chain is
+  running (candidate or vocab), so the bounded top-K path consumes the
+  RNG differently from the full-vocab one.  Seeded rows are unaffected —
+  they hash the token id — so ``--enable-deterministic-inference`` is
+  bit-for-bit identical either way.
 * Penalties (frequency/presence/repetition) are not applied on the MLX
   path (warned once per process).  #25804 skips them as well.
 * Custom logit processors run on pure-decode steps only: the first
@@ -81,6 +94,11 @@ logger = logging.getLogger(__name__)
 # --enable-deterministic-inference is on.  Mirrors the literal in
 # ``SamplingBatchInfo.from_schedule_batch``.
 DEFAULT_SAMPLING_SEED = 42
+
+# Largest ``top_k`` that still takes the bounded candidate path in
+# :func:`sample_tokens`.  Past this the [B, K] chain stops being
+# meaningfully cheaper than the [B, vocab] one it replaces.
+MAX_BOUNDED_TOP_K = 1024
 
 _warned_ignored_penalties = False
 
@@ -260,15 +278,19 @@ def sample_tokens(
         not p.is_greedy and (p.top_k < vocab_size or p.top_p < 1.0 or p.min_p > 0.0)
         for p in params
     )
+    # Token ids the Gumbel-max runs over: None means "the whole vocabulary",
+    # otherwise a [B, K] candidate array that the argmax result indexes into.
+    candidates: mx.array | None = None
     if filtering:
         probs = mx.softmax(scaled, axis=-1)
-        sorted_idx = mx.argsort(-probs, axis=-1)
+        width = _candidate_width(params, vocab_size)
+        sorted_idx = mx.argsort(-probs, axis=-1)[:, :width]
         p_sort = mx.take_along_axis(probs, sorted_idx, axis=-1)
-        ranks = mx.arange(vocab_size, dtype=mx.int32)[None, :]
+        ranks = mx.arange(width, dtype=mx.int32)[None, :]
         # SamplingParams normalizes top_k=-1 to TOP_K_ALL and temperature
-        # below eps to (temperature=1, top_k=1), so min(top_k, vocab_size)
+        # below eps to (temperature=1, top_k=1), so min(top_k, width)
         # is always >= 1: rank 0 survives and log(weights) is never all -inf.
-        top_ks = mx.array([min(p.top_k, vocab_size) for p in params], dtype=mx.int32)[
+        top_ks = mx.array([min(p.top_k, width) for p in params], dtype=mx.int32)[
             :, None
         ]
         top_ps = mx.array([p.top_p for p in params], dtype=mx.float32)[:, None]
@@ -280,11 +302,20 @@ def sample_tokens(
             | (p_sort < p_sort[:, :1] * min_ps)
         )
         w_sort = mx.where(masked_out, 0.0, p_sort)
-        # Scatter the masked weights back to vocab order: noise must be
-        # applied in vocab-id space in every branch, or a seeded row's
-        # token would change when a batchmate happens to need filtering.
-        weights = mx.put_along_axis(mx.zeros_like(probs), sorted_idx, w_sort, axis=-1)
-        log_weights = mx.log(weights)
+        if width < vocab_size:
+            # Bounded top-K: every surviving rank is inside the K
+            # candidates, so run the rest of the chain in candidate space
+            # and map the winning rank back to its vocab id at the end.
+            log_weights = mx.log(w_sort)
+            candidates = sorted_idx
+        else:
+            # Scatter the masked weights back to vocab order: noise must be
+            # applied in vocab-id space in every branch, or a seeded row's
+            # token would change when a batchmate happens to need filtering.
+            weights = mx.put_along_axis(
+                mx.zeros_like(probs), sorted_idx, w_sort, axis=-1
+            )
+            log_weights = mx.log(weights)
     else:
         # Nothing is masked, so the weights are the plain softmax and
         # ``log(softmax(scaled)) == scaled - logsumexp(scaled)``: a per-row
@@ -296,8 +327,9 @@ def sample_tokens(
     noise = _gumbel_noise(
         params=params,
         positions=positions,
-        shape=(batch_size, vocab_size),
+        shape=log_weights.shape,
         key=key,
+        columns=candidates,
     )
     # Gumbel-max over the UNNORMALIZED masked weights: normalization would
     # only shift log(w) by a per-row constant, which argmax is invariant to.
@@ -306,6 +338,8 @@ def sample_tokens(
     # TODO at layers/sampler.py "probs_sort should be re-normalized for the
     # use of multinomial_with_seed") has no analogue on this path.
     sampled = mx.argmax(log_weights + noise, axis=-1)
+    if candidates is not None:
+        sampled = mx.take_along_axis(candidates, sampled[:, None], axis=-1).squeeze(-1)
 
     greedy = [p.is_greedy for p in params]
     if not any(greedy):
@@ -316,13 +350,39 @@ def sample_tokens(
     return mx.where(mx.array(greedy), mx.argmax(logits32, axis=-1), sampled)
 
 
+def _candidate_width(params: list[MlxSamplingParams], vocab_size: int) -> int:
+    """Rank cut-off the filtered chain can run on, or ``vocab_size``.
+
+    Every rank at or beyond a row's ``top_k`` is masked to weight 0, whose
+    ``log`` is ``-inf``, so the Gumbel-max can never select it.  When every
+    row's ``top_k`` is small, the whole chain after the sort — gather,
+    cumsum, mask, log, noise, argmax — can therefore run on ``[B, K]``
+    instead of ``[B, vocab]`` and still pick exactly the same token.
+
+    Falls back to the full vocabulary as soon as one row wants more
+    candidates than :data:`MAX_BOUNDED_TOP_K` (or no top-k at all, which
+    ``SamplingParams`` spells as ``top_k = TOP_K_ALL``).
+    """
+    largest_top_k = max(p.top_k for p in params)
+    if largest_top_k > MAX_BOUNDED_TOP_K or largest_top_k >= vocab_size:
+        return vocab_size
+    return largest_top_k
+
+
 def _gumbel_noise(
     params: list[MlxSamplingParams],
     positions: list[int],
     shape: tuple[int, int],
     key: mx.array,
+    columns: mx.array | None = None,
 ) -> mx.array:
-    """[B, V] Gumbel noise: hash-derived for seeded rows, RNG otherwise."""
+    """Gumbel noise shaped like the weights: hashed if seeded, RNG otherwise.
+
+    ``columns`` is the [B, K] token ids each weight column stands for on the
+    bounded top-K path; ``None`` means column j is token id j.  Seeded rows
+    hash the token id, so their noise — and therefore their token — is the
+    same either way.
+    """
     seeded_rows = [p.seed is not None for p in params]
     if not any(seeded_rows):
         return mx.random.gumbel(shape=shape, key=key)
@@ -331,6 +391,7 @@ def _gumbel_noise(
         seeds=[p.seed if p.seed is not None else 0 for p in params],
         positions=positions,
         vocab_size=shape[1],
+        columns=columns,
     )
     u = hashed.astype(mx.float32) / float(0xFFFFFFFF)
     # REQUIRED, not cosmetic: uint32(0xFFFFFFFF) rounds UP to 2**32 in
@@ -358,13 +419,23 @@ def _murmur3_mix_py(h: int, k: int) -> int:
     return h
 
 
-def _murmur_hash32(seeds: list[int], positions: list[int], vocab_size: int) -> mx.array:
+def _murmur_hash32(
+    seeds: list[int],
+    positions: list[int],
+    vocab_size: int,
+    columns: mx.array | None = None,
+) -> mx.array:
     """Port of ``murmur_hash32`` (Triton) to mx ops: [B, V] uint32.
 
     Blocks mixed in kernel order: seed_low, seed_high, position, column.
     The first three are per-row scalars, so they are folded exactly on the
     CPU with Python ints; only the column block and finalization run as
     vectorized uint32 ops (verified to wrap like the Triton kernel).
+
+    ``columns`` hashes an explicit [B, K] set of token ids instead of every
+    id in ``[0, vocab_size)`` — same value per (row, token id) either way,
+    which is what keeps a seeded row's token identical on the bounded
+    top-K path.
     """
     row_states = []
     for seed, pos in zip(seeds, positions):
@@ -375,7 +446,10 @@ def _murmur_hash32(seeds: list[int], positions: list[int], vocab_size: int) -> m
         row_states.append(h)
 
     h = mx.array(row_states, dtype=mx.uint32)[:, None]
-    k = mx.arange(vocab_size, dtype=mx.uint32)[None, :]
+    if columns is None:
+        k = mx.arange(vocab_size, dtype=mx.uint32)[None, :]
+    else:
+        k = columns.astype(mx.uint32)
 
     # murmur3_mix on [B, V]
     k = k * mx.array(0xCC9E2D51, dtype=mx.uint32)
