@@ -4,7 +4,6 @@ import logging
 from typing import NamedTuple, Optional
 
 import torch
-
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -35,7 +34,6 @@ try:
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig
-
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
@@ -107,8 +105,11 @@ class FlashinferDispatcher(BaseDispatcher):
             if get_moe_runner_backend().is_flashinfer_trtllm_routed()
             else self.num_experts
         )
-        # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        moe_runner_backend = get_moe_runner_backend()
+        self.payload_in_workspace = (
+            moe_runner_backend.is_flashinfer_cutlass()
+            or moe_runner_backend.is_flashinfer_cutedsl()
+        )
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
         # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
