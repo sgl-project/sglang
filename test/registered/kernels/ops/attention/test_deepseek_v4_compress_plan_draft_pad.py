@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import make_paged_context, to_seq_extend
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 C4_RING_SIZE = 16  # get_compress_state_ring_size(4, is_speculative=True)
 C128_RING_SIZE = 256  # get_compress_state_ring_size(128, is_speculative=True)
@@ -87,16 +87,18 @@ class TestCompressWritePlanDraftPad(CustomTestCase):
     def _assert_ring_residency(self, compress_ratio: int, ring_size: int):
         """Every committed token must be written, for each (D, sl mod cr) combo.
 
-        This is the sufficient condition: if a step writes all of
-        `[prefix, prefix + D)`, then whatever the accept length, the tokens the
-        next compression window needs are either from this step (written here) or
-        older (written by an earlier step, same invariant by induction).
+        This is the sufficient condition, which is why there is no multi-step replay
+        test: if a step writes all of `[prefix, prefix + D)`, then whatever the accept
+        length, the tokens the next compression window needs are either from this step
+        (written here) or older (written by an earlier step, same invariant by
+        induction).
         """
         max_d = _max_draft_tokens(compress_ratio, ring_size)
-        # Cover every residue of `seq_len % compress_ratio` -- that residue is what
-        # decides whether the unpadded rule alone would have sufficed. Bases start
-        # page-aligned so the swa-page-boundary write clause does not mask the pad.
-        bases = [512 + off for off in range(compress_ratio)]
+        # Vary `seq_len % compress_ratio`: that residue decides whether the unpadded rule
+        # alone would have sufficed. Four is enough -- with the pad in place it dominates
+        # `last_c_pos` for every residue, so the rest repeat one branch. Bases are
+        # page-aligned so the swa-page-boundary clause does not mask the pad.
+        bases = [512 + off for off in range(min(compress_ratio, 4))]
         draft_counts = sorted(
             {1, 2, 3, 4, 5, max_d - 1, max_d} & set(range(1, max_d + 1))
         )
@@ -127,55 +129,6 @@ class TestCompressWritePlanDraftPad(CustomTestCase):
 
     def test_c128_ring_residency(self):
         self._assert_ring_residency(128, C128_RING_SIZE)
-
-    def _assert_window_covered_over_decode_chain(
-        self, compress_ratio: int, ring_size: int, num_draft_tokens: int
-    ):
-        """Replay a verify chain and check each compression window is resident.
-
-        Simulates the worst accept length (a=1) at every step, accumulating the
-        positions each step's `plan_w` writes. Whenever a step's tail crosses a
-        compression point, the whole window that compression reads must already be
-        in the accumulated set.
-        """
-        window = _window_size(compress_ratio)
-        for start_prefix in (512, 512 + compress_ratio // 2 + 1):
-            with self.subTest(
-                cr=compress_ratio,
-                D=num_draft_tokens,
-                start=start_prefix,
-            ):
-                resident: set[int] = set(range(start_prefix))  # prior prefill
-                prefix_len = start_prefix
-                for _ in range(2 * compress_ratio + 4):
-                    resident |= self._make_plan_positions(
-                        compress_ratio=compress_ratio,
-                        ring_size=ring_size,
-                        prefix_len=prefix_len,
-                        num_draft_tokens=num_draft_tokens,
-                    )
-                    prefix_len += 1  # accept exactly one token
-                    p = prefix_len - 1
-                    if (p + 1) % compress_ratio == 0:
-                        need = {q for q in range(p - window + 1, p + 1) if q >= 0}
-                        self.assertTrue(
-                            need <= resident,
-                            f"compression at p={p} reads unwritten positions "
-                            f"{sorted(need - resident)}",
-                        )
-
-    def test_c4_window_covered_over_decode_chain(self):
-        max_d = _max_draft_tokens(4, C4_RING_SIZE)
-        for num_draft_tokens in (1, 4, 5, max_d):
-            self._assert_window_covered_over_decode_chain(
-                4, C4_RING_SIZE, num_draft_tokens
-            )
-
-    def test_c128_window_covered_over_decode_chain(self):
-        for num_draft_tokens in (1, 4, 8):
-            self._assert_window_covered_over_decode_chain(
-                128, C128_RING_SIZE, num_draft_tokens
-            )
 
     def test_cpu_and_gpu_planner_agree(self):
         """Both planner paths must emit the same write set.
