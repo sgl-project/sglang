@@ -193,13 +193,12 @@ class WindowedAttentionKVCache:
             N, kept, return_array=return_array, window_size=window_size
         )
 
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        """Append a chunk and return the kept trailing window plus the chunk.
+    def _append(self, keys: mx.array, values: mx.array) -> tuple[int, int]:
+        """Append a chunk in place; return the (start, end) span it serves.
 
-        The kept prefix is ``min(local, window)``, matching what
-        ``make_mask`` clamps to earlier in the same forward pass.
+        Split out from ``update_and_fetch`` so the decode path can skip
+        building the two return slices, which its caller discards in
+        favour of ``get_kv``.
         """
         S = keys.shape[2]
         kept = min(self._local, self.window)
@@ -223,11 +222,22 @@ class WindowedAttentionKVCache:
         self.values[:, :, self._local : end, :] = values
         self._local = end
         self.offset += S
+        return start, end
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        """Append a chunk and return the kept trailing window plus the chunk.
+
+        The kept prefix is ``min(local, window)``, matching what
+        ``make_mask`` clamps to earlier in the same forward pass.
+        """
+        start, end = self._append(keys, values)
         return self.keys[:, :, start:end, :], self.values[:, :, start:end, :]
 
     def write_token(self, k: mx.array, v: mx.array) -> None:
         """Write one token. k, v shape: (1, n_kv_heads, 1, head_dim)."""
-        self.update_and_fetch(k, v)
+        self._append(k, v)
 
     def get_kv(self) -> tuple[mx.array, mx.array]:
         """Return buffered trailing K/V: (1, n_kv_heads, local, head_dim)."""
