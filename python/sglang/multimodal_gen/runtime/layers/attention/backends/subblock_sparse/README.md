@@ -73,18 +73,38 @@ rejected.
 | `n_q` | 4 | query sub-blocks per 64-token block (1, 2, 4, 8) |
 | `skip_first_steps` | 10 | leading denoise forwards kept dense |
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
-| `min_seq_len` | 4096 | below this the router costs more than it saves |
+| `min_seq_len` | 4096 | shorter sequences run dense |
 
 **`sparsity` is an upper bound, not an exact figure.** The kernel pads each query
 row's block count up to a multiple of 8 with phantom slots it then masks out, so
 148 blocks costs exactly what 152 costs; the router takes the 152. At 590 blocks,
-0.75 requested delivers 0.7424, and the startup log reports what was kept.
+0.75 requested delivers 0.7424, and the startup log reports what was kept. It is
+the speed lever — see below — and the only knob most users should touch.
 
-**The two schedule cutoffs are asymmetric on purpose.** The early denoise steps
-settle the layout of the sample and visibly re-frame the shot when approximated —
-lowering `skip_first_steps` from 10 to 5 halves cosine against the dense render.
-Depth does not behave that way, so `skip_first_layers` defaults to 0. Do not
-lower `skip_first_steps` without looking at the output.
+**`n_k` and `n_q` buy score accuracy, not speed.** They set how finely a block is
+cut before scoring: `n_k=4` means four 16-token key sub-blocks, and the block's
+score is the log-sum-exp over all `n_q * n_k` sub-block pairs. Raising them
+sharpens the estimate of which blocks carry mass, at `n_q * n_k` times the score
+matrix — 0.5% of denoise time at the default, so cost is not the constraint.
+Raise `n_q` and `n_k` **together**: splitting the query side alone is worse than
+not splitting at all.
+
+**The two schedule cutoffs are asymmetric on purpose.** `skip_first_steps` keeps
+the leading denoise forwards dense; those steps settle the layout of the sample
+and visibly re-frame the shot when approximated — lowering it from 10 to 5 halves
+cosine against the dense render. Depth does not behave that way, so
+`skip_first_layers` defaults to 0 and every DiT layer is sparse. Do not lower
+`skip_first_steps` without looking at the output.
+
+**`min_seq_len` is a floor, not a tuning knob.** Below it the whole call runs
+dense, and in packed varlen batches the test is per document, so H3's padding
+tail goes dense while the 37.7k-token media document is routed. Two things break
+down on short sequences: the router is four fixed Triton launches against an
+attention cost that falls as S², so the overhead stops paying for itself; and the
+budget goes coarse — 4096 keys is only 64 blocks, and at 1024 keys the
+multiple-of-8 floor already keeps half of them. 4096 sits well below any real
+video sequence and well above where either effect bites; it was chosen on that
+reasoning rather than from a measured threshold sweep.
 
 ## Measured
 
