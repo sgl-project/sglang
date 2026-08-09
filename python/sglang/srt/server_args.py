@@ -40,7 +40,12 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    mamba_extra_buffer_lazy_of,
+    mamba_extra_buffer_of,
+    resolved_view,
+)
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -7982,8 +7987,14 @@ class ServerArgs:
                     # symmetric-memory path only below a byte threshold, so
                     # which reduce runs would follow the token count.
                     self.enable_torch_symm_mem = False
+                    # Each channel carries a differently shaped tree and the
+                    # channel count is picked from the message size, so a
+                    # token's reduction order would follow the token count.
+                    nchannels = str(envs.SGLANG_DETERMINISTIC_NCCL_NCHANNELS.get())
+                    os.environ["NCCL_MIN_NCHANNELS"] = nchannels
+                    os.environ["NCCL_MAX_NCHANNELS"] = nchannels
                     logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree', and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
+                        "NCCL_ALGO is set to 'allreduce:tree', the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
                     )
 
     def _handle_unified_memory_pool(self):
@@ -8697,17 +8708,7 @@ class ServerArgs:
         return attention_backends_of(resolved_view(self))
 
     def get_attention_backends(self):
-        prefill_attention_backend_str = (
-            self.prefill_attention_backend
-            if self.prefill_attention_backend
-            else self.attention_backend
-        )
-        decode_attention_backend_str = (
-            self.decode_attention_backend
-            if self.decode_attention_backend
-            else self.attention_backend
-        )
-        return prefill_attention_backend_str, decode_attention_backend_str
+        return attention_backends_of(self)
 
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch
@@ -8723,16 +8724,10 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        return (
-            self.disable_radix_cache is False
-            and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
-        )
+        return mamba_extra_buffer_of(self)
 
     def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return (
-            self.disable_radix_cache is False
-            and self.mamba_radix_cache_strategy == "extra_buffer_lazy"
-        )
+        return mamba_extra_buffer_lazy_of(self)
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
