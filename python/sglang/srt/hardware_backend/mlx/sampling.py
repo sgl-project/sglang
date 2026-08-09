@@ -254,13 +254,14 @@ def sample_tokens(
     batch_size, vocab_size = last_logits.shape
     logits32 = last_logits.astype(mx.float32)
     temps = mx.array([p.temperature for p in params], dtype=mx.float32)[:, None]
-    probs = mx.softmax(logits32 / temps, axis=-1)
+    scaled = logits32 / temps
 
     filtering = any(
         not p.is_greedy and (p.top_k < vocab_size or p.top_p < 1.0 or p.min_p > 0.0)
         for p in params
     )
     if filtering:
+        probs = mx.softmax(scaled, axis=-1)
         sorted_idx = mx.argsort(-probs, axis=-1)
         p_sort = mx.take_along_axis(probs, sorted_idx, axis=-1)
         ranks = mx.arange(vocab_size, dtype=mx.int32)[None, :]
@@ -283,8 +284,14 @@ def sample_tokens(
         # applied in vocab-id space in every branch, or a seeded row's
         # token would change when a batchmate happens to need filtering.
         weights = mx.put_along_axis(mx.zeros_like(probs), sorted_idx, w_sort, axis=-1)
+        log_weights = mx.log(weights)
     else:
-        weights = probs
+        # Nothing is masked, so the weights are the plain softmax and
+        # ``log(softmax(scaled)) == scaled - logsumexp(scaled)``: a per-row
+        # constant offset, which the argmax below is invariant to.  Feeding
+        # the scaled logits straight to the Gumbel-max drops two full-vocab
+        # passes (softmax, log) on the common temperature-only batch.
+        log_weights = scaled
 
     noise = _gumbel_noise(
         params=params,
@@ -298,7 +305,7 @@ def sample_tokens(
     # pytorch backend's `assert sampling_seed is None` under min-p (and its
     # TODO at layers/sampler.py "probs_sort should be re-normalized for the
     # use of multinomial_with_seed") has no analogue on this path.
-    sampled = mx.argmax(mx.log(weights) + noise, axis=-1)
+    sampled = mx.argmax(log_weights + noise, axis=-1)
 
     greedy_rows = mx.array([p.is_greedy for p in params])
     return mx.where(greedy_rows, mx.argmax(logits32, axis=-1), sampled)
