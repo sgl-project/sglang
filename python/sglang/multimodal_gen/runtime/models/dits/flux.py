@@ -42,6 +42,11 @@ from sglang.kernels.ops.diffusion.fused_ln_modulate import (
 )
 from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    fused_layernorm_modulate,
+    is_plain_layer_norm,
+)
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -92,6 +97,73 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
+_FLUX_FUSED_LN_MOD_DISABLED = False
+# (shape, stride, eps) signatures whose fused output has been verified
+# ``torch.equal`` against the live eager chain.
+_FLUX_FUSED_LN_MOD_VERIFIED: set = set()
+
+
+def _flux_fused_ln_modulate(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs the eager
+    chain, or ``None`` when the fast path does not apply.
+
+    The Triton kernel replicates the aten LayerNorm kernel this dispatch
+    selects for bf16 rows (PR #34008), but bit-exactness is a property of
+    the live dispatch: every distinct (shape, stride, eps) combination is
+    verified ``torch.equal`` against the eager chain on first sight, and any
+    mismatch disables the fast path permanently.
+    """
+    global _FLUX_FUSED_LN_MOD_DISABLED
+
+    if (
+        _FLUX_FUSED_LN_MOD_DISABLED
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale, shift)
+    ):
+        return None
+    sig = (
+        x.shape,
+        x.stride(),
+        scale.shape,
+        scale.stride(),
+        shift.shape,
+        shift.stride(),
+        norm.eps,
+    )
+    verified = sig in _FLUX_FUSED_LN_MOD_VERIFIED
+    if not verified and (
+        torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+    ):
+        # The first-sight check needs the eager chain and a host sync; run
+        # neither inside compile tracing nor CUDA graph capture.
+        return None
+    try:
+        out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+    except Exception as exc:
+        if torch.compiler.is_compiling():
+            raise
+        logger.warning_once(f"Disabling FLUX fused LN+modulate fast path: {exc}")
+        _FLUX_FUSED_LN_MOD_DISABLED = True
+        return None
+    if verified:
+        return out
+    ref = modulate_scale_shift(norm(x), scale, shift)
+    if torch.equal(out, ref):
+        _FLUX_FUSED_LN_MOD_VERIFIED.add(sig)
+        return out
+    logger.warning_once(
+        "FLUX fused LN+modulate fast path is not bit-exact against this "
+        "platform's LayerNorm dispatch; falling back to eager"
+    )
+    _FLUX_FUSED_LN_MOD_DISABLED = True
+    return ref
+
+
 def _flux_norm_modulate(
     site: nn.Module,
     norm: nn.Module,
@@ -101,10 +173,16 @@ def _flux_norm_modulate(
 ) -> torch.Tensor:
     """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
 
-    Default: affine-free LayerNorm + the bit-exact fused modulate.  When the
-    site is mounted (``quality="high"``) and the per-call guard passes, the
-    modulate is folded into the LN affine instead (one kernel; not bit-exact).
+    Priority: (1) the bit-exact single-kernel LN+modulate -- lossless, so it
+    needs no quality gate and also supersedes the ``quality="high"`` affine
+    fold wherever it verifies; (2) when the site is mounted
+    (``quality="high"``) and the bit-exact kernel is unavailable, the
+    modulate folded into the LN affine (one aten kernel; not bit-exact);
+    (3) affine-free LayerNorm + the bit-exact fused modulate.
     """
+    out = _flux_fused_ln_modulate(norm, x, scale, shift)
+    if out is not None:
+        return out
     if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
     return modulate_scale_shift(norm(x), scale, shift)
