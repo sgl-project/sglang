@@ -161,7 +161,11 @@ class _FakeRunner:
         pass
 
     def request_cache_arrays(self, req_id):
-        return []
+        return self.cache_state_arrays([self._req_caches[req_id]])
+
+    @staticmethod
+    def cache_state_arrays(caches):
+        return [s for cache_list in caches for c in cache_list for s in c.state]
 
 
 class _FakeReq:

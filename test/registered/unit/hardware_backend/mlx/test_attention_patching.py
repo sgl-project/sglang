@@ -510,7 +510,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             ["r0"],
         )
         lazy_tokens = mx.argmax(lazy_logits, axis=-1)
-        mx.eval(lazy_tokens, *MlxModelRunner._cache_state_arrays(cache))
+        mx.eval(lazy_tokens, *MlxModelRunner.cache_state_arrays(cache))
 
         self.assertEqual(lazy_tokens.tolist(), [0])
         self.assertEqual(cache[0][0].offset, 1)

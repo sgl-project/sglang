@@ -675,7 +675,7 @@ class MlxTpModelWorker(TpModelWorker):
             lazy_stacked = None
 
         for p in pending_prefills:
-            async_args.extend(self._cache_state(p.cache))
+            async_args.extend(self._mlx_runner.cache_state_arrays([p.cache]))
             async_args.extend(lazy_logprob_arrays(p.lazy_logprobs))
         for e in pending_extends:
             async_args.extend(self._mlx_runner.request_cache_arrays(e.req_id))
@@ -683,8 +683,9 @@ class MlxTpModelWorker(TpModelWorker):
         if pending_mixed_decode is not None:
             async_args.append(pending_mixed_decode.lazy_tokens)
             async_args.extend(lazy_logprob_arrays(pending_mixed_decode.lazy_logprobs))
-            for c_list in pending_mixed_decode.caches:
-                async_args.extend(self._cache_state(c_list))
+            async_args.extend(
+                self._mlx_runner.cache_state_arrays(pending_mixed_decode.caches)
+            )
 
         if async_args:
             mx.async_eval(*async_args)
@@ -696,27 +697,6 @@ class MlxTpModelWorker(TpModelWorker):
             pending_mixed_decode,
             "extend",
         )
-
-    @staticmethod
-    def _cache_state(cache_list) -> list[mx.array]:
-        """Flatten a per-layer cache list to its ``state`` arrays."""
-        arrays: list[mx.array] = []
-
-        def collect(value):
-            if isinstance(value, mx.array):
-                arrays.append(value)
-            elif value is None:
-                return
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    collect(item)
-
-        for cache in cache_list:
-            collect(getattr(cache, "state", ()))
-        return arrays
 
     def async_chained_decode_mlx(
         self,

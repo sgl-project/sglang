@@ -468,14 +468,15 @@ class MlxModelRunner:
         )
 
     @staticmethod
-    def _cache_state_arrays(pending_caches: list[list[Any]]) -> list[mx.array]:
-        """Flatten pending decode cache state list into an array list.
+    def cache_state_arrays(caches: list[list[Any]]) -> list[mx.array]:
+        """Flatten per-request cache lists (``caches[req][layer]``) to arrays.
 
-        Safe to hand to ``mx.async_eval``.
+        Pass ``[cache]`` for a single request.  Safe to hand to
+        ``mx.eval`` / ``mx.async_eval``.
         """
         return [
             s
-            for cache_list in pending_caches
+            for cache_list in caches
             for cache in cache_list
             for s in MlxModelRunner._cache_arrays(cache)
         ]
@@ -1260,13 +1261,13 @@ class MlxModelRunner:
         """
         mx.eval(
             pending.lazy_tokens,
-            *self._cache_state_arrays(pending.caches),
+            *self.cache_state_arrays(pending.caches),
             *lazy_logprob_arrays(pending.lazy_logprobs),
         )
 
     def request_cache_arrays(self, req_id: str) -> list[mx.array]:
         """Cache-state arrays of a committed request; safe for async_eval."""
-        return [s for c in self._req_caches[req_id] for s in self._cache_arrays(c)]
+        return self.cache_state_arrays([self._req_caches[req_id]])
 
     @staticmethod
     def _dummy_next_token(hidden: mx.array) -> mx.array:
