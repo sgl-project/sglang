@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -212,13 +213,18 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __call__(self, text=None, images=None, **kwargs):
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
+        if images and envs.SGLANG_KIMI_K3_RS_MM_PREPROCESS.get():
+            result = self._rust_call(text, images, original_input_ids)
+            if result is not None:
+                return result
+            # An image mode outside the Rust pipeline's bit-exact scope
+            # (palette/CMYK/...): the PIL reference handles the request.
+            return self._cpu_call(text, images, original_input_ids, **kwargs)
         if images and gpu_mm_preprocess_enabled():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
-    def _gpu_call(self, text, images, original_input_ids=None):
-        input_text = text[0] if isinstance(text, list) else text
-
+    def _resize_configs_and_sizes(self, images):
         resize_configs = []
         image_sizes = []
         for image in images:
@@ -235,6 +241,40 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     self._fixed_output_tokens,
                 )
             )
+        return resize_configs, image_sizes
+
+    def _rust_call(self, text, images, original_input_ids=None):
+        """Preprocess via the Rust sglang-mm pipeline (bit-exact with the PIL
+        reference); ``None`` means an image is outside its scope and the
+        caller must take the PIL path instead."""
+        from sglang.srt.multimodal.kimi_k3_rust import rust_preprocess_images
+
+        input_text = text[0] if isinstance(text, list) else text
+        resize_configs, image_sizes = self._resize_configs_and_sizes(images)
+
+        preprocessed = rust_preprocess_images(
+            images,
+            resize_configs,
+            patch_size=self._patch_size,
+            image_mean=self._image_mean,
+            image_std=self._image_std,
+            transparent_bg_config=self._transparent_bg_config,
+        )
+        if preprocessed is None:
+            return None
+        pixel_values, grid_thws = preprocessed
+
+        return {
+            "input_ids": self._prepare_input_ids(
+                input_text, resize_configs, original_input_ids, image_sizes
+            ),
+            "pixel_values": pixel_values,
+            "image_grid_thw": grid_thws,
+        }
+
+    def _gpu_call(self, text, images, original_input_ids=None):
+        input_text = text[0] if isinstance(text, list) else text
+        resize_configs, image_sizes = self._resize_configs_and_sizes(images)
 
         input_ids = self._prepare_input_ids(
             input_text, resize_configs, original_input_ids, image_sizes
@@ -296,7 +336,10 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
 
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK3ForConditionalGeneration]
-    gpu_image_decode = True
+    # The Rust pipeline consumes decoded PIL images, so nvJPEG CUDA decode is
+    # incompatible with it (class attribute: read once at import, after the
+    # launch environment is set).
+    gpu_image_decode = not envs.SGLANG_KIMI_K3_RS_MM_PREPROCESS.get()
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2

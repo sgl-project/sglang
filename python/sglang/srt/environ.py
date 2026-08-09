@@ -986,6 +986,10 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Preprocess Kimi-K3 images with the Rust sglang-mm pipeline (library mode,
+    # like SGLANG_INKLING_RS_MM_PREPROCESS): bit-exact against the checkpoint's
+    # PIL reference and used from the Python tokenizer manager.
+    SGLANG_KIMI_K3_RS_MM_PREPROCESS = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.

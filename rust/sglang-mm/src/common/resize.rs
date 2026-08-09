@@ -165,46 +165,52 @@ fn clip8(v: i32, prec: u32) -> u8 {
     }
 }
 
-fn resample_horizontal(src: &[u8], h: usize, w: usize, out_w: usize, c: &Coeffs) -> Vec<u8> {
-    let mut out = vec![0u8; h * out_w * 3];
-    par::for_chunks_mut(&mut out, out_w * 3, |y, row| {
-        let src_row = &src[y * w * 3..(y + 1) * w * 3];
+fn resample_horizontal<const C: usize>(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_w: usize,
+    c: &Coeffs,
+) -> Vec<u8> {
+    let mut out = vec![0u8; h * out_w * C];
+    par::for_chunks_mut(&mut out, out_w * C, |y, row| {
+        let src_row = &src[y * w * C..(y + 1) * w * C];
         for xx in 0..out_w {
             let (xmin, count) = c.bounds[xx];
             let k = &c.kk[xx * c.ksize..xx * c.ksize + count];
-            let mut s = [1i32 << (c.prec - 1); 3];
+            let mut s = [1i32 << (c.prec - 1); C];
             for (x, &coef) in k.iter().enumerate() {
-                let p = (xmin + x) * 3;
-                s[0] += src_row[p] as i32 * coef;
-                s[1] += src_row[p + 1] as i32 * coef;
-                s[2] += src_row[p + 2] as i32 * coef;
+                let p = (xmin + x) * C;
+                for ch in 0..C {
+                    s[ch] += src_row[p + ch] as i32 * coef;
+                }
             }
-            let o = xx * 3;
-            row[o] = clip8(s[0], c.prec);
-            row[o + 1] = clip8(s[1], c.prec);
-            row[o + 2] = clip8(s[2], c.prec);
+            let o = xx * C;
+            for ch in 0..C {
+                row[o + ch] = clip8(s[ch], c.prec);
+            }
         }
     });
     out
 }
 
-fn resample_vertical(src: &[u8], w: usize, out_h: usize, c: &Coeffs) -> Vec<u8> {
-    let mut out = vec![0u8; out_h * w * 3];
-    par::for_chunks_mut(&mut out, w * 3, |yy, row| {
+fn resample_vertical<const C: usize>(src: &[u8], w: usize, out_h: usize, c: &Coeffs) -> Vec<u8> {
+    let mut out = vec![0u8; out_h * w * C];
+    par::for_chunks_mut(&mut out, w * C, |yy, row| {
         let (ymin, count) = c.bounds[yy];
         let k = &c.kk[yy * c.ksize..yy * c.ksize + count];
         for x in 0..w {
-            let mut s = [1i32 << (c.prec - 1); 3];
+            let mut s = [1i32 << (c.prec - 1); C];
             for (y, &coef) in k.iter().enumerate() {
-                let p = ((ymin + y) * w + x) * 3;
-                s[0] += src[p] as i32 * coef;
-                s[1] += src[p + 1] as i32 * coef;
-                s[2] += src[p + 2] as i32 * coef;
+                let p = ((ymin + y) * w + x) * C;
+                for ch in 0..C {
+                    s[ch] += src[p + ch] as i32 * coef;
+                }
             }
-            let o = x * 3;
-            row[o] = clip8(s[0], c.prec);
-            row[o + 1] = clip8(s[1], c.prec);
-            row[o + 2] = clip8(s[2], c.prec);
+            let o = x * C;
+            for ch in 0..C {
+                row[o + ch] = clip8(s[ch], c.prec);
+            }
         }
     });
     out
@@ -222,10 +228,24 @@ pub fn resize_rgb(
     out_w: usize,
     resample: Resample,
 ) -> Vec<u8> {
-    par::in_pool(move || resize_passes(src, h, w, out_h, out_w, resample))
+    par::in_pool(move || resize_passes::<3>(src, h, w, out_h, out_w, resample))
 }
 
-fn resize_passes(
+/// [`resize_rgb`] for a flat HWC RGBA buffer. PIL resamples the alpha channel
+/// with the same kernel as the color channels (no premultiplication), so the
+/// four channels share one code path.
+pub fn resize_rgba(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+    resample: Resample,
+) -> Vec<u8> {
+    par::in_pool(move || resize_passes::<4>(src, h, w, out_h, out_w, resample))
+}
+
+fn resize_passes<const C: usize>(
     src: &[u8],
     h: usize,
     w: usize,
@@ -237,11 +257,11 @@ fn resize_passes(
     let coeffs = |in_size, out_size| precompute_coeffs(in_size, out_size, resample);
     match (out_w != w, out_h != h) {
         (true, true) => {
-            let tmp = resample_horizontal(src, h, w, out_w, &coeffs(w, out_w));
-            resample_vertical(&tmp, out_w, out_h, &coeffs(h, out_h))
+            let tmp = resample_horizontal::<C>(src, h, w, out_w, &coeffs(w, out_w));
+            resample_vertical::<C>(&tmp, out_w, out_h, &coeffs(h, out_h))
         }
-        (true, false) => resample_horizontal(src, h, w, out_w, &coeffs(w, out_w)),
-        (false, true) => resample_vertical(src, w, out_h, &coeffs(h, out_h)),
+        (true, false) => resample_horizontal::<C>(src, h, w, out_w, &coeffs(w, out_w)),
+        (false, true) => resample_vertical::<C>(src, w, out_h, &coeffs(h, out_h)),
         (false, false) => src.to_vec(),
     }
 }

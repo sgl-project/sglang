@@ -9,6 +9,7 @@
 pub mod common;
 pub mod driver;
 pub mod inkling;
+pub mod kimi_k3;
 pub mod pipeline;
 pub mod qwen_vl;
 pub mod registry;
@@ -21,6 +22,7 @@ use pyo3::prelude::*;
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     common::register(m)?;
     inkling::register(m)?;
+    kimi_k3::register(m)?;
     qwen_vl::register(m)?;
     Ok(())
 }
