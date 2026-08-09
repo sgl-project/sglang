@@ -90,6 +90,29 @@ The consequence: a nonzero KL under deterministic inference that appears in ever
 helper alike means some kernel on the path is still batch-dependent. Localize it
 (below) rather than widening the threshold.
 
+Background, and the source of the fixed-reduction approach the aten overrides take:
+[Defeating nondeterminism in LLM inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/).
+
+### How much batch-invariance an operator needs
+
+For a **token-wise** operator -- GEMM, norm, activation, the router's linear -- a token's
+output depends only on that token's row, so pinning the reduction order is the whole
+requirement. Once its result is independent of how many rows share the launch, it is done.
+
+Two kinds need more than that, and they are where the remaining nonzero usually lives:
+
+- **Operators that reduce across tokens** -- attention over a KV range, and any collective.
+  Fixing the arithmetic order is not enough if the *extent* still varies: an all-reduce whose
+  tree shape follows the message size, or an attention split whose block boundary follows the
+  query count, gives a token a different reduction depending on its batch. Pin the shape, not
+  just the order.
+- **Operators that carry state across calls** -- conv windows, SSM checkpoints. These are
+  batch-invariant per call and still diverge, because what they store is reused by a later
+  request. That is condition 2, and no amount of reduction-order work reaches it.
+
+So "make everything batch-invariant" closes condition 1 for the token-wise majority, and the
+residual after that is concentrated in these two classes.
+
 ### MoE amplifies this to a degree dense models do not
 
 Top-k routing is a discrete decision over near-tied scores. A 1e-8 difference in gate
