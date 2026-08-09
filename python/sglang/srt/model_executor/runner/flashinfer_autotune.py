@@ -25,6 +25,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_spec,
+)
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -37,7 +42,7 @@ FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
-    skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
+    skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
 
@@ -49,28 +54,29 @@ def should_run_flashinfer_autotune(
     mr = model_runner
     if mr.device != "cuda":
         return False
-    if mr.server_args.disable_flashinfer_autotune:
+    if get_exec().kernel.disable_flashinfer_autotune:
         return False
-    if mr.server_args.enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         # Tuned configs are per problem shape, so the reduction order would follow
         # the batch shape.
         return False
 
-    server_args = mr.server_args
     if for_speculative_draft:
         backend_str = (
-            server_args.speculative_moe_runner_backend or server_args.moe_runner_backend
+            get_spec().speculative_moe_runner_backend
+            or get_exec().moe.moe_runner_backend
         )
         a2a_backend_str = (
-            server_args.speculative_moe_a2a_backend or server_args.moe_a2a_backend
+            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
         )
     else:
-        backend_str = server_args.moe_runner_backend
-        a2a_backend_str = server_args.moe_a2a_backend
+        backend_str = get_exec().moe.moe_runner_backend
+        a2a_backend_str = get_exec().moe.moe_a2a_backend
 
     # Autotune can run before the MoE backend globals are initialized, so read
-    # the target or draft backend from server_args. CuteDSL v1 bypasses
-    # MoeRunner, and its dummy dispatch can exceed DeepEP low-latency's token limit.
+    # the configured backends -- the draft leaves (`get_spec()`) or the target
+    # leaves (`get_exec().moe`) above. CuteDSL v1 bypasses MoeRunner, and its
+    # dummy dispatch can exceed DeepEP low-latency's token limit.
     if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
         return False
 
@@ -130,12 +136,11 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     arch = f"sm{major}{minor}"
     flashinfer_version = getattr(flashinfer, "__version__", "unknown")
 
-    server_args = mr.server_args
     model_key_parts = [
-        str(server_args.model_path),
+        str(get_model().model_path),
         str(mr.dtype),
-        str(server_args.quantization),
-        str(server_args.moe_runner_backend),
+        str(get_model().quantization),
+        str(get_exec().moe.moe_runner_backend),
         str(mr.ps.tp_size),
         str(mr.ps.pp_size),
         str(mr.ps.attn_dp_size),
