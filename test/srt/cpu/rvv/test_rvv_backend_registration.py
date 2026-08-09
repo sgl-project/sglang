@@ -25,7 +25,7 @@ class _RVVBackendTestMixin:
             mock_runner = MagicMock()
             mock_runner.device = "cpu"
             mock_runner.model_config.num_attention_heads = 8
-            mock_runner.tp_size = 1
+            mock_runner.ps.tp_size = 1
             mock_runner.req_to_token_pool.size = 4
             kv_buf = MagicMock()
             kv_buf.shape = [16, 1, 64]
@@ -88,7 +88,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         mock_runner.device = "cpu"
         mock_runner.model_config = Mock()
         mock_runner.model_config.num_attention_heads = 32
-        mock_runner.tp_size = 1
+        mock_runner.ps.tp_size = 1
         mock_runner.req_to_token_pool = Mock()
         mock_runner.req_to_token_pool.size = 4
         mock_runner.token_to_kv_pool = Mock()
