@@ -139,15 +139,12 @@ def _repo_relative_path(p: str) -> str:
 
 # The floor covers a test that is normally quick but occasionally crawls, which
 # the multiplier alone cannot: test_encoder_dp runs 200-426s across five nightly
-# runs and once took over 1185s, while 1.5 * its est_time is only 765s. Raising
-# the multiplier would not have helped -- anything under the floor is decided by
-# the floor.
+# runs and once took over 1185s, while 1.5 * its est_time is only 765s.
 DERIVED_TIMEOUT_FLOOR = 1800.0
 DERIVED_TIMEOUT_FACTOR = 1.5
 
 
 def derive_timeout_per_file(est_time: float) -> float:
-    """Per-file timeout budget for a test with the given est_time."""
     return max(float(est_time) * DERIVED_TIMEOUT_FACTOR, DERIVED_TIMEOUT_FLOOR)
 
 

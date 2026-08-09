@@ -122,9 +122,8 @@ PER_COMMIT_SUITES = {
 NIGHTLY_SUITES = {
     HWBackend.CUDA: [
         # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
-        # shape as the per-commit suites. No `nightly=True` on these: the stage
-        # name carries the cadence, and only the legacy single-string suites
-        # below still need the flag.
+        # shape as the per-commit suites. No `nightly=True`: the stage name
+        # carries the cadence; only the legacy suites below still need the flag.
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
@@ -177,8 +176,8 @@ OTHER_SUITES = {
     ],
     HWBackend.CUDA: [
         "stress",
-        # `stage="weekly"` -- same shape again. The three dicts only group
-        # names for readability; validation reads their union.
+        # `stage="weekly"` -- same shape. The three dicts group names for
+        # readability only; validation reads their union.
         "weekly-test-8-gpu-h200",
     ],
 }

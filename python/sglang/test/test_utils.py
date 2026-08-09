@@ -2241,11 +2241,10 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
-# Sized for the largest models in the scheduled suites: after test_ring_2_5_1t
-# (1T params, ~122 GiB on each of 8 GPUs) the server process exits well inside
-# 30s but the driver has still not returned the memory, which failed the next
-# class's setUpClass. Costs nothing when the GPUs are already idle -- the first
-# poll returns immediately.
+# Sized for the largest scheduled-suite models: after test_ring_2_5_1t (1T
+# params, ~122 GiB on each of 8 GPUs) the server exits well inside 30s but the
+# driver has not returned the memory, failing the next class's setUpClass. Free
+# when the GPUs are already idle -- the first poll returns immediately.
 _GPU_IDLE_TIMEOUT_SECS = 180.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB

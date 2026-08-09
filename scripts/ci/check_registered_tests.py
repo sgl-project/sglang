@@ -33,10 +33,9 @@ import sys
 # shape is always expressible (and should be expressed) the modern way.
 _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 
-# The only suite family a CUDA registry may keep on the legacy single-string
-# `suite=` form. Everything else -- per-commit, nightly and weekly alike --
-# must use the modern stage=/runner_config= form, or its effective_suite
-# matches no suite any workflow invokes and the test silently never runs.
+# The only CUDA suite family still allowed on the legacy single-string `suite=`
+# form. Anything else needs stage=/runner_config=, or its effective_suite matches
+# no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
 
 

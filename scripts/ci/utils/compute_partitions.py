@@ -128,11 +128,11 @@ def compute_partitions(
     in-source `est_time` / `(1.0, 0.0)`.
     `full_parallel=True` lifts the matrix-fanout throttle.
     """
-    # Allowlist of the stages pr-test.yml dispatches -- this is what keeps
-    # stress / weekly / nightly suites out, since CUDA scheduled suites no
-    # longer carry `nightly=True`. The nightly filter still matters for CPU:
-    # some tests sit on a dispatched suite with the flag set, so run_suite.py
-    # skips them and their est_time must not inflate the shard count.
+    # Allowlist of the stages this workflow dispatches -- what keeps stress /
+    # weekly / nightly out, since CUDA scheduled suites no longer carry
+    # `nightly=True`. The nightly filter still matters for CPU: some tests sit on
+    # a dispatched suite with the flag set, so run_suite.py skips them and their
+    # est_time must not inflate the shard count.
     dispatched_suites = set(run_timeouts) | set(_BASE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:

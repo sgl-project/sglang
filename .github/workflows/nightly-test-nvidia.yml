@@ -1,12 +1,10 @@
 # Nightly CUDA tests. One job per runner_config, running that machine's
-# `nightly-test-{runner_config}` suite -- so a test reaches a machine by
-# declaring `runner_config=` on register_cuda_ci, never by editing this file.
+# `nightly-test-{runner_config}` suite -- a test reaches a machine by declaring
+# `runner_config=` on register_cuda_ci, never by editing this file.
 #
-# The jobs go through the same _pr-test-stage.yml the per-commit suites use.
-# Everything a scheduled run needs on top (longer job timeout, serial shards,
-# est_time-derived per-file budgets, metrics upload, the precision baseline) is
-# an input on that stage, so rust-ext reuse, runner resolution and shard sizing
-# stay in one place instead of being reimplemented here.
+# Jobs go through the same _pr-test-stage.yml as the per-commit suites; what a
+# scheduled run needs on top is its `scheduled` input, so runner resolution,
+# rust-ext reuse and shard sizing are not reimplemented here.
 name: Nightly Test (Nvidia)
 
 on:
@@ -35,7 +33,7 @@ on:
         type: boolean
         default: false
       force_baseline_update:
-        description: 'Refresh the precision rolling baseline instead of comparing (sets SGLANG_PRECISION_FORCE_UPDATE=1). Dispatch once after an intentional forward-path dtype/precision change stales the baseline; later scheduled runs compare against it and go green.'
+        description: 'Refresh the precision rolling baseline instead of comparing. Dispatch once after an intentional forward-path precision change stales it; later runs compare against the new one.'
         required: false
         type: boolean
         default: false
@@ -52,7 +50,7 @@ on:
         type: string
         default: 'all'
       full_parallel:
-        description: 'Run all shards of a job at once instead of one at a time.'
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
         required: false
         type: boolean
         default: false
@@ -68,10 +66,10 @@ permissions:
   pull-requests: read
 
 jobs:
-  # run_all_tests skips the paths-filter entirely, so main_package is 'true' and
-  # sgl_kernel stays empty -- exactly right here: every test runs, and no job
-  # waits on a wheel this workflow never builds. It also sizes the shards for
-  # every `nightly-test-*` suite from this file's own run_timeout_minutes.
+  # run_all_tests skips the paths-filter, so main_package is 'true' and
+  # sgl_kernel stays empty: every test runs, and no job waits on a wheel this
+  # workflow never builds. pr_test_yml points back here so shard sizing reads
+  # this file's own run_timeout_minutes.
   check-changes:
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
