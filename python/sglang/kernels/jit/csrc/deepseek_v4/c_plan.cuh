@@ -510,13 +510,14 @@ inline PrefillPlan plan_compress_prefill(
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
   // Write pad: trailing tokens kept resident so a verify batch's committed tail survives
-  // any accept length. The ring bounds it -- a write at `w` aliases onto `w - ring_size`,
-  // and the earliest position a future compression still needs is
+  // any accept length. Zero without speculation -- nothing rolls back, and the ring is
+  // then exactly one window wide. Otherwise the ring bounds it: a write at `w` aliases
+  // onto `w - ring_size`, and the earliest position a future compression still needs is
   // `prefix_len - window_size + 2` (the next batch commits >= 1 token, and `run_prefill`
   // launches the compress kernel before the write kernel, so a batch's own compressions
   // read the pre-write ring). Padding past the extend range is harmless: the loops only
   // span `[prefix_len, seq_len)`.
-  const auto mtp_pad = std::max(0, ring_size - window_size + 2);
+  const auto mtp_pad = ring_size > window_size ? ring_size - window_size + 2 : 0;
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);

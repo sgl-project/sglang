@@ -39,7 +39,8 @@ def _window_size(compress_ratio: int) -> int:
 
 def _max_draft_tokens(compress_ratio: int, ring_size: int) -> int:
     """Largest draft count this ring serves; mirrors `mtp_pad` in c_plan.cuh."""
-    return max(0, ring_size - _window_size(compress_ratio) + 2)
+    window = _window_size(compress_ratio)
+    return ring_size - window + 2 if ring_size > window else 0
 
 
 def _written_positions(plan_w: torch.Tensor, prefix_len: int) -> set[int]:
@@ -201,28 +202,34 @@ class TestCompressWritePlanDraftPad(CustomTestCase):
                             self._make_plan_positions(**kwargs, on_gpu=True),
                         )
 
-    def test_c4_plain_prefill_write_set(self):
-        """Non-speculative c4 keeps the base write rule: its pad (`8 - 8 + 2 = 2`) never
-        binds, `last_c_pos - cr <= seq_len - cr` always being the smaller term."""
-        compress_ratio, ring_size = 4, C4_RING_SIZE_NO_SPEC
-        for seq_len in (512, 600, 777):
-            with self.subTest(sl=seq_len):
-                ctx = make_paged_context(
-                    bs=1, compress_ratio=compress_ratio, ring_size=ring_size
-                )
-                seq_lens, extend_lens, num_q = to_seq_extend([(seq_len, seq_len)])
-                plan = ctx.make_prefill_plan(seq_lens, extend_lens, num_q)
-                written = _written_positions(plan.plan_w, 0)
+    def test_plain_prefill_write_set(self):
+        """A non-speculative ring is exactly one window wide, so the pad is 0 and the
+        base write rule stands unchanged for both ratios."""
+        for compress_ratio, ring_size in (
+            (4, C4_RING_SIZE_NO_SPEC),
+            (128, C128_RING_SIZE_NO_SPEC),
+        ):
+            self.assertEqual(_max_draft_tokens(compress_ratio, ring_size), 0)
+            is_overlap = compress_ratio == 4
+            for seq_len in (512, 600, 777):
+                with self.subTest(cr=compress_ratio, sl=seq_len):
+                    ctx = make_paged_context(
+                        bs=1, compress_ratio=compress_ratio, ring_size=ring_size
+                    )
+                    seq_lens, extend_lens, num_q = to_seq_extend([(seq_len, seq_len)])
+                    plan = ctx.make_prefill_plan(seq_lens, extend_lens, num_q)
+                    written = _written_positions(plan.plan_w, 0)
 
-                last_c_pos = seq_len // compress_ratio * compress_ratio
-                first_w_pos = last_c_pos - compress_ratio
-                sps = ctx.swa_page_size
-                expected = {
-                    p
-                    for p in range(seq_len)
-                    if p >= first_w_pos or p % sps >= sps - compress_ratio
-                }
-                self.assertEqual(written, expected)
+                    last_c_pos = seq_len // compress_ratio * compress_ratio
+                    first_w_pos = last_c_pos - (compress_ratio if is_overlap else 0)
+                    sps = ctx.swa_page_size
+                    expected = {
+                        p
+                        for p in range(seq_len)
+                        if p >= first_w_pos
+                        or (is_overlap and p % sps >= sps - compress_ratio)
+                    }
+                    self.assertEqual(written, expected)
 
     def test_over_capacity_under_writes(self):
         """Beyond the ring's capacity the plan silently under-writes.
