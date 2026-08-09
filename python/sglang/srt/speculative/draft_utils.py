@@ -1,4 +1,4 @@
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -45,13 +45,17 @@ class DraftBackendFactory:
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        backend_type = (
-            self.draft_attn_backend
-            if self.draft_attn_backend
-            else getattr(self.server_args, backend_name)
+        # `attention_backends()` is the split pair with the base-backend
+        # fallback already applied, which is exactly what the two names this
+        # takes used to spell out by hand (and it reads the bags, so a
+        # post-publish override follows).
+        prefill_backend, decode_backend = attention_backends()
+        configured = (
+            decode_backend
+            if backend_name == "decode_attention_backend"
+            else prefill_backend
         )
-        if backend_type is None:
-            backend_type = self.server_args.attention_backend
+        backend_type = self.draft_attn_backend or configured
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
