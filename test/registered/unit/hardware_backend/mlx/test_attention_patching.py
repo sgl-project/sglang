@@ -561,6 +561,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req_pool_idx={"r0": 0, "r1": 1},
             req_to_token_pool=req_to_token_pool,
             attention_layer_indices=[0],
+            # The fused scatter addresses pool buffers by full-attention index,
+            # so the context requires the map whenever the RoPE kernel is live.
+            full_kv_pool_index_by_layer={0: 0},
         )
 
         self.assertEqual(ctx.seq_lens, [1, 2])
