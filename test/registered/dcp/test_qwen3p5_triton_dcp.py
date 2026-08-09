@@ -45,8 +45,6 @@ class TestQwen35TritonDCPGsm8k(CustomTestCase):
             str(DCP_SIZE),
             "--attention-backend",
             "triton",
-            "--watchdog-timeout",
-            "1200",
             "--context-length",
             "1048576",
             "--disable-radix-cache",

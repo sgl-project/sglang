@@ -1527,38 +1527,24 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Current chunk K/V is still replicated within the DCP group before the
-        # masked cache write. For GQA with multiple local KV heads, select the
-        # subset belonging to this rank's global Q-head interval. Otherwise the
-        # kernel would restart GQA mapping at KV head zero on every rank.
+        # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
-            current_k = k
-            current_v = v
             if layer.tp_k_head_num > 1:
-                group_q_heads = local_heads * group.world_size
-                assert group_q_heads % layer.tp_k_head_num == 0, (
-                    f"DCP Q heads ({group_q_heads}) must be divisible by local "
-                    f"KV heads ({layer.tp_k_head_num})"
+                kv_head_start = (
+                    group.rank_in_group * layer.tp_k_head_num // group.world_size
                 )
-                q_heads_per_kv = group_q_heads // layer.tp_k_head_num
-                q_head_start = group.rank_in_group * local_heads
-                kv_head_start = q_head_start // q_heads_per_kv
-                kv_head_end = (
-                    q_head_start + local_heads + q_heads_per_kv - 1
-                ) // q_heads_per_kv
-                current_k = k[:, kv_head_start:kv_head_end].contiguous()
-                current_v = v[:, kv_head_start:kv_head_end].contiguous()
-                current_kv_heads = kv_head_end - kv_head_start
-                assert local_heads % current_kv_heads == 0, (
-                    f"Local Q heads ({local_heads}) must be divisible by selected "
-                    f"KV heads ({current_kv_heads})"
+                kv_head_end = max(
+                    (group.rank_in_group + 1) * layer.tp_k_head_num // group.world_size,
+                    kv_head_start + 1,
                 )
+                k = k[:, kv_head_start:kv_head_end]
+                v = v[:, kv_head_start:kv_head_end]
 
             empty_kv_indptr = torch.zeros_like(kv_indptr)
             self.extend_attention_fwd(
                 q_local,
-                current_k.contiguous(),
-                current_v.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
                 current_out,
                 k_buffer,
                 v_buffer,
