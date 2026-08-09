@@ -1,11 +1,8 @@
-import json
 import unittest
 import warnings
-from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.multi_model_eval_kit import run_multi_model_accuracy_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
@@ -13,17 +10,10 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
-    check_evaluation_test_results,
     parse_models,
-    popen_launch_server,
-    write_results_to_json,
 )
 
-# Nightly eval tests run large models (up to 70B+ params) that may need
-# downloading on cache miss. Use a longer timeout than the default 600s.
-NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
-
-register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
+register_cuda_ci(est_time=2880, stage="nightly", runner_config="2-gpu-large")
 
 MODEL_SCORE_THRESHOLDS = {
     # sgl-eval (zero-shot chat, \boxed{}, math_verify grading). Thresholds are
@@ -45,93 +35,50 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.40,  # 44.66% measured - 5%
 }
 
+# 70B on 2 GPUs leaves little headroom for the KV pool at the default fraction.
+_PER_MODEL_ARGS = {
+    "meta-llama/Llama-3.1-70B-Instruct": ["--mem-fraction-static", "0.9"],
+}
 
-# Do not use `CustomTestCase` since `test_gsm8k_all_models` does not want retry
+
+def _build_models():
+    by_tp = {
+        1: (
+            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
+            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
+        ),
+        2: (
+            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
+            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
+        ),
+    }
+    return [
+        ModelLaunchSettings(
+            model_path, tp_size=tp_size, extra_args=_PER_MODEL_ARGS.get(model_path)
+        )
+        for tp_size, name_lists in by_tp.items()
+        for names in name_lists
+        for model_path in parse_models(names)
+    ]
+
+
+# Do not use `CustomTestCase`: this sweep does not want retry.
 class TestNightlyGsm8KEval(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.models = []
-        models_tp1 = parse_models(
-            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
-        for model_path in models_tp1:
-            cls.models.append(ModelLaunchSettings(model_path, tp_size=1))
-
-        models_tp2 = parse_models(
-            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
-        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2)
-        for model_path in models_tp2:
-            cls.models.append(ModelLaunchSettings(model_path, tp_size=2))
-
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
     def test_gsm8k_all_models(self):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
-        is_first = True
-        all_results = []
-        for model_setup in self.models:
-            with self.subTest(model=model_setup.model_path):
-                other_args = list(model_setup.extra_args)
-                process = None
-
-                if model_setup.model_path == "meta-llama/Llama-3.1-70B-Instruct":
-                    other_args.extend(["--mem-fraction-static", "0.9"])
-
-                try:
-                    process = popen_launch_server(
-                        model=model_setup.model_path,
-                        other_args=other_args,
-                        base_url=self.base_url,
-                        timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
-                    )
-
-                    args = SimpleNamespace(
-                        base_url=self.base_url,
-                        model=model_setup.model_path,
-                        eval_name="gsm8k",
-                        api="sgl_eval",
-                        num_examples=None,
-                        num_threads=1024,
-                    )
-
-                    metrics = run_eval(args)
-                    print(
-                        f"{'=' * 42}\n{model_setup.model_path} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
-                    )
-
-                    write_results_to_json(
-                        model_setup.model_path, metrics, "w" if is_first else "a"
-                    )
-                    is_first = False
-
-                    all_results.append(
-                        (model_setup.model_path, metrics["score"], 0.0, None)
-                    )
-                except Exception as e:
-                    error_message = str(e)
-                    all_results.append(
-                        (model_setup.model_path, None, None, error_message)
-                    )
-                    print(f"Error evaluating {model_setup.model_path}: {error_message}")
-                finally:
-                    if process is not None:
-                        kill_process_tree(process.pid)
-
-        try:
-            with open("results.json", "r") as f:
-                print("\nFinal Results from results.json:")
-                print(json.dumps(json.load(f), indent=2))
-        except Exception as e:
-            print(f"Error reading results.json: {e}")
-
-        # Check all scores after collecting all results
-        check_evaluation_test_results(
-            all_results,
-            self.__class__.__name__,
-            model_accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
-            model_count=len(self.models),
+        run_multi_model_accuracy_eval(
+            self,
+            _build_models(),
+            eval_args=dict(
+                eval_name="gsm8k",
+                api="sgl_eval",
+                num_examples=None,
+                num_threads=1024,
+            ),
+            accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
+            base_url=DEFAULT_URL_FOR_TEST,
         )
 
 

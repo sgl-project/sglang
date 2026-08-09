@@ -6,8 +6,21 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
+# Runs on both H200 and B200: registered once per runner_config below.
+# Disabled at the registry rather than only via @unittest.skip, so its est_time
+# stops counting toward shard sizing for a class that exits in ~7s.
+register_cuda_ci(
+    est_time=1800,
+    stage="nightly",
+    runner_config="8-gpu-h200",
+    disabled="CI HF account has no access to meta-llama/Llama-4-Scout-17B-16E-Instruct",
+)
+register_cuda_ci(
+    est_time=1800,
+    stage="nightly",
+    runner_config="8-gpu-b200",
+    disabled="CI HF account has no access to meta-llama/Llama-4-Scout-17B-16E-Instruct",
+)
 
 LLAMA4_MODEL_PATH = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 

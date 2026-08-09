@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     parse_models,
 )
 
-register_cuda_ci(est_time=7200, suite="nightly-perf-vlm-2-gpu", nightly=True)
+register_cuda_ci(est_time=750, stage="nightly", runner_config="2-gpu-large")
 
 RESULT_DIR = "performance_results_vlms"
 
@@ -25,9 +25,6 @@ MODEL_DEFAULTS = [
         "google/gemma-3-27b-it",
     ),
     ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]),
-    # "OpenGVLab/InternVL2_5-2B",
-    # buggy in official transformers impl
-    # "openbmb/MiniCPM-V-2_6",
 ]
 
 

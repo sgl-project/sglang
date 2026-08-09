@@ -63,6 +63,30 @@ on:
         type: boolean
         default: false
 
+      scheduled:
+        description: >
+          This is a nightly/weekly run, not a per-commit one. Turns on the three
+          things that differ, none of which any per-commit stage wants: per-file
+          budgets derived from est_time (a scheduled suite mixes 30s and 2h
+          tests), the full jit_kernel grids, and metrics upload. Shards also run
+          one at a time unless the caller was dispatched with full_parallel,
+          leaving the pool to per-commit CI.
+        type: boolean
+        default: false
+      precision_baseline:
+        description: >
+          Export the rolling-baseline env that test_nightly_precision_regression.py
+          reads. Kept separate from `scheduled` because HF_TOKEN is part of that
+          set: the baseline-store token is scoped to that one repo, so exporting
+          it on a stage that does not need it shadows the runner's own token and
+          turns every gated model into a 404.
+        type: boolean
+        default: false
+      job_timeout_minutes:
+        description: 'Job-level cap, covering install and warmup on top of run_timeout_minutes. A scheduled stage needs far more than a per-commit one.'
+        type: string
+        default: '240'
+
 # Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
 # defines must be redeclared here for the called job to see the same context.
@@ -74,6 +98,7 @@ env:
   SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.scheduled && '1' || '' }}
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -90,10 +115,10 @@ jobs:
     # $b200_runner (see runner_configs.py --map). rdma_devices is exported
     # below in a setup step via $GITHUB_ENV.
     runs-on: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
-    timeout-minutes: 240
+    timeout-minutes: ${{ fromJson(inputs.job_timeout_minutes) }}
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(inputs.partitions)[inputs.self_name].max_parallel }}
+      max-parallel: ${{ (inputs.scheduled && !fromJson(inputs.caller_inputs).full_parallel) && 1 || fromJson(inputs.partitions)[inputs.self_name].max_parallel }}
       matrix:
         partition: ${{ fromJson(inputs.partitions)[inputs.self_name].arr }}
     steps:
@@ -165,16 +190,39 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
+      # Written through $GITHUB_ENV rather than the step's `env:`, because
+      # HF_TOKEN must be left ALONE on every other stage. The baseline-store
+      # token is scoped to that one repo, and an `env:` entry sets the key
+      # unconditionally -- both a wrong value and an empty one shadow the
+      # runner's own HF_TOKEN, turning every gated model into a 401.
+      - name: Export precision baseline env
+        if: inputs.precision_baseline
+        env:
+          BASELINE_HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+        run: |
+          {
+            echo "SGLANG_PRECISION_BASELINE_DIR=/tmp/sglang_precision_baselines"
+            echo "SGLANG_PRECISION_HF_REPO=${{ vars.SGLANG_PRECISION_HF_REPO }}"
+            echo "SGLANG_PRECISION_HF_REVISION=${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}"
+            echo "SGLANG_PRECISION_COMMIT=${{ github.sha }}"
+            echo "SGLANG_PRECISION_FORCE_UPDATE=${{ fromJson(inputs.caller_inputs).force_baseline_update && '1' || '0' }}"
+            echo "HF_TOKEN=${BASELINE_HF_TOKEN}"
+          } >> "$GITHUB_ENV"
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
+          RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
+          GPU_CONFIG: ${{ inputs.runner_config }}
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
             --partition-model-file /tmp/partition-model.json \
+            ${{ inputs.scheduled && '--timeout-from-est-time' || '' }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
 
@@ -182,6 +230,26 @@ jobs:
         if: inputs.extra_pytest_path != ''
         timeout-minutes: 10
         run: python3 -m pytest -q ${{ inputs.extra_pytest_path }}
+
+      - name: Collect performance metrics
+        if: ${{ always() && inputs.scheduled }}
+        run: |
+          python3 scripts/ci/utils/save_metrics.py \
+            --gpu-config ${{ inputs.runner_config }} \
+            --partition ${{ matrix.partition }} \
+            --run-id ${{ github.run_id }} \
+            --output test/metrics-${{ inputs.runner_config }}-partition-${{ matrix.partition }}.json \
+            --search-dir test/performance_results_8_gpu \
+            --search-dir test
+
+      - name: Upload partition metrics
+        if: ${{ always() && inputs.scheduled }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ inputs.runner_config }}-partition-${{ matrix.partition }}
+          path: test/metrics-${{ inputs.runner_config }}-partition-${{ matrix.partition }}.json
+          retention-days: 5
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
