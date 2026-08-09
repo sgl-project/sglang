@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
-"""KeySplit -- training-free block-sparse attention routing for video DiTs.
+"""SubBlock -- training-free block-sparse attention routing for video DiTs.
 
-Originally vendored from the standalone KeySplit repository; ``router.py`` and
+Originally vendored from the standalone SubBlock repository; ``router.py`` and
 ``kernels.py`` have since diverged from it.
 
 ``router.py`` scores every (query block, key block) pair from sub-block-pooled

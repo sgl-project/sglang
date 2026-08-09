@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KeySplit block-sparse attention backend.
+"""SubBlock block-sparse attention backend.
 
 The schedule tests are pure CPU. The numerical tests need an SM100 GPU with
 FlashInfer's ``bsa_attn_blk64_fwd`` and are skipped otherwise.
@@ -18,9 +18,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.attention.backends.keysplit_attn import (
-    KeySplitAttentionImpl,
-    KeySplitSchedule,
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn import (
+    SubBlockAttentionImpl,
+    SubBlockSchedule,
     _dit_layer_index,
 )
 
@@ -34,7 +34,7 @@ def _sm100_available() -> bool:
     if torch.cuda.get_device_capability(0)[0] != 10:
         return False
     try:
-        from sglang.multimodal_gen.runtime.layers.attention.backends.keysplit import (
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (
             load_bsa_attn_blk64_fwd,
         )
 
@@ -66,7 +66,7 @@ def _patch_step(step: int):
         current_timestep = step
 
     return patch(
-        "sglang.multimodal_gen.runtime.layers.attention.backends.keysplit_attn.get_forward_context",
+        "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn.get_forward_context",
         return_value=_Ctx(),
     )
 
@@ -123,7 +123,7 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     )
 
 
-class TestKeySplitSchedule(unittest.TestCase):
+class TestSubBlockSchedule(unittest.TestCase):
     def test_dit_layer_index_only_matches_top_level_blocks(self):
         self.assertEqual(_dit_layer_index("blocks.7.attn"), 7)
         self.assertEqual(_dit_layer_index("blocks.0.attn"), 0)
@@ -133,7 +133,7 @@ class TestKeySplitSchedule(unittest.TestCase):
 
     def test_defaults_when_config_is_empty(self):
         with _patch_schedule({}):
-            schedule = KeySplitSchedule.from_server_args()
+            schedule = SubBlockSchedule.from_server_args()
         self.assertEqual(schedule.sparsity, 0.75)
         self.assertEqual(schedule.skip_first_steps, 10)
         # Depth is not protected by default; the early steps are. See the
@@ -144,7 +144,7 @@ class TestKeySplitSchedule(unittest.TestCase):
     def test_config_overrides(self):
         config = {"sparsity": 0.9, "skip_first_steps": 3, "skip_first_layers": 5}
         with _patch_schedule(config):
-            schedule = KeySplitSchedule.from_server_args()
+            schedule = SubBlockSchedule.from_server_args()
         self.assertEqual(schedule.sparsity, 0.9)
         self.assertEqual(schedule.skip_first_steps, 3)
         self.assertEqual(schedule.skip_first_layers, 5)
@@ -153,17 +153,17 @@ class TestKeySplitSchedule(unittest.TestCase):
         for config in ({"sparsity": 1.0}, {"n_k": 3}, {"skip_first_steps": -1}):
             with self.subTest(config=config), _patch_schedule(config):
                 with self.assertRaises(ValueError):
-                    KeySplitSchedule.from_server_args()
+                    SubBlockSchedule.from_server_args()
 
 
-class TestKeySplitGating(unittest.TestCase):
+class TestSubBlockGating(unittest.TestCase):
     """The schedule must decide sparsity from the layer and the step alone."""
 
-    def _impl(self, prefix: str, **config) -> KeySplitAttentionImpl:
+    def _impl(self, prefix: str, **config) -> SubBlockAttentionImpl:
         with _patch_schedule(config), patch.object(
-            KeySplitAttentionImpl, "_build_dense_impl", return_value=None
+            SubBlockAttentionImpl, "_build_dense_impl", return_value=None
         ):
-            return KeySplitAttentionImpl(
+            return SubBlockAttentionImpl(
                 num_heads=NUM_HEADS,
                 head_size=HEAD_DIM,
                 causal=False,
@@ -192,9 +192,9 @@ class TestKeySplitGating(unittest.TestCase):
 
     def test_head_dim_other_than_128_is_dense(self):
         with _patch_schedule({}), patch.object(
-            KeySplitAttentionImpl, "_build_dense_impl", return_value=None
+            SubBlockAttentionImpl, "_build_dense_impl", return_value=None
         ):
-            impl = KeySplitAttentionImpl(
+            impl = SubBlockAttentionImpl(
                 num_heads=NUM_HEADS,
                 head_size=64,
                 causal=False,
@@ -223,12 +223,12 @@ class TestKeySplitGating(unittest.TestCase):
 
 
 @requires_sm100
-class TestKeySplitNumerics(unittest.TestCase):
+class TestSubBlockNumerics(unittest.TestCase):
     seq_len = 8192
 
-    def _impl(self, **config) -> KeySplitAttentionImpl:
+    def _impl(self, **config) -> SubBlockAttentionImpl:
         with _patch_schedule(config):
-            return KeySplitAttentionImpl(
+            return SubBlockAttentionImpl(
                 num_heads=NUM_HEADS,
                 head_size=HEAD_DIM,
                 causal=False,
@@ -263,7 +263,7 @@ class TestKeySplitNumerics(unittest.TestCase):
         number of blocks but chosen at random the output collapses, so a high
         cosine here measures the routing, not a forgiving fixture.
         """
-        from sglang.multimodal_gen.runtime.layers.attention.backends.keysplit import (
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (
             SubBlockRouter,
             load_bsa_attn_blk64_fwd,
         )

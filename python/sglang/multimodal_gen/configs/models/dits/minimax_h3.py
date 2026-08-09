@@ -20,7 +20,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
             AttentionBackendEnum.FA,
             AttentionBackendEnum.AITER,
             AttentionBackendEnum.TORCH_SDPA,
-            AttentionBackendEnum.KEYSPLIT,
+            AttentionBackendEnum.SUBBLOCK,
         }
     )
 

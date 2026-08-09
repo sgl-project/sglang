@@ -254,27 +254,27 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video MoBA Attention backend is not installed. ") from e
 
 
-class _KeySplitAttentionBackendResolver(_CudaAttentionBackendResolver):
-    backend = AttentionBackendEnum.KEYSPLIT
+class _SubBlockAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK
 
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from sglang.multimodal_gen.runtime.layers.attention.backends.keysplit import (  # noqa: F401
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock import (  # noqa: F401
                 load_bsa_attn_blk64_fwd,
             )
-            from sglang.multimodal_gen.runtime.layers.attention.backends.keysplit_attn import (  # noqa: F401
-                KeySplitAttentionBackend,
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn import (  # noqa: F401
+                SubBlockAttentionBackend,
             )
 
             # The 64-block sparse kernel is SM100-only; loading it here turns a
             # mid-denoise failure into a startup error.
             load_bsa_attn_blk64_fwd()
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.keysplit_attn.KeySplitAttentionBackend"
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_attn.SubBlockAttentionBackend"
         except Exception as e:
-            logger.error("Failed to import KeySplit attention backend: %s", str(e))
+            logger.error("Failed to import SubBlock attention backend: %s", str(e))
             raise ImportError(
-                "KeySplit attention needs FlashInfer with the blk64 block-sparse "
+                "SubBlock attention needs FlashInfer with the blk64 block-sparse "
                 "kernel (flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)."
             ) from e
 
@@ -319,7 +319,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _VideoSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _VMOBAAttentionBackendResolver,
-        _KeySplitAttentionBackendResolver,
+        _SubBlockAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )

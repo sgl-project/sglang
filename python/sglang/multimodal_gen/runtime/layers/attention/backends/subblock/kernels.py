@@ -124,7 +124,7 @@ def fused_scores(
     out,
     n_k,
     n_valid,
-    n_q_reduce=1,
+    n_q=1,
     m_valid=None,
     num_warps=4,
     num_stages=3,
@@ -134,10 +134,8 @@ def fused_scores(
     """qp: [L, Gq*n_q, D] bf16 (already carrying softmax_scale*log2e),
     kp: [L, Gk*n_k, D] bf16 -> out, natural-log scores.
 
-    ``n_q_reduce`` query sub-cells are folded together by log-sum-exp, so out is
-    [L, Gq*n_q // n_q_reduce, Gk]: pass n_q to get one score per query block, or
-    1 to keep the query sub-blocks apart for a caller that will normalise each
-    by its own denominator first.
+    The n_q query sub-cells of a query block are folded together by log-sum-exp,
+    so out is [L, Gq, Gk].
 
     ``n_valid`` / ``m_valid`` are the counts of key / query sub-cells holding at
     least one real token; the rest pooled to zero and must not contribute.
@@ -146,7 +144,7 @@ def fused_scores(
     N = kp.shape[1]
     Mout, Nout = out.shape[1], out.shape[2]
     assert blk_n % n_k == 0, "the key tile must hold whole blocks"
-    assert blk_m % n_q_reduce == 0, "the query tile must hold whole blocks"
+    assert blk_m % n_q == 0, "the query tile must hold whole blocks"
     grid = (triton.cdiv(M, blk_m), triton.cdiv(N, blk_n), L)
     _score_kernel[grid](
         qp,
@@ -167,7 +165,7 @@ def fused_scores(
         BLK_M=blk_m,
         BLK_N=blk_n,
         NK=n_k,
-        NQR=n_q_reduce,
+        NQR=n_q,
         D=D,
         num_warps=num_warps,
         num_stages=num_stages,

@@ -47,6 +47,23 @@ end to end than any ``n_q=1`` setting.
 ``[Gq*n_q, Gk*n_k]``, and at the shipped sparsity of 0.75 no estimator in this family has
 yet separated from any other on the output.
 
+One thing not to retry without new evidence
+-------------------------------------------
+Summing un-normalised sub-block mass over the query axis lets the hottest query sub-block
+own a block's score, and the true per-row attention carries a ``1/Z_r`` the raw sum drops,
+which over-weights exactly the rows whose attention is spread widest -- the rows that lose
+least from dropping any one block. Turning each query sub-block into a distribution over
+key blocks first fixes that, and on 1092 real (cell, head, query block) samples at
+n_q=n_k=4, sparsity 0.9 it measured better on both proxies: block mass recall .6741 ->
+.6779 and relative L2 of the rebuilt attention output .2043 -> .1982, paired t = +8.0 and
+-5.7.
+
+It is worse in the pixels, on **0 of 15** prompts, by 0.107 cosine against the dense render
+(paired t = -6.4). Single-layer output error, even measured directly, does not order these
+estimators the way 40 denoise steps through 50 layers do. Nothing short of an end-to-end
+render has predicted this correctly yet -- neither block mass recall nor single-step output
+L2.
+
 Usage
 -----
     router = SubBlockRouter(n_k=4)
@@ -213,12 +230,6 @@ class SubBlockRouter:
         workspace_bytes: cap on the live score matrix (torch backend only). Heads are tiled only if
             ``[B, H, Gq, Gk*n_k]`` fp32 would exceed it -- tiling a matrix that already
             fits measured consistently slower.
-        normalise_q: turn each query sub-block into a distribution over key blocks before
-            the sub-blocks are summed. Only bites at n_q>1, where the raw sum is over
-            un-normalised mass and the hottest query sub-block owns the block's score.
-            Measured on 1092 real (cell, head, query block) samples at n_q=n_k=4,
-            sparsity 0.9: mass recall .6741 -> .6779 and relative L2 of the rebuilt
-            attention output .2043 -> .1982 (paired t = +8.0 and -5.7).
 
     Structural block reservation (an attention sink, or forcing the diagonal
     j == i) was measured on 200 real H3 attention cells and is deliberately
@@ -237,7 +248,6 @@ class SubBlockRouter:
         select_iters: int | None = None,
         score_dtype: torch.dtype = torch.float32,
         workspace_bytes: int = 8 << 30,
-        normalise_q: bool = True,
     ) -> None:
         if n_k not in VALID_N or n_q not in VALID_N:
             raise ValueError(
@@ -253,7 +263,6 @@ class SubBlockRouter:
         self.select_iters = select_iters
         self.score_dtype = score_dtype
         self.workspace_bytes = workspace_bytes
-        self.normalise_q = normalise_q
         self.last_topk = 0
 
     # ------------------------------------------------------------------ fused path
@@ -280,13 +289,7 @@ class SubBlockRouter:
         fused_pool(q, q_cells, sub_q, qp, scale=softmax_scale * LOG2E)
         fused_pool(k, k_cells, sub_k, kp)
 
-        # Normalising each query sub-block needs a denominator over *every* key
-        # block, which no single tile of the score kernel can see, so that case
-        # keeps the query sub-blocks apart and folds them in a second pass.
-        fold = nq if self._folds_query_in_kernel else 1
-        out = torch.empty(
-            L, q_cells // fold, gk, device=q.device, dtype=self.score_out_dtype
-        )
+        out = torch.empty(L, gq, gk, device=q.device, dtype=self.score_out_dtype)
         # sub-cells holding >= 1 real token; the rest pooled to zero
         fused_scores(
             qp,
@@ -294,48 +297,10 @@ class SubBlockRouter:
             out,
             nk,
             -(-sk // sub_k),
-            n_q_reduce=fold,
+            n_q=nq,
             m_valid=-(-s // sub_q),
         )
-        if not self._folds_query_in_kernel:
-            out = self._normalise_query_subblocks(out, gq, nq)
         return out.view(b, h, gq, gk)
-
-    @property
-    def _folds_query_in_kernel(self) -> bool:
-        """True when the score kernel can collapse n_q on its own.
-
-        With ``normalise_q`` off there is nothing to do between the two
-        reductions, and at n_q=1 normalising cannot change the selection: the
-        denominator is one per query block, and a constant per row leaves top-k
-        alone. Either way the single-pass kernel is exact and cheaper.
-        """
-        return self.n_q == 1 or not self.normalise_q
-
-    @staticmethod
-    def _normalise_query_subblocks(
-        scores: torch.Tensor, gq: int, nq: int
-    ) -> torch.Tensor:
-        """``[L, Gq*n_q, Gk]`` log-scores -> ``[L, Gq, Gk]``, still log-space.
-
-        Each query sub-block is turned into a distribution over key blocks
-        before the sub-blocks are added together, so a block's score is how much
-        of its queries' attention it holds rather than how large their raw
-        exponentials happen to be. Without this the sum is over un-normalised
-        mass and the hottest query sub-block owns the result -- and the true
-        per-row attention carries a 1/Z the raw sum drops, which over-weights
-        exactly the rows whose attention is spread widest and which therefore
-        lose least from dropping any one block.
-
-        The log at the end is not cosmetic. Summed probabilities land in a
-        narrow band around n_q/Gk, and the fused selector resolves its threshold
-        in log2(Gk/k) steps and then breaks ties by column index: handed that
-        band it agreed with an exact top-k on 12% of its picks, against 99.99%
-        in log space.
-        """
-        prob = torch.softmax(scores.float(), dim=-1)
-        summed = prob.view(scores.shape[0], gq, nq, scores.shape[-1]).sum(2)
-        return summed.clamp_min(torch.finfo(summed.dtype).tiny).log()
 
     # ------------------------------------------------------------------ scores
     @torch.no_grad()
@@ -370,19 +335,6 @@ class SubBlockRouter:
         for h0 in range(0, h, hc):
             h1 = min(h0 + hc, h)
             z = torch.matmul(qp[:, h0:h1], kp[:, h0:h1].transpose(-2, -1))
-            if not self._folds_query_in_kernel:
-                # Each query sub-block is normalised by its own denominator
-                # before they are added, so they stay apart through the key-side
-                # reduction. No (n_q, n_k) interleave is needed for that.
-                zq = z.view(b, h1 - h0, gq * nq, gk, nk).float()
-                zq = zq.masked_fill(~kmask.view(1, 1, 1, gk, nk), -float("inf"))
-                zq = zq.masked_fill(~qmask.view(1, 1, gq * nq, 1, 1), -float("inf"))
-                per_sub = torch.nan_to_num(torch.logsumexp(zq, dim=-1), neginf=-3.0e38)
-                out[:, h0:h1] = self._normalise_query_subblocks(
-                    per_sub.reshape(-1, gq * nq, gk), gq, nq
-                ).view(b, h1 - h0, gq, gk)
-                del z, zq, per_sub
-                continue
             if nq == 1:
                 # already [b,hc,Gq,Gk*nk]; the (Gk,nk) split is contiguous, no permute
                 zz = z.view(b, h1 - h0, gq, gk, nk)
