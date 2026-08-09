@@ -18,6 +18,22 @@ from sglang.srt.mem_cache.registry import (
 )
 from sglang.test.test_utils import CustomTestCase
 
+_PUBLISHED = []
+
+
+def _publish(**fields):
+    from sglang.srt.runtime_context import get_context, get_server_args
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    _PUBLISHED.append(override)
+    return get_server_args()
+
+
+def tearDownModule():
+    while _PUBLISHED:
+        _PUBLISHED.pop().restore()
+
 
 def _make_ctx(
     *,
@@ -32,11 +48,15 @@ def _make_ctx(
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
 ):
-    server_args = MagicMock()
-    server_args.radix_cache_backend = backend
-    server_args.enable_streaming_session = enable_streaming
-    server_args.enable_lmcache = enable_lmcache
-    server_args.enable_flexkv = False
+    # The factory reads the published bags for the cache-backend leaves, so the
+    # fixture publishes them; the instance stays for the whole-object contract
+    # `TreeCacheBuildContext` carries.
+    server_args = _publish(
+        radix_cache_backend=backend,
+        enable_streaming_session=enable_streaming,
+        enable_lmcache=enable_lmcache,
+        enable_flexkv=False,
+    )
     return TreeCacheBuildContext(
         server_args=server_args,
         params=MagicMock(),

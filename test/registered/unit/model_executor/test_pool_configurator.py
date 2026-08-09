@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -33,6 +33,28 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
+
+
+_PUBLISHED = []
+
+
+def _publish_config(**fields):
+    """Publish the configuration a runner double describes.
+
+    Installed per call (last publish wins, which is what each case wants) and
+    unwound at module teardown -- the fixture is a module function, so there is
+    no per-case hook to hang the restore on.
+    """
+    from sglang.srt.runtime_context import get_context
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    _PUBLISHED.append(override)
+
+
+def tearDownModule():
+    while _PUBLISHED:
+        _PUBLISHED.pop().restore()
 
 
 def _make_model_runner(
@@ -105,27 +127,28 @@ def _make_model_runner(
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
-    sa = SimpleNamespace()
-    sa.max_total_tokens = None
-    sa.swa_full_tokens_ratio = swa_full_tokens_ratio
-    sa.page_size = page_size
-    sa.disable_radix_cache = disable_radix_cache
-    sa.chunked_prefill_size = chunked_prefill_size
-    sa.disable_overlap_schedule = disable_overlap_schedule
-    sa.speculative_num_draft_tokens = speculative_num_draft_tokens
-    sa.max_speculative_num_draft_tokens = (
-        max_speculative_num_draft_tokens or speculative_num_draft_tokens
+    # The configurator reads the published bags, so the double publishes the
+    # configuration it describes rather than standing in for the record. The
+    # instance stays for the whole-object hand-offs the configurator still does.
+    _publish_config(
+        max_total_tokens=None,
+        swa_full_tokens_ratio=swa_full_tokens_ratio,
+        page_size=page_size,
+        disable_radix_cache=disable_radix_cache,
+        chunked_prefill_size=chunked_prefill_size,
+        disable_overlap_schedule=disable_overlap_schedule,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        speculative_algorithm=speculative_algorithm,
+        speculative_num_steps=speculative_num_steps,
+        speculative_eagle_topk=speculative_eagle_topk,
+        disaggregation_mode=disaggregation_mode,
+        max_running_requests=max_running_requests,
+        disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        enable_hisparse=False,
+        enable_dsa_cache_layer_split=False,
+        kv_cache_dtype="auto",
     )
-    sa.speculative_algorithm = speculative_algorithm
-    sa.speculative_num_steps = speculative_num_steps
-    sa.speculative_eagle_topk = speculative_eagle_topk
-    sa.disaggregation_mode = disaggregation_mode
-    sa.max_running_requests = max_running_requests
-    sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
-    sa.enable_hisparse = False
-    sa.enable_dsa_cache_layer_split = False
-    sa.kv_cache_dtype = "auto"
-    mr.server_args = sa
+    mr.server_args = get_server_args()
 
     spec = MagicMock()
     spec.is_eagle.return_value = False

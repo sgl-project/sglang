@@ -24,6 +24,23 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+_PUBLISHED = []
+
+
+def _publish(**fields):
+    from sglang.srt.runtime_context import get_context, get_server_args
+
+    override = get_context().override_server_args(**fields)
+    override.install()
+    _PUBLISHED.append(override)
+    return get_server_args()
+
+
+def tearDownModule():
+    while _PUBLISHED:
+        _PUBLISHED.pop().restore()
+
+
 def make_runner(
     *,
     state_dtype=torch.bfloat16,
@@ -31,7 +48,9 @@ def make_runner(
     value_dim=128,
     **arg_overrides,
 ):
-    args = SimpleNamespace(
+    # The policy reads the published bags, so the fixture publishes the
+    # configuration under test instead of standing in for the record.
+    fields = dict(
         linear_attn_backend="triton",
         linear_attn_prefill_backend=None,
         uses_mamba_radix_cache=False,
@@ -40,8 +59,8 @@ def make_runner(
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
     )
-    for name, value in arg_overrides.items():
-        setattr(args, name, value)
+    fields.update(arg_overrides)
+    args = _publish(**fields)
 
     return SimpleNamespace(
         server_args=args,

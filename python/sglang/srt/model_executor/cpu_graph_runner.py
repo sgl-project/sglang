@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -131,10 +131,10 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # Reuse cuda_graph_config[decode].bs here.
     # Users can customize the batch sizes supported by cpu_graph, such as:
     # --cuda-graph-bs-decode 1 2 4 8 16
-    capture_bs = server_args.cuda_graph_config.decode.bs
+    capture_bs = get_exec().graph.cuda_graph_config.decode.bs
     assert (
-        max(capture_bs) <= server_args.torch_compile_max_bs
-    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
+        max(capture_bs) <= get_exec().graph.torch_compile_max_bs
+    ), f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"

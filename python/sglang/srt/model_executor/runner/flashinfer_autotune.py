@@ -25,6 +25,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_spec,
+)
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -60,14 +65,15 @@ def should_run_flashinfer_autotune(
     server_args = mr.server_args
     if for_speculative_draft:
         backend_str = (
-            server_args.speculative_moe_runner_backend or server_args.moe_runner_backend
+            get_spec().speculative_moe_runner_backend
+            or get_exec().moe.moe_runner_backend
         )
         a2a_backend_str = (
-            server_args.speculative_moe_a2a_backend or server_args.moe_a2a_backend
+            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
         )
     else:
-        backend_str = server_args.moe_runner_backend
-        a2a_backend_str = server_args.moe_a2a_backend
+        backend_str = get_exec().moe.moe_runner_backend
+        a2a_backend_str = get_exec().moe.moe_a2a_backend
 
     # Autotune can run before the MoE backend globals are initialized, so read
     # the target or draft backend from server_args. CuteDSL v1 bypasses
@@ -135,10 +141,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
     server_args = mr.server_args
     model_key_parts = [
-        str(server_args.model_path),
+        str(get_model().model_path),
         str(mr.dtype),
-        str(server_args.quantization),
-        str(server_args.moe_runner_backend),
+        str(get_model().quantization),
+        str(get_exec().moe.moe_runner_backend),
         str(mr.ps.tp_size),
         str(mr.ps.pp_size),
         str(mr.ps.attn_dp_size),

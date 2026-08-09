@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.srt.runtime_context import (
+    attention_backends,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -161,7 +165,6 @@ def resolve_attention_backend_strs(
     target and draft coexist in one process, so it cannot come from the
     process-wide config.
     """
-    server_args = model_runner.server_args
     is_draft_worker = model_runner.is_draft_worker
     draft_attn_backend = model_runner.draft_attention_backend
     if is_draft_worker and draft_attn_backend:
@@ -172,7 +175,10 @@ def resolve_attention_backend_strs(
             decode=draft_attn_backend,
             is_draft_override=True,
         )
-    prefill, decode = server_args.get_attention_backends()
+    # The published pair, not the supplied record: this runs after publish, so
+    # it follows a post-publish override of the backend leaves the way every
+    # other consumer of the pair does.
+    prefill, decode = attention_backends()
     return ResolvedAttentionBackendStr(prefill=prefill, decode=decode)
 
 

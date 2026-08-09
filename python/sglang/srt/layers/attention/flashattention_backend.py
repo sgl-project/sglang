@@ -30,7 +30,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_memory, get_model, get_schedule, get_spec
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -319,9 +319,9 @@ class FlashAttentionBackend(AttentionBackend):
         # cache via get_key_buffer in the absorbed-MLA path.
         server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
-            server_args.is_embedding
-            and server_args.chunked_prefill_size == -1
-            and server_args.disable_radix_cache
+            get_model().is_embedding
+            and get_schedule().chunked_prefill_size == -1
+            and get_memory().disable_radix_cache
             and not self.use_mla
         )
 
