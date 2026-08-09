@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+
 from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl as cutedsl
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
@@ -11,6 +12,10 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.test.ci.ci_register import register_cpu_ci
+
+
+register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
 class _DirectWrapper:

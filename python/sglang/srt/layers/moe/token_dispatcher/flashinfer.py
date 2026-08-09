@@ -4,6 +4,7 @@ import logging
 from typing import NamedTuple, Optional
 
 import torch
+
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -34,6 +35,7 @@ try:
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig
+
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
