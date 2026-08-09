@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
@@ -27,6 +28,14 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
 # ---------------------------------------------------------------------------
+
+
+def gpu_mm_preprocess_enabled() -> bool:
+    """Whether the GPU image-preprocessing fast path may be used; the
+    PIL/CPU reference path (the checkpoint's own HF processor) runs otherwise."""
+    return (
+        torch.cuda.is_available() and not envs.SGLANG_USE_PIL_MM_PREPROCESS.get()
+    )
 
 
 def navit_resize_config(
@@ -388,7 +397,7 @@ class KimiGPUProcessorWrapper:
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
 
-        if images and torch.cuda.is_available():
+        if images and gpu_mm_preprocess_enabled():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 

@@ -977,6 +977,9 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    # Select the PIL/CPU reference image preprocessing over the GPU fast paths
+    # (nvJPEG decode + GPU resize/normalize) — for accuracy baselines.
+    SGLANG_USE_PIL_MM_PREPROCESS = EnvBool(False)
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)

@@ -28,6 +28,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
     _gpu_preprocess_images,
+    gpu_mm_preprocess_enabled,
     navit_resize_config,
 )
 from sglang.srt.utils.cuda_ipc_transport_utils import (
@@ -211,7 +212,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
     def __call__(self, text=None, images=None, **kwargs):
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
-        if images and torch.cuda.is_available():
+        if images and gpu_mm_preprocess_enabled():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
