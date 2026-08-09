@@ -140,6 +140,17 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._graph_track_conv_indices = torch.zeros(
             (max_bs, self.conv_state_len), dtype=torch.int64, device=dev
         )
+        # Inert track fields for graph capture: a capture warmup batch that
+        # carries no tracking metadata must still LAUNCH the track scatter
+        # (all rows masked off), or the python-level `if` specializes the
+        # scatter out of the captured graph.
+        self._graph_track_inert_mask = torch.zeros(max_bs, dtype=torch.bool, device=dev)
+        self._graph_track_inert_indices = torch.zeros(
+            max_bs, dtype=torch.int64, device=dev
+        )
+        self._graph_track_inert_seqlens = torch.zeros(
+            max_bs, dtype=torch.int64, device=dev
+        )
         # Same address-stability requirement; the base only sizes this from
         # init_cuda_graph_state, which the prefill graph never calls.
         self._alloc_cache_indices_buf(max_bs)
@@ -419,7 +430,15 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         every row it may read must index inside *this* replay's token buffer.
         """
         if forward_batch.mamba_track_mask is None:
-            return
+            if not on_graph_path:
+                self.sconv_metadata.track_conv_indices = None
+                return
+            # Graph capture must still launch the track scatter (see the inert
+            # buffers in __init__).
+            rows = forward_batch.batch_size
+            forward_batch.mamba_track_mask = self._graph_track_inert_mask[:rows]
+            forward_batch.mamba_track_indices = self._graph_track_inert_indices[:rows]
+            forward_batch.mamba_track_seqlens = self._graph_track_inert_seqlens[:rows]
         rows = forward_batch.batch_size
         query_start_loc = self.sconv_metadata.query_start_loc
         live = min(
