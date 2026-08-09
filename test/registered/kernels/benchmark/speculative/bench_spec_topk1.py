@@ -83,9 +83,7 @@ def accelerated_draft_topk1_postprocess(
         return _aiter_draft_topk1_postprocess(
             logits, positions, draft_tokens, draft_token_column
         )
-    return draft_topk1_postprocess(
-        logits, positions, draft_tokens, draft_token_column
-    )
+    return draft_topk1_postprocess(logits, positions, draft_tokens, draft_token_column)
 
 
 def softmax_max_draft_topk1_postprocess(logits: torch.Tensor, positions: torch.Tensor):
@@ -173,9 +171,7 @@ def benchmark_chain_materialize(
 ) -> tuple[float, float, float]:
     seed_topk_index, logits, positions = make_chain_case(batch_size, vocab_size)
     if provider == "accelerated":
-        fn = lambda: accelerated_chain_materialize(
-            seed_topk_index, logits, positions
-        )
+        fn = lambda: accelerated_chain_materialize(seed_topk_index, logits, positions)
     elif provider == "eager":
         fn = lambda: eager_chain_materialize(seed_topk_index, logits, positions)
     else:
