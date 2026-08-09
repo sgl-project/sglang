@@ -124,6 +124,10 @@ _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
+    # Headless trunk, resolved in _load_model. The class default covers unit
+    # tests that build runners via object.__new__ without loading a model.
+    _trunk = None
+
     def __init__(
         self,
         model_path: str,
@@ -495,6 +499,17 @@ class MlxModelRunner:
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
 
+        # mlx-lm models expose the headless trunk as ``Model.model``; without
+        # it, non-final chunked-prefill chunks cannot skip the logit head.
+        trunk = getattr(self.model, "model", None)
+        self._trunk = trunk if callable(trunk) else None
+        if self._trunk is None:
+            logger.info(
+                "Model %s exposes no headless trunk (`.model`); non-final "
+                "chunked-prefill chunks will compute full vocab logits.",
+                type(self.model).__name__,
+            )
+
         # Optional: Path B fusion — keep up_proj/gate_proj weights separate
         # (no matmul-kernel tile regression) but fuse the swiglu activation
         # into the gate matmul via a custom Metal kernel. Activated by
@@ -677,6 +692,7 @@ class MlxModelRunner:
         new_slot_ids: list[int],
         req_pool_idx: int,
         req: Any | None = None,
+        needs_logits: bool = True,
     ) -> int:
         """Prefill a request.  Returns next_token_id."""
         pending = self.prefill_start(
@@ -687,6 +703,7 @@ class MlxModelRunner:
             new_slot_ids=new_slot_ids,
             req_pool_idx=req_pool_idx,
             req=req,
+            needs_logits=needs_logits,
         )
         self._eval_with_cache(pending.lazy_token, pending.cache)
         return self.prefill_finalize(pending)
@@ -696,9 +713,12 @@ class MlxModelRunner:
         req_id: str,
         new_token_ids: list[int],
         new_slot_ids: list[int],
+        needs_logits: bool = True,
     ) -> int:
         """Continue prefill for a chunked request.  Returns next_token_id."""
-        pending = self.extend_start(req_id, new_token_ids, new_slot_ids)
+        pending = self.extend_start(
+            req_id, new_token_ids, new_slot_ids, needs_logits=needs_logits
+        )
         self._eval_with_cache(pending.lazy_token, self._req_caches[req_id])
         return self.extend_finalize(pending)
 
@@ -789,6 +809,7 @@ class MlxModelRunner:
         new_slot_ids: list[int],
         req_pool_idx: int,
         req: Any | None = None,
+        needs_logits: bool = True,
     ) -> MlxPendingPrefill:
         """Queue a prefill forward pass without evaluating.
 
@@ -796,6 +817,9 @@ class MlxModelRunner:
         next-token ``mx.array`` plus everything needed to commit the
         request in :meth:`prefill_finalize`.  The caller drives the GPU
         by handing ``lazy_token`` (and cache state) to ``mx.async_eval``.
+
+        ``needs_logits=False`` marks the first chunk of a chunked prompt
+        (its next-token output is discarded); see :meth:`extend_start`.
         """
         prefix_len = len(prefix_slot_ids)
         if req is not None:
@@ -804,9 +828,7 @@ class MlxModelRunner:
         if self.disable_radix_cache:
             cache = self._acquire_cache()
             input_ids = mx.array([new_token_ids], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
-            logits = self._extract_logits(model_output)
-            lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+            lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
             return MlxPendingPrefill(
                 lazy_token=lazy_token,
                 cache=cache,
@@ -860,9 +882,7 @@ class MlxModelRunner:
                 # allocated attention KV below.
                 cache = self._acquire_cache()
                 input_ids = mx.array([full_token_ids or new_token_ids], dtype=mx.int32)
-                model_output = self.model(input_ids, cache=cache)
-                logits = self._extract_logits(model_output)
-                lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+                lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
                 if new_slot_ids:
                     self._sync_new_kv_to_pool(cache, prefix_len, new_slot_ids)
                 return MlxPendingPrefill(
@@ -883,7 +903,10 @@ class MlxModelRunner:
                 # aux + SWA is rejected at init, so run_token_ids is
                 # new_token_ids on this branch.
                 input_ids = mx.array([new_token_ids[:track_new_count]], dtype=mx.int32)
-                self.model(input_ids, cache=cache)
+                # Cache side effects only — this intermediate forward's
+                # output is never read, so skip the head when possible.
+                if self._trunk_forward(input_ids, cache) is None:
+                    self.model(input_ids, cache=cache)
                 self._store_tracked_auxiliary_state(req, cache, track_len)
                 if pool_backed_attention:
                     cache = self._materialize_pool_backed_attention(cache)
@@ -900,14 +923,10 @@ class MlxModelRunner:
                 c.offset = max(c.offset - 1, 0)
 
         input_ids = mx.array([extend_tokens], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
-        logits = self._extract_logits(model_output)
+        lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
 
         if track_len is not None and track_len == prefix_len + new_token_count:
             self._store_tracked_auxiliary_state(req, cache, track_len)
-
-        last_logits = logits[:, -1, :]
-        lazy_token = mx.argmax(last_logits, axis=-1)
 
         # Convert pool-backed attention KV to contiguous attention KV for decode.
         # This appends a lazy slice-assign onto the forward graph; the
@@ -949,8 +968,14 @@ class MlxModelRunner:
         req_id: str,
         new_token_ids: list[int],
         new_slot_ids: list[int],
+        needs_logits: bool = True,
     ) -> MlxPendingExtend:
-        """Queue chunked-prefill continuation without evaluating."""
+        """Queue chunked-prefill continuation without evaluating.
+
+        ``needs_logits=False`` marks a non-final chunk whose next-token
+        output the scheduler discards; the logit head is skipped when the
+        model exposes a headless trunk.
+        """
         assert (
             req_id in self._req_caches
         ), f"extend_start called for unknown request {req_id}"
@@ -958,9 +983,7 @@ class MlxModelRunner:
         cache = self._req_caches[req_id]
 
         input_ids = mx.array([new_token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
-        logits = self._extract_logits(model_output)
-        lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+        lazy_token = self._forward_lazy_token(input_ids, cache, needs_logits)
 
         if not self.disable_radix_cache and new_slot_ids:
             synced = self._req_synced_offset[req_id]
@@ -992,6 +1015,48 @@ class MlxModelRunner:
             self._req_caches[pending.req_id],
         )
         return next_token
+
+    def _trunk_forward(self, input_ids: mx.array, cache: list[Any]) -> mx.array | None:
+        """Run the model WITHOUT its logit head, for cache side effects only.
+
+        Non-final chunked-prefill chunks discard their next-token output
+        (``extend_finalize`` pops it), yet the full model call still computes
+        vocab-sized float32 logits for every chunk position — for a 200K-vocab
+        model that is ~100x the useful head work and the largest transient
+        allocation in the process.  ``self._trunk`` is resolved once at load;
+        returns None when the model exposes no headless trunk (caller falls
+        back to the full forward).
+        """
+        if self._trunk is None:
+            return None
+        return self._trunk(input_ids, cache=cache)
+
+    def _forward_lazy_token(
+        self, input_ids: mx.array, cache: list[Any], needs_logits: bool
+    ) -> mx.array:
+        """Forward one chunk, returning the lazy next-token array.
+
+        Skips the logit head for discarded-output chunks when possible.
+        """
+        if not needs_logits:
+            hidden = self._trunk_forward(input_ids, cache)
+            if hidden is not None:
+                return self._dummy_next_token(hidden)
+        model_output = self.model(input_ids, cache=cache)
+        logits = self._extract_logits(model_output)
+        return mx.argmax(logits[:, -1, :], axis=-1)
+
+    @staticmethod
+    def _dummy_next_token(hidden: mx.array) -> mx.array:
+        """Graph-connected placeholder token for a skipped-head chunk.
+
+        Value is always 0 (a valid vocab id); it is appended and then popped
+        as the "stale intermediate token" by the next chunk's finalize.
+        Deriving it from ``hidden`` keeps the trunk in the lazy graph handed
+        to ``mx.eval``/``mx.async_eval`` (cache arrays are also evaluated
+        explicitly by both call paths).
+        """
+        return (hidden[:, -1, 0] * 0).astype(mx.int32)
 
     def _extract_model_components(self):
         """Cache embedding, norm, and lm_head for layer-by-layer hybrid forward."""

@@ -54,6 +54,9 @@ class _FakeRunner:
     def __init__(self, known_rids):
         self._known = set(known_rids)
         self.calls: list[tuple[str, str]] = []  # (op, rid)
+        # (op, rid) -> needs_logits as received; guards the worker's
+        # chunk-finality derivation reaching the runner intact.
+        self.logits_flags: dict[tuple[str, str], bool] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -74,8 +77,9 @@ class _FakeRunner:
         return SimpleNamespace(state=[mx.array([0.0], dtype=mx.float32)])
 
     # --- sync surface ---
-    def extend(self, rid, new_token_ids, new_slot_ids):
+    def extend(self, rid, new_token_ids, new_slot_ids, needs_logits=True):
         self.calls.append(("extend", rid))
+        self.logits_flags[("extend", rid)] = needs_logits
         self._counter += 1
         return 1000 + self._counter
 
@@ -93,15 +97,18 @@ class _FakeRunner:
         new_slot_ids,
         req_pool_idx,
         req=None,
+        needs_logits=True,
     ):
         self.calls.append(("prefill", req_id))
+        self.logits_flags[("prefill", req_id)] = needs_logits
         return 3000
 
     # --- async surface ---
-    def extend_start(self, req_id, new_token_ids, new_slot_ids):
+    def extend_start(self, req_id, new_token_ids, new_slot_ids, needs_logits=True):
         import mlx.core as mx
 
         self.calls.append(("extend_start", req_id))
+        self.logits_flags[("extend_start", req_id)] = needs_logits
         self._req_caches[req_id] = [self._fake_cache_layer()]
         return SimpleNamespace(lazy_token=mx.array([0], dtype=mx.int32), req_id=req_id)
 
@@ -114,10 +121,12 @@ class _FakeRunner:
         new_slot_ids,
         req_pool_idx,
         req=None,
+        needs_logits=True,
     ):
         import mlx.core as mx
 
         self.calls.append(("prefill_start", req_id))
+        self.logits_flags[("prefill_start", req_id)] = needs_logits
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
@@ -142,6 +151,11 @@ class _FakeReq:
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
         self.req_pool_idx = req_pool_idx
+        # Mirrors Req's chunk-finality contract read by
+        # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
+        # "not truncated" (final chunk / plain prefill).
+        self.extend_range = None
+        self.full_untruncated_fill_ids = self.fill_ids
 
     def get_fill_ids(self):
         return self.fill_ids
@@ -201,6 +215,21 @@ class TestMlxExtendRouting(unittest.TestCase):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend"])
+        # Untruncated (extend_range None) => final chunk => logits required.
+        self.assertIs(runner.logits_flags[("extend", "r1")], True)
+
+    def test_sync_non_final_chunk_skips_logits(self):
+        """Head-skip derivation: a scheduler-truncated chunk (extend_range.end
+        below the request's full untruncated length) reaches the runner with
+        needs_logits=False; its next-token output is popped as the stale
+        intermediate token, so computing the vocab head for it is pure waste.
+        Everything else about routing is unchanged."""
+        req = _FakeReq("r1")
+        req.full_untruncated_fill_ids = list(range(8))
+        req.extend_range = SimpleNamespace(start=0, end=4)  # 4 < 8: non-final
+        runner = self._run_sync([req], [4], {"r1"}, None, ForwardMode.EXTEND)
+        self.assertEqual(runner.ops_for("r1"), ["extend"])
+        self.assertIs(runner.logits_flags[("extend", "r1")], False)
 
     def test_sync_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
@@ -227,8 +256,18 @@ class TestMlxExtendRouting(unittest.TestCase):
             [_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND
         )
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
+        self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
         self.assertEqual(len(result[2]), 1)  # one pending extend
         self.assertIsNone(result[3])  # no mixed decode
+
+    def test_async_non_final_chunk_skips_logits(self):
+        """Async twin of the head-skip derivation guard."""
+        req = _FakeReq("r1")
+        req.full_untruncated_fill_ids = list(range(8))
+        req.extend_range = SimpleNamespace(start=0, end=4)
+        runner, _ = self._run_async([req], [4], {"r1"}, None, ForwardMode.EXTEND)
+        self.assertEqual(runner.ops_for("r1"), ["extend_start"])
+        self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")

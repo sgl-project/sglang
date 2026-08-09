@@ -156,6 +156,19 @@ class MlxTpModelWorker(TpModelWorker):
             return "decode"
         return "continuation"
 
+    @staticmethod
+    def _chunk_needs_logits(req) -> bool:
+        """False iff this extend chunk is a non-final chunked-prefill chunk.
+
+        The scheduler truncates a chunked request's extend range below the
+        tokens it already knows about; such a chunk's next-token output is
+        discarded (the runner pops it as the stale intermediate token), so
+        the runner may skip the logit head for it.
+        """
+        if req.extend_range is None:
+            return True
+        return req.extend_range.end >= len(req.full_untruncated_fill_ids)
+
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -202,7 +215,10 @@ class MlxTpModelWorker(TpModelWorker):
                 route = self._route_extend_request(req.rid, decoding_rids)
                 if route == "continuation":
                     next_token = self._mlx_runner.extend(
-                        req.rid, req_token_ids, req_new_slots
+                        req.rid,
+                        req_token_ids,
+                        req_new_slots,
+                        needs_logits=self._chunk_needs_logits(req),
                     )
                     extend_rids.append((req.rid, next_token))
                 elif route == "decode":
@@ -218,6 +234,7 @@ class MlxTpModelWorker(TpModelWorker):
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
                         req=req,
+                        needs_logits=self._chunk_needs_logits(req),
                     )
                     prefill_rids.append((req.rid, next_token))
 
@@ -348,6 +365,7 @@ class MlxTpModelWorker(TpModelWorker):
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
                         new_slot_ids=req_new_slots,
+                        needs_logits=self._chunk_needs_logits(req),
                     )
                 )
             elif route == "decode":
@@ -364,6 +382,7 @@ class MlxTpModelWorker(TpModelWorker):
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
                         req=req,
+                        needs_logits=self._chunk_needs_logits(req),
                     )
                 )
 
