@@ -32,6 +32,7 @@ _SKIP_REASON = "requires mlx + mlx_lm"
 if _HAS_MLX:
     import mlx.core as mx
     from mlx_lm.models import gpt_oss
+    from mlx_lm.models.base import create_causal_mask
 
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
@@ -46,6 +47,19 @@ if _HAS_MLX:
 
 WINDOW = 8
 HIDDEN, N_KV_HEADS, HEAD_DIM = 64, 2, 16
+
+
+def _dense_mask(mask, n_queries: int, offset: int):
+    """Densify the cheap ``"causal"`` / ``None`` mask forms.
+
+    ``make_attention_mask`` returns those instead of a materialised band
+    whenever the window cannot bind, so their width lives in the key tensor
+    rather than in the mask.  Densifying keeps width and content checkable
+    for both forms.
+    """
+    if mask is None or isinstance(mask, str):
+        return create_causal_mask(n_queries, offset)
+    return mask
 
 
 def _tiny_gpt_oss_model():
@@ -107,7 +121,11 @@ class TestWindowedCacheEquivalence(CustomTestCase):
                 at = f"chunk S={S} of {chunks}"
                 self.assertTrue(mx.array_equal(wk, fk[:, :, -wk.shape[2] :, :]), at)
                 self.assertTrue(mx.array_equal(wv, fv[:, :, -wv.shape[2] :, :]), at)
-                self.assertEqual(mask.shape[-1], wk.shape[2], f"mask width, {at}")
+                # When the window cannot bind, make_mask returns the cheap
+                # "causal"/None form whose width is implicit in the key
+                # tensor; densify so the invariant stays checkable either way.
+                dense = _dense_mask(mask, S, wk.shape[2] - S)
+                self.assertEqual(dense.shape[-1], wk.shape[2], f"mask width, {at}")
                 self.assertGreaterEqual(
                     wk.shape[2] - S, min(win.offset - S, self.W), f"prefix, {at}"
                 )

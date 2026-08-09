@@ -21,8 +21,19 @@ def make_attention_mask(N, offset, return_array=False, window_size=None):
     layers pass it, including for N == 1) or windowed models silently fall
     back to full attention.
     """
-    if window_size is not None:
+    if window_size is not None and offset + N > window_size:
         return create_causal_mask(N, offset, window_size=window_size)
+    # Either no window, or a window that cannot bind.  The lowest query
+    # position is ``offset``, so ``offset + N <= window_size`` means every
+    # causally visible key is inside the band and the banded mask is
+    # elementwise identical to a plain causal one -- the shortcut mlx_lm's own
+    # RotatingKVCache.make_mask takes, and these shims stand in for exactly
+    # that cache on sliding layers.  Worth the branch because a materialised
+    # mask forces mx.fast.scaled_dot_product_attention off its fused causal
+    # path: ~2x slower per layer, plus an N x (offset + N) allocation.
+    # It also survives a window-bounded store: offset + N <= window_size
+    # implies N + window_size - 1 >= offset + N, so no keys are dropped and
+    # the mask width still matches the returned key length.
     if N == 1:
         return None
     if return_array:
