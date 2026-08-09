@@ -26,7 +26,9 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
@@ -2971,6 +2973,84 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+
+class TestDsmlEncodingDefaultsToolCallParser(unittest.TestCase):
+    """DeepSeek-V4 / V3.2 ship no chat template, so the dsv4 / dsv32 encoder is
+    selected from the architecture and always renders tools as DSML. Launched
+    without --tool-call-parser the DSML reply came back verbatim as content
+    instead of tool_calls (issue #33163)."""
+
+    dsml_reply = (
+        "Let me look at the project.\n\n"
+        "<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="List">\n'
+        '<｜DSML｜parameter name="path" string="true">D:/Project</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="recursive" string="false">false</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>"
+    )
+
+    def _make_chat(self, architecture, tool_call_parser=None):
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = tool_call_parser
+        tm.tokenizer.chat_template = None
+        tm.model_config.hf_config.architectures = [architecture]
+        return OpenAIServingChat(tm, _MockTemplateManager())
+
+    def test_dsv4_defaults_to_deepseekv4_parser(self):
+        chat = self._make_chat("DeepseekV4ForCausalLM")
+        self.assertEqual(chat.chat_encoding_spec, "dsv4")
+        self.assertEqual(chat.tool_call_parser, "deepseekv4")
+
+    def test_dsv32_defaults_to_deepseekv32_parser(self):
+        chat = self._make_chat("DeepseekV32ForCausalLM")
+        self.assertEqual(chat.chat_encoding_spec, "dsv32")
+        self.assertEqual(chat.tool_call_parser, "deepseekv32")
+
+    def test_explicit_parser_is_kept(self):
+        chat = self._make_chat("DeepseekV4ForCausalLM", tool_call_parser="hermes")
+        self.assertEqual(chat.tool_call_parser, "hermes")
+
+    def test_other_architecture_keeps_no_parser(self):
+        chat = self._make_chat("LlamaForCausalLM")
+        self.assertIsNone(chat.chat_encoding_spec)
+        self.assertIsNone(chat.tool_call_parser)
+
+    def test_dsml_reply_becomes_tool_calls(self):
+        chat = self._make_chat("DeepseekV4ForCausalLM")
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="List",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "recursive": {"type": "boolean"},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        tool_calls, text, finish_reason = chat._process_tool_calls(
+            text=self.dsml_reply,
+            tools=tools,
+            finish_reason={"type": "stop", "matched": None},
+            tool_choice="auto",
+        )
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].function.name, "List")
+        self.assertEqual(
+            json.loads(tool_calls[0].function.arguments),
+            {"path": "D:/Project", "recursive": False},
+        )
+        self.assertNotIn("DSML", text)
+        self.assertEqual(finish_reason["type"], "tool_calls")
 
 
 class TestNormalizeToolContent(unittest.TestCase):
