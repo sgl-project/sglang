@@ -12,7 +12,7 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 LingBot-Video is a Mixture-of-Experts video diffusion model from inclusionAI. The 30B checkpoint activates 3B parameters per token, and one set of weights covers three tasks: text-to-video, image-to-video, and text-to-image.
 
-Two things make it different from the other video recipes here:
+Two differences from the other video recipes:
 
 - **Qwen3-VL is the text encoder.** For image-to-video the condition frame is passed to the encoder as an image, so the caption and the reference frame are encoded together rather than through a separate image encoder.
 - **Prompts are structured JSON captions**, not free text. See [Prompt format](#4-prompt-format).
@@ -46,7 +46,7 @@ sglang serve \
   --ulysses-degree 4
 ```
 
-`--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel all work, and can be combined. `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
+`--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel can be combined, except that image conditioning does not support sequence parallelism (see 5.2). `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
 
 `torch.compile` is not enabled by default for this model, including under `--performance-mode speed`. The fp32-pinned norms have not been checked against the eager baseline, so enable `--enable-torch-compile` only if you verify output quality yourself.
 
@@ -62,7 +62,37 @@ The model is trained on structured JSON captions. A raw natural-language prompt 
 }
 ```
 
-If you have a prompt-rewriting service, set `rewriter_url` on the pipeline config to have SGLang expand free text into a caption before denoising. The rewrite stage is skipped entirely when the URL is unset, which is the default.
+### 4.1 Prompt rewriter
+
+Rather than writing the JSON by hand, point SGLang at the rewriter the model was released with. It runs in two turns: expand the free-text prompt into a detailed caption on the base VLM, then map that caption to JSON with the rewriter LoRA enabled. The weights are Qwen3.6-27B plus `robbyant/lingbot-video-rewriter-lora`, so this is a second model rather than part of the checkpoint — serve it separately and SGLang will call it over an OpenAI-compatible API.
+
+One SGLang server can cover both turns, selecting the adapter per request:
+
+```bash Command
+sglang serve \
+  --model-path Qwen/Qwen3.6-27B \
+  --lora-paths rewriter-lora=<path to lingbot-video-rewriter-lora> \
+  --port 30000
+```
+
+Then point the pipeline at it. `rewriter_url` has no CLI flag, so pass it in a config file:
+
+```bash Command
+cat > /tmp/lingbot_rewriter.json <<'EOF'
+{
+  "model_path": "robbyant/lingbot-video-moe-30b-a3b",
+  "prompt": "A red fox trots across fresh snow in a pine forest.",
+  "num_frames": 81,
+  "rewriter_url": "http://127.0.0.1:30000",
+  "rewriter_expand_model": "Qwen/Qwen3.6-27B",
+  "rewriter_map_model": "Qwen/Qwen3.6-27B:rewriter-lora"
+}
+EOF
+
+sglang generate --config /tmp/lingbot_rewriter.json --save-output
+```
+
+The `base:adapter` suffix on `rewriter_map_model` is what enables the LoRA for the mapping turn; a plain model name runs the base weights for both turns and produces a weaker caption without failing. Prompts that already start with `{` are passed through untouched, and if the mapping turn returns nothing parseable the original prompt is used. Leaving `rewriter_url` unset, which is the default, skips the stage.
 
 ## 5. Generation
 
@@ -120,7 +150,44 @@ sglang serve \
 
 This keeps both sets of DiT weights resident, so it costs roughly twice the DiT memory of the single-pass pipeline. Defaults for the second pass are 1088x1920, 8 steps, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
 
-## 6. Notes
+## 6. Benchmark
+
+Test environment:
+
+- Hardware: NVIDIA H100 80GB (8x)
+- Model: `robbyant/lingbot-video-moe-30b-a3b`
+- Reference: the upstream `lingbot-video` diffusers implementation (diffusers 0.39.0)
+- Workload: 480x832, 121 frames, 40 steps, guidance scale 3.0, flow shift 3.0, seed 42, structured JSON caption
+
+Both stacks ran the same caption, resolution, frame count, schedule, and seed, and both computed the two CFG branches sequentially.
+
+| Stack | Parallelism | Denoise | Per step | End to end |
+| --- | --- | --- | --- | --- |
+| upstream diffusers | FSDP 8 | 409 s | 10.25 s | 469 s |
+| SGLang | `--tp-size 8` | 139 s | 3.47 s | - |
+| SGLang | `--ulysses-degree 8` | 73 s | 1.83 s | 175 s |
+
+The middle row shards weights on both sides, where SGLang denoises 2.9x faster. Sharding the sequence as well takes the denoise gap to 5.6x and end to end to 2.7x.
+
+Output matches the reference in subject, composition, and motion without being bit-identical: PSNR 20.7 dB and SSIM 0.82 on the luma plane. Switching only the sharding layout within SGLang moves the result by the same margin, so the difference is the bf16 reduction-order floor across 40 steps.
+
+Other tasks, same hardware and schedule:
+
+| Task | Parallelism | Denoise | Decode |
+| --- | --- | --- | --- |
+| Text-to-image (1 frame) | `--ulysses-degree 8` | 31.8 s | 0.2 s |
+| Image-to-video (121 frames) | `--tp-size 8` | 134 s | 4.7 s |
+| Refiner, both passes | `--ulysses-degree 8` + FSDP | 57 s + 100 s | 7.5 s |
+
+### 6.1 Recommended configuration
+
+On 8 GPUs:
+
+- Text-to-video and text-to-image: `--ulysses-degree 8`.
+- Image-to-video: `--tp-size 8`. Sequence parallelism is rejected for image conditioning, so tensor parallelism is the way to shard.
+- Refiner: `--ulysses-degree 8 --use-fsdp-inference true --vae-tiling true`. Sequence parallelism alone leaves both DiTs fully resident on every GPU, and the second pass then runs out of memory upscaling 121 frames to 1088x1920.
+
+## 7. Notes
 
 - The refiner conditions on zeros rather than on the negative prompt, and reseeds instead of continuing the base pass random stream.
 - Text-only requests batch normally. Image requests are kept out of batches by the scheduler.

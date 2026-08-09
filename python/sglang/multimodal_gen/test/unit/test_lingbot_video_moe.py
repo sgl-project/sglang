@@ -32,6 +32,13 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     _joint_position_ids,
     make_joint_position_ids,
 )
+from sglang.multimodal_gen.runtime.pipelines import (
+    lingbot_video_moe as pipeline_lingbot_video_moe,
+)
+from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe import (
+    LingBotVideoPipeline,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
     LingBotVideoTextEncodingStage,
@@ -404,3 +411,59 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         torch.testing.assert_close(
             vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
         )
+
+
+def test_image_requests_are_split_into_one_request_per_output():
+    params = LingBotVideoMoESamplingParams(
+        request_id="rid",
+        prompt='{"comprehensive_description": "a fox"}',
+        image_path="fox.png",
+        output_path="/tmp",
+        output_file_name="video.mp4",
+        num_outputs_per_prompt=2,
+        seed=[7, 8],
+    )
+
+    outputs = params.expand_video_request_outputs_for_queue(Req(sampling_params=params))
+
+    assert [req.num_outputs_per_prompt for req in outputs] == [1, 1]
+    assert [req.batch_size for req in outputs] == [1, 1]
+    assert [req.seed for req in outputs] == [7, 8]
+    assert all(req.image_path == "fox.png" for req in outputs)
+
+
+def test_single_output_requests_are_left_unsplit():
+    params = LingBotVideoMoESamplingParams(
+        request_id="rid",
+        prompt='{"comprehensive_description": "a fox"}',
+        output_path="/tmp",
+        output_file_name="video.mp4",
+    )
+    batch = Req(sampling_params=params)
+
+    assert params.expand_video_request_outputs_for_queue(batch) == [batch]
+
+
+def test_pipeline_stages_skip_the_rewriter_when_no_url_is_configured(monkeypatch):
+    # add_stage_if evaluates its argument eagerly, so the guard has to come first.
+    def refuse(*args, **kwargs):
+        raise AssertionError("the rewriter stage must not be constructed")
+
+    monkeypatch.setattr(
+        pipeline_lingbot_video_moe, "LingBotVideoPromptRewriteStage", refuse
+    )
+    added = []
+    pipeline = object.__new__(LingBotVideoPipeline)
+    pipeline.add_stage = lambda stage, *a, **k: added.append(type(stage).__name__)
+    pipeline.get_module = lambda name, default=None: SimpleNamespace(
+        modules=lambda: iter(())
+    )
+    pipeline.add_standard_latent_preparation_stage = lambda *a, **k: None
+    pipeline.add_standard_timestep_preparation_stage = lambda *a, **k: None
+    pipeline.add_standard_decoding_stage = lambda *a, **k: None
+    config = LingBotVideoMoEPipelineConfig()
+    assert config.rewriter_url is None
+
+    pipeline.create_pipeline_stages(SimpleNamespace(pipeline_config=config))
+
+    assert "InputValidationStage" in added

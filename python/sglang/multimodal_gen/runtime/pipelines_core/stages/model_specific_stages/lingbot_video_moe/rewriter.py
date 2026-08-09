@@ -81,9 +81,8 @@ def needs_rewrite(prompt: str) -> bool:
 class LingBotVideoPromptRewriteStage(PipelineStage):
     """Expand a plain prompt into the structured caption the DiT was trained on.
 
-    The rewriter is a separate vision language model reached over an OpenAI-compatible
-    endpoint, in two turns against the same server: expand without the rewriter adapter,
-    then map that expansion to JSON with the adapter enabled.
+    Two turns against one OpenAI-compatible endpoint: expand without the rewriter
+    adapter, then map that expansion to JSON with the adapter enabled.
     """
 
     def __init__(self, url: str, expand_model: str, map_model: str, timeout: float):

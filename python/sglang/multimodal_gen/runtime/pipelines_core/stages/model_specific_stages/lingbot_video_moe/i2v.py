@@ -104,11 +104,7 @@ def pixel_to_vlm_image(
 def apply_first_frame_prefix(
     latents: torch.Tensor, cond_latent: torch.Tensor
 ) -> torch.Tensor:
-    """Replace the leading latent frames with the clean condition latent.
-
-    Returns a new tensor; the denoising latents are inference tensors, which
-    cannot be updated in place.
-    """
+    """Returns a new tensor; inference latents cannot be updated in place."""
 
     cond_frames = cond_latent.shape[2]
     return torch.cat(

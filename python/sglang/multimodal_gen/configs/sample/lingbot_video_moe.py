@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -29,6 +30,15 @@ class LingBotVideoMoESamplingParams(SamplingParams):
     flow_shift: float = 3.0
     negative_prompt: str | None = DEFAULT_NEGATIVE_PROMPT
     seed: int = 0
+
+    def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
+        # The image and text conditioning stages build one sample, so each output
+        # becomes its own request, as the offline path already does.
+        from sglang.multimodal_gen.runtime.entrypoints.utils import (
+            expand_request_outputs,
+        )
+
+        return expand_request_outputs(req)
 
     def _explicitly_set(self, field: str) -> bool:
         explicit_fields = getattr(self, "_explicit_fields", None)

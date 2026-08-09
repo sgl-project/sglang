@@ -116,7 +116,7 @@ def _joint_position_ids(
     text_len_padded: int,
     device: torch.device,
 ) -> torch.Tensor:
-    # Joint video;text positions for rotary_emb; on-device, padding masked in attention.
+    # Padding rows are masked in attention, not here.
     B = text_lens.shape[0]
     n_video = grid_t * grid_h * grid_w
     seq_len = n_video + text_len_padded
@@ -560,9 +560,8 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         positions = _joint_position_ids(text_lens, gt, gh, gw, L, device)
 
-        # Ulysses shards the joint sequence evenly. A replicated text segment
-        # would be duplicated once per rank, and the shared attention layer
-        # refuses a replicated segment combined with a key mask.
+        # Text shards with the video: attention refuses a replicated segment
+        # combined with a key mask.
         shard = None
         if self._shard_sequence():
             shard = build_shard_plan(joint_seq_len)

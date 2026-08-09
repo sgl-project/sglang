@@ -38,15 +38,15 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         config = server_args.pipeline_config
-        self.add_stage_if(
-            config.rewriter_url is not None,
-            LingBotVideoPromptRewriteStage(
-                url=config.rewriter_url,
-                expand_model=config.rewriter_expand_model,
-                map_model=config.rewriter_map_model,
-                timeout=config.rewriter_timeout,
-            ),
-        )
+        if config.rewriter_url is not None:
+            self.add_stage(
+                LingBotVideoPromptRewriteStage(
+                    url=config.rewriter_url,
+                    expand_model=config.rewriter_expand_model,
+                    map_model=config.rewriter_map_model,
+                    timeout=config.rewriter_timeout,
+                ),
+            )
         # Must precede text encoding, which reads the condition frame.
         self.add_stage(
             LingBotVideoImageConditioningStage(vae=self.get_module("vae")),

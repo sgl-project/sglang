@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import PIL.Image
 import pytest
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe_refiner import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
     LingBotVideoDenoisingStage,
+    LingBotVideoRefinementStage,
     LingBotVideoRefinerUpscaleStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
@@ -75,6 +77,17 @@ class _StubVae:
     # SimpleNamespace.
     def __init__(self):
         self.use_tiling = False
+
+
+class _StubScheduler:
+    sigma_max = 1.0
+    sigma_min = 0.0
+
+    def __init__(self):
+        self.timesteps = torch.zeros(1)
+
+    def set_timesteps(self, device, sigmas, shift):
+        self.timesteps = torch.as_tensor(sigmas)
 
 
 def _text_encoding_stage(processor):
@@ -365,10 +378,92 @@ def test_pixel_resize_keeps_the_clip_layout():
 def test_refiner_weights_resolve_to_the_refiner_subfolder():
     pipeline = object.__new__(LingBotVideoRefinerPipeline)
     pipeline.model_path = "/models/lingbot"
+    server_args = SimpleNamespace(component_paths={})
 
-    path = pipeline._resolve_component_path(None, "transformer_2", "transformer_2")
+    path = pipeline._resolve_component_path(
+        server_args, "transformer_2", "transformer_2"
+    )
 
     assert path == "/models/lingbot/refiner"
+
+
+def test_transformer_2_path_override_wins_over_the_refiner_subfolder(tmp_path):
+    override = tmp_path / "custom_refiner"
+    override.mkdir()
+    pipeline = object.__new__(LingBotVideoRefinerPipeline)
+    pipeline.model_path = "/models/lingbot"
+    server_args = SimpleNamespace(component_paths={"transformer_2": str(override)})
+
+    path = pipeline._resolve_component_path(
+        server_args, "transformer_2", "transformer_2"
+    )
+
+    assert path == str(override)
+
+
+def test_refiner_reseeds_every_output_of_a_batched_request(monkeypatch):
+    monkeypatch.setattr(
+        refiner_stages_module, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    batch = SimpleNamespace(seeds=[11, 22])
+
+    generators = refiner_stages_module._refiner_generators(batch, torch.device("cpu"))
+    batched = randn_tensor(
+        (2, 1, 2, 2), generator=generators, device=torch.device("cpu")
+    )
+
+    for index, seed in enumerate(batch.seeds):
+        alone = randn_tensor(
+            (1, 1, 2, 2),
+            generator=[torch.Generator().manual_seed(seed)],
+            device=torch.device("cpu"),
+        )
+        torch.testing.assert_close(batched[index : index + 1], alone)
+
+
+def _refiner_prepared(monkeypatch, *, base_scale, refiner_scale):
+    monkeypatch.setattr(
+        refiner_stages_module, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        LingBotVideoDenoisingStage,
+        "_prepare_denoising_loop",
+        lambda self, batch, server_args: batch,
+    )
+    stage = object.__new__(LingBotVideoRefinementStage)
+    config = LingBotVideoMoEPipelineConfig()
+    config.refiner_guidance_scale = refiner_scale
+    batch = SimpleNamespace(
+        scheduler=_StubScheduler(),
+        timesteps=None,
+        num_inference_steps=None,
+        guidance_scale=base_scale,
+        do_classifier_free_guidance=base_scale > 1.0,
+        prompt_embeds=[torch.ones(1, 4, 8)],
+        prompt_attention_mask=torch.ones(1, 4, dtype=torch.long),
+        negative_prompt_embeds=None,
+        negative_attention_mask=None,
+        extra={},
+    )
+    stage._prepare_denoising_loop(batch, SimpleNamespace(pipeline_config=config))
+    return batch
+
+
+def test_refiner_guidance_turns_cfg_on_when_the_base_pass_ran_without_it(monkeypatch):
+    batch = _refiner_prepared(monkeypatch, base_scale=1.0, refiner_scale=3.0)
+
+    assert batch.guidance_scale == 3.0
+    assert batch.do_classifier_free_guidance
+    torch.testing.assert_close(
+        batch.negative_prompt_embeds[0], torch.zeros_like(batch.prompt_embeds[0])
+    )
+
+
+def test_refiner_guidance_turns_cfg_off_when_the_refiner_scale_is_one(monkeypatch):
+    batch = _refiner_prepared(monkeypatch, base_scale=6.0, refiner_scale=1.0)
+
+    assert not batch.do_classifier_free_guidance
+    assert batch.negative_prompt_embeds is None
 
 
 def test_refiner_round_trip_matches_the_declared_decode_precision(monkeypatch):
@@ -387,7 +482,7 @@ def test_refiner_round_trip_matches_the_declared_decode_precision(monkeypatch):
         seen["decode"] = vae_dtype
         return torch.zeros(1, 3, 1, 4, 4)
 
-    def encode(pixels, server_args, *, vae_dtype, generator):
+    def encode(pixels, server_args, *, vae_dtype, generators):
         seen["encode"] = vae_dtype
         return torch.zeros(1, 4, 1, 2, 2)
 

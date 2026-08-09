@@ -125,7 +125,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
             prompt_embeds = prompt_embeds[:, crop_start:]
             prompt_mask = prompt_mask[:, crop_start:]
 
-        # Trimming padding here is what lets the DiT skip the mask at B=1.
+        # Trimming padding here lets the DiT skip the mask at B=1.
         if prompt_embeds.shape[0] == 1:
             true_len = int(prompt_mask[0].sum().item())
             prompt_embeds = prompt_embeds[:, :true_len]

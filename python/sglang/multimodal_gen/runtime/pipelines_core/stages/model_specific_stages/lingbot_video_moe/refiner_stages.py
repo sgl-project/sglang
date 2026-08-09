@@ -4,6 +4,7 @@ import copy
 
 import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -49,7 +50,7 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         height, width = config.refiner_height, config.refiner_width
         # The inherited component_uses declares residency at the decode precision.
         vae_dtype = resolve_decode_precision(server_args, self.component_name)
-        generator = _refiner_generator(batch, get_local_torch_device())
+        generators = _refiner_generators(batch, get_local_torch_device())
 
         with self.use_declared_component(
             component_name=self.component_name, module=self.vae
@@ -66,19 +67,19 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
                     )
                 upscaled = resize_video_pixels(pixels, height, width)
                 latents = self._encode(
-                    upscaled, server_args, vae_dtype=vae_dtype, generator=generator
+                    upscaled, server_args, vae_dtype=vae_dtype, generators=generators
                 )
                 if batch.extra.get(COND_LATENT_KEY) is not None:
                     batch.extra[COND_LATENT_KEY] = self._encode_condition_frame(
-                        batch, server_args, height, width, vae_dtype, generator
+                        batch, server_args, height, width, vae_dtype, generators
                     )
             finally:
                 self.vae.use_tiling = was_tiling
 
         latents = apply_cond_latent(batch, latents)
-        noise = torch.randn(
+        noise = randn_tensor(
             latents.shape,
-            generator=generator,
+            generator=generators,
             device=latents.device,
             dtype=latents.dtype,
         )
@@ -92,7 +93,7 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         server_args: ServerArgs,
         *,
         vae_dtype: torch.dtype,
-        generator: torch.Generator | None,
+        generators: list[torch.Generator] | None,
     ) -> torch.Tensor:
         normalized = (pixels.to(get_local_torch_device()).float() - 0.5) / 0.5
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
@@ -106,7 +107,7 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
 
         if isinstance(latent_dist, AutoencoderKLOutput):
             latent_dist = latent_dist.latent_dist
-        latents = latent_dist.sample(generator).float()
+        latents = latent_dist.sample(generators).float()
         scaling_factor, shift_factor = (
             server_args.pipeline_config.get_decode_scale_and_shift(
                 device=latents.device, dtype=latents.dtype, vae=self.vae
@@ -123,14 +124,14 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         height: int,
         width: int,
         vae_dtype: torch.dtype,
-        generator: torch.Generator | None,
+        generators: list[torch.Generator] | None,
     ) -> torch.Tensor:
         image = batch.condition_image
         if isinstance(image, list):
             image = image[0]
         pixel = preprocess_condition_image(image, height, width)
         latents = self._encode(
-            pixel, server_args, vae_dtype=vae_dtype, generator=generator
+            pixel, server_args, vae_dtype=vae_dtype, generators=generators
         )
         return latents[:, :, :1]
 
@@ -169,6 +170,8 @@ class LingBotVideoRefinementStage(LingBotVideoDenoisingStage):
         batch.timesteps = scheduler.timesteps
         batch.num_inference_steps = len(scheduler.timesteps)
         batch.guidance_scale = config.refiner_guidance_scale
+        # Set once at request init from the base scale, which the refiner replaces.
+        batch.do_classifier_free_guidance = config.refiner_guidance_scale > 1.0
         _use_text_only_conditioning(batch)
         _zero_negative_conditioning(batch)
         return super()._prepare_denoising_loop(batch, server_args)
@@ -185,14 +188,18 @@ def _use_text_only_conditioning(batch: Req) -> None:
 
 def _zero_negative_conditioning(batch: Req) -> None:
     # The refiner conditions on zeros rather than the negative prompt.
-    if not batch.do_classifier_free_guidance or batch.prompt_embeds is None:
+    if not batch.do_classifier_free_guidance:
         return
     batch.negative_prompt_embeds = [torch.zeros_like(batch.prompt_embeds[0])]
     batch.negative_attention_mask = batch.prompt_attention_mask.clone()
 
 
-def _refiner_generator(batch: Req, device: torch.device) -> torch.Generator | None:
+def _refiner_generators(
+    batch: Req, device: torch.device
+) -> list[torch.Generator] | None:
     # The reference reseeds for the second pass rather than continuing the base stream.
     if not batch.seeds:
         return None
-    return torch.Generator(device=device).manual_seed(int(batch.seeds[0]))
+    return [
+        torch.Generator(device=device).manual_seed(int(seed)) for seed in batch.seeds
+    ]
