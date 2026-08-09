@@ -693,6 +693,11 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
+    # The qv path does not support split-KV. This also handles num_splits=0,
+    # where the heuristic above may select more than one split.
+    if qv is not None:
+        num_splits = 1
+
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
     if (
