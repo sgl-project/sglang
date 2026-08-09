@@ -271,20 +271,18 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
-        # returns (lazy_stacked, pending_prefills, pending_extends,
-        #          pending_mixed_decode, mode)
-        result = worker._async_extend_batch(batch)
-        return worker._mlx_runner, result
+        launch = worker._async_extend_batch(batch)
+        return worker._mlx_runner, launch
 
     def test_async_one_token_continuation_routes_to_extend(self):
         """THE REGRESSION (async): a 1-token continuation must extend, not decode."""
-        runner, result = self._run_async(
+        runner, launch = self._run_async(
             [_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND
         )
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
-        self.assertEqual(len(result[2]), 1)  # one pending extend
-        self.assertIsNone(result[3])  # no mixed decode
+        self.assertEqual(len(launch.extends), 1)  # one pending extend
+        self.assertIsNone(launch.decode)  # no mixed decode
 
     def test_async_non_final_chunk_skips_logits(self):
         """Async twin of the head-skip derivation guard."""
@@ -297,10 +295,10 @@ class TestMlxExtendRouting(CustomTestCase):
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")
-        runner, result = self._run_async([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
+        runner, launch = self._run_async([p, d], [4, 1], {"d1"}, [d], ForwardMode.MIXED)
         self.assertEqual(runner.ops_for("p1"), ["prefill_start"])
         self.assertEqual(runner.ops_for("d1"), ["decode_start"])
-        self.assertIsNotNone(result[3])  # pending mixed decode present
+        self.assertIsNotNone(launch.decode)  # pending mixed decode present
 
 
 if __name__ == "__main__":

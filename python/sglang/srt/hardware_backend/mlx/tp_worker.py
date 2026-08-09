@@ -13,7 +13,8 @@ normal ``GenerationBatchResult``.
 """
 
 import logging
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Optional
 
 import mlx.core as mx
 import torch
@@ -39,6 +40,34 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_device
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MlxLaunch:
+    """One lazily launched MLX forward pass: its handle and its pending work.
+
+    Produced by :meth:`MlxTpModelWorker.async_forward_batch_generation_mlx`
+    and :meth:`MlxTpModelWorker.async_chained_decode_mlx`, consumed by
+    :meth:`MlxTpModelWorker.finalize_mlx_result`.
+
+    Attributes:
+        lazy_tokens: an ``mx.array`` that, when evaluated, forces
+            materialisation of the whole batch's outputs.  ``None`` for
+            idle batches.
+        prefills: one :class:`MlxPendingPrefill` per new request in an
+            extend batch; empty for pure-decode steps.
+        extends: one :class:`MlxPendingExtend` per chunked-prefill
+            continuation; also empty for pure-decode steps.
+        decode: the :class:`MlxPendingDecode` covering full decode mode
+            AND mixed single-token decodes inside an extend batch.
+        mode: one of ``"idle"``, ``"decode"``, ``"extend"``.
+    """
+
+    lazy_tokens: Optional[mx.array]
+    prefills: list[MlxPendingPrefill]
+    extends: list[MlxPendingExtend]
+    decode: Optional[MlxPendingDecode]
+    mode: str
 
 
 class MlxTpModelWorker(TpModelWorker):
@@ -524,32 +553,13 @@ class MlxTpModelWorker(TpModelWorker):
             return None
         return mx.stack([edit_rows[rid] for rid in req_ids])
 
-    def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
-        Union[mx.array, None],
-        list[MlxPendingPrefill],
-        list[MlxPendingExtend],
-        Optional[MlxPendingDecode],
-        str,
-    ]:
+    def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> MlxLaunch:
         """Start an async (lazy) forward pass through the MLX model runner.
 
-        Returns ``(lazy_result, prefills, extends, decode, mode)``:
-
-        * ``lazy_result`` — an ``mx.array`` that, when evaluated, forces
-          materialisation of the whole batch's outputs.  ``None`` for
-          idle batches.
-        * ``prefills`` — list of :class:`MlxPendingPrefill` for new
-          requests in an extend batch.
-        * ``extends`` — list of :class:`MlxPendingExtend` for chunked
-          prefill continuations in an extend batch.
-        * ``decode`` — :class:`MlxPendingDecode` for the decode
-          sub-batch (covers full decode mode AND mixed decodes inside
-          an extend batch).
-        * ``mode`` — one of ``"idle"``, ``"decode"``, ``"extend"``.
-
-        The caller must make sure the returned pendings are fed into a
-        subsequent ``mx.async_eval`` or ``.item()`` / ``.tolist()`` call
-        — :meth:`finalize_mlx_result` does that.
+        See :class:`MlxLaunch` for the returned fields.  The caller must
+        make sure the launch's pendings are fed into a subsequent
+        ``mx.async_eval`` or ``.item()`` / ``.tolist()`` call —
+        :meth:`finalize_mlx_result` does that.
         """
         self._ensure_mlx_pool_initialized()
 
@@ -557,7 +567,9 @@ class MlxTpModelWorker(TpModelWorker):
         reqs = batch.reqs
 
         if forward_mode.is_idle():
-            return None, [], [], None, "idle"
+            return MlxLaunch(
+                lazy_tokens=None, prefills=[], extends=[], decode=None, mode="idle"
+            )
 
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
@@ -575,7 +587,13 @@ class MlxTpModelWorker(TpModelWorker):
                 pending_decode.lazy_tokens,
                 *lazy_logprob_arrays(pending_decode.lazy_logprobs),
             )
-            return pending_decode.lazy_tokens, [], [], pending_decode, "decode"
+            return MlxLaunch(
+                lazy_tokens=pending_decode.lazy_tokens,
+                prefills=[],
+                extends=[],
+                decode=pending_decode,
+                mode="decode",
+            )
 
         if forward_mode.is_extend():
             # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
@@ -588,13 +606,7 @@ class MlxTpModelWorker(TpModelWorker):
             f"MLX async runner does not support forward mode: {forward_mode}"
         )
 
-    def _async_extend_batch(self, batch: ScheduleBatch) -> tuple[
-        Union[mx.array, None],
-        list[MlxPendingPrefill],
-        list[MlxPendingExtend],
-        Optional[MlxPendingDecode],
-        str,
-    ]:
+    def _async_extend_batch(self, batch: ScheduleBatch) -> MlxLaunch:
         """Launch each request in an EXTEND batch lazily and kick GPU work."""
         reqs = batch.reqs
         input_ids_cpu = batch.input_ids.cpu().tolist()
@@ -687,18 +699,15 @@ class MlxTpModelWorker(TpModelWorker):
         if async_args:
             mx.async_eval(*async_args)
 
-        return (
-            lazy_stacked,
-            pending_prefills,
-            pending_extends,
-            pending_mixed_decode,
-            "extend",
+        return MlxLaunch(
+            lazy_tokens=lazy_stacked,
+            prefills=pending_prefills,
+            extends=pending_extends,
+            decode=pending_mixed_decode,
+            mode="extend",
         )
 
-    def async_chained_decode_mlx(
-        self,
-        prev_pending: MlxPendingDecode,
-    ) -> tuple[mx.array, list, list, MlxPendingDecode, str]:
+    def async_chained_decode_mlx(self, prev_pending: MlxPendingDecode) -> MlxLaunch:
         """Launch a decode step that chains off a still-lazy previous decode.
 
         This is the "no idle gap" pipelining primitive: build the next
@@ -720,22 +729,21 @@ class MlxTpModelWorker(TpModelWorker):
         * ``prev_pending`` should be finalised BEFORE the returned
           pending, so per-request token lists are appended in order.
 
-        Returns a 5-tuple matching
-        :meth:`async_forward_batch_generation_mlx` for the decode case:
-        ``(lazy_tokens, [], [], pending_decode, "decode")``.  The empty
-        prefill/extend lists are always absent for chained decodes.
+        Returns an :class:`MlxLaunch` in ``"decode"`` mode; its prefill
+        and extend lists are always empty for a chained decode.
         """
         pending = self._mlx_runner.decode_batch_start_chained(prev_pending)
         mx.async_eval(pending.lazy_tokens)
-        return pending.lazy_tokens, [], [], pending, "decode"
+        return MlxLaunch(
+            lazy_tokens=pending.lazy_tokens,
+            prefills=[],
+            extends=[],
+            decode=pending,
+            mode="decode",
+        )
 
     def finalize_mlx_result(
-        self,
-        prefills: list[MlxPendingPrefill],
-        extends: list[MlxPendingExtend],
-        decode: Optional[MlxPendingDecode],
-        mode: str,
-        reqs: list,
+        self, launch: MlxLaunch, reqs: list
     ) -> GenerationBatchResult:
         """Materialise a lazy MLX result into a :class:`GenerationBatchResult`.
 
@@ -745,7 +753,8 @@ class MlxTpModelWorker(TpModelWorker):
         """
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        if mode == "idle":
+        decode = launch.decode
+        if launch.mode == "idle":
             return GenerationBatchResult(
                 logits_output=LogitsProcessorOutput(next_token_logits=None),
                 can_run_cuda_graph=False,
@@ -753,16 +762,16 @@ class MlxTpModelWorker(TpModelWorker):
 
         step_logprob_rows: dict[str, tuple] = {}
 
-        if mode == "decode":
+        if launch.mode == "decode":
             assert decode is not None
             next_tokens_list = self._mlx_runner.decode_batch_finalize(decode)
             self._collect_step_logprobs(
                 step_logprob_rows, decode.lazy_logprobs, decode.req_ids
             )
 
-        elif mode == "extend":
+        elif launch.mode == "extend":
             prefill_map: dict[str, int] = {}
-            for pending_p in prefills:
+            for pending_p in launch.prefills:
                 prefill_map[pending_p.req_id] = self._mlx_runner.prefill_finalize(
                     pending_p
                 )
@@ -771,7 +780,7 @@ class MlxTpModelWorker(TpModelWorker):
                 )
 
             extend_map: dict[str, int] = {}
-            for pending_e in extends:
+            for pending_e in launch.extends:
                 extend_map[pending_e.req_id] = self._mlx_runner.extend_finalize(
                     pending_e
                 )
@@ -799,7 +808,7 @@ class MlxTpModelWorker(TpModelWorker):
                     next_tokens_list.append(prefill_map[req.rid])
 
         else:
-            raise ValueError(f"Unknown MLX async mode: {mode}")
+            raise ValueError(f"Unknown MLX async mode: {launch.mode}")
 
         next_token_ids = torch.tensor(next_tokens_list, dtype=torch.long, device="cpu")
         logits_output = (

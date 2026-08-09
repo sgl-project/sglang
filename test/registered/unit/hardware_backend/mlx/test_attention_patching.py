@@ -46,6 +46,7 @@ if _HAS_MLX:
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
+    from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
@@ -1101,11 +1102,13 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.last_batch = stale_batch
 
         pending = MlxPendingJob(
-            lazy_tokens=None,
-            prefills=["prefill"],
-            extends=[],
-            decode=None,
-            mode="extend",
+            launch=MlxLaunch(
+                lazy_tokens=None,
+                prefills=["prefill"],
+                extends=[],
+                decode=None,
+                mode="extend",
+            ),
             batch_copy=batch_copy,
             schedule_batch=schedule_batch,
             reqs=[SimpleNamespace(rid="r0")],

@@ -16,10 +16,8 @@ the GPU runs both steps back-to-back with no idle gap.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List, Optional
-
-import mlx.core as mx
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
@@ -29,11 +27,7 @@ from sglang.srt.utils import DynamicGradMode
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.mlx.model_runner import (
-        MlxPendingDecode,
-        MlxPendingExtend,
-        MlxPendingPrefill,
-    )
+    from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -43,23 +37,10 @@ class MlxPendingJob:
     """Unfinished MLX work and graphs queued on the GPU.
 
     Attributes:
-        lazy_tokens: Lazily evaluated token IDs produced by the forward
-            pass.  Unevaluated; calling ``.tolist()`` / ``.item()`` /
-            ``mx.eval`` on it will block until the Metal kernel finishes.
-            ``None`` for idle batches.
-        prefills: MLX prefill state returned by the model worker — one
-            entry per new request in an extend batch.  Used by
-            ``finalize_mlx_result`` to commit per-request caches.  Empty
-            list for pure-decode steps.
-        extends: Chunked-prefill-continuation state, one entry per
-            already-active request whose extend seq_len > 1.  Also empty
-            for pure-decode steps.
-        decode: Decode state covering full-decode mode AND mixed
-            single-token decodes inside an extend batch.  Used as the
-            chaining root by :meth:`async_chained_decode_mlx`.
-        mode: One of ``"decode"``, ``"extend"``, ``"idle"`` describing
-            which forward pass produced this job.  Drives finalise
-            dispatch and whether chaining is safe.
+        launch: The :class:`MlxLaunch` this job is waiting on — the lazy
+            token handle plus the prefill / extend / decode pendings the
+            forward produced, and the mode that drives finalise dispatch
+            and whether chaining is safe.
         batch_copy: Snapshot of the :class:`ScheduleBatch` at launch
             time.  Decoupled from the live batch so
             ``process_batch_result`` can update request state without
@@ -73,11 +54,7 @@ class MlxPendingJob:
             mutable batch object.
     """
 
-    lazy_tokens: Optional[mx.array]
-    prefills: list[MlxPendingPrefill]
-    extends: list[MlxPendingExtend]
-    decode: Optional[MlxPendingDecode]
-    mode: str
+    launch: MlxLaunch
     batch_copy: ScheduleBatch
     schedule_batch: ScheduleBatch
     reqs: List[Req]
@@ -123,13 +100,7 @@ class SchedulerMlxOverlapMixin:
         self.forward_ct += 1
         self.profiler_manager._profile_batch_predicate(pending.schedule_batch)
 
-        result = self.tp_worker.finalize_mlx_result(
-            pending.prefills,
-            pending.extends,
-            pending.decode,
-            pending.mode,
-            pending.reqs,
-        )
+        result = self.tp_worker.finalize_mlx_result(pending.launch, pending.reqs)
         result.extend_input_len_per_req = pending.extend_input_len_per_req
         result.extend_logprob_start_len_per_req = (
             pending.extend_logprob_start_len_per_req
@@ -191,9 +162,7 @@ class SchedulerMlxOverlapMixin:
             # loop must do it too, otherwise async_forward_batch_generation_mlx
             # dereferences a None input_ids.
             resolve_forward_inputs(batch, self.future_map)
-            lazy_tokens, prefills, extends, decode, mode = (
-                self.tp_worker.async_forward_batch_generation_mlx(batch)
-            )
+            launch = self.tp_worker.async_forward_batch_generation_mlx(batch)
             extend_input_len_per_req = None
             extend_logprob_start_len_per_req = None
             if batch.return_logprob:
@@ -204,11 +173,7 @@ class SchedulerMlxOverlapMixin:
                 ]
                 extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
             return MlxPendingJob(
-                lazy_tokens=lazy_tokens,
-                prefills=prefills,
-                extends=extends,
-                decode=decode,
-                mode=mode,
+                launch=launch,
                 batch_copy=batch.copy(),
                 schedule_batch=batch,
                 reqs=list(batch.reqs),
@@ -218,25 +183,15 @@ class SchedulerMlxOverlapMixin:
             )
 
         def _launch_chained(prev: MlxPendingJob) -> MlxPendingJob:
-            assert prev.decode is not None
-            lazy_tokens, prefills, extends, decode, mode = (
-                self.tp_worker.async_chained_decode_mlx(prev.decode)
-            )
-            # Composition is identical to prev: reuse a fresh batch copy
-            # of the same underlying ScheduleBatch so process_batch_result
+            assert prev.launch.decode is not None
+            # Composition is identical to prev: every scheduler-side field
+            # carries over, and only a fresh batch copy of the same
+            # underlying ScheduleBatch is needed so process_batch_result
             # updates the same req objects with the new token.
-            return MlxPendingJob(
-                lazy_tokens=lazy_tokens,
-                prefills=prefills,
-                extends=extends,
-                decode=decode,
-                mode=mode,
+            return replace(
+                prev,
+                launch=self.tp_worker.async_chained_decode_mlx(prev.launch.decode),
                 batch_copy=prev.batch_copy.copy(),
-                schedule_batch=prev.schedule_batch,
-                reqs=prev.reqs,
-                chain_safe=prev.chain_safe,
-                extend_input_len_per_req=prev.extend_input_len_per_req,
-                extend_logprob_start_len_per_req=prev.extend_logprob_start_len_per_req,
             )
 
         while True:
@@ -249,8 +204,8 @@ class SchedulerMlxOverlapMixin:
             #    build pending_next on top of it NOW — before we block on curr.
             can_chain = (
                 pending_curr is not None
-                and pending_curr.mode == "decode"
-                and pending_curr.decode is not None
+                and pending_curr.launch.mode == "decode"
+                and pending_curr.launch.decode is not None
                 and pending_curr.chain_safe
                 and not self.waiting_queue
             )
