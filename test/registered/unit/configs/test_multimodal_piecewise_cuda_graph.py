@@ -4,12 +4,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     is_multimodal_piecewise_cuda_graph_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -31,8 +33,10 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner.enable_lora = False
+        runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
         runner.has_mha_companion_layers = backend == Backend.BREAKABLE
+        runner.mla_pinned_under_bcg = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
@@ -76,13 +80,59 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
         args._cuda_graph_config_locked = set()
 
-        with patch.object(
-            ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
-        ) as disable_if_incompatible:
+        with (
+            patch.object(
+                ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
+            ) as disable_if_incompatible,
+            patch.object(
+                args, "_resolved_attention_backends", return_value=("fa3", "fa3")
+            ),
+        ):
             args._apply_cuda_graph_compatibility()
 
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
         disable_if_incompatible.assert_called_once()
+
+    def test_trtllm_mla_stays_on_breakable_and_is_disabled_by_compatibility(self):
+        args = ServerArgs(model_path="dummy")
+        # The MLA rule reads hf_config to exempt DSA models, so the stub needs
+        # an architecture that is MLA but not DSA.
+        args.model_config = SimpleNamespace(
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE)
+        )
+        args._cuda_graph_config_locked = set()
+
+        with (
+            patch.object(
+                args,
+                "_resolved_attention_backends",
+                return_value=("trtllm_mla", "trtllm_mla"),
+            ),
+            patch.object(args, "use_mla_backend", return_value=True),
+        ):
+            args._apply_cuda_graph_compatibility()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
+        args = ServerArgs(model_path="dummy")
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
+
+        with patch.object(
+            args,
+            "_resolved_attention_backends",
+            return_value=("trtllm_mla", "trtllm_mla"),
+        ):
+            args._apply_cuda_graph_compatibility()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
 
     def test_multimodal_inputs_keep_tc_piecewise_prefill_enabled(self):
         runner = self._make_prefill_runner(Backend.TC_PIECEWISE)
@@ -126,6 +176,24 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         self.assertEqual(args.chunked_prefill_size, -1)
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_encoder_embedding_model_enables_embedding_mode_without_flag(self):
+        args = ServerArgs(model_path="dummy")
+        args.is_embedding = False
+        args.model_config = SimpleNamespace(
+            embedding_model_spec=resolve_embedding_model_spec(
+                ["BertModel"],
+                is_embedding_requested=False,
+                is_embedding_gemma=False,
+            ),
+            is_multimodal=False,
+            hf_config=SimpleNamespace(architectures=["BertModel"]),
+        )
+
+        with patch.object(args, "get_model_config", return_value=args.model_config):
+            args._handle_model_capability_adjustments()
+
+        self.assertTrue(args.is_embedding)
 
 
 if __name__ == "__main__":
