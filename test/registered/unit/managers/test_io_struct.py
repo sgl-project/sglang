@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -702,6 +702,50 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
             req.normalize_batch_and_arguments()
+
+    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
+        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 2)
+        self.assertIsNone(req.data_parallel_rank)
+
+    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
+        req = GenerateReqInput(
+            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 1)
+
+    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            data_parallel_rank=3,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_dp_rank, 3)
+        self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestEmbeddingReqInputGetItem(CustomTestCase):
+    """Test EmbeddingReqInput.__getitem__."""
+
+    def test_priority_is_preserved(self):
+        """Priority must survive the batch split, in both __getitem__ branches."""
+        req = EmbeddingReqInput(text=["Hello", "World"], priority=7)
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].priority, req[1].priority], [7, 7])
+
+        cross_encoder_req = EmbeddingReqInput(
+            text=[["query 1", "doc 1"], ["query 2", "doc 2"]],
+            is_cross_encoder_request=True,
+            priority=3,
+        )
+        cross_encoder_req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
+        )
 
 
 if __name__ == "__main__":

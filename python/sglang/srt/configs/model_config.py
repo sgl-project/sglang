@@ -267,12 +267,14 @@ class ModelConfig:
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
+        is_draft_quantization_explicit: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -568,6 +570,10 @@ class ModelConfig:
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            is_draft_quantization_explicit=(
+                is_draft_model
+                and server_args._speculative_draft_quantization_explicitly_set
+            ),
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             speculative_algorithm=server_args.speculative_algorithm,
@@ -672,7 +678,20 @@ class ModelConfig:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForCausalLM",
             "InternS2PreviewForConditionalGeneration",
+            "InternS2MobiusForConditionalGeneration",
         ]:
+            if (
+                self.hf_config.architectures[0]
+                == "InternS2MobiusForConditionalGeneration"
+            ):
+                # The target owns 2,560 experts through four shared physical
+                # banks, while its bundled MTP layer is an ordinary Qwen3.5
+                # MoE layer with the checkpoint-declared smaller expert set.
+                self.hf_text_config.model_type = "qwen3_5_moe_text"
+                self.hf_text_config.num_experts = self.hf_text_config.mtp_num_experts
+                self.hf_text_config.num_experts_per_tok = (
+                    self.hf_text_config.mtp_num_experts_per_tok
+                )
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
@@ -1097,14 +1116,18 @@ class ModelConfig:
             return max(per_layer)
         return self.num_attention_heads
 
-    def get_num_kv_heads(self, tensor_parallel_size) -> int:
-        """Returns the number of KV heads per GPU."""
+    def get_num_kv_heads(self, tensor_parallel_size: int, dcp_size: int = 1) -> int:
+        """Number of KV heads per GPU.
+
+        DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups.
+        Drafts never join the group and ignore ``dcp_size``. With fewer heads
+        than groups, each GPU keeps one.
+        """
         total_num_kv_heads = self.get_total_num_kv_heads()
-        # If tensor parallelism is used, we divide the number of KV heads by
-        # the tensor parallel size. We will replicate the KV heads in the
-        # case where the number of KV heads is smaller than the tensor
-        # parallel size so each GPU has at least one KV head.
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        if self.is_draft_model:
+            dcp_size = 1
+        kv_tensor_parallel_size = tensor_parallel_size // dcp_size
+        return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
     def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
@@ -1425,7 +1448,9 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            # Keep explicit or inherited modelopt_fp4 for literal FP8 checkpoints
+            # so eligible MoE experts are requantized online.
+            "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
@@ -1467,7 +1492,6 @@ class ModelConfig:
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
-
             # Detect which checkpoint is it
             if not preserve_online_draft_quantization:
                 for _, method in QUANTIZATION_METHODS.items():
@@ -1801,6 +1825,7 @@ multimodal_model_archs = [
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
@@ -1851,6 +1876,7 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # Multimodal archs whose LM prefill is validated under breakable CUDA graph;
 # embed-carrying batches are rejected at replay (can_run_graph) and run eager.
 multimodal_breakable_cuda_graph_supported_model_archs = [
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
 ]
