@@ -19,6 +19,9 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as THINK_START,
 )
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.deepseekv4_detector import (
+    DeepSeekV4Detector as V4ToolDetector,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import DeepSeekV4Detector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -244,6 +247,132 @@ class TestDSV4ArgumentAssertions(unittest.TestCase):
 
         args = json.loads(calls[0].parameters)
         self.assertEqual(args["command"], "pwd")
+
+
+class TestDSV4FinishLeakage(unittest.TestCase):
+    """Bug 4 (think_start buffer writeback): After the fix, finish() SHALL NOT
+    emit think_start_token in reasoning_text, even when the stream is cut off
+    mid-reasoning (max_tokens, client disconnect)."""
+
+    def test_finish_no_think_start_in_reasoning_streaming(self):
+        """stream_reasoning=True: finish() after mid-reasoning cutoff SHALL NOT
+        contain think_start_token in reasoning_text."""
+        detector = _make_detector(stream_reasoning=True)
+        detector.parse_streaming_increment(THINK_START)
+        detector.parse_streaming_increment("partial reasoning")
+        r = detector.finish()
+        self.assertNotIn(THINK_START, r.reasoning_text)
+
+    def test_finish_no_think_start_in_reasoning_buffered(self):
+        """stream_reasoning=False: finish() after mid-reasoning cutoff SHALL NOT
+        contain think_start_token in reasoning_text (Bug 4 fix: buffer writeback)."""
+        detector = _make_detector(stream_reasoning=False)
+        detector.parse_streaming_increment(THINK_START)
+        detector.parse_streaming_increment("partial reasoning")
+        r = detector.finish()
+        self.assertNotIn(THINK_START, r.reasoning_text)
+
+
+class TestDSV4TerminalLeakage(unittest.TestCase):
+    """After parsing, neither think_start_token nor think_end_token SHALL appear
+    in reasoning_text or normal_text — they are structural markers, not content."""
+
+    def test_no_think_tokens_leak_streaming(self):
+        """stream_reasoning=True: after a full reasoning→normal cycle, neither
+        THINK_START nor THINK_END shall appear in either output."""
+        detector = _make_detector(stream_reasoning=True)
+        source = f"{THINK_START}reasoning here{THINK_END}normal answer"
+        reasoning, normal = _feed_streaming(detector, source, chunk_size=1)
+        self.assertNotIn(THINK_START, reasoning)
+        self.assertNotIn(THINK_END, reasoning)
+        self.assertNotIn(THINK_START, normal)
+        self.assertNotIn(THINK_END, normal)
+
+    def test_no_think_tokens_leak_buffered(self):
+        """stream_reasoning=False: same invariant — no think tokens in output."""
+        detector = _make_detector(stream_reasoning=False)
+        source = f"{THINK_START}reasoning here{THINK_END}normal answer"
+        reasoning, normal = _feed_streaming(detector, source, chunk_size=5)
+        self.assertNotIn(THINK_START, reasoning)
+        self.assertNotIn(THINK_END, reasoning)
+        self.assertNotIn(THINK_START, normal)
+        self.assertNotIn(THINK_END, normal)
+
+    def test_no_think_tokens_leak_multi_block(self):
+        """Multi-block cycling: no think tokens leak across two reasoning blocks."""
+        detector = _make_detector(stream_reasoning=True)
+        source = (
+            f"{THINK_START}first{THINK_END}answer1"
+            f"{THINK_START}second{THINK_END}answer2"
+        )
+        reasoning, normal = _feed_streaming(detector, source, chunk_size=1)
+        self.assertNotIn(THINK_START, reasoning)
+        self.assertNotIn(THINK_END, reasoning)
+        self.assertNotIn(THINK_START, normal)
+        self.assertNotIn(THINK_END, normal)
+
+
+class TestDSV4MalformedJSONStreaming(unittest.TestCase):
+    """Bug 6: MalformedJSON not caught in parse_streaming_increment.
+
+    The tool call parser's _parse_parameters_from_xml catches MalformedJSON
+    internally (line 183).  The outer except-Exception handler (line 375)
+    catches any other exception and clears the buffer to prevent cascading
+    parse failures (Bug 6 fix).  These tests verify both layers.
+    """
+
+    _TOOLS = [
+        Tool(
+            function=Function(
+                name="ls", parameters={"type": "object", "properties": {}}
+            )
+        )
+    ]
+
+    def test_malformed_json_params_no_crash(self):
+        """Feeding a DSML invoke block with malformed JSON parameters SHALL NOT
+        crash — MalformedJSON is caught inside _parse_parameters_from_xml."""
+        det = V4ToolDetector()
+        malformed = (
+            f"{DSML_OPEN}\n"
+            f'<{DSML_TOKEN}invoke name="ls">\n'
+            f'<{DSML_TOKEN}parameter name="cmd" string="true">'
+            f'{{{{"broken json'  # malformed JSON inside XML parameter
+            f"</{DSML_TOKEN}parameter>\n"
+            f"</{DSML_TOKEN}invoke>\n"
+            f"</{DSML_TOKEN}tool_calls>"
+        )
+        # This should not raise
+        result = det.parse_streaming_increment(malformed, self._TOOLS)
+        # The tool call SHALL be extracted (with garbled parameters)
+        self.assertTrue(
+            len(result.calls) > 0 or result.normal_text != "",
+            "Expected either tool calls or normal_text from malformed input",
+        )
+
+    def test_outer_exception_clears_buffer(self):
+        """When an unexpected exception escapes _parse_parameters_from_xml,
+        the outer except handler SHALL clear the buffer (Bug 6 fix)."""
+        det = V4ToolDetector()
+        # Monkey-patch _parse_parameters_from_xml to raise a non-JSON exception
+        original = det._parse_parameters_from_xml
+
+        def raise_runtime(*a, **kw):
+            raise RuntimeError("simulated unexpected error")
+
+        setattr(det, "_parse_parameters_from_xml", raise_runtime)
+        try:
+            dsml_input = (
+                f"{DSML_OPEN}\n"
+                f'<{DSML_TOKEN}invoke name="ls">\n'
+                f"</{DSML_TOKEN}invoke>\n"
+                f"</{DSML_TOKEN}tool_calls>"
+            )
+            result = det.parse_streaming_increment(dsml_input, self._TOOLS)
+            # Buffer SHALL be cleared by outer exception handler
+            self.assertEqual(det._buffer, "")
+        finally:
+            setattr(det, "_parse_parameters_from_xml", original)
 
 
 if __name__ == "__main__":

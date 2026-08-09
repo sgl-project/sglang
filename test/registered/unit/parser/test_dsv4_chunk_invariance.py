@@ -49,7 +49,8 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 # ── Constants ───────────────────────────────────────────────────────────────
 
 # Chunk sizes swept by every invariance test (vLLM uses [1,2,3,5,11,23,None]).
-CHUNK_SIZES = [1, 2, 3, 5, 7, 11]
+# None = feed entire text in one chunk (gold-standard reference).
+CHUNK_SIZES = [1, 2, 3, 5, 7, 11, 23, None]
 
 TOOL_START = f"<{DSML_TOKEN}"  # leading token of a DSML tool block
 DSML_OPEN = f"<{DSML_TOKEN}tool_calls>"
@@ -72,11 +73,15 @@ def _make_detector(**kwargs):
 
 def _feed_streaming(detector, text, chunk_size=1):
     """Feed text char-by-char (or in fixed-size chunks) to the streaming parser.
-    Returns (reasoning, normal) accumulated text."""
+    Returns (reasoning, normal) accumulated text.
+    chunk_size=None feeds the entire text as a single chunk (gold-standard)."""
     reasoning = ""
     normal = ""
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i : i + chunk_size]
+    if chunk_size is None:
+        chunks = [text]
+    else:
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    for chunk in chunks:
         r = detector.parse_streaming_increment(chunk)
         reasoning += r.reasoning_text
         normal += r.normal_text
