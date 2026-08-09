@@ -245,6 +245,82 @@ sglang serve \
   </tbody>
 </table>
 
+## Cross-Node Sequence Parallelism
+
+Ulysses alone cannot scale sequence parallelism past the GPU count of one
+node: going wider either violates head-count divisibility or exposes an
+all-to-all across the slower inter-node link. Ring's point-to-point KV
+rotation is designed to overlap with attention compute, which tolerates a
+slower cross-node link far better than an all-to-all does — so the pattern
+for scaling SP across nodes is **node-local Ulysses × cross-node Ring**, not
+Ulysses alone.
+
+Cross-node launches add three flags on top of the usual SP degrees:
+
+- `--nnodes`: number of nodes. `--num-gpus` stays the *total* GPU count
+  across every node; each node runs `num_gpus // nnodes` local workers.
+- `--node-rank`: this node's rank, `0` on the head node (which keeps the
+  HTTP/TokenizerManager surface) and `1..nnodes-1` on the others (worker-only).
+- `--dist-init-addr`: a `host:port` rendezvous address reachable from every
+  node — typically the head node's address.
+
+Run the same command on every node, changing only `--node-rank`:
+
+```bash
+# node 0 (head)
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 16 \
+  --nnodes 2 \
+  --node-rank 0 \
+  --dist-init-addr <node0-ip>:23456 \
+  --sp-degree 16 \
+  --ulysses-degree 8 \
+  --ring-degree 2 \
+  --encoder-parallel replicate \
+  --port 30010
+
+# node 1 (worker)
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 16 \
+  --nnodes 2 \
+  --node-rank 1 \
+  --dist-init-addr <node0-ip>:23456 \
+  --sp-degree 16 \
+  --ulysses-degree 8 \
+  --ring-degree 2 \
+  --encoder-parallel replicate \
+  --port 30010
+```
+
+`--encoder-parallel replicate` is required for cross-node deployments today:
+the `auto` fold decision is not yet node-boundary aware and will try to fold
+the text encoder across nodes, which crashes reference-conditioned encoders.
+See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
+
+<Warning>
+Cross-node ring support is model-specific, not a property of the launch
+flags alone — see [Supported Models and Optimization Compatibility](/docs/sglang-diffusion/compatibility_matrix)
+for which models have it. Passing `--ring-degree > 1` for a model that only
+has single-node Ulysses may either raise or, in some cases, silently
+compute incorrect output; check the model's cookbook page before assuming
+cross-node scaling is supported.
+</Warning>
+
+### Numerics across node boundaries
+
+Ring's online-softmax merge across P2P hops accumulates floating-point
+operations in a different order than single-node attention, so a cross-node
+run is **not** expected to bit-match a single-node run of the same prompt and
+seed — this is the same class of difference as choosing a different
+attention backend, not a correctness regression. What *is* expected: the same
+request run twice against the same cross-node deployment must produce
+byte-identical output. Use that repeat-request check, not a cross-topology
+comparison, to validate a cross-node deployment's determinism.
+
 ## Benchmarking Guidance
 
 When benchmarking SP, compare the same model, precision, resolution, frame count, step count, scheduler settings, prompt type, and output path. Report both stage latency and peak GPU memory; SP can reduce per-GPU memory while adding communication overhead.
@@ -375,3 +451,56 @@ The following numbers are a reference measurement for one setup. They are not a 
 </table>
 
 In this setup, end-to-end latency improved from `90.63s` to `63.74s` (`1.42x`) and peak GPU memory dropped by `7.33GB`. The overhead ratio increased, so future tuning should still check communication and runtime overhead on the target hardware.
+
+## Cross-Node Reference Benchmark
+
+The following numbers are a reference measurement for MiniMax-H3's cross-node
+Ulysses × Ring deployment. They are not a general promise for every
+model or topology — see each model's cookbook page for its own verified
+cross-node status.
+
+- Model: `MiniMaxAI/MiniMax-H3`
+- Hardware: 2 nodes × 8× NVIDIA H200 SXM, same cluster, InfiniBand between nodes
+- Cross-node config: `--num-gpus 16 --sp-degree 16 --ulysses-degree 8 --ring-degree 2`
+- Single-node baseline: `--num-gpus 8 --sp-degree 8 --ulysses-degree 8 --ring-degree 1`
+
+Denoise-stage-only comparison, holding prompt, seed, and step count fixed:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "22%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Task</th>
+      <th>Single-node (s/step)</th>
+      <th>Cross-node (s/step)</th>
+      <th>Change</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>T2VA denoise</td>
+      <td>0.749</td>
+      <td>0.477</td>
+      <td>-36.3%</td>
+    </tr>
+    <tr>
+      <td>Ref2VA / V2V denoise</td>
+      <td>2.572</td>
+      <td>1.494</td>
+      <td>-41.9%</td>
+    </tr>
+  </tbody>
+</table>
+
+The gain grows with sequence length: ring's per-hop communication cost stays
+roughly constant while attention compute grows quadratically with sequence
+length, so V2V's longer packed sequence benefits more than T2VA's shorter
+one. With the point-to-point KV rotation pipelined against attention compute
+(rather than a blocking `all_gather`), one V2V request's full denoise stage
+completed in 68.1-68.3s versus 128.6s on the single-node 8-GPU baseline
+(-47.0%), with byte-identical output to the unpipelined cross-node path.

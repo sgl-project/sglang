@@ -66,12 +66,11 @@ def norm_scale_shift_module() -> Module:
         cuda_wrappers=[
             (
                 "qwen_image_nss_bf16_row",
-                "sglang_norm_scale_shift::QwenImageNormScaleShiftKernel::run",
+                "norm_scale_shift::QwenImageNormScaleShiftKernel::run",
             ),
             (
                 "qwen_image_srnss_bf16_row",
-                "sglang_norm_scale_shift::"
-                "QwenImageScaleResidualNormScaleShiftKernel::run",
+                "norm_scale_shift::" "QwenImageScaleResidualNormScaleShiftKernel::run",
             ),
         ],
     )
