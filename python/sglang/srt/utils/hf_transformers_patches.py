@@ -109,7 +109,13 @@ def normalize_deepseek_v4_compat(config) -> None:
 
     if getattr(config, "model_type", None) != "deepseek_v4":
         return
-    if hasattr(config, "compress_ratios"):
+    # ``hasattr`` alone is not enough here: some configs may carry an
+    # explicit ``compress_ratios = None``, which would short-circuit the
+    # rebuild and hand downstream a ``None`` that then explodes at
+    # ``for r in ...`` / ``[layer_id]``. Treat only a real non-None value as
+    # "already legacy-shaped, keep as is". (See vLLM's harden pass in
+    # vllm-project/vllm#43443 for the same lesson.)
+    if getattr(config, "compress_ratios", None) is not None:
         return
 
     rates = getattr(config, "compress_rates", None)

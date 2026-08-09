@@ -211,6 +211,18 @@ class TestNormalizeDeepseekV4Compat(unittest.TestCase):
         normalize_deepseek_v4_compat(cfg)
         self.assertEqual(cfg.compress_ratios, [0, 128, 4])
 
+    def test_treats_none_valued_compress_ratios_as_absent(self):
+        # A config may carry ``compress_ratios = None`` (attribute exists but
+        # unset). A plain ``hasattr`` check would short-circuit and hand
+        # downstream a ``None`` — ``for r in None`` / ``None[layer_id]`` both
+        # explode later. The rebuild must fire in this case just like when
+        # the attribute is missing entirely. Same class of bug that vLLM's
+        # harden pass caught in vllm-project/vllm#43443.
+        cfg = self._make_new_transformers_config([self._LT_HCA, self._LT_CSA])
+        cfg.compress_ratios = None
+        normalize_deepseek_v4_compat(cfg)
+        self.assertEqual(cfg.compress_ratios, [128, 4])
+
     def test_no_op_for_non_deepseek_v4_model_type(self):
         # Negative-branch contract: unrelated model types with coincidentally
         # named ``compress_rates`` / ``layer_types`` attributes must not be
