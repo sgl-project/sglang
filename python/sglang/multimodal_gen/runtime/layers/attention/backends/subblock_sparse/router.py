@@ -63,10 +63,10 @@ the pipeline currently produces.
 
 Usage
 -----
-    router = SubBlockSparseRouter(n_k=4, n_q=4)
+    router = SubBlockRouter(n_k=4, n_q=4)
     plan = router.route(q, k, sparsity=0.8, softmax_scale=d**-0.5)   # q, k: [B, S, H, D]
     out, _ = bsa_attn_blk64_fwd(q, k, v, plan.index, plan.topk,
-                                block_sizes=SubBlockSparseRouter.block_sizes(S, q.device),
+                                block_sizes=SubBlockRouter.block_sizes(S, q.device),
                                 q2k_block_nums=None)
 """
 
@@ -163,7 +163,7 @@ class RoutingPlan(msgspec.Struct, frozen=True):
         return self.topk / self.num_blocks
 
 
-class SubBlockSparseRouter:
+class SubBlockRouter:
     """Builds ``q2k_block_index`` from sub-block-pooled Q/K.
 
     Args:

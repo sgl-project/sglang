@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-    SubBlockSparseRouter,
+    SubBlockRouter,
     load_bsa_attn_blk64_fwd,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
@@ -106,7 +106,7 @@ def _cached_block_sizes(seq_len: int, device: torch.device) -> torch.Tensor:
     Rebuilding it per call costs an arange plus a clamp launch on the critical
     path for a tensor that only depends on the sequence length.
     """
-    return SubBlockSparseRouter.block_sizes(seq_len, device)
+    return SubBlockRouter.block_sizes(seq_len, device)
 
 
 class SubBlockSparseAttentionBackend(AttentionBackend):
@@ -224,7 +224,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             and self.schedule.sparsity > 0.0
         )
         self.router = (
-            SubBlockSparseRouter(n_k=self.schedule.n_k, n_q=self.schedule.n_q)
+            SubBlockRouter(n_k=self.schedule.n_k, n_q=self.schedule.n_q)
             if self.layer_enabled
             else None
         )

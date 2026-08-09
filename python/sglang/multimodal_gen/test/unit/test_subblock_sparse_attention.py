@@ -268,7 +268,7 @@ class TestSubBlockNumerics(unittest.TestCase):
         cosine here measures the routing, not a forgiving fixture.
         """
         from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-            SubBlockSparseRouter,
+            SubBlockRouter,
             load_bsa_attn_blk64_fwd,
         )
 
@@ -296,7 +296,7 @@ class TestSubBlockNumerics(unittest.TestCase):
             v,
             random_index,
             topk,
-            block_sizes=SubBlockSparseRouter.block_sizes(self.seq_len, device),
+            block_sizes=SubBlockRouter.block_sizes(self.seq_len, device),
             q2k_block_nums=None,
             softmax_scale=HEAD_DIM**-0.5,
         )

@@ -120,7 +120,7 @@ are comparable.
 
 | | |
 | --- | --- |
-| `router.py` | `SubBlockSparseRouter` — pooling, scoring, selection, `RoutingPlan` |
+| `router.py` | `SubBlockRouter` — pooling, scoring, selection, `RoutingPlan` |
 | `kernels.py` | Triton pooling / segmented-LSE / fused top-k |
 | `../subblock_sparse_attn.py` | the `AttentionBackend`: schedule, gating, dense fallback |
 
