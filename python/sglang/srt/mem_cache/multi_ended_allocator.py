@@ -954,7 +954,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+                self.free_group.append(self._copy_for_free_group(free_index))
                 return
             if self.lazy_compaction:
                 self._free_lazy(free_index)
@@ -1928,7 +1928,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+                self.free_group.append(self._copy_for_free_group(free_index))
                 return
             self.full_attn_allocator.free(free_index)
             self.full_attn_allocator.clear_inverse_history()
@@ -2397,7 +2397,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+                self.free_group.append(self._copy_for_free_group(free_index))
                 return
             # Free both peers; the per-sub-pool v2p IS the mapping, so order isn't
             # load-bearing. Filter the swa side to skip already-tombstoned virtuals
